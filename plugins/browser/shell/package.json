@@ -1,0 +1,11 @@
+{
+  "name": "@cortex-ui/browser-shell-module",
+  "version": "0.1.0",
+  "description": "browser@1 for CortexCode, served from Electron's main process: WebContentsView tabs driven through CDP, laid over the browser pane.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "private": true,
+  "cortex": { "id": "browser.shell-module", "shellModule": { "entry": "index.js" } },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "files": ["*.js", "README.md"]
+}

@@ -1,0 +1,35 @@
+[package]
+name = "cc-lang-web"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode lang@1 plugin for HTML and CSS (SCSS, Less): the code graph's facts of pages and stylesheets, vscode-html-language-server and vscode-css-language-server diagnostics/definition/references/hover, html-validate and stylelint verifiers and web skills."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_lang_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-lang-web"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
+# SCSS: tree-sitter-scss 1.0.0 (tree-sitter-grammars) fails on `!default` and `@extend`; the
+# scss-modern grammar (ABI 15) parses current SCSS (module system, flags, control flow).
+tree-sitter-scss-modern = "0.1.0"
+# Binds `tree-sitter >=0.21` directly (ABI 14); cargo unifies it on the kit's tree-sitter 0.25.
+tree-sitter-less = "1.0.0"
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time", "test-util"] }

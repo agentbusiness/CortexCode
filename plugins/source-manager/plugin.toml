@@ -1,0 +1,69 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1): the source manager. One self-contained
+# folder (backend + settings panel), separable into its own repository and packable into a portable
+# `.ccplugin` with `cortex-pack`; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "source-manager"
+name = "Source manager"
+version = "0.1.0"
+description = "CortexCode's own source as one git repository in the code folder: live data edits, code changes approved and hot-swapped, history and revert, backup to GitHub and sharing improvements."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin (a Cargo workspace of its own; depends on the protocol crate by path). Its own
+# data (backend/data: the change-summary instructions) is compiled in and read live from the code
+# folder like any plugin's data.
+[backend]
+category = "source"
+contract = "source@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-source"
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+# "Waiting for you" in the card: code changes that need an answer.
+[[ui.package]]
+dir = "ui/card-waiting"
+id = "source-manager.card-waiting"
+slot = "card.waiting@1"
+
+# Settings > History: every change, revert, the update state.
+[[ui.package]]
+dir = "ui/settings-history"
+id = "source-manager.settings-history"
+slot = "settings.history@1"
+
+# Settings > Backup & Sync.
+[[ui.package]]
+dir = "ui/settings-backup"
+id = "source-manager.settings-backup"
+slot = "settings.backup@1"
+
+# Settings > Share improvements with CortexCode.
+[[ui.package]]
+dir = "ui/settings-share"
+id = "source-manager.settings-share"
+slot = "settings.share@1"
+
+# Settings > Storage.
+[[ui.package]]
+dir = "ui/settings-storage"
+id = "source-manager.settings-storage"
+slot = "settings.storage@1"
+
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager itself and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/source-manager"

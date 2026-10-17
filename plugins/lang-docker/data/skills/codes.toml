@@ -1,0 +1,5 @@
+# Lint codes the Docker guide covers, as hadolint (`DL3008`) and `docker build --check` (`UndefinedVar`)
+# print them. The language servers' own codes are not covered. The guide is always loaded, so the
+# tools only point to it when one of these shows up in a verifier's output; the model never reads
+# this file.
+docker = ["DL3000", "DL3002", "DL3003", "DL3006", "DL3007", "DL3008", "DL3009", "DL3015", "DL3018", "DL3019", "DL3020", "DL3025", "DL3042", "DL4006", "CopyIgnoredFile", "JSONArgsRecommended", "SecretsUsedInArgOrEnv", "UndefinedVar", "WorkdirRelativePath"]

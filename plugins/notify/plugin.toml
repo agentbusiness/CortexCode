@@ -1,0 +1,75 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: backend,
+# Electron shell module and UI package together, so the folder can live in its own repository and be
+# packed into a portable `.ccplugin` (`cortex-pack`: what to build, what to ship, where it plugs in);
+# the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "notify"
+name = "Notifications"
+version = "0.1.0"
+description = "macOS notifications when a run finishes or fails, an approval is needed, an agent is blocked, a contract is verified or fails, a merge conflicts or a plugin swap rolls back; delivered through the app window when it is open and natively otherwise; clicks open the target."
+license = "UNLICENSED"
+platforms = ["macos"]
+# The CortexCode icon (docs/brand/final); the notification app shows it on every notification.
+icon = "backend/helper/CortexCode.icns"
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame.
+[backend]
+category = "notify"
+contract = "notify@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-notify"
+swap = "blue_green"
+# Shipped beside the executable: the bundled notification app (UNUserNotificationCenter needs an
+# app bundle with a bundle identifier). The frame runs plugin executables from its content-addressed
+# store; a packed plugin keeps this app next to its executable, where cc-notify looks first.
+assets = ["backend/target/release/CortexCodeNotify.app"]
+provides = [
+  "notify.send", "notify.history", "notify.activated", "notify.deliverer",
+  "notify.prefs.get", "notify.prefs.set", "notify.status",
+]
+subscribes = ["journal.", "agents.changed", "plugin.swapped", "tools.job", "notify.focus", "memory.settings.changed"]
+publishes = ["notify.posted", "notify.activate", "notify.changed"]
+# Calls it makes (all optional: a missing peer only removes names from the text, or switches the
+# preferences to the built-in defaults, which every notification then reports).
+uses = ["frame.session.get", "frame.project.get", "frame.ui.open", "memory.settings.list", "memory.settings.set", "memory.task.get", "agents.list", "tools.job.status"]
+
+# Defaults for the frame config's [plugin.config] table (the frame config's values win).
+[backend.config]
+request_authorization = true   # ask macOS for the notification app's permission at startup
+# helper_app = "/path/to/CortexCodeNotify.app"
+
+# The settings panel: one npm package (ui/ is the package itself); its build writes ui/dist with
+# manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+test = ["npm", "run", "verify"]
+
+[[ui.package]]
+dir = "ui"
+id = "notify.settings"
+slot = "settings.notify@1"
+
+# Code that runs in the Electron main process (the shell's module interface: `load(api)` ->
+# `{ unload() }`). The frame hands the shell the module folders of enabled plugins.
+[[shell]]
+dir = "shell"
+id = "notify.shell-module"
+
+# Preferences, in the main settings database (memory.settings, section `notify`).
+[settings]
+section = "notify"
+keys = ["notify.kinds.<kind> (boolean)", "notify.only_when_away (boolean)", "notify.long_job_ms (number)", "notify.dedup_window_ms (number)"]
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/notify"

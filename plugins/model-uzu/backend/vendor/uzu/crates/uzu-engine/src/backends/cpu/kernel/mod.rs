@@ -1,0 +1,38 @@
+use crate::backends::{
+    common::{Kernels, kernel::Unsupported},
+    cpu::Cpu,
+};
+
+mod activation;
+pub(crate) mod activation_transform;
+mod attention;
+mod convolution;
+mod embedding;
+mod gated_act_mul;
+mod gdn;
+mod logit_transform;
+mod matmul;
+mod normalization;
+mod pooling;
+mod radix_top_k_small;
+mod sampling;
+mod short_conv;
+mod softmax;
+mod tensor_add_bias;
+mod tensor_add_scale;
+mod weaver;
+
+include!(concat!(env!("OUT_DIR"), "/cpu.rs"));
+
+pub struct CpuKernels;
+
+impl Kernels for CpuKernels {
+    type Backend = Cpu;
+
+    autogen_kernels!();
+    type AttentionKernel = attention::AttentionCpuKernel;
+    type DeltaNetChunkedPrefill = Unsupported<Cpu>;
+    type DeltaNetTreeVerify = Unsupported<Cpu>;
+    type MatmulKernel = matmul::MatmulCpuKernel;
+    type RadixTopKSmall = radix_top_k_small::CpuRadixTopKSmall;
+}

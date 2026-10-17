@@ -1,0 +1,47 @@
+[
+ {
+  "engine": "llamacpp",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "lumen-rs",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "xinfer",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "mistralrs",
+  "config": "gguf-q4_0",
+  "suite": "sweep"
+ },
+ {
+  "engine": "rmlx",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "uzu",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "saragossa",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "lumen",
+  "config": "default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "crane",
+  "config": "default",
+  "suite": "sweep"
+ }
+]

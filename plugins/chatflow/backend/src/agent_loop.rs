@@ -1,0 +1,1051 @@
+//! The coding agent loop: the model works with native tools (read, edit, run) in the session's
+//! workspace; the host executes every call through `tools.execute`, journals everything, injects
+//! impact after signature changes, delivers steering at tool boundaries, stops repetition
+//! structurally and, for tasks with a contract, keeps going until the host-run contract is green
+//! or the model reports it is blocked.
+//!
+//! Every piece of loop state is recoverable from the journal (steps, consumed steers, repetition
+//! history, verification failures), so a successor instance resumes a parked run where it stopped.
+
+use crate::context::Prefix;
+use crate::data::Dataset;
+use crate::contract;
+use crate::host::{self, Host};
+use crate::impact::Tracker;
+use crate::journal::Journal;
+use crate::llm::{self, CallSpec, StreamTo};
+use crate::prompts;
+use crate::reads::Scope;
+use crate::repetition::{Detector, Verdict};
+use crate::schemas::max_effort;
+use cc_protocol::contracts::agents::{VerifyReport, methods as agents_methods};
+use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, topics as chatflow_topics};
+use cc_protocol::contracts::model::methods as model_methods;
+use cc_protocol::contracts::frame::SessionStatus;
+use cc_protocol::contracts::frame::{JournalEntry, kinds};
+use cc_protocol::contracts::memory::{BoardListResult, Task, methods as memory_methods};
+use cc_protocol::contracts::model::{ChatMessage, Priority, ToolCall};
+use cc_protocol::contracts::tools::{ExecContext, ToolOutcome, methods as tools_methods};
+use cc_protocol::{RpcError, codes};
+use serde_json::{Value, json};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// How long a parking instance lets an in-flight tool call finish before cancelling it. The frame
+/// gives `plugin.shutdown` 5 s, so parking (this grace plus journaling) must fit inside that.
+pub const PARK_GRACE: Duration = Duration::from_secs(3);
+
+/// Signals that stop a run.
+#[derive(Clone, Default)]
+pub struct Stops {
+    /// The user (or the agents plugin) cancelled the run.
+    pub cancel: CancellationToken,
+    /// This instance is shutting down: stop at a boundary without a terminal status, so the
+    /// successor resumes.
+    pub park: CancellationToken,
+}
+
+impl Stops {
+    /// Fires on either signal (for calls that must stop promptly either way).
+    pub fn any(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        let (cancel, park, out) = (self.cancel.clone(), self.park.clone(), token.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => out.cancel(),
+                _ = park.cancelled() => out.cancel(),
+                _ = out.cancelled() => {}
+            }
+        });
+        token
+    }
+}
+
+#[derive(Clone)]
+pub struct RunEnv {
+    pub host: Host,
+    pub session_id: String,
+    pub scope: Scope,
+    pub prefix: Prefix,
+    pub run_id: String,
+    pub mode: String,
+    pub priority: Priority,
+    pub stops: Stops,
+    /// The data set (prompts, texts, sampling, limits) this run uses.
+    pub data: std::sync::Arc<Dataset>,
+    /// Current stage, shown by `chatflow.state`.
+    pub stage: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The model takes image content parts (`model.info`); attached images are then shown to it.
+    pub image_input: bool,
+}
+
+impl RunEnv {
+    pub fn set_stage(&self, stage: &str) {
+        if let Ok(mut current) = self.stage.lock() {
+            *current = stage.to_owned();
+        }
+    }
+
+    pub fn cache_key(&self) -> String {
+        self.session_id.clone()
+    }
+
+    /// A model call of `stage` at `effort` over `messages`, with the stage's sampling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(&self, stage: &str, effort: &str, messages: Vec<ChatMessage>, grammar: Option<String>, tool_choice: Option<Value>, step: u64, content: bool) -> CallSpec {
+        let effort = self.data.effort_for(stage, effort);
+        CallSpec {
+            stage: stage.to_owned(),
+            messages,
+            tools: self.prefix.tools.clone(),
+            json_schema: None,
+            grammar,
+            tool_choice,
+            sampling: self.data.sampling(stage, effort != "none"),
+            effort,
+            priority: self.priority,
+            cache_key: self.cache_key(),
+            stream: StreamTo { run_id: self.run_id.clone(), step, content, live: Vec::new() },
+            think_budget: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LoopKind {
+    /// The foreground DO route.
+    Foreground,
+    /// A question (the router's LOOKUP or ANSWER): explore with the tools and answer.
+    Question,
+    /// A named background agent working a task.
+    Agent { name: String },
+}
+
+pub struct LoopSpec {
+    pub kind: LoopKind,
+    pub effort: String,
+    /// A task with a contract: the host verifies before the run counts as done.
+    pub task: Option<Task>,
+    /// The one step of the run's plan this loop carries out (a DO decision's plan runs step by step).
+    pub step: Option<StepSpec>,
+}
+
+/// One step of a plan for the foreground loop: its number and text, and the steps done before it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepSpec {
+    pub n: u32,
+    pub of: u32,
+    pub text: String,
+    pub done: Vec<crate::plan::StepDone>,
+    /// The whole work in one sentence (the plan's goal): the frame the task sits in.
+    pub goal: String,
+    /// The titles of the tasks after this one, done later (named so the model leaves them).
+    pub later: Vec<String>,
+    /// The statement's requirements this task must meet (label, text), as its step lists them.
+    pub requirements: Vec<(String, String)>,
+}
+
+/// COVERAGE: the step's requirements the check script does not yet test both ways, as the host's
+/// message to the model; None when all are covered or the decision cannot be read.
+async fn coverage_missing(env: &RunEnv, journal: &mut Journal, step: &StepSpec) -> Option<String> {
+    let labels: Vec<String> = step.requirements.iter().map(|(label, _)| label.clone()).collect();
+    let shape = env.data.shape("COVERAGE")?.clone().filled(crate::schemas::REQUIREMENTS_PLACEHOLDER, &labels, None);
+    let decided = crate::flow::decide_json::<crate::schemas::Coverage>(env, journal, "COVERAGE", &shape, "").await;
+    let missing = match decided {
+        Ok((coverage, _)) => coverage.missing,
+        Err(error) => {
+            tracing::warn!(%error, "the COVERAGE decision could not be read; the task goes on");
+            return None;
+        }
+    };
+    let items: Vec<String> = step
+        .requirements
+        .iter()
+        .filter(|(label, _)| missing.contains(label))
+        .map(|(label, text)| env.data.text("list_item", &[("text", &format!("{label}: {text}"))]))
+        .collect();
+    (!items.is_empty()).then(|| env.data.text("coverage_missing", &[("items", &items.join("\n"))]))
+}
+
+/// The stage text that tells the loop its step: the step, what the earlier steps did, and that
+/// the host takes the reply as the end of this step (the plan's checks run after the last).
+pub fn step_live(data: &Dataset, step: &StepSpec) -> String {
+    let done = if step.done.is_empty() {
+        String::new()
+    } else {
+        let items: String = step.done.iter().map(|done| data.text("do_step_done_item", &[("n", &done.n.to_string()), ("summary", done.summary.trim())])).collect();
+        data.text("do_step_done", &[("items", &items)])
+    };
+    let later = if step.later.is_empty() { String::new() } else { data.text("do_step_later", &[("titles", &step.later.join("; "))]) };
+    let goal = if step.goal.trim().is_empty() { String::new() } else { data.text("do_step_goal", &[("goal", step.goal.trim())]) };
+    let mut text = data.text("do_step", &[("goal", &goal), ("n", &step.n.to_string()), ("of", &step.of.to_string()), ("text", step.text.trim()), ("later", &later), ("done", &done)]);
+    if step.n >= step.of {
+        text.push_str(&data.text("do_step_last", &[]));
+    }
+    text
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoopOutcome {
+    /// done | failed | cancelled | blocked | stopped | parked
+    pub outcome: String,
+    pub summary: String,
+    pub turns: u32,
+    pub tool_calls: u32,
+    pub changed_files: Vec<String>,
+    pub verified: Option<bool>,
+}
+
+fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
+    data.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+fn of_run<'a>(entries: &'a [JournalEntry], run_id: &'a str) -> impl Iterator<Item = &'a JournalEntry> + 'a {
+    entries.iter().filter(move |entry| str_field(&entry.data, "run_id") == run_id)
+}
+
+/// The next model step number of a run (steps are journaled on every model entry).
+pub fn next_step(entries: &[JournalEntry], run_id: &str) -> u64 {
+    of_run(entries, run_id).filter_map(|entry| entry.data.get("step").and_then(Value::as_u64)).max().unwrap_or(0) + 1
+}
+
+/// Close what a stopped instance left open: streaming entries are marked interrupted (the step is
+/// generated again) and calls without results get an honest result (their effect is unknown, so
+/// they are never replayed blindly).
+pub async fn repair_interrupted(journal: &mut Journal, run_id: &str, data: &Dataset) -> Result<(), RpcError> {
+    let entries = journal.entries_vec();
+    for entry in of_run(&entries, run_id) {
+        let streaming = entry.data.get("streaming").and_then(Value::as_bool).unwrap_or(false);
+        if streaming && matches!(entry.kind.as_str(), kinds::ASSISTANT_MESSAGE | kinds::REASONING) {
+            journal.set(entry.seq, "interrupted", json!(true)).await?;
+            journal.set(entry.seq, "streaming", json!(false)).await?;
+        }
+    }
+    let results: HashSet<String> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT)
+        .map(|entry| str_field(&entry.data, "call_id").to_owned())
+        .collect();
+    // A call that asked the user for approval is not interrupted: the run resumes waiting for it.
+    let asked: HashSet<String> = entries
+        .iter()
+        .filter(|entry| entry.kind == chatflow_kinds::APPROVAL)
+        .map(|entry| str_field(&entry.data, "call_id").to_owned())
+        .collect();
+    for entry in of_run(&entries, run_id).filter(|entry| entry.kind == kinds::TOOL_CALL) {
+        let call_id = str_field(&entry.data, "call_id");
+        if !results.contains(call_id) && !asked.contains(call_id) {
+            let host_read = entry.data.get("host").and_then(Value::as_bool).unwrap_or(false);
+            journal
+                .append(
+                    kinds::TOOL_RESULT,
+                    json!({
+                        "call_id": call_id,
+                        "ok": false,
+                        "output": data.text("interrupted", &[]),
+                        "duration_ms": 0,
+                        "run_id": run_id,
+                        "host": host_read,
+                        "interrupted_call": true,
+                    }),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the repetition detector from the run's journal.
+fn detector_from(entries: &[JournalEntry], run_id: &str, repeat_at: u32) -> Detector {
+    let mut detector = Detector::new(repeat_at);
+    let calls: std::collections::HashMap<&str, &JournalEntry> = of_run(entries, run_id)
+        .filter(|entry| entry.kind == kinds::TOOL_CALL)
+        .map(|entry| (str_field(&entry.data, "call_id"), entry))
+        .collect();
+    for entry in of_run(entries, run_id) {
+        match entry.kind.as_str() {
+            kinds::TOOL_RESULT if !entry.data.get("host").and_then(Value::as_bool).unwrap_or(false) => {
+                if let Some(call) = calls.get(str_field(&entry.data, "call_id")) {
+                    let args = call.data.get("args").cloned().unwrap_or(Value::Null);
+                    let signature = Detector::signature(str_field(&call.data, "tool"), &args);
+                    let _ = detector.observe(&signature, str_field(&entry.data, "output"));
+                }
+                if entry.data.get("changed_files").and_then(Value::as_array).is_some_and(|files| !files.is_empty()) {
+                    detector.changed();
+                }
+            }
+            kinds::USER_MESSAGE => detector.reset(),
+            // Each plan task gets its own correction before a repeat stops it.
+            kinds::NOTE if str_field(&entry.data, "purpose") == "task_start" => detector.reset(),
+            _ => {}
+        }
+    }
+    detector
+}
+
+fn changed_files_of(entries: &[JournalEntry], run_id: &str) -> BTreeSet<String> {
+    of_run(entries, run_id)
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT)
+        .flat_map(|entry| {
+            entry.data.get("changed_files").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|value| value.as_str().map(str::to_owned))
+        })
+        .collect()
+}
+
+/// Deliver pending `steer` entries at this tool boundary. Returns how many were delivered.
+pub async fn deliver_steers(journal: &mut Journal) -> Result<usize, RpcError> {
+    let pending = journal.pending_steers("steer");
+    for steer in &pending {
+        journal.consume_steer(steer.seq).await?;
+    }
+    Ok(pending.len())
+}
+
+/// Deliver board messages addressed to this agent since the last delivery.
+async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str) -> Result<(), RpcError> {
+    let since = journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "board")
+        .filter_map(|entry| entry.data.get("board_ts").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    let Ok(list) = env
+        .host
+        .get::<BoardListResult>(memory_methods::BOARD_LIST, json!({"project_id": env.scope.project_id, "since_ms": since + 1, "to": name}))
+        .await
+    else {
+        return Ok(());
+    };
+    for message in list.messages.iter().filter(|message| message.author != name && message.ts_ms > since) {
+        let text = env.data.text("board_message", &[("author", &message.author), ("kind", &message.kind), ("text", &message.text)]);
+        journal
+            .append(
+                kinds::NOTE,
+                json!({"text": text, "purpose": "board", "run_id": env.run_id, "host_message": true, "board_ts": message.ts_ms}),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether the research plugin is active (`frame.plugins.list`): the structural fact behind
+/// offering a lookup as a next step. A failure to ask counts as not available.
+async fn research_available(env: &RunEnv) -> bool {
+    let Ok(listed) = env.host.get::<Value>("frame.plugins.list", json!({})).await else { return false };
+    listed
+        .get("plugins")
+        .and_then(Value::as_array)
+        .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some("research") && plugin.get("state").and_then(Value::as_str) == Some("active")))
+}
+
+enum Exec {
+    Done(Box<ToolOutcome>),
+    Failed(String),
+    Stopped,
+}
+
+/// Bytes of a running command's output journaled live on its `tool_call` entry (`live_output`),
+/// so the person sees it run; the result carries the whole output afterwards.
+const LIVE_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// A running call's output on its way to the journal: chunks are batched (no journal op per byte)
+/// and capped at [`LIVE_OUTPUT_BYTES`].
+struct LiveOutput {
+    seq: Option<u64>,
+    pending: String,
+    sent: usize,
+    flushed: std::time::Instant,
+}
+
+impl LiveOutput {
+    fn new(seq: Option<u64>) -> Self {
+        Self { seq, pending: String::new(), sent: 0, flushed: std::time::Instant::now() }
+    }
+
+    /// Take in one streamed item of the tools plugin (`{"kind": "output", "text": ...}`).
+    fn push(&mut self, item: &Value) {
+        if self.seq.is_none() || self.sent >= LIVE_OUTPUT_BYTES || item.get("kind").and_then(Value::as_str) != Some("output") {
+            return;
+        }
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            let room = LIVE_OUTPUT_BYTES - self.sent;
+            let take: String = text.chars().take(room).collect();
+            self.sent += take.len();
+            self.pending.push_str(&take);
+            if self.sent >= LIVE_OUTPUT_BYTES {
+                self.pending.push_str("\n[… the rest is in the result]\n");
+            }
+        }
+    }
+
+    /// What to journal now: the pending text once it is big or old enough.
+    fn due(&mut self) -> Option<(u64, String)> {
+        let seq = self.seq?;
+        if self.pending.is_empty() || (self.pending.len() < 256 && self.flushed.elapsed() < Duration::from_millis(300)) {
+            return None;
+        }
+        self.flushed = std::time::Instant::now();
+        Some((seq, std::mem::take(&mut self.pending)))
+    }
+}
+
+async fn execute_call(env: &RunEnv, journal: &mut Journal, call_seq: Option<u64>, call: &ToolCall) -> Exec {
+    let params = json!({
+        "context": ExecContext {
+            project_id: env.scope.project_id.clone(),
+            session_id: env.session_id.clone(),
+            workspace: env.scope.workspace.clone(),
+            mode: env.mode.clone(),
+            edit_format: None,
+        },
+        "call": call,
+    });
+    let mut delay = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    loop {
+        let mut stream = match env.host.ctx().call_stream(tools_methods::EXECUTE, params.clone()) {
+            Ok(stream) => stream,
+            Err(error) => return Exec::Failed(env.data.text("call_unsent", &[("error", &error.to_string())])),
+        };
+        let park_grace = async {
+            env.stops.park.cancelled().await;
+            tokio::time::sleep(PARK_GRACE).await;
+        };
+        tokio::pin!(park_grace);
+        // A background agent waiting on a long tool holds no model slot: hibernate its KV.
+        let hibernate_after = env.data.limits.hibernate_after_ms;
+        let hibernate = async {
+            if env.priority != Priority::Agent || hibernate_after == 0 {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(Duration::from_millis(hibernate_after)).await;
+        };
+        tokio::pin!(hibernate);
+        let mut hibernated = false;
+        let mut live = LiveOutput::new(call_seq);
+        let outcome = loop {
+            tokio::select! {
+                _ = &mut hibernate, if !hibernated => {
+                    hibernated = true;
+                    let host = env.host.clone();
+                    let key = env.cache_key();
+                    let session = env.session_id.clone();
+                    tokio::spawn(async move {
+                        match host.call(model_methods::HIBERNATE, json!({"cache_key": key})).await {
+                            Ok(_) => host.ctx().publish(chatflow_topics::HIBERNATED, json!({"session_id": session, "cache_key": key})),
+                            Err(error) => tracing::debug!(%error, "model.hibernate failed"),
+                        }
+                    });
+                }
+                item = stream.next() => {
+                    let Some(item) = item else { break stream.finish().await };
+                    live.push(&item);
+                    if let Some((seq, text)) = live.due() {
+                        let _ = journal.append_text(seq, "live_output", &text).await;
+                    }
+                }
+                _ = env.stops.cancel.cancelled() => {
+                    stream.cancel();
+                    let _ = tokio::time::timeout(Duration::from_millis(300), async { while stream.next().await.is_some() {} }).await;
+                    return Exec::Stopped;
+                }
+                _ = &mut park_grace => {
+                    stream.cancel();
+                    return Exec::Stopped;
+                }
+            }
+        };
+        match outcome {
+            Ok(value) => {
+                return match serde_json::from_value::<ToolOutcome>(value) {
+                    Ok(outcome) => Exec::Done(Box::new(outcome)),
+                    Err(error) => Exec::Failed(env.data.text("call_unreadable", &[("error", &error.to_string())])),
+                };
+            }
+            Err(error) if host::refused(&error) && started.elapsed() < Duration::from_secs(180) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = env.stops.cancel.cancelled() => return Exec::Stopped,
+                }
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+            Err(error) if host::interrupted(&error) => {
+                return Exec::Failed(env.data.text("tools_stopped", &[("error", &error.to_string())]));
+            }
+            Err(error) => return Exec::Failed(env.data.text("call_failed", &[("error", &error.to_string())])),
+        }
+    }
+}
+
+enum Approval {
+    /// Approved and executed.
+    Approved(Box<ToolOutcome>),
+    /// Denied, or the approved call failed: the text the model gets as the result.
+    Answered(String),
+    /// The run was cancelled or parked while waiting (the entry stays for the successor).
+    Stopped,
+}
+
+/// Wait for the user's answer to an ask-mode call (an `approval` entry the UI answers through
+/// `chatflow.approve`), then run the call again with the approved classes.
+async fn await_approval(env: &RunEnv, journal: &mut Journal, call: &ToolCall, outcome: &ToolOutcome, existing: Option<u64>) -> Result<Approval, RpcError> {
+    let classes: Vec<String> = outcome
+        .display
+        .pointer("/approval/classes")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let seq = match existing {
+        Some(seq) => seq,
+        None => {
+            journal
+                .append(
+                    chatflow_kinds::APPROVAL,
+                    json!({"call_id": call.id, "tool": outcome.tool, "args": outcome.args, "classes": classes, "question": outcome.output, "state": "pending", "run_id": env.run_id}),
+                )
+                .await?
+        }
+    };
+    let _ = env.host.session_status(&env.session_id, SessionStatus::Waiting).await;
+    env.set_stage("approval");
+    let entry = loop {
+        let fresh = env.host.journal_read(&env.session_id, seq).await?;
+        let Some(entry) = fresh.into_iter().find(|entry| entry.seq == seq) else {
+            return Err(RpcError::internal("the approval entry vanished"));
+        };
+        if str_field(&entry.data, "state") != "pending" {
+            break entry;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = env.stops.cancel.cancelled() => return Ok(Approval::Stopped),
+            _ = env.stops.park.cancelled() => return Ok(Approval::Stopped),
+        }
+    };
+    let _ = env.host.session_status(&env.session_id, SessionStatus::Running).await;
+    env.set_stage("act");
+    let classes: Vec<String> = entry
+        .data
+        .get("classes")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    if str_field(&entry.data, "state") != "approved" {
+        return Ok(Approval::Answered(env.data.text("approval_denied", &[("classes", &classes.join(", "))])));
+    }
+    env.host.call(tools_methods::APPROVE, json!({"session_id": env.session_id, "classes": classes})).await?;
+    Ok(match execute_call(env, journal, None, call).await {
+        Exec::Done(outcome) => Approval::Approved(outcome),
+        Exec::Failed(message) => Approval::Answered(message),
+        Exec::Stopped => Approval::Stopped,
+    })
+}
+
+/// Finish approvals left open by a stopped predecessor. Returns false when the run stopped while
+/// waiting.
+async fn resolve_pending_approvals(env: &RunEnv, journal: &mut Journal) -> Result<bool, RpcError> {
+    let entries = journal.entries_vec();
+    let answered: HashSet<String> = entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| str_field(&entry.data, "call_id").to_owned()).collect();
+    let open: Vec<JournalEntry> = of_run(&entries, &env.run_id)
+        .filter(|entry| entry.kind == chatflow_kinds::APPROVAL && !answered.contains(str_field(&entry.data, "call_id")))
+        .cloned()
+        .collect();
+    for approval in open {
+        let call_id = str_field(&approval.data, "call_id").to_owned();
+        let Some(call_entry) = entries.iter().find(|entry| entry.kind == kinds::TOOL_CALL && str_field(&entry.data, "call_id") == call_id) else { continue };
+        let call = ToolCall {
+            id: call_id.clone(),
+            name: str_field(&call_entry.data, "raw_name").to_owned(),
+            arguments: str_field(&call_entry.data, "raw_arguments").to_owned(),
+        };
+        let pending: ToolOutcome = serde_json::from_value(json!({
+            "ok": false,
+            "output": str_field(&approval.data, "question"),
+            "display": {"approval": {"classes": approval.data.get("classes").cloned().unwrap_or(json!([]))}},
+            "tool": str_field(&approval.data, "tool"),
+            "args": approval.data.get("args").cloned().unwrap_or(Value::Null),
+            "needs_approval": true,
+            "duration_ms": 0,
+        }))?;
+        match await_approval(env, journal, &call, &pending, Some(approval.seq)).await? {
+            Approval::Stopped => return Ok(false),
+            Approval::Answered(text) => {
+                journal.append(kinds::TOOL_RESULT, json!({"call_id": call_id, "ok": false, "output": text, "duration_ms": 0, "run_id": env.run_id})).await?;
+            }
+            Approval::Approved(outcome) => {
+                let mut data = json!({
+                    "call_id": call_id, "ok": outcome.ok, "output": outcome.output, "display": outcome.display,
+                    "duration_ms": outcome.duration_ms, "changed_files": outcome.changed_files, "run_id": env.run_id,
+                });
+                if let Some(artifact) = &outcome.artifact {
+                    data["artifact"] = json!(artifact);
+                }
+                journal.append(kinds::TOOL_RESULT, data).await?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Verify a task's contract: through `agents.verify` (which records the report and the task's
+/// status), or with the shared contract runner when no agents plugin serves.
+pub async fn verify_task(host: &Host, journal: &mut Journal, task: &Task, workspace: &str, cancel: &CancellationToken) -> Result<VerifyReport, RpcError> {
+    let via_agents = host
+        .call_with(agents_methods::VERIFY, json!({"task_id": task.id, "workspace": workspace}), host::Effect::Idempotent, Some(cancel))
+        .await;
+    match via_agents {
+        Ok(value) => cc_protocol::parse_params(value),
+        Err(error) if error.code == codes::UNAVAILABLE || error.code == codes::UNKNOWN_METHOD => {
+            let (report, _) = contract::verify(host, &task.id, workspace, &task.contract, cancel).await?;
+            journal.append(kinds::VERIFICATION, json!({"task_id": task.id, "report": report})).await?;
+            let undecided_only = !report.ok && report.checks.iter().all(|check| check.ok || check.indeterminate);
+            let status = if report.ok {
+                "done"
+            } else if undecided_only {
+                "indeterminate"
+            } else {
+                "in_progress"
+            };
+            let _ = host.call(memory_methods::TASK_UPDATE, json!({"id": task.id, "status": status})).await;
+            Ok(report)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn report_text(data: &Dataset, report: &VerifyReport) -> String {
+    let mut text = String::new();
+    for check in &report.checks {
+        let spec = report.contract.checks.iter().find(|spec| spec.name == check.name).map(|spec| spec.spec.as_str()).unwrap_or("");
+        let exit = check.exit_code.map(|code| code.to_string()).unwrap_or_else(|| "none".into());
+        if check.ok {
+            text.push_str(&data.text("check_passed", &[("command", spec)]));
+        } else {
+            text.push_str(&data.text("check_failed", &[("command", spec), ("exit", &exit), ("output", check.output_tail.trim_end())]));
+        }
+    }
+    text
+}
+
+/// Finish the run with an outcome.
+fn outcome(outcome: &str, summary: String, turns: u32, tool_calls: u32, changed: &BTreeSet<String>, verified: Option<bool>) -> LoopOutcome {
+    LoopOutcome { outcome: outcome.to_owned(), summary, turns, tool_calls, changed_files: changed.iter().cloned().collect(), verified }
+}
+
+/// Run the loop until the work is done, blocked, stopped, cancelled or parked.
+pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result<LoopOutcome, RpcError> {
+    repair_interrupted(journal, &env.run_id, &env.data).await?;
+    let entries = journal.entries_vec();
+    let mut step = next_step(&entries, &env.run_id);
+    let mut detector = detector_from(&entries, &env.run_id, env.data.limits.repeat_at);
+    // Fix cycles that did not help: the same command still failing after an edit since its last
+    // failure (debugging effectiveness decays within 2-3 attempts; a different approach beats a 4th).
+    // command -> (edited since its last failure, fruitless cycles, that failure's output)
+    let mut failing: HashMap<String, (bool, u32, String)> = HashMap::new();
+    let mut coverage_asked = false;
+    // This task's loop changed a file: its steps are fixes from here on (see the thinking budget).
+    let mut edited = false;
+    let mut fruitless = 0u32;
+    let mut changed = changed_files_of(&entries, &env.run_id);
+    let mut tracker = Tracker::default();
+    let mut effort = spec.effort.clone();
+    // The contract can be revised during the run (a check found broken in itself).
+    let mut task = spec.task.clone();
+    // A failing contract raised the effort earlier in this run.
+    if of_run(&entries, &env.run_id).any(|entry| entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "verify" | "repeat")) {
+        effort = max_effort(&effort, &env.data.effort.escalate);
+    }
+    let mut awaiting_fix = of_run(&entries, &env.run_id)
+        .filter(|entry| matches!(entry.kind.as_str(), kinds::NOTE | kinds::TOOL_CALL))
+        .last()
+        .is_some_and(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "verify");
+    let (stage, live) = match &spec.kind {
+        // With a spec, the closing summary states coverage per open requirement (the self-review).
+        // No per-requirement review in the closing summary (it made the model narrate instead of
+        // verify); the spec keeps tracking requirements for the conversation.
+        // A planned change: the loop is told its step (the plan itself is in the conversation).
+        LoopKind::Foreground => ("DO", spec.step.as_ref().map(|step| step_live(&env.data, step)).unwrap_or_default()),
+        LoopKind::Question => ("ASK", String::new()),
+        LoopKind::Agent { name } => ("TASK", env.data.text("agent_live", &[("name", name)])),
+    };
+    env.set_stage("act");
+    let mut turns = 0u32;
+    let mut tool_calls = 0u32;
+    let any = env.stops.any();
+    // Finding out is a step the correction can name while the research plugin is active.
+    let research = research_available(env).await;
+    // Approvals a predecessor was waiting for when it stopped.
+    if !resolve_pending_approvals(env, journal).await? {
+        return Ok(outcome(if env.stops.park.is_cancelled() { "parked" } else { "cancelled" }, String::new(), turns, tool_calls, &changed, None));
+    }
+    let conversation = |entries: &[JournalEntry]| crate::prewarm::conversation(&env.prefix, &env.data, entries, env.image_input);
+    let prompt = |entries: &[JournalEntry]| {
+        let mut messages = conversation(entries);
+        messages.push(prompts::stage_message(&env.data, &env.prefix.role, stage, &live));
+        messages
+    };
+    // The compacted conversation being prefilled while the step's tools run (crate::fit::prepare).
+    let mut prewarm: Option<crate::fit::Prewarm> = None;
+    loop {
+        if env.stops.park.is_cancelled() {
+            return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
+        }
+        if env.stops.cancel.is_cancelled() {
+            return Ok(outcome("cancelled", "Cancelled.".into(), turns, tool_calls, &changed, None));
+        }
+        journal.sync().await?;
+        if deliver_steers(journal).await? > 0 {
+            detector.reset();
+            awaiting_fix = false;
+        }
+        if let LoopKind::Agent { name } = &spec.kind {
+            deliver_board(journal, env, name).await?;
+        }
+        // A prewarm still running ends here: the call continues from what it prefilled.
+        drop(prewarm.take());
+        // The prompt is counted and compacted until it fits the conversation's context (crate::fit).
+        let messages = match crate::fit::fitted(env, journal, prompt).await {
+            Ok(messages) => messages,
+            Err(error) if error.code == crate::fit::CONTEXT_FULL => {
+                journal.note(&env.run_id, "context", &error.message, false).await?;
+                return Ok(outcome("failed", error.message, turns, tool_calls, &changed, None));
+            }
+            Err(error) => return Err(error),
+        };
+        // The step's own entries start here; what is before it is what the next call shares.
+        let step_start = journal.last_seq() + 1;
+        let mut call = env.call(stage, &effort, messages, None, None, step, true);
+        // A plan task is execution: short thinking, so values come from running code, not from
+        // simulating it in thought (seen: thousands of characters tracing a loop by hand).
+        // Thinking in proportion to the step: the full budget while the task designs and writes
+        // its first change, a short one for every fix after that (the design is already in the
+        // file; re-deriving it each step was most of the generated tokens).
+        if spec.step.is_some() && env.data.limits.task_think_tokens > 0 {
+            let fixing = edited && env.data.limits.fix_think_tokens > 0;
+            call.think_budget = Some(if fixing { env.data.limits.fix_think_tokens } else { env.data.limits.task_think_tokens });
+        }
+        let called = match llm::chat(journal, call, &any).await {
+            Ok(called) => called,
+            Err(error) if error.code == codes::CANCELLED => continue,
+            // The engine could not use the generation (e.g. tool-call arguments that are not JSON):
+            // the model writes it again with the reason; the same failure repeating stops the run.
+            Err(error) if !host::refused(&error) && !host::interrupted(&error) => {
+                step += 1;
+                turns += 1;
+                match detector.observe("model_error", &error.code) {
+                    Verdict::Stop(_) => return Err(error),
+                    Verdict::Replan(_) => {
+                        let what = env.data.text("repeated_text", &[]);
+                        journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &what, research), true).await?;
+                        effort = max_effort(&effort, &env.data.effort.escalate);
+                    }
+                    Verdict::Fine => {}
+                }
+                journal.note(&env.run_id, "model_error", &env.data.text("generation_failed", &[("error", &error.message)]), true).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        step += 1;
+        turns += 1;
+        let result = called.result;
+
+        if result.finish_reason == "repeated" {
+            // The model plugin stopped the generation for repeating itself; its text stands but is
+            // not acted on.
+            if let Verdict::Stop(_) = detector.generation_repeated() {
+                let summary = "The work stopped because the model kept repeating itself after a corrective replan.".to_owned();
+                journal.note(&env.run_id, "repeat", &summary, false).await?;
+                return Ok(outcome("stopped", summary, turns, tool_calls, &changed, None));
+            }
+            journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_text", &[]), research), true).await?;
+            effort = max_effort(&effort, &env.data.effort.escalate);
+            continue;
+        }
+
+        if result.tool_calls.is_empty() {
+            if result.finish_reason == "length" && result.content.trim().is_empty() {
+                if crate::fit::compact_now(env, journal, prompt).await? {
+                    continue;
+                }
+                let summary = "The conversation no longer fits the model's context window.".to_owned();
+                journal.note(&env.run_id, "context", &summary, false).await?;
+                return Ok(outcome("failed", summary, turns, tool_calls, &changed, None));
+            }
+            journal.sync().await?;
+            if !journal.pending_steers("steer").is_empty() {
+                continue;
+            }
+            let summary = result.content.trim().to_owned();
+            // Once per task, before it counts as done: the requirements its check script does not
+            // yet test both ways (a case that meets it, one that breaks it). The model's own check
+            // proves only what it thought of; this names what it did not.
+            if let Some(step) = spec.step.as_ref().filter(|step| !step.requirements.is_empty())
+                && !coverage_asked
+            {
+                coverage_asked = true;
+                if let Some(missing) = coverage_missing(env, journal, step).await {
+                    journal.note(&env.run_id, "coverage", &missing, true).await?;
+                    continue;
+                }
+            }
+            let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
+            };
+            if awaiting_fix {
+                // The checks failed and the model answered without trying a fix: it reports a block.
+                return Ok(outcome("blocked", summary, turns, tool_calls, &changed, Some(false)));
+            }
+            env.set_stage("verify");
+            let mut report = match verify_task(&env.host, journal, task, &env.scope.workspace, &any).await {
+                Ok(report) => report,
+                Err(error) if error.code == codes::CANCELLED => continue,
+                Err(error) => return Err(error),
+            };
+            let fixable = |report: &VerifyReport| report.checks.iter().any(|check| !check.ok && !check.indeterminate);
+            if fixable(&report) {
+                // A check can turn out to be broken in itself only now. The worker may only propose
+                // a revision; the planner accepts or refuses it (the contract is frozen).
+                let proposer = match &spec.kind {
+                    LoopKind::Agent { name } => name.clone(),
+                    _ => format!("session:{}", env.session_id),
+                };
+                let proposal = match crate::checks::propose_after_failure(env, journal, &task.contract, &report).await {
+                    Ok(proposal) => proposal,
+                    Err(error) if error.code == codes::CANCELLED => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Some((proposed, evidence)) = proposal {
+                    let in_force = match crate::checks::submit(env, journal, task, &proposed, &proposer, &evidence, "after").await {
+                        Ok(contract) => contract,
+                        Err(error) if error.code == codes::CANCELLED => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if in_force != task.contract {
+                        task.contract = in_force;
+                        env.set_stage("verify");
+                        report = match verify_task(&env.host, journal, task, &env.scope.workspace, &any).await {
+                            Ok(report) => report,
+                            Err(error) if error.code == codes::CANCELLED => continue,
+                            Err(error) => return Err(error),
+                        };
+                    }
+                }
+            }
+            if !report.ok && !fixable(&report) {
+                // What is left the host cannot decide (manual checks): INDETERMINATE, for a person.
+                let undecided: String = report
+                    .checks
+                    .iter()
+                    .filter(|check| check.indeterminate)
+                    .map(|check| format!("\n- {}", check.output_tail.trim()))
+                    .collect();
+                let note = env.data.text("checks_indeterminate", &[("checks", &undecided)]);
+                journal.note(&env.run_id, "verify", &note, false).await?;
+                return Ok(outcome("blocked", format!("{summary}\n\n{note}").trim().to_owned(), turns, tool_calls, &changed, None));
+            }
+            env.set_stage("act");
+            if report.ok {
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
+            }
+            let failures = report_text(&env.data, &report);
+            match detector.observe("contract", &failures) {
+                Verdict::Stop(_) => {
+                    let summary = format!("The contract kept failing the same way after a corrective replan:{failures}");
+                    journal.note(&env.run_id, "repeat", &summary, false).await?;
+                    return Ok(outcome("stopped", summary, turns, tool_calls, &changed, Some(false)));
+                }
+                Verdict::Replan(_) => {
+                    journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_checks", &[]), research), true).await?;
+                }
+                Verdict::Fine => {}
+            }
+            journal.note(&env.run_id, "verify", &prompts::contract_failure(&env.data, &failures), true).await?;
+            effort = max_effort(&effort, &env.data.effort.escalate);
+            awaiting_fix = true;
+            continue;
+        }
+
+        awaiting_fix = false;
+        // Journal the model's calls as written, then execute them in order.
+        let mut call_seqs = Vec::new();
+        for call in &result.tool_calls {
+            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| Value::String(call.arguments.clone()));
+            let seq = journal
+                .append(
+                    kinds::TOOL_CALL,
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "intent": args.get("i").or_else(|| args.get("intent")).and_then(Value::as_str).unwrap_or(""),
+                        "args": args,
+                        "raw_name": call.name,
+                        "raw_arguments": call.arguments,
+                        "run_id": env.run_id,
+                        "step": step - 1,
+                    }),
+                )
+                .await?;
+            call_seqs.push(seq);
+        }
+        // The tools take a while: compact now if the conversation is getting long, and let the
+        // model re-read it meanwhile.
+        prewarm = crate::fit::prepare(env, journal, step_start, env.data.limits.compact_early_percent, conversation).await;
+        let mut verdicts = Vec::new();
+        let mut stopped = false;
+        for (index, call) in result.tool_calls.iter().enumerate() {
+            if index > 0 {
+                journal.sync().await?;
+            }
+            let steer_waiting = index > 0 && !journal.pending_steers("steer").is_empty();
+            if stopped || steer_waiting || env.stops.park.is_cancelled() || env.stops.cancel.is_cancelled() {
+                let why = if steer_waiting { env.data.text("skipped_steer", &[]) } else { env.data.text("skipped_stopped", &[]) };
+                journal
+                    .append(kinds::TOOL_RESULT, json!({"call_id": call.id, "ok": false, "output": why, "duration_ms": 0, "run_id": env.run_id, "skipped": true}))
+                    .await?;
+                continue;
+            }
+            match execute_call(env, journal, Some(call_seqs[index]), call).await {
+                Exec::Stopped => {
+                    stopped = true;
+                    let output = if env.stops.park.is_cancelled() { env.data.text("interrupted", &[]) } else { env.data.text("cancelled_running", &[]) };
+                    journal
+                        .append(kinds::TOOL_RESULT, json!({"call_id": call.id, "ok": false, "output": output, "duration_ms": 0, "run_id": env.run_id, "interrupted_call": true}))
+                        .await?;
+                }
+                Exec::Failed(message) => {
+                    tool_calls += 1;
+                    journal
+                        .append(kinds::TOOL_RESULT, json!({"call_id": call.id, "ok": false, "output": message, "duration_ms": 0, "run_id": env.run_id}))
+                        .await?;
+                    let signature = Detector::signature(&call.name, &serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null));
+                    verdicts.push(detector.observe(&signature, &message));
+                }
+                Exec::Done(mut outcome) => {
+                    if outcome.needs_approval && env.mode == "ask" {
+                        match await_approval(env, journal, call, &outcome, None).await? {
+                            Approval::Approved(approved) => outcome = approved,
+                            Approval::Answered(text) => {
+                                tool_calls += 1;
+                                journal
+                                    .append(kinds::TOOL_RESULT, json!({"call_id": call.id, "ok": false, "output": text, "duration_ms": 0, "run_id": env.run_id}))
+                                    .await?;
+                                continue;
+                            }
+                            Approval::Stopped => {
+                                stopped = true;
+                                continue;
+                            }
+                        }
+                    }
+                    tool_calls += 1;
+                    let seq = call_seqs[index];
+                    // Record the repaired, normalized form of the call for the transcript.
+                    journal.set(seq, "tool", json!(outcome.tool)).await?;
+                    journal.set(seq, "args", outcome.args.clone()).await?;
+                    if !outcome.intent.is_empty() {
+                        journal.set(seq, "intent", json!(outcome.intent)).await?;
+                    }
+                    let mut data = json!({
+                        "call_id": call.id,
+                        "ok": outcome.ok,
+                        "output": outcome.output,
+                        "display": outcome.display,
+                        "duration_ms": outcome.duration_ms,
+                        "changed_files": outcome.changed_files,
+                        "run_id": env.run_id,
+                    });
+                    if let Some(artifact) = &outcome.artifact {
+                        data["artifact"] = json!(artifact);
+                    }
+                    if let Some(kind) = &outcome.error_kind {
+                        data["error_kind"] = json!(kind);
+                    }
+                    if outcome.needs_approval {
+                        data["needs_approval"] = json!(true);
+                    }
+                    journal.append(kinds::TOOL_RESULT, data).await?;
+                    if outcome.tool == "read"
+                        && outcome.ok
+                        && let Some(path) = outcome.args.get("path").or_else(|| outcome.args.get("target")).and_then(Value::as_str)
+                        && !path.contains("://")
+                    {
+                        tracker.remember(&env.host, &env.scope, path).await;
+                    }
+                    if !outcome.changed_files.is_empty() {
+                        edited = true;
+                        changed.extend(outcome.changed_files.iter().cloned());
+                        if let Some(text) = tracker.after_edit(&env.host, &env.scope, &outcome.changed_files, &env.data).await {
+                            journal.note(&env.run_id, "impact", &text, true).await?;
+                        }
+                    }
+                    if !outcome.changed_files.is_empty() {
+                        for (edited, _, _) in failing.values_mut() {
+                            *edited = true;
+                        }
+                    }
+                    if outcome.tool == "run"
+                        && let Some(command) = outcome.args.get("command").and_then(Value::as_str)
+                    {
+                        let exit = outcome.display.get("exit_code").and_then(Value::as_i64);
+                        match exit {
+                            Some(0) => {
+                                failing.remove(command);
+                            }
+                            Some(_) => {
+                                // Fruitless only when an edit left the very same failure: a fix that
+                                // changed what fails is progress (fewer or other failing cases).
+                                let entry = failing.entry(command.to_owned()).or_insert((false, 0, String::new()));
+                                if entry.0 {
+                                    if entry.2 == outcome.output {
+                                        entry.1 += 1;
+                                        fruitless = fruitless.max(entry.1);
+                                    } else {
+                                        entry.1 = 0;
+                                    }
+                                }
+                                entry.0 = false;
+                                entry.2 = outcome.output.clone();
+                            }
+                            None => {}
+                        }
+                    }
+                    verdicts.push(detector.observe(&Detector::signature(&outcome.tool, &outcome.args), &outcome.output));
+                    if !outcome.changed_files.is_empty() {
+                        detector.changed();
+                    }
+                }
+            }
+        }
+        if stopped {
+            continue;
+        }
+        if verdicts.iter().any(|verdict| matches!(verdict, Verdict::Stop(_))) {
+            let what = verdicts.iter().find_map(|verdict| if let Verdict::Stop(what) = verdict { Some(what.clone()) } else { None }).unwrap_or_default();
+            let summary = format!("The work stopped: the agent kept repeating {what} with the same result after a corrective replan.");
+            journal.note(&env.run_id, "repeat", &summary, false).await?;
+            return Ok(outcome("stopped", summary, turns, tool_calls, &changed, None));
+        }
+        if let Some(Verdict::Replan(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Replan(_))) {
+            journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, what, research), true).await?;
+            effort = max_effort(&effort, &env.data.effort.escalate);
+        }
+        // A plan task that used its calls without finishing is stuck: it ends here and the flow
+        // writes the tasks still to do again with another approach, from where the model says it is.
+        let cycles = env.data.limits.fix_cycles;
+        if spec.step.is_some() && ((env.data.limits.task_calls > 0 && tool_calls >= env.data.limits.task_calls) || (cycles > 0 && fruitless >= cycles)) {
+            let last_words = journal
+                .entries()
+                .filter(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && entry.data.get("run_id").and_then(Value::as_str) == Some(env.run_id.as_str()))
+                .filter_map(|entry| entry.data.get("text").and_then(Value::as_str).map(str::to_owned))
+                .last()
+                .unwrap_or_default();
+            // Said as what stopped it: the fix cycles that did not help, else the calls it used.
+            let key = if cycles > 0 && fruitless >= cycles { "task_stuck_fixes" } else { "task_stuck" };
+            let summary = env.data.text(key, &[("calls", &tool_calls.to_string()), ("fixes", &fruitless.to_string()), ("last", last_words.trim())]);
+            journal.note(&env.run_id, "task_stuck", &summary, false).await?;
+            return Ok(outcome("stuck", summary, turns, tool_calls, &changed, None));
+        }
+    }
+}

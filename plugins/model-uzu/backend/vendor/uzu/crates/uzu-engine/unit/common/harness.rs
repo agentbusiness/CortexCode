@@ -1,0 +1,54 @@
+use libtest_mimic::{Arguments, Trial};
+
+pub enum UzuTest {
+    Bench(&'static dyn Fn()),
+    Test(&'static UzuTestCase),
+}
+
+pub struct UzuTestCase {
+    pub name: &'static str,
+    pub ignore: bool,
+    pub run: fn(),
+}
+
+#[cfg(target_os = "ios")]
+fn ios_set_current_dir() {
+    use objc2_foundation::{NSSearchPathDirectory, NSSearchPathDomainMask, NSSearchPathForDirectoriesInDomains};
+
+    let paths = NSSearchPathForDirectoriesInDomains(NSSearchPathDirectory(9), NSSearchPathDomainMask(1), true);
+    if let Some(docs) = paths.firstObject() {
+        let _ = std::env::set_current_dir(docs.to_string());
+    }
+}
+
+pub fn uzu_harness(tests: &[&UzuTest]) {
+    let args = std::env::args().collect::<Vec<String>>();
+    let benchmarks = args.contains(&"--bench".to_string());
+    if benchmarks {
+        #[cfg(target_os = "ios")]
+        ios_set_current_dir();
+        let bench_tests: Vec<&dyn Fn()> = tests
+            .iter()
+            .filter_map(|test| match test {
+                UzuTest::Bench(test) => Some(*test),
+                UzuTest::Test(_) => None,
+            })
+            .collect::<Vec<_>>();
+        criterion::runner(bench_tests.as_slice());
+    } else {
+        let trials: Vec<Trial> = tests
+            .iter()
+            .filter_map(|test| match **test {
+                UzuTest::Bench(_) => None,
+                UzuTest::Test(case) => Some(
+                    Trial::test(case.name, move || {
+                        (case.run)();
+                        Ok(())
+                    })
+                    .with_ignored_flag(case.ignore),
+                ),
+            })
+            .collect();
+        libtest_mimic::run(&Arguments::from_args(), trials).exit();
+    }
+}

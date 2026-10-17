@@ -1,0 +1,17 @@
+mod activation_test;
+mod activation_transform_test;
+mod attention;
+mod embedding;
+mod gated_act_mul_test;
+mod gdn;
+mod logit_transform_test;
+mod matmul;
+mod normalization_test;
+mod pooling;
+mod radix_top_k_small_test;
+mod separable_causal_conv_test;
+mod short_conv;
+mod tensor_add_bias_test;
+mod tensor_add_scale_test;
+mod trellis_test;
+mod weaver;

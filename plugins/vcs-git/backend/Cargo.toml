@@ -1,0 +1,42 @@
+[package]
+name = "cc-vcs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode vcs@1 plugin: git status/diff/stage/commit/merge, shadow-repository checkpoints, on-demand GitHub (gh) access, the GitHub connection and clones."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_vcs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-vcs"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+notify = "8.2"
+sha2 = "0.10"
+uuid = { version = "1.23", features = ["v4"] }
+libc = "0.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# GitHub: its REST API over rustls (the same client as the research plugin), the token in the macOS
+# Keychain, and clones through libgit2 (no git program; https through macOS's Secure Transport).
+# libgit2-sys declares openssl-sys for every unix target although macOS never calls it:
+# `vendored-openssl` keeps the build free of a system OpenSSL, and none of it is linked.
+reqwest = { version = "0.13.5", features = ["form", "json"] }
+security-framework = "3.7"
+git2 = { version = "0.21", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.27"

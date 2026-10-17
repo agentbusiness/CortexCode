@@ -1,0 +1,8 @@
+{
+ "id": "t-x",
+ "suite": "terminalbench",
+ "lang": "terminal",
+ "group": "build",
+ "prompt": "do t-x",
+ "agent_timeout_sec": 900
+}

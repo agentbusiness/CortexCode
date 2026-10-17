@@ -1,0 +1,7 @@
+/* settings.storage@1 — the home as a settings .row, the parts as a .tbl (both from the theme). */
+#cc .cx-storage{max-width:none;width:100%;}
+#cc .cx-storage td{vertical-align:top;}
+#cc .cx-storage td:nth-child(2){white-space:nowrap;text-align:right;}
+#cc .cx-storage td:last-child{text-align:right;}
+#cc .cx-storage-note{display:block;margin-top:4px;color:var(--ink-3);}
+#cc .cx-storage-total td{color:var(--ink);font-weight:500;}

@@ -1,0 +1,22 @@
+#include <metal_stdlib>
+#include "../common/dsl.h"
+
+// Mean pooling: Average across sequence [batch, seq_len, hidden_dim] → [batch,
+// hidden_dim]
+template <typename T>
+VARIANTS(T, float, half, bfloat)
+PUBLIC KERNEL(PoolingMean) (
+    const device T* input,
+    device T* output,
+    constant uint& seq_len,
+    constant uint& hidden_dim,
+    constant uint& batch_size,
+    uint dim_idx AXIS(hidden_dim, 16),
+    uint batch_idx AXIS(batch_size, 16)
+) {
+  float sum = 0.0f;
+  for (uint seq_idx = 0; seq_idx < seq_len; seq_idx++) {
+    sum += float(input[batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + dim_idx]);
+  }
+  output[batch_idx * hidden_dim + dim_idx] = T(sum / float(seq_len));
+}

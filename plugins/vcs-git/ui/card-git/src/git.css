@@ -1,0 +1,13 @@
+/* card.git@1 */
+#cc .cx-git-menu{flex:0 0 auto;}
+#cc .cx-git-panel{padding:4px 0 6px;}
+#cc .cx-git-acts{display:flex;align-items:center;gap:6px;padding-top:4px;}
+#cc .cx-git-acts .grow,#cc .cx-git-ask .grow{flex:1;}
+#cc .cx-git-ask{display:flex;align-items:center;gap:8px;min-width:0;}
+#cc .cx-git-ask .t{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-reading);font-size:13px;color:var(--ink-2);}
+#cc .cx-git-row{display:flex;gap:8px;align-items:center;}
+#cc .cx-git-field{flex:1;}
+#cc .cx-git-checkpoints{list-style:none;margin:0;padding:0;max-height:120px;overflow:auto;}
+#cc .cx-git-pr a{color:var(--rubric);text-decoration:none;}
+#cc .cx-cs-row > button.cx-cs-row{flex:1;width:auto;min-width:0;margin:0 0 0 -4px;}
+#cc .cx-git-branch{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);}

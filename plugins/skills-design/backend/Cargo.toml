@@ -1,0 +1,21 @@
+[package]
+name = "cc-skills-design"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode skills@1 plugin: frontend design skills for the model."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[[bin]]
+name = "cc-skills-design"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+
+[dev-dependencies]
+serde_json = "1.0.149"

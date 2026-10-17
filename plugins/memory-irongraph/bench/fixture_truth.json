@@ -1,0 +1,44 @@
+{
+  "project": {
+    "described": 0,
+    "edges": 290,
+    "embedding": "pending",
+    "error": null,
+    "external_symbols": 2,
+    "externals": "ready",
+    "files": 21,
+    "languages": [
+      "cargo.toml",
+      "javascript",
+      "package.json",
+      "pyproject.toml",
+      "python",
+      "rust",
+      "shell",
+      "tsx",
+      "typescript"
+    ],
+    "last_index_ms": 5,
+    "project_id": "fixture",
+    "root": "/private/var/folders/yq/7r3s1f3j3yl4yqcyb6rwvw_h0000gn/T/cc-memory-fixture-CgYqoW",
+    "state": "ready",
+    "symbols": 75
+  },
+  "symbols": 51,
+  "params": 8,
+  "props": 5,
+  "call_sites": 41,
+  "edges": 21,
+  "path": [
+    "js:web/src/App.tsx#App",
+    "js:web/src/components/UserCard.tsx#UserCard",
+    "js:web/src/hooks/useUser.ts#useUser",
+    "js:web/src/api.ts#fetchUser",
+    "py:server/app.py#route:GET /api/users/{user_id}",
+    "py:server/app.py#get_user",
+    "py:server/store.py#load_user"
+  ],
+  "checks": 364,
+  "total_ms": 3176,
+  "finished": "2026-10-15T03:50:14.447Z"
+}

@@ -1,0 +1,4 @@
+# The TypeScript guide is loaded into every session of a TypeScript or JavaScript project (never a
+# choice).
+[typescript]
+always = true

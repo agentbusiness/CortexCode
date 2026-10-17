@@ -1,0 +1,15 @@
+{
+  "name": "@cortex-plugin/plugin-manager-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The plugin-manager plugin's UI packages (one npm workspace; each package builds its own dist/ with manifest.json).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "workspaces": [
+    "band-status",
+    "settings-plugins"
+  ]
+}

@@ -1,0 +1,17 @@
+/* pane.markdown@1 — a document, set at the design's reading measure. */
+#cc .cx-md{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-md>.bar{padding-left:16px;}
+#cc .cx-md-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-md-scroll{flex:1;min-height:0;overflow:auto;padding:24px 20px 40px 16px;}
+#cc .cx-md-doc{font-size:16.5px;line-height:1.62;}
+#cc .cx-md-doc h1{font-size:28px;line-height:1.16;font-weight:400;letter-spacing:-.014em;margin:0 0 .6em;}
+#cc .cx-md-doc h2{font-size:21px;font-weight:500;letter-spacing:-.008em;margin:1.4em 0 .5em;}
+#cc .cx-md-doc h3{font-size:17.5px;font-weight:600;margin:1.2em 0 .4em;}
+#cc .cx-md-doc p{margin:0 0 1em;}
+#cc .cx-md-doc ul,#cc .cx-md-doc ol{padding-left:1.4em;margin:0 0 1em;}
+#cc .cx-md-doc code{font-family:var(--font-mono);font-size:.84em;border-bottom:1px solid var(--rule-2);}
+#cc .cx-md-doc pre code{border:0;}
+#cc .cx-md-doc a{color:var(--rubric);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px;}
+#cc .cx-md-doc blockquote{margin:0 0 1em;padding-left:12px;border-left:1px solid var(--rubric);color:var(--ink-2);font-style:italic;}
+#cc .cx-md-doc hr{border:0;border-top:1px solid var(--rule-2);margin:1.6em 0;}
+#cc .cx-md .lst button{padding-left:0;}

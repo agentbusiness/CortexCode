@@ -1,0 +1,3 @@
+# Third-party code kept in the repository. The repository map (memory plugin) leaves out files
+# marked linguist-vendored or linguist-generated; the code graph still indexes them.
+plugins/model-uzu/backend/vendor/** linguist-vendored

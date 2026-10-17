@@ -1,0 +1,100 @@
+{
+  "type": "object",
+  "properties": {
+    "analysis": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "approach": {
+      "type": "string"
+    },
+    "architecture": {
+      "type": "string"
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "brief": {
+            "type": "string"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@tasks"
+              ]
+            }
+          },
+          "touches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@verifiers"
+              ]
+            },
+            "maxItems": 4
+          },
+          "covers": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@requirements"
+              ]
+            }
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@catalog"
+              ]
+            },
+            "maxItems": 3
+          }
+        },
+        "required": [
+          "title",
+          "brief",
+          "depends_on",
+          "touches",
+          "checks",
+          "covers",
+          "skills"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "note": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "analysis",
+    "goal",
+    "approach",
+    "architecture",
+    "risks",
+    "tasks",
+    "note"
+  ],
+  "additionalProperties": false
+}

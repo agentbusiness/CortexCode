@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "properties": {
+    "add": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "drop": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@requirements"
+        ]
+      }
+    },
+    "modify": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "enum": [
+              "@requirements"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "add",
+    "drop",
+    "modify"
+  ],
+  "additionalProperties": false
+}

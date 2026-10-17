@@ -1,0 +1,144 @@
+use derive_more::Debug;
+use thiserror::Error;
+
+use crate::{
+    backends::common::{
+        Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding,
+        kernel::{Kernels, NormalizationKernel},
+    },
+    config::normalization::{NormalizationConfig, UpcastMode},
+    data_type::DataType,
+    safetensors::{ParameterLoaderError, ParameterTree},
+    utils::size_for_shape::size_for_shape,
+};
+
+// TODO: clean up
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PostLayerScalar {
+    None,
+    ScaleResidualSum(f32),
+    ScaleOutput(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutMode {
+    None,
+    Copy,
+    Add,
+}
+
+#[derive(Debug, Error)]
+pub enum NormalizationNewError<B: Backend> {
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("Parameter loading error: {0}")]
+    Parameter(#[from] ParameterLoaderError<B>),
+}
+
+pub struct Normalization<B: Backend> {
+    epsilon: f32,
+    scale_offset: Option<f32>,
+    scales: Option<B::GlobalBuffer>,
+    biases: Option<B::GlobalBuffer>,
+    element_count: u32,
+    hadamard_factors: Option<B::GlobalBuffer>,
+    post_layer_scalar_value: f32,
+    data_type: DataType,
+    kernel: <B::Kernels as Kernels>::NormalizationKernel,
+}
+
+impl<B: Backend> Normalization<B> {
+    pub fn new(
+        element_count: u32,
+        data_type: DataType,
+        hadamard_factors: Option<B::GlobalBuffer>,
+        shortcut_mode: ShortcutMode,
+        post_layer_scalar: PostLayerScalar,
+        config: &NormalizationConfig,
+        parameter_tree: &ParameterTree<B>,
+        context: &B::Context,
+    ) -> Result<Self, NormalizationNewError<B>> {
+        let (copy_to_shortcut, residual_add) = match shortcut_mode {
+            ShortcutMode::None => (false, false),
+            ShortcutMode::Copy => (true, false),
+            ShortcutMode::Add => (true, true),
+        };
+
+        let scales = config
+            .has_scale
+            .then(|| parameter_tree.read_buffer("scales", &[element_count], DataType::F32))
+            .transpose()?;
+        let biases = config
+            .has_biases
+            .then(|| parameter_tree.read_buffer("biases", &[element_count], DataType::F32))
+            .transpose()?;
+
+        let (scale_residual_sum, scale_output, post_layer_scalar_value) = match post_layer_scalar {
+            PostLayerScalar::None => (false, false, 1.0),
+            PostLayerScalar::ScaleResidualSum(value) => (true, false, value),
+            PostLayerScalar::ScaleOutput(value) => (false, true, value),
+        };
+
+        let kernel = <B::Kernels as Kernels>::NormalizationKernel::new(
+            context,
+            data_type,
+            DataType::F32,
+            data_type,
+            DataType::F32,
+            false,
+            config.subtract_mean,
+            config.upcast_mode == UpcastMode::FullLayer,
+            copy_to_shortcut,
+            residual_add,
+            hadamard_factors.is_some(),
+            scale_residual_sum,
+            scale_output,
+            biases.is_some(),
+            scales.is_some(),
+        )
+        .map_err(NormalizationNewError::Backend)?;
+
+        Ok(Self {
+            epsilon: config.epsilon,
+            scale_offset: config.scale_offset,
+            scales,
+            biases,
+            element_count,
+            hadamard_factors,
+            post_layer_scalar_value,
+            data_type,
+            kernel,
+        })
+    }
+
+    pub fn encode(
+        &self,
+        input: impl BufferRef<Backend = B>,
+        row_offset: u32,
+        row_count: u32,
+        shortcut: Option<impl BufferMut<Backend = B>>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, B::Error> {
+        let row_size = size_for_shape(&[self.element_count], self.data_type);
+        let row_offset_bytes = row_offset as usize * row_size;
+        let shortcut = shortcut.map(|shortcut| shortcut.subrange_mut(row_offset_bytes..));
+        let mut output = command_buffer.allocate_scratch_for_shape(&[row_count, self.element_count], self.data_type)?;
+        self.kernel.encode(
+            Some(input.subrange(row_offset_bytes..)),
+            self.scales.as_ref(),
+            self.biases.as_ref(),
+            &mut output,
+            shortcut,
+            self.hadamard_factors.as_ref(),
+            row_count,
+            self.element_count,
+            self.epsilon,
+            self.scale_offset.unwrap_or(0.0),
+            self.post_layer_scalar_value,
+            command_buffer,
+        );
+
+        Ok(output)
+    }
+}

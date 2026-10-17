@@ -1,0 +1,4 @@
+# Diagnostic codes the Python guide covers, as basedpyright emits them (the diagnostic `code`; the
+# rule in parentheses in `basedpyright` output). The guide is always loaded, so the tools only point
+# to it when one of these shows up; the model never reads this file.
+python = ["reportMissingImports", "reportAttributeAccessIssue", "reportOptionalMemberAccess", "reportCallIssue"]

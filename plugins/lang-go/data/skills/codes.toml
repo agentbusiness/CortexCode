@@ -1,0 +1,4 @@
+# Diagnostic codes the Go guide covers, as gopls emits them (the type checker's error code name as the
+# diagnostic `code`). `go build` prints no codes. The guide is always loaded, so the tools only point
+# to it when one of these shows up; the model never reads this file.
+go = ["UnusedVar", "UnusedImport", "UndeclaredName", "UndeclaredImportedName", "DuplicateDecl", "IncompatibleAssign", "InvalidIfaceAssign", "UnsupportedFeature", "MissingFieldOrMethod", "MismatchedTypes", "WrongArgCount", "WrongAssignCount", "WrongResultCount", "MissingReturn", "NoNewVar", "BrokenImport"]

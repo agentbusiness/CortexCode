@@ -1,0 +1,13 @@
+# Diagnostic codes the C/C++ guide covers, as clangd emits them (the diagnostic `code`: clang's
+# diagnostic name for errors, the `-W` flag for warnings) and as clang and gcc print warnings
+# (`[-Wsign-compare]`; gcc's own flag names where they differ). no-compile-commands is this plugin's
+# own warning. The guide is always loaded, so the tools only point to it when one of these shows up;
+# the model never reads this file.
+cpp = [
+  "unknown_typename", "unknown_typename_suggest", "undeclared_var_use", "undeclared_var_use_suggest",
+  "no_member_template", "no_member_template_suggest", "pp_file_not_found", "no-compile-commands",
+  "member_function_call_bad_cvr", "member_decl_does_not_match", "ovl_no_viable_function_in_call",
+  "ovl_no_viable_member_function_in_call", "typecheck_call_too_few_args", "typecheck_call_too_many_args",
+  "typecheck_invalid_operands", "-Wimplicit-function-declaration", "-Wsign-compare", "-Wuninitialized",
+  "-Wmaybe-uninitialized", "-Wsometimes-uninitialized", "-Wreturn-type", "-Wreturn-stack-address",
+]

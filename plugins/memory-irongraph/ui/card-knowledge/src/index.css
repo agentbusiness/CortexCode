@@ -1,0 +1,14 @@
+/* card.knowledge@1 */
+#cc .cx-kn-tabs{display:flex;gap:4px;flex-wrap:wrap;margin:0 0 6px;}
+#cc .cx-kn-tabs button{font:inherit;font-size:11.5px;padding:1px 6px;border:1px solid var(--rule);background:transparent;color:var(--ink);cursor:pointer;}
+#cc .cx-kn-tabs button[aria-pressed="true"]{color:var(--rubric);border-color:var(--rubric);}
+#cc .cx-kn-list{list-style:none;margin:0;padding:0;display:grid;gap:6px;}
+#cc .cx-kn-item{display:grid;gap:2px;padding:6px 8px;border:1px solid var(--rule);}
+#cc .cx-kn-item[data-live="false"]{opacity:.6;}
+#cc .cx-kn-head{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;}
+#cc .cx-kn-name{color:var(--ink);font-weight:600;}
+#cc .cx-kn-text{color:var(--ink);margin:0;}
+#cc .cx-kn-meta{font-size:11.5px;}
+#cc .cx-kn-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;}
+#cc .cx-kn-add{display:grid;gap:4px;margin-top:8px;padding:6px 8px;border:1px dashed var(--rule);}
+#cc .cx-kn-add input,#cc .cx-kn-add textarea,#cc .cx-kn-add select{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--rule);padding:3px 6px;}

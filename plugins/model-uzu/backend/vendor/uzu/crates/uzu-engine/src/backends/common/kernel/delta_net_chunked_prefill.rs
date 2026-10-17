@@ -1,0 +1,69 @@
+#[cfg(backend = "cpu")]
+use crate::backends::common::kernel::Unsupported;
+use crate::{
+    backends::common::{Backend, CommandBuffer, Kernels},
+    data_type::DataType,
+};
+
+pub struct DeltaNetChunkedPrefillArgs<'a, B: Backend> {
+    pub in_projected: &'a B::ScratchBuffer,
+    pub a_log: &'a B::GlobalBuffer,
+    pub dt_bias: &'a B::GlobalBuffer,
+    pub ssm_state: &'a mut B::GlobalBuffer,
+    pub delta_output: &'a mut B::ScratchBuffer,
+    pub num_heads: u32,
+    pub num_groups: u32,
+    pub value_head_dim: u32,
+    pub key_dim: u32,
+    pub value_dim: u32,
+    pub suffix_len: u32,
+}
+
+pub trait DeltaNetChunkedPrefill: Sized + Send + Sync {
+    type Backend: Backend<Kernels: Kernels<DeltaNetChunkedPrefill = Self>>;
+
+    fn new(
+        context: &<Self::Backend as Backend>::Context,
+        outer_data_type: DataType,
+        head_dim: u32,
+    ) -> Result<Option<Self>, <Self::Backend as Backend>::Error>;
+
+    fn should_use(
+        &self,
+        suffix_len: u32,
+    ) -> bool;
+
+    fn encode(
+        &self,
+        args: DeltaNetChunkedPrefillArgs<'_, Self::Backend>,
+        command_buffer: &mut <<Self::Backend as Backend>::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), <Self::Backend as Backend>::Error>;
+}
+
+#[cfg(backend = "cpu")]
+impl<B: Backend<Kernels: Kernels<DeltaNetChunkedPrefill = Unsupported<B>>>> DeltaNetChunkedPrefill for Unsupported<B> {
+    type Backend = B;
+
+    fn new(
+        _context: &B::Context,
+        _outer_data_type: DataType,
+        _head_dim: u32,
+    ) -> Result<Option<Self>, B::Error> {
+        Ok(None)
+    }
+
+    fn should_use(
+        &self,
+        _suffix_len: u32,
+    ) -> bool {
+        match self.never {}
+    }
+
+    fn encode(
+        &self,
+        _args: DeltaNetChunkedPrefillArgs<'_, B>,
+        _command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), B::Error> {
+        match self.never {}
+    }
+}

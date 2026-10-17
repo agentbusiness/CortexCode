@@ -1,0 +1,63 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages, shell modules, verification and README together, separable into its own repository
+# (only cc-protocol and @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it
+# into a portable .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "agents"
+name = "Agents"
+version = "0.1.0"
+description = "Delegation of a goal into a task tree with contracts, named agents in copy-on-write workspaces, the scheduler, contract verification, the project board and the merge steward; the board pane and the agents, tasks and board card sections."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "agents"
+contract = "agents@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-agents"
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+test = ["npm", "test"]
+
+[[ui.package]]
+dir = "ui/board"
+id = "agents.board"
+slot = "pane.board@1"
+
+[[ui.package]]
+dir = "ui/card-agents"
+id = "agents.card-agents"
+slot = "card.agents@1"
+
+[[ui.package]]
+dir = "ui/card-board"
+id = "agents.card-board"
+slot = "card.board@1"
+
+[[ui.package]]
+dir = "ui/card-tasks"
+id = "agents.card-tasks"
+slot = "card.tasks@1"
+
+[[ui.package]]
+dir = "ui/settings-agents"
+id = "agents.settings-agents"
+slot = "settings.agents@1"
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/agents"

@@ -1,0 +1,105 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <id>https://arxiv.org/api/ZW8C5dnz3KdMh9XFEeQK4DyEDaU</id>
+  <title>arXiv Query: search_query=all:"speculative decoding"&amp;id_list=&amp;start=0&amp;max_results=3</title>
+  <updated>2026-10-15T13:24:46Z</updated>
+  <link href="https://arxiv.org/api/query?search_query=all:%22speculative+decoding%22&amp;start=0&amp;max_results=3&amp;id_list=" type="application/atom+xml"/>
+  <opensearch:itemsPerPage>3</opensearch:itemsPerPage>
+  <opensearch:totalResults>797</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2610.20503v1</id>
+    <title>ReaDy: Recurrent States as Dynamic Context for Speculative Drafting in Hybrid Linear Attention Large Language Models</title>
+    <updated>2026-10-14T17:08:52Z</updated>
+    <link href="https://arxiv.org/abs/2610.20503v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2610.20503v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Speculative decoding accelerates autoregressive generation by drafting multiple tokens per step, yet feature-based drafters rely on target hidden features whose contextual emphasis may not align with the needs of subsequent draft positions. Hybrid linear attention (HLA) models maintain compact recurrent states that accumulate historical associations, offering an efficient source of complementary context for speculative drafting. We introduce ReaDy, the first speculative decoding method, to the best of our knowledge, to leverage HLA recurrent states for position-specific context retrieval during drafting. ReaDy equips each draft position with a learned query to retrieve supplementary context directly from the target's committed recurrent states. A lightweight state reader integrates this context into draft representations through residual updates, while low-rank state reads and fused operators keep additional computation and I/O overhead low. Building on DSpark's parallel backbone and sequential prediction head, ReaDy employs a lightweight two-stage adaptation strategy, with reader capacity, state sources, and residual placement examined through ablation studies. Across seven benchmarks spanning mathematics, code generation, and dialogue, ReaDy achieves an average $3.16\times$ decoding speedup over autoregressive decoding with Qwen3.8-27B on a single NVIDIA B200 GPU. It outperforms DSpark on every benchmark, improving throughput by 7.97% and acceptance length by 8.50% on average. Our code is available at https://github.com/StartLuxLabs/ReaDy.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-10-14T17:08:52Z</published>
+    <arxiv:comment>13 pages, 6 figures, 8 tables</arxiv:comment>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Bohan Sun</name>
+    </author>
+    <author>
+      <name>Zunhai Su</name>
+    </author>
+    <author>
+      <name>Xialie Zhuang</name>
+    </author>
+    <author>
+      <name>Jianjin Li</name>
+    </author>
+    <author>
+      <name>Ngai Wong</name>
+    </author>
+    <author>
+      <name>Chuan-Wei Kuo</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.20392v1</id>
+    <title>FOLD: Position-Free Far Memory with Local Order for Long-Context Speculative Decoding</title>
+    <updated>2026-10-14T15:55:10Z</updated>
+    <link href="https://arxiv.org/abs/2610.20392v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2610.20392v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Speculative decoding accelerates LLM generation through lightweight drafting and parallel verification. It is particularly promising for long inputs, where KV-cache access costs can be amortized over multiple accepted tokens. Yet most drafters are trained on short sequences and degrade on long inputs, while long-context training is costly. Existing training-free approaches restrict the context window, rescale positions, or augment recent context with retrieved distant entries. Drafters, however, read target hidden states that already encode contextual and positional information, and their lightweight architecture makes full-history attention affordable. We propose FOLD, a training-free method that preserves exact local positions and treats all distant entries as far memory at a shared position. To counter attention dilution as the memory grows, we sharpen attention within it to emphasize relevant entries while separately controlling its total weight relative to the local window. Across six target-drafter pairs and diverse benchmarks of up to 256K tokens, FOLD predominantly delivers the highest speedup, with the best case more than doubling the speedup over autoregressive decoding, from 2.08$\times$ to 4.22$\times$.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-10-14T15:55:10Z</published>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Shuxuan Li</name>
+    </author>
+    <author>
+      <name>Jialiang Kang</name>
+    </author>
+    <author>
+      <name>Yanghao Zhou</name>
+    </author>
+    <author>
+      <name>Ziye Zhu</name>
+    </author>
+    <author>
+      <name>Xiao Yang</name>
+    </author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.20175v1</id>
+    <title>TreeSpark: Learning to Draft the Trees You Verify for Speculative Decoding</title>
+    <updated>2026-10-14T13:21:09Z</updated>
+    <link href="https://arxiv.org/abs/2610.20175v1" rel="alternate" type="text/html"/>
+    <link href="https://arxiv.org/pdf/2610.20175v1" rel="related" type="application/pdf" title="pdf"/>
+    <summary>Parallel drafters such as DFlash and DSpark reduce proposal latency, but early mismatches limit how much of each block can be accepted. Retaining alternatives introduces parent states and candidate choices that reference-conditioned training does not directly supervise. We introduce TreeSpark, a unified training and inference framework extending the semi-autoregressive DSpark architecture. It constructs parent-conditioned candidate trees from one backbone pass and replays their expansion, pruning, and budgeted packing during training. Survival negative log-likelihood weights retained edges by reference-derived path mass, while a capped coverage hinge promotes target-important alternatives near local selection boundaries. Both objectives reuse reference-chain target distributions without additional target forward passes. We evaluate greedy decoding with Qwen3-4B and Qwen3-8B on nine general benchmarks and six writing domains. Across targets and suites, TreeSpark improves mean acceptance length over DSpark by 23.4% to 31.6% and mean single-request throughput by 15.1% to 25.0%. Batched Qwen3-4B throughput improves by 12.6% to 17.2%. At fixed attention capacity and inference policy, the proposed supervision further improves mean acceptance length by approximately 6.4% and mean system throughput by 4.2% to 5.0% on Qwen3-4B.</summary>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <published>2026-10-14T13:21:09Z</published>
+    <arxiv:primary_category term="cs.CL"/>
+    <author>
+      <name>Jihao Zhao</name>
+    </author>
+    <author>
+      <name>Qianyu Jiang</name>
+    </author>
+    <author>
+      <name>Shuaishuai Zu</name>
+    </author>
+    <author>
+      <name>Pengfei Li</name>
+    </author>
+    <author>
+      <name>Guanghuan Fang</name>
+    </author>
+    <author>
+      <name>Ben Feng</name>
+    </author>
+    <author>
+      <name>Biao Qin</name>
+    </author>
+    <author>
+      <name>Zhibin Wang</name>
+    </author>
+    <author>
+      <name>Baochuan Yang</name>
+    </author>
+  </entry>
+</feed>

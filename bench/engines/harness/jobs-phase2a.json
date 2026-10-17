@@ -1,0 +1,122 @@
+[
+ {
+  "engine": "xinfer",
+  "config": "gguf-q4_0",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "mtp2",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "mtp3",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "ub2048",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "dflash-q4",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "agent-default",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "mtp1",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "mtp4",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "ub1024",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "ub4096",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "kv-q8",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "fa-off",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "dflash-q8",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "ngram-mod",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "ngram-simple",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "np1",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "t4",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "t12",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "no-mmap",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "mlock",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "agent-ckpt8",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "agent-ckpt128",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "agent-cram0",
+  "suite": "sweep"
+ },
+ {
+  "engine": "llamacpp",
+  "config": "agent-cram32k",
+  "suite": "sweep"
+ }
+]

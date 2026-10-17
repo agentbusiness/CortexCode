@@ -1,0 +1,5 @@
+/* pane.code@1 — toolbar over editor and tree; the editor keeps 320px, the tree takes --cx-tree. */
+#cc .cx-code-view{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-code-toolbar{flex:none;border-bottom:1px solid var(--rule);}
+#cc .cx-code-body{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 1px minmax(0,min(var(--cx-tree,260px),calc(100% - 321px)));}
+#cc .cx-code-editor,#cc .cx-code-tree{min-height:0;min-width:0;}

@@ -1,0 +1,116 @@
+{
+  "type": "object",
+  "properties": {
+    "missing": {
+      "type": "string"
+    },
+    "route": {
+      "enum": [
+        "MORE",
+        "ANSWER",
+        "DO",
+        "DELEGATE",
+        "PLAN"
+      ]
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@catalog"
+        ]
+      },
+      "maxItems": 2,
+      "x-when": {
+        "route": [
+          "ANSWER",
+          "DO",
+          "DELEGATE",
+          "PLAN"
+        ]
+      }
+    },
+    "effort": {
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "x-when": {
+        "route": [
+          "MORE"
+        ]
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "x-when": {
+        "route": [
+          "MORE"
+        ]
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "x-when": {
+        "route": [
+          "MORE"
+        ]
+      }
+    },
+    "brief": {
+      "type": "string",
+      "x-when": {
+        "route": [
+          "DELEGATE",
+          "PLAN"
+        ]
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@verifiers"
+        ]
+      },
+      "maxItems": 4,
+      "x-when": {
+        "route": [
+          "DO",
+          "DELEGATE"
+        ]
+      }
+    },
+    "note": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "missing",
+    "route",
+    "skills",
+    "effort",
+    "symbols",
+    "files",
+    "queries",
+    "brief",
+    "checks",
+    "note"
+  ],
+  "additionalProperties": false
+}

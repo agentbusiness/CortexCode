@@ -1,0 +1,29 @@
+diff --git a/tests/test_widgets.py b/tests/test_widgets.py
+--- a/tests/test_widgets.py
++++ b/tests/test_widgets.py
+@@ -1,4 +1,8 @@
+ from widgets import core
+ 
+ def test_spin():
+     assert core.spin(1) == 2
++
++
++def test_spin_negative():
++    assert core.spin(-1) == 0
+diff --git a/tests/test_new.py b/tests/test_new.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_new.py
+@@ -0,0 +1,2 @@
++def test_new():
++    assert True
+diff --git a/tests/data/old name.txt b/tests/data/new name.txt
+similarity index 100%
+rename from tests/data/old name.txt
+rename to tests/data/new name.txt
+diff --git "a/tests/t\303\251st_unicode.py" "b/tests/t\303\251st_unicode.py"
+new file mode 100644
+--- /dev/null
++++ "b/tests/t\303\251st_unicode.py"
+@@ -0,0 +1 @@
++X = 1

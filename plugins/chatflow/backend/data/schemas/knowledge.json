@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": [
+              "concept",
+              "fact",
+              "hypothesis",
+              "question"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "asserted",
+              "open",
+              "supported",
+              "refuted"
+            ]
+          },
+          "binds": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@reads"
+              ]
+            },
+            "maxItems": 2
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "text",
+          "state",
+          "binds"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "items"
+  ],
+  "additionalProperties": false
+}

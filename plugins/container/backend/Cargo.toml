@@ -1,0 +1,35 @@
+[package]
+name = "cc-container"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode container@1 plugin: projects whose commands run inside Docker (one container, a Docker Compose project, or a devcontainer with features via the Dev Containers CLI) while their files stay on the Mac, bind-mounted into the container."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_container"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-container"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9.12"
+sha2 = "0.10"
+uuid = { version = "1.23", features = ["v4"] }
+libc = "0.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27"

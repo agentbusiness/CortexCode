@@ -1,0 +1,20 @@
+/* pane.browser@1 — the browser's chrome in apparatus; the page region is a hairline box the shell fills. */
+#cc .cx-browser{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-browser-bar{padding-left:16px;flex-wrap:nowrap;}
+#cc .cx-address{flex:1;min-width:120px;}
+#cc .cx-address input{font-family:var(--font-mono);font-size:11.5px;letter-spacing:0;}
+#cc .cx-browser-tabs{display:flex;align-items:center;gap:8px;padding:4px 16px 4px 16px;border-bottom:1px solid var(--rule);overflow-x:auto;min-height:35px;}
+#cc .cx-btab{display:inline-flex;align-items:center;border:1px solid var(--rule-2);height:22px;max-width:220px;flex:0 1 auto;min-width:0;}
+#cc .cx-btab.on{border-color:var(--rubric);}
+#cc .cx-btab-pick{
+  border:0;background:transparent;padding:0 8px;height:100%;min-width:0;cursor:pointer;color:var(--ink-2);
+  font-family:var(--font-apparatus);font-size:10px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#cc .cx-btab.on .cx-btab-pick{color:var(--ink);}
+#cc .cx-btab-close{
+  border:0;border-left:1px solid var(--rule-2);background:transparent;height:100%;padding:0 8px;cursor:pointer;color:var(--ink-3);
+  font-family:var(--font-apparatus);font-size:8.5px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;
+}
+#cc .cx-btab-close:hover{color:var(--rubric);}
+#cc .cx-browser-region{flex:1;min-height:0;margin:0 0 0 16px;border-left:1px solid var(--rule);position:relative;}
+#cc .cx-browser>.inline-error{margin:8px 16px 0 16px;}

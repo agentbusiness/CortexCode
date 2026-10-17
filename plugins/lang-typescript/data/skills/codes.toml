@@ -1,0 +1,10 @@
+# Diagnostic codes the TypeScript guide covers, in both forms TypeScript emits them: the number
+# typescript-language-server gives as the diagnostic `code` (2322), and `TS2322` as tsc prints it;
+# ERR_* are Node's error codes in run and test output. The guide is always loaded, so the tools only
+# point to it when one of these shows up; the model never reads this file.
+typescript = [
+  "2322", "TS2322", "2345", "TS2345", "2339", "TS2339", "2551", "TS2551", "2304", "TS2304", "2552", "TS2552",
+  "2307", "TS2307", "2305", "TS2305", "2614", "TS2614", "1192", "TS1192", "2554", "TS2554", "18048",
+  "TS18048", "18047", "TS18047", "2532", "TS2532", "2366", "TS2366", "2355", "TS2355", "7030", "TS7030",
+  "2835", "TS2835", "ERR_MODULE_NOT_FOUND", "ERR_REQUIRE_ESM", "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+]

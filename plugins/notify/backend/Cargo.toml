@@ -1,0 +1,32 @@
+[package]
+name = "cc-notify"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode notify@1 plugin: derives notifications from events, applies preferences, focus and dedup, and delivers them to macOS Notification Center (natively or through the Electron shell)."
+build = "build.rs"
+
+# Own workspace: the plugin builds (and ships) on its own.
+[workspace]
+
+[lib]
+name = "cc_notify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-notify"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+uuid = { version = "1.23", features = ["v4"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27"

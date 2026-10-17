@@ -1,0 +1,7 @@
+# Shared by every workspace under this repository (Cargo searches parent directories).
+#
+# The installed MacOSX27 SDK's .tbd stubs list an architecture (arm64e.x1) that the installed
+# linker cannot parse, so linking fails with "tapi error: malformed file". Pin the newest SDK that
+# passes a real link check (scripts/select-macos-sdk.sh prints it; re-run it after Xcode updates).
+[env]
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"

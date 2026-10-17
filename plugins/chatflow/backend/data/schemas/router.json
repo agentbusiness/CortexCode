@@ -1,0 +1,82 @@
+{
+  "type": "object",
+  "properties": {
+    "work": {
+      "type": "string"
+    },
+    "route": {
+      "enum": [
+        "ANSWER",
+        "LOOKUP",
+        "DO",
+        "DELEGATE",
+        "STATUS",
+        "PLAN",
+        "IMPLEMENT"
+      ]
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@catalog"
+        ]
+      },
+      "maxItems": 3,
+      "x-when": {
+        "route": [
+          "ANSWER",
+          "LOOKUP",
+          "DO",
+          "DELEGATE",
+          "PLAN"
+        ]
+      }
+    },
+    "effort": {
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "spec": {
+      "enum": [
+        "none",
+        "new",
+        "amend"
+      ]
+    },
+    "settles": {
+      "enum": [
+        "no",
+        "yes"
+      ]
+    },
+    "teaches": {
+      "enum": [
+        "no",
+        "yes"
+      ]
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "work",
+    "route",
+    "skills",
+    "effort",
+    "spec",
+    "settles",
+    "teaches",
+    "files"
+  ],
+  "additionalProperties": false
+}

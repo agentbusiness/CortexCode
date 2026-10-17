@@ -1,0 +1,24 @@
+# The projects each skill can help in: the catalog offers a skill only to a project that shows one
+# of its conditions. `languages`: as the code graph names a project's languages; `files`: path
+# globs (no `/`: any directory) of which one must exist; `imports`: packages the code imports or
+# the manifests declare (`org.neo4j` covers `org.neo4j.driver`). A skill not listed applies to
+# every project; a project with no indexed language yet is offered every skill.
+
+[cypher-queries]
+files = ["*.cypher", "*.cql"]
+imports = ["neo4j", "neo4j-driver", "py2neo", "neo4rs", "org.neo4j", "github.com/neo4j/neo4j-go-driver"]
+
+[data-formats]
+files = ["*.json", "*.jsonl", "*.ndjson", "*.yaml", "*.yml", "*.toml", "*.csv", "*.tsv", "*.xml", "*.ini"]
+imports = ["json", "csv", "yaml", "ruamel", "tomllib", "tomli", "toml", "serde_json", "serde_yaml", "encoding/json", "encoding/csv", "gopkg.in/yaml.v2", "gopkg.in/yaml.v3", "github.com/BurntSushi/toml", "github.com/pelletier/go-toml", "js-yaml", "papaparse", "csv-parse", "smol-toml", "@iarna/toml", "com.fasterxml.jackson", "com.google.gson", "org.yaml.snakeyaml", "org.json", "nlohmann"]
+
+[dataframes]
+files = ["*.csv", "*.tsv", "*.parquet", "*.feather", "*.xlsx", "*.ipynb"]
+imports = ["pandas", "polars", "dask"]
+
+[jq]
+files = ["*.json", "*.jsonl", "*.ndjson", "*.geojson"]
+
+[sql]
+files = ["*.sql", "*.sqlite", "*.sqlite3", "*.db", "schema.prisma"]
+imports = ["sqlite3", "aiosqlite", "psycopg", "psycopg2", "psycopg2-binary", "asyncpg", "pymysql", "MySQLdb", "mysql", "pyodbc", "oracledb", "duckdb", "sqlalchemy", "sqlmodel", "peewee", "rusqlite", "sqlx", "diesel", "postgres", "tokio_postgres", "tokio-postgres", "sea_orm", "sea-orm", "libsql", "database/sql", "github.com/jackc/pgx", "github.com/lib/pq", "github.com/mattn/go-sqlite3", "modernc.org/sqlite", "github.com/go-sql-driver/mysql", "github.com/jmoiron/sqlx", "gorm.io/gorm", "pg", "mysql2", "better-sqlite3", "sqlite", "knex", "kysely", "@prisma/client", "prisma", "typeorm", "sequelize", "drizzle-orm", "sql.js", "java.sql", "javax.sql", "jakarta.persistence", "javax.persistence", "org.hibernate", "org.springframework.jdbc", "org.jooq", "sqlite3.h", "libpq-fe.h", "pqxx", "mysql.h"]

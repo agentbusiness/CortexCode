@@ -1,0 +1,42 @@
+{
+  "name": "@cortex-ui/chatflow-chat",
+  "version": "0.1.0",
+  "description": "The conversation: the session's journal as turns, steps, the live working area; hosts chat.composer@1.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "chatflow.chat",
+    "slot": "workbench.chat@1",
+    "label": "Conversation",
+    "order": 0
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "test": "vitest run"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "dependencies": {
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "jsdom": "30.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  }
+}

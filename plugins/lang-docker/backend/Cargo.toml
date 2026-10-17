@@ -1,0 +1,30 @@
+[package]
+name = "cc-lang-docker"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode lang@1 plugin for Docker: the code graph's facts of Dockerfiles and Compose files, dockerfile-language-server and compose-language-service diagnostics/definition/references/hover, docker and hadolint verifiers and Docker skills."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_lang_docker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-lang-docker"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+tree-sitter-containerfile = "0.9.2"
+tree-sitter-yaml = "0.7.2"
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time", "test-util"] }

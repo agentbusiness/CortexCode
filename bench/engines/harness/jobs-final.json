@@ -1,0 +1,12 @@
+[
+ {
+  "engine": "uzu",
+  "config": "default",
+  "suite": "full"
+ },
+ {
+  "engine": "uzu",
+  "config": "no-spec",
+  "suite": "sweep"
+ }
+]

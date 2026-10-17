@@ -1,0 +1,6 @@
+# uzu (vendor/uzu, rust-version 1.98) needs a newer stable compiler than the repository pin
+# (1.94.1). This pin applies to this plugin only (approved by the driver, 2026-10-15). Stable, no
+# nightly features.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

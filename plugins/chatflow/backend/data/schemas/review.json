@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "found": {
+      "type": "string"
+    },
+    "replan": {
+      "enum": [
+        "no",
+        "yes"
+      ]
+    }
+  },
+  "required": [
+    "found",
+    "replan"
+  ],
+  "additionalProperties": false
+}

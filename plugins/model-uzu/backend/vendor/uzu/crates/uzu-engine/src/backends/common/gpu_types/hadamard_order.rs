@@ -1,0 +1,1 @@
+pub const HADAMARD_TRANSFORM_BLOCK_SIZE: u32 = 32;

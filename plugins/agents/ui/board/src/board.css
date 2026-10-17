@@ -1,0 +1,20 @@
+/* pane.board@1 — tasks as a ruled tree, agents as rows with their controls, the board as the design's register. */
+#cc .cx-board{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-board>.bar{padding-left:16px;}
+#cc .cx-board-scroll{flex:1;min-height:0;overflow:auto;padding:0 16px 24px 0;}
+#cc .cx-board .lst .t{font-size:14.5px;}
+#cc .cx-board .lst .r{align-items:center;}
+#cc .cx-board .empty-line{padding-left:16px;}
+#cc .cx-board .inline-error{margin-left:16px;}
+#cc .cx-task-open{border-left:1px solid var(--rule-2);padding:4px 0 12px 12px;margin-bottom:12px;display:flex;flex-direction:column;gap:8px;}
+#cc .cx-task-brief{margin:0;font-size:14px;line-height:1.5;color:var(--ink-2);max-width:64ch;white-space:pre-wrap;}
+#cc .cx-task-plan{margin:0;font-family:var(--font-mono);font-size:12px;line-height:1.5;color:var(--ink-2);white-space:pre-wrap;}
+#cc .cx-contract{list-style:none;margin:0;padding:0;}
+#cc .cx-contract li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-contract code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-3);flex-basis:100%;overflow-wrap:anywhere;}
+#cc .cx-check-name{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
+#cc .cx-agent-row{padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
+#cc .cx-agent-row .r{display:flex;align-items:baseline;gap:8px;}
+#cc .cx-agent-acts{display:flex;gap:4px;flex-wrap:wrap;}
+#cc .cx-board .reg-log{padding:0 0 0 16px;}
+#cc .cx-board-post{margin:12px 0 0 16px;}

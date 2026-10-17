@@ -1,0 +1,216 @@
+/* workbench.chat@1 — the conversation surface (`.conversation`, `.turn`, `.composer`,
+   `.chat-working`, `.run-steps`), plus the few things a coding conversation adds. */
+#cc .cx-chat.conversation{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:0 12px 12px 16px;}
+#cc .cx-chat .cx-composer-slot{flex:none;}
+#cc .cx-chat .conversation-scroll{padding:24px 8px 0 0;}
+/* One width for everything in a turn: the feed's. No element narrows itself (the theme's 64ch on
+   your message is undone here), so prose, the route detail, steps and cards line up. */
+#cc .cx-chat .conversation-feed{max-width:820px;}
+#cc .cx-chat .turn.you .say{max-width:none;white-space:pre-wrap;}
+#cc .cx-chat .prose{max-width:none;}
+#cc .cx-lead{font-size:16px;margin-top:12px;}
+
+/* An answer is reading. */
+#cc .cx-answer{font-size:16.5px;line-height:1.6;}
+#cc .cx-answer p{margin:0 0 .9em;}
+#cc .cx-answer > :last-child{margin-bottom:0;}
+#cc .cx-answer h1,#cc .cx-answer h2,#cc .cx-answer h3{font-weight:500;letter-spacing:-.008em;margin:1.1em 0 .45em;line-height:1.25;}
+#cc .cx-answer h1{font-size:22px;} #cc .cx-answer h2{font-size:19px;} #cc .cx-answer h3{font-size:17px;}
+#cc .cx-answer ul,#cc .cx-answer ol{margin:0 0 .9em;padding-left:1.4em;}
+#cc .cx-answer li{margin:.2em 0;}
+#cc .cx-answer code{font-family:var(--font-mono);font-size:.86em;color:var(--ink);border-bottom:1px solid var(--rule-2);}
+#cc .cx-answer a{color:var(--rubric);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px;}
+/* The design's streaming caret sits after the last line of the answer, not on its own line. */
+#cc .cx-answer.stream::after{display:none;}
+#cc .cx-answer.stream > :last-child::after{
+  content:"";display:inline-block;width:7px;height:15px;margin-left:4px;
+  background:var(--rubric);vertical-align:-2px;animation:blink 1s steps(2,start) infinite;
+}
+#cc .cx-answer.stream:empty::after{display:inline-block;content:"";width:7px;height:15px;background:var(--rubric);animation:blink 1s steps(2,start) infinite;}
+@media (prefers-reduced-motion:reduce){#cc .cx-answer.stream > :last-child::after{animation:none;}}
+
+#cc .turn.model .message-body > * + *{margin-top:12px;}
+#cc .cx-route-detail{margin:-4px 0 12px;font-size:13.5px;line-height:1.45;color:var(--ink-3);font-style:italic;}
+
+/* Steering: what you said into a running turn, set in from the turn it went into. */
+#cc .cx-steer{border-left:1px solid var(--rubric);padding:4px 0 4px 12px;margin:16px 0;}
+#cc .cx-steer[data-consumed="true"]{border-left-color:var(--rule-2);}
+#cc .cx-steer .turn-h{margin-bottom:8px;}
+#cc .cx-steer .say{font-size:16px;line-height:1.5;color:var(--ink);margin:0;}
+
+#cc .cx-note{font-style:italic;color:var(--ink-2);font-size:14.5px;margin:12px 0;}
+#cc .cx-single{margin:8px 0;}
+#cc .cx-single .stream-row:disabled{cursor:default;}
+
+#cc .cx-checks{list-style:none;margin:4px 0 0;padding:0;grid-column:2;}
+#cc .cx-checks li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-checks li.bad .ap:first-child{color:var(--rubric);}
+#cc .cx-checks li.ok .ap:first-child{color:var(--counter);}
+#cc .cx-check-name{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
+#cc .cx-checks pre{flex-basis:100%;margin:4px 0 0;}
+
+#cc .cx-flush-notes{margin:8px 0 0;}
+#cc .run-open .run-output{font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;}
+#cc .run-open .cx-diff{margin:4px 0 8px;}
+
+
+/* A step another region pointed at (an attribution in the code view), marked for a moment. */
+/* an ask-mode approval: what the call would do, then Allow / Deny */
+#cc .cx-approval .cx-approval-classes{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin-top:8px;}
+#cc .cx-approval .cx-approval-args{grid-column:2;margin-top:8px;}
+#cc .cx-approval .cx-approval-args summary{cursor:pointer;}
+#cc .cx-approval .cx-approval-args pre{margin:4px 0 0;max-height:240px;overflow:auto;}
+/* a code change to CortexCode: the plain-English summary first, then why and the risk; the diff on demand */
+#cc .cx-change .cx-change-title{font-weight:500;}
+#cc .cx-change .cx-change-line{color:var(--ink-2);margin-top:4px;}
+#cc .cx-change .cx-change-progress{font-family:var(--font-mono);font-size:12px;color:var(--ink-2);margin-top:8px;overflow-wrap:anywhere;}
+#cc .cx-change .cx-change-outcome{color:var(--ink-2);margin-top:8px;}
+#cc .cx-change .cx-change-diff{grid-column:2;min-width:0;margin-top:8px;max-height:480px;overflow:auto;}
+/* in a narrow conversation, a turn's labels wrap as whole phrases rather than squeezing */
+#cc .cx-chat .turn-h{flex-wrap:wrap;row-gap:4px;}
+#cc .cx-chat .turn-h>.ap,#cc .cx-chat .turn-h>time{white-space:nowrap;}
+#cc .chat-working-model{display:block;margin:8px 0 0;text-transform:none;letter-spacing:.04em;font-size:11px;line-height:1.5;}
+
+/* what was attached to a message (the design's `.attached` / `.chip`), a preview for images */
+#cc .cx-chat .cx-attached{list-style:none;margin:8px 0 0;padding:0;}
+#cc .cx-chat .cx-chip{max-width:320px;padding:0;text-transform:none;letter-spacing:.02em;font-size:11px;}
+#cc .cx-chat .cx-chip:has(.cx-thumb){height:auto;}
+#cc .cx-chat .cx-chip-open{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:0 8px;height:100%;font:inherit;color:inherit;text-transform:none;letter-spacing:inherit;}
+#cc .cx-chat .cx-chip-open:disabled{cursor:default;}
+#cc .cx-chat .cx-chip:has(.cx-thumb) .cx-chip-open{padding:4px 8px 4px 4px;}
+#cc .cx-chat .cx-thumb{display:block;width:64px;height:64px;object-fit:cover;}
+#cc .cx-chat .cx-chip-kind{color:var(--ink-3);text-transform:uppercase;letter-spacing:.13em;font-size:9px;}
+#cc .cx-chat .cx-chip-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);}
+#cc .cx-chat .cx-chip-size{color:var(--ink-3);white-space:nowrap;}
+#cc .cx-chat .cx-pasted{margin:8px 0 0;}
+#cc .cx-chat .cx-pasted summary{cursor:pointer;}
+#cc .cx-chat .cx-pasted pre{margin:4px 0 0;max-height:240px;overflow:auto;white-space:pre;}
+
+/* the spec (pinned at the top), proposed decisions and plans: the design's notices */
+#cc .cx-chat .cx-spec,#cc .cx-chat .cx-plan,#cc .cx-chat .cx-decision{margin:12px 0;}
+#cc .cx-chat .cx-spec-text summary{cursor:pointer;}
+#cc .cx-chat .cx-spec-text .prose{white-space:pre-wrap;max-height:240px;overflow:auto;margin:4px 0 0;}
+#cc .cx-chat .cx-requirements,#cc .cx-chat .cx-plan-tasks{list-style:none;margin:8px 0 0;padding:0;grid-column:2;}
+#cc .cx-chat .cx-requirements li{display:flex;align-items:baseline;gap:8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-chat .cx-requirements li[data-status="dropped"] .cx-req-text{text-decoration:line-through;color:var(--ink-3);}
+#cc .cx-chat .cx-requirements li[data-status="met"] .ap:first-child{color:var(--counter);}
+#cc .cx-chat .cx-requirements .cx-req-text,#cc .cx-chat .cx-requirements input{flex:1;min-width:0;}
+#cc .cx-chat .cx-spec-field{display:flex;flex-direction:column;gap:4px;margin-top:8px;grid-column:2;}
+#cc .cx-chat .cx-spec-field textarea{font:inherit;resize:vertical;}
+#cc .cx-chat .cx-decisions{margin:8px 0 0;padding-left:1.2em;grid-column:2;}
+#cc .cx-chat .cx-decided{color:var(--ink);margin:4px 0 0;}
+#cc .cx-chat .cx-knowledge-text{display:block;width:100%;box-sizing:border-box;margin:4px 0 0;font:inherit;color:var(--ink);background:transparent;border:1px solid var(--line);padding:4px 6px;resize:vertical;}
+#cc .cx-chat .cx-plan-goal{font-size:16px;color:var(--ink);margin:4px 0 0;}
+#cc .cx-chat .cx-plan-steps,#cc .cx-chat .cx-plan-risks{margin:8px 0 0;padding-left:1.4em;grid-column:2;}
+#cc .cx-chat .cx-plan-tasks li{padding:8px 0;border-top:1px solid var(--rule);}
+#cc .cx-chat .cx-task-title{color:var(--ink);}
+#cc .cx-chat .cx-task-brief{margin:4px 0;font-size:14px;color:var(--ink-2);}
+#cc .cx-chat .cx-task-progress{display:flex;align-items:center;gap:8px;margin-top:4px;}
+#cc .cx-chat .cx-plan-diff{grid-column:2;margin-top:8px;}
+#cc .cx-chat .cx-plan-diff summary{cursor:pointer;}
+#cc .cx-chat .cx-plan-diff ul{margin:4px 0 0;padding-left:1.2em;}
+
+/* A note written for the model (a skill's text): kept as written when opened. */
+#cc .cx-host-note-text { white-space: pre-wrap; font-style: normal; font-size: 13px; }
+
+/* The work behind an answer as one line (Activity.tsx): what was done, then its count, time and
+   tokens; while running, what is under way and the model's progress. One text line high, no box:
+   no border, padding or reserved height. Opened, one dense line per item, each opening in place. */
+/* Work groups are boxed off from the prose by a left rule; the one running is orange. */
+#cc .cx-activity{min-width:0;border-left:2px solid var(--rule-2);padding:4px 0 4px 12px;}
+#cc .cx-activity[data-running="true"]{border-left-color:var(--rubric);background:var(--rubric-wash);}
+#cc .cx-activity[data-running="true"] .cx-activity-facts{color:var(--rubric);}
+#cc .cx-activity[data-running="true"] .run-item[data-status="running"] .subject{color:var(--ink);}
+#cc .cx-activity[data-running="true"] .run-item[data-status="running"] .row-end{color:var(--rubric);font-variant-numeric:tabular-nums;}
+#cc .cx-activity-running{flex:none;}
+#cc .turn.model .message-body > .cx-activity + *{margin-top:8px;}
+#cc .turn.model .message-body > * + .cx-activity{margin-top:8px;}
+#cc .cx-activity-line,#cc .cx-activity-row{
+  display:flex;align-items:baseline;gap:8px;width:100%;min-width:0;margin:0;padding:0;border:0;
+  background:transparent;cursor:pointer;text-align:left;font:inherit;color:var(--ink-3);
+}
+#cc .cx-activity-line:hover .cx-activity-what,#cc .cx-activity-row:hover .cx-activity-what{color:var(--ink);}
+#cc .cx-activity-line:focus-visible,#cc .cx-activity-row:focus-visible{outline:1px solid var(--rubric);outline-offset:4px;}
+#cc .cx-activity .thinking-caret{flex:none;align-self:center;}
+#cc .cx-activity-what{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;line-height:20px;color:var(--ink-2);}
+#cc .cx-activity-facts{flex:none;margin-left:auto;font-size:12px;line-height:20px;color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap;}
+#cc .cx-activity[data-running="true"] .cx-activity-what{font-style:italic;}
+#cc .cx-activity-list{list-style:none;margin:4px 0 0 12px;padding:0;}
+/* The list is a flex column: its items must be allowed to shrink, or a one-line row runs past the feed. */
+#cc .cx-activity-list > li{border-top:0;min-width:0;max-width:100%;}
+#cc .cx-activity-folded,#cc .cx-activity-list .run-item{min-width:0;max-width:100%;}
+#cc .cx-activity-list > li:last-child{border-bottom:0;}
+#cc .cx-activity-list .stream-row{padding:0;line-height:20px;}
+#cc .cx-activity-list .stream-row .subject{font-size:13px;line-height:20px;}
+#cc .cx-activity-list .step-notes{margin:0 0 4px 16px;}
+#cc .cx-activity-list .grounded-item-card{margin:0 0 4px 16px;}
+#cc .cx-activity-text{margin:0 0 4px 16px;white-space:pre-wrap;font-size:13px;}
+#cc .cx-activity-usage{font-size:12px;line-height:20px;color:var(--ink-3);font-variant-numeric:tabular-nums;}
+/* The decision being written now, under the line, in the reasoning's small italic. */
+#cc .cx-activity-live{display:flex;flex-direction:column;gap:2px;margin:4px 0 0 16px;font-size:13px;line-height:1.45;color:var(--ink-3);font-style:italic;}
+#cc .cx-activity-live span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+/* A running command's output so far, under the line, in the small mono of the reasoning. */
+#cc .cx-activity-tail{margin:4px 0 0 16px;max-height:140px;overflow:hidden;font-family:var(--font-mono);font-size:12px;line-height:1.45;color:var(--ink-3);white-space:pre-wrap;}
+
+/* What the turn edited: a card after the answer, one row per file with its counts. */
+#cc .cx-edits{border:1px solid var(--rule);border-radius:8px;padding:10px 12px;}
+#cc .cx-edits-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+#cc .cx-edits-title{font-size:14px;font-weight:500;color:var(--ink);}
+#cc .cx-edits-counts{font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap;}
+#cc .cx-add{color:var(--counter);} #cc .cx-del{color:var(--rubric);}
+#cc .cx-edit-counts{font-variant-numeric:tabular-nums;}
+#cc .cx-failed{color:var(--rubric);}
+#cc .run-item[data-status="failed"] > .stream-row .who,
+#cc .run-item[data-status="failed"] > .stream-row .subject,
+#cc .run-item[data-status="failed"] > .stream-row .row-end{color:var(--rubric);}
+#cc .cx-edits-files{list-style:none;margin:8px 0 0;padding:0;}
+#cc .cx-edits-files li{border-top:1px solid var(--rule);}
+#cc .cx-edits-file{display:flex;align-items:center;gap:8px;width:100%;padding:6px 0;background:none;border:0;cursor:pointer;text-align:left;font:inherit;color:inherit;}
+#cc .cx-edits-file:hover .cx-edits-name{text-decoration:underline;}
+#cc .cx-edits-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;}
+#cc .cx-edits-dir{color:var(--ink-3);} #cc .cx-edits-name{color:var(--ink);font-weight:500;}
+#cc .cx-edits-more{margin-top:6px;padding:0;background:none;border:0;cursor:pointer;font:inherit;font-size:13px;color:var(--ink-2);}
+#cc .cx-edits-more:hover{color:var(--ink);}
+#cc .cx-edits-view{margin-top:8px;}
+#cc .cx-working-decision{font-style:italic;}
+
+/* A plan carried out by the conversation's loop: each task's state (the running one in the run's orange). */
+.cx-plan-tasks li[data-state="done"] { color: var(--fg-muted, #9a9a9a); }
+.cx-plan-tasks li[data-state="done"]::marker { content: "\2713  "; }
+.cx-plan-tasks li[data-state="failed"]::marker { content: "\2717  "; color: var(--danger, #d9534f); }
+.cx-plan-tasks li[data-state="current"] { color: var(--accent, #e8873a); font-weight: 600; }
+.cx-plan-step-summary { display: block; font-weight: 400; font-size: 0.9em; opacity: 0.8; margin-top: 0.1em; }
+
+
+/* A task the turn made: its state at the row's end (the running one in the run's orange). */
+.cx-task-link[data-state="in_progress"] .cx-task-state, .cx-task-link[data-state="in_progress"] .dot { color: var(--accent, #e8873a); }
+.cx-task-link[data-state="in_progress"] .dot { background: var(--accent, #e8873a); }
+.cx-task-link[data-state="done"] .cx-task-state { color: var(--fg-muted, #9a9a9a); }
+.cx-task-link[data-state="done"] .subject { color: var(--fg-muted, #9a9a9a); }
+.cx-task-link[data-state="failed"] .cx-task-state { color: var(--danger, #d9534f); }
+
+/* A plan task's work, nested under its header; the body indented with a left rule. */
+.cx-task-run { margin: 0.6em 0; }
+.cx-task-run > .sources-list.cx-single { margin-bottom: 0.2em; }
+.cx-task-run-body { margin-left: 1.1em; padding-left: 0.8em; border-left: 2px solid var(--line, #333); }
+.cx-task-run[data-state="in_progress"] .cx-task-run-body { border-left-color: var(--accent, #e8873a); }
+
+/* The plan card is one line (tasks and the goal, cut to a line); the rest opens on a click. */
+#cc .cx-chat .cx-plan .cx-plan-details{grid-column:1 / -1;}
+#cc .cx-chat .cx-plan .cx-plan-line{display:flex;gap:10px;align-items:baseline;cursor:pointer;min-width:0;}
+#cc .cx-chat .cx-plan .cx-plan-line .cx-plan-goal{font-size:14px;color:var(--ink-2);margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;}
+
+#cc .cx-test-results{margin:8px 0 4px;padding:8px 12px;border-left:2px solid var(--counter);}
+#cc .cx-test-results[data-failed="true"]{border-left-color:var(--rubric);}
+#cc .cx-test-results-head{display:flex;gap:10px;align-items:baseline;font-variant-numeric:tabular-nums;}
+#cc .cx-test-list{list-style:none;margin:6px 0 0;padding:0;}
+#cc .cx-test-list li{margin:2px 0;}
+#cc .cx-test-failed{color:var(--rubric);}
+#cc .cx-test-passed summary{cursor:pointer;margin-top:6px;}
+
+#cc .cx-verdict{display:flex;gap:12px;align-items:baseline;margin:14px 0;padding:10px 14px;border:1px solid var(--counter);border-left-width:3px;}
+#cc .cx-verdict[data-passed="false"]{border-color:var(--rubric);}
+#cc .cx-verdict-mark{font-size:1.3em;font-weight:700;color:var(--counter);}
+#cc .cx-verdict[data-passed="false"] .cx-verdict-mark,#cc .cx-verdict[data-passed="false"] .cx-verdict-text{color:var(--rubric);}
+#cc .cx-verdict-text{font-weight:600;color:var(--counter);}
+#cc .cx-verdict-facts{font-variant-numeric:tabular-nums;opacity:.8;}

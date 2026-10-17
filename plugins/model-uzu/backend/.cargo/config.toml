@@ -1,0 +1,5 @@
+# This plugin only: uzu's build script compiles its Metal kernels with `xcrun -sdk macosx metal`,
+# which needs Xcode's Metal toolchain (the Command Line Tools have no Metal compiler). The global
+# xcode-select setting is left alone. SDKROOT stays the repository pin (see ../../../.cargo/config.toml).
+[env]
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"

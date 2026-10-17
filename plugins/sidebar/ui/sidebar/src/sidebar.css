@@ -1,0 +1,81 @@
+/* workbench.sidebar@1 — the list column, in the design's `.lst` and `.nav` grammar. */
+#cc .cx-sidebar{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-sidebar>.bar{padding:8px 16px 8px 0;gap:8px;justify-content:flex-start;box-sizing:border-box;min-height:0px;}
+#cc .cx-sidebar .cx-action{flex:0 0 auto;}
+#cc .cx-sidebar>.inline-error{margin:8px 16px 0 0;}
+#cc .cx-sidebar-scroll{flex:1;min-height:0;overflow:auto;padding:0 0 24px;}
+#cc .cx-pad{padding:16px 16px 0 0;}
+#cc .cx-flush{padding:0;}
+
+/* A project is a heading row: its name set like the index's names, its folder in the apparatus. */
+#cc .cx-proj{border-bottom:1px solid var(--rule);padding:0 0 4px;}
+#cc .cx-proj-h{display:flex;align-items:center;gap:8px;padding:12px 16px 4px 0;min-width:0;}
+#cc .cx-proj-h .grow{flex:1;}
+#cc .cx-proj-toggle{
+  display:inline-flex;align-items:center;gap:8px;border:0;background:transparent;padding:0;cursor:pointer;
+  min-width:0;color:var(--ink-2);
+}
+#cc .cx-proj-toggle:hover{color:var(--ink);}
+#cc .cx-caret{width:8px;height:8px;flex:0 0 auto;color:var(--ink-3);}
+#cc .cx-proj-name{
+  font-family:var(--font-apparatus);font-size:10.5px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;
+  color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#cc .cx-proj.on .cx-proj-name{color:var(--ink);}
+#cc .cx-proj.on .cx-caret{color:var(--rubric);}
+#cc .cx-proj-pick{
+  display:block;width:100%;border:0;background:transparent;padding:0 16px 8px 16px;cursor:pointer;min-width:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left;
+}
+#cc .cx-proj-pick .ap{letter-spacing:.06em;text-transform:none;font-weight:500;}
+#cc .cx-proj-pick:hover .ap{color:var(--ink-2);}
+#cc .cx-proj-pick[aria-pressed="true"] .ap{color:var(--rubric);}
+
+#cc .cx-sessions,#cc .cx-agents{margin:0;}
+#cc .cx-sessions li:last-child,#cc .cx-agents li:last-child{border-bottom:0;}
+#cc .cx-sidebar .lst button{padding:8px 16px 8px 16px;}
+#cc .cx-sidebar .lst button:disabled{cursor:default;}
+#cc .cx-sidebar .lst button:disabled:hover{background:transparent;}
+#cc .cx-sidebar .lst .t{font-size:14.5px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#cc .cx-sidebar .lst .r{margin-top:4px;align-items:center;gap:8px;}
+#cc .cx-sidebar .lst .r .ap{white-space:nowrap;}
+#cc .cx-none button .t{font-style:italic;color:var(--ink-3);font-size:14px;}
+#cc .cx-none button:hover .t{color:var(--ink);}
+
+#cc .cx-sub{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px 4px 16px;}
+#cc .cx-task{color:var(--ink-2);}
+
+
+/* A conversation or agent that needs the person (an ask-mode call to allow, a block) is washed in
+   rubric: the one place the list spends its accent besides the selection. */
+#cc .cx-sidebar li.cx-attn>button{background:var(--rubric-wash);}
+/* A notification shown only here (the window was in front, or macOS did not show it) marks its row
+   with a rule and a tag until the session is opened. */
+#cc .cx-sidebar li.cx-notice>button{background:var(--rubric-wash);box-shadow:inset 2px 0 0 var(--rubric);}
+#cc .cx-sidebar .cx-notice-tag{white-space:nowrap;}
+#cc .cx-strip-mark.cx-notice{box-shadow:inset 0 0 0 1px var(--rubric);}
+
+/* the open sidebar's foot: Fold, which leaves the strip */
+#cc .cx-sidebar-foot{flex:0 0 auto;display:flex;align-items:center;padding:8px 16px 8px 0;border-top:1px solid var(--rule);}
+#cc .cx-sidebar-fold{display:inline-flex;align-items:center;gap:8px;}
+#cc .cx-sidebar-fold svg{width:8px;height:8px;}
+/* folded: a 44px rail — New chat, then per project (a hairline apart) one 32px mark per
+   conversation and agent: a short code with its state as a dot in the corner; Show at the foot,
+   where the open sidebar has Fold */
+#cc .cx-strip{align-items:center;padding:8px 0 0;gap:4px;border-right:0;}
+#cc .cx-strip>.cx-slot{flex:0 0 auto;}
+#cc .cx-strip-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:4px 0 8px;width:100%;}
+#cc .cx-strip-project{display:flex;flex-direction:column;align-items:center;gap:4px;padding:4px 0 0;border-top:1px solid var(--rule);width:100%;}
+#cc .cx-strip-project:empty{display:none;}
+#cc .cx-strip .cx-strip-mark{position:relative;font-size:10px;letter-spacing:.02em;}
+#cc .cx-strip-code{display:inline-flex;align-items:baseline;max-width:30px;overflow:hidden;white-space:nowrap;}
+#cc .cx-strip-at{font-size:9px;color:var(--ink-3);}
+/* the state dot sits in the mark's corner; a mark that needs the person or carries a notification
+   takes the rubric */
+#cc .cx-strip-mark .cx-pip{position:absolute;top:3px;right:3px;}
+#cc .cx-strip-mark.cx-attn .cx-pip,#cc .cx-strip-mark.cx-notice .cx-pip{background:var(--rubric);box-shadow:none;}
+/* A running conversation's mark is outlined, not only dotted: visible from across the room. */
+#cc .cx-strip-mark[data-status="running"],#cc .cx-strip-mark[data-status="working"]{box-shadow:inset 0 0 0 1px var(--rubric);}
+#cc .cx-strip-foot{width:100%;justify-content:center;padding:8px 0;}
+#cc .cx-verdict-pass{color:var(--counter);font-weight:600;}
+#cc .cx-verdict-fail{color:var(--rubric);font-weight:600;}

@@ -1,0 +1,642 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+
+<!--[if IE 6]><html class="ie6" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 7]><html class="lt-ie8 lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 8]><html class="lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if gt IE 8]><!--><html xmlns="http://www.w3.org/1999/xhtml"><!--<![endif]-->
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=1" />
+  <meta name="referrer" content="origin" />
+  <meta name="HandheldFriendly" content="true" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>speculative decoding llama.cpp at DuckDuckGo</title>
+  <link title="DuckDuckGo (HTML)" type="application/opensearchdescription+xml" rel="search" href="//duckduckgo.com/opensearch_html_v2.xml" />
+  <link href="//duckduckgo.com/favicon.ico" rel="shortcut icon" />
+  <link rel="icon" href="//duckduckgo.com/favicon.ico" type="image/x-icon" />
+  <link id="icon60" rel="apple-touch-icon" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_60x60.png?v=2"/>
+  <link id="icon76" rel="apple-touch-icon" sizes="76x76" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_76x76.png?v=2"/>
+  <link id="icon120" rel="apple-touch-icon" sizes="120x120" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_120x120.png?v=2"/>
+  <link id="icon152" rel="apple-touch-icon" sizes="152x152" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_152x152.png?v=2"/>
+  <link rel="image_src" href="//duckduckgo.com/assets/icons/meta/DDG-icon_256x256.png">
+  <link rel="stylesheet" media="handheld, all" href="//duckduckgo.com/dist/h.12e359033b8c1146e5f7.css" type="text/css"/>
+</head>
+
+<body class="body--html">
+  <a name="top" id="top"></a>
+
+  <form action="/html/" method="post">
+    <input type="text" name="state_hidden" id="state_hidden" />
+  </form>
+
+  <div>
+    <div class="site-wrapper-border"></div>
+
+    <div id="header" class="header cw header--html">
+      <a title="DuckDuckGo" href="/html/" class="header__logo-wrap"></a>
+
+      <form name="x" class="header__form" action="/html/" method="post">
+        <div class="search search--header">
+          <input name="q" autocomplete="off" class="search__input" id="search_form_input_homepage" type="text" value="speculative decoding llama.cpp" />
+          <input name="b" id="search_button_homepage" class="search__button search__button--html" value="" title="Search" alt="Search" type="submit" />
+        </div>
+
+        
+        
+        
+        
+
+        <div class="frm__select">
+          <select name="kl">
+            
+              <option value="" >All Regions</option>
+            
+              <option value="ar-es" >Argentina</option>
+            
+              <option value="au-en" >Australia</option>
+            
+              <option value="at-de" >Austria</option>
+            
+              <option value="be-fr" >Belgium (fr)</option>
+            
+              <option value="be-nl" >Belgium (nl)</option>
+            
+              <option value="br-pt" >Brazil</option>
+            
+              <option value="bg-bg" >Bulgaria</option>
+            
+              <option value="ca-en" >Canada (en)</option>
+            
+              <option value="ca-fr" >Canada (fr)</option>
+            
+              <option value="ct-ca" >Catalonia</option>
+            
+              <option value="cl-es" >Chile</option>
+            
+              <option value="cn-zh" >China</option>
+            
+              <option value="co-es" >Colombia</option>
+            
+              <option value="hr-hr" >Croatia</option>
+            
+              <option value="cz-cs" >Czech Republic</option>
+            
+              <option value="dk-da" >Denmark</option>
+            
+              <option value="ee-et" >Estonia</option>
+            
+              <option value="fi-fi" >Finland</option>
+            
+              <option value="fr-fr" >France</option>
+            
+              <option value="de-de" >Germany</option>
+            
+              <option value="gr-el" >Greece</option>
+            
+              <option value="hk-tzh" >Hong Kong</option>
+            
+              <option value="hu-hu" >Hungary</option>
+            
+              <option value="is-is" >Iceland</option>
+            
+              <option value="in-en" >India (en)</option>
+            
+              <option value="id-en" >Indonesia (en)</option>
+            
+              <option value="ie-en" >Ireland</option>
+            
+              <option value="il-en" >Israel (en)</option>
+            
+              <option value="it-it" >Italy</option>
+            
+              <option value="jp-jp" >Japan</option>
+            
+              <option value="kr-kr" >Korea</option>
+            
+              <option value="lv-lv" >Latvia</option>
+            
+              <option value="lt-lt" >Lithuania</option>
+            
+              <option value="my-en" >Malaysia (en)</option>
+            
+              <option value="mx-es" >Mexico</option>
+            
+              <option value="nl-nl" >Netherlands</option>
+            
+              <option value="nz-en" >New Zealand</option>
+            
+              <option value="no-no" >Norway</option>
+            
+              <option value="pk-en" >Pakistan (en)</option>
+            
+              <option value="pe-es" >Peru</option>
+            
+              <option value="ph-en" >Philippines (en)</option>
+            
+              <option value="pl-pl" >Poland</option>
+            
+              <option value="pt-pt" >Portugal</option>
+            
+              <option value="ro-ro" >Romania</option>
+            
+              <option value="ru-ru" >Russia</option>
+            
+              <option value="xa-ar" >Saudi Arabia</option>
+            
+              <option value="sg-en" >Singapore</option>
+            
+              <option value="sk-sk" >Slovakia</option>
+            
+              <option value="sl-sl" >Slovenia</option>
+            
+              <option value="za-en" >South Africa</option>
+            
+              <option value="es-ca" >Spain (ca)</option>
+            
+              <option value="es-es" >Spain (es)</option>
+            
+              <option value="se-sv" >Sweden</option>
+            
+              <option value="ch-de" >Switzerland (de)</option>
+            
+              <option value="ch-fr" >Switzerland (fr)</option>
+            
+              <option value="tw-tzh" >Taiwan</option>
+            
+              <option value="th-en" >Thailand (en)</option>
+            
+              <option value="tr-tr" >Turkey</option>
+            
+              <option value="us-en" >US (English)</option>
+            
+              <option value="us-es" >US (Spanish)</option>
+            
+              <option value="ua-uk" >Ukraine</option>
+            
+              <option value="uk-en" >United Kingdom</option>
+            
+              <option value="vn-en" >Vietnam (en)</option>
+            
+          </select>
+        </div>
+
+        <div class="frm__select frm__select--last">
+          <select class="" name="df">
+            
+              <option value="" selected>Any Time</option>
+            
+              <option value="d" >Past Day</option>
+            
+              <option value="w" >Past Week</option>
+            
+              <option value="m" >Past Month</option>
+            
+              <option value="y" >Past Year</option>
+            
+          </select>
+        </div>
+      </form>
+    </div>
+
+    
+
+    
+      <!-- Web results are present -->
+      <div>
+        <div class="serp__results">
+          <div id="links" class="results">
+            
+
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fdocs%2Fspeculative.md&amp;rut=a09160991da006fa866752d8f7a4071ca0f4361375b59bbb8fa18ea54706f31a">llama.cpp/docs/speculative.md at master · ggml-org/llama.cpp</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fdocs%2Fspeculative.md&amp;rut=a09160991da006fa866752d8f7a4071ca0f4361375b59bbb8fa18ea54706f31a">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/github.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fdocs%2Fspeculative.md&amp;rut=a09160991da006fa866752d8f7a4071ca0f4361375b59bbb8fa18ea54706f31a">
+                            github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fdocs%2Fspeculative.md&amp;rut=a09160991da006fa866752d8f7a4071ca0f4361375b59bbb8fa18ea54706f31a"><b>llama.cpp</b> supports <b>speculative</b> <b>decoding</b>, a technique that can significantly accelerate token generation by predicting multiple tokens ahead of the main model. <b>Speculative</b> <b>decoding</b> leverages the fact that computing n tokens in a batch (as in prompt processing) is more efficient than computing n sequentially (as in response generation).</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fggml%2Dorg%2Fllama.cpp%2F8.3%2Dspeculative%2Ddecoding&amp;rut=63af2554cd94f63f91c59e5bb52d1bc98ee56dc06942dd813d7100240731fe85">Speculative Decoding | ggml-org/llama.cpp | DeepWiki</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fggml%2Dorg%2Fllama.cpp%2F8.3%2Dspeculative%2Ddecoding&amp;rut=63af2554cd94f63f91c59e5bb52d1bc98ee56dc06942dd813d7100240731fe85">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/deepwiki.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fggml%2Dorg%2Fllama.cpp%2F8.3%2Dspeculative%2Ddecoding&amp;rut=63af2554cd94f63f91c59e5bb52d1bc98ee56dc06942dd813d7100240731fe85">
+                            deepwiki.com/ggml-org/llama.cpp/8.3-speculative-decoding
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-10-07T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fggml%2Dorg%2Fllama.cpp%2F8.3%2Dspeculative%2Ddecoding&amp;rut=63af2554cd94f63f91c59e5bb52d1bc98ee56dc06942dd813d7100240731fe85"><b>Speculative</b> <b>decoding</b> is a technique implemented in <b>llama.cpp</b> to accelerate language model inference by generating multiple future tokens (&quot;drafts&quot;) using a faster, approximate &quot;draft model&quot; or other heuristics, before verifying those drafts with the main &quot;target model&quot; in bulk.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fexamples%2Fspeculative%2FREADME.md&amp;rut=ac7a2a2ce3dc17c16dc33229192b815fdc9ab8680c17efa797e40a1f69e512c5">llama.cpp/examples/speculative/README.md at master - GitHub</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fexamples%2Fspeculative%2FREADME.md&amp;rut=ac7a2a2ce3dc17c16dc33229192b815fdc9ab8680c17efa797e40a1f69e512c5">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/github.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fexamples%2Fspeculative%2FREADME.md&amp;rut=ac7a2a2ce3dc17c16dc33229192b815fdc9ab8680c17efa797e40a1f69e512c5">
+                            github.com/ggml-org/llama.cpp/blob/master/examples/speculative/README.md
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fggml%2Dorg%2Fllama.cpp%2Fblob%2Fmaster%2Fexamples%2Fspeculative%2FREADME.md&amp;rut=ac7a2a2ce3dc17c16dc33229192b815fdc9ab8680c17efa797e40a1f69e512c5">LLM inference in C/C++. Contribute to ggml-org/llama.cpp development by creating an account on GitHub.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fhussain%2Dnazary.github.io%2Fspeculative%2Ddecoding.html&amp;rut=947e0f41a1a5b2416966a602ea1ed2b705305043d81d0d29902a379a606a97f3">Speculative Decoding: How Local AI Gets Faster (2026 Guide)</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fhussain%2Dnazary.github.io%2Fspeculative%2Ddecoding.html&amp;rut=947e0f41a1a5b2416966a602ea1ed2b705305043d81d0d29902a379a606a97f3">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/hussain-nazary.github.io.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fhussain%2Dnazary.github.io%2Fspeculative%2Ddecoding.html&amp;rut=947e0f41a1a5b2416966a602ea1ed2b705305043d81d0d29902a379a606a97f3">
+                            hussain-nazary.github.io/speculative-decoding.html
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-08-08T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fhussain%2Dnazary.github.io%2Fspeculative%2Ddecoding.html&amp;rut=947e0f41a1a5b2416966a602ea1ed2b705305043d81d0d29902a379a606a97f3"><b>Speculative</b> <b>decoding</b> explained: how draft models make local LLMs 1.5-3x faster, when it works, and how to enable it in <b>llama.cpp</b>, Ollama, and vLLM.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funsloth.ai%2Fdocs%2Fbasics%2Finference%2Dand%2Ddeployment%2Fsaving%2Dto%2Dgguf%2Fspeculative%2Ddecoding&amp;rut=764b7f9f6dcacc6b5dff9b2de65ef9d48727c79466267c87d225dccf8f396034">Speculative Decoding | Unsloth Documentation</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funsloth.ai%2Fdocs%2Fbasics%2Finference%2Dand%2Ddeployment%2Fsaving%2Dto%2Dgguf%2Fspeculative%2Ddecoding&amp;rut=764b7f9f6dcacc6b5dff9b2de65ef9d48727c79466267c87d225dccf8f396034">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/unsloth.ai.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funsloth.ai%2Fdocs%2Fbasics%2Finference%2Dand%2Ddeployment%2Fsaving%2Dto%2Dgguf%2Fspeculative%2Ddecoding&amp;rut=764b7f9f6dcacc6b5dff9b2de65ef9d48727c79466267c87d225dccf8f396034">
+                            unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf/speculative-decoding
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2025-12-27T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funsloth.ai%2Fdocs%2Fbasics%2Finference%2Dand%2Ddeployment%2Fsaving%2Dto%2Dgguf%2Fspeculative%2Ddecoding&amp;rut=764b7f9f6dcacc6b5dff9b2de65ef9d48727c79466267c87d225dccf8f396034">🦙<b>Speculative</b> <b>Decoding</b> in <b>llama.cpp</b>, llama-server <b>Speculative</b> <b>decoding</b> in <b>llama.cpp</b> can be easily enabled via llama-cli and llama-server via the --model-draft argument. Note you must have a draft model, which generally is a smaller model, but it must have the same tokenizer Spec <b>Decoding</b> for GLM 4.7</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fqualcomm%2Fllama.cpp%2F7.3%2Dspeculative%2Ddecoding&amp;rut=429a7dcc6511880e30c2e59952e1e0cf41f487b9cfa3b0166ae0f56ad6125af8">Speculative Decoding | qualcomm/llama.cpp | DeepWiki</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fqualcomm%2Fllama.cpp%2F7.3%2Dspeculative%2Ddecoding&amp;rut=429a7dcc6511880e30c2e59952e1e0cf41f487b9cfa3b0166ae0f56ad6125af8">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/deepwiki.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fqualcomm%2Fllama.cpp%2F7.3%2Dspeculative%2Ddecoding&amp;rut=429a7dcc6511880e30c2e59952e1e0cf41f487b9cfa3b0166ae0f56ad6125af8">
+                            deepwiki.com/qualcomm/llama.cpp/7.3-speculative-decoding
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-04-10T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdeepwiki.com%2Fqualcomm%2Fllama.cpp%2F7.3%2Dspeculative%2Ddecoding&amp;rut=429a7dcc6511880e30c2e59952e1e0cf41f487b9cfa3b0166ae0f56ad6125af8">If the target model accepts the suggestions, multiple tokens are generated in a single forward pass, significantly increasing the tokens-per-second (TPS) in memory-bound scenarios. Overview of Implementations <b>llama.cpp</b> provides several strategies for <b>speculative</b> <b>decoding</b>, ranging from traditional draft models to statistical n-gram lookups.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fvucense.com%2Fdev%2Dcorner%2Fspeculative%2Ddecoding%2Dexplained%2D2x%2Dfaster%2Dlocal%2Dllms%2Dollama%2Dllama%2Dcpp%2D2026%2F&amp;rut=ba2701a28e10be4a1a4930a95f73c5e56b28f687e4815b0edd2ff95f01bb8fd8">Speculative Decoding for Local LLMs: llama.cpp + Ollama Setup</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fvucense.com%2Fdev%2Dcorner%2Fspeculative%2Ddecoding%2Dexplained%2D2x%2Dfaster%2Dlocal%2Dllms%2Dollama%2Dllama%2Dcpp%2D2026%2F&amp;rut=ba2701a28e10be4a1a4930a95f73c5e56b28f687e4815b0edd2ff95f01bb8fd8">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/vucense.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fvucense.com%2Fdev%2Dcorner%2Fspeculative%2Ddecoding%2Dexplained%2D2x%2Dfaster%2Dlocal%2Dllms%2Dollama%2Dllama%2Dcpp%2D2026%2F&amp;rut=ba2701a28e10be4a1a4930a95f73c5e56b28f687e4815b0edd2ff95f01bb8fd8">
+                            vucense.com/dev-corner/speculative-decoding-explained-2x-faster-local-llms-ollama-llama-cpp-2026/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-04-16T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fvucense.com%2Fdev%2Dcorner%2Fspeculative%2Ddecoding%2Dexplained%2D2x%2Dfaster%2Dlocal%2Dllms%2Dollama%2Dllama%2Dcpp%2D2026%2F&amp;rut=ba2701a28e10be4a1a4930a95f73c5e56b28f687e4815b0edd2ff95f01bb8fd8"><b>Speculative</b> <b>decoding</b> pairs a small draft model with a large target model. How it works, the exact <b>llama.cpp</b> flags, Ollama setup, and how to measure your own speedup.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftech%2Dinsider.org%2Fspeculative%2Ddecoding%2Dsetup%2D2026%2F&amp;rut=ad41faa1ab46e954746c7eaf2e3325c721d23917255a32bc424fe8f318cf0cfb">Speculative Decoding Setup: 13 Steps, 90 Min [2026]</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftech%2Dinsider.org%2Fspeculative%2Ddecoding%2Dsetup%2D2026%2F&amp;rut=ad41faa1ab46e954746c7eaf2e3325c721d23917255a32bc424fe8f318cf0cfb">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/tech-insider.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftech%2Dinsider.org%2Fspeculative%2Ddecoding%2Dsetup%2D2026%2F&amp;rut=ad41faa1ab46e954746c7eaf2e3325c721d23917255a32bc424fe8f318cf0cfb">
+                            tech-insider.org/speculative-decoding-setup-2026/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-09-29T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftech%2Dinsider.org%2Fspeculative%2Ddecoding%2Dsetup%2D2026%2F&amp;rut=ad41faa1ab46e954746c7eaf2e3325c721d23917255a32bc424fe8f318cf0cfb">Speed up local LLM inference with <b>speculative</b> <b>decoding</b>. A 13-step, 90-minute guide covering <b>llama.cpp</b>, vLLM, and Ollama draft-model setup for 2026.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funixgaming.org%2Fspeculative%2Ddecoding%2Dlocal%2Dllm%2Dsetup%2D2026%2F&amp;rut=a9e7cc20b9a4fc9f545e9eda8aa5a81c3fca7136da565ddbe1d214078212d7d6">Speculative Decoding Setup: llama.cpp &amp; vLLM [2026]</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funixgaming.org%2Fspeculative%2Ddecoding%2Dlocal%2Dllm%2Dsetup%2D2026%2F&amp;rut=a9e7cc20b9a4fc9f545e9eda8aa5a81c3fca7136da565ddbe1d214078212d7d6">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/unixgaming.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funixgaming.org%2Fspeculative%2Ddecoding%2Dlocal%2Dllm%2Dsetup%2D2026%2F&amp;rut=a9e7cc20b9a4fc9f545e9eda8aa5a81c3fca7136da565ddbe1d214078212d7d6">
+                            unixgaming.org/speculative-decoding-local-llm-setup-2026/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-10-06T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Funixgaming.org%2Fspeculative%2Ddecoding%2Dlocal%2Dllm%2Dsetup%2D2026%2F&amp;rut=a9e7cc20b9a4fc9f545e9eda8aa5a81c3fca7136da565ddbe1d214078212d7d6"><b>Speculative</b> <b>decoding</b> attacks that problem directly, and October 2026 is the first time the tooling to run it has gotten genuinely easy. <b>llama.cpp</b> 0.6.0, released October 5-6, 2026, shipped native MTP (multi-token prediction) <b>speculative</b> <b>decoding</b> support for Qwen4Exp and first-party handling for GLM-5.3-Flash. vLLM 0.30.0, which landed September ...</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mindstudio.ai%2Fblog%2Fllama%2Dcpp%2Dspeculative%2Ddecoding%2Dguide&amp;rut=e248bb61d42a59d225e2a42a3c883270f22a14f9362686ce80c54cb8f363b52f">Speculative Decoding in Llama.cpp: How to Actually Speed Up Local LLMs</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mindstudio.ai%2Fblog%2Fllama%2Dcpp%2Dspeculative%2Ddecoding%2Dguide&amp;rut=e248bb61d42a59d225e2a42a3c883270f22a14f9362686ce80c54cb8f363b52f">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/www.mindstudio.ai.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mindstudio.ai%2Fblog%2Fllama%2Dcpp%2Dspeculative%2Ddecoding%2Dguide&amp;rut=e248bb61d42a59d225e2a42a3c883270f22a14f9362686ce80c54cb8f363b52f">
+                            www.mindstudio.ai/blog/llama-cpp-speculative-decoding-guide
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-09-14T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.mindstudio.ai%2Fblog%2Fllama%2Dcpp%2Dspeculative%2Ddecoding%2Dguide&amp;rut=e248bb61d42a59d225e2a42a3c883270f22a14f9362686ce80c54cb8f363b52f"><b>Speculative</b> <b>Decoding</b> in <b>Llama.cpp</b>: How to Actually Speed Up Local LLMs How draft models, NGL layer tuning, and quantization choice combine in <b>Llama.cpp</b> to speed up local LLM inference, based on real hardware tests.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+
+            
+              
+              
+                <div class="nav-link">
+                  <form action="/html/" method="post">
+                    <input type="submit" class='btn btn--alt' value="Next" />
+                    <input type="hidden" name="q" value="speculative decoding llama.cpp" />
+                    <input type="hidden" name="s" value="10" />
+                    <input type="hidden" name="nextParams" value="" />
+                    <input type="hidden" name="v" value="l" />
+                    <input type="hidden" name="o" value="json" />
+                    <input type="hidden" name="dc" value="11" />
+                    <input type="hidden" name="api" value="d.js" />
+                    <input type="hidden" name="vqd" value="4-63078630330576172156008063381866834148" />
+
+                    
+                    
+                    
+                      <input name="kl" value="wt-wt" type="hidden" />
+                    
+                    
+                    
+                    
+                  </form>
+                </div>
+              
+            
+
+            <div class="feedback-btn">
+              <a rel="nofollow" href="//duckduckgo.com/feedback.html" target="_new">Feedback</a>
+            </div>
+            <div class="clear"></div>
+          </div>
+        </div>
+      </div> <!-- links wrapper //-->
+    
+  </div>
+
+  <div id="bottom_spacing2"></div>
+
+  
+    <img src="//duckduckgo.com/t/sl_h"/>
+  
+</body>
+</html>

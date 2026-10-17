@@ -1,0 +1,233 @@
+use std::range::Range;
+
+use derive_more::Debug;
+use thiserror::Error;
+
+use crate::{
+    backends::common::{Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding},
+    config::decoder::DecoderConfig,
+    data_type::DataType,
+    encodable_block::{
+        batch_topology::BatchTopology,
+        embedding::{Embedding, EmbeddingError},
+        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        per_layer_embedding::{PerLayerEmbedding, PerLayerEmbeddingError},
+        transformer::{RopeRows, Transformer, TransformerEncodeError, TransformerNewError, TransformerState},
+    },
+    safetensors::ParameterTree,
+};
+
+#[derive(Debug, Error)]
+pub enum DecoderError<B: Backend> {
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("Embedding error: {0}")]
+    EmbeddingError(#[from] EmbeddingError<B>),
+    #[error("Normalization error: {0}")]
+    Normalization(#[from] NormalizationNewError<B>),
+    #[error("Per-layer embedding error: {0}")]
+    PerLayerEmbedding(#[from] PerLayerEmbeddingError<B>),
+    #[error("Transformer error: {0}")]
+    Transformer(#[from] TransformerNewError<B>),
+    #[error("Transformer encoding error: {0}")]
+    TransformerEncode(#[from] TransformerEncodeError<B>),
+}
+
+pub struct Decoder<B: Backend> {
+    embedding: Embedding<B>,
+    embedding_norm: Option<Normalization<B>>,
+    per_layer_embedding: Option<PerLayerEmbedding<B>>,
+    transformer: Transformer<B>,
+}
+
+/// CortexCode patch P7: consecutive rows of the embedded batch replaced by given embeddings (image
+/// tokens), in the residual stream's basis (the embedding lookup's output basis).
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddingRows<'a> {
+    /// First batch row replaced.
+    pub row: u32,
+    /// Whole rows of bf16 bits (`model_dim` values each).
+    pub data: &'a [u16],
+}
+
+pub struct DecoderEncodeOutput<B: Backend> {
+    pub logits: Option<B::ScratchBuffer>,
+    pub hidden_features: Option<Box<[B::ScratchBuffer]>>,
+    pub final_hidden: Option<B::ScratchBuffer>,
+}
+
+impl<B: Backend> Decoder<B> {
+    pub(crate) fn embedding(&self) -> &Embedding<B> {
+        &self.embedding
+    }
+
+    pub fn new(
+        data_type: DataType,
+        config: &DecoderConfig,
+        parameter_tree: &ParameterTree<B>,
+        context: &B::Context,
+    ) -> Result<Self, DecoderError<B>> {
+        let (embedding, readout_input_hadamard_factors) = Embedding::new(
+            config.vocab_size,
+            config.transformer_config.model_dim,
+            data_type,
+            &config.embedding_config,
+            &parameter_tree.subtree("embedding"),
+            context,
+        )?;
+
+        let embedding_norm = config
+            .embedding_norm_config
+            .as_ref()
+            .map(|norm_config| {
+                Normalization::new(
+                    config.transformer_config.model_dim,
+                    data_type,
+                    None,
+                    ShortcutMode::None,
+                    PostLayerScalar::None,
+                    norm_config,
+                    &parameter_tree.subtree("embedding_norm"),
+                    context,
+                )
+            })
+            .transpose()?;
+
+        let per_layer_embedding = if let Some(ple_config) = &config.ple_model_config {
+            assert_eq!(
+                ple_config.num_layers,
+                config.transformer_config.layer_configs.len() as u32,
+                "per-layer embedding num_layers must match transformer layer count"
+            );
+            Some(PerLayerEmbedding::new(
+                config.transformer_config.model_dim,
+                data_type,
+                ple_config,
+                &parameter_tree.subtree("per_layer_embedding"),
+                context,
+            )?)
+        } else {
+            None
+        };
+
+        let transformer = Transformer::new(
+            data_type,
+            readout_input_hadamard_factors,
+            &config.transformer_config,
+            &parameter_tree.subtree("transformer"),
+            context,
+        )?;
+
+        Ok(Self {
+            embedding,
+            embedding_norm,
+            per_layer_embedding,
+            transformer,
+        })
+    }
+
+    pub fn speculation_supported(&self) -> bool {
+        self.transformer.speculation_supported()
+    }
+
+    pub fn max_context_length(&self) -> Option<u32> {
+        self.transformer.max_context_length()
+    }
+
+    /// CortexCode patch P7: the residual stream width.
+    pub fn model_dim(&self) -> u32 {
+        self.embedding.model_dim()
+    }
+
+    pub fn prefill_cache_skips_trailing_layers(&self) -> bool {
+        self.transformer.prefill_cache_skips_trailing_layers()
+    }
+
+    pub fn create_empty_state(
+        &self,
+        max_context_length: Option<u32>,
+        context: &B::Context,
+    ) -> Result<TransformerState<B>, B::Error> {
+        self.transformer.create_empty_state(max_context_length, context)
+    }
+
+    /// CortexCode patch P7: `embedding_rows` replace looked-up rows (image tokens) and `rope_rows`
+    /// give explicit rotary positions; both empty/None is the original behaviour.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        &self,
+        token_ids: impl BufferRef<Backend = B>,
+        batch_dim: &BatchTopology,
+        output_range: Option<Range<u32>>,
+        hidden_feature_layer_indices: Option<&[u32]>,
+        state: &mut TransformerState<B>,
+        embedding_rows: &[EmbeddingRows<'_>],
+        rope_rows: Option<RopeRows<'_>>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<DecoderEncodeOutput<B>, DecoderError<B>> {
+        let command_buffer = &mut *command_buffer.debug_group("decoder");
+
+        let mut embedded = self.embedding.encode_lookup(token_ids, batch_dim.size(), command_buffer)?;
+        // CortexCode patch P7: blit given rows over the lookup (the residual stream is in the
+        // original basis: the lookup undoes the table's incoherence rotation).
+        let row_bytes = self.embedding.model_dim() as usize * DataType::BF16.size_in_bytes();
+        for rows in embedding_rows {
+            let model_dim = self.embedding.model_dim() as usize;
+            assert!(!rows.data.is_empty() && rows.data.len().is_multiple_of(model_dim), "embedding rows must be whole rows");
+            let count = rows.data.len() / model_dim;
+            assert!(rows.row as usize + count <= batch_dim.size() as usize, "embedding rows exceed the batch");
+            let source = command_buffer.allocate_constant_from_slice(rows.data).map_err(DecoderError::Backend)?;
+            let start = rows.row as usize * row_bytes;
+            command_buffer.encode_copy(&source, (&mut embedded).subrange_mut(start..start + count * row_bytes));
+        }
+        let embedded = if let Some(embedding_norm) = &self.embedding_norm {
+            embedding_norm
+                .encode(&embedded, 0, batch_dim.size(), None::<&mut B::ScratchBuffer>, command_buffer)
+                .map_err(DecoderError::Backend)?
+        } else {
+            embedded
+        };
+
+        let per_layer_inputs = if let Some(per_layer_embedding) = &self.per_layer_embedding {
+            Some(per_layer_embedding.encode(token_ids, &embedded, batch_dim.size(), command_buffer)?)
+        } else {
+            None
+        };
+
+        let transformer_output = self.transformer.encode_with_rope_rows(
+            embedded,
+            per_layer_inputs.as_ref(),
+            batch_dim,
+            output_range,
+            hidden_feature_layer_indices,
+            Some(state),
+            rope_rows,
+            command_buffer,
+        )?;
+
+        let logits = if let Some(output_range) = output_range {
+            let output = transformer_output.output.as_ref().expect("decoder output range requires transformer output");
+            Some(self.embedding.encode_readout(
+                output,
+                output_range.end - output_range.start,
+                self.embedding.vocab_size(),
+                None::<&B::ScratchBuffer>,
+                true,
+                command_buffer,
+            )?)
+        } else {
+            None
+        };
+        let final_hidden = if hidden_feature_layer_indices.is_none() {
+            None
+        } else {
+            transformer_output.output
+        };
+
+        Ok(DecoderEncodeOutput {
+            logits,
+            hidden_features: transformer_output.hidden_features,
+            final_hidden,
+        })
+    }
+}

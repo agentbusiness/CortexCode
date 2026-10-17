@@ -1,0 +1,11 @@
+{
+ "id": "omni__core-6",
+ "suite": "swebench",
+ "lang": "python",
+ "group": "omni/core",
+ "repo": "omni/core",
+ "instance_id": "omni__core-6",
+ "base_commit": "0000000000000000000000000000000000000000",
+ "test_files": [],
+ "prompt": "fix omni__core-6"
+}

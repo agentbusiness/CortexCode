@@ -1,0 +1,44 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# verification and README together, separable into its own repository (only cc-protocol comes from
+# outside). `cortex-pack` builds the folder and packs it into a portable .ccplugin; the frame runs it only as an installed package. Paths are relative to this folder.
+
+[plugin]
+id = "container"
+name = "Containers"
+version = "0.1.0"
+description = "Projects whose commands run inside Docker while their files stay on the Mac: one container (the root bind-mounted at its workdir), a Docker Compose project (commands run in one service), or a devcontainer with features (built by the Dev Containers CLI); attach from parameters, .cortex/container.toml or devcontainer.json (build, pull, seed from the image, published ports, lifecycle commands), exec with streamed output, timeout and in-container kill, interactive shell argv for terminals, images, build, pull, logs, ps and ports."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "container"
+contract = "container@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-container"
+provides = [
+  "container.attach", "container.status", "container.exec", "container.detach", "container.list",
+  "container.shell_command", "container.images", "container.build", "container.pull", "container.logs",
+  "container.ps", "container.ports",
+]
+publishes = ["container.changed"]
+
+# Defaults for the frame config's [plugin.config] table (the frame config's values win).
+[backend.config]
+# docker = "/usr/local/bin/docker"   # the docker CLI; default: `docker` on PATH, then Docker Desktop's locations
+max_output_bytes = 8388608           # output kept in an exec result (the latest bytes); items stream all of it
+stop_wait_ms = 3000                  # after a timeout/cancel: wait this long for the command to end after each kill
+devcontainer_cli_version = "0.75.0"  # @devcontainers/cli installed into $CORTEX_HOME/toolchains/devcontainers-cli/<version>
+# devcontainer_cli = "/path/to/devcontainer"   # use this Dev Containers CLI instead of installing one
+# node = "/opt/homebrew/bin/node"              # node for the Dev Containers CLI; default: on PATH, then Homebrew's
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/container"

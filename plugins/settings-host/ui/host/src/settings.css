@@ -1,0 +1,12 @@
+/* settings.host@1 — a window over the workbench: the design's sheet, wider, with the index's nav. */
+#cc .cx-settings-scrim{padding-top:8vh;}
+#cc .cx-settings{width:min(980px,calc(100vw - 32px));height:min(720px,84vh);display:flex;flex-direction:column;}
+#cc .cx-settings-body{flex:1;min-height:0;display:grid;grid-template-columns:184px 1px minmax(0,1fr);}
+#cc .cx-settings-body::before{content:"";grid-column:2;grid-row:1;background:var(--rule);}
+#cc .cx-settings-nav{grid-column:1;grid-row:1;padding:16px 12px 0 0;}
+#cc .cx-settings-panel{grid-column:3;grid-row:1;min-height:0;overflow:auto;padding:16px 20px 48px;}
+#cc .cx-settings:focus{outline:none;}
+/* The shared look of settings panels' titles, lines and paths. */
+#cc .cx-settings-title{font-family:var(--font-reading);font-size:19px;font-weight:500;margin:12px 0 8px;color:var(--ink);letter-spacing:-.008em;}
+#cc .cx-settings-line{font-size:15px;color:var(--ink-2);margin:0 0 8px;max-width:62ch;}
+#cc .cx-path{font-family:var(--font-mono);font-size:12px;overflow-wrap:anywhere;}

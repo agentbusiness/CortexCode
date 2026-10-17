@@ -1,0 +1,34 @@
+[package]
+name = "cc-agents"
+description = "CortexCode agents (agents@1): delegation into a task tree with contracts, named agents in copy-on-write workspaces, scheduler, verification, board and merge steward."
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+
+# A self-contained plugin: its own workspace, depending only on the protocol.
+[workspace]
+
+[lib]
+name = "cc_agents"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-agents"
+path = "src/bin/cc-agents.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23", features = ["v4"] }
+toml = "0.9.12"
+regex = "1.12"
+
+[profile.release]
+debug = 1

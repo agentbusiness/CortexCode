@@ -1,0 +1,35 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# data, verification and README together, separable into its own repository (only cc-protocol and
+# cc-lang-kit come from outside). `cortex-pack` builds the folder and packs it into a portable
+# .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "lang-go"
+name = "Go"
+version = "0.1.0"
+description = "Everything CortexCode knows about Go: the code graph's facts of .go files and go.mod, gopls diagnostics, definition, references and hover, go build / vet / test verifiers, Go, gopls and delve installed into the toolchains directory, and Go skills."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+# One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.
+# `data/` (the skills) ships beside the executable. `[plugin.config] server_path` overrides the
+# gopls executable.
+[backend]
+category = "lang-go"
+contract = "lang@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-lang-go"
+assets = ["data"]
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/lang-go"

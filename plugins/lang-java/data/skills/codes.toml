@@ -1,0 +1,17 @@
+# Diagnostic codes the Java guide covers, as jdtls emits them: the Eclipse compiler's problem id
+# (org.eclipse.jdt.core.compiler.IProblem) as the diagnostic `code`. javac, Gradle and Maven print no
+# codes. The guide is always loaded, so the tools only point to it when one of these shows up; the
+# model never reads this file.
+#
+# UndefinedType 16777218, UndefinedMethod 67108964, UndefinedName 570425394, UndefinedField 33554502,
+# ImportNotFound 268435846, IsClassPathCorrect 16777540, TypeMismatch 16777233, ParameterMismatch
+# 67108979, UndefinedConstructor 134217858, UnhandledException 16777384, UnhandledExceptionOnAutoClose
+# 16778098, OuterLocalMustBeEffectivelyFinal 536871575, LocalMustBeEffectivelyFinal 536871586,
+# ParsingError 1610612940, ParsingErrorNoSuggestion 1610612941, ParsingErrorInsertTokenAfter
+# 1610612967, ParsingErrorDeleteToken 1610612968, ParsingErrorInsertToComplete 1610612976,
+# ParsingErrorInsertToCompleteScope 1610612977, ParsingErrorInsertToCompletePhrase 1610612978.
+java = [
+  "16777218", "67108964", "570425394", "33554502", "268435846", "16777540", "16777233", "67108979",
+  "134217858", "16777384", "16778098", "536871575", "536871586",
+  "1610612940", "1610612941", "1610612967", "1610612968", "1610612976", "1610612977", "1610612978",
+]

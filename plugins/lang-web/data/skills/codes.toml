@@ -1,0 +1,5 @@
+# Diagnostic codes the web guide covers: vscode-css-language-server's diagnostic `code` (`unknownProperties`,
+# `css-semicolonexpected`), and html-validate's and stylelint's rule names as their output prints them
+# (`no-dup-id`, `property-no-unknown`). The guide is always loaded, so the tools only point to it when
+# one of these shows up; the model never reads this file.
+web = ["css-semicolonexpected", "css-rcurlyexpected", "css-lcurlyexpected", "css-colonexpected", "css-propertyvalueexpected", "css-identifierexpected", "css-ruleorselectorexpected", "css-selectorexpected", "unknownProperties", "property-no-unknown", "no-invalid-double-slash-comments", "no-invalid-position-at-import-rule", "declaration-block-no-duplicate-properties", "no-descending-specificity", "element-permitted-content", "element-permitted-parent", "close-order", "void-style", "no-self-closing", "void-content", "no-dup-id", "no-missing-references", "no-implicit-button-type", "missing-doctype", "doctype-html"]

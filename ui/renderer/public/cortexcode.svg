@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>CortexCode — Bracketed graph, square</title>
+  <rect width="64" height="64" fill="#14171A"/>
+  <path d="M17 16 7 32l10 16M47 16l10 16-10 16" fill="none" stroke="#E9EBEC" stroke-width="3.5" stroke-linecap="square" stroke-linejoin="miter"/>
+  <!-- four nodes on a square (IronGraph's 2x2 die), fully connected -->
+  <path d="M23 23H41V41H23Z M23 23 41 41 M41 23 23 41" fill="none" stroke="#6E9BB5" stroke-width="1.6"/>
+  <rect x="19.5" y="19.5" width="7" height="7" fill="#E9EBEC"/>
+  <rect x="37.5" y="19.5" width="7" height="7" fill="#E9EBEC"/>
+  <rect x="19.5" y="37.5" width="7" height="7" fill="#E9EBEC"/>
+  <rect x="37.5" y="37.5" width="7" height="7" fill="#E2603F"/>
+</svg>

@@ -1,0 +1,32 @@
+[package]
+name = "cc-protocol"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "Cortex Plugin Protocol: framing, RPC connection, plugin runtime and the versioned category contracts shared by the CortexCode frame and every plugin."
+
+# Standalone: every plugin is its own workspace and depends on this crate by path.
+[workspace]
+
+# `preserve_order`: JSON objects keep their key order through parse and serialize (serde_json's
+# feature of the same name), so a request relayed through the frame reaches its plugin with its
+# properties in the order the caller wrote them (a JSON schema whose property order matters to a
+# model, for example). The frame enables it; a plugin that builds or reads order-sensitive JSON
+# enables it too. Opt-in rather than default because it applies to every crate in a build: it makes
+# `serde_json::Value` (and so `RpcError`) larger, which plugins that do not need it should not pay.
+[features]
+preserve_order = ["serde_json/preserve_order"]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["full"] }
