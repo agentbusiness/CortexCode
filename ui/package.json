@@ -1,0 +1,53 @@
+{
+  "name": "cortexcode-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "CortexCode workbench: the Electron shell, the renderer and its UI plugins",
+  "type": "module",
+  "main": "shell/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "verify:build": "node scripts/verify-build.mjs",
+    "postinstall": "install-electron && node scripts/brand-electron.mjs",
+    "brand:electron": "node scripts/brand-electron.mjs"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/language": "6.13.1",
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/merge": "6.12.2",
+    "@codemirror/search": "6.7.2",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.14",
+    "@fontsource-variable/archivo": "5.3.0",
+    "@fontsource-variable/source-serif-4": "5.3.1",
+    "@lezer/highlight": "1.2.5",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.2",
+    "@vitejs/plugin-react": "6.1.2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "6.0.0",
+    "electron": "44.7.2",
+    "jsdom": "30.1.2",
+    "playwright": "1.64.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  },
+  "workspaces": [
+    "sdk"
+  ]
+}

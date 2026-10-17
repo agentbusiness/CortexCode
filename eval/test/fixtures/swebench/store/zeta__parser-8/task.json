@@ -1,0 +1,11 @@
+{
+ "id": "zeta__parser-8",
+ "suite": "swebench",
+ "lang": "python",
+ "group": "zeta/parser",
+ "repo": "zeta/parser",
+ "instance_id": "zeta__parser-8",
+ "base_commit": "0000000000000000000000000000000000000000",
+ "test_files": [],
+ "prompt": "fix zeta__parser-8"
+}

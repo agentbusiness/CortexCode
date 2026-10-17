@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "brief": {"type": "string"},
+          "plan": {"type": "string"},
+          "checks": {"type": "array", "items": {"enum": ["@verifiers"]}, "maxItems": 4},
+          "touches": {"type": "array", "items": {"type": "string"}},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "effort": {"enum": ["none", "low", "medium", "high", "xhigh"]}
+        },
+        "required": ["title", "brief", "plan", "checks", "touches", "depends_on", "effort"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["tasks"],
+  "additionalProperties": false
+}

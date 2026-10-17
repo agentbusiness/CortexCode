@@ -1,0 +1,28 @@
+[package]
+name = "cc-lang-go"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode lang@1 plugin for Go: the code graph's facts of .go files and go.mod, gopls diagnostics/definition/references/hover, go build / vet / test verifiers and Go skills."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_lang_go"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-lang-go"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+tree-sitter-go = "0.25"
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }

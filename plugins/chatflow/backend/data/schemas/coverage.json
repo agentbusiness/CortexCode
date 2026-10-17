@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "missing": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@requirements"
+        ]
+      },
+      "maxItems": 12
+    }
+  },
+  "required": [
+    "missing"
+  ],
+  "additionalProperties": false
+}

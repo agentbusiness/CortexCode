@@ -1,0 +1,3 @@
+# The Docker guide is loaded into every session of a Docker project (never a choice).
+[docker]
+always = true

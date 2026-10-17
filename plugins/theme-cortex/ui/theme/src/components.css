@@ -1,0 +1,2225 @@
+/*
+ * The parts the mockup never drew.
+ *
+ * `reference.css` is the approved design, unchanged: it draws the shell and the eight screens.
+ * The application also carries components the mockup had no sample of — a Gantt canvas, a
+ * markdown editor, a graph plot, a skills panel, a model catalogue — and without rules those
+ * render as unstyled boxes with runaway heights.
+ *
+ * This sheet dresses exactly those, in the design's own grammar and its own tokens: one ground,
+ * hairlines at one device pixel, no radius, no shadow, no gradient, the 4px lattice, Archivo for
+ * apparatus and Source Serif for reading. Nothing here redefines a token or overrides a rule in
+ * the design; if a rule here disagrees with `reference.css`, this sheet is the one that is wrong.
+ */
+
+/* ─── shared idioms ──────────────────────────────────────────────────────── */
+/* The design sizes the register cross wherever it draws one; its sheet does it inline. */
+#cc .sheet-h .cross{width:9px;height:9px;color:var(--rubric);flex:0 0 auto;}
+#cc .sr-only{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0;
+}
+#cc .spin{animation:cc-spin 1s linear infinite;}
+@keyframes cc-spin{to{transform:rotate(360deg);}}
+#cc .hint,#cc .sidebar-empty,#cc .settings-empty,#cc .graph-empty,#cc .result-empty,
+#cc .selection-empty,#cc .composer-skill-empty,#cc .research-hint{
+  font-family:Archivo,sans-serif;font-size:11px;font-weight:500;letter-spacing:.06em;
+  color:var(--ink-3);margin:8px 0;
+}
+#cc .banner,#cc .document-banner,#cc .settings-notice,#cc .inline-error,#cc .field-error,
+#cc .settings-error,#cc .research-error,#cc .identity-error,#cc .renderer-error{
+  font-family:Archivo,sans-serif;font-size:11px;font-weight:500;letter-spacing:.05em;
+  color:var(--ink-2);border-left:2px solid var(--rule-2);padding:7px 11px;margin:10px 0;
+  display:flex;align-items:center;gap:10px;
+}
+#cc .banner.error,#cc .document-banner.error,#cc .inline-error,#cc .field-error,
+#cc .settings-error,#cc .research-error,#cc .identity-error,#cc .renderer-error,
+#cc .document-banner.warning{border-left-color:var(--rubric);color:var(--rubric);}
+#cc .document-banner.ok,#cc .document-banner.working{border-left-color:var(--counter);color:var(--counter);}
+
+/* Buttons the components ask for by another name. The design has two shapes — a detent you
+   press and a pick that states a value — so every one of these becomes a detent. */
+#cc .button,#cc .icon-button,#cc .link-button,#cc .menu-trigger,#cc .new-button,
+#cc .cluster-expand,#cc .research-close,#cc .report-modal-close,#cc .omnibox-close,
+#cc .settings-skill-open,#cc .settings-skill-add,#cc .pending-group-toggle,
+#cc .attachment-remove,#cc .reply-close,#cc .research-plan-remove,#cc .message-action-link,
+#cc .graph-block-footer button,#cc .share-actions button{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-2);background:transparent;
+  border:1px solid var(--rule-2);padding:0 9px;height:22px;
+  display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;
+}
+#cc .button:hover,#cc .icon-button:hover,#cc .link-button:hover,#cc .menu-trigger:hover,
+#cc .new-button:hover,#cc .settings-skill-open:hover{color:var(--ink);border-color:var(--ink-3);}
+/* The same answer the design gives `.detent`, since these are the same control by another name:
+   one step down the ink and rule ladders, and hover says nothing back. Not opacity. */
+#cc .button:disabled,#cc .icon-button:disabled,#cc .menu-trigger:disabled,
+#cc .link-button:disabled,#cc .new-button:disabled,#cc .button[aria-disabled="true"]{
+  color:var(--ink-3);border-color:var(--rule);cursor:default;
+}
+#cc .button:disabled:hover,#cc .icon-button:disabled:hover,#cc .menu-trigger:disabled:hover,
+#cc .link-button:disabled:hover,#cc .new-button:disabled:hover{color:var(--ink-3);border-color:var(--rule);}
+#cc .button.primary,#cc .menu-trigger.primary,#cc .icon-button.on,
+#cc .button[aria-pressed="true"],#cc .icon-button[aria-pressed="true"]{
+  color:var(--rubric);border-color:var(--rubric);
+}
+#cc .button.danger,#cc .icon-button.danger,#cc .button.compact.danger{color:var(--rubric);border-color:var(--rubric-deep);}
+#cc .link-button{border:0;padding:0;color:var(--rubric);text-decoration:underline;text-underline-offset:2px;}
+#cc .icon-button{padding:0 6px;}
+
+/* A search field is the design's `.field`. */
+#cc .search{
+  display:flex;align-items:center;gap:7px;height:24px;padding:0 8px;
+  border:1px solid var(--rule-2);color:var(--ink-3);min-width:0;
+}
+#cc .search input{
+  border:0;background:transparent;color:var(--ink);min-width:0;flex:1;
+  font-family:Archivo,sans-serif;font-size:11.5px;letter-spacing:.02em;outline:0;
+}
+#cc .search input::placeholder{color:var(--unwritten);}
+
+/* ─── the timeline: the Gantt the mockup drew by hand ────────────────────── */
+#cc .timeline{display:flex;flex-direction:column;min-height:0;flex:1;}
+#cc .timeline-body{
+  display:flex;min-height:0;flex:1;border:1px solid var(--rule);
+  max-height:56vh;overflow:hidden;
+}
+#cc .timeline-outline{
+  flex:0 0 auto;border-right:1px solid var(--rule);overflow-x:hidden;overflow-y:auto;
+  min-height:0;
+}
+#cc .outline-header{
+  position:sticky;top:0;z-index:2;background:var(--ground);
+  display:flex;align-items:center;padding:0 11px;border-bottom:1px solid var(--rule);
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-3);flex:0 0 auto;
+}
+#cc .outline-rows{position:relative;}
+#cc .outline-row{
+  display:flex;align-items:center;gap:7px;cursor:pointer;
+  border-bottom:1px solid var(--rule);font-size:13px;color:var(--ink-2);
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+}
+#cc .outline-row:hover{background:var(--rubric-wash);}
+#cc .outline-row.selected{color:var(--ink);box-shadow:inset 2px 0 0 var(--rubric);}
+#cc .outline-title{
+  font-size:13px;line-height:1.2;color:inherit;overflow:hidden;
+  white-space:nowrap;text-overflow:ellipsis;min-width:0;
+}
+#cc .outline-twisty{
+  border:0;background:transparent;color:var(--ink-3);cursor:pointer;
+  padding:0;width:12px;flex:0 0 auto;
+}
+#cc .canvas-scroll{flex:1;min-width:0;overflow:auto;position:relative;}
+#cc .canvas-header{
+  position:sticky;top:0;z-index:2;background:var(--ground);
+  border-bottom:1px solid var(--rule);
+}
+#cc .canvas-tick{
+  position:absolute;font-family:Archivo,sans-serif;font-size:9px;font-weight:500;
+  letter-spacing:.06em;color:var(--ink-3);font-variant-numeric:tabular-nums;
+  padding-left:4px;white-space:nowrap;
+}
+#cc .canvas-grid{position:absolute;inset:0;pointer-events:none;}
+#cc .canvas-line{position:absolute;top:0;bottom:0;width:1px;background:var(--rule);}
+#cc .now-line{position:absolute;top:0;bottom:0;width:1px;background:var(--rubric);}
+#cc .now-flag{
+  position:absolute;top:0;font-family:Archivo,sans-serif;font-size:9px;font-weight:650;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--rubric);padding-left:3px;
+}
+/*
+ * The Gantt canvas has to claim the width the outline leaves.
+ *
+ * Everything drawn on it — bars, grid lines, the now marker — is absolutely positioned, so the
+ * element has no intrinsic width, and as a plain flex item it resolved to **zero**. The bars were
+ * being laid out correctly and painted into a 0px box: a Gantt chart with rows down the left and
+ * nothing at all to the right of them.
+ */
+#cc .timeline-canvas{position:relative;flex:1 1 auto;min-width:0;overflow-x:hidden;overflow-y:auto;}
+#cc .canvas-arrows{position:absolute;inset:0;pointer-events:none;overflow:visible;}
+#cc .gbar{
+  position:absolute;display:flex;align-items:center;gap:6px;padding:0 7px;
+  border:1px solid var(--counter);background:transparent;color:var(--ink);
+  font-size:12px;cursor:grab;white-space:nowrap;overflow:hidden;
+}
+#cc .gbar:hover{background:var(--rubric-wash);}
+#cc .gbar.selected{border-color:var(--rubric);box-shadow:inset 0 0 0 1px var(--rubric);}
+#cc .gbar.running{border-color:var(--rubric-lift);}
+#cc .gbar.state-overdue,#cc .gbar.state-needs_attention{border-color:var(--rubric);color:var(--rubric);}
+#cc .gbar.state-blocked{border-style:dashed;color:var(--ink-3);}
+#cc .gbar.dimmed{opacity:.34;}
+#cc .gbar.highlighted{border-color:var(--rubric-lift);}
+#cc .gbar-label{overflow:hidden;text-overflow:ellipsis;}
+#cc .gbar-handle{
+  position:absolute;top:0;bottom:0;width:5px;cursor:ew-resize;background:transparent;
+  border:0;padding:0;
+}
+#cc .gbar-handle.start{left:0;}
+#cc .gbar-handle.end{right:0;}
+#cc .gbar-empty{
+  position:absolute;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-3);
+}
+#cc .gbar-empty-hint{font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.1em;text-transform:uppercase;}
+#cc .canvas-tools{
+  display:flex;align-items:center;gap:9px;padding:7px 0;
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+
+/* ─── the calendar grid ──────────────────────────────────────────────────── */
+#cc .calendar-grid{display:flex;flex-direction:column;min-height:0;border:1px solid var(--rule);}
+#cc .calendar-header{
+  display:flex;align-items:center;gap:11px;padding:8px 11px;border-bottom:1px solid var(--rule);
+}
+#cc .calendar-title{
+  font-family:Archivo,sans-serif;font-size:10px;font-weight:650;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink);
+}
+#cc .calendar-nav{display:flex;gap:6px;margin-left:auto;}
+#cc .calendar-weekdays{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--rule);}
+#cc .calendar-weekday{
+  padding:6px 8px;font-family:Archivo,sans-serif;font-size:9px;font-weight:650;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);
+}
+#cc .calendar-weekday-date{margin-left:6px;font-variant-numeric:tabular-nums;color:var(--ink-2);}
+#cc .calendar-weekday.today,#cc .calendar-cell.today .calendar-cell-date{color:var(--rubric);}
+#cc .calendar-month{display:grid;grid-template-columns:repeat(7,1fr);overflow:auto;min-height:0;}
+#cc .calendar-cell{
+  min-height:96px;padding:6px;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);
+  display:flex;flex-direction:column;gap:3px;
+}
+#cc .calendar-cell-date{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:600;letter-spacing:.06em;
+  color:var(--ink-3);font-variant-numeric:tabular-nums;
+}
+#cc .calendar-more{font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.1em;color:var(--ink-3);}
+/* Both of these fill what the header leaves. Without `flex:1` they size to content, and since
+   their own children are absolutely positioned against a height the component sets, the whole
+   week body resolved to zero — the hours were laid out correctly inside a 0px box. */
+#cc .calendar-week{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;overflow:hidden;}
+#cc .calendar-allday{display:grid;grid-template-columns:var(--cal-rail,52px) repeat(7,1fr);border-bottom:1px solid var(--rule);}
+#cc .calendar-allday-cell{padding:4px 5px;border-left:1px solid var(--rule);min-height:26px;display:flex;flex-wrap:wrap;gap:3px;}
+#cc .calendar-hours{display:grid;grid-template-columns:var(--cal-rail,52px) 1fr;flex:1 1 auto;overflow:auto;min-height:0;position:relative;}
+#cc .calendar-hour-rail{position:relative;border-right:1px solid var(--rule);}
+#cc .calendar-hour-label{
+  position:absolute;right:6px;font-family:Archivo,sans-serif;font-size:9px;
+  letter-spacing:.05em;color:var(--ink-3);font-variant-numeric:tabular-nums;
+}
+#cc .calendar-columns{display:grid;grid-template-columns:repeat(7,1fr);position:relative;}
+#cc .calendar-column{position:relative;border-left:1px solid var(--rule);}
+#cc .calendar-hour-line{position:absolute;left:0;right:0;height:1px;background:var(--rule);}
+#cc .calendar-now{position:absolute;left:0;right:0;height:1px;background:var(--rubric);z-index:3;}
+#cc .calendar-event{
+  position:absolute;left:2px;right:2px;padding:2px 5px;overflow:hidden;
+  border:1px solid var(--counter);background:var(--ground);color:var(--ink);
+  font-size:11.5px;line-height:1.25;text-align:left;cursor:pointer;
+}
+#cc .calendar-event.selected{border-color:var(--rubric);}
+#cc .calendar-event.state-overdue,#cc .calendar-event.state-needs_attention{border-color:var(--rubric);color:var(--rubric);}
+#cc .calendar-event-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .calendar-event-time{
+  display:block;font-family:Archivo,sans-serif;font-size:8.5px;letter-spacing:.06em;
+  color:var(--ink-3);font-variant-numeric:tabular-nums;
+}
+
+/* ─── the graph plot ─────────────────────────────────────────────────────── */
+#cc .graph-canvas-wrap{position:relative;flex:1;min-height:240px;border:1px solid var(--rule);overflow:hidden;}
+#cc .graph-canvas{display:block;width:100%;height:100%;}
+#cc .graph-empty{display:flex;align-items:center;justify-content:center;height:100%;}
+#cc .graph-hud-stats{
+  position:absolute;left:9px;bottom:9px;font-family:Archivo,sans-serif;font-size:9px;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);
+}
+#cc .graph-legend{
+  position:absolute;right:9px;top:9px;display:flex;flex-direction:column;gap:4px;
+  background:var(--ground);border:1px solid var(--rule);padding:7px 9px;max-width:180px;
+}
+#cc .graph-legend div{display:flex;align-items:center;gap:7px;}
+#cc .graph-legend-swatch{width:6px;height:6px;flex:0 0 auto;}
+#cc .graph-legend-name{
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.06em;color:var(--ink-2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .graph-legend-count{
+  margin-left:auto;font-family:Archivo,sans-serif;font-size:9px;color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
+#cc .graph-control-panel{
+  display:flex;flex-wrap:wrap;align-items:center;gap:9px;padding:8px 0;
+  border-bottom:1px solid var(--rule);margin-bottom:10px;
+}
+#cc .graph-control-row,#cc .graph-control-checks{display:flex;align-items:center;gap:9px;flex-wrap:wrap;}
+#cc .graph-control-label,#cc .graph-control-check,#cc .graph-control-note{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:600;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);display:inline-flex;align-items:center;gap:5px;
+}
+#cc .graph-segmented{display:flex;border:1px solid var(--rule-2);}
+#cc .graph-segmented button{
+  border:0;background:transparent;padding:0 9px;height:22px;cursor:pointer;
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .graph-segmented button+button{border-left:1px solid var(--rule-2);}
+#cc .graph-segmented button[aria-pressed="true"],#cc .graph-segmented button.active{color:var(--rubric);}
+#cc .selection-card,#cc .cluster-card{border:1px solid var(--rule);padding:11px 13px;margin-top:12px;}
+#cc .selection-kind{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--counter);
+}
+#cc .cluster-members{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;}
+#cc .cluster-members-more{font-family:Archivo,sans-serif;font-size:9px;color:var(--ink-3);}
+
+/* ─── the history rail ───────────────────────────────────────────────────── */
+/* The sidebar is history and nothing else, so a row can afford to show the whole statement
+   rather than one truncated line of it. */
+#cc .lst.hist li.hist-row{display:flex;align-items:flex-start;gap:0;}
+#cc .lst.hist li.hist-row > button:first-child{flex:1;min-width:0;}
+#cc .hist-query{
+  display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;
+  white-space:pre-wrap;overflow-wrap:anywhere;
+  font:500 12.5px Archivo,ui-monospace,monospace;color:var(--ink);letter-spacing:.01em;
+}
+#cc .lst.hist li.hist-row:hover .hist-query{color:var(--ink);}
+/* Forgetting one statement is per row, and stays out of the way until the row is under the
+   pointer or the key focus — it is the destructive control of the pair. */
+#cc .hist-forget{
+  /* `.lst button` is a full-width block row; this one sits beside such a row, so it takes its
+     width from its own text instead. */
+  flex:0 0 auto;width:auto;display:block;
+  border:0;background:transparent;padding:12px 16px 0 10px;cursor:pointer;
+  opacity:0;transition:opacity .12s linear;
+}
+#cc .hist-forget:hover{background:transparent;}
+#cc .lst.hist li.hist-row:hover .hist-forget,#cc .hist-forget:focus-visible{opacity:1;}
+#cc .hist-forget:hover{color:var(--rubric);}
+#cc .lst.hist .daybreak{padding-left:18px;padding-right:16px;}
+
+/* ─── the schema census, beside the editor ───────────────────────────────── */
+#cc .census{border:1px solid var(--rule);margin-bottom:12px;}
+#cc .census-bar{padding:7px 11px 8px;border-bottom:0;gap:10px;}
+#cc .census.open .census-bar{border-bottom:1px solid var(--rule);}
+#cc .census-toggle{
+  display:inline-flex;align-items:center;gap:7px;border:0;background:transparent;padding:0;
+  cursor:pointer;color:var(--ink-2);
+}
+#cc .census-toggle:hover{color:var(--ink);}
+/* The disclosure is a square that gains a bar when it opens: the design's mark vocabulary, not a
+   chevron borrowed from somewhere else. */
+#cc .census-mark{
+  width:7px;height:7px;flex:0 0 auto;box-shadow:inset 0 0 0 1px var(--ink-3);position:relative;
+}
+#cc .census.open .census-mark{background:var(--rubric);box-shadow:none;}
+#cc .census-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 1px;background:var(--rule);}
+#cc .census-col{background:var(--ground);min-width:0;display:flex;flex-direction:column;min-height:0;}
+#cc .census-col .bar.tier{border-top:0;padding-left:11px;padding-right:11px;}
+#cc .census-col .schema{overflow:auto;max-height:34vh;}
+#cc .census-col .schema button{padding-left:11px;padding-right:11px;gap:7px;}
+/* The counts are a column, not a suffix: right-aligned and tabular, they can be compared down the
+   list without reading a single one of them. */
+#cc .census-col .schema .ct{min-width:52px;text-align:right;font-size:10.5px;color:var(--ink-2);}
+#cc .census-col .schema .lb{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+/* Where a row lives when a plain statement cannot see it. Counter, because it is provenance. */
+#cc .census-layer{
+  font-family:Archivo,sans-serif;font-size:8.5px;font-weight:650;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--counter);border:1px solid var(--counter);
+  padding:1px 4px;flex:0 0 auto;
+}
+#cc .census-layers{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 16px;margin:0;
+  padding:8px 11px 9px;border-top:1px solid var(--rule);
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:600;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .census-layers b{font-size:12px;font-variant-numeric:tabular-nums;color:var(--ink);letter-spacing:.02em;}
+#cc .census-note{
+  flex:1;min-width:220px;text-transform:none;letter-spacing:0;font-weight:400;
+  font:400 12.5px/1.45 "Source Serif 4","Iowan Old Style",Georgia,serif;color:var(--ink-3);
+}
+
+/* ─── the margin, reading the plot ───────────────────────────────────────── */
+#cc .marg.insp{padding-right:16px;}
+#cc .insp-clear{border:0;background:transparent;padding:0;cursor:pointer;}
+#cc .insp-clear:hover{color:var(--rubric);}
+#cc .insp-lede{margin:0 0 22px;font-size:13.5px;line-height:1.5;color:var(--ink-2);}
+
+#cc .insp-head{display:flex;align-items:center;gap:7px;margin-bottom:10px;}
+#cc .insp-swatch{width:7px;height:7px;flex:0 0 auto;background:var(--ink-3);}
+#cc .insp-swatch.hollow{background:transparent;box-shadow:inset 0 0 0 1px var(--ink-3);}
+#cc .insp-id{
+  margin-left:auto;font-family:Archivo,sans-serif;font-size:9.5px;font-weight:500;
+  letter-spacing:.06em;font-variant-numeric:tabular-nums;color:var(--ink-3);
+}
+#cc .insp-title{
+  margin:0 0 10px;font:400 19px/1.24 "Source Serif 4","Iowan Old Style",Georgia,serif;
+  letter-spacing:-.008em;color:var(--ink);overflow-wrap:anywhere;
+}
+#cc .insp-labels{display:flex;flex-wrap:wrap;gap:5px 8px;margin-bottom:15px;}
+#cc .insp-lb{font:500 11.5px Archivo,ui-monospace,monospace;color:var(--counter);letter-spacing:.01em;}
+#cc .insp-acts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;}
+
+/* What a traversal answered, and what went wrong when one did. Both are reports about the node
+   above them, so both are bracketed to it the way the margin brackets everything else. */
+#cc .insp-note,#cc .insp-trouble{
+  margin:0 0 18px;padding-left:10px;border-left:1px solid var(--counter);
+  font-family:Archivo,sans-serif;font-size:10.5px;font-weight:500;line-height:1.55;
+  letter-spacing:.04em;color:var(--ink-2);
+}
+#cc .insp-trouble{border-left-color:var(--rubric);color:var(--rubric);}
+
+#cc .insp-sec{display:flex;align-items:center;gap:9px;margin:0 0 10px;}
+#cc .insp-sec-rule{flex:1;height:1px;background:var(--rule);}
+
+#cc .insp-rels{list-style:none;margin:0 0 22px;padding:0;}
+#cc .insp-rels li{
+  display:flex;align-items:center;gap:9px;padding:5px 0;border-bottom:1px solid var(--rule);
+}
+#cc .insp-rels li:last-child{border-bottom:0;}
+#cc .insp-rel-name{
+  flex:1;min-width:0;font:500 11px Archivo,ui-monospace,monospace;color:var(--counter);
+  letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .insp-rel-count{
+  display:inline-flex;align-items:center;gap:4px;font-family:Archivo,sans-serif;font-size:9.5px;
+  font-variant-numeric:tabular-nums;color:var(--ink-3);
+}
+#cc .insp-arrow{width:12px;height:7px;flex:0 0 auto;color:var(--ink-3);}
+
+#cc .insp-props{margin:0 0 22px;}
+#cc .insp-props > div{
+  border-left:1px solid var(--rule);padding-left:12px;margin-bottom:13px;
+  transition:border-color .12s linear;
+}
+#cc .insp-props > div:hover{border-left-color:var(--rubric);}
+#cc .insp-props dt{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:4px;overflow-wrap:anywhere;
+}
+#cc .insp-props dd{margin:0;}
+#cc .insp-value{
+  display:block;font-size:13.5px;line-height:1.45;color:var(--ink);
+  font-variant-numeric:tabular-nums;overflow-wrap:anywhere;
+}
+#cc .insp-value.clamped{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;}
+#cc .insp-more{
+  border:0;background:transparent;padding:0;margin-top:5px;color:var(--rubric);cursor:pointer;
+  font-size:8.5px;
+}
+#cc .insp-more:hover{color:var(--rubric-lift);}
+
+/* A relationship reads down the column: one end, the type on the rule between them, the other. */
+#cc .insp-flow{margin:0 0 20px;}
+#cc .insp-end{
+  display:flex;align-items:center;gap:8px;width:100%;padding:6px 0;border:0;
+  background:transparent;text-align:left;cursor:pointer;
+}
+#cc .insp-end-name{
+  flex:1;min-width:0;font-size:14px;line-height:1.3;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .insp-end:hover .insp-end-name{color:var(--rubric);}
+#cc .insp-flow-rel{
+  display:flex;align-items:center;gap:8px;margin-left:3px;padding:7px 0 7px 15px;
+  border-left:1px solid var(--rule-2);
+}
+
+#cc .insp-members{list-style:none;margin:0 0 22px;padding:0;}
+#cc .insp-members li{border-bottom:1px solid var(--rule);}
+#cc .insp-members li:last-child{border-bottom:0;}
+#cc .insp-members button{
+  width:100%;padding:5px 0;border:0;background:transparent;text-align:left;cursor:pointer;
+  font-size:13px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .insp-members button:hover{color:var(--rubric);}
+#cc .insp-none{
+  margin:0 0 20px;font-family:Archivo,sans-serif;font-size:10.5px;font-weight:500;
+  letter-spacing:.05em;line-height:1.55;color:var(--ink-3);
+}
+
+/* What is on the canvas, and where it came from. The counter colour is the design's provenance
+   voice, which is exactly what this is. */
+#cc .insp-census{margin-top:28px;padding-top:13px;border-top:1px solid var(--rule);}
+#cc .insp-census-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;margin:10px 0;}
+#cc .insp-tally{display:inline-flex;align-items:baseline;gap:5px;}
+#cc .insp-tally b{
+  font-family:Archivo,sans-serif;font-size:12.5px;font-weight:600;letter-spacing:.02em;
+  font-variant-numeric:tabular-nums;color:var(--ink);
+}
+#cc .insp-census p{margin:0;font-size:12.5px;line-height:1.5;color:var(--ink-3);}
+
+/* ─── the cypher editor and its results ──────────────────────────────────── */
+#cc .cypher-editor,#cc .query-editor-panel{border:1px solid var(--rule);margin-bottom:12px;}
+#cc .query-toolbar{
+  display:flex;align-items:center;gap:9px;padding:6px 9px;border-top:1px solid var(--rule);
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .query-label{font-weight:650;}
+#cc .toolbar-spacer{flex:1;}
+#cc .cypher-editor textarea,#cc .query-editor-panel textarea{
+  width:100%;border:0;background:transparent;color:var(--ink);resize:none;outline:0;
+  font:400 13px/1.55 Archivo,ui-monospace,monospace;padding:10px 11px;display:block;
+}
+#cc .results-panel{display:flex;flex-direction:column;min-height:0;flex:1;}
+#cc .result-tabs{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--rule);padding-bottom:7px;margin-bottom:10px;}
+#cc .result-tab-spacer{flex:1;}
+#cc .result-summary,#cc .result-details{
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .result-content{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .truncation-banner{
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--rubric-lift);
+  border-left:2px solid var(--rubric-lift);padding:5px 9px;margin-bottom:8px;
+}
+
+/* ─── the virtual table ──────────────────────────────────────────────────── */
+#cc .virtual-table{border:1px solid var(--rule);display:flex;flex-direction:column;min-height:0;flex:1;}
+#cc .virtual-table-header{
+  display:flex;border-bottom:1px solid var(--rule);background:var(--ground);
+  position:sticky;top:0;z-index:2;
+}
+#cc .header-cell{
+  padding:6px 9px;font-family:Archivo,sans-serif;font-size:9px;font-weight:650;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);
+  border-right:1px solid var(--rule);white-space:nowrap;
+}
+#cc .virtual-table-body{overflow:auto;min-height:0;flex:1;}
+#cc .virtual-row{display:flex;border-bottom:1px solid var(--rule);}
+#cc .virtual-row.striped{background:var(--rubric-wash);}
+#cc .virtual-cell{
+  padding:5px 9px;font-size:12.5px;color:var(--ink-2);border-right:1px solid var(--rule);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums;
+}
+
+/* ─── the markdown editor and rendered prose ─────────────────────────────── */
+#cc .markdown-editor{border:1px solid var(--rule);margin:12px 0;}
+#cc .markdown-toolbar,#cc .markdown-tools{
+  display:flex;align-items:center;gap:5px;flex-wrap:wrap;
+  padding:5px 7px;border-bottom:1px solid var(--rule);
+}
+#cc .markdown-toolbar button,#cc .markdown-tools button{
+  border:1px solid transparent;background:transparent;color:var(--ink-3);cursor:pointer;
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.1em;
+  text-transform:uppercase;height:20px;padding:0 6px;
+}
+#cc .markdown-toolbar button:hover,#cc .markdown-tools button:hover{color:var(--ink);border-color:var(--rule-2);}
+#cc .markdown-tool-divider{width:1px;height:14px;background:var(--rule-2);margin:0 3px;}
+#cc .markdown-editor textarea,#cc .markdown-live{
+  width:100%;border:0;background:transparent;color:var(--ink);outline:0;resize:vertical;
+  font:400 15.5px/1.62 "Source Serif 4",Georgia,serif;padding:12px 14px;min-height:280px;display:block;
+}
+/* Live Markdown uses CodeMirror decorations rather than heading/strong HTML elements. */
+#cc .markdown-live .cm-editor{font:inherit;color:inherit;}
+#cc .markdown-live .cm-content{caret-color:var(--caret);padding:0;}
+#cc .markdown-live .cm-editor.cm-focused{outline:none;}
+#cc .markdown-live .lm-heading{font-weight:600;color:var(--ink);line-height:1.25;padding-top:16px;padding-bottom:8px;}
+#cc .markdown-live .lm-h1{font-size:24px;}
+#cc .markdown-live .lm-h2{font-size:19px;}
+#cc .markdown-live .lm-h3{font-size:16.5px;}
+#cc .markdown-live .lm-h4,#cc .markdown-live .lm-h5,#cc .markdown-live .lm-h6{font-size:16px;}
+#cc .markdown-live .lm-strong{font-weight:700;}
+#cc .markdown-live .lm-em{font-style:italic;}
+#cc .markdown-live .lm-strike,#cc .markdown-live .lm-done{text-decoration:line-through;}
+#cc .markdown-live .lm-link{color:var(--rubric);text-decoration:underline;text-underline-offset:2px;cursor:pointer;}
+#cc .markdown-live .lm-syntax,#cc .markdown-live .lm-footnote{color:var(--ink-3);}
+#cc .markdown-live .lm-quote{border-inline-start:1px solid var(--rule-2);padding-inline-start:12px;font-style:italic;color:var(--ink-3);}
+#cc .markdown-live .lm-codespan,#cc .markdown-live .lm-fence,#cc .markdown-live .lm-tablesrc{font:400 13px/1.5 ui-monospace,monospace;color:var(--counter);}
+#cc .markdown-live .lm-bulletdot{display:inline-block;width:12px;color:var(--ink-2);}
+#cc .markdown-live .lm-rule{margin-block:16px;}
+#cc .markdown-live .lm-rule hr{border:0;border-top:1px solid var(--rule);}
+#cc .markdown-live .lm-embed{max-width:100%;overflow-x:auto;}
+#cc .markdown-live .lm-embed-edit{border:1px solid var(--rule-2);background:transparent;color:var(--ink-3);cursor:pointer;font:500 10px Archivo,sans-serif;padding:4px 8px;}
+#cc .markdown-live .lm-checkbox{accent-color:var(--rubric);}
+#cc .research-finding summary{cursor:pointer;}
+#cc .research-sources a{color:var(--rubric);text-underline-offset:2px;overflow-wrap:anywhere;}
+@media(max-width:600px){
+  #cc .research-head{flex-wrap:wrap;}
+  #cc .research-title{flex-basis:calc(100% - 24px);}
+}
+#cc .markdown,#cc .document-prose,#cc .report-modal-body,#cc .research-report{
+  font:400 16px/1.62 "Source Serif 4",Georgia,serif;color:var(--ink-2);max-width:65ch;
+}
+#cc .markdown h1,#cc .markdown h2,#cc .markdown h3{
+  font-weight:600;color:var(--ink);line-height:1.25;margin:1.4em 0 .5em;
+}
+#cc .markdown h1{font-size:24px;}
+#cc .markdown h2{font-size:19px;}
+#cc .markdown h3{font-size:16.5px;}
+#cc .markdown p{margin:0 0 .85em;}
+#cc .markdown ul,#cc .markdown ol{margin:0 0 .85em;padding-left:1.3em;}
+#cc .turn .markdown ol{padding-left:2.5em;}
+#cc .markdown li{margin:.2em 0;}
+#cc .markdown a{color:var(--rubric);text-decoration:underline;text-underline-offset:2px;}
+#cc .markdown code{font:400 13px Archivo,ui-monospace,monospace;color:var(--counter);}
+#cc .markdown pre{
+  border:1px solid var(--rule);padding:10px 12px;overflow-x:auto;
+  font:400 12.5px/1.5 Archivo,ui-monospace,monospace;color:var(--ink-2);
+}
+#cc .markdown blockquote{
+  border-left:2px solid var(--rule-2);padding-left:12px;margin:0 0 .85em;
+  color:var(--ink-3);font-style:italic;
+}
+/* A table in an answer is the design's `.tbl`, whether the model wrote it as markdown or not. */
+#cc .markdown table{border-collapse:collapse;width:100%;max-width:66ch;margin:.9em 0 1.1em;}
+#cc .markdown th{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-3);text-align:left;
+  padding:0 12px 6px 0;border-bottom:1px solid var(--rule-2);white-space:nowrap;
+}
+#cc .markdown td{
+  padding:8px 12px 8px 0;border-bottom:1px solid var(--rule);
+  font-size:14px;color:var(--ink-2);vertical-align:top;
+}
+#cc .markdown tr:hover td{color:var(--ink);}
+#cc .markdown td:last-child,#cc .markdown th:last-child{padding-right:0;}
+#cc .markdown img{max-width:100%;}
+#cc .editor-shortcuts{
+  font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--ink-3);padding:5px 9px;border-top:1px solid var(--rule);
+}
+
+/* ─── message bodies and their parts ─────────────────────────────────────── */
+#cc .body{
+  font:400 15.5px/1.6 "Source Serif 4",Georgia,serif;color:var(--ink-2);
+  white-space:pre-wrap;word-break:break-word;margin:0;max-width:65ch;
+}
+#cc .body.html{white-space:normal;}
+#cc .body.html img{max-width:100%;height:auto;}
+#cc .body.quoted{color:var(--ink-3);}
+#cc .quoted-wrap,#cc .thread-earlier-wrap{margin-top:12px;border-top:1px solid var(--rule);padding-top:9px;}
+#cc .quoted-wrap summary,#cc .thread-earlier-wrap summary{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);cursor:pointer;
+}
+#cc .thread-earlier{list-style:none;margin:8px 0 0;padding:0;}
+#cc .thread-earlier li{border-bottom:1px solid var(--rule);}
+#cc .thread-earlier-head{
+  width:100%;display:flex;align-items:baseline;gap:9px;border:0;background:transparent;
+  text-align:left;cursor:pointer;padding:7px 0;
+}
+#cc .thread-earlier-head .who{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-2);white-space:nowrap;
+}
+#cc .thread-earlier-head .line{
+  flex:1;font-size:13px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .thread-earlier-head time{
+  font-family:Archivo,sans-serif;font-size:9px;color:var(--ink-3);font-variant-numeric:tabular-nums;
+}
+#cc .awaiting{font-style:italic;color:var(--ink-3);font-size:15px;}
+#cc .files,#cc .message-attachments,#cc .attachment-chips{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:6px;}
+#cc .files li,#cc .attachment-chip{
+  display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule-2);
+  padding:2px 8px;font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.06em;color:var(--ink-3);
+}
+#cc .attachment-chip.error{border-color:var(--rubric);color:var(--rubric);}
+#cc .attachment-name{color:var(--ink-2);max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .attachment-size{font-variant-numeric:tabular-nums;}
+#cc .attachment-remove{border:0;height:auto;padding:0 0 0 3px;}
+#cc .message-body{min-width:0;}
+#cc .message-meta,#cc .open-meta,#cc .grounded-task-meta{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:11px;margin-top:9px;
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:500;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .message-facts,#cc .message-performance{font-variant-numeric:tabular-nums;}
+#cc .message-performance summary{cursor:pointer;}
+#cc .message-performance summary:focus-visible{outline:1px solid var(--rubric);outline-offset:3px;}
+#cc .message-performance[open] summary{margin-bottom:8px;}
+#cc .message-performance div{line-height:1.6;overflow-wrap:anywhere;}
+#cc .message-thinking{border-left:2px solid var(--rule-2);padding-left:11px;margin-bottom:10px;}
+#cc .thinking-toggle{
+  border:0;background:transparent;cursor:pointer;padding:0;
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);display:inline-flex;align-items:center;gap:5px;
+}
+#cc .thinking-caret{transition:transform .12s;}
+#cc .thinking-caret.open{transform:rotate(90deg);}
+#cc .thinking-content{font-size:14px;color:var(--ink-3);font-style:italic;margin-top:7px;}
+#cc .thinking-dots{display:inline-flex;gap:3px;}
+#cc .thinking-dots span{width:3px;height:3px;background:var(--rubric);animation:cc-pulse 1.1s infinite;}
+#cc .thinking-dots span:nth-child(2){animation-delay:.16s;}
+#cc .thinking-dots span:nth-child(3){animation-delay:.32s;}
+@keyframes cc-pulse{0%,100%{opacity:.25;}50%{opacity:1;}}
+#cc .thinking-label,#cc .chat-thinking{
+  font-family:Archivo,sans-serif;font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--rubric);display:inline-flex;align-items:center;gap:8px;
+}
+#cc .message-skills,#cc .message-sources{margin-top:11px;padding-top:9px;border-top:1px solid var(--rule);}
+#cc .skills-used-label,#cc .sources-label{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:6px;
+}
+#cc .skills-used-list,#cc .sources-list,#cc .active-skill-chips{
+  list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:6px;
+}
+#cc .sources-list{counter-reset:src;flex-direction:column;gap:4px;}
+#cc .skills-used-chip{
+  display:inline-flex;align-items:center;gap:5px;border:1px solid var(--rule-2);
+  padding:2px 8px;font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--ink-3);
+}
+#cc .skills-used-chip.written{border-color:var(--rubric);color:var(--rubric);}
+#cc .message-files{margin-top:11px;padding-top:9px;border-top:1px solid var(--rule);}
+#cc .files-list{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:6px;}
+#cc .file-chip{
+  display:flex;align-items:baseline;gap:12px;border:1px solid var(--rule-2);padding:8px 12px;
+  color:var(--ink);text-decoration:none;max-width:100%;
+}
+#cc .file-chip:hover,#cc .file-chip:focus-visible{border-color:var(--ink-3);}
+#cc .file-name{flex:1;min-width:0;overflow-wrap:anywhere;}
+#cc .file-size{font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--ink-3);font-variant-numeric:tabular-nums;}
+#cc .file-get{font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--rubric);}
+/* A skill's deliverable as a card: first page, facts, check, details on request. */
+#cc .file-card{
+  display:grid;grid-template-columns:80px minmax(0,1fr);gap:0 14px;align-items:start;
+  border:1px solid var(--rule-2);padding:10px 12px;max-width:100%;
+}
+#cc .file-card.no-preview,#cc .file-card.large{grid-template-columns:minmax(0,1fr);}
+#cc .file-card-preview{
+  display:block;padding:0;border:1px solid var(--rule);background:var(--ground);line-height:0;cursor:zoom-in;
+}
+#cc .file-card-preview:focus-visible{outline:1px solid var(--rubric);outline-offset:2px;}
+#cc .file-card-preview img{display:block;width:78px;height:auto;max-height:110px;object-fit:contain;}
+#cc .file-card.large .file-card-preview{justify-self:start;margin-bottom:10px;cursor:zoom-out;max-width:100%;}
+#cc .file-card.large .file-card-preview img{width:auto;max-width:100%;max-height:480px;}
+#cc .file-card-body{display:flex;flex-direction:column;gap:3px;min-width:0;}
+#cc .file-card-kind,#cc .file-card-label{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .file-card-name{color:var(--ink);text-decoration:none;font-size:14px;overflow-wrap:anywhere;}
+#cc .file-card-name:hover,#cc .file-card-name:focus-visible{color:var(--rubric);}
+#cc .file-card-facts{
+  font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
+#cc .file-card-foot{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:6px;}
+#cc .file-card-foot .file-get{margin-left:auto;text-decoration:none;}
+#cc .file-card-check{
+  display:inline-flex;align-items:center;border:1px solid var(--rule-2);padding:1px 7px;
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .file-card-check.clean{border-color:var(--counter);color:var(--counter);}
+#cc .file-card-check.warnings{border-color:var(--rubric-lift);color:var(--rubric-lift);}
+#cc .file-card-check.problems{border-color:var(--rubric);color:var(--rubric);}
+#cc .file-card-details{grid-column:1/-1;margin-top:9px;padding-top:7px;border-top:1px solid var(--rule);}
+#cc .file-card-summary{
+  width:max-content;display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none;
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .file-card-summary::-webkit-details-marker{display:none;}
+#cc .file-card-summary:hover{color:var(--ink);}
+#cc .file-card-summary:focus-visible{outline:1px solid var(--rubric);outline-offset:3px;}
+#cc .file-card-mark{width:7px;height:7px;flex:0 0 auto;box-shadow:inset 0 0 0 1px currentColor;}
+#cc .file-card-details[open] .file-card-mark{background:var(--rubric);box-shadow:none;}
+#cc .file-card-details[open] .file-card-summary{margin-bottom:8px;}
+#cc .file-card-details .file-card-label{display:block;margin:8px 0 4px;}
+#cc .file-card-changes,#cc .file-card-findings{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;}
+#cc .file-card-changes li{font-size:12.5px;color:var(--ink-2);overflow-wrap:anywhere;}
+#cc .file-card-findings li{
+  display:grid;grid-template-columns:62px minmax(0,1fr);gap:1px 10px;align-items:baseline;font-size:12.5px;color:var(--ink-2);
+}
+#cc .file-card-severity{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.11em;text-transform:uppercase;
+}
+#cc .file-card-severity.critical{color:var(--rubric);}
+#cc .file-card-severity.warning{color:var(--rubric-lift);}
+#cc .file-card-message{overflow-wrap:anywhere;}
+#cc .file-card-where{
+  grid-column:2;font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--ink-3);
+  overflow-wrap:anywhere;
+}
+#cc .source-index{
+  font-family:Archivo,sans-serif;font-size:9px;color:var(--counter);
+  font-variant-numeric:tabular-nums;min-width:14px;
+}
+#cc .source-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .sources-list a,#cc .source-file,#cc .source-report{
+  display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-2);
+  text-decoration:none;border:0;background:transparent;cursor:pointer;padding:0;text-align:left;
+}
+#cc .sources-list a:hover,#cc .source-report:hover{color:var(--rubric);}
+#cc .grounded-item-card,#cc .grounded-task-card{border-left:2px solid var(--rule-2);padding-left:11px;margin-top:7px;}
+#cc .grounded-item-heading{display:flex;align-items:center;gap:7px;font-size:14px;color:var(--ink);}
+#cc .grounded-item-state{font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.09em;color:var(--ink-3);}
+#cc .grounded-item-state.error{color:var(--rubric);}
+#cc .grounded-person-actions,#cc .grounded-task-actions,#cc .open-actions,
+#cc .action-row,#cc .reply-actions,#cc .inspector-actions,#cc .identity-actions,
+#cc .modal-actions,#cc .share-actions,#cc .settings-skill-actions,#cc .merge-actions,
+#cc .research-actions,#cc .research-run-actions,#cc .pending-group-actions,
+#cc .report-modal-tools,#cc .new-message-actions,#cc .proposal-list li,
+#cc .people-contact-modes,#cc .reply-checks{
+  display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:9px;
+}
+#cc .reply-chip,#cc .state-chip,#cc .kind-chip,#cc .style-chip,#cc .tag,
+#cc .person-handle-chip,#cc .research-badge,#cc .document-flag,#cc .document-status,
+#cc .thread-count,#cc .settings-account-kind,#cc .channel-kind,#cc .mention-kind{
+  display:inline-flex;align-items:center;gap:5px;border:1px solid var(--rule-2);
+  padding:1px 7px;background:transparent;cursor:default;
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-3);white-space:nowrap;
+}
+#cc .reply-chip{cursor:pointer;border-color:var(--rubric);color:var(--rubric);height:22px;padding:0 9px;}
+#cc .reply-chip:disabled{opacity:.45;cursor:default;}
+#cc .document-status.stable,#cc .state-chip.ready{border-color:var(--counter);color:var(--counter);}
+#cc .document-flag.conflict,#cc .document-flag.stale,#cc .state-chip.overdue,
+#cc .state-chip.needs_attention{border-color:var(--rubric);color:var(--rubric);}
+#cc .person-handle-chip.actionable{cursor:pointer;}
+#cc .fact-line{display:block;font-size:14px;color:var(--ink-2);}
+#cc .fact-context,#cc .fact-source,#cc .person-item-snip,#cc .mention-snippet{
+  display:block;font-size:12px;color:var(--ink-3);
+}
+#cc .person-facts,#cc .person-items,#cc .person-handles{list-style:none;margin:7px 0 0;padding:0;}
+#cc .person-handles{display:flex;flex-wrap:wrap;gap:5px;}
+#cc .person-facts li,#cc .person-items li{border-bottom:1px solid var(--rule);padding:7px 0;}
+#cc .person-facts li.withdrawn{color:var(--ink-3);text-decoration:line-through;text-decoration-color:var(--rule-2);}
+#cc .person-block{margin-top:16px;}
+#cc .person-block h2{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 6px;
+  display:flex;align-items:baseline;gap:8px;
+}
+#cc .person-block-count{color:var(--ink-2);font-variant-numeric:tabular-nums;}
+#cc .person-item-subject{display:block;font-size:14px;color:var(--ink-2);}
+
+/* ─── panels that stack down a reading column ────────────────────────────── */
+#cc .attest-panel,#cc .pending-changes,#cc .research-panel,#cc .research-runs,
+#cc .share-bundle,#cc .settings-card,#cc .settings-block,
+#cc .proposals,#cc .merge-card,#cc .run-history,#cc .graph-block,#cc .reply-composer,
+#cc .new-message,#cc .chat-thread{
+  border:1px solid var(--rule);padding:12px 14px;margin:12px 0;
+}
+#cc .attest-header,#cc .pending-header,#cc .research-head,#cc .research-runs-header,
+#cc .settings-card-head,#cc .proposals-head,#cc .reply-head,#cc .pending-group-header,
+#cc .research-step-head,#cc .canvas-header-row{
+  display:flex;align-items:baseline;gap:9px;margin-bottom:8px;
+}
+#cc .attest-header h2,#cc .pending-title,#cc .research-title,#cc .proposals-title,
+#cc .settings-card-head h2,#cc .settings-card-head h3,#cc .pending-group-title,
+#cc .report-modal-title,#cc .channel-header h2,#cc .merge-card h2{
+  font-family:Archivo,sans-serif;font-size:10px;font-weight:650;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink);margin:0;
+}
+#cc .pending-subtitle,#cc .settings-lead,#cc .settings-note,#cc .research-stage,
+#cc .pending-summary,#cc .proposal-gist,#cc .merge-reason,#cc .attest-verdict,
+#cc .settings-card-text,#cc .settings-skill-desc,#cc .grounded-task-description{
+  font:400 14px/1.5 "Source Serif 4",Georgia,serif;color:var(--ink-3);margin:0 0 8px;max-width:62ch;
+}
+#cc .pending-groups,#cc .pending-facts,#cc .research-steps,#cc .research-sources,
+#cc .settings-accounts,#cc .settings-skills,#cc .proposal-list,#cc .identity-rows,
+#cc .attest-rows,#cc .run-output,#cc .research-plan{list-style:none;margin:0;padding:0;}
+#cc .research-plan-stage{max-width:none;}
+#cc .research-plan{display:grid;gap:8px;}
+#cc .research-plan > li{
+  display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:12px;
+}
+#cc .research-plan textarea{
+  width:100%;min-width:0;min-height:2lh;field-sizing:content;resize:vertical;
+  line-height:1.5;overflow-wrap:anywhere;
+}
+#cc .pending-group,#cc .settings-account,#cc .settings-skill-row,#cc .identity-row,
+#cc .attest-rows li,#cc .research-step,#cc .research-finding,#cc .merge-row,
+#cc .proposal-list li,#cc .research-sources li{
+  display:flex;flex-wrap:wrap;align-items:center;gap:9px;
+  padding:8px 0;border-bottom:1px solid var(--rule);
+}
+#cc .research-step-dot,#cc .research-step-icon,#cc .pending-icon,#cc .research-mark,
+#cc .running-dot,#cc .status-pulse,#cc .dot{
+  width:5px;height:5px;flex:0 0 auto;background:var(--rubric);
+}
+#cc .research-step.pending .research-step-dot,#cc .dot{background:transparent;box-shadow:inset 0 0 0 1px var(--ink-3);}
+#cc .research-step-text,#cc .pending-fact-text,#cc .settings-skill-name,
+#cc .settings-account-name,#cc .proposal-take,#cc .merge-names{
+  flex:1;min-width:0;font-size:14px;color:var(--ink-2);
+}
+#cc .settings-account-address,#cc .settings-account-count,#cc .settings-source-state,
+#cc .pending-group-counts,#cc .pending-fact-context,#cc .pending-fact-more,
+#cc .research-run-status,#cc .run-outcome,#cc .attest-stale,#cc .attest-receipt{
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:500;letter-spacing:.08em;
+  color:var(--ink-3);font-variant-numeric:tabular-nums;
+}
+#cc .pending-fact-conflict,#cc .attest-result.failed,#cc .run-outcome.failed,
+#cc .settings-confirm{color:var(--rubric);}
+#cc .settings-switch{
+  width:26px;height:14px;border:1px solid var(--rule-2);background:transparent;
+  cursor:pointer;padding:0;position:relative;flex:0 0 auto;
+}
+#cc .settings-switch[aria-pressed="true"]{border-color:var(--rubric);}
+#cc .settings-switch-knob{position:absolute;top:1px;left:1px;width:10px;height:10px;background:var(--ink-3);transition:left .12s,background .12s;}
+#cc .settings-switch[aria-pressed="true"] .settings-switch-knob{left:13px;background:var(--rubric);}
+#cc .settings-skill-editor textarea,#cc .settings-skill-md,#cc .run-output pre,
+#cc .research-report pre,#cc .graph-block-query{
+  width:100%;border:1px solid var(--rule);background:transparent;color:var(--ink-2);
+  font:400 12.5px/1.5 Archivo,ui-monospace,monospace;padding:9px 11px;outline:0;resize:vertical;
+}
+#cc .settings-skill-caret{transition:transform .12s;}
+#cc .settings-skill-row.expanded .settings-skill-caret{transform:rotate(90deg);}
+
+/* ─── forms ──────────────────────────────────────────────────────────────── */
+#cc .identity-field,#cc .research-field,#cc .from-field,#cc .field-row,
+#cc .people-contact-fields,#cc .people-contact-fields label,#cc .settings-rename,
+#cc .project-name-field,#cc .reply-edit{
+  display:flex;flex-direction:column;gap:4px;margin:9px 0;
+}
+#cc .identity-field > span,#cc .research-field > span,#cc .field-row > span,
+#cc .project-name-field > span,#cc .people-contact-fields > span{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+/*
+ * Inputs carry no box of their own.
+ *
+ * This was a blanket `border:1px solid` and an Archivo 12.5px face on every input, textarea and
+ * select under `#cc`, with a per-control opt-out list underneath it. That is backwards, and it beat
+ * `reference.css` on specificity: the ask band's input is meant to be a borderless serif line with
+ * a rule that appears under it only while you are writing, and it was drawn as a hard box in the
+ * wrong face, with an orange ring the moment anyone typed.
+ *
+ * A control that wants a box asks for one — `.sheet-b input`, the design's own rule. Everything
+ * else sits on the ground, and the design's named rules (`.field`, `.askband`, `.palette-in`,
+ * `.qedit`) are left to say how each one looks.
+ *
+ * Wrapped in `:where()` so it carries **no specificity at all**. An `#cc input[type=...]` selector
+ * outranks every class in `reference.css`, which is how it beat the ask band in the first place —
+ * and it would go on beating it here, silently swallowing the rubric underline the design draws
+ * under a line you are writing. At zero specificity this is a floor that anything can stand on.
+ */
+:where(#cc) :where(input[type="text"],input[type="search"],input:not([type]),select,textarea){
+  color:var(--ink);background:transparent;border:0;padding:0;outline:0;
+  font-family:inherit;font-size:inherit;
+}
+/* An unnamed input inside a settings row still needs an edge to be found. */
+#cc .row > input,#cc .row > select{border-bottom:1px solid var(--rule-2);padding:3px 0;}
+#cc .row > input:focus-visible,#cc .row > select:focus-visible{border-bottom-color:var(--rubric);}
+#cc .field-hint{font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.09em;color:var(--ink-3);}
+#cc .identity-colors,#cc .identity-kinds{display:flex;flex-wrap:wrap;gap:5px;}
+#cc .identity-color,#cc .identity-swatch{
+  width:16px;height:16px;border:1px solid var(--rule-2);cursor:pointer;padding:0;
+}
+#cc .identity-color[aria-pressed="true"]{border-color:var(--ink);}
+
+/* ─── overlays ───────────────────────────────────────────────────────────── */
+#cc .modal-backdrop,#cc .identity-backdrop,#cc .report-modal-scrim,
+#cc .project-dialog-backdrop,#cc .omnibox-backdrop{
+  position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--ground) 82%,transparent);padding:24px;
+}
+#cc .modal-card,#cc .identity-dialog,#cc .report-modal,#cc .project-dialog,#cc .omnibox{
+  width:min(680px,100%);max-height:82vh;overflow:auto;
+  border:1px solid var(--rubric);background:var(--ground);padding:16px 18px;
+}
+#cc .report-modal-head,#cc .omnibox-field{display:flex;align-items:center;gap:9px;margin-bottom:10px;}
+#cc .omnibox-field input{flex:1;border:0;font-size:15px;}
+#cc .omnibox-results{list-style:none;margin:0;padding:0;max-height:56vh;overflow:auto;}
+#cc .omnibox-hit{
+  width:100%;display:grid;grid-template-columns:auto 1fr auto;gap:9px;align-items:baseline;
+  border:0;border-top:1px solid var(--rule);background:transparent;text-align:left;
+  cursor:pointer;padding:8px 4px;
+}
+#cc .omnibox-hit:hover,#cc .omnibox-hit.selected{background:var(--rubric-wash);}
+#cc .omnibox-hit-title{font-size:14.5px;color:var(--ink);}
+#cc .omnibox-hit-kind,#cc .omnibox-verb,#cc .omnibox-group-hint,#cc .omnibox-footer{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .omnibox-hit-snippet{grid-column:2;font-size:12.5px;color:var(--ink-3);}
+#cc .omnibox-footer{display:flex;gap:11px;border-top:1px solid var(--rule);padding-top:8px;margin-top:8px;}
+#cc .mention-picker{
+  position:absolute;z-index:80;min-width:220px;max-width:340px;
+  border:1px solid var(--rubric);background:var(--ground);
+}
+#cc .mention-picker button{
+  width:100%;display:block;border:0;background:transparent;text-align:left;cursor:pointer;padding:7px 10px;
+}
+#cc .mention-picker button+button{border-top:1px solid var(--rule);}
+#cc .mention-picker button:hover,#cc .mention-picker button.selected{background:var(--rubric-wash);}
+#cc .mention-title{font-size:14px;color:var(--ink);}
+
+/* ─── the screens before the workspace ───────────────────────────────────── */
+/*
+ * The startup gate, the model catalogue and the error screen run before the shell mounts. They
+ * used to render outside `#cc` entirely, in system sans-serif on a white ground — the first thing
+ * anyone sees, and the one place the design did not reach. They are inside the frame now, so the
+ * only rules here are the two shapes the design had no sample of: a gate and a board.
+ */
+#cc.frame{overflow:auto;}
+#cc .gate{
+  width:min(100%,68ch);margin:9vh auto 0;padding:0 0 60px;
+}
+#cc .gate.gate-wide{width:min(100%,1180px);}
+#cc .gate .pagekey{margin:8px 0 0;}
+#cc .gate .prose{margin-top:14px;}
+#cc .gate .sign{margin-top:22px;}
+#cc .gate-note{display:block;margin-top:10px;}
+
+/* A measured wait, drawn as a rule that fills. */
+#cc .gate-meter{margin-top:22px;}
+#cc .gate-meter-h{display:flex;align-items:baseline;gap:9px;margin:7px 0;}
+#cc .gate-meter-h .grow{flex:1;}
+#cc .gate-track{height:2px;background:var(--rule);overflow:hidden;}
+/*
+ * The fill is scaled, not widened.
+ *
+ * Animating `width` on a bar that updates continuously through a multi-gigabyte download makes the
+ * browser re-lay-out the page on every frame of the whole warm-up. `transform` is composited, so
+ * the same movement costs nothing and stays smooth while the model loads — which is the one moment
+ * this element exists for.
+ */
+#cc .gate-fill{
+  height:2px;background:var(--rubric);width:100%;
+  transform-origin:left center;transition:transform .3s linear;
+}
+@media (prefers-reduced-motion:reduce){#cc .gate-fill{transition:none;}}
+/* An unmeasured one says only that work is happening, rather than inventing a percentage. */
+#cc .gate-sweep{height:2px;width:34%;background:var(--rubric);animation:cc-sweep 1.5s ease-in-out infinite;}
+@keyframes cc-sweep{0%{transform:translateX(-100%);}100%{transform:translateX(300%);}}
+@media (prefers-reduced-motion:reduce){
+  #cc .gate-sweep{animation:none;width:100%;background:var(--rule-2);}
+}
+
+/* The catalogue: one column per maker, each row a control that loads. */
+#cc .model-board{
+  display:grid;grid-auto-flow:column;grid-auto-columns:minmax(240px,1fr);
+  margin-top:26px;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+  overflow-x:auto;
+}
+#cc .model-column{border-right:1px solid var(--rule);min-width:0;}
+#cc .model-column:last-child{border-right:0;}
+#cc .model-column__head{
+  display:flex;align-items:baseline;gap:9px;padding:9px 14px;border-bottom:1px solid var(--rule);
+}
+#cc .model-column__head .grow{flex:1;}
+#cc .model-column__body{display:flex;flex-direction:column;}
+#cc .model-card{
+  display:flex;flex-direction:column;gap:5px;align-items:stretch;
+  border:0;border-bottom:1px solid var(--rule);background:transparent;
+  text-align:left;cursor:pointer;padding:12px 14px 13px;color:inherit;min-width:0;
+}
+#cc .model-column__body .model-card:last-child{border-bottom:0;}
+#cc .model-card:hover{background:var(--rubric-wash);}
+#cc .model-card:disabled{opacity:.45;cursor:default;}
+#cc .model-card:disabled:hover{background:transparent;}
+#cc .model-card.current{box-shadow:inset 2px 0 0 var(--rubric);}
+#cc .model-card__head{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;}
+#cc .model-card__name{font-size:15.5px;line-height:1.25;color:var(--ink);}
+#cc .model-card:hover .model-card__name{color:var(--rubric-lift);}
+#cc .model-card__tagline{font-size:13px;line-height:1.4;color:var(--ink-3);}
+#cc .model-card__foot{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;}
+#cc .model-card__foot .grow{flex:1;}
+
+/* ─── odds and ends the pages still name ─────────────────────────────────── */
+#cc .center-state{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:40px 20px;color:var(--ink-3);}
+#cc .stream-open{padding-top:10px;}
+#cc .row-end{display:flex;align-items:baseline;gap:8px;margin-left:auto;}
+#cc .snippet{display:block;font-size:13px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .route,#cc .route-bean{display:inline-flex;align-items:center;gap:5px;}
+#cc .route-bean{
+  font-family:Archivo,sans-serif;font-size:8.5px;font-weight:600;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-3);border-left:1px solid var(--rule-2);padding-left:8px;white-space:nowrap;
+}
+#cc .route-mark{width:5px;height:5px;display:inline-block;}
+#cc .person-avatar{
+  width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid var(--rule-2);font-family:Archivo,sans-serif;font-size:9px;color:var(--ink-3);
+}
+#cc .proposal-list li{gap:8px;}
+#cc .proposal-list input{flex:1;min-width:0;}
+/*
+ * A proposed reply, as a row you can take.
+ *
+ * `.proposal`, `.proposal-body` and `.proposal-waiting` had no rule in either sheet, so the row
+ * that carries a whole drafted reply was an unstyled button: the gist, the reply and "Use this"
+ * ran together in one undifferentiated block, and the chosen one looked like the rest. Everything
+ * here is the design's own — a rule to separate, the rubric to mark what is live, apparatus type
+ * for anything that is not the reply itself.
+ */
+#cc .proposal{
+  width:100%;display:flex;flex-direction:column;align-items:flex-start;gap:5px;
+  border:0;background:transparent;padding:2px 0;text-align:left;cursor:pointer;
+}
+#cc .proposal:hover{background:var(--rubric-wash);}
+/* The one in the editor is the live one, marked the way the design marks a chosen row. */
+#cc .proposal.picked{box-shadow:inset 2px 0 0 var(--rubric);padding-left:9px;}
+#cc .proposal-body{
+  font:400 14px/1.5 "Source Serif 4",Georgia,serif;color:var(--ink);max-width:62ch;
+}
+/* Not the reply — a state of it. Apparatus, so it never reads as words you might send. */
+#cc .proposal-body.pending,#cc .proposal-waiting{
+  display:flex;align-items:center;gap:6px;margin:0;
+  font-family:Archivo,sans-serif;font-size:9.5px;font-weight:600;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);
+}
+#cc .live-output,#cc .run-output{font:400 12px/1.5 Archivo,ui-monospace,monospace;color:var(--ink-3);white-space:pre-wrap;}
+#cc .pagekey-edit{
+  display:block;width:100%;min-width:0;border:0;background:transparent;padding:0;
+  field-sizing:content;resize:vertical;overflow-wrap:anywhere;
+  font:600 30px/1.14 "Source Serif 4",Georgia,serif;color:var(--ink);letter-spacing:-.01em;
+}
+/* Pending document decisions must fit both the reader and the narrower chat column. */
+#cc .pending-h{flex-wrap:wrap;}
+#cc .pending-h .pending-summary{flex:1 1 240px;min-width:0;}
+#cc .pending-bulk{flex:0 0 auto;}
+#cc .pending-bulk .detent,#cc .pending-group-header .detent{white-space:nowrap;}
+#cc .pending-group{display:block;min-width:0;}
+#cc .pending-group-header{flex-wrap:wrap;align-items:center;}
+#cc .pending-group-toggle{
+  flex:1 1 240px;min-width:0;max-width:100%;height:auto;min-height:28px;
+  padding:4px 8px;white-space:normal;text-align:left;
+}
+#cc .pending-group-toggle > svg{width:12px;height:12px;flex:0 0 auto;}
+#cc .pending-group-title{min-width:0;overflow-wrap:anywhere;}
+#cc .pending-group-counts{display:flex;flex-wrap:wrap;gap:4px;margin-left:auto;flex:0 0 auto;}
+#cc .pending-group-header .tools{flex:0 0 auto;margin-top:0;}
+#cc .pending-facts{overflow-wrap:anywhere;}
+#cc .empty-line.warn,#cc .warn{color:var(--rubric);}
+
+/* ─── what real data does to a drawn layout ──────────────────────────────── */
+/*
+ * The design's columns are `minmax(0, 400px)` and its rows ellipsis their text, which is exactly
+ * right for the prose the mockup was drawn with. Real mail carries unbreakable URLs, and a grid
+ * item whose min-content is wider than its track pushes out of the column rather than clipping.
+ * These set the floor the mockup never needed, and change nothing else about the drawing.
+ */
+#cc .col-i,#cc .col-ii,#cc .marg{min-width:0;}
+#cc .arr button > *,#cc .lst button > *,#cc .lst .r > *{min-width:0;}
+#cc .arr .subj,#cc .lst .t{overflow-wrap:anywhere;}
+#cc .arr .snip,#cc .lst .r .ap{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .arr .top{min-width:0;}
+#cc .arr .who,#cc .arr .acct{min-width:0;max-width:14ch;overflow:hidden;text-overflow:ellipsis;}
+#cc .arr .who{max-width:22ch;}
+
+/* ─── CodeMirror, on the plate ───────────────────────────────────────────── */
+/*
+ * The editor ships its own light theme, which put a white slab in the middle of the plate.
+ * These are the surfaces it paints; every one takes a design token instead.
+ */
+#cc .cm-editor{background:transparent;color:var(--ink);}
+#cc .cm-editor.cm-focused{outline:0;}
+#cc .cm-content,#cc .cm-line{font-family:inherit;}
+/* The markdown editor is reading, so it is set as reading. */
+#cc .markdown-editor .cm-scroller{font:400 15.5px/1.62 "Source Serif 4",Georgia,serif;padding:10px 0;}
+#cc .markdown-editor .cm-gutters{display:none;}
+#cc .markdown-editor .cm-line{padding:0 14px;}
+#cc .markdown-editor .cm-activeLine{background:transparent;}
+#cc .qedit .cm-scroller{
+  font:400 13px/1.6 Archivo,ui-monospace,SFMono-Regular,Menlo,monospace;
+  padding:8px 0;max-height:34vh;
+}
+#cc .qedit .cm-gutters{
+  background:transparent;border-right:1px solid var(--rule);color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
+#cc .qedit .cm-activeLine,#cc .qedit .cm-activeLineGutter{background:var(--rubric-wash);}
+/*
+ * The caret, in every CodeMirror the product runs — not only the Cypher editor.
+ *
+ * CodeMirror's base theme declares `&light .cm-content{caret-color:black}`. That is a declaration
+ * on the element, so it beats the `caret-color` the design sets once on `#cc` and inherits
+ * everywhere else. Neither editor loads `drawSelection`, so what blinks on screen is the native
+ * caret, and black is what it gets: invisible on the plate. The Cypher editor carried this rule
+ * scoped to `.qedit`; the document editor did not, which is why writing a document showed no
+ * cursor at all.
+ */
+#cc .cm-content{caret-color:var(--rubric);}
+/* Inert while no editor loads `drawSelection` or `dropCursor`, and right the moment one does. */
+#cc .cm-cursor,#cc .cm-dropCursor{border-left-color:var(--rubric);}
+#cc .qedit .cm-selectionBackground,
+#cc .qedit .cm-editor ::selection{background:var(--rubric-wash) !important;}
+#cc .qedit .cm-focused .cm-selectionBackground{background:var(--rubric-wash) !important;}
+#cc .qedit .cm-line{padding:0 10px;}
+#cc .cm-placeholder{color:var(--unwritten);}
+/* The completion popup is the design's menu. */
+/*
+ * The design draws completions as `.sugs` — a bordered list of `.sug` rows, each a three-column
+ * grid of kind, text and meta. The editor is CodeMirror, whose completion popup is a real one
+ * (it filters, ranks and applies), so this dresses that popup as `.sugs` rather than replacing
+ * working completion with a list that only looks the part.
+ */
+#cc .cm-tooltip,.cm-tooltip.cm-tooltip-autocomplete{
+  background:var(--ground,#14171A);border:1px solid var(--rubric,#E2603F);color:var(--ink,#E9EBEC);
+  max-height:210px;border-radius:0;box-shadow:none;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li{
+  display:grid;grid-template-columns:74px 1fr auto;gap:11px;align-items:baseline;
+  padding:6px 10px;line-height:1.35;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]{
+  background:var(--rubric-wash,#E2603F14);box-shadow:inset 2px 0 0 var(--rubric,#E2603F);
+}
+/* The type badge is the `.sk` kind column: a word, tracked and in the provenance steel. */
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon{
+  width:auto;padding:0;margin:0;opacity:1;
+  font:650 9px/1.9 Archivo,sans-serif;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--counter,#7E93A6);
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon::after{content:attr(class);display:none;}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon-keyword::before{content:'Keyword';}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon-class::before{content:'Label';}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon-type::before{content:'Type';}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon-property::before{content:'Property';}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionIcon-function::before{content:'Function';}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionLabel{
+  font:500 13px Archivo,ui-monospace,monospace;color:var(--ink,#E9EBEC);letter-spacing:.01em;
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionMatchedText{
+  text-decoration:none;color:var(--rubric,#E2603F);
+}
+.cm-tooltip.cm-tooltip-autocomplete .cm-completionDetail{
+  font:9px/1.9 Archivo,sans-serif;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-2,#A9B2B8);font-style:normal;
+}
+
+/*
+ * Apparatus text that is also a control.
+ *
+ * The result meta over the plot states what came back and opens the statistics; the design writes
+ * it as `.ap faint`, so it has to read as that text and not as a button sitting in the bar.
+ */
+#cc button.ap{border:0;background:transparent;padding:0;cursor:pointer;text-align:right;}
+#cc button.ap:hover{color:var(--ink);}
+
+/* Mail set as reading: the design's measure and rhythm, whatever the sender sent. */
+#cc .prose.mail p{margin:0 0 .9em;overflow-wrap:anywhere;}
+#cc .prose.mail{max-width:65ch;}
+
+/* A short window must not push the index over the bands below it. */
+#cc .index{overflow:auto;}
+#cc .index .nav{flex:0 0 auto;}
+
+/* ─── a sheet that is taller than the screen ─────────────────────────────── */
+/*
+ * The design's sheets were short — a name and two buttons. The task editor is eleven fields, and
+ * at that height it ran off the bottom of the page and took Save with it. The head and foot stay
+ * put and the body scrolls, so the actions are always reachable whatever the sheet holds.
+ */
+#cc .sheet{display:flex;flex-direction:column;max-height:72vh;}
+#cc .sheet > form{display:flex;flex-direction:column;min-height:0;}
+#cc .sheet-h,#cc .sheet-f{flex:0 0 auto;}
+#cc .sheet-b{overflow:auto;min-height:0;}
+/* Nothing inside a sheet may be wider than the sheet. */
+#cc .sheet-b input,#cc .sheet-b select,#cc .sheet-b textarea,
+#cc .sheet-b .fld,#cc .sheet-b .mention-input{max-width:100%;width:100%;}
+#cc .sheet-b .fld-row{display:flex;gap:11px;flex-wrap:wrap;}
+#cc .sheet-b .fld-row > .fld{flex:1 1 180px;}
+
+/* ─── an address, being described ────────────────────────────────────────── */
+/*
+ * The first-run identity prompt. It used to be native `fieldset`/`legend` and OS radio buttons,
+ * which is the one place a browser's own chrome reaches the page hardest — and it landed in the
+ * middle of a design that has no rounded anything.
+ */
+#cc .ident{padding:14px 0;border-top:1px solid var(--rule);}
+#cc .ident:first-of-type{border-top:0;}
+#cc .ident-h{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+#cc .ident-mark{width:6px;height:6px;flex:0 0 auto;display:inline-block;}
+/* The colour is the mark itself, at the size a list actually draws it. */
+#cc .swatches{display:flex;gap:6px;}
+#cc .swatches button{
+  width:18px;height:18px;padding:0;cursor:pointer;
+  border:1px solid var(--rule-2);background-clip:padding-box;
+}
+#cc .swatches button.on{box-shadow:inset 0 0 0 1px var(--ground),0 0 0 1px var(--ink);}
+#cc .swatches button:disabled{cursor:default;opacity:.5;}
+
+/* ─── what an answer cited ───────────────────────────────────────────────── */
+/*
+ * A cited message, person or task, listed under an answer and openable in place. These had no
+ * layout rule at all, so the kind label and the title ran together — "MessageEmail or message" —
+ * and each source drew its own box. The design lists things; it does not box them.
+ */
+#cc .sources-list{counter-reset:src;gap:0;}
+#cc .sources-list > li{border-top:1px solid var(--rule);}
+#cc .sources-list > li:last-child{border-bottom:1px solid var(--rule);}
+/* Five cells: the mark, the kind, which account it came to, the title, and when. The snippet
+   spans the row beneath them — the same shape the arrivals list uses, at a smaller size. */
+#cc .stream-row{
+  width:100%;display:grid;grid-template-columns:6px auto auto 1fr auto;align-items:baseline;
+  gap:0 10px;padding:8px 2px;border:0;background:transparent;text-align:left;cursor:pointer;
+  /* A row is usually a <button>, which takes the browser's control font (Arial) instead of the
+     page's. Inherit it, so the title reads in the reading face like everything else it sits in;
+     the kind and the date set Archivo themselves. */
+  font-family:inherit;
+}
+#cc .stream-row:hover{background:var(--rubric-wash);}
+#cc .stream-row .dot{
+  grid-row:1;align-self:center;width:5px;height:5px;
+  background:transparent;box-shadow:inset 0 0 0 1px var(--counter);
+}
+/* The kind, set as apparatus — it labels the row rather than being part of the title. */
+#cc .stream-row .who{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--counter);white-space:nowrap;
+}
+#cc .stream-row .subject{
+  font-size:14px;line-height:1.3;color:var(--ink-2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;
+}
+#cc .stream-row:hover .subject{color:var(--ink);}
+#cc .stream-row .route:empty{display:none;}
+#cc .stream-row .row-end{
+  font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.05em;color:var(--ink-3);
+  font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+#cc .stream-row .snippet{grid-column:2/6;color:var(--ink-3);font-size:12.5px;margin-top:3px;}
+/* Opened in place, indented under the row it belongs to rather than floating free. */
+#cc .grounded-item-card,#cc .grounded-task-card,#cc .person-open{
+  border:0;border-left:1px solid var(--rule-2);margin:0 0 10px 16px;padding:2px 0 2px 12px;
+}
+#cc .person-item-row{
+  width:100%;display:grid;grid-template-columns:1fr auto;gap:0 10px;
+  border:0;background:transparent;text-align:left;cursor:pointer;padding:6px 0;
+}
+#cc .person-item-row:hover{background:var(--rubric-wash);}
+
+/* ─── the palette, when it is not full ───────────────────────────────────── */
+/*
+ * `.scrim` is a flex row, so its default `align-items: stretch` pulled the palette down to its
+ * `max-height` whatever it held — 667px of box around 363px of results. The design never showed
+ * it because its sample always filled the frame. The cap stays; the box now ends where the
+ * results do.
+ */
+#cc .scrim{align-items:flex-start;}
+#cc .palette-out{flex:0 1 auto;min-height:0;}
+/* The foot is one line. Its last phrase yields rather than wrapping under the key hints. */
+#cc .palette-foot{flex-wrap:nowrap;align-items:baseline;}
+/* Each hint is one phrase and stays on one line; only the trailing note is allowed to yield. */
+#cc .palette-foot > .ap{white-space:nowrap;flex:0 0 auto;}
+/* Whatever the trailing note says, it stays inside the box. */
+#cc .palette-foot{overflow:hidden;}
+#cc .palette-foot > .ap:last-child{
+  min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;
+}
+/* A result is a row: kind, what it is, where it came from — the last of those yields first. */
+#cc .pres{align-items:baseline;}
+#cc .pres .pt{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .pres .pm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+/* A control's label is one line. The query bar's foot gets cramped before anything else does. */
+#cc .qbar-foot .detent,#cc .bar .detent,#cc .bar .pick{white-space:nowrap;}
+
+/*
+ * The schema column, against a real graph rather than a demo.
+ *
+ * The mockup's schema list is a handful of rows, so the whole column scrolling as one is fine
+ * there. This machine's graph has sixty-six kinds and as many relationship types, which pushed
+ * History a hundred and thirty rows down a single scroll — present, but unreachable in practice.
+ * Each list gets its own scroll instead, so both bars stay where they are and History keeps a
+ * third of the column.
+ */
+/* The graph column is one bar and one list that scrolls under it. It used to be two lists sharing
+   the height — the schema above, history capped at a third below — and when the schema moved to
+   the editor that cap would have left history in the top third of an empty column. */
+#cc .screen[data-screen="graph"] .col-i{display:flex;flex-direction:column;overflow:hidden;}
+#cc .screen[data-screen="graph"] .col-i > .bar{flex:0 0 auto;}
+#cc .screen[data-screen="graph"] .col-i > .empty-line{flex:0 0 auto;}
+#cc .screen[data-screen="graph"] .col-i > .lst{flex:1 1 auto;min-height:0;overflow:auto;}
+
+/*
+ * Skills: three shapes the design never had to draw.
+ *
+ * A skill is a page of instructions and a handful of files, which is more than a preference and
+ * less than a document. The design's settings blocks stop at a row with a switch on it, so these
+ * are built from its own materials rather than invented: the reading measure and hairline of a
+ * `.blk`, the mono of `.qedit`, the ground of the page.
+ */
+#cc .skill-open{
+  display:flex;align-items:baseline;gap:0;min-width:0;
+  border:0;background:transparent;padding:0;text-align:left;cursor:pointer;
+}
+#cc .skill-open:hover .nm{color:var(--rubric);}
+#cc .skill-open .nm,#cc .skill-open .ap{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .skill-detail{padding:4px 0 10px;border-top:1px solid var(--rule);}
+#cc .skill-detail > p{margin:10px 0 0;font-size:15px;line-height:1.55;color:var(--ink-2);max-width:62ch;}
+#cc .skill-md{
+  margin:12px 0 0;padding:12px 14px;border:1px solid var(--rule);background:var(--ground-2,transparent);
+  font:400 12.5px/1.7 Archivo,ui-monospace,monospace;color:var(--ink-2);
+  white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto;max-width:72ch;
+}
+#cc .skill-editor{display:flex;flex-direction:column;gap:10px;margin-top:12px;max-width:72ch;}
+#cc .skill-editor .field{width:100%;}
+#cc .skill-md-edit{display:flex;flex-direction:column;gap:5px;}
+#cc .skill-md-edit textarea{
+  width:100%;padding:10px 12px;border:1px solid var(--rule);background:transparent;color:var(--ink);
+  font:400 12.5px/1.7 Archivo,ui-monospace,monospace;resize:vertical;
+}
+#cc .skill-md-edit textarea:focus-visible{outline:0;border-color:var(--rubric);}
+
+/*
+ * Send is the affirmative control, and the design draws it in the accent. Always.
+ *
+ * The mockup writes `aria-pressed="true"` on it permanently — a static page's way of saying "this
+ * is always drawn this way". The first attempt here tied the colour to whether there was anything
+ * to send, which sounds honest and is wrong: an ask band with an empty draft is the state the app
+ * sits in nearly all the time, so the one coloured control on every screen was grey nearly all the
+ * time. It is the accent whenever it is on screen, and the handlers behind it refuse an empty
+ * draft — which is where a guard belongs.
+ */
+#cc .detent.send{color:var(--rubric);border-color:var(--rubric);}
+#cc .detent.send:hover{color:var(--rubric-lift);border-color:var(--rubric-lift);}
+/*
+ * Not available outranks live.
+ *
+ * The send variant is the one control in the product that overrides the design's own detent ink,
+ * and it does so from `#cc` — so the design's new disabled state, which carries no id, lost to it
+ * and a Send with nothing to send still drew in the rubric. The state has to be restated at the
+ * specificity that beat it, and hover stays quiet with it.
+ */
+#cc .detent.send:disabled,#cc .detent.send[aria-disabled="true"],
+#cc .detent.send:disabled:hover{color:var(--ink-3);border-color:var(--rule);cursor:default;}
+
+/*
+ * One focus mark on a text field, never two.
+ *
+ * `#cc :focus-visible` puts a rubric outline on everything focusable, which is right for a button
+ * — a button has no other way to say it has focus. A text field does: the design turns its own
+ * edge rubric, `.field:focus-within` and `.qbar:focus-within` and the ask band's underline. Both
+ * firing at once drew two orange rectangles nested inside each other, two pixels apart, on every
+ * search box and every composer in the app.
+ *
+ * So every text-entry control gives up the ring and keeps its edge. Buttons, links and anything
+ * else keep the ring, because for them it is the only mark there is — this removes a duplicate,
+ * not the focus indicator.
+ */
+#cc :is(input,textarea,select):focus-visible,
+#cc [contenteditable]:focus-visible,
+#cc .cm-editor .cm-content:focus-visible,
+#cc .cm-editor.cm-focused{outline:0;}
+
+/* Each of those edges, so giving up the ring never leaves a field with no focus mark at all. */
+#cc .askband input:focus-visible{border-bottom-color:var(--rubric);}
+#cc .field:focus-within,#cc .qbar:focus-within,#cc .search:focus-within,
+#cc .composer:focus-within,#cc .palette-in:focus-within{border-color:var(--rubric);}
+#cc .skill-md-edit textarea:focus-visible,#cc .sheet-b input[type="text"]:focus-visible,
+#cc .markdown-editor textarea:focus-visible{border-color:var(--rubric);}
+
+/*
+ * A search row keeps the top padding every other bar has.
+ *
+ * The mockup writes `padding-top:0` on the bar under a column head, which sets the field hard
+ * against the rule above it. On the page that reads as a rendering fault rather than as tightness,
+ * so the bar keeps `.bar`'s own 8px and the column gets the same rhythm everywhere.
+ */
+#cc .col-i > .bar + .bar{padding-top:8px;}
+
+/*
+ * A handle is an identifier and renders as itself.
+ *
+ * Apparatus text in this design is tracked capitals, which is right for a label and wrong for a
+ * business key: an agent stored as `mara` was being drawn as `@MARA`, and the store's own rule is
+ * that case never varies. A reader who types what the screen shows must get the agent the screen
+ * was describing. The tracking and the face stay; only the transform goes.
+ */
+#cc .ap.handle{text-transform:none;letter-spacing:.04em;}
+/* The byline sets its spans as tracked capitals too; a handle inside one is still an identifier. */
+#cc .byline span.handle{text-transform:none;letter-spacing:.04em;}
+
+/* ─── the tables grid ────────────────────────────────────────────────────────
+ * Tables reuses `.virtual-table` rather than drawing a second table grammar. The plot's table is
+ * virtualised and positions its cells absolutely, so it sets each width inline; this one renders a
+ * bounded window as real rows, so the widths belong here. Nothing below redefines a token, and
+ * nothing overrides a rule in reference.css. */
+#cc .table-scroll{display:flex;min-width:0;min-height:0;flex:1;overflow-x:auto;}
+#cc .table-scroll .virtual-table{min-width:min-content;}
+#cc .table-scroll .virtual-cell,
+#cc .table-scroll .header-cell{flex:0 0 196px;min-width:0;}
+#cc .table-scroll .header-cell{
+  display:flex;flex-direction:column;align-items:flex-start;gap:2px;white-space:normal;
+}
+/* The selected row is marked by the same wash the stripe uses, one step stronger at its edge, so
+   selection reads as position rather than as colour. */
+#cc .table-scroll .virtual-row.sel{background:var(--rubric-wash);box-shadow:inset 2px 0 0 var(--rubric);}
+
+/* A cell you can edit is a control, and says so by being one. A cell you cannot is text. */
+#cc .table-cell-edit{
+  display:block;width:100%;padding:0;border:0;background:none;text-align:left;
+  font:inherit;color:inherit;cursor:text;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .table-cell-edit:disabled{cursor:default;opacity:.55;}
+#cc .table-cell-input{
+  width:100%;padding:0;border:0;border-bottom:1px solid var(--rubric);background:none;
+  font:inherit;color:var(--ink);font-variant-numeric:tabular-nums;
+}
+
+/*
+ * The reading notice's foot: what the pass is still doing.
+ *
+ * `.notice` is a two-column grid — kindmark, then content — and every child the design drew
+ * declares `grid-column: 2` for itself. A bare span does not, so it would be auto-placed into
+ * column one and sit under the kindmark instead of under the text it belongs to.
+ */
+#cc .notice > .ap{grid-column:2;margin-top:9px;}
+
+/*
+ * The streaming caret, sized to whatever it follows and stilled for anyone who asked for that.
+ *
+ * `.stream::after` is the design's mark for text still being written, and it is drawn at a fixed
+ * 7×15px for the chat turn's 18px setting. Following a notice's 14.5px paragraph it stands too
+ * tall, so it takes its size from the text instead. The design gives the blink no
+ * `prefers-reduced-motion` guard; a caret blinking twice a second is exactly what that setting
+ * exists to stop, so it holds steady rather than disappearing — still marking the position,
+ * without the motion.
+ */
+#cc .notice p.stream::after{width:.45em;height:1em;vertical-align:-.15em;}
+@media (prefers-reduced-motion:reduce){
+  #cc .stream::after{animation:none;}
+}
+
+/* ─── drawing on the calendar ────────────────────────────────────────────────
+ *
+ * The gestures every calendar already has: draw on empty time to make something, drag a block to
+ * move it, drag its bottom edge to say how long. Nothing here invents a mark — a thing that is not
+ * real yet is dashed and rubric, which is what "provisional" already looks like everywhere else in
+ * this interface, and a thing being dragged goes translucent so the grid underneath stays readable.
+ */
+#cc .wk-body{touch-action:none;}
+#cc .wk-body.dragging{cursor:grabbing;user-select:none;}
+#cc .wk-col{cursor:crosshair;}
+#cc .wk-ev{cursor:grab;touch-action:none;user-select:none;}
+#cc .wk-ev.moving{opacity:.45;}
+#cc .wk-ev.draft{
+  border-style:dashed;border-color:var(--rubric);color:var(--rubric);
+  background:var(--rubric-wash);pointer-events:none;z-index:4;
+}
+#cc .wk-ev.draft b{font-variant-numeric:tabular-nums;}
+/* The grip is a target, not a decoration: it appears under the pointer and nowhere else. */
+#cc .wk-grip{position:absolute;left:0;right:0;bottom:0;height:7px;cursor:ns-resize;}
+#cc .wk-ev:hover .wk-grip::before{
+  content:"";position:absolute;left:50%;bottom:2px;width:18px;height:1px;
+  transform:translateX(-50%);background:currentColor;
+}
+
+/* An hour with nothing in it is still somewhere to put something. */
+#cc .day .slot.free{min-height:32px;}
+#cc .slot-free{
+  display:block;width:100%;border:0;background:transparent;padding:0 0 4px;text-align:left;
+  cursor:pointer;
+}
+#cc .slot-free .ap{opacity:0;transition:opacity 120ms ease-out;}
+#cc .slot.free:hover .slot-free .ap,
+#cc .slot-free:focus-visible .ap{opacity:1;}
+@media (prefers-reduced-motion:reduce){
+  #cc .slot-free .ap{transition:none;}
+}
+
+#cc .cal .cell{cursor:pointer;}
+#cc .cal .cell.over{box-shadow:inset 0 0 0 1px var(--rubric);}
+#cc .cal .ce.moving{opacity:.45;}
+
+/* The Gantt's two surfaces: the dates move time, the body draws on it. */
+#cc .canvas-header{cursor:grab;}
+#cc .timeline-canvas{cursor:crosshair;}
+#cc .gbar.sketch{
+  height:22px;border-style:dashed;border-color:var(--rubric);color:var(--rubric);
+  background:var(--rubric-wash);pointer-events:none;
+}
+#cc .gbar.sketch .gbar-label{font-variant-numeric:tabular-nums;}
+
+/* ─── the Gantt's marks ──────────────────────────────────────────────────────
+ *
+ * Ten class names the Timeline puts on elements had no rule in either sheet, so the marks that
+ * carry the plan's meaning all rendered as an ordinary bar: the critical path highlighted nothing,
+ * a repeat's ghost was indistinguishable from a real occurrence, the "starts now" shadow looked
+ * like a second real bar, and the dependency arrows — the one thing a Gantt exists for — were
+ * bare SVG paths, which means filled black and no stroke.
+ *
+ * The vocabulary is the design's own: dashed is provisional, `--rubric` is live or urgent,
+ * `--rule-2` is structure, and nothing is drawn in a colour the palette does not already hold.
+ */
+
+/* A future occurrence of a repeat. It has not happened and may yet move. */
+#cc .gbar.ghost{border-style:dashed;border-color:var(--rule-2);background:transparent;opacity:.7;}
+
+/* Everything this waits for is done, so it starts now rather than in its slot. */
+#cc .gbar.shadow{
+  border-style:dashed;border-color:var(--rubric-lift);color:var(--rubric-lift);
+  background:var(--rubric-wash);
+}
+
+/* A parent's bar spans its children rather than being work of its own. */
+#cc .gbar.summary{border-color:var(--ink-2);border-top-width:2px;background:transparent;}
+
+/* The chain that decides when the plan finishes. `.gbar.crit` is the design's own name for this
+   in reference.css; the component says `critical`, so both mean it. */
+#cc .gbar.critical{border-color:var(--rubric);color:var(--rubric);background:var(--rubric-wash);}
+
+/* Two grips on the right edge, side by side rather than stacked: the outer one changes how long
+   the task runs, the inner one is dragged onto another task to make it wait for this one. The
+   sheet positioned `.start`/`.end`, which this component has never used. */
+#cc .gbar-handle.resize{right:0;width:6px;cursor:ew-resize;}
+#cc .gbar-handle.link{right:6px;width:6px;cursor:crosshair;}
+#cc .gbar:hover .gbar-handle.resize{box-shadow:inset -2px 0 0 var(--rubric);}
+#cc .gbar:hover .gbar-handle.link{box-shadow:inset -1px 0 0 var(--counter);}
+
+/* What waits for what. A path with no rule is filled black and unstroked — a blot, not an arrow. */
+#cc .canvas-arrows .dependency{fill:none;stroke:var(--rule-2);stroke-width:1;}
+#cc .canvas-arrows .dependency.dimmed{opacity:.3;}
+#cc .canvas-arrows .dependency.linking{stroke:var(--rubric);stroke-dasharray:3 3;}
+#cc .canvas-arrows marker path{fill:var(--rule-2);}
+
+/* A leaf has no twisty; the span only holds the indent a twisty would occupy. */
+#cc .outline-twisty.placeholder{visibility:hidden;pointer-events:none;}
+
+/* ─── a task's run history ───────────────────────────────────────────────────
+ *
+ * `.run-history`, `.run-outcome` and `.run-output` were all dressed; the run itself was not, so
+ * "What happened" drew every attempt as one unseparated block of text inside a styled container.
+ *
+ * The outcome had the same mismatch as `.gbar.crit` against `critical`: the sheet anticipated
+ * `.run-outcome.failed`, but the component never writes `failed` on that span — it writes the
+ * outcome as text and puts `outcome-failed` on the article. So a failed run was marked nowhere.
+ * Both spellings resolve now, since the sheet's own is the one another surface may yet use.
+ */
+#cc .run{border-top:1px solid var(--rule);padding:7px 0 6px;}
+#cc .run:first-of-type{border-top:0;padding-top:2px;}
+#cc .run header{display:flex;align-items:baseline;gap:9px;}
+#cc .run header span:first-child{font-size:11.5px;color:var(--ink-2);font-variant-numeric:tabular-nums;}
+#cc .run header .run-outcome{margin-left:auto;text-transform:uppercase;}
+
+/* What the attempt came to. Failure is the only one that gets the rubric. */
+#cc .run.outcome-failed .run-outcome{color:var(--rubric);}
+#cc .run.outcome-open .run-outcome{color:var(--rubric-lift);}
+#cc .run.outcome-cancelled,#cc .run.outcome-skipped{color:var(--ink-3);}
+#cc .run.outcome-cancelled .run-outcome,#cc .run.outcome-skipped .run-outcome{color:var(--ink-3);}
+
+/* Firings that were missed and rolled into this one — a note about the schedule, not the work. */
+#cc .run-skipped{
+  margin:3px 0 0;font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.08em;
+  color:var(--ink-3);
+}
+
+/* A proposal is not a value. It is set in the apparatus face beside the control that would make it
+   one, so a cell the model filled can never be mistaken for a cell the graph holds. */
+#cc .virtual-cell.proposed{display:flex;align-items:baseline;gap:7px;}
+#cc .virtual-cell.proposed .ap{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .detent.tiny{padding:1px 5px;font-size:8.5px;flex:0 0 auto;}
+
+/* The identity's own colour, on an arrival row. `.pip` is the design's 5px square and is already
+   what the identity setup screen puts beside an address; this only gives it the gap it needs when
+   it sits inside `.acct`, which is a text cell rather than a flex row. */
+#cc .acct-pip{display:inline-block;margin-right:4px;vertical-align:middle;}
+
+/* The run behind an answer. Rows reuse `.stream-row`; only the states it does not already draw are
+   added here. A failed step is marked in the accent because it is the one thing that needs finding;
+   a running one is dimmed because it is not news yet. */
+#cc .run-steps-summary{
+  width:max-content;max-width:100%;display:flex;align-items:center;gap:7px;cursor:pointer;
+  list-style:none;font-family:Archivo,sans-serif;font-size:9px;font-weight:650;
+  letter-spacing:.15em;text-transform:uppercase;color:var(--ink-3);
+}
+#cc .run-steps-summary::-webkit-details-marker{display:none;}
+#cc .run-steps-summary:hover{color:var(--ink);}
+#cc .run-steps-summary:focus-visible{outline:1px solid var(--rubric);outline-offset:3px;}
+#cc .run-steps-mark{
+  width:7px;height:7px;flex:0 0 auto;box-shadow:inset 0 0 0 1px currentColor;
+}
+#cc .run-steps[open] .run-steps-mark{background:var(--rubric);box-shadow:none;}
+#cc .run-steps[open] .run-steps-summary{margin-bottom:6px;}
+#cc .run-steps:not([open]) .sources-list{display:none;}
+#cc .run-steps .sources-list{list-style:none;margin:0;padding:0;}
+#cc .run-step{display:grid;grid-template-columns:6px auto 1fr auto;gap:0 9px;align-items:baseline;width:100%;}
+#cc .run-step .who{text-transform:uppercase;letter-spacing:.08em;font-size:9px;color:var(--ink-3);}
+#cc .run-step-running{opacity:.62;}
+/* A failed step (a file that is not there, a test run that fails) is an ordinary step of the work:
+   no alarm colour; the steps' summary line counts it. */
+#cc .run-step-failed .who{color:var(--ink-3);}
+/* An applied change: what the host guaranteed (the counter ink the design gives a clean state) and
+   its Undo, one quiet line under the row, set in from the row's mark like its opened detail. */
+#cc .step-notes{
+  display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;min-width:0;
+  margin:-4px 0 6px 17px;font-size:12.5px;line-height:1.35;color:var(--ink-3);
+}
+#cc .step-security{display:inline-flex;align-items:center;gap:5px;min-width:0;color:var(--counter);overflow-wrap:anywhere;}
+#cc .step-security svg{width:9px;height:10px;flex:none;fill:none;stroke:currentColor;stroke-width:1.1;}
+#cc .step-notes .step-undo{height:18px;padding:0 7px;}
+#cc .step-undo-receipt{color:var(--ink-2);overflow-wrap:anywhere;}
+#cc .step-undo-left{color:var(--ink-3);}
+#cc .step-undo-error{color:var(--rubric);overflow-wrap:anywhere;}
+/* A step that runs a program, edits a file or starts a job carries its run. The row stays the step's
+   own; beneath it the newest output lines while it goes (a fixed four, so arriving output never
+   moves the conversation) and the end of a failure afterwards. A success folds back to its row. */
+#cc .run-tail{
+  margin:0 0 8px 16px;padding:0 0 0 12px;border-left:1px solid var(--rule-2);
+  overflow:hidden;overflow-wrap:anywhere;
+}
+#cc .run-item-running .run-tail{height:6em;white-space:pre;}
+#cc .run-open .ap{display:block;margin-top:4px;}
+#cc .run-open .run-output{margin:2px 0 6px;max-height:24em;overflow:auto;overflow-wrap:anywhere;}
+/* Background jobs: session state above the composer, one line each, only while they run. */
+#cc .conversation>.session-jobs{flex:none;margin-top:8px;}
+#cc .session-job{display:grid;grid-template-columns:1fr auto;align-items:center;gap:0 10px;border-top:1px solid var(--rule);}
+#cc .session-job:last-of-type{border-bottom:1px solid var(--rule);}
+#cc .session-job .run-tail{grid-column:1/-1;}
+#cc .session-job .dot{background:var(--rubric);box-shadow:none;animation:cc-pulse 2s ease-in-out infinite;}
+@media (prefers-reduced-motion:reduce){#cc .session-job .dot{animation:none;}}
+
+/* Apparatus in a list row's meta line truncates rather than clipping silently.
+   `.ap` in reference.css sets no overflow behaviour, which is right for a short count or state but
+   wrong for the one case that carries arbitrary text — an address or a handle in a `.r` row, where
+   it overflowed and was cut with no ellipsis, so the reader could not tell there was more.
+   Interface rule 6 prescribes exactly this: anything that can carry an unbreakable string sets its
+   own `min-width: 0` and truncates. Scoped to the row context so multi-line apparatus elsewhere,
+   and the margin's notes, are untouched. */
+#cc .lst .r .ap,#cc .stream-row .ap{
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+/* A database choice and its separate destructive action share one row. */
+#cc .menu > div + div { border-top: 1px solid var(--rule); }
+#cc .menu .menu-action-row { display: flex; align-items: stretch; }
+#cc .menu .menu-action-row > button:first-child { flex: 1; min-width: 0; }
+#cc .menu .menu-action-row .ml { min-width: 0; overflow-wrap: anywhere; }
+#cc .menu button.menu-delete { display: flex; align-items: center; justify-content: center; flex: 0 0 32px; width: 32px; min-height: 32px; padding: 4px; border: 0; color: var(--ink-3); }
+#cc .menu button.menu-delete:hover { color: var(--rubric); }
+#cc .menu button.menu-delete:disabled { color: var(--ink-3); cursor: wait; }
+#cc .menu button.menu-delete:focus-visible { outline: 1px solid var(--rubric); outline-offset: -3px; }
+
+/* Native modal focus containment, dressed in the existing sheet vocabulary. */
+#cc .delete-confirmation {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  padding: 0;
+  width: min(470px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  color: var(--ink);
+}
+#cc .delete-confirmation::backdrop {
+  background: color-mix(in srgb, var(--ground) 72%, transparent);
+}
+#cc .delete-confirmation .sheet-b p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font: 400 18px/1.6 "Source Serif 4", Georgia, serif;
+}
+#cc .delete-confirmation .sheet-b p + p { margin-top: 16px; }
+#cc .delete-confirmation .sheet-f { flex-wrap: wrap; }
+
+/* Inbox has no annotation margin; let the reader use its desktop tracks. */
+@media(min-width:881px){
+  #cc .screen[data-screen="inbox"]>.col-ii{grid-column:5 / -1;}
+}
+
+/* Inbox conversations use the original full chat surface, with a stationary writing area. */
+#cc .col-ii.conversation{
+  display:flex;flex-direction:column;overflow:hidden;padding:20px 12px 12px 16px;
+}
+#cc .conversation-bar{flex:none;gap:8px;min-width:0;}
+#cc .conversation-bar>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .conversation-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:22px 8px 0 0;}
+/* The way back to the latest, shown only once the reader has scrolled up: it floats over the
+   foot of the conversation, centred, and takes no room of its own. */
+#cc .conversation-end{flex:none;position:relative;height:0;}
+/* An ordinary detent; only the ground behind it is filled, so the text it floats over stays out. */
+#cc .conversation-toend{
+  position:absolute;left:50%;bottom:10px;z-index:2;background:var(--ground);transform:translateX(-50%);
+  opacity:0;visibility:hidden;transition:opacity .15s linear,visibility .15s linear,border-color .12s linear;
+}
+#cc .conversation-toend[data-shown="true"]{opacity:1;visibility:visible;}
+#cc .conversation-toend:focus-visible{outline:1px solid var(--rubric);outline-offset:3px;}
+#cc .conversation-toend svg{width:9px;height:9px;fill:none;stroke:currentColor;stroke-width:1.4;}
+@media (prefers-reduced-motion:reduce){#cc .conversation-toend{transition:none;}}
+#cc .conversation-research{
+  flex:1;min-height:0;min-width:0;overflow:auto;overscroll-behavior:contain;
+  padding-right:8px;
+}
+#cc .conversation-research>.research-panel{margin:0;min-width:0;overflow-wrap:anywhere;}
+#cc .conversation-research .research-head{flex-wrap:wrap;align-items:flex-start;}
+#cc .conversation-research .research-title{flex:1;min-width:0;}
+#cc .conversation-research .research-step,#cc .conversation-research .research-finding{display:block;}
+#cc .conversation>.composer{flex:none;margin-top:12px;}
+#cc .conversation>.session-tasks{flex:none;max-height:30%;overflow:auto;}
+@media(max-width:880px){
+  #cc:has(.conversation){height:100dvh;min-height:0;}
+  #cc:has(.conversation) .work{grid-template-rows:auto minmax(0,1fr);}
+  #cc:has(.conversation) .screen[data-screen="inbox"]>.col-i{display:none;}
+  #cc .col-ii.conversation{padding:12px 0;}
+}
+#cc .conversation-back{display:none;}
+@media(max-width:880px){#cc .conversation-back{display:inline-flex;}}
+
+/* Keep long plan names inside the toolbar; the full title remains on hover. */
+#cc .plan-selector { min-width: 0; max-width: 100%; flex: 0 1 220px; }
+#cc .plan-selector .menu-anchor { min-width: 0; max-width: 100%; }
+#cc .plan-selector .pick { min-width: 0; max-width: 100%; }
+#cc .plan-selector .pick .v { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#cc .plan-selector .pick svg { flex-shrink: 0; }
+
+/* Prerequisite order is visible even when tasks have no scheduled dates. */
+#cc .outline-copy{display:flex;flex-direction:column;min-width:0;gap:2px;}
+#cc .outline-dependencies{font-family:Archivo,sans-serif;font-size:9px;color:var(--counter);overflow:hidden;text-overflow:ellipsis;}
+#cc .outline-row .ap{flex-shrink:0;}
+#cc .gbar-empty-hint{width:100%;height:100%;padding:0 4px;border:1px dashed var(--counter);background:var(--ground);color:var(--ink-2);cursor:pointer;white-space:nowrap;letter-spacing:0;}
+#cc .gbar-empty.dimmed{opacity:.34;}
+#cc .gbar-empty.critical .gbar-empty-hint{border-color:var(--rubric);color:var(--rubric);}
+#cc .canvas-arrows .dependency{stroke:var(--counter);stroke-width:1.5;}
+#cc .canvas-arrows marker path{fill:var(--counter);}
+
+
+/* Task editing occupies the annotation track, keeping the plan available beside it. */
+#cc .work:has(.task-inspector) {
+  grid-template-columns: 184px 1px minmax(200px, 280px) 46px minmax(240px, 1fr) 1px clamp(400px, 32vw, 560px);
+}
+#cc .task-inspector {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--ground);
+}
+#cc .task-inspector .sheet-h { flex-wrap: wrap; padding: 16px; }
+#cc .task-inspector .sheet-b { flex: 1; padding: 16px; }
+#cc .task-inspector .sheet-f { flex-wrap: wrap; align-items: flex-start; padding: 16px; }
+#cc .task-inspector .action-row { display: flex; flex-wrap: wrap; gap: 8px; }
+#cc .task-inspector .fld-row { gap: 16px; }
+#cc .task-inspector .fld { min-width: 0; }
+#cc .task-inspector input, #cc .task-inspector select, #cc .task-inspector textarea { min-width: 0; box-sizing: border-box; }
+#cc .task-inspector .run-output { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (min-width: 881px) and (max-width: 1400px) {
+  #cc .work:has(.task-inspector) {
+    grid-template-columns: 144px 1px minmax(160px, 200px) 36px minmax(0, 1fr) 1px 400px;
+  }
+}
+@media (max-width: 880px) {
+  #cc .work:has(.task-inspector) { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
+  #cc .task-inspector { grid-column: 1; grid-row: 3; height: 80dvh; border-block: 1px solid var(--rule); }
+  #cc .work:has(.task-inspector) .col-ii { grid-row: 4; }
+  #cc .task-inspector-rule { display: none; }
+}
+
+/* Plan uses the shared graph canvas with readable task discs and relationship arrows. */
+#cc .plan-graph { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+#cc .plan-graph-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#cc .plan-graph-toolbar .grow { flex: 1; }
+#cc .plan-graph-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--ink-2); font: 12px Archivo, sans-serif; }
+#cc .plan-graph-legend > span { display: inline-flex; align-items: center; gap: 8px; }
+#cc .plan-graph-legend i { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; }
+#cc .plan-graph-legend .edge-key { width: 24px; height: 3px; border-radius: 0; }
+#cc .plan-graph-stage { display: flex; height: clamp(360px, 60dvh, 800px); min-width: 0; }
+
+/* Graph is a shortcut-only workspace: no app index, twice the inspector width. */
+#cc .work.work-graph{grid-template-columns:minmax(0,400px) 46px minmax(0,1fr) 1px 456px;}
+@media (max-width:1400px){
+  #cc .work.work-graph{grid-template-columns:minmax(0,368px) 44px minmax(0,1fr) 1px 424px;}
+}
+@media (max-width:1180px){
+  #cc .work.work-graph{grid-template-columns:minmax(0,360px) 42px minmax(0,1fr) 0 0;}
+}
+@media (max-width:880px){
+  #cc .work.work-graph{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);}
+}
+
+/* Global semantic search: a field and anchored results, never a modal. */
+#cc .record-search { position: relative; width: min(360px, 46vw); min-width: 0; flex: 0 1 360px; z-index: 30; }
+#cc .record-search-field { display: flex; width: 100%; cursor: text; }
+#cc .record-search-field:focus-within { border-color: var(--ink-2); }
+#cc .record-search-field svg { width: 12px; height: 12px; flex: none; stroke: currentColor; stroke-width: 1.3; fill: none; }
+#cc .record-search input { appearance: none; width: 100%; height: 20px; min-width: 0; margin: 0; padding: 0; border: 0; outline: none; background: transparent; color: var(--ink); font: inherit; letter-spacing: inherit; text-transform: inherit; }
+#cc .record-search input::placeholder { color: var(--ink-2); opacity: 1; }
+#cc .record-search input::-webkit-search-cancel-button { display: none; }
+#cc .record-search kbd { font: inherit; letter-spacing: .06em; color: var(--ink-2); white-space: nowrap; }
+#cc .record-search-clear { display: grid; place-items: center; width: 16px; height: 20px; flex: none; padding: 0; background: none; border: 0; color: var(--ink-2); cursor: pointer; }
+#cc .record-search-clear:focus-visible { outline: 1px solid var(--rubric); outline-offset: 2px; }
+#cc .record-search-results { position: absolute; top: calc(100% + 6px); left: 0; right: 0; background: var(--ground); border: 1px solid var(--rule-2); max-height: min(65vh, 560px); overflow-y: auto; overscroll-behavior: contain; }
+#cc .record-search-heading { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--rule); }
+#cc .search-message { padding: 12px; margin: 0; color: var(--ink-2); font-size: 14px; line-height: 1.5; }
+#cc .search-message.warn { color: var(--rubric); }
+#cc .record-search-hits { list-style: none; margin: 0; padding: 0; }
+#cc .record-search-hits li { padding: 10px 12px; overflow-wrap: anywhere; }
+#cc .record-search-hits li + li { border-top: 1px solid var(--rule); }
+#cc .record-search-hits h3 { font: inherit; font-size: 17px; line-height: 1.3; margin: 5px 0; color: var(--ink); }
+#cc .record-search-hits p { font-size: 14px; line-height: 1.5; margin: 0; color: var(--ink-2); white-space: pre-line; }
+#cc .database-settings .row, #cc .settings-themes { flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+@media (max-width: 680px) {
+  #cc .band { flex-wrap: wrap; height: auto; gap: 12px; padding-top: 12px; padding-bottom: 12px; }
+  #cc .record-search { width: 100%; flex: 1 0 100%; }
+}
+
+/* Database settings use the existing ruled settings rows with visible actions. */
+#cc .database-list { padding: 0; margin: 24px 0 0; list-style: none; }
+#cc .database-list .row { margin: 0; min-height: 54px; gap: 12px; flex-wrap: nowrap; }
+#cc .database-name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 17px; }
+#cc .database-active { min-width: 44px; text-align: center; }
+#cc .database-create { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--rule); }
+#cc .database-create .fld { margin: 16px 0 8px; }
+#cc .database-create-fields { display: flex; align-items: center; gap: 12px; }
+#cc .database-create-fields input { flex: 1; min-width: 0; height: 30px; padding: 0 9px; border: 1px solid var(--rule-2); background: transparent; color: var(--ink); font: inherit; font-size: 14px; }
+#cc .database-create-fields input::placeholder { color: var(--ink-2); }
+#cc .database-create-fields input:focus-visible { outline: 1px solid var(--rubric); outline-offset: 2px; }
+@media (max-width: 480px) { #cc .database-create-fields { flex-wrap: wrap; } #cc .database-create-fields input { flex-basis: 100%; } }
+
+#cc .supported-models .row { gap: 12px; min-height: 48px; }
+#cc .model-choice-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#cc .model-choice-state { min-width: 42px; text-align: center; }
+#cc .supported-models h3 { margin-bottom: 16px; }
+
+#cc .record-search-hits li:has(> a) { padding: 0; }
+#cc .record-search-hits a { display: block; padding: 10px 12px; color: inherit; text-decoration: none; }
+#cc .record-search-hits a:hover h3 { color: var(--rubric); }
+#cc .record-search-hits a:focus-visible { outline: 1px solid var(--rubric); outline-offset: -2px; }
+
+/* Live chat activity uses the existing reading column and apparatus tokens. */
+#cc .chat-working{margin:16px 0;padding:12px 0;border-top:1px solid var(--rule);min-width:0;overflow-wrap:anywhere;}
+#cc .chat-working summary{cursor:pointer;}
+#cc .chat-working summary:focus-visible{outline:1px solid var(--rubric);outline-offset:4px;}
+#cc .chat-working-status,#cc .chat-working-latest{display:block;margin-top:8px;}
+#cc .chat-working-latest,#cc .chat-working li{font-family:"Source Serif 4","Iowan Old Style",Georgia,serif;font-size:14px;line-height:1.6;color:var(--ink-2);}
+#cc .chat-working-thinking{display:block;margin-top:6px;font-family:"Source Serif 4","Iowan Old Style",Georgia,serif;font-size:13px;line-height:1.5;font-style:italic;color:var(--ink-3);opacity:.62;}
+#cc .chat-working ol{margin:12px 0 0;padding-left:24px;}
+/* The searches and other steps of the run, live while the answer is prepared. Same rows as the
+   run behind a finished answer. */
+#cc .chat-working .chat-working-steps{list-style:none;margin:12px 0 0;padding:0;}
+#cc .chat-working .chat-working-steps li+li{margin-top:0;}
+#cc .chat-working .chat-working-steps li.chat-working-step-older{opacity:.5;}
+#cc .chat-working-context{display:block;margin-top:4px;font-variant-numeric:tabular-nums;}
+#cc .chat-working li+li{margin-top:8px;}
+
+/* ─── conversation sandbox ─────────────────────────────────────────────────
+   Files and folders a conversation's programs read and edit in place. On wide screens the
+   conversation keeps the annotation margin for them; where the design hides that margin, the
+   conversation bar carries the same list as a count. */
+@media(min-width:1181px){
+  #cc .screen[data-screen="inbox"]:has(> .marg.sandbox)>.col-ii{grid-column:5;}
+}
+#cc .sandbox-narrow{display:none;}
+@media(max-width:1180px){#cc .sandbox-narrow{display:inline-flex;}}
+#cc .marg.sandbox{display:flex;flex-direction:column;min-width:0;padding-right:14px;}
+#cc .sandbox .marg-h{min-width:0;}
+#cc .sandbox-count{margin-left:auto;white-space:nowrap;}
+#cc .sandbox-empty{margin:0 0 18px;font-size:13.5px;line-height:1.5;color:var(--ink-3);}
+#cc .sandbox-list{list-style:none;margin:0 0 18px;padding:0;display:grid;gap:14px;}
+#cc .sandbox-entry{
+  display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:8px;row-gap:4px;min-width:0;
+  border-left:1px solid var(--rule);padding-left:12px;transition:border-color .12s linear;
+}
+#cc .sandbox-entry:hover{border-left-color:var(--rubric);}
+#cc .sandbox-entry>.kd,#cc .sandbox-entry>.nm,#cc .sandbox-entry>.in,#cc .sandbox-entry>.ct{grid-column:1;min-width:0;}
+#cc .sandbox-entry>.ct{margin-top:2px;white-space:nowrap;}
+#cc .sandbox-entry>.nm{
+  font-size:14px;line-height:1.3;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+#cc .sandbox-entry>.in{
+  font-family:Archivo,sans-serif;font-size:10px;letter-spacing:.02em;line-height:1.3;color:var(--ink-3);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left;
+}
+#cc .sandbox-entry.missing>.kd{color:var(--rubric);}
+#cc .sandbox-entry.missing>.nm{color:var(--ink-3);text-decoration:line-through;text-decoration-color:var(--rubric-deep);}
+#cc .sandbox-acts{grid-column:2;grid-row:1 / span 4;align-self:start;display:flex;flex-direction:column;gap:2px;}
+#cc .sandbox-act{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:22px;height:22px;padding:0;border:1px solid transparent;background:transparent;color:var(--ink-3);cursor:pointer;
+  transition:border-color .12s linear,color .12s linear;
+}
+#cc .sandbox-act:hover{color:var(--rubric);border-color:var(--rule-2);}
+#cc .sandbox-act:focus-visible{outline:1px solid var(--rubric);outline-offset:1px;}
+#cc .sandbox-act:disabled{color:var(--rule-2);cursor:default;border-color:transparent;}
+#cc .sandbox-add{display:flex;flex-wrap:wrap;gap:6px;}
+#cc .sandbox-error{margin:12px 0 0;line-height:1.5;overflow-wrap:anywhere;}
+
+/* Files and folders attached to the message being written: their own pills, or one summary. */
+#cc .attached.paths{align-items:center;min-width:0;}
+#cc .path-chip{max-width:min(280px,100%);min-width:0;}
+#cc .path-chip>.kd{flex:none;color:var(--ink-3);}
+#cc .path-chip>.nm{
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  text-transform:none;letter-spacing:.01em;font-size:11px;font-weight:500;color:var(--ink);
+}
+#cc .path-chip>button{flex:none;display:inline-flex;align-items:center;}
+#cc .path-chip>button:focus-visible{outline:1px solid var(--rubric);outline-offset:2px;}
+#cc .path-chip.summary{gap:6px;padding:0;border:0;height:auto;}
+#cc .path-chip.summary .detent{height:20px;letter-spacing:.08em;}
+
+/* ─── results a skill measured, under the answer ─────────────────────────── */
+/*
+ * `ResultCheck.tsx`, the `result` type of the shared views channel. The answer's own grammar for what it rests on: a `.stream-row` that opens in
+ * place into the design's `.tbl`, indented under its row. The state is carried by the row's mark
+ * and the accent alone — a result that holds keeps the provenance outline, one that does not is
+ * drawn in the rubric like a failed run step, one that is not settled is dimmed to the third ink.
+ */
+#cc .result-view .stream-row{grid-template-columns:6px auto minmax(0,1fr) fit-content(40%);}
+#cc .result-view .result-static{cursor:default;}
+#cc .result-view .result-static:hover{background:transparent;}
+#cc .result-view .result-static:hover .subject{color:var(--ink-2);}
+#cc .result-fail .stream-row .dot{background:var(--rubric);box-shadow:none;}
+#cc .result-fail .stream-row .who,#cc .result-fail .stream-row .subject{color:var(--rubric);}
+#cc .result-open .stream-row .dot{box-shadow:inset 0 0 0 1px var(--ink-3);}
+#cc .result-open .stream-row .who{color:var(--ink-3);}
+#cc .result-view .stream-row:focus-visible{outline:1px solid var(--rubric);outline-offset:-1px;}
+#cc .result-view{min-width:0;max-width:100%;}
+#cc .result-view .row-end{min-width:0;overflow:hidden;text-overflow:ellipsis;}
+/* On a phone the title is what a result is read for; its provenance note gives way. */
+@media (max-width:560px){
+  #cc .result-view .stream-row{grid-template-columns:6px auto minmax(0,1fr);}
+  #cc .result-view .row-end{display:none;}
+}
+#cc .result-view-body{min-width:0;}
+/* A wide table scrolls inside its own box. `contain: inline-size` keeps the table's own width out
+   of the row's size, so an opened result never pushes the answer's column wider (interface rule 6). */
+#cc .result-table-scroll{width:100%;max-width:100%;overflow-x:auto;contain:inline-size;}
+#cc .result-table{margin:4px 0 8px;font-variant-numeric:tabular-nums;}
+#cc .result-table td{font-size:14px;white-space:nowrap;}
+#cc .result-table td.mark{color:var(--rubric);text-decoration:underline 1px var(--rubric);text-underline-offset:3px;}
+
+/* ─── results a data script showed: tables and charts ───────────────────── */
+/*
+ * `ResultViews.tsx`. Chart hues are the data worker's (`crates/server/src/data/chart/palette.rs`,
+ * whose tests hold these values to it): six categorical hues that stay apart for colour-blind
+ * readers, a gray for context, and a one-hue ramp for magnitude. They follow the theme the way
+ * reference.css's tokens do, so the same drawing reads on the page and on the plate.
+ */
+:root{
+  --cc-chart-s0:#2C5F80; --cc-chart-s1:#B23520; --cc-chart-s2:#15957B; --cc-chart-s3:#A47726; --cc-chart-s4:#7E6ED3; --cc-chart-s5:#562D47;
+  --cc-chart-context:#9AA1A6;
+  --cc-chart-q0:#DCE8F0; --cc-chart-q1:#A9C6DA; --cc-chart-q2:#6E9BB5; --cc-chart-q3:#3E6F8F; --cc-chart-q4:#1E4560;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+  --cc-chart-s0:#6E9BB5; --cc-chart-s1:#E2603F; --cc-chart-s2:#7EDBAE; --cc-chart-s3:#E4AE28; --cc-chart-s4:#7868CD; --cc-chart-s5:#9A6982;
+  --cc-chart-context:#5C656B;
+  --cc-chart-q0:#1B2A35; --cc-chart-q1:#24445A; --cc-chart-q2:#33688A; --cc-chart-q3:#5A93B6; --cc-chart-q4:#9CC3DC;
+  }
+}
+:root[data-theme="dark"]{
+  --cc-chart-s0:#6E9BB5; --cc-chart-s1:#E2603F; --cc-chart-s2:#7EDBAE; --cc-chart-s3:#E4AE28; --cc-chart-s4:#7868CD; --cc-chart-s5:#9A6982;
+  --cc-chart-context:#5C656B;
+  --cc-chart-q0:#1B2A35; --cc-chart-q1:#24445A; --cc-chart-q2:#33688A; --cc-chart-q3:#5A93B6; --cc-chart-q4:#9CC3DC;
+}
+#cc[data-view="page"]{
+  --cc-chart-s0:#2C5F80; --cc-chart-s1:#B23520; --cc-chart-s2:#15957B; --cc-chart-s3:#A47726; --cc-chart-s4:#7E6ED3; --cc-chart-s5:#562D47;
+  --cc-chart-context:#9AA1A6;
+  --cc-chart-q0:#DCE8F0; --cc-chart-q1:#A9C6DA; --cc-chart-q2:#6E9BB5; --cc-chart-q3:#3E6F8F; --cc-chart-q4:#1E4560;
+}
+#cc[data-view="plate"]{
+  --cc-chart-s0:#6E9BB5; --cc-chart-s1:#E2603F; --cc-chart-s2:#7EDBAE; --cc-chart-s3:#E4AE28; --cc-chart-s4:#7868CD; --cc-chart-s5:#9A6982;
+  --cc-chart-context:#5C656B;
+  --cc-chart-q0:#1B2A35; --cc-chart-q1:#24445A; --cc-chart-q2:#33688A; --cc-chart-q3:#5A93B6; --cc-chart-q4:#9CC3DC;
+}
+#cc .message-results{margin-top:11px;padding-top:9px;border-top:1px solid var(--rule);min-width:0;}
+#cc .result-views{display:flex;flex-direction:column;gap:2px;min-width:0;}
+#cc .result-data .stream-row .row-end{font-variant-numeric:tabular-nums;}
+#cc .result-gone{margin:6px 0 10px;font-size:12.5px;color:var(--ink-3);}
+
+/* The whole result, one screen at a time. Rows have one fixed height (ResultViews ROW_HEIGHT) so
+   the virtualizer never measures; the head and the summary stay in view while the body scrolls. */
+#cc .result-grid-wrap{min-width:0;max-width:100%;}
+#cc .result-grid-scroll{
+  width:100%;max-width:100%;overflow:auto;contain:inline-size;overscroll-behavior:contain;
+}
+#cc .result-grid-scroll:focus-visible{outline:1px solid var(--rubric);outline-offset:2px;}
+#cc .result-grid{margin:0;max-width:none;width:max-content;min-width:100%;font-variant-numeric:tabular-nums;}
+#cc .result-grid thead th{position:sticky;top:0;z-index:1;background:var(--ground);padding:0;white-space:nowrap;}
+#cc .result-grid th.num{text-align:right;}
+#cc .result-sort{
+  display:inline-flex;align-items:center;gap:6px;width:100%;padding:4px 14px 6px 0;border:0;background:transparent;
+  font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;cursor:pointer;text-align:inherit;
+}
+#cc .result-grid th.num .result-sort{justify-content:flex-end;}
+#cc .result-sort:hover{color:var(--ink);}
+#cc .result-sort:focus-visible{outline:1px solid var(--rubric);outline-offset:-1px;}
+#cc .result-sort-mark{flex:none;fill:currentColor;opacity:0;}
+#cc .result-sort:hover .result-sort-mark{opacity:.45;}
+#cc th[aria-sort="ascending"] .result-sort,#cc th[aria-sort="descending"] .result-sort{color:var(--ink);}
+#cc th[aria-sort="ascending"] .result-sort-mark,#cc th[aria-sort="descending"] .result-sort-mark{opacity:1;fill:var(--rubric);}
+#cc .result-grid td{
+  height:33px;box-sizing:border-box;padding:0 14px 0 0;font-size:14px;line-height:32px;white-space:nowrap;
+  color:var(--ink-2);
+}
+#cc .result-grid td:first-child{color:var(--ink);}
+#cc .result-grid td.num{text-align:right;}
+#cc .result-grid td.empty{
+  font-family:Archivo,sans-serif;font-size:9px;letter-spacing:.11em;text-transform:uppercase;color:var(--unwritten);
+}
+#cc .result-grid tr.result-pending td{color:transparent;}
+#cc .result-grid tr.result-pending td::after{
+  content:"";display:inline-block;width:38%;max-width:96px;height:1px;vertical-align:middle;background:var(--rule);
+}
+#cc .result-grid tr.result-spacer td{padding:0;border:0;height:auto;line-height:0;}
+#cc .result-grid tbody tr:not(.result-spacer):hover td{background:var(--rubric-wash);}
+#cc .result-grid tfoot td{
+  position:sticky;bottom:0;background:var(--ground);border-top:1px solid var(--rule-2);border-bottom:0;
+  height:auto;line-height:1.35;padding:6px 14px 4px 0;vertical-align:top;
+}
+#cc .result-sum{display:block;font-size:12.5px;color:var(--ink-2);white-space:nowrap;}
+#cc .result-sum-key{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:600;letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
+}
+#cc .result-grid-foot{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin:8px 0 10px;}
+#cc .result-grid-count{font-family:Archivo,sans-serif;font-size:9.5px;letter-spacing:.07em;color:var(--ink-3);font-variant-numeric:tabular-nums;}
+#cc .result-grid-error{font-size:12.5px;color:var(--rubric);}
+#cc .result-retry{
+  border:0;background:transparent;padding:0;cursor:pointer;color:var(--ink-2);font:inherit;
+  text-decoration:underline 1px;text-underline-offset:3px;
+}
+#cc .result-retry:hover,#cc .result-retry:focus-visible{color:var(--ink);}
+#cc .result-grid-foot .file-get{margin-left:auto;text-decoration:none;}
+#cc .file-get:hover,#cc .file-get:focus-visible{color:var(--rubric-deep);text-decoration:underline 1px;text-underline-offset:3px;}
+
+/* The chart: the worker's drawing at the column's width, on the page's own ground. */
+#cc .result-chart{margin:6px 0 10px;min-width:0;max-width:100%;}
+#cc .result-chart-wait{aspect-ratio:880/520;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);}
+#cc .result-chart-plot{position:relative;min-width:0;}
+#cc .result-chart-plot:focus-visible{outline:1px solid var(--rubric);outline-offset:4px;}
+#cc .result-chart-drawing{line-height:0;}
+#cc .result-chart-drawing svg{display:block;width:100%;height:auto;overflow:visible;}
+#cc .result-chart-drawing .cc-chart-surface{fill:transparent;}
+#cc .result-chart-drawing .cc-ink{fill:var(--ink);}
+#cc .result-chart-drawing text.cc-test{fill:var(--ink);}
+#cc .result-chart-drawing .cc-ink-2{fill:var(--ink-2);}
+#cc .result-chart-drawing .cc-ink-3{fill:var(--ink-3);}
+#cc .result-chart-drawing line.cc-rule{stroke:var(--rule);}
+#cc .result-chart-drawing line.cc-rule-2{stroke:var(--rule-2);}
+#cc .result-chart-drawing line.cc-ink-2{stroke:var(--ink-2);fill:none;}
+#cc .result-chart-drawing .cc-s0{--cc-hue:var(--cc-chart-s0);}
+#cc .result-chart-drawing .cc-s1{--cc-hue:var(--cc-chart-s1);}
+#cc .result-chart-drawing .cc-s2{--cc-hue:var(--cc-chart-s2);}
+#cc .result-chart-drawing .cc-s3{--cc-hue:var(--cc-chart-s3);}
+#cc .result-chart-drawing .cc-s4{--cc-hue:var(--cc-chart-s4);}
+#cc .result-chart-drawing .cc-s5{--cc-hue:var(--cc-chart-s5);}
+#cc .result-chart-drawing .cc-context{--cc-hue:var(--cc-chart-context);}
+#cc .result-chart-drawing .cc-accent{--cc-hue:var(--rubric);}
+#cc .result-chart-drawing .cc-q0{--cc-hue:var(--cc-chart-q0);}
+#cc .result-chart-drawing .cc-q1{--cc-hue:var(--cc-chart-q1);}
+#cc .result-chart-drawing .cc-q2{--cc-hue:var(--cc-chart-q2);}
+#cc .result-chart-drawing .cc-q3{--cc-hue:var(--cc-chart-q3);}
+#cc .result-chart-drawing .cc-q4{--cc-hue:var(--cc-chart-q4);}
+#cc .result-chart-drawing rect.cc-mark,#cc .result-chart-drawing circle.cc-point,#cc .result-chart-drawing .cc-area,
+#cc .result-chart-drawing .cc-legend-key,#cc .result-chart-drawing text.cc-direct{fill:var(--cc-hue);}
+#cc .result-chart-drawing .cc-line,#cc .result-chart-drawing .cc-median,#cc .result-chart-drawing .cc-outlier{stroke:var(--cc-hue);}
+#cc .result-chart-drawing .cc-box{fill:var(--cc-hue);stroke:var(--cc-hue);}
+#cc .result-chart-drawing circle.cc-hit{fill:transparent;}
+/* Heatmap labels take whichever ink reads on their cell: measured 4.7:1 or better on both themes. */
+#cc .result-chart-drawing .cc-cell-q0,#cc .result-chart-drawing .cc-cell-q1,#cc .result-chart-drawing .cc-cell-q2{fill:var(--ink);}
+#cc .result-chart-drawing .cc-cell-q3,#cc .result-chart-drawing .cc-cell-q4{fill:var(--ground);}
+/* What the pointer or the arrow keys are on, and what the reader muted. */
+#cc .result-chart-drawing .cc-hover{stroke:var(--ink);stroke-width:1.5px;}
+#cc .result-chart-drawing circle.cc-hit.cc-hover{fill:var(--cc-hue);r:3.5px;}
+#cc .result-chart-drawing .cc-muted{opacity:.12;}
+#cc .result-chart-drawing .cc-legend-item{cursor:pointer;}
+#cc .result-chart-drawing .cc-legend-item:hover .cc-legend-label{fill:var(--ink);}
+#cc .result-chart-drawing .cc-legend-item:focus-visible{outline:1px solid var(--rubric);outline-offset:2px;}
+#cc .result-chart-drawing .cc-legend-off .cc-legend-key{fill:transparent;stroke:var(--cc-hue);stroke-width:1px;}
+#cc .result-chart-drawing .cc-legend-off .cc-legend-label{fill:var(--unwritten);text-decoration:line-through;}
+#cc .result-chart-cross{position:absolute;width:0;border-left:1px solid var(--ink-3);pointer-events:none;}
+#cc .result-chart-tip{
+  position:absolute;z-index:2;pointer-events:none;transform:translate(10px,calc(-100% - 8px));
+  display:flex;flex-direction:column;gap:2px;width:max-content;min-width:96px;max-width:min(320px,90%);padding:6px 9px 7px;
+  background:var(--ground);border:1px solid var(--rule-2);
+}
+#cc .result-chart-tip.flip{transform:translate(calc(-100% - 10px),calc(-100% - 8px));}
+#cc .result-chart-tip.beside{transform:translate(10px,0);}
+#cc .result-chart-tip.beside.flip{transform:translate(calc(-100% - 10px),0);}
+#cc .result-chart-tip-head{
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);
+  overflow-wrap:anywhere;
+}
+#cc .result-chart-tip-line{display:flex;align-items:baseline;gap:6px;font-size:12.5px;color:var(--ink-2);}
+#cc .result-chart-tip-key{flex:none;width:7px;height:7px;align-self:center;background:var(--cc-hue);}
+#cc .result-chart-tip-key.cc-s0{--cc-hue:var(--cc-chart-s0);}
+#cc .result-chart-tip-key.cc-s1{--cc-hue:var(--cc-chart-s1);}
+#cc .result-chart-tip-key.cc-s2{--cc-hue:var(--cc-chart-s2);}
+#cc .result-chart-tip-key.cc-s3{--cc-hue:var(--cc-chart-s3);}
+#cc .result-chart-tip-key.cc-s4{--cc-hue:var(--cc-chart-s4);}
+#cc .result-chart-tip-key.cc-s5{--cc-hue:var(--cc-chart-s5);}
+#cc .result-chart-tip-key.cc-context{--cc-hue:var(--cc-chart-context);}
+#cc .result-chart-tip-key.cc-accent{--cc-hue:var(--rubric);}
+#cc .result-chart-tip-series{min-width:0;overflow-wrap:break-word;}
+#cc .result-chart-tip-value{margin-left:auto;padding-left:8px;color:var(--ink);font-variant-numeric:tabular-nums;white-space:nowrap;}
+#cc .result-chart-foot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:8px;padding-top:7px;border-top:1px solid var(--rule);}
+#cc .result-chart-switch{display:inline-flex;border:1px solid var(--rule-2);}
+#cc .result-chart-switch button{
+  border:0;background:transparent;padding:3px 9px;cursor:pointer;
+  font-family:Archivo,sans-serif;font-size:9px;font-weight:650;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);
+}
+#cc .result-chart-switch button+button{border-left:1px solid var(--rule-2);}
+#cc .result-chart-switch button:hover{color:var(--ink);}
+#cc .result-chart-switch button[aria-pressed="true"]{color:var(--ink);background:var(--rubric-wash);box-shadow:inset 0 -1px 0 var(--rubric);}
+#cc .result-chart-switch button:focus-visible{outline:1px solid var(--rubric);outline-offset:-1px;}
+#cc .result-chart-name{flex:1 1 140px;min-width:0;font-size:12.5px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .result-chart-files{display:inline-flex;gap:12px;}
+#cc .result-chart-files .file-get{text-decoration:none;}
+#cc .result-chart .result-grid-wrap{margin-top:2px;}
+@media (max-width:560px){
+  #cc .result-chart-name{display:none;}
+  #cc .result-chart-files{margin-left:auto;}
+}
+@media (forced-colors:active){
+  #cc .result-chart-drawing .cc-muted{opacity:.3;}
+  #cc .result-chart-tip{border-color:CanvasText;}
+}
+/* A picture file opens to the column's width rather than a page preview's height. */
+#cc .file-card-image.large .file-card-preview img{max-height:none;width:100%;}
+#cc .file-card-image.large .file-card-preview{width:100%;}
+
+/* ─── deep research in the conversation ─────────────────────────────────────
+   The run's progress is drawn like live chat activity: a hairline, apparatus, and one row per
+   question with a square mark — rubric while it is being read, ink when done, hollow while it
+   waits. The source count is provenance and takes the counter. */
+#cc .research-progress{margin:16px 0;padding:12px 0 4px;border-top:1px solid var(--rule);min-width:0;overflow-wrap:anywhere;}
+#cc .research-progress-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;}
+#cc .research-progress-clock{margin-left:auto;font-variant-numeric:tabular-nums;}
+#cc .research-progress-question{
+  margin:8px 0 0;max-width:62ch;
+  font:400 15.5px/1.4 "Source Serif 4","Iowan Old Style",Georgia,serif;color:var(--ink);
+}
+#cc .research-progress-status{display:block;margin:8px 0 0;font-variant-numeric:tabular-nums;}
+#cc .research-progress-rows{list-style:none;margin:12px 0 0;padding:0;border-top:1px solid var(--rule);}
+#cc .research-progress-rows>li{
+  display:grid;grid-template-columns:5px minmax(0,1fr) auto;align-items:baseline;column-gap:12px;
+  padding:8px 0;border-bottom:1px solid var(--rule);
+}
+/* On the first line of a question that wraps: 8px puts the 5px mark at the middle of a 21px line. */
+#cc .research-progress-mark{
+  width:5px;height:5px;box-sizing:border-box;align-self:start;margin-top:8px;
+  border:1px solid var(--ink-3);background:transparent;
+}
+#cc .research-progress-report .research-progress-mark{margin-top:5px;}
+#cc .research-progress-rows>li[data-state="reading"] .research-progress-mark,
+#cc .research-progress-rows>li[data-state="summarizing"] .research-progress-mark{background:var(--rubric);border-color:var(--rubric);}
+#cc .research-progress-rows>li[data-state="done"] .research-progress-mark{background:var(--ink-2);border-color:var(--ink-2);}
+#cc .research-progress-text{
+  min-width:0;font:400 14px/1.5 "Source Serif 4","Iowan Old Style",Georgia,serif;color:var(--ink-2);
+}
+#cc .research-progress-rows>li[data-state="waiting"] .research-progress-text,
+#cc .research-progress-rows>li[data-state="stopped"] .research-progress-text{color:var(--ink-3);}
+#cc .research-progress-rows>li[data-state="reading"] .research-progress-text{color:var(--ink);}
+#cc .research-progress-report .research-progress-text{
+  font:600 10px/1.5 Archivo,sans-serif;letter-spacing:.15em;text-transform:uppercase;
+}
+#cc .research-progress-rows .ap{white-space:nowrap;}
+#cc .research-progress .research-actions:empty{display:none;}
+/* The report a run delivered: what the run was, above the report itself. */
+#cc .message-research{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;
+  margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--rule);
+}
+#cc .message-performance .message-calls{margin:6px 0 0;padding-left:18px;}
+
+/* ─── settings in chat ───────────────────────────────────────────────────── */
+/*
+ * `SettingsViews.tsx` (docs/settings-chat-plan.md §4.2): widgets the settings lane places inside an
+ * answer, drawn in the design's settings vocabulary — `.row` with its `.pip`, `.nm` and apparatus,
+ * the `.detent`, `.field`, `.seg-set` and `.sw` controls, the `.notice` and its `.acts`. These
+ * rules only lay the rows out inside a turn, where no `.blk` carries them; every colour and face
+ * is the design's own.
+ */
+#cc .settings-widget{margin:10px 0 14px;min-width:0;max-width:72ch;}
+#cc .settings-widget>.ap{display:block;margin-bottom:4px;}
+#cc .settings-widget .row{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--rule);min-width:0;}
+#cc .settings-widget .row .grow{flex:1;min-width:0;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+#cc .settings-widget .row .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .settings-widget .row .detent{flex:none;}
+#cc .settings-search{margin:6px 0 4px;max-width:320px;}
+#cc .settings-search input{width:100%;min-width:0;}
+#cc .settings-group{display:block;margin:10px 0 2px;}
+#cc .settings-widget .notice{margin:6px 0 8px;}
+#cc .settings-widget .ap.warn[role="alert"]{display:block;margin-top:6px;}
+#cc .settings-form .field{margin:8px 0;max-width:320px;}
+#cc .settings-form .sign{display:flex;align-items:center;gap:7px;margin-top:10px;border:0;padding:0;}
+#cc .settings-facts .settings-fact{width:140px;flex:none;}
+/* A settled widget keeps its place but answers nothing: the design's one way to be unavailable. */
+#cc .settings-widget .detent:disabled{color:var(--ink-3);border-color:var(--rule);}

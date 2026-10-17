@@ -1,0 +1,4 @@
+# Diagnostic codes the shell guide covers, as ShellCheck emits them (bash-language-server's diagnostic
+# `code`; `SC2086` in shellcheck output). The guide is always loaded, so the tools only point to it
+# when one of these shows up; the model never reads this file.
+shell = ["SC1009", "SC1017", "SC1072", "SC1073", "SC1090", "SC1091", "SC2012", "SC2030", "SC2031", "SC2045", "SC2046", "SC2048", "SC2068", "SC2086", "SC2115", "SC2155", "SC2162", "SC2164", "SC3010", "SC3014", "SC3030", "SC3040", "SC3054"]

@@ -1,0 +1,26 @@
+/* chat.composer@1 — the composer at the foot of the conversation. */
+#cc .cx-composer-plugin{flex:none;}
+#cc .cx-composer-plugin .composer{margin-top:12px;}
+#cc .cx-send-error{margin:8px 0 0;}
+#cc .cx-composer .cx-target{max-width:260px;}
+#cc .cx-composer .cx-target .v{overflow:hidden;text-overflow:ellipsis;}
+/* attachments: chips above the field (the design's `.attached` / `.chip`), a preview for images */
+#cc .cx-composer[data-dragging="true"] .write{border-color:var(--rubric);}
+#cc .cx-composer .cx-attached{list-style:none;margin:0 0 8px;padding:0;}
+#cc .cx-composer .cx-chip{max-width:280px;text-transform:none;letter-spacing:.02em;font-size:11px;}
+#cc .cx-composer .cx-chip:has(.cx-thumb){height:auto;padding:4px 8px 4px 4px;}
+#cc .cx-composer .cx-thumb{display:block;width:40px;height:40px;object-fit:cover;}
+#cc .cx-composer .cx-chip-kind{color:var(--ink-3);text-transform:uppercase;letter-spacing:.13em;font-size:9px;}
+#cc .cx-composer .cx-chip-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);}
+#cc .cx-composer .cx-chip-size{color:var(--ink-3);white-space:nowrap;}
+#cc .cx-composer .cx-chip[data-making="true"]{color:var(--ink-3);}
+#cc .cx-composer .cx-attach-problems{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin:0 0 8px;}
+#cc .cx-composer .cx-attach-problems .inline-error{margin:0;flex-basis:100%;}
+#cc .cx-composer .cx-chip button{text-transform:none;letter-spacing:.02em;}
+#cc .cx-composer .cx-pasted-view{margin:0 0 8px;max-height:240px;overflow:auto;white-space:pre;font-family:var(--font-mono);font-size:12px;}
+/* mentions: the completion of `@project` and `@project:symbol`, above the field (the design's `.menu`, in place) */
+#cc .cx-composer .cx-mentions{position:static;max-width:none;margin:0 0 8px;max-height:240px;overflow:auto;}
+#cc .cx-composer .cx-mentions .ml{text-transform:none;letter-spacing:.02em;font-size:12px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-composer .cx-mentions button[aria-selected="true"]{background:var(--rubric-wash);}
+#cc .cx-composer .cx-mentions .mh{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-composer .cx-mentions-info{margin:0;padding:8px 12px;}

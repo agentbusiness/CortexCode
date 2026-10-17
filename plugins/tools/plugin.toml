@@ -1,0 +1,30 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# verification and README together, separable into its own repository (only cc-protocol comes from
+# outside). `cortex-pack` builds the folder and packs it into a portable .ccplugin; the frame runs it only as an installed package. Paths are relative to this folder.
+
+[plugin]
+id = "tools"
+name = "Tools"
+version = "0.1.0"
+description = "The agent's hands: hashline read/edit/write, search, shell runs in a write sandbox with a per-workspace Python venv, background jobs, tool-call repair and ask-mode approval."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+# `cx_path` (the cx CLI agent commands call) comes from the frame config's [plugin.config].
+[backend]
+category = "tools"
+contract = "tools@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-tools"
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/tools"

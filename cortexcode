@@ -1,0 +1,34 @@
+#!/bin/sh
+# Start CortexCode: the frame, every installed plugin (model, memory, tools, git, terminal, chat,
+# agents, ...) and the app window. Usage: cortexcode (from anywhere; a link to this file works too).
+#
+# The frame runs plugins only from installed packages (<home>/plugins/<id>/<version>/). On a first
+# start every plugin folder of this repository that is not installed yet is built, packed and
+# queued for installation; after that, `cortex-pack build plugins/<name> --install` delivers a
+# changed plugin to the running app.
+self="$0"
+# Follow links (e.g. ~/.local/bin/cortexcode) to this file in the repository.
+while [ -L "$self" ]; do
+  target="$(readlink "$self")"
+  case "$target" in
+    /*) self="$target" ;;
+    *) self="$(dirname "$self")/$target" ;;
+  esac
+done
+cd "$(dirname "$self")" || exit 1
+home="${CORTEX_HOME:-$HOME/.cortexcode}"
+pack=packer/target/release/cortex-pack
+[ -x "$pack" ] || (cd packer && cargo build --release) || exit 1
+for toml in plugins/*/plugin.toml; do
+  dir="$(dirname "$toml")"
+  id="$(basename "$dir")"
+  grep -q '^test_only = true' "$toml" && continue
+  ls "$home/plugins/$id"/*/manifest.json >/dev/null 2>&1 && continue
+  ls "$home/plugins/.incoming/$id-"*.ccplugin >/dev/null 2>&1 && continue
+  echo "cortexcode: $id is not installed; building and packing it"
+  "$pack" build "$dir" --install || echo "cortexcode: $id was not packed (see above); it is not loaded"
+done
+# The process is called CortexCode (Activity Monitor, ps), like every plugin process: a hard link
+# of the frame binary under that name, refreshed on each start so a rebuild is picked up.
+ln -f frame/target/release/cortex-frame frame/target/release/CortexCode || exit 1
+exec frame/target/release/CortexCode --config cortex.dev.toml "$@"

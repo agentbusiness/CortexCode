@@ -1,0 +1,35 @@
+{
+  "name": "@cortex-ui/source-manager-settings-backup",
+  "version": "0.1.0",
+  "description": "Settings > Backup & Sync: the GitHub repository CortexCode's changes are pushed to, back up now, restore.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "source-manager.settings-backup",
+    "slot": "settings.backup@1",
+    "label": "Backup & Sync",
+    "order": 40
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4"
+  }
+}

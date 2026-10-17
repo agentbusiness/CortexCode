@@ -1,0 +1,176 @@
+/*
+ * CortexCode's shared primitives, in the design's grammar: what more than one plugin draws (a
+ * diff, a state mark, an agent handle, a code block, a mark button, a floating panel). Built only
+ * from the tokens: one ground, 1px hairlines, no radius, no shadow, no gradient, Archivo apparatus
+ * and Source Serif reading. Plugins style their own layout with the tokens and these classes.
+ */
+
+/* A list row is a <button>, which would take the browser's control face; it reads in the page's
+   Its apparatus still sets Archivo itself. */
+#cc .lst button{font-family:inherit;color:inherit;}
+/* toasts sit at the window's bottom right, clear of the composer, under any open sheet */
+#cc .toast{max-width:min(640px,calc(100vw - 32px));left:auto;right:16px;bottom:16px;transform:none;z-index:85;}
+#cc .toast span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .band .state .pip.hollow{background:transparent;}
+
+/* A slot that failed, or that no plugin fills. */
+#cc .cx-slot-empty{padding:20px 16px;}
+#cc .cx-slot-failed{padding:16px;}
+
+/* ─── state marks: the design's 5px square ─────────────────────────────────────
+   Live is the rubric, waiting its lift, finished a filled third ink, failed outlined in the deep
+   rubric, idle hollow. */
+#cc .cx-pip{display:inline-block;width:5px;height:5px;flex:0 0 auto;box-shadow:inset 0 0 0 1px var(--ink-3);}
+/* work in progress pulses in counter; what needs the person is a steady rubric square */
+#cc .cx-pip-running,#cc .cx-pip-working,#cc .cx-pip-in_progress,#cc .cx-pip-verifying{background:var(--counter);box-shadow:none;animation:cc-pulse 1.6s ease-in-out infinite;}
+#cc .cx-pip-waiting,#cc .cx-pip-blocked{background:var(--rubric);box-shadow:none;}
+#cc .cx-pip-done{background:var(--ink-3);box-shadow:none;}
+#cc .cx-pip-failed{box-shadow:inset 0 0 0 1px var(--rubric-deep);background:var(--rubric-wash);}
+@media (prefers-reduced-motion:reduce){#cc .cx-pip{animation:none !important;}}
+
+/* An agent's handle: provenance, so it takes the counter. */
+#cc .cx-at{font-family:var(--font-apparatus);font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--counter);}
+#cc .cx-plus{color:var(--counter);}
+#cc .cx-minus{color:var(--rubric);}
+#cc .cx-mono{font-family:var(--font-mono);font-size:12px;}
+
+/* Code, set in fixed pitch on the ground. */
+#cc .cx-code{
+  font-family:var(--font-mono);font-size:12.5px;line-height:1.55;color:var(--ink-2);
+  border:1px solid var(--rule);padding:8px 12px;margin:0 0 12px;overflow:auto;white-space:pre;
+}
+#cc .cx-code code{border:0;font-size:inherit;color:inherit;}
+
+/* A path that opens something. */
+#cc .cx-file-link{
+  border:0;background:transparent;padding:0;cursor:pointer;
+  font-family:var(--font-mono);font-size:11.5px;color:var(--ink-2);
+  text-decoration:underline;text-decoration-color:var(--rule-2);text-underline-offset:2px;
+}
+#cc .cx-file-link:hover{color:var(--rubric);text-decoration-color:var(--rubric);}
+
+/* A square button holding a drawn mark (12px strokes); the design's detent without its label. */
+#cc .cx-markbtn{width:24px;height:24px;padding:0;justify-content:center;}
+#cc .cx-markbtn .cx-mark{width:12px;height:12px;display:block;}
+#cc .cx-markbtn[aria-pressed="true"]{color:var(--rubric);border-color:var(--rubric);}
+
+/* A floating panel (the card, a menu with content, the settings window): the ground with a rule
+   around it, never a shadow. */
+#cc .cx-panel{background:var(--ground);border:1px solid var(--rule-2);}
+#cc .cx-panel.live{border-color:var(--rubric);}
+
+/* A section of a panel (the card's git, agents, tasks…), and one pressable line in it. */
+#cc .cx-sec{padding:8px 0;border-bottom:1px solid var(--rule);}
+#cc .cx-card-line{width:100%;display:flex;align-items:baseline;gap:8px;padding:4px 0;border:0;background:transparent;cursor:pointer;text-align:left;font-family:var(--font-reading);color:var(--ink-2);min-width:0;}
+#cc .cx-card-line:hover,#cc .cx-card-line.on{background:var(--rubric-wash);color:var(--ink);}
+#cc .cx-card-line .grow{flex:1;}
+/* A small progress row: one square per check, filled when passed. */
+#cc .cx-checks-row{display:inline-flex;gap:4px;align-items:center;}
+#cc .cx-checks-row i{width:5px;height:5px;box-shadow:inset 0 0 0 1px var(--ink-3);}
+#cc .cx-checks-row i.ok{background:var(--counter);box-shadow:none;}
+#cc .cx-checks-row i.bad{background:var(--rubric);box-shadow:none;}
+
+/* A card section read at a glance: its label in a narrow column, then one line per thing (a branch,
+   an agent, a task, a message), each line's detail in its tooltip and the whole of it a pane away.
+   A section with nothing to say renders nothing. */
+#cc .cx-cs{display:grid;grid-template-columns:52px minmax(0,1fr);column-gap:10px;align-items:start;padding:4px 0;}
+#cc .cx-cs-l{display:flex;flex-direction:column;gap:3px;line-height:20px;}
+#cc .cx-cs-l .ap{line-height:20px;}
+#cc .cx-cs-l .sub{line-height:1;}
+#cc .cx-cs-b{min-width:0;display:flex;flex-direction:column;}
+#cc .cx-cs-row{display:flex;align-items:center;gap:8px;min-width:0;min-height:20px;}
+#cc .cx-cs-row .grow{flex:1;}
+#cc .cx-cs-row .ap{white-space:nowrap;flex:0 0 auto;}
+#cc .cx-cs-row .t{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-reading);font-size:13px;line-height:20px;color:var(--ink-2);}
+#cc button.cx-cs-row{width:calc(100% + 8px);margin:0 -4px;padding:0 4px;border:0;background:transparent;cursor:pointer;text-align:left;color:var(--ink-2);}
+#cc button.cx-cs-row:hover,#cc button.cx-cs-row.on{background:var(--rubric-wash);}
+#cc button.cx-cs-row:hover .t{color:var(--ink);}
+#cc button.cx-cs-row:disabled{cursor:default;}
+#cc button.cx-cs-row:disabled:hover{background:transparent;}
+#cc .cx-cs .hint{margin:2px 0;}
+/* A square icon control (refresh, settings): the third ink until hovered. */
+#cc .cx-icon{width:20px;height:20px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid transparent;background:transparent;color:var(--ink-3);cursor:pointer;}
+#cc .cx-icon:hover{color:var(--ink);border-color:var(--rule-2);}
+#cc .cx-icon:disabled{color:var(--rule-2);border-color:transparent;cursor:default;}
+#cc .cx-icon svg{width:13px;height:13px;}
+
+/* A small heading inside a panel: apparatus with a rule under it. */
+#cc .cx-sec-h{display:flex;align-items:center;gap:8px;padding:8px 0 4px;border-bottom:1px solid var(--rule);margin-bottom:4px;}
+#cc .cx-sec-h .grow{flex:1;}
+
+/* ─── a unified diff (DiffView in @cortex/sdk) ───────────────────────────────
+   The design's `.diff`: what went is struck in the deep rubric and steps down to the third ink;
+   what came keeps the full ink on a wash of the counter, the design's clean-state ink (the design has
+   no green). Numbers and marks are apparatus. */
+#cc .cx-diff{display:flex;flex-direction:column;gap:12px;min-width:0;}
+#cc .cx-diff-file{border:1px solid var(--rule);min-width:0;}
+#cc .cx-diff-head{
+  display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid var(--rule);min-width:0;
+  position:sticky;top:0;background:var(--ground);z-index:1;
+}
+#cc .cx-diff-path{
+  font-family:var(--font-mono);font-size:12px;color:var(--ink);border:0;background:transparent;padding:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;text-align:left;
+}
+#cc button.cx-diff-path{cursor:pointer;}
+#cc button.cx-diff-path:hover{color:var(--rubric);}
+#cc .cx-hunk+.cx-hunk{border-top:1px solid var(--rule);}
+#cc .cx-hunk-head{display:flex;align-items:center;gap:8px;padding:4px 8px;min-width:0;}
+#cc .cx-hunk-ctx{font-family:var(--font-mono);font-size:11px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+#cc .cx-hunk-head .detent{height:20px;padding:0 8px;}
+#cc .cx-hunk-lines{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px;line-height:1.6;table-layout:fixed;}
+#cc .cx-hunk-lines td{padding:0;vertical-align:top;}
+#cc .cx-hunk-lines td.n{
+  width:40px;padding-right:8px;text-align:right;color:var(--ink-3);user-select:none;
+  font-family:var(--font-apparatus);font-size:9.5px;font-variant-numeric:tabular-nums;letter-spacing:.04em;line-height:19.2px;
+}
+#cc .cx-hunk-lines td.m{width:16px;text-align:center;color:var(--ink-3);user-select:none;}
+#cc .cx-hunk-lines td.c{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink-2);padding-right:12px;}
+#cc .cx-hunk-lines tr.add td.c{color:var(--ink);}
+#cc .cx-hunk-lines tr.add{background:color-mix(in srgb,var(--counter) 11%,transparent);}
+#cc .cx-hunk-lines tr.add td.m{color:var(--counter);}
+#cc .cx-hunk-lines tr.del td.c{color:var(--ink-3);text-decoration:line-through;text-decoration-color:var(--rubric-deep);}
+#cc .cx-hunk-lines tr.del td.m{color:var(--rubric);}
+
+/* CodeMirror's merge view, everywhere it is used: added text on the wash with a counter rule in
+   the gutter; the original above it struck through in the deep rubric. */
+#cc .cm-changedLine{background:color-mix(in srgb,var(--counter) 11%,transparent) !important;}
+#cc .cm-changedText{background:transparent !important;border-bottom:1px solid var(--counter);}
+#cc .cm-deletedChunk{background:transparent !important;padding-left:4px;}
+/* only a chunk that removed lines carries the removal rule; a pure addition has just its controls */
+#cc .cm-deletedChunk:has(.cm-deletedLine){border-left:1px solid var(--rubric-deep);}
+#cc .cm-deletedChunk .cm-deletedLine,#cc .cm-deletedChunk del,#cc .cm-deletedText{
+  background:transparent !important;color:var(--ink-3);text-decoration:line-through;text-decoration-color:var(--rubric-deep);
+}
+#cc .cm-changeGutter{width:4px;padding:0;}
+#cc .cm-changedLineGutter{background:var(--counter) !important;}
+#cc .cm-deletedLineGutter{background:var(--rubric-deep) !important;}
+/* a change's controls take their own row above it, right-aligned: they never cover code */
+#cc .cm-chunkButtons{position:static;display:flex;justify-content:flex-end;gap:4px;padding:4px 12px 4px 0;white-space:normal;}
+#cc .cm-chunkButtons button.detent{
+  height:24px;padding:0 10px;background:var(--ground);border:1px solid var(--rule-2);color:var(--ink-2);
+  font-family:var(--font-apparatus);font-size:9.5px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;cursor:pointer;
+}
+#cc .cm-chunkButtons button.detent:hover{color:var(--ink);border-color:var(--ink-3);}
+#cc .cm-chunkButtons button.warn{color:var(--rubric);border-color:var(--rubric-deep);}
+#cc .cm-mergeView .cm-gutters{background:var(--ground);}
+
+/* a draggable divider between regions: the hairline, a wider invisible hit area, rubric while held */
+#cc .cx-divider{position:relative;width:1px;min-height:0;background:var(--rule);cursor:col-resize;z-index:6;touch-action:none;}
+#cc .cx-divider::before{content:"";position:absolute;top:0;bottom:0;left:-4px;right:-4px;}
+#cc .cx-divider:hover,#cc .cx-divider[data-dragging="true"]{background:var(--rubric);}
+#cc[data-resizing="true"],#cc[data-resizing="true"] *{cursor:col-resize !important;user-select:none !important;}
+#cc .cx-divider[data-snap="collapse"]{background:var(--rubric-deep);}
+
+/* a compact mark-button (the sidebar's strip): a 32px square set in type, no icon */
+#cc .cx-strip-mark{
+  display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;flex:0 0 auto;
+  border:1px solid transparent;background:transparent;color:var(--ink-2);cursor:pointer;
+  font-family:var(--font-apparatus);font-size:12px;font-weight:600;letter-spacing:.04em;
+}
+#cc .cx-strip-mark:hover{border-color:var(--rule-2);color:var(--ink);}
+#cc .cx-strip-mark:disabled{cursor:default;opacity:.4;}
+#cc .cx-strip-mark.sel{border-color:var(--rubric);color:var(--ink);}
+#cc .cx-strip-mark.cx-attn{background:var(--rubric-wash);}
+#cc .cx-strip-mark svg{width:8px;height:8px;}
+#cc .cx-strip-mark .cx-strip-cross{width:12px;height:12px;color:var(--rubric);}

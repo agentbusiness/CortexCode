@@ -1,0 +1,30 @@
+[package]
+name = "cortex-pack"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "Builds a CortexCode plugin folder (plugin.toml, backend/, ui/, shell modules) and packs it into one portable .ccplugin."
+
+# Its own workspace, depending only on the protocol crate (for the plugin.toml / .ccplugin schema).
+[workspace]
+
+[[bin]]
+name = "cortex-pack"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.9.12"
+tar = { version = "0.4.46", default-features = false }
+flate2 = "1.1.9"
+clap = { version = "4.6.2", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = 1

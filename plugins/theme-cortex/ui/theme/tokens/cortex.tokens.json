@@ -1,0 +1,151 @@
+{
+  "$description": "CortexCode's design tokens, as DTCG. $value is the plate (dark, the design's default ground); the page (light) value is in $extensions.\"org.cortexcode.ground\".page.",
+  "color": {
+    "ground": {
+      "$type": "color",
+      "$value": "#14171A",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#EDEFF0"
+        }
+      }
+    },
+    "ink": {
+      "$type": "color",
+      "$value": "#E9EBEC",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#15181B"
+        }
+      }
+    },
+    "ink-2": {
+      "$type": "color",
+      "$value": "#A8AFB3",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#4A5157"
+        }
+      }
+    },
+    "ink-3": {
+      "$type": "color",
+      "$value": "#828A8F",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#636B71"
+        }
+      }
+    },
+    "unwritten": {
+      "$type": "color",
+      "$value": "#616A70",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#7C858B"
+        }
+      }
+    },
+    "rule": {
+      "$type": "color",
+      "$value": "#262B2F",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#D3D7DA"
+        }
+      }
+    },
+    "rule-2": {
+      "$type": "color",
+      "$value": "#3B4247",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#AFB6BB"
+        }
+      }
+    },
+    "rubric": {
+      "$type": "color",
+      "$value": "#E2603F",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#B23520"
+        }
+      }
+    },
+    "rubric-deep": {
+      "$type": "color",
+      "$value": "#B8452E",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#8E2E19"
+        }
+      }
+    },
+    "rubric-lift": {
+      "$type": "color",
+      "$value": "#F59A5B",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#7E4C04"
+        }
+      }
+    },
+    "counter": {
+      "$type": "color",
+      "$value": "#6E9BB5",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#2C5F80"
+        }
+      }
+    },
+    "rubric-wash": {
+      "$type": "color",
+      "$value": "#E2603F14",
+      "$extensions": {
+        "org.cortexcode.ground": {
+          "page": "#B2352009"
+        }
+      }
+    }
+  },
+  "other": {
+    "caret": {
+      "$type": "other",
+      "$value": "block",
+      "$description": "The caret is a glyph, not a hairline: block fills the cell it sits in."
+    }
+  },
+  "font": {
+    "reading": {
+      "$type": "fontFamily",
+      "$value": [
+        "Source Serif 4",
+        "Iowan Old Style",
+        "Georgia",
+        "serif"
+      ]
+    },
+    "apparatus": {
+      "$type": "fontFamily",
+      "$value": [
+        "Archivo",
+        "Helvetica Neue",
+        "Arial",
+        "sans-serif"
+      ]
+    },
+    "mono": {
+      "$type": "fontFamily",
+      "$value": [
+        "ui-monospace",
+        "SF Mono",
+        "SFMono-Regular",
+        "Menlo",
+        "monospace"
+      ],
+      "$description": "Code needs fixed pitch; the design never set code, so it takes the system face, present offline on macOS."
+    }
+  }
+}

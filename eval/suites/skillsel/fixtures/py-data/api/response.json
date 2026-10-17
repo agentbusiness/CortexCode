@@ -1,0 +1,9 @@
+{
+  "page": 1,
+  "users": [
+    {"id": 101, "name": "Ada", "plan": {"tier": "pro", "seats": 5}},
+    {"id": 102, "name": "Linus", "plan": {"tier": "free", "seats": 1}},
+    {"id": 103, "name": "Grace", "plan": {"tier": "pro", "seats": 12}},
+    {"id": 104, "name": "Ken", "plan": null}
+  ]
+}

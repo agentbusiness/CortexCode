@@ -1,0 +1,5 @@
+$ink: #333;
+
+@mixin pad($size: 1rem) {
+  padding: $size;
+}

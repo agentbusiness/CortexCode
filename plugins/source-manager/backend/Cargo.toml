@@ -1,0 +1,35 @@
+[package]
+name = "cc-source"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode code folder manager (source@1): CortexCode's own source as one git repository, live data, approved code changes built and swapped, history, backup and sharing."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_source"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-source"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+toml = "0.9"
+# Git as a library (no git program on the user's Mac); https through macOS's Secure Transport.
+# libgit2-sys also declares OpenSSL on every unix target although macOS never calls it: vendored,
+# so the binary links no Homebrew library (as in the vcs plugin).
+git2 = { version = "0.21", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+tokio-util = "0.7"
+uuid = { version = "1.23", features = ["v4"] }
+libc = "0.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

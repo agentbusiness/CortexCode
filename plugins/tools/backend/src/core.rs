@@ -1,0 +1,271 @@
+//! Shared state of the tools plugin and its configuration.
+
+use crate::artifacts::{Artifacts, InlineLimits};
+use crate::jobs::Jobs;
+use crate::read::ReadConfig;
+use crate::readstate::ReadState;
+use crate::shell::{ShellConfig, Shells, find_bash};
+use crate::workspace::Workspaces;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub read: ReadConfig,
+    /// Inline limits for command output.
+    pub run_limits: InlineLimits,
+    /// Inline limits for any other tool output (reads of explicit huge ranges, outlines).
+    pub read_limits: InlineLimits,
+    pub default_timeout_ms: u64,
+    pub bash: Option<String>,
+    /// Stop a session's shell after this long without commands (state is kept on disk).
+    pub shell_idle_s: u64,
+    /// Explicit path of the `cx` binary.
+    pub cx_path: Option<String>,
+    /// Explicit path of the `cortex-pack` binary (agents pack plugin folders into .ccplugin files
+    /// with it and install them with `cx plugin install`).
+    pub pack_path: Option<String>,
+    /// Extra directories every command may write (beyond the workspace, CORTEX_HOME, temp dirs,
+    /// package caches and the session venv), e.g. an IDE's build cache.
+    pub sandbox_write_paths: Vec<String>,
+    /// How long a read of another project (`graph://<project>/...`, `symbol://<project>/...`,
+    /// `outline://<project>/...`) waits for that project's index before it answers with the
+    /// indexing progress instead (`reference_wait_ms`).
+    pub reference_wait: std::time::Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            read: ReadConfig::default(),
+            run_limits: InlineLimits::default(),
+            read_limits: InlineLimits { inline: 256 * 1024, head: 32 * 1024, tail: 32 * 1024 },
+            default_timeout_ms: 600_000,
+            bash: None,
+            shell_idle_s: 1800,
+            cx_path: None,
+            pack_path: None,
+            sandbox_write_paths: Vec::new(),
+            reference_wait: std::time::Duration::from_millis(5000),
+        }
+    }
+}
+
+impl Config {
+    /// Read overrides from the plugin's `[plugin.config]` table.
+    pub fn from_value(value: &Value) -> Config {
+        let mut config = Config::default();
+        let number = |key: &str| value.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        if let Some(lines) = number("outline_lines") {
+            config.read.outline_lines = lines.max(1);
+        }
+        if let Some(bytes) = number("outline_bytes") {
+            config.read.outline_bytes = bytes.max(1);
+        }
+        if let Some(inline) = number("inline_output_bytes") {
+            config.run_limits.inline = inline.max(256);
+            config.run_limits.head = (inline / 4).max(64);
+            config.run_limits.tail = (inline / 2).max(64);
+        }
+        if let Some(ms) = value.get("default_timeout_ms").and_then(Value::as_u64) {
+            config.default_timeout_ms = ms.max(1);
+        }
+        if let Some(seconds) = value.get("shell_idle_s").and_then(Value::as_u64) {
+            config.shell_idle_s = seconds.max(1);
+        }
+        if let Some(ms) = value.get("reference_wait_ms").and_then(Value::as_u64) {
+            config.reference_wait = std::time::Duration::from_millis(ms);
+        }
+        config.bash = value.get("bash").and_then(Value::as_str).map(str::to_owned);
+        config.cx_path = value.get("cx_path").and_then(Value::as_str).map(str::to_owned);
+        config.pack_path = value.get("pack_path").and_then(Value::as_str).map(str::to_owned);
+        config.sandbox_write_paths = value
+            .get("sandbox_write_paths")
+            .and_then(Value::as_array)
+            .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default();
+        config
+    }
+}
+
+pub struct Core {
+    pub home: PathBuf,
+    pub data_dir: PathBuf,
+    pub config: Config,
+    pub read_state: ReadState,
+    pub shells: Shells,
+    pub jobs: Arc<Jobs>,
+    pub artifacts: Artifacts,
+    pub workspaces: Workspaces,
+    file_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    approvals: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// Where the `cx` binary was found (linked into `<home>/bin`).
+    pub cx: Option<PathBuf>,
+    /// The write sandbox's machine-wide policy.
+    pub sandbox: crate::sandbox::Policy,
+}
+
+/// How a session's commands run: its sandbox, its Python environment and the writes approved for it.
+pub struct Runtime {
+    pub sandbox: crate::sandbox::Sandbox,
+    pub venv: Option<crate::pyenv::PyEnv>,
+    pub grants: Vec<PathBuf>,
+    /// Why there is no Python environment (creation failed), for the tool output.
+    pub venv_error: Option<String>,
+}
+
+/// Locate the `cx` binary: the `cx_path` plugin config, else the `CORTEX_CX_BIN` environment
+/// variable, else a `cx` shipped next to this executable (the plugin package layout). The plugin
+/// never assumes a repository layout.
+pub fn find_cx(configured: Option<&str>) -> Option<PathBuf> {
+    find_program("cx", configured, "CORTEX_CX_BIN")
+}
+
+/// Locate `cortex-pack` the same way (`pack_path`, `CORTEX_PACK_BIN`, beside this executable).
+pub fn find_pack(configured: Option<&str>) -> Option<PathBuf> {
+    find_program("cortex-pack", configured, "CORTEX_PACK_BIN")
+}
+
+fn find_program(name: &str, configured: Option<&str>, env: &str) -> Option<PathBuf> {
+    let explicit = configured.map(str::to_owned).or_else(|| std::env::var(env).ok().filter(|value| !value.is_empty()));
+    if let Some(path) = explicit {
+        // Absolute, so the link in the shells' bin directory resolves (a relative configured path
+        // is relative to where the frame runs, not to that directory).
+        return PathBuf::from(path).canonicalize().ok().filter(|path| path.is_file());
+    }
+    let exe = std::env::current_exe().and_then(|exe| exe.canonicalize()).ok()?;
+    let beside = exe.parent()?.join(name);
+    beside.is_file().then_some(beside)
+}
+
+/// Put `target` on the shells' PATH as `<bin_dir>/<name>` (a symlink, created beside and renamed
+/// over, so it is never missing for a running shell).
+fn link_program(bin_dir: &Path, name: &str, target: &Path) {
+    let _ = std::fs::create_dir_all(bin_dir);
+    let link = bin_dir.join(name);
+    if std::fs::read_link(&link).ok().as_deref() == Some(target) {
+        return;
+    }
+    let temp = bin_dir.join(format!(".{name}-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    if std::os::unix::fs::symlink(target, &temp).is_ok() && std::fs::rename(&temp, &link).is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+impl Core {
+    pub fn new(home: &Path, data_dir: &Path, config: Config) -> Arc<Core> {
+        let bash = find_bash(config.bash.as_deref());
+        let bin_dir = home.join("bin");
+        let cx = find_cx(config.cx_path.as_deref());
+        if let Some(cx) = &cx {
+            link_program(&bin_dir, "cx", cx);
+        }
+        // Agents rewrite CortexCode itself: pack a plugin folder, then `cx plugin install` it.
+        if let Some(pack) = find_pack(config.pack_path.as_deref()) {
+            link_program(&bin_dir, "cortex-pack", &pack);
+        }
+        let approvals = std::fs::read(data_dir.join("approvals.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, BTreeSet<String>>>(&bytes).ok())
+            .unwrap_or_default();
+        let core = Arc::new(Core {
+            home: home.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            shells: Shells::new(ShellConfig { state_root: data_dir.join("shells"), bin_dir: Some(bin_dir), bash: bash.clone() }),
+            jobs: Jobs::new(home, bash),
+            artifacts: Artifacts::new(home),
+            workspaces: Workspaces::new(home),
+            read_state: ReadState::default(),
+            file_locks: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(approvals),
+            sandbox: crate::sandbox::Policy::new(home, data_dir, &config.sandbox_write_paths),
+            config,
+            cx,
+        });
+        // Reap idle shells in the background (when running inside a Tokio runtime), and drop the
+        // automatic venvs of workspaces that were deleted meanwhile.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let home = core.home.clone();
+            runtime.spawn_blocking(move || crate::pyenv::remove_orphans(&home));
+            let weak = Arc::downgrade(&core);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let Some(core) = weak.upgrade() else { return };
+                    core.shells.reap_idle(std::time::Duration::from_secs(core.config.shell_idle_s)).await;
+                }
+            });
+        }
+        core
+    }
+
+    /// Serialize edits to one file across sessions.
+    pub fn file_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = match self.file_locks.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locks.entry(path.to_path_buf()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
+    pub fn approve(&self, session: &str, classes: &[String]) -> Vec<String> {
+        let mut approvals = match self.approvals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = approvals.entry(session.to_owned()).or_default();
+        for class in classes {
+            entry.insert(class.clone());
+        }
+        let result = entry.iter().cloned().collect();
+        if let Ok(bytes) = serde_json::to_vec(&*approvals) {
+            let _ = std::fs::create_dir_all(&self.data_dir);
+            let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
+        }
+        result
+    }
+
+    /// The sandbox and Python environment for commands of `session` in `workspace`. With
+    /// `python_env`, the project's venv is used, or the automatic one is created on first use.
+    pub async fn runtime(&self, session: &str, workspace: &Path, python_env: bool) -> Result<Runtime, String> {
+        if !self.sandbox.available() {
+            return Err(format!(
+                "commands are not run: the write sandbox needs {}, which this system does not have. Work with read and edit.",
+                crate::sandbox::SANDBOX_EXEC
+            ));
+        }
+        let mut venv_error = None;
+        let venv = if !python_env {
+            None
+        } else if let Some(project) = crate::pyenv::project_env(workspace) {
+            Some(crate::pyenv::PyEnv::Project(project))
+        } else {
+            let dir = crate::pyenv::auto_dir(&self.home, workspace);
+            let lock = self.file_lock(&dir);
+            let _guard = lock.lock().await;
+            match crate::pyenv::ensure_auto(&dir, workspace).await {
+                Ok(_) => Some(crate::pyenv::PyEnv::Auto(dir)),
+                Err(error) => {
+                    venv_error = Some(error);
+                    None
+                }
+            }
+        };
+        let grants = crate::sandbox::grants(&self.approved(session));
+        let sandbox = self
+            .sandbox
+            .sandbox(workspace, venv.as_ref().map(|venv| venv.path()), &grants)
+            .ok_or_else(|| "the write sandbox is unavailable".to_owned())?;
+        Ok(Runtime { sandbox, venv, grants, venv_error })
+    }
+
+    pub fn approved(&self, session: &str) -> BTreeSet<String> {
+        match self.approvals.lock() {
+            Ok(guard) => guard.get(session).cloned().unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().get(session).cloned().unwrap_or_default(),
+        }
+    }
+}

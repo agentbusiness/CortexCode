@@ -1,0 +1,10 @@
+@use "vars" as *;
+
+.card {
+  color: $ink;
+  @include pad;
+
+  &__title {
+    font-weight: bold;
+  }
+}

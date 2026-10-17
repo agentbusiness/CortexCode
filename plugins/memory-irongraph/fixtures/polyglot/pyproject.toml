@@ -1,0 +1,7 @@
+[project]
+name = "polyglot-server"
+version = "0.1.0"
+dependencies = ["fastapi>=0.110", "flask"]
+
+[project.scripts]
+polyglot-serve = "server.app:main"

@@ -1,0 +1,46 @@
+# Every short model-facing text of cc-agents. `{name}` is filled in by the host; each text must keep
+# exactly the placeholders it is shipped with (checked on load).
+
+host_prefix = "[host]"
+stage = "Current stage: {stage}."
+stage_live = "Current stage: {stage}.\n{live}"
+
+# ---- planning ----------------------------------------------------------------------------------
+request = "Goal: {goal}\n\nWhat the conversation established:\n{context}\n\nGraph context for the goal:\n{graph}"
+no_context = "(nothing beyond the goal)"
+plan_unreadable = "Your previous plan could not be read ({error}). Write only the JSON object."
+plan_unusable = "Your previous plan cannot be used: {problems}. Write the corrected plan."
+overlaps = "These tasks would run at the same time but affect the same code, so their changes would collide. Make one depend on the other, merge them, or cut them along a different line:"
+overlap = "\n- \"{a}\" and \"{b}\": {shared}"
+graph_related = "Code related to the goal:\n{text}"
+graph_impact = "What depends on that code:\n{text}"
+graph_unavailable = "(the code graph is unavailable)"
+verifiers_candidates = "This project's own check commands (`checks` picks among them; none when none tests the task):\n{list}"
+verifier_line = "- {kind}: `{command}`"
+
+# ---- contract review (the planner judging a worker's proposed revision) ------------------------
+review_request = "Task: {title}\n\n{brief}\n\nThe checks in force (frozen when the task was claimed):\n{old}\n\nThe checks {worker} proposes instead:\n{new}\n\nWhat the proposal rests on:\n{evidence}"
+review_check = "\n- `{command}`"
+review_unreadable = "Your previous decision could not be read ({error}). Write only the JSON object."
+review_refused_check = "The proposal was refused without review: a proposed check {why}."
+review_refused_empty = "The proposal was refused without review: it leaves no check the host can run."
+review_refused_unchanged = "The proposal is the contract already in force."
+review_no_decision = "The planner gave no readable decision, so the contract in force stands."
+
+# ---- merge steward (sent to the agent) -----------------------------------------------------------
+merge_conflict = "Merging your branch into the project conflicts in: {files}. {pulled} Resolve every conflict so both sides' intent is kept, run the contract again, then finish with a summary."
+merge_blocked_by_local = "The agent's work is ready, but merging it would change files that have edits you have not committed: {files}. Commit those edits, then merge again (nothing was changed)."
+pulled_clean = "The project's latest changes merged into your workspace cleanly; check the result."
+pulled_conflicts = "The project's latest changes were merged into your workspace and left conflict markers in those files."
+pull_failed = "Merging the project's changes into your workspace failed ({error})."
+branch_unknown = "The project's branch could not be read."
+
+# ---- board posts (read by other agents) ----------------------------------------------------------
+board_claim = "Working on \"{title}\".{touches}"
+board_touches = " Touches: {touches}."
+board_error = "Stopped by an error: {error}"
+board_run_ended = "Run ended: {outcome}."
+board_done = "Done: {title}. {summary}"
+board_merged_failing = "{title} was merged but its contract fails in the project."
+board_conflict = "{title}: merge conflict in {files}; handed back to {agent}"
+board_blocked_by_local = "{title}: {agent}'s work is ready; the merge waits for uncommitted edits in {files} to be committed."

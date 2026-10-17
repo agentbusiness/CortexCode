@@ -1,0 +1,29 @@
+[package]
+name = "cc-lang-typescript"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode lang@1 plugin for TypeScript and JavaScript: the code graph's facts of .ts/.tsx/.js files and package.json, typescript-language-server diagnostics/definition/references/hover, tsc / npm test / eslint verifiers and TypeScript skills."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_lang_typescript"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-lang-typescript"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }

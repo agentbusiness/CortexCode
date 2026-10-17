@@ -1,0 +1,40 @@
+{
+  "budget_ms": 500,
+  "median_ms": 90,
+  "max_ms": 101,
+  "latencies": [
+    {
+      "change": "edit body",
+      "ms": 87
+    },
+    {
+      "change": "add function",
+      "ms": 75
+    },
+    {
+      "change": "delete function",
+      "ms": 92
+    },
+    {
+      "change": "rename function",
+      "ms": 101
+    },
+    {
+      "change": "move file",
+      "ms": 92
+    },
+    {
+      "change": "add file",
+      "ms": 90
+    },
+    {
+      "change": "delete file",
+      "ms": 82
+    }
+  ],
+  "lines_checked": 273,
+  "files": 21,
+  "checks": 309,
+  "total_ms": 3475,
+  "finished": "2026-10-15T03:58:58.160Z"
+}

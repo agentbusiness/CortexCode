@@ -1,0 +1,30 @@
+[package]
+name = "cc-lang-python"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode lang@1 plugin for Python: the code graph's facts of .py files and pyproject.toml, basedpyright diagnostics/definition/references/hover, pytest / ruff / basedpyright verifiers and Python skills."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_lang_python"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-lang-python"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }
+tree-sitter-python = "0.25"
+toml = "0.9"
+serde_json = "1.0.149"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }

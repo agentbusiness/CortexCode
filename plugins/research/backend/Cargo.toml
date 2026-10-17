@@ -1,0 +1,48 @@
+[package]
+name = "cc-research"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode research@1 plugin: search (arXiv, Semantic Scholar, GitHub, Reddit, Hacker News, the web), fetch pages and PDFs as clean text, cited notes, and deep research as a background map-reduce job with the local model. Online only when a network exists; no cloud models, no required keys."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[lib]
+name = "cc_research"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-research"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# HTTP: rustls, HTTP/2, the macOS system proxy, compressed responses.
+reqwest = { version = "0.13.5", features = ["gzip", "brotli", "deflate"] }
+url = "2.5.8"
+percent-encoding = "2"
+encoding_rs = "0.8"
+# Readability (a maintained port of Mozilla's Readability.js) and its DOM (also used for result pages
+# and meta tags).
+dom_smoothie = "0.18.2"
+dom_query = "0.28"
+# PDF text (lopdf underneath, re-exported).
+pdf-extract = "0.12.1"
+# Atom (arXiv, Reddit RSS).
+roxmltree = "0.21"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+sha2 = "0.10"
+uuid = { version = "1.23", features = ["v4"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+toml = "0.9.12"

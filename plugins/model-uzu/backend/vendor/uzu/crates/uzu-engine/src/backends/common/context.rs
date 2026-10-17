@@ -1,0 +1,65 @@
+use std::{path::Path, sync::Arc};
+
+use crate::backends::common::{Backend, CommandBuffer, DeviceCapabilities};
+
+pub trait Context: Sized + Send + Sync {
+    type Backend: Backend<Context = Self>;
+
+    fn new() -> Result<Arc<Self>, <Self::Backend as Backend>::Error>;
+
+    fn device_name(&self) -> Option<&str>;
+
+    fn create_command_buffer(
+        &self,
+        name: Option<&str>,
+        allocation_pool: Option<Arc<<Self::Backend as Backend>::AllocationPool>>,
+    ) -> Result<<<Self::Backend as Backend>::CommandBuffer as CommandBuffer>::Encoding, <Self::Backend as Backend>::Error>;
+
+    fn create_buffer(
+        &self,
+        size: usize,
+    ) -> Result<<Self::Backend as Backend>::GlobalBuffer, <Self::Backend as Backend>::Error>;
+
+    fn create_sparse_buffer(
+        &self,
+        capacity: usize,
+    ) -> Result<<Self::Backend as Backend>::SparseBuffer, <Self::Backend as Backend>::Error>;
+
+    fn create_allocation_pool(&self) -> Arc<<Self::Backend as Backend>::AllocationPool>;
+
+    fn peak_memory_usage(&self) -> Option<usize>;
+
+    fn start_capture(
+        &self,
+        output_path: &Path,
+    ) -> Result<<Self::Backend as Backend>::CaptureSpan, <Self::Backend as Backend>::Error>;
+
+    fn device_capabilities(&self) -> DeviceCapabilities;
+
+    /// CortexCode patch P5: facts about the device the engine runs on (for memory planning and
+    /// reporting). Backends without a GPU report none.
+    fn device_facts(&self) -> DeviceFacts {
+        DeviceFacts::default()
+    }
+
+    /// CortexCode patch P6: release cached, currently unused buffers; returns how many.
+    fn trim_buffer_cache(&self) -> usize {
+        0
+    }
+}
+
+/// CortexCode patch P5.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceFacts {
+    pub name: Option<String>,
+    pub gpu_cores: Option<u32>,
+    /// The newest Apple GPU family, e.g. `Apple10`.
+    pub gpu_family: Option<String>,
+    /// The M5 matrix units ("MXU") are present and used by uzu's kernels.
+    pub matrix_units: Option<bool>,
+    /// Metal's recommended maximum working set.
+    pub recommended_working_set_bytes: Option<u64>,
+    /// Bytes the device has allocated right now.
+    pub allocated_bytes: Option<u64>,
+    pub sparse_buffers: bool,
+}

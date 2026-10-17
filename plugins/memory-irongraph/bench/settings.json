@@ -1,0 +1,34 @@
+{
+  "settings": {
+    "agents": {
+      "defaults": {
+        "max_parallel": 3,
+        "roles": [
+          "worker",
+          "reviewer"
+        ]
+      }
+    },
+    "model": {
+      "context_tokens": 131072,
+      "variant": "qwen3.5-4b"
+    },
+    "night": {
+      "enabled": "weekdays"
+    },
+    "plugins": {
+      "memory": {
+        "watch": true
+      }
+    },
+    "ui": {
+      "theme": {
+        "accent": "#ff5500",
+        "mode": "dark"
+      }
+    }
+  },
+  "checks": 28,
+  "total_ms": 10400,
+  "finished": "2026-10-15T03:55:21.897Z"
+}

@@ -1,0 +1,3 @@
+# The Rust guide is loaded into every session of a Rust project (never a choice).
+[rust]
+always = true

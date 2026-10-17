@@ -1,0 +1,16 @@
+{
+  "name": "@cortexcode/notify-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CortexCode notify plugin, Electron main-process module: shows cc-notify's notifications with Electron's Notification API, reports clicks and publishes the window's focus state.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "cortex": {
+    "id": "notify.shell-module",
+    "shellModule": { "entry": "index.js" }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

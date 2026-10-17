@@ -1,0 +1,167 @@
+use std::any::Any;
+
+use derive_more::Debug;
+use thiserror::Error;
+
+use crate::{
+    backends::common::{Backend, CommandBuffer},
+    config::{rope::AnyRoPEConfig, token_mixer::AnyTokenMixerConfig},
+    data_type::DataType,
+    encodable_block::{
+        batch_topology::BatchTopology,
+        linear::LinearEncodeError,
+        mixer::{
+            attention::{Attention, AttentionEncodeError, AttentionNewError, rope::PrecalculatedRoPE},
+            delta_net::{DeltaNet, DeltaNetNewError},
+            short_conv::{ShortConv, ShortConvNewError},
+        },
+    },
+    safetensors::ParameterTree,
+    utils::maybe_mut::MaybeMut,
+};
+
+pub mod attention;
+pub mod delta_net;
+pub mod short_conv;
+
+pub trait MixerState<B: Backend>: Any + Send {
+    fn prepare(
+        &mut self,
+        context_length: u32,
+        suffix_length: u32,
+    ) -> Result<(), B::Error>;
+
+    fn encode_accept(
+        &mut self,
+        accepted_indices: &[u32],
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), B::Error>;
+
+    /// CortexCode patch P1: copy this (idle) state's live contents into new CPU-accessible buffers.
+    /// The copies are encoded into `command_buffer`; they are readable once it completed.
+    fn encode_snapshot(
+        &self,
+        mode: SnapshotMode,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<MixerSnapshot<B>, MixerSnapshotError<B>>;
+
+    /// CortexCode patch P1: replace this (idle) state's contents with a snapshot of the same layer.
+    fn encode_restore(
+        &mut self,
+        snapshot: &MixerSnapshot<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), MixerSnapshotError<B>>;
+}
+
+/// CortexCode patch P1: what a snapshot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Everything needed to rebuild the state elsewhere (hibernation to disk).
+    Full,
+    /// Enough to roll the *same* state back to this point later: recurrent state is copied, while
+    /// append-only attention caches record only their length (their earlier rows stay valid as
+    /// long as the state only grows and is rolled back, never shrunk by other means).
+    Checkpoint,
+}
+
+/// CortexCode patch P1: a copy of one mixer state (scalars plus CPU-accessible buffer copies).
+pub struct MixerSnapshot<B: Backend> {
+    pub scalars: Box<[u64]>,
+    pub buffers: Box<[B::GlobalBuffer]>,
+}
+
+#[derive(Debug, Error)]
+pub enum MixerSnapshotError<B: Backend> {
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("State is busy: {0}")]
+    Busy(&'static str),
+    #[error("Snapshot does not match this state: {0}")]
+    Mismatch(String),
+}
+
+impl<'a, B: Backend> MaybeMut<'a, dyn MixerState<B>> {
+    pub fn downcast<T: MixerState<B>>(self) -> Option<MaybeMut<'a, T>> {
+        match self {
+            MaybeMut::Const(value) => (value as &dyn Any).downcast_ref::<T>().map(MaybeMut::Const),
+            MaybeMut::Mut(value) => (value as &mut dyn Any).downcast_mut::<T>().map(MaybeMut::Mut),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MixerEncodeError<B: Backend> {
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("Linear error: {0}")]
+    Linear(#[from] LinearEncodeError<B>),
+    #[error("Attention error: {0}")]
+    Attention(#[from] AttentionEncodeError<B>),
+}
+
+pub trait Mixer<B: Backend>: Any + Send + Sync {
+    fn speculation_supported(&self) -> bool;
+
+    fn max_context_length(&self) -> Option<u32>;
+
+    fn create_empty_state(
+        &self,
+        max_context_length: Option<u32>,
+        context: &B::Context,
+    ) -> Result<Box<dyn MixerState<B>>, B::Error>;
+
+    fn encode(
+        &self,
+        hidden: B::ScratchBuffer,
+        precalculated_rope: Option<&PrecalculatedRoPE<B>>,
+        batch_dim: &BatchTopology,
+        state: Option<MaybeMut<dyn MixerState<B>>>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>>;
+}
+
+#[derive(Debug, Error)]
+pub enum MixerNewError<B: Backend> {
+    #[error("Attention mixer error: {0}")]
+    Attention(#[from] AttentionNewError<B>),
+    #[error("Delta net mixer error: {0}")]
+    DeltaNet(#[from] DeltaNetNewError<B>),
+    #[error("Short conv mixer error: {0}")]
+    ShortConv(#[from] ShortConvNewError<B>),
+}
+
+impl<B: Backend> dyn Mixer<B> {
+    pub fn new(
+        hidden_dim: u32,
+        data_type: DataType,
+        rope_config: Option<&AnyRoPEConfig>, // TODO: this shouldn't exist
+        config: &AnyTokenMixerConfig,
+        parameter_tree: &ParameterTree<B>,
+        context: &B::Context,
+    ) -> Result<(Box<dyn Mixer<B>>, Option<B::GlobalBuffer>), MixerNewError<B>> {
+        match config {
+            AnyTokenMixerConfig::AttentionConfig(config) => {
+                let (attention, in_projection_input_hadamard_factors) =
+                    Attention::new(hidden_dim, data_type, rope_config, config, parameter_tree, context)?;
+
+                Ok((Box::new(attention), in_projection_input_hadamard_factors))
+            },
+            AnyTokenMixerConfig::DeltaNetConfig(config) => {
+                assert!(rope_config.is_none(), "unexpected rope for delta net mixer");
+
+                let (delta_net, in_projection_input_hadamard_factors) =
+                    DeltaNet::new(hidden_dim, data_type, config, parameter_tree, context)?;
+
+                Ok((Box::new(delta_net), in_projection_input_hadamard_factors))
+            },
+            AnyTokenMixerConfig::ShortConvConfig(config) => {
+                assert!(rope_config.is_none(), "unexpected rope for short conv mixer");
+
+                let (short_conv, in_projection_input_hadamard_factors) =
+                    ShortConv::new(hidden_dim, data_type, config, parameter_tree, context)?;
+
+                Ok((Box::new(short_conv), in_projection_input_hadamard_factors))
+            },
+        }
+    }
+}

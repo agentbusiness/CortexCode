@@ -1,0 +1,40 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages, shell modules, verification and README together, separable into its own repository
+# (only cc-protocol and @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it
+# into a portable .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "workbench"
+name = "Workbench"
+version = "0.1.0"
+description = "The workbench's right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+test = ["npm", "test"]
+
+[[ui.package]]
+dir = "ui/band-connection"
+id = "workbench.band-connection"
+slot = "workbench.band@1"
+
+[[ui.package]]
+dir = "ui/right-pane"
+id = "workbench.right-pane"
+slot = "workbench.rightPane@1"
+
+[[ui.package]]
+dir = "ui/settings-appearance"
+id = "workbench.settings-appearance"
+slot = "settings.appearance@1"
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/workbench"

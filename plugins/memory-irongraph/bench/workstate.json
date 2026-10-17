@@ -1,0 +1,15 @@
+{
+  "tasks": 3,
+  "board": 3,
+  "agents": 2,
+  "rules": 5,
+  "global_rules": 2,
+  "styles": 2,
+  "reimported": [
+    "Never call the database from a React component.",
+    "Prefer small pull requests."
+  ],
+  "checks": 44,
+  "total_ms": 4510,
+  "finished": "2026-10-15T03:55:11.449Z"
+}

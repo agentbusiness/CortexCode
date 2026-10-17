@@ -1,0 +1,3 @@
+build: ok
+tests: ok
+smoke: failed (timeout)

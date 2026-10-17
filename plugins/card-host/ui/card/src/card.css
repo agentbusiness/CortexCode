@@ -1,0 +1,20 @@
+/* workbench.band@1 — at the band's right: the toggle (and Open pane with the right pane collapsed);
+   the card floats under the band, its right edge the toggle's. */
+#cc .cx-card-host{position:relative;}
+#cc .cx-card-bar{display:flex;align-items:center;gap:8px;min-width:0;}
+#cc .cx-card-toggle{max-width:min(420px,40vw);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-pane-open{flex:0 0 auto;}
+/* The card floats clear of the bar's rule (its own thing, not part of the line), narrow and dense:
+   one line per thing, the detail a pane away. Its right edge is the toggle's. */
+#cc .cx-card{
+  position:absolute;right:0;top:100%;z-index:60;width:min(400px,calc(100vw - 32px));max-height:calc(100vh - 150px);overflow:auto;
+  padding:0 12px 6px;margin-top:21px;
+}
+#cc .cx-card-section,#cc .cx-card-header{display:block;}
+#cc .cx-card[hidden]{display:none;}
+#cc .cx-card-foot{display:flex;align-items:center;gap:10px;padding-top:6px;border-top:1px solid var(--rule);margin-top:4px;}
+#cc .cx-kv-meter{flex:1;min-width:0;display:flex;align-items:center;gap:8px;}
+#cc .cx-kv-bar{flex:1;min-width:24px;height:3px;background:var(--rule);position:relative;}
+#cc .cx-kv-bar span{position:absolute;left:0;top:0;bottom:0;background:var(--counter);}
+/* something needs the person: the toggle says so in rubric */
+#cc .cx-card-toggle.cx-attn{color:var(--rubric);border-color:var(--rubric);}

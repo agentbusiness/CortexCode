@@ -1,0 +1,5 @@
+plugins-dist/
+plugins/*/*/dist/
+plugins/theme-cortex/theme/src/generated/
+sdk/dist/
+verify/results/*.log

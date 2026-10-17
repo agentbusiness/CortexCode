@@ -1,0 +1,388 @@
+use std::{any::Any, range::Range};
+
+use derive_more::Debug;
+use thiserror::Error;
+
+use crate::{
+    backends::common::{
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, gpu_types::trie::TrieNode,
+    },
+    config::{dflash::DFlashDraftConfig, rope::AnyRoPEConfig, token_mixer::AnyTokenMixerConfig},
+    data_type::DataType,
+    encodable_block::{
+        batch_topology::BatchTopology,
+        embedding::{Embedding, EmbeddingError},
+        linear::{Linear, LinearBlockError, LinearEncodeError},
+        mixer::{
+            MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
+            attention::{
+                ATTENTION_SUFFIX_CAPACITY, Attention, AttentionNewError, AttentionState, rope::PrecalculatedRoPE,
+            },
+        },
+        mlp::MlpBlockNewError,
+        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        transformer_layer::{TransformerLayer, TransformerLayerError},
+    },
+    safetensors::ParameterTree,
+    utils::{maybe_mut::MaybeMut, size_for_shape::size_for_shape},
+};
+
+pub struct DFlashState<B: Backend> {
+    layer_states: Box<[Box<dyn MixerState<B>>]>,
+    context_length: u32,
+    context_capacity: u32,
+}
+
+impl<B: Backend> DFlashState<B> {
+    pub fn context_length(&self) -> u32 {
+        self.context_length
+    }
+
+    /// CortexCode patch P1: snapshot the drafter's context state.
+    pub fn encode_snapshot(
+        &self,
+        mode: SnapshotMode,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(Box<[MixerSnapshot<B>]>, u32), MixerSnapshotError<B>> {
+        let layers = self
+            .layer_states
+            .iter()
+            .map(|state| state.encode_snapshot(mode, command_buffer))
+            .collect::<Result<Box<[_]>, _>>()?;
+        Ok((layers, self.context_length))
+    }
+
+    /// CortexCode patch P1: restore the drafter's context state.
+    pub fn encode_restore(
+        &mut self,
+        layers: &[MixerSnapshot<B>],
+        context_length: u32,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), MixerSnapshotError<B>> {
+        if layers.len() != self.layer_states.len() || context_length > self.context_capacity {
+            return Err(MixerSnapshotError::Mismatch("drafter state shape differs".into()));
+        }
+        for (state, snapshot) in self.layer_states.iter_mut().zip(layers) {
+            state.encode_restore(snapshot, command_buffer)?;
+        }
+        self.context_length = context_length;
+        Ok(())
+    }
+}
+
+pub struct DFlash<B: Backend> {
+    target_feature_projection: Box<dyn Linear<B>>,
+    projected_feature_norm: Normalization<B>,
+    state_kv_projection: Box<dyn Linear<B>>,
+    layer_kv_dim: u32,
+    layers: Box<[TransformerLayer<B>]>,
+    output_norm: Normalization<B>,
+    rope_config: AnyRoPEConfig,
+    model_dim: u32,
+    max_context_length: u32,
+    block_size: u32,
+    mask_token_id: u32,
+    target_feature_input_dim: u32,
+    data_type: DataType,
+}
+
+pub struct DFlashOutput<B: Backend> {
+    pub draft_hidden: B::ScratchBuffer,
+    pub logits: B::ScratchBuffer,
+}
+
+#[derive(Debug, Error)]
+pub enum DFlashNewError<B: Backend> {
+    #[error("Linear error: {0}")]
+    Linear(#[from] LinearBlockError<B>),
+    #[error("Normalization error: {0}")]
+    Normalization(#[from] NormalizationNewError<B>),
+    #[error("MLP error: {0}")]
+    Mlp(#[from] MlpBlockNewError<B>),
+    #[error("Attention error: {0}")]
+    Attention(#[from] AttentionNewError<B>),
+    #[error("Transformer layer error: {0}")]
+    TransformerLayer(#[from] TransformerLayerError<B>),
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("invalid DFlash attention config: {0}")]
+    InvalidAttentionConfig(&'static str),
+}
+
+#[derive(Debug, Error)]
+pub enum DFlashEncodeError<B: Backend> {
+    #[error("Backend error: {0}")]
+    Backend(#[source] B::Error),
+    #[error("Linear error: {0}")]
+    Linear(#[from] LinearEncodeError<B>),
+    #[error("Transformer layer error: {0}")]
+    TransformerLayer(#[from] TransformerLayerError<B>),
+    #[error("Embedding error: {0}")]
+    Embedding(#[from] EmbeddingError<B>),
+}
+
+impl<B: Backend> DFlash<B> {
+    pub fn new(
+        data_type: DataType,
+        config: &DFlashDraftConfig,
+        parameter_tree: &ParameterTree<B>,
+        context: &B::Context,
+    ) -> Result<Self, DFlashNewError<B>> {
+        let mask_token_id = config.mask_token_id as u32;
+        assert!(config.block_size <= ATTENTION_SUFFIX_CAPACITY, "DFlash block_size exceeds attention suffix capacity");
+        let target_feature_projection = <dyn Linear<B>>::new(
+            config.model_dim * config.target_layer_ids.len() as u32,
+            config.model_dim,
+            data_type,
+            false,
+            &parameter_tree.subtree("context_projection"),
+            context,
+        )?;
+        let projected_feature_norm = Normalization::new(
+            config.model_dim,
+            data_type,
+            None,
+            ShortcutMode::None,
+            PostLayerScalar::None,
+            &config.context_norm_config,
+            &parameter_tree.subtree("context_norm"),
+            context,
+        )?;
+        let layers_tree = parameter_tree.subtree("layers");
+        let first_layer_config = config.layer_configs.first().expect("DFlash draft model must have at least one layer");
+        let AnyTokenMixerConfig::AttentionConfig(attention_config) = &first_layer_config.mixer_config else {
+            return Err(DFlashNewError::InvalidAttentionConfig("DFlash layers must use attention mixers"));
+        };
+        let layer_kv_dim = 2 * attention_config.num_groups * attention_config.head_dim;
+        let num_layers = config.layer_configs.len() as u32;
+        let state_kv_projection = <dyn Linear<B>>::new(
+            config.model_dim,
+            num_layers * layer_kv_dim,
+            data_type,
+            false,
+            &parameter_tree.subtree("state_kv_projection"),
+            context,
+        )?;
+        let layers = config
+            .layer_configs
+            .iter()
+            .zip(0u32..)
+            .map(|(layer_config, index)| {
+                TransformerLayer::new(
+                    config.model_dim,
+                    config.hidden_dim,
+                    num_layers,
+                    index,
+                    data_type,
+                    layer_config,
+                    &layers_tree.subtree(&index.to_string()),
+                    context,
+                )
+            })
+            .collect::<Result<Box<[_]>, TransformerLayerError<B>>>()?;
+        let output_norm = Normalization::new(
+            config.model_dim,
+            data_type,
+            None,
+            ShortcutMode::Add,
+            PostLayerScalar::None,
+            &config.output_norm_config,
+            &parameter_tree.subtree("output_norm"),
+            context,
+        )?;
+
+        Ok(Self {
+            target_feature_projection,
+            projected_feature_norm,
+            state_kv_projection,
+            layer_kv_dim,
+            layers,
+            output_norm,
+            rope_config: config.rope_config.clone(),
+            model_dim: config.model_dim,
+            max_context_length: *config.rope_config.max_sequence_length(),
+            block_size: config.block_size,
+            mask_token_id,
+            target_feature_input_dim: config.model_dim * config.target_layer_ids.len() as u32,
+            data_type,
+        })
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub fn empty_state(
+        &self,
+        context_capacity: u32,
+        context: &B::Context,
+    ) -> Result<DFlashState<B>, B::Error> {
+        assert!(context_capacity <= self.max_context_length, "DFlash state capacity exceeds configured RoPE capacity");
+        let layer_states = self
+            .layers
+            .iter()
+            .map(|layer| layer.mixer.create_empty_state(Some(context_capacity), context))
+            .collect::<Result<Box<[_]>, B::Error>>()?;
+        Ok(DFlashState {
+            layer_states,
+            context_length: 0,
+            context_capacity,
+        })
+    }
+
+    pub fn encode_accept(
+        &self,
+        target_features: impl ExactSizeIterator<Item = impl BufferRef<Backend = B>>,
+        accepted_indices: &[u32],
+        state: &mut DFlashState<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), DFlashEncodeError<B>> {
+        if accepted_indices.is_empty() {
+            return Ok(());
+        }
+
+        let command_buffer = &mut *command_buffer.debug_group("dflash accept");
+
+        let num_tokens = accepted_indices.len() as u32;
+        let captured_layer_count = self.target_feature_input_dim / self.model_dim;
+        assert_eq!(target_features.len() as u32, captured_layer_count);
+        let layer_feature_bytes = size_for_shape(&[self.model_dim], self.data_type);
+        let context_length = state.context_length + num_tokens;
+        assert!(context_length <= state.context_capacity, "DFlash state capacity exceeded");
+        assert!(context_length <= self.max_context_length, "DFlash context exceeds configured RoPE capacity");
+
+        let mut packed_target_features = command_buffer
+            .allocate_scratch_for_shape(&[num_tokens, self.target_feature_input_dim], self.data_type)
+            .map_err(DFlashEncodeError::Backend)?;
+        for (layer_index, features) in target_features.enumerate() {
+            assert!(features.size() % layer_feature_bytes == 0);
+            for (token_index, &accepted_index) in accepted_indices.iter().enumerate() {
+                let source_start = accepted_index as usize * layer_feature_bytes;
+                assert!(source_start + layer_feature_bytes <= features.size(), "accepted index out of feature bounds");
+                let destination_start =
+                    (token_index * captured_layer_count as usize + layer_index) * layer_feature_bytes;
+                command_buffer.encode_copy(
+                    features.subrange(source_start..source_start + layer_feature_bytes),
+                    packed_target_features.subrange_mut(destination_start..destination_start + layer_feature_bytes),
+                );
+            }
+        }
+        let projected_features =
+            self.target_feature_projection.encode(packed_target_features, num_tokens, command_buffer)?;
+        let normalized_features = self
+            .projected_feature_norm
+            .encode(&projected_features, 0, num_tokens, None::<&mut B::ScratchBuffer>, command_buffer)
+            .map_err(DFlashEncodeError::Backend)?;
+        let token_positions = (state.context_length..state.context_length + num_tokens).collect::<Box<[_]>>();
+        let rope = PrecalculatedRoPE::precalculate(&self.rope_config, &token_positions, command_buffer)
+            .map_err(DFlashEncodeError::Backend)?;
+
+        let projected_kv = self.state_kv_projection.encode(normalized_features, num_tokens, command_buffer)?;
+        let layer_kv_bytes = size_for_shape(&[self.layer_kv_dim], self.data_type);
+        let kv_chunk =
+            |chunk_index: usize| Range::from(chunk_index * layer_kv_bytes..(chunk_index + 1) * layer_kv_bytes);
+        let mut layer_key_values = (0..self.layers.len())
+            .map(|_| command_buffer.allocate_scratch(num_tokens as usize * layer_kv_bytes))
+            .collect::<Result<Box<[_]>, _>>()
+            .map_err(DFlashEncodeError::Backend)?;
+        for (layer_index, key_value) in layer_key_values.iter_mut().enumerate() {
+            for token_index in 0..num_tokens as usize {
+                command_buffer.encode_copy(
+                    projected_kv.subrange(kv_chunk(token_index * self.layers.len() + layer_index)),
+                    key_value.subrange_mut(kv_chunk(token_index)),
+                );
+            }
+        }
+        for ((layer, mixer_state), mut key_value) in
+            self.layers.iter().zip(state.layer_states.iter_mut()).zip(layer_key_values)
+        {
+            mixer_state.prepare(state.context_length, num_tokens).map_err(DFlashEncodeError::Backend)?;
+            let attention = (layer.mixer.as_ref() as &dyn Any)
+                .downcast_ref::<Attention<B>>()
+                .expect("DFlash draft layers must use attention mixers");
+            let attention_state = (mixer_state.as_mut() as &mut dyn Any)
+                .downcast_mut::<AttentionState<B>>()
+                .expect("DFlash draft layer states must be attention states");
+            attention
+                .append_projected_kv(&mut key_value, &rope, num_tokens, attention_state, command_buffer)
+                .map_err(DFlashEncodeError::Backend)?;
+        }
+
+        state.context_length += num_tokens;
+
+        Ok(())
+    }
+
+    pub fn encode_draft(
+        &self,
+        target_embedding: &Embedding<B>,
+        target_output_token: u32,
+        batch_size: u32,
+        state: &mut DFlashState<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<DFlashOutput<B>, DFlashEncodeError<B>> {
+        let command_buffer = &mut *command_buffer.debug_group("dflash draft");
+
+        assert!(batch_size >= 2 && batch_size <= self.block_size, "batch size exceeds DFlash block size");
+        assert!(
+            state.context_length + batch_size <= self.max_context_length,
+            "DFlash block positions exceed configured RoPE capacity"
+        );
+
+        let mut tokens = vec![self.mask_token_id; batch_size as usize];
+        tokens[0] = target_output_token;
+        let token_ids = command_buffer.allocate_constant_from_slice(&tokens).map_err(DFlashEncodeError::Backend)?;
+
+        let token_embeddings = target_embedding.encode_lookup(&token_ids, batch_size, command_buffer)?;
+
+        let nodes = (0..batch_size)
+            .map(|index| TrieNode {
+                trie_start: index,
+                trie_end: batch_size - 1,
+                height: index,
+            })
+            .collect::<Box<[_]>>();
+        let batch_topology = BatchTopology::new(&nodes, true);
+        let token_positions = (state.context_length..state.context_length + batch_size).collect::<Box<[_]>>();
+        let rope = PrecalculatedRoPE::precalculate(&self.rope_config, &token_positions, command_buffer)
+            .map_err(DFlashEncodeError::Backend)?;
+
+        let mut hidden = token_embeddings;
+        let mut residual = command_buffer.allocate_scratch(hidden.size()).map_err(DFlashEncodeError::Backend)?;
+        for (layer, mixer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
+            mixer_state.prepare(state.context_length, batch_size).map_err(DFlashEncodeError::Backend)?;
+            hidden = layer.encode(
+                hidden,
+                &mut residual,
+                None::<&B::ScratchBuffer>,
+                Some(&rope),
+                &batch_topology,
+                Some(MaybeMut::Mut(mixer_state.as_mut())),
+                command_buffer,
+            )?;
+        }
+        let draft_hidden = self
+            .output_norm
+            .encode(&hidden, 0, batch_size, Some(&mut residual), command_buffer)
+            .map_err(DFlashEncodeError::Backend)?;
+
+        let row_bytes = size_for_shape(&[target_embedding.model_dim()], DataType::BF16);
+        let lookahead_rows = Range::from(row_bytes..batch_size as usize * row_bytes);
+        let mut lookahead_hidden =
+            command_buffer.allocate_scratch(lookahead_rows.iter().len()).map_err(DFlashEncodeError::Backend)?;
+        command_buffer.encode_copy(draft_hidden.subrange(lookahead_rows), &mut lookahead_hidden);
+        let logits = target_embedding.encode_readout(
+            &lookahead_hidden,
+            batch_size - 1,
+            target_embedding.vocab_size(),
+            None::<&B::ScratchBuffer>,
+            false,
+            command_buffer,
+        )?;
+
+        Ok(DFlashOutput {
+            draft_hidden,
+            logits,
+        })
+    }
+}

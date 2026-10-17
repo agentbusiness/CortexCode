@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@verifiers"
+        ]
+      },
+      "maxItems": 8
+    }
+  },
+  "required": [
+    "checks"
+  ],
+  "additionalProperties": false
+}

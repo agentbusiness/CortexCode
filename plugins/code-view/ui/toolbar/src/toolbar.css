@@ -1,0 +1,7 @@
+/* code.toolbar@1 — one row of picks and mark buttons. */
+/* the bar wraps in a narrow pane: every control stays visible, nothing scrolls sideways */
+#cc .cx-code-bar{flex-wrap:wrap;gap:4px;padding:8px 12px 8px 16px;border-bottom:0;min-width:0;}
+#cc .cx-code-bar .pick .v{max-width:160px;overflow:hidden;text-overflow:ellipsis;}
+#cc .cx-code-bar .cx-branch-pick{max-width:240px;}
+#cc .cx-total{display:inline-flex;gap:8px;padding:0 8px;}
+#cc .cx-code-bar .cx-markbtn{flex:0 0 auto;}

@@ -1,0 +1,41 @@
+{
+ "suite": "swebench",
+ "tasks": [
+  {
+   "id": "acme__widgets-101",
+   "lang": "python",
+   "group": "acme/widgets"
+  },
+  {
+   "id": "acme__widgets-102",
+   "lang": "python",
+   "group": "acme/widgets"
+  },
+  {
+   "id": "acme__widgets-103",
+   "lang": "python",
+   "group": "acme/widgets"
+  },
+  {
+   "id": "zeta__parser-7",
+   "lang": "python",
+   "group": "zeta/parser"
+  },
+  {
+   "id": "zeta__parser-8",
+   "lang": "python",
+   "group": "zeta/parser"
+  },
+  {
+   "id": "omni__core-5",
+   "lang": "python",
+   "group": "omni/core"
+  },
+  {
+   "id": "omni__core-6",
+   "lang": "python",
+   "group": "omni/core",
+   "excluded": "fixture: excluded instance"
+  }
+ ]
+}

@@ -1,0 +1,11 @@
+/* settings.backup@1 — the design's settings rows (.row, .nm, .sw, .detent come from the theme). */
+#cc .cx-backup{max-width:72ch;}
+#cc .cx-backup .row .grow{min-width:0;}
+#cc .cx-backup .sw:disabled{cursor:default;border-color:var(--rule);}
+#cc .cx-backup-note{font-family:var(--font-reading);font-size:13.5px;line-height:1.45;color:var(--ink-3);margin-top:4px;overflow-wrap:anywhere;}
+#cc .cx-backup-pick{display:flex;flex-direction:column;gap:8px;padding:0 0 12px;}
+#cc .cx-backup-pickrow{display:flex;align-items:center;gap:8px;}
+#cc .cx-backup-field{flex:1;}
+#cc .cx-backup-field select{width:100%;min-width:0;font-family:var(--font-apparatus);font-size:10.5px;}
+#cc .cx-backup-confirm{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 0 12px;}
+#cc .cx-backup-confirm .t{font-size:14px;color:var(--ink-2);}

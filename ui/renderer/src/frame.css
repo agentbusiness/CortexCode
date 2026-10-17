@@ -1,0 +1,30 @@
+/*
+ * The workbench core's layout: where the regions sit. No colour, no face, no component: all of that
+ * is the active theme plugin's (slot theme@1).
+ */
+html,body,#root{height:100%;margin:0;}
+body{overflow:hidden;}
+
+/* sidebar | divider | conversation | divider | right pane. The widths come from the workbench's
+   state (--cx-left, --cx-pane); the conversation keeps 360px whenever the window allows. */
+#cc .cx-work{
+  flex:1;min-height:0;display:grid;position:relative;
+  grid-template-columns:var(--cx-left,248px) 1px minmax(0,1fr) 1px minmax(0,min(var(--cx-pane,46%),calc(100% - var(--cx-left,248px) - 362px)));
+  grid-template-rows:minmax(0,1fr);
+}
+/* collapsed: the pane is gone (the card's Open pane, in the band, brings it back) */
+#cc .cx-work[data-pane="collapsed"]{grid-template-columns:var(--cx-left,248px) 1px minmax(0,1fr) 0 0;}
+#cc .cx-work[data-pane="collapsed"]>.cx-pane-divider{visibility:hidden;pointer-events:none;}
+#cc .cx-work[data-pane="collapsed"]>.cx-right>.cx-slot[data-slot="workbench.rightPane@1"]{display:none;}
+#cc .cx-left,#cc .cx-center,#cc .cx-right{min-width:0;min-height:0;display:flex;flex-direction:column;position:relative;}
+#cc .cx-right{display:grid;grid-template-rows:minmax(0,1fr);}
+#cc .cx-left>.cx-slot,#cc .cx-center>.cx-slot{flex:1;min-height:0;}
+#cc .cx-right>.cx-slot:last-child{min-height:0;}
+
+/* A slot is the box a plugin draws in; a staged version waits in it, hidden. */
+#cc .cx-slot{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-slot>.cx-instance{flex:1;min-height:0;min-width:0;display:flex;flex-direction:column;}
+#cc .cx-band-item{flex:0 0 auto;flex-direction:row;align-items:center;}
+#cc .cx-band-item>.cx-instance{flex-direction:row;align-items:center;}
+#cc .cx-theme-slot{display:none;}
+

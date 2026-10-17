@@ -1,0 +1,53 @@
+/* code.editor@1 — a file header, facts in the apparatus, the editor, a checkpoint hairline. */
+#cc .cx-editor-view{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-editor-empty{padding:16px;}
+#cc .cx-file{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-file-head{display:flex;align-items:center;gap:8px;padding:8px 12px 8px 16px;border-bottom:1px solid var(--rule);min-width:0;flex-wrap:wrap;}
+#cc .cx-file-head .grow{flex:1;}
+#cc .cx-file-head .cx-break{flex-basis:100%;height:0;}
+#cc .cx-file-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:12px;}
+#cc .cx-file-dir{color:var(--ink-3);}
+#cc .cx-file-name{color:var(--ink);font-weight:600;}
+#cc .cx-file-counts{display:inline-flex;gap:8px;}
+#cc .cx-file-facts{display:flex;flex-direction:column;gap:4px;padding:8px 16px;border-bottom:1px solid var(--rule);}
+#cc .cx-fact{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin:0;}
+#cc .cx-fact-link{border:0;background:transparent;padding:0;cursor:pointer;font-family:var(--font-reading);font-size:13.5px;color:var(--ink);text-decoration:underline;text-decoration-color:var(--rule-2);text-underline-offset:2px;}
+/* The task behind a change: one line, cut with an ellipsis; the full text is the hover tooltip. */
+#cc .cx-fact-line{flex-wrap:nowrap;min-width:0;}
+#cc .cx-fact-line > *{flex:none;white-space:nowrap;}
+#cc .cx-fact-line .cx-fact-link{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;}
+#cc .cx-fact-link:hover{color:var(--rubric);text-decoration-color:var(--rubric);}
+#cc .cx-conflict{border-left:1px solid var(--rubric-lift);padding-left:8px;}
+#cc .cx-file-notice{margin:8px 16px;}
+#cc .cx-file-host{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-file-host[hidden]{display:none;}
+#cc .cx-file-host .cm-editor,#cc .cx-file-host .cm-mergeView{flex:1;min-height:0;}
+#cc .cx-file-host .cm-mergeView{overflow:auto;}
+#cc .cx-file-md{flex:1;min-height:0;overflow:auto;padding:24px 20px 40px 16px;font-size:16px;}
+
+/* Notes the journal and the graph write above the code. */
+#cc .cx-anno{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:8px 12px 8px 8px;margin:0;white-space:normal;box-sizing:border-box;contain:inline-size;border-left:1px solid var(--counter);font-family:var(--font-reading);}
+#cc .cx-anno-symbol{border-left-color:var(--rubric-lift);}
+#cc .cx-anno-turn{font-size:12.5px;font-style:italic;color:var(--ink-2);}
+#cc .cx-anno-sym{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
+#cc .cx-anno-go{border:0;background:transparent;padding:0;cursor:pointer;font-family:var(--font-apparatus);font-size:9px;font-weight:650;letter-spacing:.15em;text-transform:uppercase;color:var(--rubric);}
+#cc .cx-anno-go:hover{color:var(--ink);}
+#cc .cx-anno-sites{list-style:none;margin:4px 0 0;padding:0;flex-basis:100%;display:flex;flex-direction:column;gap:4px;}
+#cc .cx-anno-sites li{display:flex;gap:8px;align-items:baseline;}
+#cc .cx-symbol-tip{padding:8px 12px;max-width:420px;display:flex;flex-direction:column;gap:4px;font-family:var(--font-reading);}
+#cc .cx-symbol-tip code{font-family:var(--font-mono);font-size:12px;color:var(--ink);white-space:pre-wrap;}
+#cc .cx-symbol-tip p{margin:0;font-size:13px;color:var(--ink-2);}
+
+/* The tree's checkpoints: ticks on a hairline, the design's rail ticks laid down. */
+#cc .cx-checkpoints{display:flex;align-items:center;gap:8px;padding:8px 16px;border-top:1px solid var(--rule);}
+#cc .cx-scrub{position:relative;flex:1;height:12px;border-bottom:1px solid var(--rule-2);margin:0 8px;min-width:80px;}
+#cc .cx-tick{position:absolute;bottom:-4px;width:8px;height:8px;margin-left:-4px;padding:0;border:1px solid var(--ink-3);background:var(--ground);cursor:pointer;}
+#cc .cx-tick:hover{border-color:var(--ink);}
+#cc .cx-tick.on{background:var(--rubric);border-color:var(--rubric);}
+
+/* The review list. */
+#cc .cx-list{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-list-scroll{flex:1;min-height:0;overflow:auto;padding:12px 12px 20px 16px;}
+#cc .cx-commit{border-top:1px solid var(--rule-2);border-bottom:0;padding:8px 12px 12px 16px;}
+#cc .cx-commit .write{min-height:0;font-size:15px;padding:8px 12px;}
+#cc .cx-commit .tools{margin-top:8px;}

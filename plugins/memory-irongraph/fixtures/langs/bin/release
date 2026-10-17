@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+release() {
+  ./scripts/audit.sh "$1"
+}
+release "$TAG"

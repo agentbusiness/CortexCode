@@ -1,0 +1,1656 @@
+{
+ "version": 1,
+ "about": "Skill-selection bank (docs/SKILL-SELECTION-TESTS.md). Expectations are judged by a person with the skill files open, not derived from words in the prompt. Skill names are data: rename them here (or in `sets`) when a plugin renames a skill; bank.mjs refuses to load a URI that does not exist under plugins/lang-*/data/skills or plugins/skills-*/data/skills. `@name` in any URI list expands to `sets.name`; `*` in a URI is a glob. must = groups (each satisfied by any one URI in it; every group must be satisfied); may = neutral; anything else read is wasted; must_not reads are also counted as wrong reads.",
+ "defaults": {
+  "turn_budget_min": 10
+ },
+ "sets": {
+  "change": [
+   "skill://skills-engineering/git-and-github"
+  ],
+  "any": [
+   "skill://*"
+  ]
+ },
+ "fixtures": {
+  "rs-borrow": {
+   "languages": [
+    "rust"
+   ],
+   "planted": "src/cache.rs: E0502, `self.evict(key)` (needs &mut self) inside `for ... in self.entries.iter()`"
+  },
+  "rs-trait": {
+   "languages": [
+    "rust"
+   ],
+   "planted": "src/report.rs: E0277, generic `describe<T>` formats `{}` without a `Display` bound"
+  },
+  "rs-clean": {
+   "languages": [
+    "rust"
+   ],
+   "planted": "compiling crate: src/config.rs (load_from_file / parse_config), src/retry.rs (retry helper), src/main.rs CLI, unit and integration tests"
+  },
+  "rs-hang": {
+   "base": "rs-clean",
+   "languages": [
+    "rust"
+   ],
+   "planted": "rs-clean plus src/server.rs whose test_server_start blocks forever in accept() (nobody connects)"
+  },
+  "rs-exercise": {
+   "languages": [
+    "rust"
+   ],
+   "planted": "Exercism layout: src/lib.rs with todo!(), tests/ with #[ignore], .docs/instructions.md"
+  },
+  "py-pkg": {
+   "languages": [
+    "python"
+   ],
+   "planted": "src/ layout package `mypkg`, pytest tests import it; ModuleNotFoundError until the package is installed (pip install -e .)"
+  },
+  "py-app": {
+   "languages": [
+    "python",
+    "shell"
+   ],
+   "planted": "importer/dates.py parses DD/MM/YYYY input month-first; scripts/test.sh line 4 `filter=$1` under set -u (make test calls it without args); importer/retry.py retry helper; README typo `recieve`"
+  },
+  "py-exercise": {
+   "languages": [
+    "python"
+   ],
+   "planted": "Exercism stub two_fer.py with `pass`, .docs/instructions.md, two_fer_test.py"
+  },
+  "py-bcb": {
+   "languages": [
+    "python"
+   ],
+   "planted": "task.py: BigCodeBench-style task_func docstring (pandas), body `pass`"
+  },
+  "ts-app": {
+   "languages": [
+    "typescript"
+   ],
+   "planted": "src/cart.ts: TS2345 (string passed to a number parameter); package.json without \"type\" while dist/*.js use ESM import"
+  },
+  "ts-react": {
+   "languages": [
+    "typescript"
+   ],
+   "planted": "src/Counter.tsx: useEffect sets `count`, which is its own dependency (renders forever)"
+  },
+  "go-race": {
+   "languages": [
+    "go"
+   ],
+   "planted": "counter.go: Counter.Inc without a lock, counter_test.go TestCounter fails intermittently; cmd/server serves on :8080"
+  },
+  "go-unused": {
+   "languages": [
+    "go"
+   ],
+   "planted": "main.go: `n, err := strconv.Atoi(...)` with err never used (declared and not used: err)"
+  },
+  "c-plain": {
+   "languages": [
+    "c"
+   ],
+   "planted": "src/main.c calls parse_line with no prototype in scope (implicit declaration); Makefile"
+  },
+  "cpp-link": {
+   "languages": [
+    "cpp"
+   ],
+   "planted": "CMakeLists.txt omits src/parser.cpp: undefined reference to Parser::parse"
+  },
+  "java-gradle": {
+   "languages": [
+    "java"
+   ],
+   "planted": "Gradle project, shop.OrderService with total(), no tests"
+  },
+  "sh-tools": {
+   "languages": [
+    "shell"
+   ],
+   "planted": "deploy.sh: unquoted variables, set -e and a `grep -q` that fails with no message; logs/app.log with ERROR lines over several hours"
+  },
+  "poly": {
+   "languages": [
+    "rust",
+    "python",
+    "shell"
+   ],
+   "planted": "core/ Rust crate renamed tokenize_words -> split_words; bindings/polycore/__init__.py still imports tokenize_words (ImportError); ci.sh runs cargo test then the python import"
+  },
+  "ts-wasm": {
+   "languages": [
+    "typescript",
+    "rust"
+   ],
+   "planted": "TypeScript web app; crates/wasm/src/lib.rs uses a moved String (E0382)"
+  },
+  "docs-only": {
+   "languages": [],
+   "planted": "Markdown files only (README.md, docs/*.md)"
+  },
+  "empty": {
+   "languages": [],
+   "empty": true,
+   "planted": "an empty folder (the harness still makes it a git repository with one empty commit)"
+  },
+  "rs-msrv": {
+   "languages": [
+    "rust"
+   ],
+   "planted": "crate with rust-version = \"1.60\" in Cargo.toml (README: CI builds with the MSRV); src/args.rs uses let-else (stable since 1.65, E0658 on 1.60)"
+  },
+  "ts-exercise": {
+   "languages": [
+    "typescript"
+   ],
+   "planted": "Exercism layout: bob.ts throws \"Remove this statement and implement this function\", bob.test.ts with xit, .docs/instructions.md"
+  },
+  "go-exercise": {
+   "languages": [
+    "go"
+   ],
+   "planted": "Exercism layout: leap.go with panic(\"Please implement the IsLeapYear function\"), leap_test.go, .docs/instructions.md"
+  },
+  "go-data": {
+   "languages": [
+    "go"
+   ],
+   "planted": "batch.go: Split appends batches that share one buffer (batch = batch[:0]), TestSplit gets [[5 4] [5 4] [5]]; config.go: Load returns fmt.Errorf/errors.New strings, cmd/ingest tells a missing file from a bad one with strings.HasPrefix(err.Error(), ...)"
+  },
+  "java-broken": {
+   "base": "java-gradle",
+   "languages": [
+    "java"
+   ],
+   "planted": "java-gradle plus src/main/java/shop/Receipt.java calling item.price() (the record component is unitPrice): cannot find symbol"
+  },
+  "java-runtime": {
+   "base": "java-gradle",
+   "languages": [
+    "java"
+   ],
+   "planted": "java-gradle plus OrderService.dropEmptyLines removing from the list inside a for-each (ConcurrentModificationException) and src/test/java/shop/OrderServiceTest.java (dropsEmptyLines fails, totalAppliesCoupon passes)"
+  },
+  "java-exercise": {
+   "languages": [
+    "java"
+   ],
+   "planted": "Exercism Gradle layout: src/main/java/Hamming.java throwing UnsupportedOperationException, src/test/java/HammingTest.java with @Disabled tests, .docs/instructions.md"
+  },
+  "cpp-exercise": {
+   "languages": [
+    "cpp"
+   ],
+   "planted": "Exercism layout: empty namespace leap in leap.h/leap.cpp, leap_test.cpp (Catch2, EXERCISM_RUN_ALL_TESTS), CMakeLists.txt, .docs/instructions.md"
+  },
+  "cpp-clean": {
+   "languages": [
+    "cpp"
+   ],
+   "planted": "the cpp-link calculator with a working CMakeLists.txt (library exprcore, executable, ctest target tests/eval_test.cpp incl. the empty-input case)"
+  },
+  "cpp-crash": {
+   "base": "cpp-clean",
+   "languages": [
+    "cpp"
+   ],
+   "planted": "cpp-clean with src/eval.cpp starting from tokens.front(): the empty-input test dereferences an empty vector (segfault)"
+  },
+  "cpp-compile": {
+   "base": "cpp-clean",
+   "languages": [
+    "cpp"
+   ],
+   "planted": "cpp-clean with src/main.cpp calling evaluate(tokens, precision): no matching function for call to evaluate (it takes one argument)"
+  },
+  "docker-api": {
+   "languages": [
+    "dockerfile",
+    "compose",
+    "python"
+   ],
+   "planted": "python http.server API (app/main.py binds 127.0.0.1:8000, so a published port answers nothing), tests/test_api.py; Dockerfile FROM python:3.12 (full image), COPY . , runs as root, shell-form CMD; compose.yaml with one api service, no healthchecks"
+  },
+  "docker-broken": {
+   "base": "docker-api",
+   "languages": [
+    "dockerfile",
+    "compose",
+    "python"
+   ],
+   "planted": "docker-api with a Dockerfile that COPYs requirements.txt from the context root (it lives in app/): the build fails at that COPY"
+  },
+  "web-site": {
+   "languages": [
+    "html",
+    "css",
+    "javascript"
+   ],
+   "planted": "static site: sticky header inside .page { overflow: hidden }; no viewport meta, description or og tags; root-absolute /css /js /img paths; js/menu.js loaded in <head> without defer (null addEventListener); contact form email input without name; FAQ answers toggled with display; h1-h3 at body size, full-width text; .plans fixed at 1100px; light-only hard-coded colors, #aaa text; gradient headline, eyebrow label, glow CTA, three icon cards"
+  },
+  "py-shop": {
+   "languages": [
+    "python"
+   ],
+   "planted": "sqlite shop: db.upsert_product uses INSERT OR REPLACE (wipes stock), db.search_products builds SQL with an f-string, report.orders_per_customer COUNT(*) over a LEFT JOIN (1 for customers without orders), report.daily_sales filters on date(created_at) with a correlated subquery and no index, orders.place_order writes on two connections (database is locked), images.make_thumbnail runs convert with shell=True on the upload name, customers.import_customers dedupes with a list (quadratic), uncalled legacy_export and format_customer_label"
+  },
+  "py-data": {
+   "languages": [
+    "python"
+   ],
+   "planted": "config.yaml lists NO (yaml.safe_load gives False); summary.py merges a stores.csv with a duplicated store (North counted twice) and regions.csv spelling west lowercase (NaN manager); api/response.json users with nested plan.tier; parse_log.py regex with overlapping alternatives under * that backtracks forever on the last access.log line (no closing quote); graph/follows.py MERGEs the whole (a)-[:FOLLOWS]->(b) pattern (duplicate User nodes)"
+  },
+  "sh-ops": {
+   "languages": [
+    "shell",
+    "html"
+   ],
+   "planted": "configure.sh asks four questions with read -p/-s; install.sh is #!/bin/sh but uses arrays and [[ ]] (fails on busybox ash); backup.sh for a nightly job; gen_report.sh prints 40,000 lines then \"SUMMARY: 1 failed checks\"; www/ status pages"
+  }
+ },
+ "scenarios": [
+  {
+   "id": "P7",
+   "group": "positive",
+   "fixture": "sh-tools",
+   "turns": [
+    "deploy.sh stops halfway with exit 1 and no message"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-engineering/debugging",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P12",
+   "group": "positive",
+   "fixture": "sh-tools",
+   "turns": [
+    "how many ERROR lines per hour are in logs/app.log"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": []
+   },
+   "note": "plain text processing is common knowledge since the skills were streamlined; the skill may still be read"
+  },
+  {
+   "id": "P35",
+   "group": "positive",
+   "fixture": "sh-tools",
+   "turns": [
+    "add a --dry-run option to deploy.sh that only prints what it would do"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P41",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "the header is supposed to stick to the top when you scroll but it scrolls away with the page"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-design/ui-design",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P44",
+   "group": "positive",
+   "fixture": "py-shop",
+   "turns": [
+    "orders_per_customer says b@x has 1 order but they never ordered anything"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/sql"
+     ]
+    ],
+    "may": [
+     "skill://skills-data/sql",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P45",
+   "group": "positive",
+   "fixture": "py-shop",
+   "turns": [
+    "we move to postgres next month. make upsert_product work on both sqlite and postgres, right now it also resets the stock to 0"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/sql"
+     ]
+    ],
+    "may": [
+     "skill://skills-data/sql",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P46",
+   "group": "positive",
+   "fixture": "py-shop",
+   "turns": [
+    "python -m shop.worker dies with sqlite3.OperationalError: database is locked"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/sql"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/debugging",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P47",
+   "group": "positive",
+   "fixture": "py-shop",
+   "turns": [
+    "daily_sales takes 30 seconds on the production db (2 million orders), make it fast"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/sql"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/performance-work",
+     "skill://skills-data/sql",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P48",
+   "group": "positive",
+   "fixture": "py-data",
+   "turns": [
+    "load_config prints ['SE', False, 'DK', 'FI']. where did norway go? fix it"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/data-formats"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-data/jq",
+     "skill://skills-data/regex"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P49",
+   "group": "positive",
+   "fixture": "py-data",
+   "turns": [
+    "revenue_per_region counts North twice and West comes out with NaN as manager"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/dataframes"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-data/sql"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P50",
+   "group": "positive",
+   "fixture": "py-data",
+   "turns": [
+    "with jq, list the ids of the users on the pro tier in api/response.json, one per line"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/jq"
+     ]
+    ],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": [
+     "skill://skills-data/data-formats"
+    ]
+   }
+  },
+  {
+   "id": "P51",
+   "group": "positive",
+   "fixture": "py-data",
+   "turns": [
+    "python parse_log.py logs/access.log hangs on the last line"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/regex"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/debugging",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P52",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "add a pricing page for the three plans. it should look like it belongs to a real product"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/ui-design",
+     "skill://skills-design/design-verify-rendered",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P53",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "the landing page looks like every other ai-generated startup site. make it look like ours"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/ui-design",
+     "skill://skills-design/design-verify-rendered",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P54",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "add a dark mode that follows the system setting"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/design-verify-rendered",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P55",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "on my phone the home page scrolls sideways and the plans don't fit"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/design-verify-rendered",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P56",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "make the faq answers slide open smoothly instead of popping in"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/ui-design",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P57",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "the 'why we built it' text is hard to read: the lines run across the whole screen and the headings look like body text"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/ui-design",
+     "skill://skills-design/design-verify-rendered",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "P58",
+   "group": "positive",
+   "fixture": "web-site",
+   "turns": [
+    "open the site in the browser and check it at phone and desktop widths: overflow, contrast, tap targets, console errors. just report, don't fix anything yet"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/design-verify-rendered"
+     ]
+    ],
+    "may": [],
+    "must_not": [
+     "skill://skills-design/ui-design"
+    ]
+   }
+  },
+  {
+   "id": "P59",
+   "group": "positive",
+   "fixture": "sh-ops",
+   "turns": [
+    "run ./configure.sh and take the default for every question"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-terminal/interactive-terminal"
+     ]
+    ],
+    "may": [],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ]
+   },
+   "note": "configure.sh reads from the terminal (read -p, read -s); run-commands' summary excludes prompts"
+  },
+  {
+   "id": "P60",
+   "group": "positive",
+   "fixture": "sh-ops",
+   "turns": [
+    "run backup.sh every night at 02:30 as a cron job"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": [
+     "skill://skills-terminal/interactive-terminal"
+    ]
+   },
+   "note": "cron is common knowledge since the skills were streamlined; the skill may still be read"
+  },
+  {
+   "id": "P61",
+   "group": "positive",
+   "fixture": "sh-ops",
+   "turns": [
+    "run ./gen_report.sh and tell me the summary line, it prints a huge amount of output"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-terminal/commands-and-processes"
+     ]
+    ],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": [
+     "skill://skills-terminal/interactive-terminal"
+    ]
+   }
+  },
+  {
+   "id": "P62",
+   "group": "positive",
+   "fixture": "sh-ops",
+   "turns": [
+    "get this box into the state the grader checks: www/ served over http on port 8080 and still running after you finish, and ready.txt containing ok in the repo root"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": [
+     "skill://skills-terminal/interactive-terminal"
+    ]
+   },
+   "note": "terminal-bench-shaped task"
+  },
+  {
+   "id": "P64",
+   "group": "positive",
+   "fixture": "rs-clean",
+   "turns": [
+    "run only the config tests, not the whole suite"
+   ],
+   "expect": {
+    "must": [],
+    "may": [],
+    "must_not": [
+     "skill://skills-engineering/debugging"
+    ]
+   }
+  },
+  {
+   "id": "M5",
+   "group": "multi",
+   "fixture": "go-race",
+   "turns": [
+    "start the server in the background, wait till port 8080 answers, then run the race test"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-terminal/commands-and-processes"
+     ]
+    ],
+    "may": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "must_not": [
+     "skill://skills-terminal/interactive-terminal"
+    ]
+   },
+   "note": "processes-and-services is a general terminal skill (skills-terminal), offered in every project"
+  },
+  {
+   "id": "M6",
+   "group": "multi",
+   "fixture": "ts-react",
+   "turns": [
+    "add a reset button to Counter that asks for confirmation in a dialog first"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-design/ui-design"
+     ]
+    ],
+    "may": [
+     "skill://skills-design/ui-design",
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "G1",
+   "group": "general",
+   "fixture": "rs-clean",
+   "turns": [
+    "split config.rs into a parser module and a loader module, no behaviour change"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/refactoring-in-steps"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-engineering/debugging",
+     "skill://skills-engineering/long-horizon-work"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "G2",
+   "group": "general",
+   "fixture": "empty",
+   "turns": [
+    "write a small command-line todo app in python from scratch: add, list and done, saved to todo.json, with tests"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/designing-new-software"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/debugging",
+     "skill://skills-data/data-formats",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-engineering/ideation",
+     "skill://skills-engineering/planning-for-agents"
+    ],
+    "before_first_edit": true
+   },
+   "note": "building, not weighing options: ideation must not be picked"
+  },
+  {
+   "id": "G3",
+   "group": "general",
+   "fixture": "rs-clean",
+   "turns": [
+    "is there a maintained crate that reads this key = value format with # comments, so we can drop our own parser? check what's out there"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/research-method"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/ideation"
+    ],
+    "must_not": [
+     "skill://skills-engineering/unfamiliar-codebase"
+    ]
+   },
+   "note": "outside knowledge; the repository cannot answer it"
+  },
+  {
+   "id": "G4",
+   "group": "general",
+   "fixture": "rs-clean",
+   "turns": [
+    "how should the cli pick up config changes without a restart? sighup, watching the file, polling... give me the options and the tradeoffs, don't build anything"
+   ],
+   "expect": {
+    "decision": [
+     "LOOKUP",
+     "ANSWER"
+    ],
+    "must": [
+     [
+      "skill://skills-engineering/ideation"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/research-method"
+    ],
+    "must_not": [
+     "skill://skills-engineering/designing-new-software",
+     "skill://skills-engineering/planning-for-agents",
+     "skill://skills-engineering/long-horizon-work"
+    ]
+   },
+   "note": "options weighed, not a plan: the turn must not end in PLAN"
+  },
+  {
+   "id": "G5",
+   "group": "general",
+   "fixture": "py-app",
+   "turns": [
+    "we need a proper rejected-rows report for the importer. requirements:\n- every row that fails validation goes to rejected.csv with its line number in the export and a reason\n- the reasons are bad_date, missing_guest or duplicate_id, nothing else\n- the import carries on after a bad row\n- at the end it prints how many rows were imported and how many were rejected\n- an empty export is not an error\n- running the import twice on the same file must not duplicate rows in rejected.csv\n- dates stay day-first\n- one test per reason\nkeep these as a checklist while we work, then build it"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/writing-a-spec"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/long-horizon-work",
+     "skill://skills-engineering/planning-for-agents",
+     "skill://skills-engineering/debugging",
+     "skill://skills-data/data-formats",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-engineering/ideation"
+    ]
+   },
+   "note": "long, requirement-heavy request (ROUTE spec: new)"
+  },
+  {
+   "id": "G6",
+   "group": "general",
+   "fixture": "rs-clean",
+   "turns": [
+    "switch the config file format from key = value to toml: the parser, the cli, app.conf, the tests and the readme. do all of it now, no plan needed"
+   ],
+   "expect": {
+    "decision": [
+     "DO",
+     "DELEGATE"
+    ],
+    "must": [
+     [
+      "skill://skills-engineering/long-horizon-work"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/refactoring-in-steps",
+     "skill://skills-engineering/debugging",
+     "skill://skills-engineering/research-method",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-engineering/planning-for-agents"
+    ],
+    "before_first_edit": true
+   },
+   "note": "carrying out a multi-step migration, not planning it"
+  },
+  {
+   "id": "G7",
+   "group": "general",
+   "fixture": "poly",
+   "turns": [
+    "i'm new to this repo. before changing anything find where the python side gets its word splitting from and which tests cover it, then add count_words to the rust core and the python bindings"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/unfamiliar-codebase"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-engineering/research-method"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "G8",
+   "group": "general",
+   "fixture": "rs-clean",
+   "turns": [
+    "what tests does the retry helper need? add them"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/debugging"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "G9",
+   "group": "general",
+   "fixture": "py-app",
+   "turns": [
+    "some bookings come out with the wrong arrival date but others are fine, and there's no error. find out why"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/debugging"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": []
+   },
+   "note": "no error to read; the cause is not named (T3 names it)"
+  },
+  {
+   "id": "G10",
+   "group": "general",
+   "fixture": "py-shop",
+   "turns": [
+    "make_thumbnail gets the file name straight from the upload form. is that safe? fix it if not"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/security-pitfalls"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "before_first_edit": true
+   }
+  },
+  {
+   "id": "L1",
+   "group": "plan",
+   "fixture": "ts-app",
+   "turns": [
+    "plan splitting src/cart.ts into a pricing module and an items module so two agents can do it in parallel. don't change any code yet, i want to review the plan first"
+   ],
+   "expect": {
+    "route": [
+     "PLAN"
+    ],
+    "decision": [
+     "PLAN"
+    ],
+    "must": [
+     [
+      "skill://skills-engineering/planning-for-agents"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/refactoring-in-steps"
+    ],
+    "must_not": [
+     "skill://skills-engineering/long-horizon-work",
+     "skill://skills-engineering/writing-a-spec",
+     "skill://skills-engineering/designing-new-software"
+    ]
+   },
+   "note": "plan mode: the skills come only from DECIDE (PLAN), injected for the planner"
+  },
+  {
+   "id": "L2",
+   "group": "plan",
+   "fixture": "rs-clean",
+   "turns": [
+    "we want config profiles (dev, staging, prod) that inherit from each other, plus env var overrides. write up a plan with tasks for the agents first, nothing gets changed until i approve it"
+   ],
+   "expect": {
+    "route": [
+     "PLAN"
+    ],
+    "decision": [
+     "PLAN"
+    ],
+    "must": [
+     [
+      "skill://skills-engineering/planning-for-agents"
+     ]
+    ],
+    "may": [
+     "skill://skills-engineering/ideation",
+     "skill://skills-engineering/designing-new-software",
+     "skill://skills-engineering/debugging"
+    ],
+    "must_not": [
+     "skill://skills-engineering/long-horizon-work"
+    ]
+   }
+  },
+  {
+   "id": "N1",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "hi"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "@any"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "greeting with a large catalog in the prompt"
+  },
+  {
+   "id": "N2",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "whats the difference between a mutex and a rwlock"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [],
+    "must": [],
+    "may": []
+   },
+   "note": "general knowledge in a Rust project"
+  },
+  {
+   "id": "N3",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "where is the config loaded?"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "skill://skills-engineering/unfamiliar-codebase"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "rust-cargo-commands used to say \"starting work in a Rust/Cargo project\"; unfamiliar-codebase says \"cannot tell where a behaviour is implemented\""
+  },
+  {
+   "id": "N4",
+   "group": "negative",
+   "fixture": "py-app",
+   "turns": [
+    "what does the retry function do"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [],
+    "must": [],
+    "may": []
+   },
+   "note": "python-project-commands used to say \"Read first in any Python project\""
+  },
+  {
+   "id": "N5",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "what are the agents doing"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "@any"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "STATUS route"
+  },
+  {
+   "id": "N6",
+   "group": "negative",
+   "fixture": "py-app",
+   "turns": [
+    "fix the typo recieve -> receive in the README"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [],
+    "must": [],
+    "may": []
+   },
+   "note": "an edit, but not code"
+  },
+  {
+   "id": "N7",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "explain what this repo does"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "skill://skills-engineering/unfamiliar-codebase"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "broad question in a Rust project"
+  },
+  {
+   "id": "N8",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "what changed in the last commit"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "@any"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "git question (the workspace has one snapshot commit)"
+  },
+  {
+   "id": "N9",
+   "group": "negative",
+   "fixture": "docs-only",
+   "turns": [
+    "summarise the docs folder"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "@any"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "no language; only general skills offered"
+  },
+  {
+   "id": "N10",
+   "group": "negative",
+   "fixture": "docs-only",
+   "turns": [
+    "whats the difference between a spec and a plan?"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "@any"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "general question using the words of writing-a-spec and planning-for-agents"
+  },
+  {
+   "id": "N11",
+   "group": "negative",
+   "fixture": "rs-clean",
+   "turns": [
+    "does this project use a crate to parse the config or is it hand-written?"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "skill://skills-engineering/research-method",
+     "skill://skills-engineering/unfamiliar-codebase"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "the repository answers it; research-method is for what it cannot"
+  },
+  {
+   "id": "N12",
+   "group": "negative",
+   "fixture": "docs-only",
+   "turns": [
+    "update the release plan in docs/releases.md: no releases in the last two weeks of december"
+   ],
+   "expect": {
+    "no_skills": true,
+    "must_not": [
+     "skill://skills-engineering/planning-for-agents",
+     "skill://skills-engineering/writing-a-spec"
+    ],
+    "must": [],
+    "may": []
+   },
+   "note": "a \"plan\" that is a Markdown edit"
+  },
+  {
+   "id": "T6",
+   "group": "tempting",
+   "fixture": "rs-hang",
+   "turns": [
+    "cargo test hangs on test_server_start"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-engineering/debugging",
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/interactive-terminal"
+    ],
+    "before_first_edit": true
+   },
+   "note": "\"hangs\" pulls toward terminal skills"
+  },
+  {
+   "id": "T7",
+   "group": "tempting",
+   "fixture": "py-app",
+   "turns": [
+    "run only the date tests"
+   ],
+   "expect": {
+    "must": [],
+    "may": [],
+    "must_not": [
+     "skill://skills-engineering/debugging"
+    ]
+   },
+   "note": "running tests, not writing them (make test also trips the planted test.sh bug)"
+  },
+  {
+   "id": "T8",
+   "group": "tempting",
+   "fixture": "ts-app",
+   "turns": [
+    "run just the cart tests"
+   ],
+   "expect": {
+    "must": [],
+    "may": [],
+    "must_not": [
+     "skill://skills-engineering/debugging"
+    ]
+   },
+   "note": "running tests, not writing them"
+  },
+  {
+   "id": "T9",
+   "group": "tempting",
+   "fixture": "java-runtime",
+   "turns": [
+    "run just OrderServiceTest"
+   ],
+   "expect": {
+    "must": [],
+    "may": [],
+    "must_not": [
+     "skill://skills-engineering/debugging"
+    ]
+   },
+   "note": "running tests, not writing them"
+  },
+  {
+   "id": "T10",
+   "group": "tempting",
+   "fixture": "web-site",
+   "turns": [
+    "messages from the contact form arrive without the sender's email"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-design/ui-design"
+    ],
+    "before_first_edit": true
+   },
+   "note": "a form, but a missing name attribute, not focus or labels"
+  },
+  {
+   "id": "T11",
+   "group": "tempting",
+   "fixture": "web-site",
+   "turns": [
+    "when i share the site on slack there's no preview card, and on my phone the page shows zoomed out"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-design/ui-design"
+    ],
+    "before_first_edit": true
+   },
+   "note": "\"on my phone\" pulls toward responsive layout; the cause is the missing viewport meta"
+  },
+  {
+   "id": "T12",
+   "group": "tempting",
+   "fixture": "py-shop",
+   "turns": [
+    "which functions in this repo are never called from anywhere? list them all"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://memory/irongraph-queries"
+     ]
+    ],
+    "may": [],
+    "must_not": [
+     "skill://skills-data/cypher-queries",
+     "skill://skills-engineering/unfamiliar-codebase"
+    ]
+   },
+   "note": "code-graph Cypher, not Neo4j; a LOOKUP (ROUTE skills)"
+  },
+  {
+   "id": "T13",
+   "group": "tempting",
+   "fixture": "py-data",
+   "turns": [
+    "after importing graph/follows.csv neo4j has two User nodes each for ada, grace and linus, and follower_counts is wrong"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-data/cypher-queries"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://memory/irongraph-queries"
+    ],
+    "before_first_edit": true
+   },
+   "note": "Neo4j, not the code graph"
+  },
+  {
+   "id": "T14",
+   "group": "tempting",
+   "fixture": "sh-ops",
+   "turns": [
+    "install.sh fails on the alpine box: install.sh: line 4: syntax error: unexpected \"(\""
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-terminal/commands-and-processes"
+    ],
+    "before_first_edit": true
+   },
+   "note": "bash syntax under busybox ash, not a strict-mode exit"
+  },
+  {
+   "id": "T19",
+   "group": "tempting",
+   "fixture": "py-shop",
+   "turns": [
+    "import_customers takes minutes on the 100k-row crm export, it has to finish in a few seconds"
+   ],
+   "expect": {
+    "must": [
+     [
+      "skill://skills-engineering/performance-work"
+     ]
+    ],
+    "may": [
+     "@change"
+    ],
+    "must_not": [
+     "skill://skills-data/sql"
+    ],
+    "before_first_edit": true
+   },
+   "note": "slow Python loop in a database app, not a slow query"
+  },
+  {
+   "id": "C1",
+   "group": "conversation",
+   "fixture": "rs-clean",
+   "turns": [
+    "add a --verbose flag to the cli",
+    "now add a test for it"
+   ],
+   "expect": [
+    {
+     "may": [
+      "@change"
+     ],
+     "must_not": [],
+     "must": []
+    },
+    {
+     "may": [
+      "skill://skills-engineering/debugging",
+      "@change"
+     ],
+     "must_not": [],
+     "must": []
+    }
+   ],
+   "note": "a skill read in turn 1 is not read again in turn 2 while its body is unfolded"
+  },
+  {
+   "id": "C2",
+   "group": "conversation",
+   "fixture": "rs-borrow",
+   "turns": [
+    "cargo build fails, fix it",
+    "try again"
+   ],
+   "expect": [
+    {
+     "must": [],
+     "may": [
+      "@change"
+     ],
+     "must_not": [],
+     "before_first_edit": true
+    },
+    {
+     "may": [
+      "@change"
+     ],
+     "must_not": [],
+     "must": []
+    }
+   ],
+   "note": "turn 2 does not re-read rust-borrow-checker while its body is unfolded; a re-read after folding is correct and counted separately"
+  },
+  {
+   "id": "C3",
+   "group": "conversation",
+   "fixture": "rs-clean",
+   "turns": [
+    "add a --quiet flag to the cli that hides the success line",
+    "commit that with a sensible message"
+   ],
+   "expect": [
+    {
+     "may": [
+      "@change"
+     ],
+     "must_not": [],
+     "must": []
+    },
+    {
+     "must": [
+      [
+       "skill://skills-engineering/git-and-github"
+      ]
+     ],
+     "may": [
+      "@change"
+     ],
+     "must_not": []
+    }
+   ],
+   "note": "turn 2: committing needs git-safety; the workspace is a git repository with one snapshot commit"
+  },
+  {
+   "id": "C4",
+   "group": "conversation",
+   "fixture": "rs-clean",
+   "turns": [
+    "make retry double the delay after every failed attempt",
+    "before i merge: go over your diff and check you didn't miss a caller or an edge case"
+   ],
+   "expect": [
+    {
+     "may": [
+      "skill://skills-engineering/debugging",
+      "@change"
+     ],
+     "must_not": [],
+     "must": []
+    },
+    {
+     "must": [
+      [
+       "skill://skills-engineering/git-and-github"
+      ]
+     ],
+     "may": [],
+     "must_not": []
+    }
+   ],
+   "note": "turn 2: self-review is the work itself, not only a may"
+  },
+  {
+   "id": "C5",
+   "group": "conversation",
+   "fixture": "rs-clean",
+   "turns": [
+    "plan adding a --check flag that only validates the config file and exits 0 or 1. don't change code yet",
+    "looks good, implement it"
+   ],
+   "expect": [
+    {
+     "route": [
+      "PLAN"
+     ],
+     "decision": [
+      "PLAN"
+     ],
+     "must": [
+      [
+       "skill://skills-engineering/planning-for-agents"
+      ]
+     ],
+     "may": [
+      "skill://skills-engineering/debugging"
+     ],
+     "must_not": [
+      "skill://skills-engineering/long-horizon-work",
+      "skill://skills-engineering/writing-a-spec"
+     ]
+    },
+    {
+     "route": [
+      "IMPLEMENT"
+     ],
+     "may": [
+      "skill://skills-engineering/debugging",
+      "@change"
+     ],
+     "must_not": [
+      "skill://skills-engineering/planning-for-agents",
+      "skill://skills-engineering/long-horizon-work"
+     ],
+     "must": []
+    }
+   ],
+   "note": "PLAN then IMPLEMENT: ROUTE's skills serve the planner only; each plan task chooses its own skills (plan.json tasks[].skills) and only those reach the implementing run (the DO decision of stage implement, or the agent's task brief), so turn 2 is scored by the tasks' choices and planning-for-agents there is a task's wrong pick"
+  },
+  {
+   "id": "K1",
+   "group": "catalog",
+   "fixture": "empty",
+   "turns": [
+    "create a small rust cli that prints today's date, with a test"
+   ],
+   "expect": {
+    "must": [],
+    "may": [
+     "skill://skills-engineering/designing-new-software",
+     "skill://skills-engineering/debugging",
+     "@change"
+    ],
+    "before_first_edit": true,
+    "must_not": []
+   },
+   "note": "catalog coverage: the graph knows no language of an empty project, so every language plugin's skills are offered (context.rs language_skills) until it does; a miss here is a catalog miss"
+  }
+ ]
+}

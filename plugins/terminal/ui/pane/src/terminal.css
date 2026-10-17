@@ -1,0 +1,8 @@
+/* pane.terminal@1 — xterm on the ground, inset from the pane's hairlines. */
+#cc .cx-terminal{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-terminal>.bar{padding-left:16px;}
+#cc .cx-xterm{flex:1;min-height:0;padding:8px 8px 8px 16px;background:var(--ground);}
+#cc .cx-xterm .xterm{height:100%;}
+#cc .cx-xterm .xterm-viewport{background:var(--ground) !important;}
+#cc .cx-terminal-error{display:flex;align-items:center;gap:8px;padding:0 16px;}
+#cc .cx-terminal-ended{padding:0 16px 8px 16px;}

@@ -1,0 +1,17 @@
+# The projects each skill can help in: the catalog offers a skill only to a project that shows one
+# of its conditions. `languages`: as the code graph names a project's languages; `files`: path
+# globs (no `/`: any directory) of which one must exist; `imports`: packages the code imports or
+# the manifests declare (`org.neo4j` covers `org.neo4j.driver`). A skill not listed applies to
+# every project; a project with no indexed language yet is offered every skill.
+
+# Every design skill is about web interfaces: pages, stylesheets and component files.
+
+[design-verify-rendered]
+languages = ["html", "css", "scss", "less", "tsx"]
+files = ["*.jsx", "*.vue", "*.svelte", "*.astro"]
+imports = ["react", "preact", "vue", "svelte", "solid-js", "@angular/core"]
+
+[ui-design]
+languages = ["html", "css", "scss", "less", "tsx"]
+files = ["*.jsx", "*.vue", "*.svelte", "*.astro"]
+imports = ["react", "preact", "vue", "svelte", "solid-js", "@angular/core"]

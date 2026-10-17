@@ -1,0 +1,13 @@
+/* settings.notify@1 — drawn in the design's settings grammar (.row, .sw, .ap, .detent, .lst, .tbl
+   come from the theme); everything here uses the theme's tokens only. */
+#cc .cx-notify{max-width:72ch;}
+#cc .cx-notify-title{font-family:var(--font-reading);font-size:19px;font-weight:500;margin:12px 0 8px;color:var(--ink);letter-spacing:-.008em;}
+#cc .cx-notify-line{font-family:var(--font-reading);font-size:15px;line-height:1.5;color:var(--ink-2);margin:0 0 12px;max-width:62ch;overflow-wrap:anywhere;}
+#cc .cx-notify-note{font-family:var(--font-reading);font-size:13.5px;line-height:1.45;color:var(--ink-3);margin-top:4px;overflow-wrap:anywhere;}
+#cc .cx-notify-block{padding:0 0 20px;margin-bottom:20px;border-bottom:1px solid var(--rule);}
+#cc .cx-notify-block:last-child{border-bottom:0;}
+#cc .cx-notify-block>.ap{display:block;margin:8px 0 12px;}
+#cc .cx-notify-facts{max-width:none;}
+#cc .cx-notify-facts td:first-child{white-space:nowrap;vertical-align:top;}
+#cc .cx-notify .row .grow{min-width:0;}
+#cc .cx-notify .sw:disabled{cursor:default;border-color:var(--rule);}

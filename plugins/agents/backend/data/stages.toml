@@ -1,0 +1,72 @@
+# cc-agents model-facing configuration. Loaded at startup and reloaded on change; a set that does
+# not validate is rejected and the previous one stays active. The copy in the code folder
+# (~/.cortexcode/code/plugins/agents/backend/data/) is the live one: an edit there is in use
+# within a second.
+
+label = "agents-data 1"
+
+# Sampling profiles (Qwen3.8 guidance). `auto` picks `thinking` or `plain` by the call's thinking.
+[sampling.thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+
+[sampling.plain]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+
+# The planner: one constrained generation (no thinking: the engine applies the grammar to the
+# whole generation). Attempts bound re-asking after an unreadable or invalid plan.
+[plan]
+policy = "planner"
+rules = "plan"
+schema = "schemas/plan.json"
+effort = "none"
+sampling = "auto"
+attempts = 4
+
+# The planner reviewing a worker's proposed revision of its frozen contract: the planner's policy
+# and sampling, a fresh context (never the worker's conversation), one constrained decision.
+[review]
+rules = "review"
+schema = "schemas/review.json"
+
+[effort]
+# When the planner named no effort for a task.
+default = "medium"
+
+[limits]
+# Graph context for planning: semantic search hits for the goal (no repository map; at most 10).
+search_limit = 5
+
+# Agents in flight (running, including those waiting on tools: an agent in a tool holds no model
+# slot, the chat flow hibernates its KV). A control loop moves the limit within [min, max] to the
+# measured best agent throughput while keeping foreground latency within target.
+[scheduler]
+# Initial limit; 0 = the conversations the model holds resident at once, minus one.
+start = 0
+min = 1
+# 0 = no ceiling: the limit rises while it raises measured agent throughput and the foreground
+# targets below hold. The model plugin interleaves running requests (concurrency, not parallel
+# decoding), so more agents gain only while others wait on tools.
+max = 0
+# Control loop period, and the window of live metrics each step looks at (ms).
+tick_ms = 2000
+window_ms = 20000
+# A new limit is in force this long before its throughput is measured (ms).
+settle_ms = 20000
+# Foreground targets, all about what agents add: the longest wait for a model slot, prefill time
+# per uncached token as a multiple of its value with no agent running (a long cold prompt is slow
+# alone too, so absolute prefill time is not a target), and time per output token.
+foreground_queue_ms = 1000
+foreground_prefill_slowdown = 1.5
+foreground_tpot_ms = 150
+# A higher limit is kept only when it raises agent throughput by at least this fraction.
+gain = 0.05
+# Re-measure the neighbours of a held limit after this long (ms).
+probe_after_ms = 120000

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <title>CortexCode favicon, 32 px cut</title>
+  <rect width="32" height="32" fill="#14171A"/>
+  <path d="M8.5 7.5 3.5 16l5 8.5M23.5 7.5l5 8.5-5 8.5" fill="none" stroke="#E9EBEC" stroke-width="2" stroke-linecap="square" shape-rendering="geometricPrecision"/>
+  <path d="M12 12h8v8h-8z" fill="none" stroke="#6E9BB5" stroke-width="1"/>
+  <path d="M12 12l8 8M20 12l-8 8" stroke="#6E9BB5" stroke-width="1" shape-rendering="geometricPrecision"/>
+  <rect x="10" y="10" width="4" height="4" fill="#E9EBEC"/>
+  <rect x="18" y="10" width="4" height="4" fill="#E9EBEC"/>
+  <rect x="10" y="18" width="4" height="4" fill="#E9EBEC"/>
+  <rect x="18" y="18" width="4" height="4" fill="#E2603F"/>
+</svg>

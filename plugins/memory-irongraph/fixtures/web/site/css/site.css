@@ -1,0 +1,25 @@
+@import "base.css";
+
+.btn {
+  color: var(--brand);
+  animation: spin 1s linear infinite;
+}
+
+.btn:hover, .primary {
+  color: white;
+}
+
+#main {
+  margin: 0 auto;
+}
+
+main, button {
+  font: inherit;
+  animation: main 1s;
+}
+
+@media (min-width: 40rem) {
+  .btn {
+    padding: 1rem;
+  }
+}

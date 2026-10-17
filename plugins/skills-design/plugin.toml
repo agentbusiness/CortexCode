@@ -1,0 +1,34 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# data, verification and README together, separable into its own repository (only cc-protocol and
+# cc-lang-kit come from outside). `cortex-pack` builds the folder and packs it into a portable
+# .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "skills-design"
+name = "Frontend design skills"
+version = "0.1.0"
+description = "Frontend design know-how for the model: one UI design guide (direction, colour, typography, layout, motion, interaction and accessibility, anti-patterns) and checking the rendered result in a browser."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+# One skills plugin per body of know-how: the `skills` family, category `skills-<id>`, contract
+# `skills@1`. `data/` (the skills) ships beside the executable.
+[backend]
+category = "skills-design"
+contract = "skills@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-skills-design"
+assets = ["data"]
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/skills-design"

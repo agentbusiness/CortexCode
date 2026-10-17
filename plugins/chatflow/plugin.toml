@@ -1,0 +1,48 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages, shell modules, verification and README together, separable into its own repository
+# (only cc-protocol and @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it
+# into a portable .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "chatflow"
+name = "Chat flow"
+version = "0.1.0"
+description = "The foreground flow: router, parallel host reads from the graph, missing-first decide, answer/do/delegate, and the coding agent loop with steering, follow-ups, cancellation and impact injection; the conversation, its composer, and its title and run state in the brand band."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "chatflow"
+contract = "chatflow@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-chatflow"
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+test = ["npm", "test"]
+
+[[ui.package]]
+dir = "ui/chat"
+id = "chatflow.chat"
+slot = "workbench.chat@1"
+
+[[ui.package]]
+dir = "ui/composer"
+id = "chatflow.composer"
+slot = "chat.composer@1"
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is).
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/chatflow"

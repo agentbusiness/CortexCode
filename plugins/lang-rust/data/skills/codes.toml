@@ -1,0 +1,4 @@
+# Diagnostic codes the Rust guide covers, as rustc / cargo and rust-analyzer emit them (the diagnostic
+# `code`; `error[E0382]` in cargo output). The guide is always loaded, so the tools only point to it
+# when one of these shows up; the model never reads this file.
+rust = ["E0004", "E0277", "E0282", "E0308", "E0382", "E0384", "E0412", "E0425", "E0428", "E0432", "E0433", "E0499", "E0502", "E0505", "E0506", "E0507", "E0515", "E0596", "E0597", "E0599", "E0716", "unlinked-file"]

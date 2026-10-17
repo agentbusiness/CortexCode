@@ -1,0 +1,944 @@
+use std::{
+    iter::{once, repeat_n},
+    mem::replace,
+    range::Range,
+    sync::Arc,
+};
+
+use shoji::traits::backend::chat_token::TokenStreamMetrics;
+
+#[cfg(grammar)]
+use crate::engine::language_model::grammar::Grammar;
+use crate::{
+    backends::common::{
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable,
+        CommandBufferPending, Context,
+        capture_matcher::{CAPTURE_MATCHER, CaptureMatcherSpan},
+        gpu_types::trie::TrieNode as GpuTrieNode,
+        kernel::ContextRingUpdateKernel,
+    },
+    data_type::DataType,
+    encodable_block::{
+        batch_topology::BatchTopology, decoder::EmbeddingRows, sampling::SamplingMethod, transformer::RopeRows,
+    },
+    engine::language_model::{
+        LanguageModel,
+        state::LanguageModelState,
+        stream::{LanguageModelStreamError, LanguageModelStreamOptions},
+    },
+    trie::TrieNode,
+    utils::size_for_shape::size_for_shape,
+};
+
+enum ForwardPassChaining<B: Backend> {
+    Constant {
+        token: u64,
+        output_norm: Option<B::ScratchBuffer>,
+    },
+    InFlight(DecodingStatePending<B>),
+}
+
+impl<B: Backend> ForwardPassChaining<B> {
+    fn resolve<'a>(
+        &'a mut self,
+        tokens: &mut Vec<u64>,
+        #[cfg(grammar)] grammar: Option<&mut Grammar>,
+    ) -> Result<(u64, Option<&'a B::ScratchBuffer>), LanguageModelStreamError<B>> {
+        match self {
+            Self::Constant {
+                token,
+                output_norm,
+            } => Ok((*token, output_norm.as_ref())),
+            Self::InFlight(in_flight) => {
+                assert!(in_flight.full_accept);
+                for pending in replace(&mut in_flight.pending, Box::new([])) {
+                    pending.wait_until_completed().map_err(LanguageModelStreamError::Backend)?;
+                }
+                let output_tokens = in_flight.output_tokens.as_slice::<u32>();
+                assert_eq!(output_tokens.len(), 1);
+                let token_id = output_tokens[0] as u64;
+                let output_norm = in_flight.output_norm.take();
+                *self = Self::Constant {
+                    token: token_id,
+                    output_norm,
+                };
+                tokens.push(token_id);
+                #[cfg(grammar)]
+                if let Some(grammar) = grammar {
+                    grammar.accept_token(token_id)?;
+                }
+                let Self::Constant {
+                    output_norm,
+                    ..
+                } = self
+                else {
+                    unreachable!()
+                };
+                Ok((token_id, output_norm.as_ref()))
+            },
+        }
+    }
+
+    fn drop_output_norm(&mut self) {
+        match self {
+            Self::Constant {
+                output_norm,
+                ..
+            } => drop(output_norm.take()),
+            Self::InFlight(pending) => drop(pending.output_norm.take()),
+        }
+    }
+}
+
+struct DecodingStatePending<B: Backend> {
+    input_trie: TrieNode,
+    full_accept: bool,
+    pending: Box<[<B::CommandBuffer as CommandBuffer>::Pending]>,
+    capture_span: Option<CaptureMatcherSpan>,
+    hidden_features: Option<Box<[B::ScratchBuffer]>>,
+    output_norm: Option<B::ScratchBuffer>,
+    output_tokens: Arc<B::GlobalBuffer>,
+    _input_token_source: Option<Arc<B::GlobalBuffer>>,
+}
+
+enum DecodingState<B: Backend> {
+    Seeded {
+        seed_token: u64,
+    },
+    ForwardPassPending(DecodingStatePending<B>),
+    Accepting {
+        full: Box<[(usize, u64, u64)]>,
+        num_accepted: usize,
+        hidden_features: Option<Box<[B::ScratchBuffer]>>,
+        output_norm: Option<(B::ScratchBuffer, usize)>,
+        capture_span: Option<CaptureMatcherSpan>,
+    },
+    Halted,
+    Invalid,
+}
+
+fn prefill_chunk_parts(
+    input_chunk: &[u64],
+    last_batch: bool,
+    split_logits_row: bool,
+) -> [Option<(&[u64], bool)>; 2] {
+    if last_batch && split_logits_row && input_chunk.len() > 1 {
+        let (prompt_chunk, sample_chunk) = input_chunk.split_at(input_chunk.len() - 1);
+        [Some((prompt_chunk, false)), Some((sample_chunk, true))]
+    } else {
+        [Some((input_chunk, last_batch)), None]
+    }
+}
+
+pub struct LanguageModelStream<'a, B: Backend> {
+    model: &'a LanguageModel<B>,
+    model_state: &'a mut LanguageModelState<B>,
+    options: LanguageModelStreamOptions,
+    allocation_pool: Arc<B::AllocationPool>,
+    context_ring: Option<B::GlobalBuffer>,
+    decoding_state: DecodingState<B>,
+    metrics: TokenStreamMetrics,
+}
+
+impl<'a, B: Backend> LanguageModelStream<'a, B> {
+    pub fn new(
+        model: &'a LanguageModel<B>,
+        input: &[u64],
+        model_state: &'a mut LanguageModelState<B>,
+        options: LanguageModelStreamOptions,
+    ) -> Result<Self, LanguageModelStreamError<B>> {
+        let mut options = options;
+        if model_state.tokens.is_empty() && input.is_empty() {
+            return Err(LanguageModelStreamError::NoSeedToken);
+        };
+
+        if model_state
+            .max_context_length
+            .is_some_and(|max_context_length| model_state.tokens.len() + input.len() > max_context_length as usize)
+        {
+            return Err(LanguageModelStreamError::ContextOverflow);
+        }
+
+        let allocation_pool = model.engine.context.create_allocation_pool();
+
+        let mut context_ring = if let Some(suffix_repetition_length) =
+            options.sampling_method.suffix_repetition_length()
+        {
+            let mut context_ring = model
+                .engine
+                .context
+                .create_buffer(size_for_shape(&[2 + suffix_repetition_length], DataType::U32))
+                .map_err(LanguageModelStreamError::Backend)?;
+
+            // CortexCode patch P3: an empty window when only generated tokens are penalized.
+            let window_start = if options.penalty_window_includes_state {
+                model_state.tokens.len().saturating_sub(suffix_repetition_length as usize)
+            } else {
+                model_state.tokens.len()
+            };
+            let state_tokens_range = Range::from(window_start..model_state.tokens.len());
+
+            context_ring.copyin(
+                &once(0) // offset
+                    .chain(once(state_tokens_range.iter().len() as u64)) // length
+                    .chain(model_state.tokens[state_tokens_range].iter().copied()) // tokens
+                    .chain(repeat_n(0, suffix_repetition_length as usize - state_tokens_range.iter().len())) // pad if not full
+                    .map(|x| x as u32)
+                    .collect::<Box<[_]>>(),
+            );
+
+            Some(context_ring)
+        } else {
+            None
+        };
+
+        let mut metrics = TokenStreamMetrics::default();
+
+        // CortexCode patch P7: image embeddings and their rotary positions for this input.
+        let images = options.images.take().filter(|images| !images.images.is_empty());
+        if images.is_some() && input.is_empty() {
+            return Err(LanguageModelStreamError::Images("images need input tokens".into()));
+        }
+        let image_plan = images
+            .as_ref()
+            .map(|images| {
+                images.plan(
+                    model_state.transformer_state.context_length(),
+                    model_state.transformer_state.rope_delta(),
+                    input.len(),
+                    model.decoder.model_dim() as usize,
+                )
+            })
+            .transpose()
+            .map_err(LanguageModelStreamError::Images)?;
+
+        let decoding_state = if !input.is_empty() {
+            let _capture_span = CAPTURE_MATCHER.capture::<B>(&model.engine.context, "prefill")?;
+            model_state.last_output_token.take();
+
+            // NOTE: this is required for attention correctness (hardcoded suffix 1024). This is really bad design, attention should be rewritten to allow on-demand suffix length
+            let max_batch_size = 1024;
+            let number_of_batches = input.len().div_ceil(max_batch_size);
+
+            model_state
+                .transformer_state
+                .prepare(
+                    model_state.transformer_state.context_length() + ((number_of_batches - 1) * max_batch_size) as u32,
+                    usize::min(max_batch_size, input.len()) as u32,
+                )
+                .map_err(LanguageModelStreamError::Backend)?;
+
+            let mut command_buffer = model
+                .engine
+                .context
+                .create_command_buffer(Some("prefill"), Some(allocation_pool.clone()))
+                .map_err(LanguageModelStreamError::Backend)?;
+
+            command_buffer.debug_point(&format!(
+                "prefill at context {}, suffix {} ({} batches)",
+                model_state.transformer_state.context_length(),
+                input.len(),
+                number_of_batches
+            ));
+
+            let mut output_tokens = None;
+            let mut output_norm = None;
+            let split_logits_row = model.decoder.prefill_cache_skips_trailing_layers();
+            let hidden_feature_layer_indices =
+                model.speculator.as_ref().map(|speculator| speculator.hidden_feature_layer_indices());
+
+            // CortexCode patch P7: index of the current chunk's first row in `input`.
+            let mut chunk_offset = 0usize;
+            for (input_chunk, sample_last) in input
+                .chunks(max_batch_size)
+                .enumerate()
+                .flat_map(|(batch_idx, input_chunk)| {
+                    prefill_chunk_parts(input_chunk, batch_idx == number_of_batches - 1, split_logits_row)
+                })
+                .flatten()
+            {
+                let input_trie = TrieNode::flat(model_state.tokens.len(), input_chunk, &model_state.prng);
+                let input_flat_trie = input_trie.linearize();
+
+                let token_ids = command_buffer
+                    .allocate_constant_from_slice(
+                        &input_chunk.iter().map(|token_id| *token_id as u32).collect::<Box<[u32]>>(),
+                    )
+                    .map_err(LanguageModelStreamError::Backend)?;
+
+                let input_flat_trie_nodes = input_flat_trie.token_subtrie_ranges().collect::<Box<[GpuTrieNode]>>();
+                let batch_dim = BatchTopology::new(&input_flat_trie_nodes, true);
+
+                // CortexCode patch P7: this chunk's image rows and positions.
+                let chunk_range = chunk_offset..chunk_offset + input_chunk.len();
+                let model_dim = model.decoder.model_dim() as usize;
+                let embedding_rows = match (&images, &image_plan) {
+                    (Some(images), Some(plan)) => plan
+                        .segments
+                        .iter()
+                        .filter_map(|segment| {
+                            let start = segment.input_row.max(chunk_range.start);
+                            let end = (segment.input_row + segment.count).min(chunk_range.end);
+                            (start < end).then(|| {
+                                let image_row = segment.image_row + (start - segment.input_row);
+                                EmbeddingRows {
+                                    row: (start - chunk_range.start) as u32,
+                                    data: &images.images[segment.image].rows
+                                        [image_row * model_dim..(image_row + end - start) * model_dim],
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let rope_rows = match (&images, &image_plan) {
+                    (Some(images), Some(plan)) => Some(RopeRows {
+                        positions: &plan.positions[chunk_range.clone()],
+                        section: images.mrope_section,
+                    }),
+                    _ => None,
+                };
+                chunk_offset = chunk_range.end;
+
+                let decoder_output = model.decoder.encode(
+                    &token_ids,
+                    &batch_dim,
+                    sample_last.then(|| (input_chunk.len() as u32 - 1..input_chunk.len() as u32).into()),
+                    hidden_feature_layer_indices,
+                    &mut model_state.transformer_state,
+                    &embedding_rows,
+                    rope_rows,
+                    &mut command_buffer,
+                )?;
+                let logits = decoder_output.logits;
+
+                if sample_last {
+                    let logits = logits.unwrap();
+
+                    let seeds = if matches!(options.sampling_method, SamplingMethod::Stochastic { .. }) {
+                        Some(
+                            command_buffer
+                                .allocate_constant_from_slice(&[model_state
+                                    .prng
+                                    .derive((model_state.tokens.len() + input_chunk.len() - 1) as u64)])
+                                .map_err(LanguageModelStreamError::Backend)?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    #[cfg(grammar)]
+                    let bitmask = if let Some(grammar) = options.grammar.as_mut() {
+                        let mut bitmask = command_buffer
+                            .allocate_constant(
+                                model.vocab_size.div_ceil(DataType::U32.size_in_bits()) * DataType::U32.size_in_bytes(),
+                            )
+                            .map_err(LanguageModelStreamError::Backend)?;
+
+                        if grammar.next_bitmask(bitmask.as_slice_mut()) {
+                            Some(bitmask)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    #[cfg(not(grammar))]
+                    let bitmask = None::<B::ConstantBuffer>;
+
+                    output_norm = decoder_output.final_hidden;
+                    let sampled_row = batch_dim.size() - 1;
+                    output_tokens = Some(
+                        model
+                            .sampling
+                            .encode(
+                                &logits,
+                                seeds.as_ref(),
+                                bitmask.as_ref(),
+                                context_ring.as_ref(),
+                                Some(&token_ids),
+                                &batch_dim,
+                                (sampled_row..sampled_row + 1).into(),
+                                &options.sampling_method,
+                                &mut command_buffer,
+                            )
+                            .map_err(LanguageModelStreamError::Backend)?,
+                    );
+                }
+
+                model_state
+                    .transformer_state
+                    .encode_accept(&(0..input_chunk.len() as u32).collect::<Box<[u32]>>(), &mut command_buffer)
+                    .map_err(LanguageModelStreamError::Backend)?;
+
+                if let Some(speculator) = model.speculator.as_ref() {
+                    let speculator_state = model_state.speculator_state.as_mut().unwrap();
+                    speculator.encode_accept(
+                        speculator_state,
+                        decoder_output.hidden_features.as_ref().unwrap().iter(),
+                        &(0..input_chunk.len() as u32).collect::<Box<[u32]>>(),
+                        &mut command_buffer,
+                    )?;
+                }
+
+                if let Some(suffix_repetition_length) = options.sampling_method.suffix_repetition_length() {
+                    model.context_ring_update.encode(
+                        &token_ids,
+                        context_ring.as_mut().unwrap(),
+                        suffix_repetition_length,
+                        input_chunk.len() as u32,
+                        &mut command_buffer,
+                    );
+                }
+
+                model_state.tokens.extend(input_chunk);
+            }
+
+            // CortexCode patch P7: text after this input continues at the shifted position.
+            if let Some(plan) = &image_plan {
+                model_state.transformer_state.set_rope_delta(plan.rope_delta_after);
+            }
+
+            let pending = Box::new([command_buffer.end_encoding().submit()]);
+
+            metrics.num_prefill_forward_passes += 1;
+            metrics.num_tokens_prefilled += input.len();
+            metrics.num_tokens_proposed += 1;
+            metrics.num_tokens_accepted += 1;
+
+            DecodingState::ForwardPassPending(DecodingStatePending {
+                input_trie: TrieNode::new(0, 0, 0.0),
+                full_accept: true,
+                pending,
+                capture_span: None,
+                hidden_features: None,
+                output_norm,
+                output_tokens: Arc::new(output_tokens.unwrap()),
+                _input_token_source: None,
+            })
+        } else {
+            // TODO: this leaks previous LanguageModelStreamOptions
+            DecodingState::Seeded {
+                seed_token: model_state.last_output_token.take().unwrap(),
+            }
+        };
+
+        Ok(LanguageModelStream {
+            model,
+            model_state,
+            options,
+            allocation_pool,
+            context_ring,
+            decoding_state,
+            metrics,
+        })
+    }
+
+    fn generate(&mut self) -> Result<Option<u64>, LanguageModelStreamError<B>> {
+        let (mut prev_output, acceptance): (
+            ForwardPassChaining<B>,
+            Option<(<B::CommandBuffer as CommandBuffer>::Encoding, Option<CaptureMatcherSpan>)>,
+        ) = match replace(&mut self.decoding_state, DecodingState::Invalid) {
+            DecodingState::Seeded {
+                seed_token,
+            } => {
+                self.model_state.tokens.push(seed_token);
+                #[cfg(grammar)]
+                if let Some(grammar) = self.options.grammar.as_mut() {
+                    let _ = grammar.accept_token(seed_token); // TODO: this should not be ignored
+                }
+                self.metrics.num_tokens_returned += 1;
+                (
+                    ForwardPassChaining::Constant {
+                        token: seed_token,
+                        output_norm: None,
+                    },
+                    None,
+                )
+            },
+            DecodingState::ForwardPassPending(forward_pass_pending) => {
+                if forward_pass_pending.full_accept {
+                    self.metrics.num_tokens_returned += 1;
+                    (ForwardPassChaining::InFlight(forward_pass_pending), None)
+                } else {
+                    for pending in forward_pass_pending.pending {
+                        pending.wait_until_completed().map_err(LanguageModelStreamError::Backend)?;
+                    }
+                    let sampled_tokens = forward_pass_pending
+                        .output_tokens
+                        .as_slice::<u32>()
+                        .iter()
+                        .map(|x| *x as u64)
+                        .collect::<Box<[u64]>>();
+                    let flat_trie = forward_pass_pending.input_trie.linearize();
+                    let full = flat_trie.accept(
+                        &sampled_tokens,
+                        #[cfg(grammar)]
+                        self.options.grammar.as_mut(),
+                    )?;
+                    let output_norm = forward_pass_pending.output_norm.map(|norm| {
+                        let row_bytes = norm.size() / flat_trie.len();
+                        (norm, row_bytes)
+                    });
+                    self.metrics.num_tokens_accepted += full.len();
+                    self.decoding_state = DecodingState::Accepting {
+                        full,
+                        num_accepted: 0,
+                        hidden_features: forward_pass_pending.hidden_features,
+                        output_norm,
+                        capture_span: forward_pass_pending.capture_span,
+                    };
+                    return self.generate();
+                }
+            },
+            DecodingState::Accepting {
+                full,
+                num_accepted,
+                hidden_features,
+                output_norm,
+                capture_span,
+            } => {
+                let output_token_id = full[num_accepted].2;
+
+                self.metrics.num_tokens_returned += 1;
+
+                if num_accepted < full.len() - 1 {
+                    self.decoding_state = DecodingState::Accepting {
+                        full,
+                        num_accepted: num_accepted + 1,
+                        hidden_features,
+                        output_norm,
+                        capture_span,
+                    };
+                    return Ok(Some(output_token_id));
+                } else {
+                    let accepted_token_indicies = full.iter().map(|(i, _, _)| *i as u32).collect::<Box<[u32]>>();
+                    let accepted_input_token_ids = full.iter().map(|(_, t, _)| *t).collect::<Box<[u64]>>();
+                    let accepted_output_token_ids = full.iter().map(|(_, _, t)| *t).collect::<Box<[u64]>>();
+                    let mut command_buffer = self
+                        .model
+                        .engine
+                        .context
+                        .create_command_buffer(
+                            Some(&format!("decode {} (accept)", self.metrics.num_decode_forward_passes - 1)),
+                            Some(self.allocation_pool.clone()),
+                        )
+                        .map_err(LanguageModelStreamError::Backend)?;
+                    self.model_state
+                        .transformer_state
+                        .encode_accept(&accepted_token_indicies, &mut command_buffer)
+                        .map_err(LanguageModelStreamError::Backend)?;
+                    if let Some(speculator) = self.model.speculator.as_ref() {
+                        speculator.encode_accept(
+                            self.model_state.speculator_state.as_mut().unwrap(),
+                            hidden_features.as_ref().unwrap().iter(),
+                            &accepted_token_indicies,
+                            &mut command_buffer,
+                        )?;
+                    }
+                    let output_norm = if let Some((final_hidden, row_bytes)) = output_norm {
+                        let row = full.last().unwrap().0;
+                        let mut norm =
+                            command_buffer.allocate_scratch(row_bytes).map_err(LanguageModelStreamError::Backend)?;
+                        command_buffer
+                            .encode_copy(final_hidden.subrange(row * row_bytes..(row + 1) * row_bytes), &mut norm);
+                        Some(norm)
+                    } else {
+                        None
+                    };
+                    if let Some(suffix_repetition_length) = self.options.sampling_method.suffix_repetition_length() {
+                        let accepted_input_token_ids_const = command_buffer
+                            .allocate_constant_from_slice(
+                                &accepted_input_token_ids
+                                    .iter()
+                                    .map(|token_id| *token_id as u32)
+                                    .collect::<Box<[u32]>>(),
+                            )
+                            .map_err(LanguageModelStreamError::Backend)?;
+                        self.model.context_ring_update.encode(
+                            &accepted_input_token_ids_const,
+                            self.context_ring.as_mut().unwrap(),
+                            suffix_repetition_length,
+                            full.len() as u32,
+                            &mut command_buffer,
+                        );
+                    }
+                    self.model_state.tokens.extend(accepted_output_token_ids);
+                    (
+                        ForwardPassChaining::Constant {
+                            token: output_token_id,
+                            output_norm,
+                        },
+                        Some((command_buffer, capture_span)),
+                    )
+                }
+            },
+            DecodingState::Halted => return Ok(None),
+            DecodingState::Invalid => unreachable!(),
+        };
+
+        let context_length = self.model_state.transformer_state.context_length();
+
+        if self.model_state.max_context_length.is_some_and(|max_context_length| context_length >= max_context_length) {
+            self.decoding_state = DecodingState::Halted;
+            return Ok(Some(
+                prev_output
+                    .resolve(
+                        &mut self.model_state.tokens,
+                        #[cfg(grammar)]
+                        self.options.grammar.as_mut(),
+                    )?
+                    .0,
+            ));
+        }
+
+        let mut pending = Vec::new();
+        if let Some((accept_command_buffer, _capture_span)) = acceptance {
+            pending.push(accept_command_buffer.end_encoding().submit());
+        }
+
+        let mut capture_span = CAPTURE_MATCHER
+            .capture::<B>(&self.model.engine.context, &format!("decode:{}", self.metrics.num_decode_forward_passes))?;
+
+        let (input_trie, chain_copy, full_accept) = if let Some(speculator) = &self.model.speculator
+            && self.options.speculation
+            && let Some(shape) = speculator.make_shape(
+                self.model_state.max_context_length.map(|max_context_length| max_context_length - context_length),
+                &self.options.sampling_method,
+            )
+            && let (root_token, Some(output_norm)) = prev_output.resolve(
+                &mut self.model_state.tokens,
+                #[cfg(grammar)]
+                self.options.grammar.as_mut(),
+            )? {
+            let trie = speculator.propose_tree(
+                self.model_state.speculator_state.as_mut().unwrap(),
+                output_norm,
+                root_token as u32,
+                self.model.decoder.embedding(),
+                shape,
+                #[cfg(grammar)]
+                self.options.grammar.as_mut(),
+                &self.model_state.prng,
+                self.allocation_pool.clone(),
+                Some(&format!("decode {} (speculate)", self.metrics.num_decode_forward_passes)),
+            )?;
+            prev_output.drop_output_norm();
+            (trie, None, false)
+        } else {
+            prev_output.drop_output_norm();
+            let (token, chain_copy) = match &prev_output {
+                ForwardPassChaining::Constant {
+                    token,
+                    ..
+                } => (*token, None),
+                ForwardPassChaining::InFlight(pending) => (0, Some(pending.output_tokens.clone())),
+            };
+            (TrieNode::new(token, self.model_state.prng.derive(context_length as u64), 0.0), chain_copy, true)
+        };
+        let input_flat_trie = input_trie.linearize();
+
+        self.allocation_pool = self.model.engine.context.create_allocation_pool();
+
+        let mut command_buffer = self
+            .model
+            .engine
+            .context
+            .create_command_buffer(
+                Some(&format!("decode {} (forward)", self.metrics.num_decode_forward_passes)),
+                Some(self.allocation_pool.clone()),
+            )
+            .map_err(LanguageModelStreamError::Backend)?;
+
+        command_buffer.debug_point(&format!(
+            "decode round {} at context {} suffix {}",
+            self.metrics.num_decode_forward_passes,
+            context_length,
+            input_flat_trie.len()
+        ));
+
+        let scratch_token_ids;
+        let mut constant_token_ids = None;
+        let token_ids: &dyn Buffer<Backend = B> = if let Some(chain_copy) = chain_copy.as_deref() {
+            let mut token_ids = command_buffer
+                .allocate_scratch(DataType::U32.size_in_bytes())
+                .map_err(LanguageModelStreamError::Backend)?;
+            command_buffer.encode_copy(chain_copy, &mut token_ids);
+            scratch_token_ids = token_ids;
+            &scratch_token_ids
+        } else {
+            constant_token_ids.insert(
+                command_buffer
+                    .allocate_constant_from_slice(
+                        &input_flat_trie.token_ids().map(|token_id| token_id as u32).collect::<Box<[u32]>>(),
+                    )
+                    .map_err(LanguageModelStreamError::Backend)?,
+            )
+        };
+
+        let input_flat_trie_nodes = input_flat_trie.token_subtrie_ranges().collect::<Box<[GpuTrieNode]>>();
+        let batch_dim = BatchTopology::new(&input_flat_trie_nodes, full_accept);
+
+        self.model_state
+            .transformer_state
+            .prepare(self.model_state.transformer_state.context_length(), batch_dim.size())
+            .map_err(LanguageModelStreamError::Backend)?;
+
+        let hidden_feature_layer_indices =
+            self.model.speculator.as_ref().map(|speculator| speculator.hidden_feature_layer_indices());
+
+        let decoder_output = self.model.decoder.encode(
+            token_ids,
+            &batch_dim,
+            Some((0..batch_dim.size()).into()),
+            hidden_feature_layer_indices,
+            &mut self.model_state.transformer_state,
+            &[],
+            None,
+            &mut command_buffer,
+        )?;
+        let logits = decoder_output.logits.unwrap();
+
+        #[cfg(grammar)]
+        let (bitmask, mut command_buffer) = if let Some(grammar) = self.options.grammar.as_mut() {
+            if chain_copy.is_some() {
+                pending.push(command_buffer.end_encoding().submit());
+
+                let mut command_buffer = self
+                    .model
+                    .engine
+                    .context
+                    .create_command_buffer(
+                        Some(&format!("decode {} (sample and accept)", self.metrics.num_decode_forward_passes)),
+                        Some(self.allocation_pool.clone()),
+                    )
+                    .map_err(LanguageModelStreamError::Backend)?;
+
+                let mut bitmask = command_buffer
+                    .allocate_constant(
+                        self.model.vocab_size.div_ceil(DataType::U32.size_in_bits()) * DataType::U32.size_in_bytes(),
+                    )
+                    .map_err(LanguageModelStreamError::Backend)?;
+
+                prev_output.resolve(&mut self.model_state.tokens, Some(grammar))?;
+                if grammar.next_bitmask(bitmask.as_slice_mut()) {
+                    (Some(bitmask), command_buffer)
+                } else {
+                    (None, command_buffer)
+                }
+            } else {
+                let mut bitmasks = command_buffer
+                    .allocate_constant(
+                        input_flat_trie.len()
+                            * self.model.vocab_size.div_ceil(DataType::U32.size_in_bits())
+                            * DataType::U32.size_in_bytes(),
+                    )
+                    .map_err(LanguageModelStreamError::Backend)?;
+
+                if input_flat_trie.fill_bitmasks(bitmasks.as_slice_mut(), self.model.vocab_size, grammar) {
+                    (Some(bitmasks), command_buffer)
+                } else {
+                    (None, command_buffer)
+                }
+            }
+        } else {
+            (None, command_buffer)
+        };
+        #[cfg(not(grammar))]
+        let bitmask = None::<B::ConstantBuffer>;
+
+        let seeds = if matches!(self.options.sampling_method, SamplingMethod::Stochastic { .. }) {
+            Some(
+                command_buffer
+                    .allocate_constant_from_slice(&input_flat_trie.token_seeds().collect::<Box<[u64]>>())
+                    .map_err(LanguageModelStreamError::Backend)?,
+            )
+        } else {
+            None
+        };
+
+        let output_tokens = self
+            .model
+            .sampling
+            .encode(
+                &logits,
+                seeds.as_ref(),
+                bitmask.as_ref(),
+                self.context_ring.as_ref(),
+                Some(token_ids),
+                &batch_dim,
+                (0..batch_dim.size()).into(),
+                &self.options.sampling_method,
+                &mut command_buffer,
+            )
+            .map_err(LanguageModelStreamError::Backend)?;
+
+        drop(seeds);
+        drop(bitmask);
+        drop(logits);
+
+        if full_accept {
+            self.model_state
+                .transformer_state
+                .encode_accept(&(0..batch_dim.size()).collect::<Box<[u32]>>(), &mut command_buffer)
+                .map_err(LanguageModelStreamError::Backend)?;
+
+            if let Some(speculator) = self.model.speculator.as_ref() {
+                let speculator_state = self.model_state.speculator_state.as_mut().unwrap();
+                speculator.encode_accept(
+                    speculator_state,
+                    decoder_output.hidden_features.as_ref().unwrap().iter(),
+                    &(0..batch_dim.size()).collect::<Box<[u32]>>(),
+                    &mut command_buffer,
+                )?;
+            }
+
+            if let Some(suffix_repetition_length) = self.options.sampling_method.suffix_repetition_length() {
+                self.model.context_ring_update.encode(
+                    token_ids,
+                    self.context_ring.as_mut().unwrap(),
+                    suffix_repetition_length,
+                    batch_dim.size(),
+                    &mut command_buffer,
+                );
+            }
+        }
+
+        drop(constant_token_ids);
+        pending.push(command_buffer.end_encoding().submit());
+
+        if full_accept {
+            capture_span.take();
+        }
+
+        self.metrics.num_decode_forward_passes += 1;
+        self.metrics.num_tokens_proposed += input_flat_trie.len();
+        if full_accept {
+            self.metrics.num_tokens_accepted += input_flat_trie.len();
+        }
+
+        self.decoding_state = DecodingState::ForwardPassPending(DecodingStatePending {
+            input_trie,
+            full_accept,
+            pending: pending.into_boxed_slice(),
+            capture_span,
+            hidden_features: if full_accept {
+                None
+            } else {
+                decoder_output.hidden_features
+            },
+            output_norm: decoder_output.final_hidden,
+            output_tokens: Arc::new(output_tokens),
+            _input_token_source: chain_copy,
+        });
+
+        Ok(Some(
+            prev_output
+                .resolve(
+                    &mut self.model_state.tokens,
+                    #[cfg(grammar)]
+                    self.options.grammar.as_mut(),
+                )?
+                .0,
+        ))
+    }
+
+    pub fn metrics(&self) -> &TokenStreamMetrics {
+        &self.metrics
+    }
+}
+
+impl<'a, B: Backend> Iterator for LanguageModelStream<'a, B> {
+    type Item = Result<u64, LanguageModelStreamError<B>>;
+
+    fn next(&mut self) -> Option<Result<u64, LanguageModelStreamError<B>>> {
+        self.generate().transpose()
+    }
+}
+
+impl<'a, B: Backend> Drop for LanguageModelStream<'a, B> {
+    fn drop(&mut self) {
+        let last_output_token = match replace(&mut self.decoding_state, DecodingState::Invalid) {
+            DecodingState::Seeded {
+                seed_token,
+            } => Some(seed_token),
+            DecodingState::ForwardPassPending(in_flight) => {
+                for pending in in_flight.pending {
+                    pending.wait_until_completed().unwrap();
+                }
+
+                if !in_flight.full_accept {
+                    let mut command_buffer = self
+                        .model
+                        .engine
+                        .context
+                        .create_command_buffer(
+                            Some(&format!("decode {} (accept on drop)", self.metrics.num_decode_forward_passes - 1)),
+                            Some(self.allocation_pool.clone()),
+                        )
+                        .unwrap();
+                    self.model_state.transformer_state.encode_accept(&[0], &mut command_buffer).unwrap();
+                    if let Some(speculator) = self.model.speculator.as_ref() {
+                        speculator
+                            .encode_accept(
+                                self.model_state.speculator_state.as_mut().unwrap(),
+                                in_flight.hidden_features.as_ref().unwrap().iter(),
+                                &[0],
+                                &mut command_buffer,
+                            )
+                            .unwrap();
+                    }
+                    command_buffer.end_encoding().submit().wait_until_completed().unwrap();
+                }
+
+                Some(in_flight.output_tokens.as_slice::<u32>()[0] as u64)
+            },
+            DecodingState::Accepting {
+                full,
+                num_accepted,
+                hidden_features,
+                output_norm: _,
+                capture_span,
+            } => {
+                assert!(num_accepted > 0 && num_accepted < full.len());
+
+                let mut command_buffer = self
+                    .model
+                    .engine
+                    .context
+                    .create_command_buffer(
+                        Some(&format!("decode {} (accept on drop)", self.metrics.num_decode_forward_passes - 1)),
+                        Some(self.allocation_pool.clone()),
+                    )
+                    .unwrap();
+                let accepted_token_indicies =
+                    full.iter().take(num_accepted + 1).map(|(i, _, _)| *i as u32).collect::<Box<[u32]>>();
+                self.model_state
+                    .transformer_state
+                    .encode_accept(&accepted_token_indicies, &mut command_buffer)
+                    .unwrap();
+                if let Some(speculator) = self.model.speculator.as_ref() {
+                    speculator
+                        .encode_accept(
+                            self.model_state.speculator_state.as_mut().unwrap(),
+                            hidden_features.as_ref().unwrap().iter(),
+                            &accepted_token_indicies,
+                            &mut command_buffer,
+                        )
+                        .unwrap();
+                }
+                command_buffer.end_encoding().submit().wait_until_completed().unwrap();
+
+                drop(capture_span);
+
+                self.model_state.tokens.extend(full.iter().take(num_accepted).map(|(_, _, t)| *t));
+
+                Some(full[num_accepted].2)
+            },
+            DecodingState::Halted => None,
+            DecodingState::Invalid => None, // TODO: proper error handling
+        };
+
+        self.model_state.last_output_token = last_output_token;
+    }
+}

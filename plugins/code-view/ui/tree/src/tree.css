@@ -1,0 +1,22 @@
+/* code.tree@1 — a ruled column: filter and switch on top, rows below with counts aligned right. */
+#cc .cx-tree-view{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-tree-bar{display:flex;flex-direction:column;gap:8px;padding:8px 12px;border-bottom:1px solid var(--rule);}
+#cc .cx-tree-bar .seg-set{align-self:flex-start;}
+#cc .cx-tree-scroll{flex:1;min-height:0;overflow:auto;padding:4px 0 24px;}
+#cc .cx-pad{padding:8px 12px;}
+#cc .cx-tree,#cc .cx-tree ul{list-style:none;margin:0;padding:0;}
+#cc .cx-tree li{position:relative;}
+#cc .cx-tree li.sel>.cx-row{background:var(--rubric-wash);}
+#cc .cx-tree li.sel::before{content:"";position:absolute;left:0;top:4px;bottom:4px;width:4px;border:1px solid var(--rubric-deep);border-right:0;}
+#cc .cx-row{
+  width:100%;display:flex;align-items:center;gap:8px;min-width:0;padding-top:4px;padding-bottom:4px;padding-right:12px;
+  border:0;background:transparent;text-align:left;cursor:pointer;color:var(--ink-2);
+}
+#cc .cx-row:hover{background:var(--rubric-wash);color:var(--ink);}
+#cc .cx-row .nm{font-family:var(--font-mono);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
+#cc .cx-row.dir .nm{color:var(--ink);}
+#cc .cx-row .nm.gone{text-decoration:line-through;text-decoration-color:var(--rubric-deep);color:var(--ink-3);}
+#cc .cx-lang{flex:0 0 32px;font-size:8px;letter-spacing:.08em;}
+#cc .cx-also{white-space:nowrap;font-size:8.5px;}
+#cc .cx-counts{display:inline-flex;gap:4px;flex:0 0 auto;justify-content:flex-end;}
+#cc .cx-caret{width:8px;height:8px;flex:0 0 auto;color:var(--ink-3);}
