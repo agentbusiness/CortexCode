@@ -16,6 +16,10 @@
 
 ---
 
+<p align="center">
+  <img src="assets/screenshot.webp" alt="CortexCode: a planned task carried out step by step, with edits, checks and the model's live status" width="100%" />
+</p>
+
 ## Why CortexCode
 
 Most coding agents are built for frontier cloud models and then "also support" local ones. A small
