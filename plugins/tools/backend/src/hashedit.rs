@@ -8,7 +8,10 @@
 //!   of those edits (a line that the session did not touch keeps its identity);
 //! - if both interpretations exist and disagree, the anchor is ambiguous and the batch is rejected.
 //!
-//! Any stale, ambiguous or overlapping anchor rejects the whole batch; nothing is written.
+//! An anchor that no longer names its line (stale, ambiguous, or a bare number after a change) skips
+//! only its own operation: the others are applied, and the result names each skipped one with the
+//! lines around it as they now are (seen: six good edits lost to one stale anchor). A malformed
+//! batch (a bad range, overlapping operations) or one with nothing left to apply is rejected whole.
 
 use crate::doc::{Doc, text_to_lines};
 use cc_protocol::hashline::{self, Anchor};
@@ -144,6 +147,9 @@ pub struct Applied {
     pub relocations: Vec<String>,
     pub added: usize,
     pub removed: usize,
+    /// The operations not applied (their anchors no longer named their lines), said with the lines
+    /// around each in the new file and fresh anchors; empty when every operation was applied.
+    pub skipped: String,
 }
 
 enum Resolved {
@@ -293,7 +299,10 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
         }
     }
 
-    if !problems.is_empty() {
+    // Only anchor problems (a line that moved or changed) skip their own operation; anything else,
+    // or nothing left to apply, rejects the batch.
+    let anchor_only = problems.iter().all(|problem| matches!(problem, Problem::Stale { .. } | Problem::Ambiguous { .. } | Problem::BareWithoutView { .. }));
+    if !problems.is_empty() && (!anchor_only || planned.is_empty()) {
         return Err(reject(doc, problems, ops.len() > 1));
     }
 
@@ -352,7 +361,52 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
         old += 1;
     }
     let new_doc = doc.rebuild(entries);
-    Ok(Applied { doc: new_doc, changed, line_map, relocations, added, removed })
+    let skipped = if problems.is_empty() { String::new() } else { skipped_text(&new_doc, &line_map, &problems, ops.len() > 1) };
+    Ok(Applied { doc: new_doc, changed, line_map, relocations, added, removed, skipped })
+}
+
+/// The operations a partly applied batch skipped, each with the lines around its anchor as they now
+/// are (after the applied ones), and the step: send those again.
+fn skipped_text(new_doc: &Doc, line_map: &[Option<usize>], problems: &[Problem], several: bool) -> String {
+    let label = |op: usize| if several { format!("edit #{}: ", op + 1) } else { String::new() };
+    // A line of the old file, where it is now (or the nearest kept line before it).
+    let now = |line: usize| -> usize {
+        let old = line.saturating_sub(1).min(line_map.len().saturating_sub(1));
+        (0..=old).rev().find_map(|index| line_map.get(index).copied().flatten()).map(|index| index + 1).unwrap_or(1)
+    };
+    let mut lines = Vec::new();
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for problem in problems {
+        let (op, why, line) = match problem {
+            Problem::Stale { op, anchor, line } => (*op, format!("anchor {anchor} is stale"), *line),
+            Problem::Ambiguous { op, anchor, direct, .. } => (*op, format!("anchor {anchor} is ambiguous"), *direct),
+            Problem::BareWithoutView { op, line } => (*op, format!("line number {line} cannot be used (the file changed)"), *line),
+            _ => continue,
+        };
+        lines.push(format!("{}{why}", label(op)));
+        let at = now(line);
+        regions.push((at.saturating_sub(3).max(1), (at + 3).min(new_doc.len())));
+    }
+    let mut text = format!("Not applied (the other edits were written):\n{}", lines.iter().map(|line| format!("- {line}.\n")).collect::<String>());
+    regions.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in regions.into_iter().filter(|(start, end)| start <= end) {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    if !merged.is_empty() {
+        text.push_str("The lines there now:\n");
+    }
+    for (index, (start, end)) in merged.iter().enumerate() {
+        if index > 0 {
+            text.push_str("...\n");
+        }
+        text.push_str(&new_doc.render(*start, *end));
+    }
+    text.push_str("Send those edits again with these anchors.\n");
+    text
 }
 
 /// What was wrong, the current lines around it (with fresh anchors), and the step: send the edit

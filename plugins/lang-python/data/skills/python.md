@@ -2,25 +2,30 @@ Python here: get it right, run and test it, code that runs, common errors and th
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the task statement and the code (signatures, stubs, tests).
+1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, docstrings), its tests, docs and callers.
    - Per function: what it takes, returns and raises.
-   - The statement decides, never the name. "whether" returns a bool. "find" may return `None`. "compute X" returns X, not whether X exists.
-   - When there may be no answer (nothing found, no valid result) and the statement does not name a value for that case, return `None`: it is Python's "no result". Not `False`, `-1` or `[]`, and not a value remembered from elsewhere.
+   - The request and the project decide, never a name alone. "whether" returns a bool. "find" may return `None`. "compute X" returns X, not whether X exists.
+   - When there may be no answer and nothing names a value for that case, do what the project already does (`None`, an exception, an empty result); in new code `None` is Python's "no result", not `False` or `-1`.
    - Keep existing names and signatures.
-2. **Before coding, turn the statement into cases** for the check script (section 2).
-   - Each sentence that states a behaviour, value, error or limit is one case. A shown requirement list is that list.
-   - A sentence with no case is a requirement you will miss.
-   - Unsure of a domain, format or protocol? With the research plugin, learn its rules and copy them into the cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that states them.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+2. **Before coding, note the request's examples: they are the check, their values copied, never computed.**
+   - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
+   - Unsure of a domain, format or protocol? Look it up: the research plugin, the docs, how others solved it:
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 3. **Write whole functions, in slices.**
-   - First the simplest complete path (one case, input to result). Run the check script.
-   - Add the next behaviour the statement names. Run again after every change.
-   - New file, or a stub you have not changed yet: send it whole once with `edit` `content`. After that: anchored `edits` only, every change in one call (a second whole write is refused).
-   - Rewrite a function: replace its whole `def` block, `def` line to last line. Never leave part of the old body.
-4. **Run the project's tests** (section 2). Fix the first failure's cause, run again. Change only the code that failure runs through: a function whose cases pass stays as it is unless the task asks to change it.
-5. **Before you finish**, check each requirement against the code, including the named errors (type and message).
+   - First the simplest complete path (one case, input to result). Run the tests.
+   - Add the next behaviour. Run again after every change.
+   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - Change a function: replace it from its `def` line to its last line. Never leave part of the old body.
+4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests (section 2); fix the first failure's cause, run again.
+5. **Before you finish**, check each requirement against the code, including the errors the request or the project names (type and message).
 
-A check disagrees with the statement: the statement wins. Fix the code, name the wrong check.
+**How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
+- Returning a stored list, dict or object hands out the object itself: the caller can change it. Return a copy (`list(x)`, `dict(x)`, `copy.copy(x)`) when it must not.
+- A fixed record: `@dataclass` (`frozen=True` when it must not change). A state with several values: `enum.Enum`, not flags that can conflict.
+- Shared between threads: a `threading.Lock` held around every change, or a `queue.Queue` between them.
+- Containers: `dict` for lookup, `list` for order, `collections.deque` for both ends, `heapq` for smallest first, `set` for uniqueness.
+- Standard building blocks first: `collections`, `itertools`, `functools`, `heapq`, `bisect`, `datetime`, `json`, `re`, before writing your own.
 
 ## 2. Run, test, check
 
@@ -35,43 +40,28 @@ python -m pytest "tests/test_mod.py::test_x" -q  # one test
 python -m unittest -q tests.test_mod             # a project without pytest
 ```
 
-- pytest missing: `python -m pip install pytest` (offline: `uv pip install --offline pytest`), or use `python -m unittest`.
-- Never install into the system Python, never `sudo`, never create another venv.
-- Project's own package not found: `python -m pip install -e .` (offline: `uv pip install --offline -e .`), or prefix the command with `PYTHONPATH=src` for a `src/` layout.
+- pytest missing: `python -m pip install pytest` (into the session's venv), or use `python -m unittest`.
+- Never install into the system Python, never `sudo`. An install outside the venv changes the user's machine: ask first (`permission`).
+- Project's own package not found: `python -m pip install -e .`, or prefix the command with `PYTHONPATH=src` for a `src/` layout.
 - CI files (`.github/workflows/*.yml`, `Makefile`) show the project's exact test command.
 
-**Checking your work.** One file, `check.py`, beside the code. Edit it; never re-send it as a heredoc.
-- Build inputs in code, never by hand.
-- Copy expected values from the statement, never work them out yourself.
-- Print one line per case, no asserts: one run shows every case.
-
-```python
-from mymodule import solve
-
-cases = [                      # (input built in code, result copied from the statement)
-    ([3, 1, 2], [1, 2, 3]),
-    (list(range(5)) * 2, list(range(5)) * 2),
-]
-for given, want in cases:
-    try:
-        got = solve(given)
-    except Exception as error:
-        got = f"{type(error).__name__}: {error}"
-    print("ok " if got == want else "BAD", given, "->", got, "want", want)
-```
-
-Run `python check.py`. Fix the first `BAD`, run again.
-- After any fix, run every case again, passing ones too. One fix can break another case.
-- A case fails: check the case before the code. Re-derive it from the statement. A case that breaks a stated rule or holds a value you computed is bad: fix it first.
-- Keep the file while the work can change. Delete it when the user is done.
+**Checking your work.**
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/test_<module>.py` with the standard `unittest` (no install), run with `python -m unittest discover -s tests`; they stay in the project.
+2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
+3. Build a long input in code from its parts, never typed out: `[0] * 18`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+4. Each check shows what the code returned when it fails: `assert got == want, got`.
+5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
+6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
+7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
+8. A one-off try (call a function, print a value) goes in `tmp/probe.py`, run with `python tmp/probe.py`; git ignores `tmp/`.
 
 ## 3. Code that runs
 
-Raise the exact type and message the statement names:
+Raise the type and message the request or the project's API names:
 
 ```python
 raise ValueError("width must be positive")   # good
-raise Exception("bad input")                 # bad: a test expecting ValueError fails
+raise Exception("bad input")                 # bad: callers cannot tell it apart from other errors
 ```
 
 Return values, never print them:

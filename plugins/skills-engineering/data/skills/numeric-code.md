@@ -4,7 +4,7 @@ Do the steps in order.
 
 ## 1. Expected values come from a run, never from your head
 
-- Every expected number in a check comes from the statement, or from running a second, plain way to compute it:
+- Every expected number in a test comes from the request or the project's docs, or from running a second, plain way to compute it:
 
 ```bash
 python3 -c 'from fractions import Fraction as F; print(F(1, 3) + F(1, 6))'
@@ -64,4 +64,4 @@ python3 -c 'from decimal import Decimal as D; print(D("19.99") * 3)'
 
 ## 7. Before you finish
 
-Run the check with zero, one, negative values, the largest values the statement allows, and inputs that make a divisor zero.
+Run the tests with zero, one, negative values, the largest values the code must handle, and inputs that make a divisor zero.

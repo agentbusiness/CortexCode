@@ -1,0 +1,58 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages and README together, separable into its own repository (only cc-protocol and
+# @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it into a portable
+# .ccplugin; the frame runs it only as an installed package. Paths are relative to this folder.
+
+[plugin]
+id = "model-bonsai"
+name = "Model (Bonsai)"
+version = "0.1.0"
+description = "Ternary Bonsai 2 27B (PrismML's ternary Qwen3.8-27B, PQ2_0, 7.2 GB) in-process on PrismML's llama.cpp with Metal: the model engine for Macs with 24 GB of memory or less."
+license = "UNLICENSED"
+platforms = ["macos"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace, the
+# vendored PrismML llama.cpp under backend/vendor, built by CMake from backend/build.rs).
+[backend]
+category = "model"
+contract = "model@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-model-bonsai"
+hello_timeout_ms = 60000
+probe_timeout_ms = 600000
+
+[backend.config]
+variant = "bonsai2-27b-pq2"
+
+# The machines this engine is the default for (the frame picks it when the person chose none):
+# 24 GiB is what a 24 GB Mac reports as its memory.
+[backend.machine]
+max_memory_bytes = 25769803776
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui/card-model"
+id = "model-bonsai.card-model"
+slot = "card.model@1"
+
+[[ui.package]]
+dir = "ui/settings-model"
+id = "model-bonsai.settings-model"
+slot = "settings.model@1"
+
+# What building this plugin's code needs on a Mac: code editing is offered only when all of it
+# is present (data editing always is). CMake builds the vendored llama.cpp; its Metal kernels are
+# compiled at run time, so no Xcode Metal compiler is needed.
+[build]
+needs = ["rust", "apple-clt"]
+
+# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
+[source]
+repo = "cortexcode"
+subdir = "plugins/model-bonsai"

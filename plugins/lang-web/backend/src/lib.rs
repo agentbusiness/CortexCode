@@ -106,21 +106,21 @@ impl LanguagePack for WebPack {
         }
     }
 
-    /// The project's own html-validate and stylelint, never downloaded (`npx --no --offline`):
+    /// The project's own html-validate and stylelint, never downloaded (`npx --no`):
     /// html-validate when it is installed in the project, stylelint when the project configures it.
     fn verifiers(&self) -> Vec<Verifier> {
         vec![
             Verifier {
             files: Vec::new(),                name: "html-validate".into(),
                 kind: "lint".into(),
-                command: strings(&["npx", "--no", "--offline", "--", "html-validate", "{files}"]),
+                command: strings(&["npx", "--no", "--", "html-validate", "{files}"]),
                 when: strings(&["node_modules/.bin/html-validate"]),
                 requires: strings(&["npx"]),
             },
             Verifier {
             files: Vec::new(),                name: "stylelint".into(),
                 kind: "lint".into(),
-                command: strings(&["npx", "--no", "--offline", "--", "stylelint", "\"**/*.css\""]),
+                command: strings(&["npx", "--no", "--", "stylelint", "\"**/*.css\""]),
                 when: strings(STYLELINT_CONFIGS),
                 requires: strings(&["npx"]),
             },

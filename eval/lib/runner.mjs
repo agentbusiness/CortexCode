@@ -90,7 +90,8 @@ async function prepareAttemptState(ctx, task) {
   const suite = ctx.suite;
   const scratch = ctx.scratch(task.id);
   await rmrf(scratch);
-  const workspace = path.join(scratch, 'ws');
+  // A suite may name the workspace folder (a build that derives names from it, as C++'s CMakeLists).
+  const workspace = path.join(scratch, suite.workspaceName?.(task) ?? 'ws');
   const { snapshot } = await suite.makeWorkspace(task, workspace);
   const hidden = await hiddenIndex(suite.hiddenFiles(task));
   return { scratch, scoreScratch: ctx.scoreScratch(task.id), workspace, snapshot, hidden };

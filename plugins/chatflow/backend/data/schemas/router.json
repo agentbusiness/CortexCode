@@ -4,6 +4,12 @@
     "work": {
       "type": "string"
     },
+    "asks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "route": {
       "enum": [
         "ANSWER",
@@ -70,6 +76,7 @@
   },
   "required": [
     "work",
+    "asks",
     "route",
     "skills",
     "effort",

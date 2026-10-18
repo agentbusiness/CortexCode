@@ -24,6 +24,8 @@ const MAX_OPEN_JOURNALS: usize = 64;
 enum WriterMsg {
     Line { session_id: String, bytes: Vec<u8>, ack: oneshot::Sender<Result<(), String>> },
     Flush(oneshot::Sender<()>),
+    /// Delete a session's file after the lines queued before it.
+    Remove(String),
 }
 
 struct SessionLog {
@@ -35,6 +37,8 @@ struct SessionLog {
 pub struct Journal {
     dir: PathBuf,
     sessions: Mutex<HashMap<String, SessionLog>>,
+    /// Sessions deleted while the frame runs: their journals take no more patches.
+    deleted: Mutex<std::collections::HashSet<String>>,
     writer: Mutex<Option<std::sync::mpsc::Sender<WriterMsg>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -61,6 +65,7 @@ impl Journal {
         Ok(Journal {
             dir,
             sessions: Mutex::new(HashMap::new()),
+            deleted: Mutex::new(std::collections::HashSet::new()),
             writer: Mutex::new(Some(tx)),
             thread: Mutex::new(Some(thread)),
         })
@@ -129,6 +134,20 @@ impl Journal {
         Ok((log.entries.get(start..).map(<[JournalEntry]>::to_vec).unwrap_or_default(), log.rev))
     }
 
+    /// Delete a session's journal: its materialization now, its file after the lines already
+    /// queued; later patches for it are refused.
+    pub fn remove(&self, session_id: &str) -> Result<(), RpcError> {
+        if !valid_session_id(session_id) {
+            return Err(RpcError::invalid_params(format!("invalid session id `{session_id}`")));
+        }
+        let mut sessions = self.lock();
+        self.deleted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(session_id.to_owned());
+        sessions.remove(session_id);
+        let writer = self.writer.lock().map_err(|_| RpcError::internal("journal writer lock poisoned"))?;
+        let sender = writer.as_ref().ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "the frame is shutting down"))?;
+        sender.send(WriterMsg::Remove(session_id.to_owned())).map_err(|_| RpcError::new(codes::UNAVAILABLE, "journal writer stopped"))
+    }
+
     /// Wait until everything enqueued so far is written and fsynced.
     pub async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
@@ -169,6 +188,9 @@ impl Journal {
     ) -> Result<&'a mut SessionLog, RpcError> {
         if !valid_session_id(session_id) {
             return Err(RpcError::invalid_params(format!("invalid session id `{session_id}`")));
+        }
+        if self.deleted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(session_id) {
+            return Err(RpcError::not_found(format!("session `{session_id}` was deleted")));
         }
         if !sessions.contains_key(session_id) {
             let log = load(&self.dir, session_id).map_err(|error| RpcError::internal(error.to_string()))?;
@@ -328,6 +350,15 @@ fn writer_loop(dir: PathBuf, rx: std::sync::mpsc::Receiver<WriterMsg>) {
                     acks.push((session_id, ack));
                 }
                 WriterMsg::Flush(done) => flushes.push(done),
+                WriterMsg::Remove(session_id) => {
+                    files.remove(&session_id);
+                    dirty.retain(|dirty| dirty != &session_id);
+                    match std::fs::remove_file(journal_path(&dir, &session_id)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(session_id, %error, "deleting a journal file failed"),
+                    }
+                }
             }
         }
         for session_id in dirty {

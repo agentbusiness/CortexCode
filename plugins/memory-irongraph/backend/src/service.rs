@@ -66,7 +66,7 @@ pub struct Memory {
     failed: std::sync::Mutex<HashMap<String, String>>,
     /// Trees whose open (cold index) runs now, by project id: their progress, without waiting.
     opening_trees: std::sync::Mutex<HashMap<String, Arc<CodeTree>>>,
-    /// References closed while their background index ran: forgotten once it stops.
+    /// References closed, or projects deleted, while their background index ran: forgotten once it stops.
     forgotten: std::sync::Mutex<HashSet<String>>,
     /// The background opens started, by project id.
     background: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
@@ -250,6 +250,14 @@ impl Memory {
         use cc_protocol::contracts::{contract_of, frame, lang};
         if topic == frame::topics::PROJECT_CHANGED {
             self.open_frame_project(&data).await;
+            return;
+        }
+        if topic == frame::topics::PROJECT_DELETED {
+            if let Some(id) = data.get("project_id").and_then(Value::as_str)
+                && let Err(error) = self.forget_project(id).await
+            {
+                tracing::warn!(project = id, %error, "dropping a deleted project's memory failed");
+            }
             return;
         }
         if topic != frame::topics::PLUGIN_STATE && topic != frame::topics::PLUGIN_SWAPPED {
@@ -566,6 +574,27 @@ impl Memory {
             self.drop_reference(&entry.id).await?;
         }
         Ok(ProjectCloseResult { project_id: entry.id, name: entry.name, root: entry.root })
+    }
+
+    /// A project the person deleted: everything memory holds for it goes (its code graph and
+    /// workspaces, line indexes, knowledge, registry entry), as for a closed reference.
+    async fn forget_project(&self, project_id: &str) -> Result<(), RpcError> {
+        // Under the lock the background open ends under, so the drop is seen by it or done here.
+        let running = match self.indexing.lock() {
+            Ok(set) if set.contains(project_id) => {
+                if let Ok(mut forgotten) = self.forgotten.lock() {
+                    forgotten.insert(project_id.to_owned());
+                }
+                true
+            }
+            _ => false,
+        };
+        self.unregister(project_id).await?;
+        if !running {
+            self.drop_reference(project_id).await?;
+        }
+        tracing::info!(project = project_id, "dropped a deleted project's memory");
+        Ok(())
     }
 
     /// Remove a project's registry entry.

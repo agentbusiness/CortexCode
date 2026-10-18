@@ -45,7 +45,7 @@ To change a file, use `edit`, not an editor in a terminal.
 - pdb: `program: "<venv>/bin/python -m pdb script.py"`; `b mod.py:42`, `c`, `p expr`, `n`, `s`, `bt`, `q`, each plus `<Enter>`.
 - lldb (this Mac has lldb, not gdb): `program: "lldb ./prog -- args"`; `b file.c:42`, `run`, `p x`, `bt`, `quit`.
 - A program opens an editor (`git rebase -i`, `crontab -e`): vim saves with `<Esc>:wq<Enter>`, discards with `<Esc>:q!<Enter>`.
-- ssh with a password: `program: "ssh -o StrictHostKeyChecking=no -p 2222 user@host"`, `until: "assword: \x{258C}"`, send the password from the request plus `<Enter>`. Leave with `exit<Enter>`; a hung session with `<Enter>~.`.
+- ssh with a password: `program: "ssh -p 2222 user@host"`. An unknown host key asks `(yes/no)`: show the user the fingerprint and answer only as they say. Then `until: "assword: \x{258C}"`, send the password from the request plus `<Enter>`. Leave with `exit<Enter>`; a hung session with `<Enter>~.`.
 - VM console (qemu `-nographic`): `until: "login: \x{258C}"`, `wait_ms: 300000` (slow boot). Quit qemu with `<C-a>x`.
 
 ## Stuck

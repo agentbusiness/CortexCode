@@ -55,9 +55,35 @@ async function readExerciseFile(root, rel) {
   try { return await fsp.readFile(path.join(root, rel), 'utf8'); } catch { return null; }
 }
 
+/** Files the language's test runner runs as tests. They are hidden with the declared test files: an
+ * exercise may ship more than it declares (Go's `cases_test.go` as an editor file, Rust's extra
+ * `tests/*.rs`), and test code in the workspace is the tests' answers. */
+const TEST_FILE = {
+  go: (rel) => rel.endsWith('_test.go'),
+  rust: (rel) => rel.startsWith('tests/') && rel.endsWith('.rs'),
+  python: (rel) => /(^|\/)(test_[^/]*|[^/]*_test)\.py$/.test(rel),
+  javascript: (rel) => /\.(spec|test)\.[cm]?js$/.test(rel),
+  java: (rel) => rel.startsWith('src/test/'),
+  cpp: (rel) => /_test\.cpp$/.test(rel),
+};
+
+/** Every file of the exercise (relative paths), `.meta/` and `.docs/` left out. */
+async function exerciseFiles(root, dir = '') {
+  const out = [];
+  for (const entry of await fsp.readdir(path.join(root, dir), { withFileTypes: true })) {
+    const rel = dir ? `${dir}/${entry.name}` : entry.name;
+    if (rel === '.meta' || rel === '.docs') continue;
+    if (entry.isDirectory()) out.push(...(await exerciseFiles(root, rel)));
+    else out.push(rel);
+  }
+  return out;
+}
+
 async function materializeExercise(lang, slug, exDir, outRoot) {
   const config = JSON.parse(await fsp.readFile(path.join(exDir, '.meta', 'config.json'), 'utf8'));
-  const testFiles = config.files?.test ?? [];
+  const isTest = TEST_FILE[lang] ?? (() => false);
+  const declared = config.files?.test ?? [];
+  const testFiles = [...declared, ...(await exerciseFiles(exDir)).filter((rel) => isTest(rel) && !declared.includes(rel)).sort()];
   const exampleFiles = config.files?.example ?? [];
   const solutionFiles = new Set(config.files?.solution ?? []);
   // aider's ignore set: CMakeLists.txt, Cargo.toml, .meta/**, .docs/**, tests, examples.

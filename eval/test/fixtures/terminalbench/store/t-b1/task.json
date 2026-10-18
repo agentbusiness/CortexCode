@@ -1,8 +1,0 @@
-{
- "id": "t-b1",
- "suite": "terminalbench",
- "lang": "terminal",
- "group": "security",
- "prompt": "do t-b1",
- "agent_timeout_sec": 900
-}

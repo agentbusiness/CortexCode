@@ -154,6 +154,9 @@ export async function polyglotScore(task, workspace, scoreDirIn, outDir, tag) {
   if (task.lang === 'rust') env.CARGO_TARGET_DIR = path.join(scoreDir, 'target');
   const res = await scoreInCopy({
     workspace, scoreDir, outDir, hiddenFiles: hiddenFiles(task),
+    // A build folder the agent's own builds left (CMake's cache names the folder it was made in, so
+    // a copied one stops the scoring build): scoring builds afresh.
+    deletions: task.lang === 'cpp' ? ['build'] : [],
     setup: (dir) => setupCopy(task, dir), command: testCommand(task), env,
     timeoutMs: POLYGLOT.testTimeoutMs, tag: tag.replace(/[^A-Za-z0-9_.-]/g, '_'),
     denyRead: [HIDDEN, SRC, ...LOCAL_REFS], denyWrite: [T.polyglotJs, T.polyglotPy, T.go, T.jdk, T.gradleHome, T.boost].filter((p) => fs.existsSync(p)),
@@ -167,8 +170,10 @@ export function followupPrompt(task, errors) {
   // go as a pasted-text attachment (the way a person's long paste goes), the instructions as the
   // message: the model reads the output it needs instead of carrying the whole log in every prompt.
   return {
+    // The tests stay hidden (the workspace is offline for them): said, so the model fixes from the
+    // failures instead of searching the machine for the test file (seen: find / and grep -r /).
     text: `See the testing errors in the attached test output.
-The tests are correct, don't try and change them.
+The tests are correct, don't try and change them. They are not in your project: work from the failures in the output.
 Fix the code in ${task.file_list} to resolve the errors.
 `,
     pasted: errors,

@@ -1,8 +1,0 @@
-{
- "id": "t-c1",
- "suite": "terminalbench",
- "lang": "terminal",
- "group": "games",
- "prompt": "do t-c1",
- "agent_timeout_sec": 900
-}

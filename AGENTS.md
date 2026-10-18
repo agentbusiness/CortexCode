@@ -46,7 +46,8 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 - Plans: the tasks are the steps (no second list); after each task a short REVIEW asks whether the
   tasks still to do fit what the work showed, and writes them again when not.
 - Skills: line 1 is the catalog summary (when the skill helps, at most 100 characters), then a blank
-  line, then concrete steps, commands and examples. See `docs/SKILLS-BRIEF.md`.
+  line, then concrete steps and commands; no worked scenario examples in procedural skills (the
+  model copies their shape). See `docs/SKILLS-BRIEF.md`.
 - Where things live: chat flow prompts `plugins/chatflow/backend/data/prompts/*.md`, short texts
   `plugins/chatflow/backend/data/texts.toml`, stage settings `plugins/chatflow/backend/data/stages.toml`,
   decision schemas `plugins/chatflow/backend/data/schemas/`, language guides

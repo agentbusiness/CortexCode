@@ -19,6 +19,10 @@ pub mod methods {
     pub const PROJECT_LIST: &str = "frame.project.list";
     /// [`super::ProjectGetParams`] -> [`super::Project`].
     pub const PROJECT_GET: &str = "frame.project.get";
+    /// Forget a project and delete all of its sessions (as `frame.session.delete`); publishes
+    /// `project.deleted` so every plugin drops its own data about the project. The project's folder
+    /// on disk is never touched. [`super::ProjectGetParams`] -> [`super::DeleteResult`].
+    pub const PROJECT_DELETE: &str = "frame.project.delete";
 
     /// [`super::SessionCreateParams`] -> [`super::Session`].
     pub const SESSION_CREATE: &str = "frame.session.create";
@@ -28,6 +32,10 @@ pub mod methods {
     pub const SESSION_GET: &str = "frame.session.get";
     /// [`super::SessionUpdateParams`] -> [`super::Session`].
     pub const SESSION_UPDATE: &str = "frame.session.update";
+    /// Delete a session, the sessions started from it (`parent`), and their journals; publishes
+    /// `session.deleted` for each so every plugin drops its own data about it (a running turn is
+    /// stopped by its plugin). [`super::SessionGetParams`] -> [`super::DeleteResult`].
+    pub const SESSION_DELETE: &str = "frame.session.delete";
 
     /// Append entries / patches to a session journal (plugins).
     /// [`super::JournalAppendParams`] -> [`super::JournalAppendResult`]; answered after the patch is durable.
@@ -63,6 +71,15 @@ pub mod methods {
     /// restores both. A `.ccplugin` dropped into `<CORTEX_HOME>/plugins-store/incoming/` is
     /// installed the same way. [`super::InstallParams`] -> [`super::PackageSwapResult`].
     pub const PLUGINS_INSTALL: &str = "frame.plugins.install";
+    /// The plugins installed for one category and which one serves it (a category such as the
+    /// model can have several: one serves, the others wait as alternatives).
+    /// [`super::ProvidersParams`] -> [`super::ProvidersResult`].
+    pub const PLUGINS_PROVIDERS: &str = "frame.plugins.providers";
+    /// Serve a category with another of its installed plugins: the serving plugin is drained and
+    /// stopped (its idle state handed over), the chosen one started in the same slot, and the UI
+    /// packages follow. On failure the previous plugin is restored. The choice persists.
+    /// [`super::SwitchParams`] -> [`super::SwitchResult`].
+    pub const PLUGINS_SWITCH: &str = "frame.plugins.switch";
 
     /// The workbench's durable slot state (what the UI must not forget across hot swaps and app
     /// restarts), kept by the frame in `<CORTEX_HOME>/state/ui_state.json`.
@@ -94,6 +111,10 @@ pub mod topics {
     pub const JOURNAL_PREFIX: &str = "journal.";
     pub const SESSION_CHANGED: &str = "session.changed";
     pub const PROJECT_CHANGED: &str = "project.changed";
+    /// A session was deleted. Data: [`super::SessionDeleted`].
+    pub const SESSION_DELETED: &str = "session.deleted";
+    /// A project was deleted (its sessions each had `session.deleted` first). Data: [`super::ProjectDeleted`].
+    pub const PROJECT_DELETED: &str = "project.deleted";
     /// A plugin instance changed state (starting, probing, active, draining, stopped, crashed).
     pub const PLUGIN_STATE: &str = "plugin.state";
     /// A hot-swap finished (ok or rolled back).
@@ -174,6 +195,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// The model the session runs on (`model.info` `model_id`), recorded by its first run. A
+    /// session is never continued on another model: after an engine or variant switch it stays
+    /// readable, and new work starts in a new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -219,6 +245,32 @@ pub struct SessionUpdateParams {
     pub status: Option<SessionStatus>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Record the model the session runs on ([`Session::model`]).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// What `frame.session.delete` or `frame.project.delete` deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DeleteResult {
+    /// The sessions deleted, children first.
+    pub sessions: Vec<String>,
+}
+
+/// `session.deleted`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionDeleted {
+    pub session_id: String,
+    pub project_id: String,
+    /// The folder its commands worked in (an agent's own workspace, or the project root).
+    pub workspace: String,
+}
+
+/// `project.deleted`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectDeleted {
+    pub project_id: String,
+    pub root: String,
 }
 
 /// Journal entry kinds. `data` schemas are documented per kind.
@@ -427,6 +479,77 @@ pub struct PluginUnit {
     /// The version `frame.plugins.rollback {plugin}` would restore.
     #[serde(default)]
     pub previous_version: Option<String>,
+    /// Another plugin serves this one's category: it is installed but not running, and its UI
+    /// packages are not served, until `frame.plugins.switch` chooses it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standby: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProvidersParams {
+    pub category: String,
+}
+
+/// One installed plugin of a category ([`ProvidersResult`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProviderInfo {
+    pub plugin: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    pub enabled: bool,
+    /// It serves the category now.
+    pub serving: bool,
+    /// The machine range it declares (`[backend.machine]`), when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<package::MachineFit>,
+    /// This machine is inside the declared range (None: no range declared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fits_machine: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProvidersResult {
+    pub category: String,
+    /// The plugin serving it.
+    #[serde(default)]
+    pub serving: String,
+    /// Why that one: `user` (chosen with frame.plugins.switch), `machine` (the one whose declared
+    /// range holds this machine's memory), `only` (no alternative installed) or `first`.
+    #[serde(default)]
+    pub chosen_by: String,
+    /// This machine's physical memory, which the declared ranges are compared with.
+    #[serde(default)]
+    pub memory_bytes: u64,
+    pub providers: Vec<ProviderInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwitchParams {
+    pub category: String,
+    pub plugin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwitchResult {
+    pub ok: bool,
+    pub category: String,
+    #[serde(default)]
+    pub from_plugin: String,
+    #[serde(default)]
+    pub to_plugin: String,
+    /// False when the plugin already served the category (nothing was done).
+    pub changed: bool,
+    /// The backend swap in the category's slot.
+    #[serde(default)]
+    pub backend: Option<SwapResult>,
+    #[serde(default)]
+    pub steps: Vec<SwapStep>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -744,6 +867,26 @@ pub mod package {
         /// `[plugin.config]` keys override them.
         #[serde(default)]
         pub config: Option<Value>,
+        /// The machines this backend is meant for. When several plugins serve one category and
+        /// the person chose none, the frame runs the one whose range holds the machine's memory.
+        #[serde(default)]
+        pub machine: Option<MachineFit>,
+    }
+
+    /// `[backend.machine]`: a range of physical memory (`hw.memsize`), both ends inclusive.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(deny_unknown_fields)]
+    pub struct MachineFit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub min_memory_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_memory_bytes: Option<u64>,
+    }
+
+    impl MachineFit {
+        pub fn holds(&self, memory_bytes: u64) -> bool {
+            self.min_memory_bytes.is_none_or(|min| memory_bytes >= min) && self.max_memory_bytes.is_none_or(|max| memory_bytes <= max)
+        }
     }
 
     fn default_backend_dir() -> String {
@@ -965,6 +1108,9 @@ pub mod package {
         pub hello_timeout_ms: Option<u64>,
         #[serde(default)]
         pub probe_timeout_ms: Option<u64>,
+        /// `[backend.machine]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub machine: Option<MachineFit>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

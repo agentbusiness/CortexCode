@@ -388,7 +388,7 @@ pub fn arguments_of(tool: &str) -> &'static str {
         "edit" => {
             "intent, path, then one of: edits [{op, at, to?, text}] | old + new (+ all) | replacements [{old, new}] | content | patch"
         }
-        "run" => "intent, command, timeout_ms, background, wake {pattern, silence_s}, cwd, write_outside [dir]",
+        "run" => "intent, command, timeout_ms, background, wake {pattern, silence_s}, cwd, permission",
         "terminal" => "intent, action (open | send | read | close), id, keys, until, wait_ms, program",
         _ => "",
     }
@@ -733,6 +733,12 @@ fn map_read(payload: Payload, raw_name: &str, mut notes: Vec<String>) -> Result<
     args.finish(out, intent)
 }
 
+/// Whether `text` is a whole number (digits only, around spaces).
+fn is_number(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn range_text(args: &mut Args, field: &str, value: Value) -> Result<String, RepairError> {
     let text = match value {
         // A stringified array (markup values are text): `"[4, 9]"`.
@@ -745,7 +751,19 @@ fn range_text(args: &mut Args, field: &str, value: Value) -> Result<String, Repa
                 _ => Err(RepairError::new("bad_argument", format!("`{field}` must be [start, end]")).tool("read").field(field)),
             };
         }
-        Value::String(text) => text.trim().trim_start_matches(':').to_owned(),
+        Value::String(text) => {
+            let text = text.trim().trim_start_matches(':');
+            // `95:290` or `95..290` mean lines 95 to 290: read so, and said.
+            let pair = text.split_once(':').or_else(|| text.split_once(".."));
+            match pair {
+                Some((start, end)) if is_number(start) && is_number(end) => {
+                    let range = format!("{}-{}", start.trim(), end.trim());
+                    args.tell(format!("read `{text}` as lines {range}"));
+                    range
+                }
+                _ => text.to_owned(),
+            }
+        }
         Value::Number(number) => number.to_string(),
         Value::Array(items) => {
             let numbers: Vec<i64> = items.iter().filter_map(Value::as_i64).collect();
@@ -980,7 +998,7 @@ fn hashline_item(args: &mut Args, item: Map<String, Value>) -> Result<Value, Rep
         RepairError::new("missing_argument", format!("edit op `{op}` needs `at` (an anchor like \"12:ab\")")).tool("edit").field("at")
     })?;
     let at = anchor_value(&mut sub, "at", at)?;
-    let to = match sub.take("to", &["end", "until", "through", "end_anchor", "end_line"])? {
+    let to = match sub.take("to", &["end", "until", "through", "end_anchor", "end_line", "at2", "end_at", "at_end", "to_anchor", "last"])? {
         Some(value) => Some(anchor_value(&mut sub, "to", value)?),
         None => None,
     };
@@ -1392,9 +1410,9 @@ fn map_edit(payload: Payload, notes: Vec<String>) -> Result<Canonical, RepairErr
     }
     modes.dedup();
     // `content` and `edits` together are one change in both forms: the edit runs with the one the
-    // file allows (whole when new or untouched, else the edits) instead of being refused.
+    // file allows (whole when new or empty, else the edits) instead of being refused.
     if modes.len() == 2 && modes.contains(&"content") && modes.contains(&"edits") {
-        args.tell("`content` and `edits` were both sent: the file is written whole when it is new or still untouched, otherwise the edits are applied");
+        args.tell("`content` and `edits` were both sent: the file is written whole when it is new, otherwise the edits are applied");
         modes.retain(|mode| *mode != "content");
     }
     match modes.len() {
@@ -1639,41 +1657,24 @@ fn map_run(payload: Payload, raw_name: &str, notes: Vec<String>) -> Result<Canon
             out.insert("cwd".to_owned(), Value::String(cwd));
         }
     }
-    if let Some(value) = args.take("write_outside", &["write_paths", "allow_write", "writable_paths"])? {
-        let paths: Vec<String> = match value {
-            Value::String(path) => {
-                args.note("write_outside string -> [string]");
-                vec![path]
-            }
+    // Why the command must go past the sandbox; a list of folders (the older `write_outside`) asks
+    // to write there.
+    if let Some(value) = args.take("permission", &["write_outside", "write_paths", "allow_write", "writable_paths", "sandbox_permission"])? {
+        let why = match value {
+            Value::String(why) => why,
             Value::Array(items) => {
-                let mut paths = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::String(path) => paths.push(path),
-                        other => {
-                            return Err(RepairError::new(
-                                "bad_argument",
-                                format!("`write_outside` items must be directory paths (strings), got {}", kind_of(&other)),
-                            )
-                            .tool("run")
-                            .field("write_outside"));
-                        }
-                    }
-                }
-                paths
+                let paths: Vec<String> = items.into_iter().filter_map(|item| item.as_str().map(str::to_owned)).collect();
+                args.note("folders -> permission");
+                format!("write to {}", paths.join(", "))
             }
             other => {
-                return Err(RepairError::new(
-                    "bad_argument",
-                    format!("`write_outside` must be a list of directory paths, got {}", kind_of(&other)),
-                )
-                .tool("run")
-                .field("write_outside"));
+                return Err(RepairError::new("bad_argument", format!("`permission` must say why, as text; got {}", kind_of(&other)))
+                    .tool("run")
+                    .field("permission"));
             }
         };
-        let paths: Vec<Value> = paths.into_iter().filter(|path| !path.trim().is_empty()).map(Value::String).collect();
-        if !paths.is_empty() {
-            out.insert("write_outside".to_owned(), Value::Array(paths));
+        if !why.trim().is_empty() {
+            out.insert("permission".to_owned(), Value::String(why.trim().to_owned()));
         }
     }
     let mut wake = Map::new();

@@ -7,7 +7,7 @@ A question the repo can't answer: a domain's rules, a library choice, an outside
   2. `read research://fetch/<url>` for the one or two pages that state the rules.
   3. Copy each rule into your check cases, then code. Reading beats guessing edge rules.
 - **Three failed fixes on one problem**: reduce it to the core: the smallest failing input, one sentence "happens X, should Y". Search that sentence (`sources=github_issues,web`), read two sources, return to the code.
-- **Not available** (plugin off, offline): say so once; continue from the statement and code.
+- **Not available** (plugin off, offline): say so once; continue from the request and the code.
 
 ## 1. Use what you already have
 

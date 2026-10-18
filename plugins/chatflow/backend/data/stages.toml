@@ -72,9 +72,28 @@ task_think_tokens = 1024
 # A plan task whose same command still fails after this many edit-and-rerun cycles is stuck too
 # (debugging decays within 2-3 attempts): the tasks still to do are written again.
 fix_cycles = 3
+# The same error (its lines without numbers) back in this many more failing runs, with other calls
+# between (edits, terminal writes, scratch files): the host says its cause is a declaration the line
+# uses, not the line (an error key, so other commands, files and moved lines match).
+same_error_edits = 3
+# A plan task that runs this many commands once a command has failed twice, without any failing
+# command turning to pass, is stuck too: traces and reruns that never land (no edit sits between
+# them, so `fix_cycles` misses them). High on purpose: debugging needs a run of traces, prints and
+# reruns; seen stuck: 97 calls on one case. 0 = no limit.
+stall_runs = 20
 # Once the task has changed a file, each step is a fix: this short budget (the full one above is
 # for designing and writing the first change).
 fix_think_tokens = 384
+# Any other agent loop's step (a question, a follow-up). Every step has a budget: the model plugin's
+# own table (4096 for medium) never applies (seen: a loop without a plan step ran 4k thoughts for
+# two hours).
+loop_think_tokens = 1024
+# Steps whose reasoning stays in the prompt (newest first); older steps keep their answer and calls
+# only, as the model's template renders earlier turns. 0 (none): the engine then resumes every step
+# from the checkpoint at the end of the previous prompt and re-reads only the answer and the new
+# results. With 1 the step before the newest changes every time, so the engine falls back to one
+# fixed older checkpoint and the re-read grows by a step each step (seen: reused 10950 of 19156).
+reasoning_steps = 0
 # Host-read rounds per request, the first included (ends a read loop, never output).
 read_rounds = 5
 # Baseline rounds of the CHECKS decision before the checks stand.
@@ -98,18 +117,32 @@ reads_per_round = 24
 # Tokens of one conversation's context kept free for the answer. Before every model call the prompt
 # is counted exactly (model.count); older tool outputs are folded until it fits the rest.
 answer_reserve_tokens = 8192
-# A compaction (older tool outputs folded, finished turns digested) brings the prompt down to this
-# share of the conversation's context in one batch (percent): every compaction makes the model
-# re-read the conversation, so they are made rare.
-compact_target_percent = 50
-# At a wait (the run's tools executing, the turn ended) a prompt past this share (percent) is
-# compacted then, and the compacted prompt is prefilled in the background (model.prewarm), so the
-# next call finds it warm. 0 = only when a prompt no longer fits.
-compact_early_percent = 70
-# When a turn ends a prompt past this share (percent) is compacted while the user reads the answer,
-# so the next turn starts with room: mid-run compactions re-read the conversation while the model
-# waits (a fast tool hides little of it). 0 = only at the early share.
-compact_idle_percent = 55
+# Tokens one conversation may use at most, whatever the model could hold (0 = the model's window).
+# The compaction shares below apply to this. Off: a 48k cap compacted a working task every minute,
+# folding the model's own reads and edits away, and it rewrote its code from memory.
+context_tokens = 0
+# A compaction (older tool outputs folded, finished turns digested) brings the prompt down to at
+# most this many tokens; one that cannot reach it is not made. A fixed size: what the model works
+# from stays small whatever the window holds (shares of a 230k window let a turn grow to 220k, each
+# compaction saving 2k and costing a 15-minute re-read).
+compact_target_tokens = 24576
+# At a wait (the run's tools executing) a prompt past this many tokens is compacted then, and the
+# compacted prompt is prefilled in the background (model.prewarm). 0 = only when a prompt no longer
+# fits.
+compact_early_tokens = 49152
+# When a turn ends (the user reads the answer, the model is idle) a prompt past this many tokens is
+# compacted then, so the next turn starts with room. 0 = only at the early size.
+compact_idle_tokens = 32768
+# Steps of an agent loop between settles: a settle applies the in-place rewrites (outdated reads,
+# earlier edit echoes, outputs of a command run again) up to the newest entry; between settles the
+# prompt only grows and the engine continues its state. 0 = only at compactions.
+settle_steps = 8
+# A settle is made only when it shrinks the prompt by at least this many tokens (it costs one re-read
+# of the history after the system block; seen: 12k re-read for about 1k saved).
+settle_min_tokens = 3072
+# Steps of the running turn a compaction keeps whole (the newest). When folding older outputs does
+# not bring a long turn under its target, its older steps become one note listing their calls.
+history_tail_steps = 8
 # Skills the turn's first decision may choose for its work (ROUTE's `skills`, and each PLAN task's,
 # an enum of the session's catalog). 0 = no choice field: the model reads skills only on its own
 # (baseline).
@@ -122,8 +155,9 @@ skills_per_turn = 3
 # turn's skills.
 skills_in_prefix = true
 # A user message whose text is longer than this (characters) becomes the session's spec when the
-# session has none yet. 0 = only when the user marks it or the router asks for one.
-spec_min_chars = 1500
+# session has none yet. 0 = only when the user marks it or the router asks for one. Off: a long
+# message is often a pasted log or stack trace, not a list of requirements.
+spec_min_chars = 0
 # Spec text pinned whole at most (characters): pasted text beyond it is referenced by its path.
 spec_max_chars = 24000
 # Tasks one plan may hold (the `depends_on` numbers its grammar offers).
@@ -162,14 +196,6 @@ sampling = "decision"
 
 # After a task that ended well, before the next: do the tasks still to do fit what the work
 # showed? `replan` yes writes them again (within `replans`).
-# Before a plan task counts as done: the statement's requirements its check script does not yet
-# test with a case that meets them and one that breaks them (asked once per task).
-[stage.COVERAGE]
-rules = "coverage"
-schema = "schemas/coverage.json"
-effort = "none"
-sampling = "decision"
-
 [stage.REVIEW]
 rules = "review"
 schema = "schemas/review.json"

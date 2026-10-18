@@ -4,6 +4,7 @@
 
 pub mod approval;
 pub mod artifacts;
+pub mod cleanup;
 pub mod codeskills;
 pub mod core;
 pub mod doc;
@@ -23,6 +24,7 @@ pub mod schemas;
 pub mod service;
 pub mod shell;
 pub mod term;
+pub mod testout;
 pub mod textedit;
 pub mod uris;
 pub mod util;

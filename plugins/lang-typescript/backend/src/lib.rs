@@ -133,8 +133,8 @@ impl LanguagePack for TypeScriptPack {
         }
     }
 
-    /// Offline: tools run only from the project's own `node_modules/.bin` (`npx --no --offline`
-    /// never installs, and never asks the registry); `npm test` runs the package's test script.
+    /// Tools run only from the project's own `node_modules/.bin` (`npx --no` never installs: an
+    /// install is the user's to approve); `npm test` runs the package's test script.
     fn verifiers(&self) -> Vec<Verifier> {
         let verifier = |name: &str, kind: &str, args: &[&str], when: &[&str]| Verifier {
             files: Vec::new(),            name: name.into(),
@@ -144,10 +144,10 @@ impl LanguagePack for TypeScriptPack {
             requires: strings(&[args[0]]),
         };
         vec![
-            verifier("tsc --noEmit", "build", &["npx", "--no", "--offline", "--", "tsc", "--noEmit", "-p", "."], &["tsconfig.json"]),
+            verifier("tsc --noEmit", "build", &["npx", "--no", "--", "tsc", "--noEmit", "-p", "."], &["tsconfig.json"]),
             // The test script's runner (jest, vitest) fails when it finds no tests.
             Verifier { files: strings(&["**/*.test.*", "**/*.spec.*", "**/__tests__/**"]), ..verifier("npm test", "test", &["npm", "test"], &["package.json"]) },
-            verifier("eslint", "lint", &["npx", "--no", "--offline", "--", "eslint", "."], ESLINT_CONFIGS),
+            verifier("eslint", "lint", &["npx", "--no", "--", "eslint", "."], ESLINT_CONFIGS),
         ]
     }
 

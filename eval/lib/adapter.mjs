@@ -56,6 +56,7 @@ export function filterTasks(list, { ids, lang, group } = {}) {
  *   o.agentPath(), o.agentEnvExtra()  PATH entries and env for agents
  *   o.aiderFiles(task)        files aider gets in chat (its benchmark protocol)
  *   o.sequential              {initialState, advance, maxTries}: multi-step tasks (Web-Bench)
+ *   o.workspaceName(task)     optional folder name of the workspace (default `ws`)
  */
 export function makeAdapter(o) {
   const dir = path.join(HIDDEN, o.name);
@@ -93,6 +94,7 @@ export function makeAdapter(o) {
     followup: o.followup ?? (() => null),
     aiderFiles: o.aiderFiles,
     sequential: o.sequential ?? null,
+    workspaceName: o.workspaceName,
     reportNote: o.reportNote ?? null,
   };
   return adapter;

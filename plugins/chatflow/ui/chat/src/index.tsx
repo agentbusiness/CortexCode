@@ -72,18 +72,8 @@ function Chat() {
   // What the model does for this conversation now (its requests' progress, a decision's text).
   const liveRun = useLiveRun(session?.kind === 'agent' ? null : sessionId, running);
 
-  // A conversation opened or selected: its prompt prefix is prefilled into the model's cache in the
-  // background, so the next message is answered without re-reading it (once per conversation state;
-  // the chat flow skips a state it prefilled already).
-  const lastSeq = entries.at(-1)?.seq ?? 0;
-  const warmedFor = useRef<string | null>(null);
-  useEffect(() => {
-    if (!sessionId || session?.kind === 'agent' || journal.status !== 'ready' || running) return;
-    const state = `${sessionId}:${lastSeq}`;
-    if (warmedFor.current === state) return;
-    warmedFor.current = state;
-    void client.call('chatflow.prewarm', { session_id: sessionId }).catch(() => undefined);
-  }, [client, sessionId, session?.kind, journal.status, running, lastSeq]);
+  // Opening a conversation loads nothing into the model: only writing in it does (the composer
+  // prefills while the person writes, the turn reads the rest when it is sent).
 
   useEffect(() => {
     setError(null);

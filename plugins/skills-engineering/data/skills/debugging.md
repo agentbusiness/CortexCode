@@ -7,7 +7,7 @@ Do the steps in order.
 One test, or a snippet with the smallest failing input:
 
 ```bash
-timeout 120 <one-test-command> > "${TMPDIR:-/tmp}/repro.log" 2>&1; echo "exit=$?"
+timeout 120 <one-test-command> > "$TMPDIR/repro.log" 2>&1; echo "exit=$?"
 ```
 
 - Long output comes back whole as `artifact://<id>`.
@@ -84,28 +84,31 @@ For rules, not examples (a rule system, a parser, a state machine): hand-compute
 
 ```
 for each generated input:
-    if reference(input) != solution(input): print(input, reference(...), solution(...))
+    if reference(input) != current(input): print(input, reference(...), current(...))
 ```
 
-- Mismatch: suspect the generator or reference first, the solution second.
+- Mismatch: suspect the generator or reference first, the current code second.
 - Zero mismatches is strong evidence. Keep the script while the work can still change; delete it when the user is done.
 
 ## Regression: it used to work
 
-Bisect in a throwaway worktree; the check script lives outside the repo:
+Bisect in a throwaway worktree; the bisect script lives in the scratch folder (`$TMPDIR` is the project's git-ignored `tmp/`). Write `$TMPDIR/bisect.sh` with `edit` (`content`):
 
-```bash
-cat > "${TMPDIR:-/tmp}/bisect.sh" <<'EOF'
+```sh
 #!/bin/sh
 <build-command> || exit 125      # 125 = cannot test this commit: skip it
 <one-test-command>               # exit 0 = good, 1-124 = bad
-EOF
-chmod +x "${TMPDIR:-/tmp}/bisect.sh"
-git worktree add --detach "${TMPDIR:-/tmp}/bisect" HEAD && cd "${TMPDIR:-/tmp}/bisect"
+```
+
+Then, in one `run`:
+
+```bash
+chmod +x "$TMPDIR/bisect.sh"
+git worktree add --detach "$TMPDIR/bisect" HEAD && cd "$TMPDIR/bisect"
 git bisect start <bad-sha> <good-sha>
-git bisect run "${TMPDIR:-/tmp}/bisect.sh"
+git bisect run "$TMPDIR/bisect.sh"
 git bisect log | tail -3; git bisect reset
-cd - && git worktree remove --force "${TMPDIR:-/tmp}/bisect"
+cd - && git worktree remove --force "$TMPDIR/bisect"
 ```
 
 Read the first bad commit: `git show --stat <sha>`, `git show <sha> -- <file>`.

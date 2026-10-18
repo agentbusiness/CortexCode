@@ -13,6 +13,7 @@ import {
   definePlugin,
   errorMessage,
   useClient,
+  useEvent,
   useHost,
   useNow,
   useProjects,
@@ -25,6 +26,7 @@ import {
   type Project,
   type Session,
 } from '@cortex/sdk';
+import { createPortal } from 'react-dom';
 import { markCode } from './mark';
 import './sidebar.css';
 
@@ -173,6 +175,34 @@ function Sidebar() {
     }
   };
 
+  // Deleting: the frame deletes the conversation (and the ones started from it) or the project with
+  // all of its conversations; each plugin drops its own data about them. The folder stays on disk.
+  const deleteSession = async (projectId: string, sessionId: string) => {
+    setError(null);
+    try {
+      await client.call('frame.session.delete', { id: sessionId });
+      if (selection.sessionId === sessionId) selection.select(projectId, null);
+      await everything.refresh();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      throw cause;
+    }
+  };
+  const deleteProject = async (projectId: string) => {
+    setError(null);
+    try {
+      await client.call('frame.project.delete', { id: projectId });
+      if (selection.projectId === projectId) selection.select(null, null);
+      await Promise.all([projects.refresh(), everything.refresh()]);
+    } catch (cause) {
+      setError(errorMessage(cause));
+      throw cause;
+    }
+  };
+  // Deleted elsewhere (another window, a plugin): the lists follow.
+  useEvent('project.deleted', () => void projects.refresh());
+  useEvent('session.deleted', () => void everything.refresh());
+
   const [strip, setStrip] = useShared<boolean>('layout.sidebarCollapsed', false);
   const list = useMemo(() => orderProjects(projects.data ?? [], everything.data ?? []), [projects.data, everything.data]);
   if (strip) {
@@ -219,6 +249,8 @@ function Sidebar() {
             onSelect={(sessionId) => selection.select(project.id, sessionId)}
             onNewChat={() => void newChat(project.id)}
             creating={busy === `new:${project.id}`}
+            onDeleteSession={(sessionId) => deleteSession(project.id, sessionId)}
+            onDelete={() => deleteProject(project.id)}
           />
         ))}
       </div>
@@ -314,7 +346,7 @@ function StripProject({ project, notices, selected, selectedSession, onSelect }:
   );
 }
 
-function ProjectBlock({ project, notices, open, onToggle, selectedProject, selectedSession, onSelect, onNewChat, creating }: {
+function ProjectBlock({ project, notices, open, onToggle, selectedProject, selectedSession, onSelect, onNewChat, creating, onDeleteSession, onDelete }: {
   project: Project;
   notices: Map<string, Notice>;
   open: boolean;
@@ -324,8 +356,13 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
   onSelect: (sessionId: string | null) => void;
   onNewChat: () => void;
   creating: boolean;
+  onDeleteSession: (sessionId: string) => Promise<void>;
+  onDelete: () => Promise<void>;
 }) {
   const sessions = useSessions(project.id);
+  useEvent('session.deleted', (_topic, data) => {
+    if ((data as { project_id?: string } | null)?.project_id === project.id) void sessions.refresh();
+  });
   const agents = useQuery<AgentRecord[]>(
     `agents.list:${project.id}`,
     async (client) => {
@@ -348,23 +385,33 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
   return (
     <section className={`cx-proj${isSelected ? ' on' : ''}`} data-project={project.id}>
       <div className="cx-proj-h">
-        <button type="button" className="cx-proj-toggle" aria-expanded={open} onClick={onToggle} title={open ? 'Fold this project' : 'Unfold this project'}>
+        <button type="button" className="cx-proj-toggle cx-proj-fold" aria-expanded={open} onClick={onToggle} aria-label={`${open ? 'Fold' : 'Unfold'} ${project.name}`} title={open ? 'Fold this project' : 'Unfold this project'}>
           <Caret dir={open ? 'down' : 'right'} className="cx-caret" />
+        </button>
+        <button type="button" className="cx-proj-toggle cx-proj-open" onClick={() => onSelect(null)} aria-pressed={isSelected && !selectedSession}
+          title={`${project.root} — show this project without a conversation`}>
           <span className="cx-proj-name">{project.name}</span>
         </button>
         <span className="grow" />
-        {running > 0 && <span className="ap live" title={`${running} running`}>{running} running</span>}
+        {running > 0 && <span className="cx-run-badge" title={`${running} running`} aria-label={`${running} running`}>{running}</span>}
+        <DeleteButton what="project" detail="its conversations, agents, code graph and caches go; the folder stays on disk"
+          confirm={{
+            title: `Delete ${project.name}?`,
+            body: `Its conversations, agents, code graph and caches are deleted from CortexCode. The folder stays on disk: ${project.root}`,
+            action: 'Delete project',
+          }}
+          onDelete={onDelete} />
       </div>
-      <button type="button" className="cx-proj-pick" onClick={() => onSelect(null)} aria-pressed={isSelected && !selectedSession}
-        title={`${project.root} — show this project without a conversation`}>
-        <span className="ap faint">{project.root}</span>
-      </button>
       {open && (
         <>
           <ul className="lst cx-sessions" aria-label={`Conversations in ${project.name}`}>
             {chats.map((session) => (
               <SessionRow key={session.id} session={session} now={now} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
-                selected={selectedSession === session.id} onSelect={() => onSelect(session.id)} />
+                selected={selectedSession === session.id} onSelect={() => onSelect(session.id)}
+                onDelete={async () => {
+                  await onDeleteSession(session.id);
+                  await sessions.refresh();
+                }} />
             ))}
             {sessions.data && chats.length === 0 && (
               <li className="cx-none">
@@ -410,10 +457,17 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
   );
 }
 
-function SessionRow({ session, selected, onSelect, now, notice }: { session: Session; selected: boolean; onSelect: () => void; now: number; notice?: Notice }) {
+function SessionRow({ session, selected, onSelect, onDelete, now, notice }: {
+  session: Session;
+  selected: boolean;
+  onSelect: () => void;
+  onDelete: () => Promise<void>;
+  now: number;
+  notice?: Notice;
+}) {
   const title = session.title.trim() || 'New conversation';
   return (
-    <li className={[selected ? 'sel' : '', needsYou(session.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
+    <li className={['cx-row', selected ? 'sel' : '', needsYou(session.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ')}
       data-session={session.id} data-status={session.status} data-notice={notice?.kind}>
       <button type="button" onClick={onSelect} aria-current={selected ? 'true' : undefined} title={notice ? notice.title : undefined}>
         <div className="t"><VerdictTitle title={title} /></div>
@@ -425,7 +479,67 @@ function SessionRow({ session, selected, onSelect, now, notice }: { session: Ses
           <span className="ap faint">{ago(session.updated_ms, now)}</span>
         </div>
       </button>
+      <DeleteButton what="chat" detail="the conversation and its history go; this cannot be undone"
+        confirm={{ title: 'Delete this chat?', body: `“${title}” and its history are deleted. This cannot be undone.`, action: 'Delete chat' }}
+        onDelete={onDelete} />
     </li>
+  );
+}
+
+/** What a delete asks before it goes ahead (a project: it takes all of its conversations). */
+interface Confirm {
+  title: string;
+  body: string;
+  action: string;
+}
+
+/** An × shown on hover; a click asks in the theme's confirm dialog, and Delete there deletes. */
+function DeleteButton({ what, detail, confirm, onDelete }: { what: string; detail: string; confirm: Confirm; onDelete: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const run = async () => {
+    setBusy(true);
+    try {
+      await onDelete();
+    } catch {
+      // The sidebar shows the error.
+    } finally {
+      setBusy(false);
+      setAsking(false);
+    }
+  };
+  return (
+    <>
+      <button type="button" className="cx-del" data-action={`delete-${what}`} aria-label={`Delete ${what}`} title={`Delete this ${what}: ${detail}`} disabled={busy}
+        onClick={(event) => {
+          event.stopPropagation();
+          setAsking(true);
+        }}>
+        ×
+      </button>
+      {asking && <ConfirmDialog confirm={confirm} busy={busy} onConfirm={() => void run()} onCancel={() => setAsking(false)} />}
+    </>
+  );
+}
+
+/** The theme's modal: a question, what it does, and the two answers (Escape cancels). */
+function ConfirmDialog({ confirm, busy, onConfirm, onCancel }: { confirm: Confirm; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
+  const confirmButton = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => confirmButton.current?.focus(), []);
+  // Over the whole window, inside the theme's scope (a list row or a scrolled column would clip it).
+  return createPortal(
+    <div className="modal-backdrop" role="presentation" onClick={(event) => event.target === event.currentTarget && !busy && onCancel()}
+      onKeyDown={(event) => event.key === 'Escape' && !busy && onCancel()}>
+      <div className="modal-card cx-confirm" role="alertdialog" aria-modal="true" aria-labelledby="cx-confirm-title" aria-describedby="cx-confirm-body">
+        <h2 id="cx-confirm-title" className="cx-confirm-title">{confirm.title}</h2>
+        <p id="cx-confirm-body" className="cx-confirm-body">{confirm.body}</p>
+        <div className="modal-actions cx-confirm-actions">
+          <button type="button" className="detent" disabled={busy} onClick={onCancel}>Cancel</button>
+          <button type="button" className="detent warn" ref={confirmButton} disabled={busy} onClick={onConfirm}>{busy ? 'Deleting…' : confirm.action}</button>
+        </div>
+      </div>
+    </div>,
+    document.getElementById('cc') ?? document.body,
   );
 }
 

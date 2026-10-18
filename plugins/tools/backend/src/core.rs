@@ -41,7 +41,7 @@ impl Default for Config {
         Self {
             read: ReadConfig::default(),
             run_limits: InlineLimits::default(),
-            read_limits: InlineLimits { inline: 256 * 1024, head: 32 * 1024, tail: 32 * 1024 },
+            read_limits: InlineLimits { inline: 48 * 1024, head: 16 * 1024, tail: 16 * 1024 },
             default_timeout_ms: 600_000,
             bash: None,
             shell_idle_s: 1800,
@@ -101,6 +101,10 @@ pub struct Core {
     pub workspaces: Workspaces,
     file_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     approvals: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// Per session: edits of project files since its last run (an edit result names the next step).
+    pub edits_since_run: Mutex<HashMap<String, usize>>,
+    /// Per session: the files `edit` wrote (the model's work, which a turn's cleanup keeps).
+    pub edited: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
     /// Where the `cx` binary was found (linked into `<home>/bin`).
     pub cx: Option<PathBuf>,
     /// The write sandbox's machine-wide policy.
@@ -114,6 +118,11 @@ pub struct Runtime {
     pub grants: Vec<PathBuf>,
     /// Why there is no Python environment (creation failed), for the tool output.
     pub venv_error: Option<String>,
+}
+
+/// Whether `path` lies under `root` (both resolved).
+fn inside(root: &Path, path: &Path) -> bool {
+    crate::util::canonical_lenient(path).starts_with(crate::util::canonical_lenient(root))
 }
 
 /// Locate the `cx` binary: the `cx_path` plugin config, else the `CORTEX_CX_BIN` environment
@@ -181,6 +190,8 @@ impl Core {
             read_state: ReadState::default(),
             file_locks: Mutex::new(HashMap::new()),
             approvals: Mutex::new(approvals),
+            edits_since_run: Mutex::new(HashMap::new()),
+            edited: Mutex::new(HashMap::new()),
             sandbox: crate::sandbox::Policy::new(home, data_dir, &config.sandbox_write_paths),
             config,
             cx,
@@ -260,6 +271,45 @@ impl Core {
             .sandbox(workspace, venv.as_ref().map(|venv| venv.path()), &grants)
             .ok_or_else(|| "the write sandbox is unavailable".to_owned())?;
         Ok(Runtime { sandbox, venv, grants, venv_error })
+    }
+
+    /// A deleted session: its shell, background jobs, approvals and, when it worked in a workspace
+    /// clone of its own, that clone and its venv go.
+    pub async fn forget_session(&self, session: &str, workspace: &Path) {
+        self.shells.drop_session(session).await;
+        for job in self.jobs.list(Some(session)) {
+            self.jobs.kill(&job.job_id).await;
+        }
+        {
+            let mut approvals = match self.approvals.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if approvals.remove(session).is_some()
+                && let Ok(bytes) = serde_json::to_vec(&*approvals)
+            {
+                let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
+            }
+        }
+        if inside(self.workspaces.root(), workspace) {
+            self.forget_workspace(workspace);
+        }
+    }
+
+    /// A deleted project: its workspace clones and the venv of its folder go (the folder stays).
+    pub fn forget_project(&self, project_id: &str, root: &Path) {
+        for workspace in self.workspaces.list(Some(project_id)) {
+            self.forget_workspace(Path::new(&workspace.path));
+        }
+        let _ = std::fs::remove_dir_all(self.workspaces.root().join(project_id));
+        let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, root));
+    }
+
+    fn forget_workspace(&self, workspace: &Path) {
+        if let Err(error) = self.workspaces.remove(&workspace.to_string_lossy()) {
+            tracing::debug!(workspace = %workspace.display(), error = %error.message, "removing a deleted session's workspace");
+        }
+        let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, workspace));
     }
 
     pub fn approved(&self, session: &str) -> BTreeSet<String> {

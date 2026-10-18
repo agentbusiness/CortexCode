@@ -12,10 +12,19 @@
 //! - `route` entries (router and decide outputs) -> a short host message stating the decision.
 //! - `note` with `host_message: true` -> host message; other notes are transcript-only.
 //! - A consumed `steer` -> user message at the place it was consumed (`consumed_at`).
-//! - The current spec (or, without one, the accepted decisions) is one host message right after the
-//!   system prompt, whole ([`crate::spec::pinned`]); the user message it was made from is shown as
-//!   a reference to it, and each `spec` entry in place as one line saying what changed.
-//! - A `plan` entry -> host message: the newest version of its plan whole, older ones as one line.
+//! - Append-only between compactions: nothing a call has already seen is rewritten, so every call
+//!   continues the previous call's state (the model's recurrent state cannot be cut back; one
+//!   rewrite near the start re-reads the whole conversation). What changed is shown where it
+//!   happened, at the end. In-place changes are applied only up to the `context` entry's
+//!   `settled_through` mark, which each compaction moves to its newest entry ([`crate::fit`]).
+//! - The spec settled at the last compaction (or, without one, the accepted decisions) is one host
+//!   message right after the system prompt, whole ([`crate::spec::pinned`]); the user message it
+//!   was made from is shown as a reference to it, and each settled `spec` entry in place as one
+//!   line saying what changed. A `spec` entry after the mark is shown whole in place, and so is a
+//!   decision accepted after it.
+//! - A `plan` entry -> host message: the plan as it was made, without its status or task states
+//!   (the step message says which task is now); a version replaced by one before the mark is one
+//!   line, and a plan being carried out before the mark is its goal and task titles.
 //! - `status`, `usage`, `error`, `task_link`, `agent_spawned`, `verification`, `context`,
 //!   `decision` and unconsumed steers are not part of the conversation.
 //! - Entries marked `interrupted` (a generation cut off by a hot-swap) are skipped: the step is
@@ -23,7 +32,9 @@
 //! - Compaction marks on the `context` entry ([`crate::fit`] sets them): a tool output at or before
 //!   `folded_through` is one line saying it was folded; a finished turn whose terminal status is at
 //!   or before `digested_through` keeps its user message, steers, plans and spec changes, and the
-//!   rest of it becomes one host note listing its calls plus its final answer, placed where it ended.
+//!   rest of it becomes one host note listing its calls plus its final answer, placed where it ended;
+//!   steps at or before `steps_through` that no turn digest covers (the running turn's older steps)
+//!   become one host note listing their calls, placed where the first of them was.
 //!
 //! Host messages are user-role messages starting with `[host]`: chat templates reject system
 //! messages after the first, and the system prompt states that `[host]` messages come from the host.
@@ -190,13 +201,18 @@ fn call_label(call: &JournalEntry) -> String {
 }
 
 fn digest_text(ds: &Dataset, calls: &[(String, bool)]) -> String {
+    digest_text_with(ds, calls, "turn_digest")
+}
+
+/// A digest note of `calls` in the data set's text `key` (`turn_digest`, `steps_digest`).
+fn digest_text_with(ds: &Dataset, calls: &[(String, bool)], key: &str) -> String {
     let failed = ds.text("turn_digest_failed", &[]);
     let shown: Vec<String> = calls.iter().take(DIGEST_CALLS).map(|(label, bad)| if *bad { format!("{label}{failed}") } else { label.clone() }).collect();
     let mut list = shown.join("; ");
     if calls.len() > DIGEST_CALLS {
         list = ds.text("turn_digest_more", &[("calls", &list), ("more", &(calls.len() - DIGEST_CALLS).to_string())]);
     }
-    ds.text("turn_digest", &[("calls", &list)])
+    ds.text(key, &[("calls", &list)])
 }
 
 /// Render a router or decide entry as the host's statement of that decision.
@@ -257,6 +273,17 @@ pub fn project(entries: &[JournalEntry], ds: &Dataset) -> Vec<ChatMessage> {
 /// [`project`], and `image_input` (the model takes image parts, per `model.info`): messages with
 /// image attachments also carry them as content parts.
 pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -> Vec<ChatMessage> {
+    // The steps whose reasoning the prompt carries: the newest `reasoning_steps` (see the limit).
+    let mut step_keys: Vec<(String, u64)> = Vec::new();
+    for entry in entries {
+        if let Some(key) = step_key(entry)
+            && step_keys.last() != Some(&key)
+        {
+            step_keys.push(key);
+        }
+    }
+    let kept = ds.limits.reasoning_steps as usize;
+    let reasoning_kept: std::collections::HashSet<(String, u64)> = step_keys.iter().rev().take(kept).cloned().collect();
     // A stuck task's attempt (an `attempt_failed` note's range) is not shown: the note says what
     // did not work, and the next attempt starts from fresh reads, not from the old picture.
     let dropped: Vec<(String, u64, u64)> = entries
@@ -284,12 +311,13 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             .collect();
         &kept
     };
-    let folded_through = entries
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == extra_kinds::CONTEXT)
-        .and_then(|entry| entry.data.get("folded_through").and_then(Value::as_u64))
-        .unwrap_or(0);
+    let context = entries.iter().rev().find(|entry| entry.kind == extra_kinds::CONTEXT);
+    let mark = |field: &str| context.and_then(|entry| entry.data.get(field).and_then(Value::as_u64)).unwrap_or(0);
+    let folded_through = mark("folded_through");
+    // In-place changes count only up to the last compaction (see the module notes).
+    let settled_through = mark(crate::fit::SETTLED);
+    let settled_len = entries.iter().position(|entry| entry.seq > settled_through).unwrap_or(entries.len());
+    let settled = &entries[..settled_len];
     // The newest tool output is never folded.
     let newest_result = entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| entry.seq);
 
@@ -318,7 +346,8 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     let is_skill_read = |result: &JournalEntry| calls.get(str_field(&result.data, "call_id")).and_then(|call| crate::skillsel::read_skill_uri(call)).is_some();
     // A read of a file that a later edit changed is an outdated view: shown whole, it competes
     // with the edit result's current view and the model starts doubting the file (seen: "the file
-    // on disk may differ from what I'm shown"). It is shown as a one-line pointer instead.
+    // on disk may differ from what I'm shown"). It is shown as a one-line pointer instead, once the
+    // edit is settled: until then the edit result, which comes later, shows the code as it is now.
     let file_of = |call: &JournalEntry| -> Option<String> {
         let args = call.data.get("args")?;
         let raw = args.get("path").or_else(|| args.get("target")).and_then(Value::as_str)?;
@@ -331,24 +360,71 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         };
         Some(base.trim().trim_start_matches("./").to_owned())
     };
+    // The same for every other outdated output once it is settled: a read repeated later (the
+    // newest read shows the file), an earlier edit of a file edited again (the latest edit result
+    // shows it), the output of a command run again (the newest run's output is the one that
+    // counts). Each becomes one line; the history the model continues from stays the current
+    // state, not every version of it (seen: the same file read 37 times and edited 90 times, all
+    // kept whole, filled the window).
+    let command_of = |call: &JournalEntry| -> Option<String> {
+        call.data.get("args")?.get("command").and_then(Value::as_str).map(|command| command.trim().to_owned())
+    };
     let mut edited_at: HashMap<String, u64> = HashMap::new();
-    for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && bool_field(&entry.data, "ok")) {
-        if let Some(call) = calls.get(str_field(&result.data, "call_id"))
-            && str_field(&call.data, "tool") == "edit"
-            && let Some(file) = file_of(call)
-        {
-            let at = edited_at.entry(file).or_insert(0);
-            *at = (*at).max(result.seq);
+    let mut read_at: HashMap<String, u64> = HashMap::new();
+    let mut run_at: HashMap<String, u64> = HashMap::new();
+    for result in settled.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT) {
+        let Some(call) = calls.get(str_field(&result.data, "call_id")) else { continue };
+        let ok = bool_field(&result.data, "ok");
+        match str_field(&call.data, "tool") {
+            "edit" if ok => {
+                if let Some(file) = file_of(call) {
+                    let at = edited_at.entry(file).or_insert(0);
+                    *at = (*at).max(result.seq);
+                }
+            }
+            tool if ok && (tool == "read" || tool == tools_methods::READ) => {
+                if let Some(file) = file_of(call) {
+                    let at = read_at.entry(file).or_insert(0);
+                    *at = (*at).max(result.seq);
+                }
+            }
+            "run" => {
+                if let Some(command) = command_of(call) {
+                    let at = run_at.entry(command).or_insert(0);
+                    *at = (*at).max(result.seq);
+                }
+            }
+            _ => {}
         }
     }
+    let later = |map: &HashMap<String, u64>, key: &str, seq: u64| map.get(key).is_some_and(|&at| at > seq);
     let superseded = |result: &JournalEntry| -> Option<String> {
-        let call = calls.get(str_field(&result.data, "call_id"))?;
-        let tool = str_field(&call.data, "tool");
-        if tool != "read" && tool != tools_methods::READ {
+        if result.seq > settled_through {
             return None;
         }
-        let file = file_of(call)?;
-        (edited_at.get(&file).is_some_and(|&at| at > result.seq)).then(|| ds.text("read_superseded", &[("path", &file)]))
+        let call = calls.get(str_field(&result.data, "call_id"))?;
+        match str_field(&call.data, "tool") {
+            tool if tool == "read" || tool == tools_methods::READ => {
+                let file = file_of(call)?;
+                if later(&edited_at, &file, result.seq) {
+                    Some(ds.text("read_superseded", &[("path", &file)]))
+                } else if later(&read_at, &file, result.seq) {
+                    Some(ds.text("read_repeated", &[("path", &file)]))
+                } else {
+                    None
+                }
+            }
+            "edit" => {
+                let file = file_of(call)?;
+                (bool_field(&result.data, "ok") && later(&edited_at, &file, result.seq)).then(|| ds.text("edit_superseded", &[("path", &file)]))
+            }
+            "run" => {
+                let command = command_of(call)?;
+                let shown: String = command.chars().take(60).collect();
+                later(&run_at, &command, result.seq).then(|| ds.text("run_superseded", &[("command", &shown)]))
+            }
+            _ => None,
+        }
     };
     let render_output = |result: &JournalEntry| -> String {
         if let Some(pointer) = superseded(result) {
@@ -360,16 +436,73 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         }
     };
     let digests = digests(entries, &calls);
+    // Compaction layer 2 ([`crate::fit`]): steps at or before `steps_through` that no turn digest
+    // covers (the running turn's older steps) become one note listing their calls, where the first
+    // of them was; their reasoning, texts and outputs are not shown. Notes, plans, steers and host
+    // reads stay.
+    let steps_through = mark("steps_through");
+    let stepped = |entry: &JournalEntry| -> bool {
+        steps_through > 0
+            && entry.seq <= steps_through
+            && !bool_field(&entry.data, "interrupted")
+            && digests.of(entry, &calls).is_none()
+            && (step_key(entry).is_some() || (entry.kind == kinds::TOOL_RESULT && !is_host(entry)))
+    };
+    let failed_calls: HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.data.get("ok").and_then(Value::as_bool) == Some(false))
+        .map(|entry| str_field(&entry.data, "call_id"))
+        .collect();
+    let step_calls: Vec<(String, bool)> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_CALL && stepped(entry))
+        .map(|entry| (call_label(entry), failed_calls.contains(str_field(&entry.data, "call_id"))))
+        .collect();
+    let steps_first = entries.iter().find(|entry| stepped(entry)).map(|entry| entry.seq);
+    // Layer 3, from structured facts (no model call): what the compacted steps changed and how
+    // their last test run ended, so the state survives the digest.
+    let steps_state = {
+        let mut files: Vec<String> = Vec::new();
+        let mut tests: Option<(String, &Value)> = None;
+        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && stepped(entry)) {
+            for file in result.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                if !files.iter().any(|known| known == file) {
+                    files.push(file.to_owned());
+                }
+            }
+            if let Some(report) = result.data.get("display").and_then(|display| display.get("tests")).filter(|report| !report.is_null()) {
+                let command = calls
+                    .get(str_field(&result.data, "call_id"))
+                    .and_then(|call| call.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_owned();
+                tests = Some((command, report));
+            }
+        }
+        let mut state = String::new();
+        if !files.is_empty() {
+            state.push_str(&ds.text("steps_state_files", &[("files", &files.join(", "))]));
+        }
+        if let Some((command, report)) = tests {
+            let number = |field: &str| report.get(field).and_then(Value::as_u64).unwrap_or(0).to_string();
+            let names: Vec<&str> = report.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(5).collect();
+            let names = if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) };
+            let command: String = command.lines().next().unwrap_or("").chars().take(80).collect();
+            state.push_str(&ds.text("steps_state_tests", &[("command", &command), ("failed", &number("failed")), ("ran", &number("ran")), ("names", &names)]));
+        }
+        state
+    };
 
     let mut messages: Vec<ChatMessage> = Vec::new();
-    // Pinned right after the system prompt: the spec (or the decision list), whole.
-    if let Some(pinned) = spec::pinned(ds, entries) {
+    // Pinned right after the system prompt: the settled spec (or the decision list), whole.
+    if let Some(pinned) = spec::pinned(ds, settled) {
         messages.push(host_message(ds, &pinned));
     }
     let pins = Pins {
-        source: spec::current(entries).and_then(|(_, current)| current.source_seq).and_then(|seq| spec::source_reference(ds, entries, seq).map(|text| (seq, text))),
-        newest_plans: plan::newest_versions(entries),
+        source: spec::current(settled).and_then(|(_, current)| current.source_seq).and_then(|seq| spec::source_reference(ds, settled, seq).map(|text| (seq, text))),
+        newest_plans: plan::newest_versions(settled),
         spec_versions: spec::versions(entries),
+        settled: settled_through,
     };
     let mut emitted_results: HashSet<String> = HashSet::new();
     let mut host_group: Vec<HostRead> = Vec::new();
@@ -415,6 +548,15 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             index += 1;
             continue;
         }
+        if stepped(entry) {
+            flush_host(&mut host_group, &mut messages);
+            if Some(entry.seq) == steps_first && !step_calls.is_empty() {
+                messages.push(host_message(ds, &digest_text_with(ds, &step_calls, "steps_digest").replace("{state}", &steps_state)));
+            }
+            emit_steers(ds, entry.seq, &steers_at, &mut messages, image_input);
+            index += 1;
+            continue;
+        }
         if let Some(key) = step_key(entry) {
             flush_host(&mut host_group, &mut messages);
             // Collect the whole step.
@@ -455,7 +597,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
                 }
             }
             let mut message = ChatMessage::new("assistant", content);
-            if !reasoning.is_empty() {
+            if !reasoning.is_empty() && reasoning_kept.contains(&key) {
                 message.reasoning_content = Some(reasoning);
             }
             message.tool_calls = tool_calls.clone();
@@ -502,12 +644,14 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
 
 /// What the spec and plans change about entries in place.
 struct Pins {
-    /// The user message the current spec was made from, and the reference it is shown as.
+    /// The user message the settled spec was made from, and the reference it is shown as.
     source: Option<(u64, String)>,
-    /// Seq of the newest version of each plan.
+    /// Seq of the newest settled version of each plan.
     newest_plans: HashMap<String, u64>,
     /// The version of each `spec` entry (its place in append order).
     spec_versions: HashMap<u64, u32>,
+    /// The `settled_through` mark: in-place changes count up to it.
+    settled: u64,
 }
 
 /// How a host read is named to the model: the target its own `read` would take, or what it is.
@@ -557,9 +701,20 @@ fn emit_other(
             let text = attachments::message_text(ds, own, &attached, image_input);
             messages.push(attachments::user_message(text, &attached, image_input))
         }
-        chatflow_kinds::SPEC => messages.push(host_message(ds, &spec::changed_text(ds, pins.spec_versions.get(&entry.seq).copied().unwrap_or(0), data))),
+        chatflow_kinds::SPEC => {
+            let version = pins.spec_versions.get(&entry.seq).copied().unwrap_or(0);
+            // A spec after the mark is not pinned yet: it is shown whole where it was made.
+            let text = if entry.seq > pins.settled { spec::whole_in_place(ds, version, data) } else { None };
+            messages.push(host_message(ds, &text.unwrap_or_else(|| spec::changed_text(ds, version, data))));
+        }
         chatflow_kinds::PLAN => {
-            if let Some(text) = plan::in_place(ds, entry, &pins.newest_plans) {
+            if let Some(text) = plan::in_place(ds, entry, &pins.newest_plans, pins.settled) {
+                messages.push(host_message(ds, &text));
+            }
+        }
+        // A decision accepted after the mark is not pinned yet: it is shown where it was made.
+        chatflow_kinds::DECISION if entry.seq > pins.settled => {
+            if let Some(text) = spec::accepted_in_place(ds, data) {
                 messages.push(host_message(ds, &text));
             }
         }

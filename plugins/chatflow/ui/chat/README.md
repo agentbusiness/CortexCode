@@ -18,7 +18,7 @@ React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
 - **Workbench state read:** `chat.focus`, `chat.stick`, `projectId`, `sessionId`
 - **Workbench state written:** `board.focus`, `chat.focus`, `chat.stick`, `code.open`, `composer.focus`, `pane.tab`, `projectId`, `sessionId`
 - **Own durable state (survives hot swaps):** `scroll`
-- **Frame methods called:** `browser.open`, `chatflow.approve`, `chatflow.decision.answer`, `chatflow.knowledge.answer`, `chatflow.plan.implement`, `chatflow.plan.update`, `chatflow.prewarm`, `chatflow.spec.save`, `chatflow.spec.update`, `chatflow.state`, `frame.journal.read`, `frame.plugins.list`, `frame.project.list`, `memory.project.status`, `memory.task.list`, `source.decide`, `source.diff`, `tools.read`, `tools.save`
+- **Frame methods called:** `browser.open`, `chatflow.approve`, `chatflow.decision.answer`, `chatflow.knowledge.answer`, `chatflow.plan.implement`, `chatflow.plan.update`, `chatflow.spec.save`, `chatflow.spec.update`, `chatflow.state`, `frame.journal.read`, `frame.plugins.list`, `frame.project.list`, `memory.project.status`, `memory.task.list`, `source.decide`, `source.diff`, `tools.read`, `tools.save`
 - **Topics followed:** `agents.changed`, `journal.<session>`, `memory.indexed`, `memory.task.changed`, `plugin.unit`, `project.changed`
 
 Styles use the theme's tokens and primitives only (`ui/verify/tokens.mjs` checks). Nothing is

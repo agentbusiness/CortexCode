@@ -92,6 +92,7 @@ id_ed25519*
 # Logs, profiles, temp files
 # ---------------------------------------------------------------------------
 *.log
+!eval/suites/skillsel/fixtures/**/*.log
 *.tmp
 *.temp
 perf.data*

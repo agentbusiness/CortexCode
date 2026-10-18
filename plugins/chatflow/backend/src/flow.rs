@@ -441,6 +441,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             .map(|entry| str_field(&entry.data, "text").to_owned())
                             .unwrap_or_default();
                         let fallback = RouterDecision {
+                            asks: if text.trim().is_empty() { Vec::new() } else { vec![text.clone()] },
                             work: text,
                             route: "LOOKUP".into(),
                             effort: "medium".into(),
@@ -1025,9 +1026,7 @@ async fn review_plan(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: 
 fn decide_routes(full: Shape, route: &str) -> Shape {
     match route {
         "PLAN" => full.without("route", "DO").without("route", "DELEGATE"),
-        // A change the user asked for is made, not turned into a question back: what no read can
-        // supply is assumed from the statement (a run once ended asking the user for a test file).
-        "DO" => full.without("route", "ANSWER"),
+        // A change keeps ANSWER: a request that can be read two ways is asked back to the user.
         _ => full,
     }
 }
@@ -1195,7 +1194,23 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     if auto {
         journal.set(seq, "implement_run", json!(env.run_id)).await?;
     }
+    if let Some(previous) = &previous {
+        cancel_replaced_tasks(env, previous, &made).await;
+    }
     Ok(())
+}
+
+/// The task records of `previous` that its next version `made` does not carry are cancelled: a
+/// replaced plan's tasks are not work any more (seen: version 1's tasks left pending in the task
+/// list beside version 2's). Best effort: a record left open only shows in the list.
+async fn cancel_replaced_tasks(env: &RunEnv, previous: &plan::Plan, made: &plan::Plan) {
+    let kept: HashSet<&str> = made.tasks.iter().filter_map(|task| task.task_id.as_deref()).chain(made.root_task.as_deref()).collect();
+    let records = previous.tasks.iter().filter_map(|task| task.task_id.as_deref()).chain(previous.root_task.as_deref());
+    for id in records.filter(|id| !kept.contains(id)) {
+        if let Err(error) = env.host.call(memory_methods::TASK_UPDATE, json!({"id": id, "status": "cancelled"})).await {
+            tracing::warn!(%error, task = id, "cancelling a replaced plan's task failed");
+        }
+    }
 }
 
 /// IMPLEMENT: the open plan (or the one the Implement button named) goes to the existing

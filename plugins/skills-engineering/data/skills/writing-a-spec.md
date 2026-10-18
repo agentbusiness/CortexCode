@@ -51,11 +51,10 @@ Only when the user asks.
 - In strings write `\"`, `\n`, `\$`, `` \` `` for a quote, line break, `$`, backtick.
 
 ```bash
-cat > /tmp/spec.json <<EOF
+cx call chatflow.spec.update - <<EOF
 {"session_id": "$CORTEX_SESSION_ID", "title": "CSV and JSON export",
  "text": "<the request as agreed, then one acceptance line per requirement id>",
  "requirements": [{"id": "R1", "text": "When ..."}, {"text": "If ..."}]}
 EOF
-cx call chatflow.spec.update @/tmp/spec.json
 cx call chatflow.spec.save "{\"session_id\": \"$CORTEX_SESSION_ID\"}"   # writes docs/specs/<slug>.md; only when the user wants it in the repo
 ```

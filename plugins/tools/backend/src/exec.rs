@@ -150,6 +150,7 @@ pub async fn execute_in(
         }
         out.code_hits.extend(hits);
     }
+    next_step(core, &session, canonical.tool, &mut out);
     attach_code_skills(core, host.as_ref(), &session.context.session_id, &mut out).await;
     // What the repair changed in the call's meaning comes first (a rename says nothing).
     if !canonical.shown.is_empty() {
@@ -280,7 +281,22 @@ pub async fn read_target(
         None => None,
     };
     let target = qualified.as_deref().unwrap_or(target);
-    let mut path_text = target.to_owned();
+    // `file#Name` (or `file#Type::method`): one definition of the file as it is now, found by the
+    // language's parser, read as its line range (anchors, tracked as a read). A big file is read
+    // one definition at a time instead of whole.
+    let by_name;
+    let target = match target.split_once('#') {
+        Some((file, name)) if !target.contains("://") && !file.is_empty() && !name.trim().is_empty() => match definition_range(session, file, name.trim()) {
+            Ok(lines) => {
+                by_name = format!("{file}:{lines}");
+                by_name.as_str()
+            }
+            Err(message) => return Out::fail("not_found", message),
+        },
+        _ => target,
+    };
+    // `$TMPDIR/...` is the scratch folder `tmp/` (the same folder its shells see).
+    let mut path_text = util::expand_scratch(target, &util::scratch_dir(&session.workspace));
     let mut range = range.map(str::to_owned);
     let mut absolute = util::resolve(&session.workspace, &path_text);
     if range.is_none() && !absolute.exists() {
@@ -384,9 +400,17 @@ async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
 // edit
 
 fn resolve_in_workspace(session: &Session<'_>, path: &str) -> Result<PathBuf, Box<Out>> {
-    let absolute = util::resolve(&session.workspace, path);
+    // The workspace, its scratch folder `tmp/` included (throwaway checks, also as `$TMPDIR/...`).
+    let scratch = util::scratch_dir(&session.workspace);
+    let absolute = util::resolve(&session.workspace, &util::expand_scratch(path, &scratch));
     if !util::is_inside(&absolute, &session.workspace) {
-        return Err(Box::new(Out::fail("outside_workspace", format!("{path} is outside the workspace; edit only files inside it."))));
+        return Err(Box::new(Out::fail(
+            "outside_workspace",
+            format!("{path} is outside the workspace; edit files inside it, a throwaway one in `tmp/<name>`."),
+        )));
+    }
+    if util::is_inside(&absolute, &scratch) {
+        util::ensure_scratch(&session.workspace);
     }
     if absolute.is_dir() {
         return Err(Box::new(Out::fail("is_directory", format!("{path} is a directory"))));
@@ -437,6 +461,34 @@ fn syntax_check(path: &Path, old: &str, new: &str) -> (Option<Vec<lang::SyntaxIs
     }
 }
 
+/// An edit result ends with the step to take next: run the check (seen: seven edits in a row from
+/// re-reading the file shown after each one, never run). After two edits of project files without a
+/// run it says so. A run starts the count again.
+fn next_step(core: &Core, session: &Session<'_>, tool: &str, out: &mut Out) {
+    let session_id = &session.context.session_id;
+    let Ok(mut counts) = core.edits_since_run.lock() else { return };
+    if tool == "run" {
+        counts.remove(session_id);
+        return;
+    }
+    if tool != "edit" || !out.ok || out.changed_files.is_empty() || !out.output.trim_end().ends_with("No errors.") {
+        return;
+    }
+    let scratch = util::scratch_dir(&session.workspace);
+    let in_scratch = out.changed_files.iter().all(|file| util::is_inside(&util::resolve(&session.workspace, file), &scratch));
+    if in_scratch {
+        out.output.push_str("Next: run it.\n");
+        return;
+    }
+    let count = counts.entry(session_id.clone()).or_insert(0);
+    *count += 1;
+    if *count >= 2 {
+        let _ = writeln!(out.output, "You changed the code {count} times without running it: run the check now.");
+    } else {
+        out.output.push_str("Next: run the check.\n");
+    }
+}
+
 /// The check line(s) of an edited file: "No errors." when the syntax check and the language server
 /// are both clean; else one list, the syntax check's new errors first and the language server's
 /// for the other lines, each with its anchored line. Empty when nothing checks the file.
@@ -470,7 +522,12 @@ pub async fn check_text(host: &dyn Host, session: &Session<'_>, check: Check, se
     }
     let errors = items.iter().filter(|(_, _, error)| *error).count();
     let mut text = format!("{label}{}{partial}:\n", crate::langs::counts(errors, items.len() - errors));
-    for (line, message, _) in items.iter().take(crate::langs::EDIT_DIAGNOSTICS_SHOWN) {
+    // Errors are what must be fixed: they are shown first when the list is cut, and last in the
+    // text, right before the step to take (seen: a list ending in style warnings, then a whole
+    // rewrite of a 400-line file instead of four one-line fixes).
+    let mut shown: Vec<&(usize, String, bool)> = items.iter().filter(|(_, _, error)| *error).chain(items.iter().filter(|(_, _, error)| !*error)).take(crate::langs::EDIT_DIAGNOSTICS_SHOWN).collect();
+    shown.sort_by_key(|(line, _, error)| (*error, *line));
+    for (line, message, _) in shown {
         let _ = writeln!(text, "line {line}: {message}");
         if (1..=check.doc.len()).contains(line) {
             text.push_str(&check.doc.render(*line, *line));
@@ -478,6 +535,10 @@ pub async fn check_text(host: &dyn Host, session: &Session<'_>, check: Check, se
     }
     if items.len() > crate::langs::EDIT_DIAGNOSTICS_SHOWN {
         let _ = writeln!(text, "... {} more (read diagnostics://{})", items.len() - crate::langs::EDIT_DIAGNOSTICS_SHOWN, check.display);
+    }
+    if errors > 0 {
+        let what = if errors == 1 { "the error".to_owned() } else { format!("the {errors} errors") };
+        let _ = writeln!(text, "Next: fix {what} above, each at its line{}.", if errors < items.len() { "; the warnings can wait" } else { "" });
     }
     (text, hits)
 }
@@ -532,6 +593,9 @@ fn widen_to_definitions(path: &Path, text: &str, changed: &[(usize, usize)]) -> 
     (shown, whole)
 }
 
+/// Lines shown before and after each syntax error in a refused edit.
+const SYNTAX_CONTEXT: usize = 3;
+
 fn render_regions(doc: &Doc, changed: &[(usize, usize)]) -> String {
     let total = doc.len();
     if total == 0 {
@@ -567,6 +631,124 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
     similar::TextDiff::from_lines(old, new).unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
 }
 
+/// The line range (`a-b`, 1-based) of the one definition of `file` that `name` names: its last
+/// part (`take` in `Cursor::take`) is a word of the definition's header, and every earlier part is
+/// a word of an enclosing definition's header. A refusal lists the candidates when the name is
+/// unknown or names several.
+fn definition_range(session: &Session<'_>, file: &str, name: &str) -> Result<String, String> {
+    let absolute = util::resolve(&session.workspace, &util::expand_scratch(file, &util::scratch_dir(&session.workspace)));
+    let text = std::fs::read_to_string(&absolute).map_err(|_| format!("{file}: no such file."))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let items = crate::lang::Lang::detect(&absolute, &text).and_then(|lang| crate::lang::outline(lang, &text)).ok_or_else(|| format!("{file}: its definitions cannot be listed; read a line range instead, e.g. {file}:1-100."))?;
+    let parts: Vec<&str> = name.split(|c: char| c == ':' || c == '.').filter(|part| !part.is_empty()).collect();
+    let header = |item: &crate::lang::Item| -> String { lines.get(item.start..=item.header_end.min(lines.len().saturating_sub(1))).map(|rows| rows.join(" ")).unwrap_or_default() };
+    let has_word = |text: &str, word: &str| {
+        text.match_indices(word).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    fn walk<'a>(items: &'a [crate::lang::Item], parents: &mut Vec<&'a crate::lang::Item>, out: &mut Vec<(Vec<&'a crate::lang::Item>, &'a crate::lang::Item)>) {
+        for item in items {
+            out.push((parents.clone(), item));
+            parents.push(item);
+            walk(&item.children, parents, out);
+            parents.pop();
+        }
+    }
+    let mut all = Vec::new();
+    walk(&items, &mut Vec::new(), &mut all);
+    let (last, earlier) = parts.split_last().ok_or_else(|| format!("name a definition after `#`, e.g. {file}#Name"))?;
+    let found: Vec<&crate::lang::Item> = all
+        .iter()
+        .filter(|(parents, item)| has_word(&header(item), last) && earlier.iter().all(|part| parents.iter().any(|parent| has_word(&header(parent), part))))
+        .map(|(_, item)| *item)
+        .collect();
+    let shown = |item: &crate::lang::Item| format!("line {} `{}`", item.start + 1, lines.get(item.start).map(|line| line.trim().chars().take(60).collect::<String>()).unwrap_or_default());
+    match found.as_slice() {
+        [item] => Ok(format!("{}-{}", item.start + 1, item.end + 1)),
+        [] => {
+            let listed: Vec<String> = all.iter().take(30).map(|(_, item)| shown(item)).collect();
+            Err(format!("{file} has no definition named `{name}`. Its definitions:\n{}", listed.join("\n")))
+        }
+        many => {
+            let listed: Vec<String> = many.iter().take(10).map(|item| shown(item)).collect();
+            Err(format!("`{name}` names {} definitions in {file}; name the one you mean with its type, e.g. {file}#Type::{last}:\n{}", many.len(), listed.join("\n")))
+        }
+    }
+}
+
+/// Files of at most this many lines are shown whole after an edit: the same size a read shows whole.
+const WHOLE_AFTER_EDIT: usize = 300;
+
+/// Top-level definitions one edit may replace in an existing file.
+const MAX_DEFINITIONS_PER_EDIT: usize = 2;
+
+/// Lines of a definition's body that hold code: after its header, neither blank nor only closing
+/// brackets. A stub (`pass`, `todo!()`, one `throw`) or a one-line function has at most one.
+fn body_lines(lines: &[&str], item: &crate::lang::Item) -> usize {
+    let end = item.end.min(lines.len().saturating_sub(1));
+    (item.header_end + 1..=end)
+        .filter_map(|index| lines.get(index))
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ',')))
+        .count()
+}
+
+/// A file whose definitions are all stubs or one-liners (a skeleton to fill): written whole, it
+/// loses no working code.
+fn is_skeleton(path: &Path, text: &str) -> bool {
+    let Some(items) = crate::lang::Lang::detect(path, text).and_then(|lang| crate::lang::outline(lang, text)) else {
+        return false;
+    };
+    fn all_stubs(items: &[crate::lang::Item], lines: &[&str]) -> bool {
+        items.iter().all(|item| if item.children.is_empty() { body_lines(lines, item) <= 1 } else { all_stubs(&item.children, lines) })
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    !items.is_empty() && all_stubs(&items, &lines)
+}
+
+/// The top-level definitions of `old` that an edit replaces: a function with whatever it nests, or
+/// a class (impl, struct) with its methods, each counted once; a namespace or module is looked
+/// through. One counts when a function in it lost at least half of its lines (`line_map` maps each
+/// old line to its new one, None when replaced or deleted). A small fix inside a function does not
+/// count, nor does a stub or one-line function (filling a skeleton loses no working code), nor one
+/// that was only deleted (`written`: the line ranges that got new text). Their header lines,
+/// shortened, as names. None when the language has no outline.
+fn replaced_definitions(path: &Path, old: &str, line_map: &[Option<usize>], written: &[(usize, usize)]) -> Option<Vec<String>> {
+    let items = crate::lang::Lang::detect(path, old).and_then(|lang| crate::lang::outline(lang, old))?;
+    let lines: Vec<&str> = old.lines().collect();
+    let replaced = |item: &crate::lang::Item| {
+        let span = item.start..=item.end.min(line_map.len().saturating_sub(1));
+        let total = span.clone().count();
+        let gone = span.filter(|&index| line_map.get(index).is_some_and(Option::is_none)).count();
+        // `written` holds 1-based ranges that got new text; `item` rows are 0-based.
+        let overwritten = written.iter().any(|&(at, to)| at <= item.end + 1 && to >= item.start + 1);
+        total >= 2 && gone * 2 >= total && body_lines(&lines, item) > 1 && overwritten
+    };
+    fn any_replaced(item: &crate::lang::Item, replaced: &dyn Fn(&crate::lang::Item) -> bool) -> bool {
+        if item.children.is_empty() { replaced(item) } else { item.children.iter().any(|child| any_replaced(child, replaced)) }
+    }
+    fn top_level<'a>(items: &'a [crate::lang::Item], out: &mut Vec<&'a crate::lang::Item>) {
+        for item in items {
+            let namespace = matches!(
+                item.kind.as_str(),
+                "namespace_definition" | "namespace_declaration" | "mod_item" | "foreign_mod_item" | "internal_module" | "module"
+            );
+            if namespace && !item.children.is_empty() { top_level(&item.children, out) } else { out.push(item) }
+        }
+    }
+    let mut tops = Vec::new();
+    top_level(&items, &mut tops);
+    let names = tops
+        .into_iter()
+        .filter(|item| any_replaced(item, &replaced))
+        .map(|item| lines.get(item.start).map(|line| line.trim().chars().take(50).collect::<String>()).unwrap_or_default())
+        .collect();
+    Some(names)
+}
+
 fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Commit) -> Out {
     let Commit { absolute, display, old, new, line_map, changed, notes } = commit;
     let old_text = old.clone().unwrap_or_default();
@@ -588,10 +770,29 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
                 let _ = writeln!(text, "- line {}: {}", issue.line, issue.detail);
             }
             text.push_str("What the edit would make it (not in the file):\n");
+            // The changed region, and every error line with the lines around it: an error just past
+            // the changed region (a leftover brace) must be in view, or the same edit comes back.
+            let mut lines: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             for &(start, end) in &shown {
-                for line in start.saturating_sub(1)..(end + 1).min(proposed.len()) {
-                    let _ = writeln!(text, "{}  {}", line + 1, proposed.lines[line]);
+                lines.extend(start.saturating_sub(1)..(end + 1).min(proposed.len()));
+            }
+            for issue in issues.iter().take(5) {
+                let at = issue.line.saturating_sub(1);
+                lines.extend(at.saturating_sub(SYNTAX_CONTEXT)..(at + SYNTAX_CONTEXT + 1).min(proposed.len()));
+            }
+            let mut previous: Option<usize> = None;
+            for line in lines {
+                if previous.is_some_and(|previous| line > previous + 1) {
+                    text.push_str("...\n");
                 }
+                let number = (line + 1).to_string();
+                let _ = writeln!(text, "{number}  {}", proposed.lines[line]);
+                // A caret under each error's column: the spot, not only the line.
+                for issue in issues.iter().take(5).filter(|issue| issue.line == line + 1) {
+                    let lead: String = proposed.lines[line].chars().take(issue.column.saturating_sub(1)).map(|c| if c == '\t' { '\t' } else { ' ' }).collect();
+                    let _ = writeln!(text, "{}  {lead}^ {}", " ".repeat(number.len()), issue.detail);
+                }
+                previous = Some(line);
             }
             text.push_str("Send the edit again with the error fixed; the anchors from your last read still hold.\n");
             return Out::fail("syntax_error", text);
@@ -616,13 +817,31 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     };
     let mut output = String::new();
     if line_map.is_some() {
-        let anchors = if edit_format(session.context) == EditFormat::Hashline { ", with new anchors" } else { "" };
+        // The prefix is named once here: after a whole-file echo the model doubted whether the
+        // `N:hh|` prefixes were in the file and sent edits that repeated them.
+        let anchors = if edit_format(session.context) == EditFormat::Hashline { ", with new anchors (the `N:hh|` prefix is not part of a line)" } else { "" };
         // A change inside a function shows that whole function as it now is: the model compares
         // its intent with the real function, never with fragments it pieced together.
         let (shown, whole) = widen_to_definitions(&absolute, &new, &changed);
         let what = if whole { "Each changed function, whole, as it is now" } else { "Changed lines and 2 around them" };
-        let _ = writeln!(output, "{verb} {display}. {what}{anchors}:");
-        output.push_str(&render_regions(&doc, &shown));
+        // A read of this file earlier in the conversation now shows an older version (reads are
+        // never rewritten afterwards: that keeps the conversation in the model's cache). Said once
+        // per edit after a read, so the model does not doubt the file on disk (seen: caches
+        // cleared and the module's source inspected to see "which version runs").
+        if core.read_state.take_read_since_edit(&session.context.session_id, &absolute) {
+            let _ = writeln!(output, "Your earlier reads of {display} above are older than this edit; the file on disk is as shown here.");
+        }
+        if doc.len() <= WHOLE_AFTER_EDIT {
+            // A small file is shown whole after every edit: the model has the complete current
+            // file and no reason to read it again (seen: re-reads after every edit when only the
+            // changed functions were shown). Older views collapse to one line at the next settle.
+            let _ = writeln!(output, "{verb} {display}. The whole file as it is now{anchors}:");
+            output.push_str(&doc.render(1, doc.len()));
+            let _ = writeln!(output, "[end of file]");
+        } else {
+            let _ = writeln!(output, "{verb} {display}. {what}{anchors} ({} lines; the rest is unchanged):", doc.len());
+            output.push_str(&render_regions(&doc, &shown));
+        }
         // Lines the edit took out whose text is nowhere in what it wrote: a replace over the wrong
         // range shows here, not only when a run fails later (seen: a branch replaced away).
         if let (Some(old), Some(map)) = (&old, &line_map) {
@@ -637,6 +856,10 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         output.push_str(&read::render_outline(&absolute, &display, &new, &doc, false));
     }
     let (syntax_issues, syntax) = syntax_check(&absolute, &old_text, &new);
+    // The model's work: a turn's cleanup keeps what `edit` wrote.
+    if let Ok(mut edited) = core.edited.lock() {
+        edited.entry(session.context.session_id.clone()).or_default().insert(absolute.clone());
+    }
     host.publish(
         topics::FILES_CHANGED,
         json!({ "workspace": session.context.workspace, "paths": [display.clone()], "session_id": session.context.session_id }),
@@ -719,28 +942,33 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
     let session_id = &session.context.session_id;
 
     // Both `content` and `edits` sent (the two forms describe the same change): the whole content
-    // where a whole write is allowed (a new file, or a stub not changed yet), else the edits.
+    // where a whole write is allowed (a new or empty file), else the edits.
+    // A throwaway file in the session's scratch folder is the model's own: written whole freely
+    // (nothing of the user's to protect there).
+    let in_scratch = util::is_inside(&absolute, &util::scratch_dir(&session.workspace));
     let rewrite_refused = |existing: &Option<String>| {
-        existing.as_ref().is_some_and(|text| !text.trim().is_empty())
+        !in_scratch
+            && existing.as_ref().is_some_and(|text| !text.trim().is_empty() && !is_skeleton(&absolute, text))
             && edit_format(session.context) != EditFormat::Whole
-            && core.read_state.has_changed(session_id, &absolute)
     };
     let content = args.get("content").and_then(Value::as_str).filter(|_| !args.contains_key("edits") || !rewrite_refused(&current));
     if let Some(content) = content {
-        // `content` writes a file whole once: a new file, or a stub the session has not changed yet.
-        // A file the session already changed is changed by anchored edits, never written whole
-        // again (a rewrite throws away what worked and hides what changed). The task step says so
-        // up front; the refusal carries the file with its anchors for the next call.
+        // `content` writes a new (or empty) file. An existing file is changed only where it needs
+        // changing, never written whole: a whole write replaces code that works and hides what
+        // changed (seen: "clean rewrites" that dropped working functions). A full rewrite the user
+        // asked for is one edit over the file's lines. The refusal carries the file with its
+        // anchors for the next call.
         if let Some(existing) = &current
+            && !in_scratch
             && !existing.trim().is_empty()
+            && !is_skeleton(&absolute, existing)
             && edit_format(session.context) != EditFormat::Whole
-            && core.read_state.has_changed(session_id, &absolute)
         {
             let view = read_target(core, host, session, &display, None, true, Default::default()).await;
             let (text, artifact) = offload_text(core, view.output, core.config.read_limits);
             let how = match edit_format(session.context) {
                 EditFormat::Replace => "with old/new replacements",
-                _ => "with anchored edits, every change to it in one call",
+                _ => "with anchored edits, one or two top-level definitions per call",
             };
             let mut text = text;
             if !text.ends_with('\n') {
@@ -748,13 +976,17 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
             }
             let mut out = Out::fail(
                 "whole_rewrite",
-                format!("Nothing was written: you already changed {display}, so it is not written whole again. Its current content:\n{text}Change the parts that need changing {how}."),
+                format!(
+                    "Nothing was written: {display} exists (a file is written whole again only when the user asks). Its current content:\n{text}Change it {how}, only the lines the task needs."
+                ),
             );
             out.display = view.display;
             out.artifact = artifact;
             return out;
         }
-        if let Some(existing) = &current {
+        if let Some(existing) = &current
+            && !in_scratch
+        {
             let hash = util::content_hash(existing.as_bytes());
             if !core.read_state.has_seen(session_id, &absolute, &hash) {
                 let reason = if core.read_state.has_read_any(session_id, &absolute) {
@@ -813,6 +1045,39 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         let view = core.read_state.view(session_id, &absolute, &hash);
         return match hashedit::apply(&doc, view.as_ref(), &ops) {
             Ok(applied) => {
+                // One edit replaces at most two definitions of an existing file: a whole rewrite
+                // sent as many line ranges breaks on one range off by a line, and the whole
+                // generation is lost (seen: four 3k-token implementations refused in a row).
+                // Only code written over code counts: a delete (or a replace with a line or two)
+                // generates nothing to lose (seen: dead code after a refactor refused four times).
+                let written: Vec<(usize, usize)> = ops
+                    .iter()
+                    .filter(|op| op.lines.len() > 2)
+                    .filter_map(|op| {
+                        let line = |reference: &hashedit::LineRef| match reference {
+                            hashedit::LineRef::Tagged(anchor) => Some(anchor.line),
+                            hashedit::LineRef::Bare(line) => Some(*line),
+                            hashedit::LineRef::Start => None,
+                        };
+                        let at = line(&op.at)?;
+                        Some((at, op.to.as_ref().and_then(line).unwrap_or(at)))
+                    })
+                    .collect();
+                if !in_scratch
+                    && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
+                    && replaced.len() > MAX_DEFINITIONS_PER_EDIT
+                {
+                    let names: Vec<String> = replaced.iter().take(6).map(|name| format!("`{name}`")).collect();
+                    return Out::fail(
+                        "too_big",
+                        format!(
+                            "Nothing was written: this edit replaces {} top-level definitions of {display} at once ({}{}). Change an existing file one or two top-level definitions per edit (a class with its methods is one); the anchors of the lines you do not change stay valid between edits.",
+                            replaced.len(),
+                            names.join(", "),
+                            if replaced.len() > 6 { ", ..." } else { "" }
+                        ),
+                    );
+                }
                 // Anchors mapped through the session's own edits are journaled, not told.
                 if !applied.relocations.is_empty() {
                     notes
@@ -820,12 +1085,53 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 }
                 let new = applied.doc.to_text();
                 let old = current.map(|_| text);
-                commit(
+                let mut out = commit(
                     core,
                     host,
                     session,
                     Commit { absolute, display, old, new, line_map: Some(applied.line_map), changed: applied.changed, notes },
-                )
+                );
+                // Operations whose anchors no longer named their line: the rest was written.
+                if !applied.skipped.is_empty() {
+                    out.output.push_str(&applied.skipped);
+                }
+                // A refused edit whose cause is a one-line replace carrying many lines (no `to`):
+                // the lines after the anchor stayed, which is where the extra braces come from
+                // (seen: four full implementations refused before the model gave the range).
+                if !out.ok {
+                    let old_line = |line: usize| doc.lines.get(line.wrapping_sub(1)).map(|text| text.trim().to_owned());
+                    // The anchor to copy (`121:ab`): a bare line number gets the same call resent.
+                    let anchor = |line: usize| if (1..=doc.lines.len()).contains(&line) { format!("{line}:{}", doc.tag(line - 1)) } else { line.to_string() };
+                    let closing = |text: &str| !text.is_empty() && text.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ',')) || text == "end";
+                    for (index, op) in ops.iter().enumerate() {
+                        let first = op.lines.iter().map(|line| line.trim()).find(|line| !line.is_empty()).unwrap_or("");
+                        let last = op.lines.iter().rev().map(|line| line.trim()).find(|line| !line.is_empty()).unwrap_or("");
+                        if op.kind == hashedit::OpKind::Replace && op.to.is_none() && op.lines.len() > 1 {
+                            let _ = writeln!(out.output, "Edit #{} replaced only its `at` line with {} lines (no `to`): the lines after it stayed. Give `to`, the last line to replace.", index + 1, op.lines.len());
+                        }
+                        // Where to look: a range that ends one line before a closing line its text
+                        // also ends with, or starts one line after a line its text also starts with
+                        // (seen: three refusals in one task, each a range ending one line early).
+                        if op.kind == hashedit::OpKind::Replace
+                            && let Some(hashedit::LineRef::Tagged(to)) = &op.to
+                            && let Some(after) = old_line(to.line + 1)
+                            && closing(&after)
+                            && after == last
+                        {
+                            let _ = writeln!(out.output, "Look at edit #{}: its text ends with `{last}`, and line {} right after its `to` is `{after}` too: the range ends one line early. Give `to` as `{}`.", index + 1, to.line + 1, anchor(to.line + 1));
+                        }
+                        if op.kind == hashedit::OpKind::Replace
+                            && let hashedit::LineRef::Tagged(at) = &op.at
+                            && at.line > 1
+                            && let Some(before) = old_line(at.line - 1)
+                            && before.len() > 3
+                            && before == first
+                        {
+                            let _ = writeln!(out.output, "Look at edit #{}: its text starts with `{first}`, and line {} right before its `at` is the same: the range starts one line late. Give `at` as `{}`.", index + 1, at.line - 1, anchor(at.line - 1));
+                        }
+                    }
+                }
+                out
             }
             Err(rejection) => {
                 let mut out = Out::fail(rejection.error_kind, rejection.message);
@@ -1084,6 +1390,25 @@ pub fn present_output(core: &Core, captured: Captured, limits: InlineLimits) -> 
     }
 }
 
+/// Bytes of output a test run may have for its compact view (see [`crate::testout`]).
+const TEST_VIEW_BYTES: u64 = 1 << 20;
+
+/// A failing test run shown in the form the model acts on (see [`crate::testout`]): its counts,
+/// one line per failing test, the first failure whole, and the whole output kept as an artifact
+/// for the rest. Any other output is `text` as given.
+fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
+    let Some(whole) = whole else { return (text, artifact) };
+    let Some(summary) = crate::testout::present(&whole) else { return (text, artifact) };
+    let id = match artifact {
+        Some(id) => id,
+        None => match core.artifacts.store(whole.as_bytes()) {
+            Ok(id) => id,
+            Err(_) => return (text, None),
+        },
+    };
+    (format!("{summary}\nEvery failure whole: read artifact://{id}\n"), Some(id))
+}
+
 /// The paths named on the lines of captured output that report a refused write
 /// (see [`sandbox::eperm_paths`]).
 fn refused_paths(captured: &Captured) -> Vec<PathBuf> {
@@ -1097,8 +1422,61 @@ fn refused_paths(captured: &Captured) -> Vec<PathBuf> {
     }
 }
 
+/// Programs that walk a directory tree for files or text.
+const SEARCHERS: &[&str] = &["find", "grep", "egrep", "fgrep", "rg", "ag", "ack", "fd"];
+
+/// Whether a command searches the whole machine: a tree-walking search given `/` or the home folder
+/// as a path (structural: the program's name and a `/`, `~` or home-folder word, in any simple
+/// command of the script; `$HOME` is an expansion, so it is matched in the raw words).
+fn searches_whole_disk(command: &str) -> bool {
+    let raw_home = command.split_whitespace().any(|word| matches!(word.trim_end_matches('/'), "$HOME" | "${HOME}" | "\"$HOME\"" | "\"${HOME}\""));
+    crate::approval::simple_commands(command).iter().any(|words| {
+        let Some(Some(program)) = words.first() else { return false };
+        let name = program.rsplit('/').next().unwrap_or(program);
+        // `/` or the home folder: both hold the whole machine's files (seen: `find ~` for minutes).
+        let home = std::env::var("HOME").unwrap_or_default();
+        let whole = |word: &str| {
+            let word = word.trim_end_matches('/');
+            word.is_empty() || matches!(word, "~" | "$HOME" | "${HOME}") || (!home.is_empty() && word == home.trim_end_matches('/'))
+        };
+        SEARCHERS.contains(&name) && (raw_home || words.iter().skip(1).any(|word| word.as_deref().is_some_and(whole)))
+    })
+}
+
 /// The directories commands may write, in words, for model-facing explanations.
-const WRITABLE: &str = "the workspace, temp dirs, package caches, your Python venv";
+const WRITABLE: &str = "the workspace, temp dirs, package caches and your Python venv";
+
+/// The step after the sandbox kept a program from starting.
+const PROGRAM_STEP: &str = "When the user's request needs what it shows, run the same command with `permission` saying why: the user is asked once, then it runs outside the sandbox. Otherwise answer from what you can read.";
+
+/// Whether `path` is a program file (a regular file someone may execute), as opposed to a place a
+/// command tried to write.
+fn is_program(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// The step after the sandbox stopped a command.
+const LIFT_STEP: &str = "If the task cannot be done without it (an install), run the command that does it with `permission` saying why: an install changes the user's machine, so the user is asked first; once they approve it runs. Never ask for what commands may do already.";
+
+/// The programs a shell reported missing in command output (`command not found`, as sh, bash and
+/// zsh word it), in order, once each.
+fn missing_programs(output: &str) -> Vec<String> {
+    let word = |text: &str| text.split_whitespace().next().map(|word| word.trim_matches(|c| c == '\'' || c == '`').to_owned()).filter(|word| !word.is_empty());
+    let mut programs: Vec<String> = Vec::new();
+    for line in output.lines().map(str::trim_end) {
+        let program = match line.split_once("command not found: ") {
+            Some((_, rest)) => word(rest),
+            None => line.strip_suffix(": command not found").and_then(|head| head.rsplit(": ").next()).and_then(word),
+        };
+        if let Some(program) = program
+            && !programs.contains(&program)
+        {
+            programs.push(program);
+        }
+    }
+    programs
+}
 
 /// The end of a run's result: its exit (the time only when it took over 10 s).
 fn exit_line(code: i32, duration_ms: u64) -> String {
@@ -1130,21 +1508,6 @@ fn started_line(job_id: &str, artifact: &str, wake: &Wake) -> String {
         }
     };
     format!("Started background job {job_id}. You are woken when {when}. Its output so far: read artifact://{artifact}. Stop it: `cx job kill {job_id}`.\n")
-}
-
-/// Paths of `write_outside` (absolute, or relative to the command's directory).
-fn requested_writes(args: &Map<String, Value>, cwd: &Path) -> Vec<PathBuf> {
-    let values: Vec<&str> = match args.get("write_outside") {
-        Some(Value::String(path)) => vec![path.as_str()],
-        Some(Value::Array(paths)) => paths.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
-    };
-    values
-        .into_iter()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| util::canonical_lenient(&util::resolve(cwd, path)))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1401,7 +1764,11 @@ async fn run_in_container(
     let exit_code = result.get("exit_code").and_then(Value::as_i64).map(|code| code as i32);
     let duration_ms = result.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
     let timed_out = result.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
-    let (mut text, artifact, bytes) = present_output(core, Captured::Mem(output), core.config.run_limits);
+    let captured = Captured::Mem(output);
+    let whole = captured.whole(TEST_VIEW_BYTES);
+    let tests = whole.as_deref().and_then(crate::testout::summary);
+    let (text, artifact, bytes) = present_output(core, captured, core.config.run_limits);
+    let (mut text, artifact) = test_view(core, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
@@ -1420,7 +1787,7 @@ async fn run_in_container(
         }
     };
     let mut out = Out { ok, output: text, artifact: artifact.clone(), error_kind: kind.map(str::to_owned), code_hits, ..Out::default() };
-    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "artifact": artifact, "bytes": bytes, "container": container.id });
+    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "artifact": artifact, "bytes": bytes, "tests": tests, "container": container.id });
     out
 }
 
@@ -1432,7 +1799,8 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     if let Some(container) = project_container(host, session).await {
         return run_in_container(core, host, session, &container, command, args, cancel).await;
     }
-    let shell_cwd = core.shells.saved_cwd(&session.context.session_id).unwrap_or_else(|| session.workspace.clone());
+    // Every command starts in the workspace (see `crate::shell`); a relative `cwd` is from there.
+    let shell_cwd = session.workspace.clone();
     let cwd = args.get("cwd").and_then(Value::as_str).map(|cwd| util::resolve(&shell_cwd, cwd));
     if let Some(cwd) = &cwd
         && !cwd.is_dir()
@@ -1440,60 +1808,120 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         return Out::fail("not_found", format!("cwd {} is not a directory", cwd.display()));
     }
     let effective_cwd = cwd.clone().unwrap_or(shell_cwd);
+    // A search of the whole machine takes minutes and finds nothing the project needs (seen: a
+    // model hunting a missing file with `find /` and `grep -r /`): answered with where to search.
+    // Files are written with edit (line anchors, the result shows the change, the host tracks
+    // them), not through the terminal (seen: a check rewritten whole with `cat > f <<EOF` again
+    // and again).
+    // A plain look at one project file through the terminal (`cat f`, `head -40 f`, `sed -n
+    // '10,40p' f`) is answered as a `read`: the same lines, with anchors for edit, and tracked as a
+    // read (seen: `cat bowling.py` three times in one task; the next edit had no anchors and the
+    // reads stayed whole in the history).
+    if let Some((file, range)) = crate::approval::terminal_read(command)
+        && let Ok(absolute) = resolve_in_workspace(session, &file)
+        && absolute.is_file()
+    {
+        let mut read_args = Map::new();
+        let path = match &range {
+            Some(range) if range.starts_with('-') => {
+                // `tail -N`: the last N lines of the file.
+                let total = std::fs::read_to_string(&absolute).map(|text| text.lines().count()).unwrap_or(0);
+                let last: usize = range[1..].parse().unwrap_or(10);
+                format!("{file}:{}-{total}", total.saturating_sub(last) + 1)
+            }
+            Some(range) => format!("{file}:{range}"),
+            None => file.clone(),
+        };
+        read_args.insert("path".to_owned(), Value::String(path));
+        let mut out = exec_read(core, host, session, &read_args).await;
+        out.output = format!("(Shown with the read tool, so the lines carry anchors for edit; use read for files.)\n{}", out.output);
+        return out;
+    }
+    // A here-document into the scratch folder `tmp/` or outside the project (`/tmp/x`) runs: a
+    // refusal there protects nothing and costs a step. Project files go through edit.
+    let scratch = util::scratch_dir(&session.workspace);
+    let own = |target: &str| {
+        let absolute = util::resolve(&session.workspace, &util::expand_scratch(target, &scratch));
+        util::is_inside(&absolute, &scratch) || !util::is_inside(&absolute, &session.workspace)
+    };
+    let edits = crate::approval::terminal_edits(command, &own);
+    if !edits.is_empty() {
+        return Out::fail(
+            "terminal_edit",
+            format!("Not run: it {} through the terminal. Write the file with edit (a project file by its path, a throwaway one as `tmp/<name>`), then run it.", edits.join(" and ")),
+        );
+    }
+    if searches_whole_disk(command) {
+        return Out::fail(
+            "whole_disk_search",
+            format!("Not run: `/` and the home folder hold the whole machine, and searching them takes minutes. Search the project ({}) or a folder you know, e.g. `grep -rn <text> .`.", session.workspace.display()),
+        );
+    }
     let runtime = match core.runtime(&session.context.session_id, &session.workspace, session.python_env).await {
         Ok(runtime) => runtime,
         Err(message) => return Out::fail("sandbox_unavailable", message),
     };
     let venv_path = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
     let writable = |path: &Path| core.sandbox.writable(path, &session.workspace, venv_path.as_deref(), &runtime.grants);
-    // Writes outside the sandbox: asked for by the model (`write_outside`) or, in ask mode, implied
-    // by a deletion or overwrite outside the workspace that the user is asked about anyway.
-    let requested = requested_writes(args, &effective_cwd);
-    if requested.iter().any(|path| core.sandbox.protected(path)) {
-        return Out::fail("protected_path", "Not run: it would change CortexCode's own state.\n".to_owned());
-    }
-    let mut write_classes: Vec<String> = requested.iter().filter(|path| !writable(path)).map(|path| sandbox::write_class(path)).collect();
+    let session_id = &session.context.session_id;
+    // Past the sandbox: the model asks with `permission` (why the command needs it); the user decides
+    // in every mode, and the approved command runs without the sandbox.
+    let permission = args.get("permission").and_then(Value::as_str).map(str::trim).filter(|why| !why.is_empty());
+    let lift = sandbox::lift_class(command);
+    let lifted = core.approved(session_id).contains(&lift);
+    let mut classes: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut concerns: Vec<approval::Concern> = Vec::new();
     if session.context.mode == "ask" {
-        let approved = core.approved(&session.context.session_id);
+        let approved = core.approved(session_id);
         let all = approval::assess(command, &approval::Context { cwd: &effective_cwd, workspace: &session.workspace });
-        for concern in &all {
-            if let Some(path) = &concern.path
-                && !writable(path)
-            {
-                write_classes.push(sandbox::write_class(path));
+        // A deletion or overwrite outside the workspace the user is asked about anyway widens the
+        // sandbox for its folder; a command past the sandbox needs no folder.
+        let mut write_classes: Vec<String> = Vec::new();
+        if !lifted && permission.is_none() {
+            for concern in &all {
+                if let Some(path) = &concern.path
+                    && !writable(path)
+                {
+                    write_classes.push(sandbox::write_class(path));
+                }
             }
         }
-        let concerns: Vec<approval::Concern> = all.into_iter().filter(|concern| !approved.contains(concern.class)).collect();
         write_classes.sort();
         write_classes.dedup();
-        if !concerns.is_empty() || !write_classes.is_empty() {
-            let mut classes: Vec<String> = concerns.iter().map(|concern| concern.class.to_owned()).collect();
-            classes.dedup();
-            classes.extend(write_classes.iter().cloned());
-            let mut reasons: Vec<String> =
-                concerns.iter().map(|concern| format!("{} ({})", describe_class(concern.class), concern.detail)).collect();
-            reasons.extend(write_classes.iter().map(|class| describe_class(class)));
-            let mut output = String::from("Not run: this command needs the user's approval because it ");
-            output.push_str(&reasons.join("; "));
-            output.push_str(". The user has been asked; continue with other work or wait for their answer.\n");
-            let mut out = Out::fail("needs_approval", output);
-            out.needs_approval = true;
-            out.display = json!({ "approval": { "classes": classes, "concerns": concerns, "command": command } });
-            return out;
-        }
-    } else if !write_classes.is_empty() {
-        write_classes.sort();
-        write_classes.dedup();
-        let paths: Vec<&str> = write_classes.iter().filter_map(|class| class.strip_prefix(sandbox::WRITE_CLASS_PREFIX)).collect();
-        let output = format!(
-            "Not run: it writes to {}, outside the folders commands may write to ({WRITABLE}). Do it inside the workspace; if that is impossible, say in your reply what it needs.\n",
-            paths.join(", ")
-        );
-        let mut out = Out::fail("approval_required", output);
-        out.display = json!({ "approval": { "classes": write_classes, "command": command, "mode": "auto" } });
+        concerns = all.into_iter().filter(|concern| !approved.contains(concern.class)).collect();
+        classes = concerns.iter().map(|concern| concern.class.to_owned()).collect();
+        classes.dedup();
+        classes.extend(write_classes.iter().cloned());
+        reasons = concerns.iter().map(|concern| format!("{} ({})", describe_class(concern.class), concern.detail)).collect();
+        reasons.extend(write_classes.iter().map(|class| describe_class(class)));
+    }
+    // An offline workspace (the marker file) has no network for anyone: an install or a download
+    // cannot run here whoever approves it, so it is a result, not a question (seen: an unattended
+    // run waiting for a human on a `pip install`).
+    if permission.is_some() && !lifted && session.workspace.join(crate::sandbox::OFFLINE_MARKER).exists() {
+        return Out::fail("offline", "Not run: this workspace is offline, so a command that needs the network or an install cannot run here. Work with what the project has.".to_owned());
+    }
+    let asks_lift = permission.is_some() && !lifted;
+    if let Some(why) = permission
+        && !lifted
+    {
+        classes.push(lift.clone());
+        reasons.push(format!("runs past the sandbox: it may write outside the workspace and use the network ({why})"));
+    }
+    if !classes.is_empty() {
+        let mut output = String::from("Not run: this command needs the user's approval because it ");
+        output.push_str(&reasons.join("; "));
+        output.push_str(". The user has been asked; continue with other work or wait for their answer.\n");
+        let mut out = Out::fail("needs_approval", output);
+        out.needs_approval = true;
+        out.display = json!({ "approval": { "classes": classes, "concerns": concerns, "command": command, "always": asks_lift } });
         return out;
     }
-    let identity = identity(core, session, Some(&runtime));
+    let mut identity = identity(core, session, Some(&runtime));
+    if lifted {
+        identity.sandbox = None;
+    }
     // The language plugins' installed toolchains (Go, a JDK, shellcheck ...) on the command's PATH.
     let toolchain = crate::langs::toolchain(host.as_ref()).await;
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
@@ -1514,7 +1942,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             env_file: env_file.as_deref(),
             identity_env,
             wake: wake.clone(),
-            sandbox: Some(&runtime.sandbox),
+            sandbox: identity.sandbox.as_ref(),
             venv: venv_path.as_deref(),
             toolchain: toolchain.clone(),
         }) {
@@ -1541,8 +1969,16 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         Ok(run) => run,
         Err(error) => return Out::fail("shell_error", format!("could not run the command: {error}")),
     };
-    // A refused write: the OS error names a path the sandbox does not let commands write.
-    let eperm = refused_paths(&run.output).iter().any(|path| !writable(path));
+    // EPERM names a path. A program file there could not start: macOS never lets a sandboxed
+    // command start a program that takes more rights (setuid tools such as `ps` and `top`), whatever
+    // the profile says. Any other path is a refused write.
+    let refused = if lifted { Vec::new() } else { refused_paths(&run.output) };
+    let blocked_programs: Vec<String> = refused
+        .iter()
+        .filter(|path| !writable(path.as_path()) && is_program(path.as_path()))
+        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .collect();
+    let eperm = refused.iter().any(|path| !writable(path.as_path()) && !is_program(path.as_path()));
     let code_hits = match &run.output {
         Captured::Mem(bytes) => verifier_hits(host, command, &bytes[..]).await,
         Captured::File { path, .. } => match std::fs::File::open(path) {
@@ -1550,14 +1986,27 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Err(_) => Vec::new(),
         },
     };
-    let (mut text, artifact, bytes) = present_output(core, run.output, core.config.run_limits);
+    let whole = run.output.whole(TEST_VIEW_BYTES).map(|whole| util::relative_paths(&whole, &session.workspace));
+    let tests = whole.as_deref().and_then(crate::testout::summary);
+    let (text, artifact, bytes) = present_output(core, run.output, core.config.run_limits);
+    let text = util::relative_paths(&text, &session.workspace);
+    let (mut text, artifact) = test_view(core, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     let seconds = run.duration_ms as f64 / 1000.0;
     // Notes on how it ran come before its exit line, which stays last.
+    if !blocked_programs.is_empty() {
+        let names: Vec<String> = blocked_programs.iter().map(|name| format!("`{name}`")).collect();
+        let _ = writeln!(text, "[{} could not start: a command in the sandbox cannot start a program that needs more rights than it has. {PROGRAM_STEP}]", names.join(", "));
+    }
     if eperm {
-        let _ = writeln!(text, "[\"Operation not permitted\": commands may write only in the workspace, temp dirs, package caches and your venv.]");
+        let _ = writeln!(text, "[\"Operation not permitted\": the sandbox stopped this (commands may write only in {WRITABLE}). {LIFT_STEP}]");
+    }
+    let missing = missing_programs(&text);
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(|program| format!("`{program}`")).collect();
+        let _ = writeln!(text, "[{} not installed. {LIFT_STEP}]", names.join(", "));
     }
     if let Some(error) = &runtime.venv_error
         && core.read_state.first_note(&session.context.session_id, "no-venv")
@@ -1596,6 +2045,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         "cancelled": run.cancelled,
         "artifact": artifact,
         "bytes": bytes,
+        "tests": tests,
         "sandbox": {
             "venv": venv_path,
             "venv_kind": runtime.venv.as_ref().map(|venv| if matches!(venv, PyEnv::Project(_)) { "project" } else { "auto" }),

@@ -142,30 +142,8 @@ pub struct StepSpec {
     pub goal: String,
     /// The titles of the tasks after this one, done later (named so the model leaves them).
     pub later: Vec<String>,
-    /// The statement's requirements this task must meet (label, text), as its step lists them.
+    /// The requirements this task serves (label, text), as its step lists them.
     pub requirements: Vec<(String, String)>,
-}
-
-/// COVERAGE: the step's requirements the check script does not yet test both ways, as the host's
-/// message to the model; None when all are covered or the decision cannot be read.
-async fn coverage_missing(env: &RunEnv, journal: &mut Journal, step: &StepSpec) -> Option<String> {
-    let labels: Vec<String> = step.requirements.iter().map(|(label, _)| label.clone()).collect();
-    let shape = env.data.shape("COVERAGE")?.clone().filled(crate::schemas::REQUIREMENTS_PLACEHOLDER, &labels, None);
-    let decided = crate::flow::decide_json::<crate::schemas::Coverage>(env, journal, "COVERAGE", &shape, "").await;
-    let missing = match decided {
-        Ok((coverage, _)) => coverage.missing,
-        Err(error) => {
-            tracing::warn!(%error, "the COVERAGE decision could not be read; the task goes on");
-            return None;
-        }
-    };
-    let items: Vec<String> = step
-        .requirements
-        .iter()
-        .filter(|(label, _)| missing.contains(label))
-        .map(|(label, text)| env.data.text("list_item", &[("text", &format!("{label}: {text}"))]))
-        .collect();
-    (!items.is_empty()).then(|| env.data.text("coverage_missing", &[("items", &items.join("\n"))]))
 }
 
 /// The stage text that tells the loop its step: the step, what the earlier steps did, and that
@@ -268,8 +246,7 @@ fn detector_from(entries: &[JournalEntry], run_id: &str, repeat_at: u32) -> Dete
             kinds::TOOL_RESULT if !entry.data.get("host").and_then(Value::as_bool).unwrap_or(false) => {
                 if let Some(call) = calls.get(str_field(&entry.data, "call_id")) {
                     let args = call.data.get("args").cloned().unwrap_or(Value::Null);
-                    let signature = Detector::signature(str_field(&call.data, "tool"), &args);
-                    let _ = detector.observe(&signature, str_field(&entry.data, "output"));
+                    let _ = detector.observe_call(str_field(&call.data, "tool"), &args, str_field(&entry.data, "output"));
                 }
                 if entry.data.get("changed_files").and_then(Value::as_array).is_some_and(|files| !files.is_empty()) {
                     detector.changed();
@@ -507,24 +484,7 @@ async fn await_approval(env: &RunEnv, journal: &mut Journal, call: &ToolCall, ou
                 .await?
         }
     };
-    let _ = env.host.session_status(&env.session_id, SessionStatus::Waiting).await;
-    env.set_stage("approval");
-    let entry = loop {
-        let fresh = env.host.journal_read(&env.session_id, seq).await?;
-        let Some(entry) = fresh.into_iter().find(|entry| entry.seq == seq) else {
-            return Err(RpcError::internal("the approval entry vanished"));
-        };
-        if str_field(&entry.data, "state") != "pending" {
-            break entry;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-            _ = env.stops.cancel.cancelled() => return Ok(Approval::Stopped),
-            _ = env.stops.park.cancelled() => return Ok(Approval::Stopped),
-        }
-    };
-    let _ = env.host.session_status(&env.session_id, SessionStatus::Running).await;
-    env.set_stage("act");
+    let Some(entry) = wait_for_answer(env, seq).await? else { return Ok(Approval::Stopped) };
     let classes: Vec<String> = entry
         .data
         .get("classes")
@@ -540,6 +500,30 @@ async fn await_approval(env: &RunEnv, journal: &mut Journal, call: &ToolCall, ou
         Exec::Failed(message) => Approval::Answered(message),
         Exec::Stopped => Approval::Stopped,
     })
+}
+
+/// Wait for the user's answer to approval entry `seq` (the session shows it needs them meanwhile);
+/// the answered entry, or None when the run stopped while waiting.
+pub async fn wait_for_answer(env: &RunEnv, seq: u64) -> Result<Option<JournalEntry>, RpcError> {
+    let _ = env.host.session_status(&env.session_id, SessionStatus::Waiting).await;
+    env.set_stage("approval");
+    let entry = loop {
+        let fresh = env.host.journal_read(&env.session_id, seq).await?;
+        let Some(entry) = fresh.into_iter().find(|entry| entry.seq == seq) else {
+            return Err(RpcError::internal("the approval entry vanished"));
+        };
+        if str_field(&entry.data, "state") != "pending" {
+            break entry;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = env.stops.cancel.cancelled() => return Ok(None),
+            _ = env.stops.park.cancelled() => return Ok(None),
+        }
+    };
+    let _ = env.host.session_status(&env.session_id, SessionStatus::Running).await;
+    env.set_stage("act");
+    Ok(Some(entry))
 }
 
 /// Finish approvals left open by a stopped predecessor. Returns false when the run stopped while
@@ -643,10 +627,21 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // failure (debugging effectiveness decays within 2-3 attempts; a different approach beats a 4th).
     // command -> (edited since its last failure, fruitless cycles, that failure's output)
     let mut failing: HashMap<String, (bool, u32, String)> = HashMap::new();
-    let mut coverage_asked = false;
     // This task's loop changed a file: its steps are fixes from here on (see the thinking budget).
     let mut edited = false;
     let mut fruitless = 0u32;
+    // Commands run since a failing command last turned to pass, counted once some command has
+    // failed twice since then (a probe that fails once is an answer, not a loop): command -> its
+    // failures since that pass.
+    let mut stalled = 0u32;
+    let mut refailed: HashMap<String, u32> = HashMap::new();
+    // The same error coming back ([`crate::typeerrors::error_key`]): its key, the failing runs it
+    // came back in with other calls between (any command, any file: edits made through the
+    // terminal or in scratch files count too), and whether that was said; a call since the last
+    // failing run; declarations shown with it.
+    let mut same_error: Option<(u64, u32, bool)> = None;
+    let mut worked_since_run = false;
+    let mut types_shown = false;
     let mut changed = changed_files_of(&entries, &env.run_id);
     let mut tracker = Tracker::default();
     let mut effort = spec.effort.clone();
@@ -685,8 +680,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         messages.push(prompts::stage_message(&env.data, &env.prefix.role, stage, &live));
         messages
     };
-    // The compacted conversation being prefilled while the step's tools run (crate::fit::prepare).
-    let mut prewarm: Option<crate::fit::Prewarm> = None;
+    // The compacted conversation being prefilled under the second cache key while the work goes on
+    // (crate::fit::prepare_aside), taken over before a call once ready (crate::fit::adopt).
+    let mut aside: Option<crate::fit::Aside> = None;
+    let mut steps_since_settle = 0u32;
     loop {
         if env.stops.park.is_cancelled() {
             return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
@@ -702,8 +699,16 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         if let LoopKind::Agent { name } = &spec.kind {
             deliver_board(journal, env, name).await?;
         }
-        // A prewarm still running ends here: the call continues from what it prefilled.
-        drop(prewarm.take());
+        // A compaction prepared aside whose prefill is done is written now and its state taken
+        // over; one still prefilling keeps going while this call continues the conversation as is.
+        aside = crate::fit::adopt(env, journal, aside.take()).await;
+        // Every `settle_steps` steps the in-place rewrites apply up to the newest entry (outdated
+        // reads, earlier edit echoes, outputs of a command run again): the history the model
+        // continues from stays small, at one re-read of that history per settle.
+        if env.data.limits.settle_steps > 0 && steps_since_settle >= env.data.limits.settle_steps {
+            crate::fit::settle(env, journal, prompt).await?;
+            steps_since_settle = 0;
+        }
         // The prompt is counted and compacted until it fits the conversation's context (crate::fit).
         let messages = match crate::fit::fitted(env, journal, prompt).await {
             Ok(messages) => messages,
@@ -721,12 +726,21 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // Thinking in proportion to the step: the full budget while the task designs and writes
         // its first change, a short one for every fix after that (the design is already in the
         // file; re-deriving it each step was most of the generated tokens).
-        if spec.step.is_some() && env.data.limits.task_think_tokens > 0 {
-            let fixing = edited && env.data.limits.fix_think_tokens > 0;
-            call.think_budget = Some(if fixing { env.data.limits.fix_think_tokens } else { env.data.limits.task_think_tokens });
+        // Every step carries a budget: a loop without a plan step (a question, a follow-up) gets
+        // the loop budget, never the model plugin's effort table.
+        let budget = if spec.step.is_some() {
+            if edited && env.data.limits.fix_think_tokens > 0 { env.data.limits.fix_think_tokens } else { env.data.limits.task_think_tokens }
+        } else {
+            env.data.limits.loop_think_tokens
+        };
+        if budget > 0 {
+            call.think_budget = Some(budget);
         }
         let called = match llm::chat(journal, call, &any).await {
-            Ok(called) => called,
+            Ok(called) => {
+                steps_since_settle += 1;
+                called
+            }
             Err(error) if error.code == codes::CANCELLED => continue,
             // The engine could not use the generation (e.g. tool-call arguments that are not JSON):
             // the model writes it again with the reason; the same failure repeating stops the run.
@@ -740,7 +754,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &what, research), true).await?;
                         effort = max_effort(&effort, &env.data.effort.escalate);
                     }
-                    Verdict::Fine => {}
+                    Verdict::Fine | Verdict::Reread(_) => {}
                 }
                 journal.note(&env.run_id, "model_error", &env.data.text("generation_failed", &[("error", &error.message)]), true).await?;
                 continue;
@@ -778,18 +792,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 continue;
             }
             let summary = result.content.trim().to_owned();
-            // Once per task, before it counts as done: the requirements its check script does not
-            // yet test both ways (a case that meets it, one that breaks it). The model's own check
-            // proves only what it thought of; this names what it did not.
-            if let Some(step) = spec.step.as_ref().filter(|step| !step.requirements.is_empty())
-                && !coverage_asked
-            {
-                coverage_asked = true;
-                if let Some(missing) = coverage_missing(env, journal, step).await {
-                    journal.note(&env.run_id, "coverage", &missing, true).await?;
-                    continue;
-                }
-            }
             let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
             };
@@ -859,7 +861,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 Verdict::Replan(_) => {
                     journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_checks", &[]), research), true).await?;
                 }
-                Verdict::Fine => {}
+                Verdict::Fine | Verdict::Reread(_) => {}
             }
             journal.note(&env.run_id, "verify", &prompts::contract_failure(&env.data, &failures), true).await?;
             effort = max_effort(&effort, &env.data.effort.escalate);
@@ -889,9 +891,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 .await?;
             call_seqs.push(seq);
         }
-        // The tools take a while: compact now if the conversation is getting long, and let the
-        // model re-read it meanwhile.
-        prewarm = crate::fit::prepare(env, journal, step_start, env.data.limits.compact_early_percent, conversation).await;
+        // The tools take a while: when the conversation is getting long, prepare its compaction
+        // aside (the next steps keep their cache until it is ready).
+        if aside.is_none() {
+            aside = crate::fit::prepare_aside(env, journal, step_start, env.data.limits.compact_early_tokens, conversation).await;
+        }
         let mut verdicts = Vec::new();
         let mut stopped = false;
         for (index, call) in result.tool_calls.iter().enumerate() {
@@ -919,11 +923,13 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     journal
                         .append(kinds::TOOL_RESULT, json!({"call_id": call.id, "ok": false, "output": message, "duration_ms": 0, "run_id": env.run_id}))
                         .await?;
-                    let signature = Detector::signature(&call.name, &serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null));
-                    verdicts.push(detector.observe(&signature, &message));
+                    verdicts.push(detector.observe_call(&call.name, &serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null), &message));
                 }
                 Exec::Done(mut outcome) => {
-                    if outcome.needs_approval && env.mode == "ask" {
+                    // Ask mode asks for every risky call; an approval the tools mark `always` (a command
+                    // the model asked to run past the sandbox) is asked for in every mode.
+                    let always = outcome.display.pointer("/approval/always").and_then(Value::as_bool).unwrap_or(false);
+                    if outcome.needs_approval && (env.mode == "ask" || always) {
                         match await_approval(env, journal, call, &outcome, None).await? {
                             Approval::Approved(approved) => outcome = approved,
                             Approval::Answered(text) => {
@@ -965,7 +971,59 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     if outcome.needs_approval {
                         data["needs_approval"] = json!(true);
                     }
+                    // A failing run: the declarations of the project's types its errors go through,
+                    // right under the error, where the next fix is decided (the line number alone
+                    // pulls every fix to that line).
+                    // Failed by its exit status, or by the error report a pipe hid behind status 0.
+                    let run_failed = if outcome.tool == "run" { outcome.display.get("exit_code").and_then(Value::as_i64).map(|code| crate::typeerrors::failed(code, &outcome.output)) } else { None };
+                    if run_failed == Some(true) {
+                        let declared = crate::typeerrors::declarations(&env.host, &env.scope, &outcome.output).await;
+                        types_shown = declared.is_some();
+                        if let Some(declared) = declared {
+                            data["output"] = json!(format!("{}\n\n{}", outcome.output.trim_end(), env.data.text("error_types", &[("items", &declared)])));
+                        }
+                    }
+                    // A failing test (a test report in the result) repeats for another reason than a
+                    // compile error: its note speaks of the test, not of a declaration.
+                    let test_run = data.get("display").and_then(|display| display.get("tests")).is_some_and(|tests| !tests.is_null());
                     journal.append(kinds::TOOL_RESULT, data).await?;
+                    if run_failed != Some(true) {
+                        worked_since_run = true;
+                    }
+                    match run_failed {
+                        Some(false) => same_error = None,
+                        Some(true) => {
+                            let worked = worked_since_run;
+                            let key = crate::typeerrors::error_key(&outcome.output);
+                            match (key, &mut same_error) {
+                                (Some(key), Some((known, survived, _))) if *known == key => {
+                                    if worked {
+                                        *survived += 1;
+                                    }
+                                }
+                                (Some(key), _) => same_error = Some((key, 0, false)),
+                                (None, _) => {}
+                            }
+                            worked_since_run = false;
+                            let limit = env.data.limits.same_error_edits;
+                            if let Some((_, survived, said)) = &mut same_error
+                                && limit > 0
+                                && *survived >= limit
+                                && !*said
+                            {
+                                *said = true;
+                                let key = if test_run {
+                                    "same_error_test"
+                                } else if types_shown {
+                                    "same_error"
+                                } else {
+                                    "same_error_plain"
+                                };
+                                journal.note(&env.run_id, "same_error", &env.data.text(key, &[("edits", &survived.to_string())]), true).await?;
+                            }
+                        }
+                        None => {}
+                    }
                     if outcome.tool == "read"
                         && outcome.ok
                         && let Some(path) = outcome.args.get("path").or_else(|| outcome.args.get("target")).and_then(Value::as_str)
@@ -985,20 +1043,47 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             *edited = true;
                         }
                     }
+                    // A refused or unrun command (`run_failed == None`) is not a run: it counts for
+                    // nothing here. A recognised test run (`display.tests`, see the tools plugin's
+                    // test view) is what the counters watch: a green one resets them, a failing one
+                    // opens them. A probe, an install or a search never does either (seen: a task
+                    // with 16 green tests ended as stuck because a denied install and a probe that
+                    // exits 1 by design "never turned to pass").
                     if outcome.tool == "run"
+                        && run_failed.is_some()
                         && let Some(command) = outcome.args.get("command").and_then(Value::as_str)
                     {
-                        let exit = outcome.display.get("exit_code").and_then(Value::as_i64);
-                        match exit {
-                            Some(0) => {
+                        let tests = outcome.display.get("tests").filter(|tests| tests.is_object());
+                        let failed_tests = tests.and_then(|tests| tests.get("failed")).and_then(Value::as_u64);
+                        if tests.is_some() && run_failed == Some(false) {
+                            stalled = 0;
+                            refailed.clear();
+                            failing.clear();
+                        } else {
+                            if tests.is_some() && run_failed == Some(true) {
+                                *refailed.entry(command.to_owned()).or_default() += 1;
+                            }
+                            if refailed.values().any(|&failures| failures >= 2) {
+                                stalled += 1;
+                            }
+                        }
+                        match run_failed {
+                            Some(false) => {
                                 failing.remove(command);
                             }
-                            Some(_) => {
+                            Some(true) => {
                                 // Fruitless only when an edit left the very same failure: a fix that
-                                // changed what fails is progress (fewer or other failing cases).
+                                // changed what fails is progress (fewer or other failing cases). For
+                                // a test run the failing count is the measure; otherwise the same
+                                // error lines without numbers (moved lines and counters do not make
+                                // it new), else the same output.
+                                let same = match failed_tests {
+                                    Some(failed) => format!("tests:{failed}"),
+                                    None => crate::typeerrors::error_key(&outcome.output).map(|key| key.to_string()).unwrap_or_else(|| outcome.output.clone()),
+                                };
                                 let entry = failing.entry(command.to_owned()).or_insert((false, 0, String::new()));
                                 if entry.0 {
-                                    if entry.2 == outcome.output {
+                                    if entry.2 == same {
                                         entry.1 += 1;
                                         fruitless = fruitless.max(entry.1);
                                     } else {
@@ -1006,12 +1091,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                                     }
                                 }
                                 entry.0 = false;
-                                entry.2 = outcome.output.clone();
+                                entry.2 = same;
                             }
                             None => {}
                         }
                     }
-                    verdicts.push(detector.observe(&Detector::signature(&outcome.tool, &outcome.args), &outcome.output));
+                    verdicts.push(detector.observe_call(&outcome.tool, &outcome.args, &outcome.output));
                     if !outcome.changed_files.is_empty() {
                         detector.changed();
                     }
@@ -1030,11 +1115,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         if let Some(Verdict::Replan(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Replan(_))) {
             journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, what, research), true).await?;
             effort = max_effort(&effort, &env.data.effort.escalate);
+        } else if let Some(Verdict::Reread(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Reread(_))) {
+            // A reread is harmless: said once, plainly, with the step to take.
+            journal.note(&env.run_id, "repeat", &env.data.text("reread", &[("what", what)]), true).await?;
         }
         // A plan task that used its calls without finishing is stuck: it ends here and the flow
         // writes the tasks still to do again with another approach, from where the model says it is.
         let cycles = env.data.limits.fix_cycles;
-        if spec.step.is_some() && ((env.data.limits.task_calls > 0 && tool_calls >= env.data.limits.task_calls) || (cycles > 0 && fruitless >= cycles)) {
+        let stall = env.data.limits.stall_runs;
+        let fixes_failed = cycles > 0 && fruitless >= cycles;
+        let runs_stalled = stall > 0 && stalled >= stall;
+        if spec.step.is_some() && ((env.data.limits.task_calls > 0 && tool_calls >= env.data.limits.task_calls) || fixes_failed || runs_stalled) {
             let last_words = journal
                 .entries()
                 .filter(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && entry.data.get("run_id").and_then(Value::as_str) == Some(env.run_id.as_str()))
@@ -1042,8 +1133,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 .last()
                 .unwrap_or_default();
             // Said as what stopped it: the fix cycles that did not help, else the calls it used.
-            let key = if cycles > 0 && fruitless >= cycles { "task_stuck_fixes" } else { "task_stuck" };
-            let summary = env.data.text(key, &[("calls", &tool_calls.to_string()), ("fixes", &fruitless.to_string()), ("last", last_words.trim())]);
+            let key = if fixes_failed {
+                "task_stuck_fixes"
+            } else if runs_stalled {
+                "task_stuck_runs"
+            } else {
+                "task_stuck"
+            };
+            let summary = env.data.text(
+                key,
+                &[("calls", &tool_calls.to_string()), ("fixes", &fruitless.to_string()), ("runs", &stalled.to_string()), ("last", last_words.trim())],
+            );
             journal.note(&env.run_id, "task_stuck", &summary, false).await?;
             return Ok(outcome("stuck", summary, turns, tool_calls, &changed, None));
         }

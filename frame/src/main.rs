@@ -155,7 +155,7 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
     let journal = journal::Journal::open(home.journal()).map_err(|e| format!("journal: {e}"))?;
     let state = state::StateStore::open(home.state()).map_err(|e| format!("state: {e}"))?;
-    let units = units::Units::load(&home.plugins(), &home.state(), config.overrides.clone()).map_err(|e| format!("plugins: {e}"))?;
+    let units = units::Units::load(&home.plugins(), &home.state(), config.overrides.clone(), machine.memory_bytes).map_err(|e| format!("plugins: {e}"))?;
     let token = home::random_token(32).map_err(|e| format!("token: {e}"))?;
 
     // Plugin socket. We hold the home lock, so an existing socket file is stale.

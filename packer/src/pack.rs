@@ -210,6 +210,7 @@ pub fn build(options: &Options) -> Result<Packed, String> {
             assets,
             hello_timeout_ms: spec.hello_timeout_ms,
             probe_timeout_ms: spec.probe_timeout_ms,
+            machine: spec.machine.clone(),
         });
     }
 

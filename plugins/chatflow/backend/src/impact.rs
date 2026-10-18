@@ -29,7 +29,7 @@ pub struct SignatureChange {
     pub after: Option<SymbolRef>,
 }
 
-fn scope_args(scope: &Scope, extra: Value) -> Value {
+pub(crate) fn scope_args(scope: &Scope, extra: Value) -> Value {
     let mut value = if scope.workspace == scope.root {
         json!({"project_id": scope.project_id})
     } else {

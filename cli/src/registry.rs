@@ -1108,7 +1108,74 @@ pub fn commands() -> Vec<Command> {
             build: plain_args,
             format: format_toggle,
         },
+        Command {
+            path: "plugin providers",
+            method: "frame.plugins.providers",
+            summary: "The installed plugins of a category (the model engines): which one serves it and why.",
+            positional: &["category"],
+            schema: schema(json!({"category": name("Category, e.g. model.")}), &["category"]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_providers,
+        },
+        Command {
+            path: "plugin switch",
+            method: "frame.plugins.switch",
+            summary: "Serve a category with another of its installed plugins (drains the serving one, starts the other; restores it on failure).",
+            positional: &["category", "plugin"],
+            schema: schema(json!({"category": name("Category, e.g. model."), "plugin": name("Plugin id (cx plugin providers <category>).")}), &["category", "plugin"]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_switch,
+        },
     ]
+}
+
+fn format_providers(value: &Value) -> String {
+    let providers = value.get("providers").and_then(Value::as_array).cloned().unwrap_or_default();
+    if providers.is_empty() {
+        return format!("no plugin serves `{}`", s(value, "category"));
+    }
+    let mut out = format!("`{}` is served by {} ({})", s(value, "category"), s(value, "serving"), s(value, "chosen_by"));
+    for provider in providers {
+        let serving = provider.get("serving").and_then(Value::as_bool).unwrap_or(false);
+        let enabled = provider.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let fits = match provider.get("fits_machine").and_then(Value::as_bool) {
+            Some(true) => "  fits this machine",
+            Some(false) => "  made for other machines",
+            None => "",
+        };
+        let state = if serving { "serving" } else if enabled { "standby" } else { "disabled" };
+        let _ = write!(out, "\n{} {}  {state}{fits}", s(&provider, "plugin"), s(&provider, "version"));
+    }
+    out
+}
+
+fn format_switch(value: &Value) -> String {
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let changed = value.get("changed").and_then(Value::as_bool).unwrap_or(false);
+    let mut out = match (ok, changed) {
+        (true, true) => format!("`{}`: {} -> {}: live", s(value, "category"), s(value, "from_plugin"), s(value, "to_plugin")),
+        (true, false) => format!("`{}`: {} already serves it", s(value, "category"), s(value, "to_plugin")),
+        _ => format!(
+            "`{}`: FAILED: {}; {} keeps serving",
+            s(value, "category"),
+            value.get("error").and_then(Value::as_str).unwrap_or("see the steps"),
+            s(value, "from_plugin")
+        ),
+    };
+    let mut steps = format_steps(value);
+    if let Some(backend) = value.get("backend").filter(|backend| !backend.is_null()) {
+        let inner = format_steps(backend);
+        if !inner.is_empty() {
+            steps = if steps.is_empty() { inner } else { format!("{inner}\n{steps}") };
+        }
+    }
+    if !steps.is_empty() {
+        out.push('\n');
+        out.push_str(&steps);
+    }
+    out
 }
 
 fn project_line(project: &Value) -> String {

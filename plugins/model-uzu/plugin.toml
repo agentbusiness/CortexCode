@@ -28,6 +28,11 @@ probe_timeout_ms = 600000
 [backend.config]
 variant = "qwen3.8-27b-m"
 
+# The machines this engine is the default for (the frame picks it when the person chose none):
+# above 24 GiB. Smaller Macs default to model-bonsai.
+[backend.machine]
+min_memory_bytes = 25769803777
+
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
 [ui]

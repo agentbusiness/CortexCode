@@ -19,9 +19,9 @@ Writing or revising a plan and task graph for agents before code changes (plan m
 2. **Order**: shared types or interface; a thin end-to-end slice; independent slices in parallel; wiring, docs, cleanup last.
 3. **`brief`**: files and symbols, expected behaviour with the spec's values, shared names, the new test's name, what not to touch.
 4. **`touches`**: exact paths, with tests and registration files (`mod.rs`, `__init__.py`, `index.ts`, manifests, route tables). A path you did not read is a guess: note it in `risks`.
-5. **Conflicts** (only the plan prevents parallel edits): tasks sharing a path, or one changing a function the other calls: `depends_on` or merge. Many tasks registering in one file: task 1 creates all stubs and registrations.
+5. **Conflicts** (only the plan prevents parallel edits): tasks sharing a path, or one changing a function the other calls: `depends_on` or merge. Many tasks registering in one file: task 1 creates all the empty entries and registrations.
 6. **`depends_on`**: real needs only; a chain of every task serialises the agents.
-7. **`checks`**: the project's test or build command narrowed to the new test (file, module or name filter); fails before, passes after. Repo root, offline: no `cd`, `||` or installs. Expected values from the spec or repo only. No possible check: merge the task into one with a check.
+7. **`checks`**: the project's test or build command narrowed to the new test (file, module or name filter); fails before, passes after. Repo root: no `cd`, `||` or installs. Expected values from the spec or repo only. No possible check: merge the task into one with a check.
 8. **`covers`**: every open requirement id in some task; uncoverable ones go to `risks`.
 9. **`skills`**: only these reach the agent.
 

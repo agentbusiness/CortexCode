@@ -2,11 +2,13 @@
  * settings.model@1 — the model: what is loaded (model.info: id, quantization, context, slots, KV
  * type, speculative decoding, the Metal tensor path), and the choice between the variants
  * (model.variants: installed or not, with their notes). Choosing one calls model.select, shows the
- * reload as it runs and its measured time, and reads model.info again afterwards.
+ * reload as it runs and its measured time, and reads model.info again afterwards. Above it, the
+ * engine (which installed model plugin serves the model, see engine.tsx).
  */
 
 import { useState } from 'react';
 import { bytes, definePlugin, duration, errorMessage, plural, useClient, useModelState, useNow, useQuery, ServiceProblem } from '@cortex/sdk';
+import { EngineChoice } from './engine';
 import './model.css';
 
 interface Variant { id: string; label: string; path: string; installed: boolean; active: boolean; notes?: string; bytes?: number | null; verified?: boolean | null; mtp?: boolean | null }
@@ -37,6 +39,7 @@ function ModelPanel() {
   const m = info.data;
   return (
     <div className="cx-settings-panel-body" data-build={__CORTEX_BUILD__} data-panel="model">
+      <EngineChoice />
       <h3 className="cx-settings-title">The model</h3>
       {info.error && !m && <ServiceProblem service="model" state={info} className="inline-error" />}
       {state.testVariant && (

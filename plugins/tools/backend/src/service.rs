@@ -6,6 +6,7 @@ use crate::host::{CtxHost, Host, NoHost};
 use crate::schemas::{self, EditFormat};
 use crate::shell::RunRequest;
 use crate::util;
+use cc_protocol::contracts::frame::{ProjectDeleted, SessionDeleted, topics as frame_topics};
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
@@ -38,6 +39,7 @@ pub const PROVIDES: &[&str] = &[
     methods::NORMALIZE,
     methods::APPROVE,
     methods::SKILLS_SHOWN,
+    methods::CLEANUP,
 ];
 
 pub struct ToolsPlugin {
@@ -212,7 +214,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             // A caller confining a command further (`sandbox-exec -p <profile> <command...>`, e.g. a
             // check run without network): a sandboxed shell cannot apply a second sandbox, so the
             // wrapped command runs in a one-off shell under the intersection of both profiles.
-            let cwd = core.shells.saved_cwd(&context.session_id).unwrap_or_else(|| session.workspace.clone());
+            let cwd = session.workspace.clone();
             if let Some(argv) = crate::approval::simple_argv(&params.command)
                 && let Some(wrapped) = crate::sandbox::unwrap_sandbox_exec(&argv, &cwd)
             {
@@ -373,6 +375,19 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 core.read_state.record_skill(&params.session_id, uri);
             }
             Ok(json!({ "shown": new }))
+        }
+        methods::CLEANUP => {
+            let workspace = params.get("workspace").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let since_ms = params.get("since_ms").and_then(Value::as_u64).unwrap_or(0);
+            if workspace.is_empty() || session_id.is_empty() {
+                return Err(RpcError::invalid_params("tools.cleanup needs workspace and session_id"));
+            }
+            let core = core.clone();
+            let removed = tokio::task::spawn_blocking(move || crate::cleanup::turn_end(&core, &util::expand_home(&workspace), &session_id, since_ms))
+                .await
+                .map_err(|error| RpcError::internal(error.to_string()))?;
+            Ok(json!({ "removed": removed }))
         }
         other => Err(RpcError::unknown_method(other)),
     }
@@ -680,13 +695,25 @@ impl Plugin for ToolsPlugin {
         })
     }
 
-    fn event(&self, _ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+    fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
         if topic == crate::langs::SKILLS_CHANGED
             && let Some(category) = data.get("category").and_then(Value::as_str)
         {
             crate::langs::forget(category);
         }
-        Box::pin(async {})
+        // A deleted session or project: this plugin's own data about it goes.
+        let core = self.core(&ctx);
+        Box::pin(async move {
+            if topic == frame_topics::SESSION_DELETED
+                && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data.clone())
+            {
+                core.await.forget_session(&deleted.session_id, std::path::Path::new(&deleted.workspace)).await;
+            } else if topic == frame_topics::PROJECT_DELETED
+                && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data)
+            {
+                core.await.forget_project(&deleted.project_id, std::path::Path::new(&deleted.root));
+            }
+        })
     }
 
     fn shutdown(&self, ctx: Ctx) -> BoxFuture<'static, ()> {

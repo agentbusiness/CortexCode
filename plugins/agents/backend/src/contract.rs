@@ -40,23 +40,6 @@ fn tail(text: &str) -> String {
     format!("[{skipped} earlier characters not shown]\n{kept}")
 }
 
-/// The Seatbelt profile checks run under: everything as usual except outbound network beyond this
-/// machine. A contract check proves the work as it is; it must not download or install anything
-/// (a model once wrote `pip install --break-system-packages ...` as a "check").
-const OFFLINE_PROFILE: &str = "(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\"))(allow network-outbound (remote unix-socket))";
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-/// Wrap a check command so it runs without network. Returns the command to run and a note when
-/// the sandbox is unavailable (the check then runs unconfined, and the report says so).
-pub fn offline(command: &str) -> (String, Option<&'static str>) {
-    if cfg!(target_os = "macos") && std::path::Path::new(SANDBOX_EXEC).exists() {
-        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
-        (format!("{SANDBOX_EXEC} -p {} /bin/sh -c {}", quote(OFFLINE_PROFILE), quote(command)), None)
-    } else {
-        (command.to_owned(), Some("[network was not blocked for this check: no sandbox is available]"))
-    }
-}
-
 /// A check's exit status is its verdict, so a pipeline fails when any stage fails (`pytest | tail`
 /// would otherwise exit with `tail`'s status, 0, while the tests fail).
 pub fn strict(command: &str) -> String {
@@ -86,16 +69,15 @@ pub async fn run_check(
                     full_output: output,
                 });
             }
-            let (command, unconfined) = offline(&strict(&check.spec));
+            // The check runs like the model's own commands (the workspace's write sandbox), with
+            // the network: a project's tests may need to fetch what they build with.
+            let command = strict(&check.spec);
             let params = json!({"workspace": workspace, "command": command, "timeout_ms": CHECK_TIMEOUT_MS, "background": false});
             let outcome = host.call_with(tools_methods::RUN, params, crate::host::Effect::Idempotent, Some(cancel)).await?;
             let run: RunResult = cc_protocol::parse_params(outcome)?;
             let exit_ok = run.exit_code == Some(0) && !run.timed_out;
             let ok = exit_ok && expectation_holds(check.expect.as_deref(), &run.output);
             let mut output = run.output.clone();
-            if let Some(note) = unconfined {
-                output.push_str(&format!("\n{note}"));
-            }
             if run.timed_out {
                 output.push_str("\n[the check timed out]");
             }

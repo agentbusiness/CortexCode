@@ -117,6 +117,9 @@ impl LanguagePack for PythonPack {
             // pytest exits 5 when it collects no test.
             Verifier { files: strings(&["**/test_*.py", "**/*_test.py"]), ..verifier("pytest", "test", &["python", "-m", "pytest", "-q"], PYTEST_MARKERS, "python") },
             verifier("pytest file", "test", &["python", "-m", "pytest", "-q", "-x", "{file}"], PYTEST_MARKERS, "python"),
+            // The standard library's runner: what a project with a `tests` folder can always run
+            // (pytest may not be installed in its environment).
+            Verifier { files: strings(&["tests/test_*.py", "tests/**/test_*.py"]), ..verifier("unittest", "test", &["python", "-m", "unittest", "discover", "-s", "tests", "-q"], &["tests"], "python") },
             verifier("ruff", "lint", &["ruff", "check", "."], &["ruff.toml", ".ruff.toml", "pyproject.toml"], "ruff"),
             // Type check: errors only; the project's pyright configuration decides the rules. The
             // installed CLI is on commands' PATH (the toolchain).
