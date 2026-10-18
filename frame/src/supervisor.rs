@@ -18,7 +18,7 @@ use crate::config::PluginConfig;
 use crate::hub::{FRAME_VERSION, Frame, Peer, Route};
 use cc_protocol::contracts::frame::{PluginInfo, SwapParams, SwapResult, SwapStep, topics};
 use cc_protocol::contracts::lifecycle::{
-    DrainParams, DrainResult, Hello, HelloAck, ProbeReport, SwapPolicy, methods as lifecycle,
+    DrainParams, DrainResult, Health, Hello, HelloAck, ProbeReport, SwapPolicy, methods as lifecycle,
 };
 use cc_protocol::contracts::{contract_of, now_ms};
 use cc_protocol::{RpcError, codes, to_value};
@@ -48,6 +48,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// A runnable version of a plugin's backend: an installed package version.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecSpec {
+    /// The plugin (unit) this version belongs to. A category's slot runs one plugin at a time,
+    /// and `frame.plugins.switch` moves it to another plugin of the same category.
+    pub plugin: String,
     /// The executable the process runs (the package's [`crate::package::PROCESS_NAME`] link).
     pub exec: PathBuf,
     /// The plugin's data folder name under `<home>/plugins-data` (the packed executable's name).
@@ -183,8 +186,9 @@ struct SlotInner {
 
 pub struct Slot {
     pub category: String,
-    /// The plugin (unit) this category belongs to.
-    pub plugin: String,
+    /// The plugin (unit) serving this category; a switch to another plugin of the category
+    /// changes it when the new plugin's instance is committed.
+    plugin: Mutex<String>,
     pub cfg: Mutex<PluginConfig>,
     pub(crate) op: tokio::sync::Mutex<()>,
     inner: Mutex<SlotInner>,
@@ -197,7 +201,7 @@ impl Slot {
         let status = if disabled { "disabled" } else { "waiting to start" };
         Arc::new(Slot {
             category: cfg.category.clone(),
-            plugin: cfg.plugin.clone(),
+            plugin: Mutex::new(cfg.plugin.clone()),
             cfg: Mutex::new(cfg.clone()),
             op: tokio::sync::Mutex::new(()),
             inner: Mutex::new(SlotInner { status: status.into(), ..SlotInner::default() }),
@@ -207,6 +211,21 @@ impl Slot {
 
     pub fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::SeqCst)
+    }
+
+    /// The plugin serving this category.
+    pub fn plugin(&self) -> String {
+        self.plugin.lock().map(|plugin| plugin.clone()).unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// Move the slot to another plugin of its category (its config comes with it).
+    pub(crate) fn serve_with(&self, cfg: PluginConfig) {
+        if let Ok(mut plugin) = self.plugin.lock() {
+            *plugin = cfg.plugin.clone();
+        }
+        if let Ok(mut current) = self.cfg.lock() {
+            *current = cfg;
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SlotInner> {
@@ -296,7 +315,7 @@ impl Supervisor {
     pub fn add_slot(&self, slot: Arc<Slot>) -> Result<(), String> {
         let mut slots = self.slots.write().map_err(|_| "slot table poisoned".to_owned())?;
         if let Some(existing) = slots.iter().find(|s| s.category == slot.category) {
-            return Err(format!("category `{}` is already served by plugin `{}`", slot.category, existing.plugin));
+            return Err(format!("category `{}` is already served by plugin `{}`", slot.category, existing.plugin()));
         }
         slots.push(slot);
         Ok(())
@@ -365,7 +384,7 @@ impl Supervisor {
             }
             let listed = list.iter().any(|p: &PluginInfo| p.category == slot.category);
             if !listed {
-                let spec = frame.units.current_spec(&slot.plugin);
+                let spec = frame.units.current_spec(&slot.plugin());
                 list.push(PluginInfo {
                     plugin_id: String::new(),
                     version: String::new(),
@@ -381,7 +400,7 @@ impl Supervisor {
                     build: spec.map(|s| s.version).unwrap_or_default(),
                     known_good: false,
                     transport: "process".into(),
-                    plugin: slot.plugin.clone(),
+                    plugin: slot.plugin(),
                 });
             }
         }
@@ -469,7 +488,7 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
     let (hello_tx, hello_rx) = oneshot::channel();
     let instance = Arc::new(Instance {
         id: id.clone(),
-        plugin: slot.plugin.clone(),
+        plugin: spec.plugin.clone(),
         category,
         spec,
         pid,
@@ -632,7 +651,8 @@ async fn admit(
     handoff: Handoff,
     steps: &mut Steps,
 ) -> Result<Arc<Instance>, String> {
-    let cfg = slot.config();
+    // The timeouts are the starting plugin's own (a switch starts another plugin in this slot).
+    let cfg = if spec.plugin == slot.plugin() { slot.config() } else { frame.units.backend_config_of(&spec.plugin).unwrap_or_else(|| slot.config()) };
     let instance = steps
         .run("start", async {
             let instance = spawn_instance(frame, slot, spec).await?;
@@ -727,6 +747,21 @@ fn commit(frame: &Arc<Frame>, slot: &Arc<Slot>, new: &Arc<Instance>, previous: O
     let route = new.route().ok_or("new instance has no connection")?;
     new.committed.store(true, Ordering::SeqCst);
     frame.set_route(&slot.category, route);
+    let moved_from = (slot.plugin() != new.plugin).then(|| slot.plugin());
+    if let Some(from) = &moved_from {
+        // Another plugin of the category serves it now: the slot takes its settings, and its UI
+        // packages replace the previous plugin's.
+        if let Some(cfg) = frame.units.backend_config_of(&new.plugin) {
+            slot.serve_with(cfg);
+        }
+        frame.units.serving_changed(&slot.category, &new.plugin);
+        tracing::info!(category = %slot.category, from = %from, to = %new.plugin, "the category is served by another plugin");
+        let frame = frame.clone();
+        tokio::spawn(async move {
+            frame.refresh_ui().await;
+            crate::units::publish_units(&frame);
+        });
+    }
     {
         let mut inner = slot.lock();
         inner.others.retain(|other| other.id != new.id);
@@ -989,7 +1024,7 @@ pub async fn swap_request(frame: &Arc<Frame>, params: SwapParams) -> Result<Swap
     // A restart of the version the plugin runs (blue/green or drain-first, like any swap).
     let target = frame
         .units
-        .current_spec(&slot.plugin)
+        .current_spec(&slot.plugin())
         .ok_or_else(|| RpcError::not_found(format!("`{}` has no installed backend", params.category)))?;
     Ok(swap(frame, &slot, target, SwapKind::Swap).await)
 }
@@ -1039,7 +1074,7 @@ async fn handle_crash(frame: Arc<Frame>, slot: Arc<Slot>, instance: Arc<Instance
         if restored {
             drop(op);
             // The plugin goes back as a whole (UI included).
-            crate::units::backend_moved(&frame, &slot.plugin, &to_version).await;
+            crate::units::backend_moved(&frame, &slot.plugin(), &to_version).await;
             return;
         }
     }
@@ -1057,7 +1092,7 @@ fn fallback_target(frame: &Frame, slot: &Slot, failing: &ExecSpec) -> Option<Exe
     if slot.recent_crashes() < CRASH_LOOP_COUNT {
         return None;
     }
-    let known = frame.units.known_good_spec(&slot.plugin)?;
+    let known = frame.units.known_good_spec(&slot.plugin())?;
     (known.version != failing.version).then(|| {
         tracing::warn!(category = %slot.category, crashes = slot.recent_crashes(), version = %known.version, "crash loop: falling back to the last known good version");
         slot.lock().crashes.clear();
@@ -1111,8 +1146,8 @@ pub async fn ensure_running(frame: Arc<Frame>, slot: Arc<Slot>, mut target: Exec
         match outcome {
             Ok(new) => {
                 tracing::info!(category = %slot.category, instance = %new.id, version = %new.spec.version, "plugin is active");
-                if frame.units.current_spec(&slot.plugin).is_some_and(|current| current.version != new.spec.version) {
-                    let (frame, plugin, version) = (frame.clone(), slot.plugin.clone(), new.spec.version.clone());
+                if frame.units.current_spec(&slot.plugin()).is_some_and(|current| current.version != new.spec.version) {
+                    let (frame, plugin, version) = (frame.clone(), slot.plugin(), new.spec.version.clone());
                     tokio::spawn(async move { crate::units::backend_moved(&frame, &plugin, &version).await });
                 }
                 return;
@@ -1124,7 +1159,7 @@ pub async fn ensure_running(frame: Arc<Frame>, slot: Arc<Slot>, mut target: Exec
                 slot.set_status(format!("failed: {error}"));
                 last_error = Some(error.clone());
                 tracing::warn!(category = %slot.category, %error, crashes, "plugin bring-up failed");
-                let known = frame.units.known_good_spec(&slot.plugin).filter(|known| known.version != target.version);
+                let known = frame.units.known_good_spec(&slot.plugin()).filter(|known| known.version != target.version);
                 match known {
                     Some(known) if deterministic || crashes >= CRASH_LOOP_COUNT => {
                         tracing::warn!(category = %slot.category, version = %known.version, "falling back to the last known good version");
@@ -1149,11 +1184,11 @@ pub async fn start_all(frame: Arc<Frame>) {
             return;
         }
         if slot.is_disabled() {
-            tracing::info!(category = %slot.category, plugin = %slot.plugin, "plugin is disabled; not starting it");
+            tracing::info!(category = %slot.category, plugin = %slot.plugin(), "plugin is disabled; not starting it");
             continue;
         }
         let cfg = slot.config();
-        let Some(target) = frame.units.current_spec(&slot.plugin) else {
+        let Some(target) = frame.units.current_spec(&slot.plugin()) else {
             slot.set_status("no installed backend");
             continue;
         };
@@ -1256,6 +1291,13 @@ pub async fn enable(frame: &Arc<Frame>, slot: &Arc<Slot>, target: ExecSpec) -> V
     tokio::spawn(ensure_running(frame.clone(), slot.clone(), target, Duration::ZERO));
     frame.publish_slot_state(slot);
     steps.list
+}
+
+/// Category requests the slot's serving instance runs now (its `plugin.health`), when one serves.
+pub async fn in_flight(slot: &Slot) -> Option<usize> {
+    let instance = slot.live_current()?;
+    let value = instance.call(lifecycle::HEALTH, Value::Null, Duration::from_secs(5)).await.ok()?;
+    serde_json::from_value::<Health>(value).ok().map(|health| health.in_flight)
 }
 
 /// Swap a slot to `target` as part of a whole-plugin operation (install, plugin rollback).

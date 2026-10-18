@@ -19,8 +19,15 @@ pub mod methods {
     pub const SLOTS: &str = "model.slots";
     /// Persist a cache key's KV state to disk and free its slot.
     pub const HIBERNATE: &str = "model.hibernate";
+    /// Keep a cache key resident while its turn runs (`hold: true`), or let it go (`hold: false`):
+    /// a held conversation is not spilled for being idle (a turn waiting on a long tool is not
+    /// idle); it can still be spilled when the pool needs the room.
+    pub const HOLD: &str = "model.hold";
     /// Warm a cache key's prefix (prefill without generating), e.g. the shared system block.
     pub const PREWARM: &str = "model.prewarm";
+    /// `{from, to}`: the state kept under `from` becomes `to`'s (an idle `to` state is dropped);
+    /// a conversation's compacted prompt prefilled under a second key is taken over this way.
+    pub const RENAME: &str = "model.rename";
     /// Local OpenAI-compatible HTTP endpoint serving the same weights (used by baseline harnesses).
     pub const ENDPOINT: &str = "model.endpoint";
     /// Available model variants and the active one (e.g. stock vs. uncensored).
@@ -488,6 +495,19 @@ pub struct CacheKeyParams {
     pub cache_key: String,
 }
 
+/// `model.hold`: keep `cache_key` resident while its turn runs, or release it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HoldParams {
+    pub cache_key: String,
+    pub hold: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenameParams {
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrewarmParams {
     pub cache_key: String,
@@ -500,6 +520,12 @@ pub struct PrewarmParams {
     /// with it: the model keeps it for any cache key and keeps no conversation under `cache_key`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_only: bool,
+    /// Prefill only while the model serves no other conversation: it waits while another
+    /// conversation's request runs or waits, and such a request stops it at its next step (what it
+    /// prefilled is kept). For a guess that the conversation continues (a turn just ended), which
+    /// must never slow work under way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

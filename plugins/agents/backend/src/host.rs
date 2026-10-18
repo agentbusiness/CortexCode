@@ -158,7 +158,7 @@ impl Host {
     }
 
     pub async fn session_status(&self, id: &str, status: fc::SessionStatus) -> Result<(), RpcError> {
-        self.session_update(&SessionUpdateParams { id: id.to_owned(), title: None, status: Some(status), task_id: None })
+        self.session_update(&SessionUpdateParams { id: id.to_owned(), title: None, status: Some(status), task_id: None, model: None })
             .await
     }
 

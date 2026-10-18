@@ -34,6 +34,7 @@ pub mod repetition;
 pub mod schemas;
 pub mod skillsel;
 pub mod spec;
+pub mod typeerrors;
 pub mod verifiers;
 
 /// Start a plugin process: logging to stderr (the frame captures it), then serve until shutdown.

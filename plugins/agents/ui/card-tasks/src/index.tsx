@@ -2,7 +2,7 @@
  * card.tasks@1 — the project's planned tasks, one line each: its mark, title and state in words
  * (pending, in progress, verifying, done, failed, or blocked when it waits for unfinished
  * prerequisites, which its tooltip names). Only the tasks that are work are listed, flat: a task
- * with sub-tasks is just their summary and is left out. A line opens the task on the board (brief,
+ * with sub-tasks is just their summary and is left out, and so is a task a replan cancelled. A line opens the task on the board (brief,
  * plan, contract, last verification). No tasks: nothing.
  */
 
@@ -18,7 +18,7 @@ export function taskRows(tasks: readonly Task[]): Row[] {
   const summaries = new Set(tasks.map((task) => task.parent_id).filter((id): id is string => Boolean(id && byId.has(id))));
   const planned = (task: Task) => (task.parent_id && byId.get(task.parent_id)?.created_ms) || task.created_ms;
   return tasks
-    .filter((task) => !summaries.has(task.id))
+    .filter((task) => !summaries.has(task.id) && task.status !== 'cancelled')
     .sort((a, b) => planned(b) - planned(a) || a.created_ms - b.created_ms)
     .map((task) => ({ task, waitsFor: (task.depends_on ?? []).filter((id) => byId.get(id)?.status !== 'done').map((id) => byId.get(id)?.title ?? id) }));
 }

@@ -14,7 +14,7 @@ use crate::variants::{self, Progress, Spec, VerifyCache};
 use crate::vision::prompt::{ImagePart, PromptImage};
 use crate::vision::{self, VisionConfig};
 use cc_protocol::contracts::model::{
-    CacheKeyParams, ChatDelta, ChatMessage, ChatParams, ChatResult, CompleteParams, ContentPart, CountResult, ModelInfo,
+    CacheKeyParams, ChatDelta, ChatMessage, ChatParams, ChatResult, CompleteParams, ContentPart, CountResult, HoldParams, ModelInfo,
     PrewarmParams, Priority, Sampling, SelectResult, SlotsResult, TokenizeParams, TokenizeResult, Usage, Variant,
     VariantsResult, VisionInfo,
 };
@@ -226,11 +226,13 @@ pub struct Prompt {
     pub shared: Option<usize>,
     /// Prefill only up to `shared`, for other conversations (a prewarm's `shared_only`).
     pub shared_only: bool,
+    /// Run only while no other conversation is served (a prewarm's `idle_only`).
+    pub idle_only: bool,
 }
 
 impl Prompt {
     pub fn text(tokens: Vec<u64>) -> Self {
-        Self { tokens, images: Vec::new(), vision: None, checkpoints: Vec::new(), shared: None, shared_only: false }
+        Self { tokens, images: Vec::new(), vision: None, checkpoints: Vec::new(), shared: None, shared_only: false, idle_only: false }
     }
 }
 
@@ -664,7 +666,7 @@ impl Runtime {
             vision::prompt::expand(&tokens, vision.image_token_id, &parts).map_err(RpcError::invalid_params)?;
         let checkpoints = expanded_points(&checkpoints, &images);
         let shared = shared.and_then(|point| expanded_points(&[point], &images).first().copied());
-        Ok(Prompt { tokens, images, vision: Some(vision), checkpoints, shared, shared_only: false })
+        Ok(Prompt { tokens, images, vision: Some(vision), checkpoints, shared, shared_only: false, idle_only: false })
     }
 
     fn encode(&self, loaded: &Loaded, text: &str) -> Result<Vec<u64>, RpcError> {
@@ -693,7 +695,7 @@ impl Runtime {
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let _stop_on_drop = StopOnDrop(stop.clone());
-        let Prompt { tokens: prompt, images, vision, checkpoints, shared, shared_only } = prompt;
+        let Prompt { tokens: prompt, images, vision, checkpoints, shared, shared_only, idle_only } = prompt;
         let request = engine::Request {
             id: 0,
             key,
@@ -701,6 +703,7 @@ impl Runtime {
             checkpoints,
             shared,
             shared_only,
+            idle_only,
             images,
             vision,
             priority,
@@ -895,6 +898,7 @@ impl Runtime {
             }
             prompt.shared_only = true;
         }
+        prompt.idle_only = params.idle_only;
         let mut sink = |_: &Piece| {};
         let generated = self
             .generate(&loaded, params.cache_key.clone(), prompt, Priority::Background, Work::Prewarm, OutputParser::raw(), &[], &mut sink, &cancel)
@@ -950,6 +954,29 @@ impl Runtime {
             Ok(value) => Ok(value),
             Err((code, message)) if code == "not_found" => Err(RpcError::not_found(message)),
             Err((_, message)) => Err(RpcError::internal(message)),
+        }
+    }
+
+    /// Keep a conversation resident while its turn runs, or release it (`model.hold`). Before the
+    /// model is loaded there is nothing to hold: the answer says so.
+    pub fn hold(&self, params: HoldParams) -> Result<Value, RpcError> {
+        let Some(loaded) = self.current() else { return Ok(json!({"held": false})) };
+        loaded.engine.send(Command::Hold { key: params.cache_key, hold: params.hold }).map_err(unavailable)?;
+        Ok(json!({"held": params.hold}))
+    }
+
+    /// The state kept under `from` becomes `to`'s (`model.rename`): a conversation's compacted prompt
+    /// prefilled under a second key is taken over without re-reading it.
+    pub fn rename(&self, params: cc_protocol::contracts::model::RenameParams) -> Result<Value, RpcError> {
+        let Some(loaded) = self.current() else { return Ok(json!({"renamed": false})) };
+        loaded.engine.send(Command::Rename { from: params.from, to: params.to }).map_err(unavailable)?;
+        Ok(json!({"renamed": true}))
+    }
+
+    /// Drop a conversation for good (its session was deleted), resident or on disk.
+    pub fn forget(&self, cache_key: String) {
+        if let Some(loaded) = self.current() {
+            let _ = loaded.engine.send(Command::Forget(cache_key));
         }
     }
 

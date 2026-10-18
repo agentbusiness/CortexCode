@@ -15,13 +15,21 @@
 //! - Packages dropped into `<home>/plugins/.incoming/` are installed at startup and whenever one
 //!   appears; while the frame runs, the outcome is written beside it as `<file>.result.json` for
 //!   the packer that waits for it.
+//! - Alternatives: several plugins may serve one category (two model engines). One serves it;
+//!   the others are on standby (installed, not started, their UI packages not served). The one
+//!   that serves is the person's choice (`frame.plugins.switch`, kept in `plugins.json` under
+//!   `providers`), else the one whose declared `[backend.machine]` range holds this machine's
+//!   memory, else the first enabled one. A switch is a swap of the category's slot to the other
+//!   plugin, with the swap engine's drain, probe and restore.
 
 use crate::config::{DEFAULT_HELLO_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS, PluginConfig, PluginOverride, merge_config};
 use crate::home::write_atomic;
 use crate::hub::Frame;
 use crate::package::{INCOMING, Installed};
 use crate::supervisor::{self, ExecSpec};
-use cc_protocol::contracts::frame::{PackageSwapResult, PluginToggleResult, PluginUnit, SwapStep, UiPlugin, topics};
+use cc_protocol::contracts::frame::{
+    PackageSwapResult, PluginToggleResult, PluginUnit, ProviderInfo, ProvidersResult, SwapStep, SwitchResult, UiPlugin, topics,
+};
 use cc_protocol::contracts::{CATEGORIES, FAMILIES};
 use cc_protocol::{RpcError, to_value};
 use serde::{Deserialize, Serialize};
@@ -102,6 +110,7 @@ impl Unit {
             shell: Self::shell_of(current).into_iter().map(|(id, _)| id).collect(),
             shell_dirs: if state.enabled { Self::shell_of(current).into_iter().map(|(_, d)| d.display().to_string()).collect() } else { Vec::new() },
             previous_version: state.previous.as_ref().map(|v| v.version().to_owned()),
+            standby: false,
         }
     }
 }
@@ -110,6 +119,7 @@ impl Unit {
 pub fn exec_spec(version: &Installed, over: &PluginOverride) -> Option<ExecSpec> {
     let packed = version.manifest.backend.as_ref()?;
     Some(ExecSpec {
+        plugin: version.id().to_owned(),
         exec: version.process_exec()?,
         data_name: version.exec_name()?,
         args: over.args.clone().unwrap_or_else(|| packed.args.clone()),
@@ -150,6 +160,9 @@ struct PluginsFile {
     disabled: BTreeSet<String>,
     #[serde(default)]
     installed: BTreeMap<String, InstalledRecord>,
+    /// The plugin the person chose for a category that has alternatives (`frame.plugins.switch`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    providers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -167,14 +180,20 @@ pub struct Units {
     /// `<home>/plugins`.
     pub root: PathBuf,
     overrides: BTreeMap<String, PluginOverride>,
-    /// Serializes enable, disable, install and rollback.
+    /// Serializes enable, disable, install, rollback and switch.
     pub op: tokio::sync::Mutex<()>,
+    /// The person's choice per category with alternatives (persisted).
+    providers: Mutex<BTreeMap<String, String>>,
+    /// The plugin serving each category now, and why (`user`, `machine`, `only`, `first`).
+    serving: Mutex<BTreeMap<String, (String, &'static str)>>,
+    /// This machine's physical memory (`hw.memsize`), for the declared machine ranges.
+    memory_bytes: u64,
 }
 
 impl Units {
     /// Build the units from `plugins.json`, then install what waits in `.incoming/` (the frame is
     /// not serving yet, so a newer version simply becomes current).
-    pub fn load(root: &Path, state_dir: &Path, overrides: BTreeMap<String, PluginOverride>) -> Result<Units, String> {
+    pub fn load(root: &Path, state_dir: &Path, overrides: BTreeMap<String, PluginOverride>, memory_bytes: u64) -> Result<Units, String> {
         let file = state_dir.join("plugins.json");
         let saved: PluginsFile = match std::fs::read(&file) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", file.display()))?,
@@ -200,7 +219,16 @@ impl Units {
             }
             list.push(Arc::new(unit));
         }
-        let units = Units { list: RwLock::new(list), file, root: root.to_path_buf(), overrides, op: tokio::sync::Mutex::new(()) };
+        let units = Units {
+            list: RwLock::new(list),
+            file,
+            root: root.to_path_buf(),
+            overrides,
+            op: tokio::sync::Mutex::new(()),
+            providers: Mutex::new(saved.providers.clone()),
+            serving: Mutex::new(BTreeMap::new()),
+            memory_bytes,
+        };
         for archive in units.incoming() {
             let outcome = units.install_offline(&archive, &saved.disabled);
             // Nobody waits for a startup install (a packer waits only while a frame runs): the
@@ -212,8 +240,136 @@ impl Units {
             let _ = std::fs::remove_file(&archive);
         }
         units.sort();
+        units.choose_serving();
         units.persist()?;
         Ok(units)
+    }
+
+    /// Decide, at startup, which plugin serves each category.
+    fn choose_serving(&self) {
+        let categories: BTreeSet<String> = self.all().iter().filter_map(|unit| unit.category()).collect();
+        let mut serving = BTreeMap::new();
+        for category in categories {
+            if let Some((unit, why)) = self.pick(&category) {
+                if why != "only" {
+                    tracing::info!(%category, plugin = %unit.id, chosen_by = why, memory_gb = self.memory_bytes / (1 << 30), "category with alternatives");
+                }
+                serving.insert(category, (unit.id.clone(), why));
+            }
+        }
+        if let Ok(mut current) = self.serving.lock() {
+            *current = serving;
+        }
+    }
+
+    /// The plugin that should serve `category`: the person's choice, else the one whose declared
+    /// machine range holds this machine, else the first enabled one.
+    fn pick(&self, category: &str) -> Option<(Arc<Unit>, &'static str)> {
+        let units = self.units_of(category);
+        if units.len() <= 1 {
+            return units.into_iter().next().map(|unit| (unit, "only"));
+        }
+        let chosen = self.providers.lock().ok().and_then(|providers| providers.get(category).cloned());
+        if let Some(unit) = chosen.and_then(|id| units.iter().find(|unit| unit.id == id).cloned()) {
+            return Some((unit, "user"));
+        }
+        if let Some(unit) = units.iter().find(|unit| unit.enabled() && self.fits_machine(unit) == Some(true)) {
+            return Some((unit.clone(), "machine"));
+        }
+        units.iter().find(|unit| unit.enabled()).or(units.first()).cloned().map(|unit| (unit, "first"))
+    }
+
+    /// Whether this machine is inside the unit's declared range (None: it declares none).
+    fn fits_machine(&self, unit: &Unit) -> Option<bool> {
+        unit.current().manifest.backend.as_ref()?.machine.as_ref().map(|fit| fit.holds(self.memory_bytes))
+    }
+
+    /// Every unit whose backend serves `category`, in start order.
+    fn units_of(&self, category: &str) -> Vec<Arc<Unit>> {
+        self.all().into_iter().filter(|unit| unit.category().as_deref() == Some(category)).collect()
+    }
+
+    /// The plugin serving `category` now.
+    pub fn serving_of(&self, category: &str) -> Option<String> {
+        self.serving.lock().ok().and_then(|serving| serving.get(category).map(|(plugin, _)| plugin.clone()))
+    }
+
+    /// Another plugin serves this unit's category: it is installed but does not run.
+    pub fn is_standby(&self, unit: &Unit) -> bool {
+        unit.category().and_then(|category| self.serving_of(&category)).is_some_and(|serving| serving != unit.id)
+    }
+
+    /// The swap engine committed `plugin` in `category`'s slot: it serves the category now. A
+    /// recorded choice follows it (a crash in the watch window that restored the previous plugin
+    /// is not undone at the next start).
+    pub fn serving_changed(&self, category: &str, plugin: &str) {
+        if let Ok(mut serving) = self.serving.lock() {
+            let why = if serving.get(category).is_some_and(|(id, _)| id == plugin) { serving[category].1 } else { "user" };
+            serving.insert(category.to_owned(), (plugin.to_owned(), why));
+        }
+        let recorded = self.providers.lock().map(|mut providers| match providers.get_mut(category) {
+            Some(chosen) if chosen != plugin => {
+                *chosen = plugin.to_owned();
+                true
+            }
+            _ => false,
+        });
+        if recorded.unwrap_or(false)
+            && let Err(error) = self.persist()
+        {
+            tracing::error!(%error, "cannot record the serving plugin");
+        }
+    }
+
+    /// Record the person's choice for `category`.
+    fn choose(&self, category: &str, plugin: &str) -> Result<(), String> {
+        if let Ok(mut providers) = self.providers.lock() {
+            providers.insert(category.to_owned(), plugin.to_owned());
+        }
+        if let Ok(mut serving) = self.serving.lock() {
+            serving.insert(category.to_owned(), (plugin.to_owned(), "user"));
+        }
+        self.persist()
+    }
+
+    /// The slot settings of `plugin`'s backend as it is installed now.
+    pub fn backend_config_of(&self, plugin: &str) -> Option<PluginConfig> {
+        let unit = self.get(plugin)?;
+        backend_config(&unit.current(), &self.override_of(plugin))
+    }
+
+    /// A unit as `frame.plugins.list` shows it.
+    pub fn info_of(&self, unit: &Unit) -> PluginUnit {
+        PluginUnit { standby: self.is_standby(unit), ..unit.info() }
+    }
+
+    /// `frame.plugins.providers`.
+    pub fn providers(&self, category: &str) -> ProvidersResult {
+        let (serving, chosen_by) = self
+            .serving
+            .lock()
+            .ok()
+            .and_then(|serving| serving.get(category).map(|(plugin, why)| (plugin.clone(), (*why).to_owned())))
+            .unwrap_or_default();
+        let providers = self
+            .units_of(category)
+            .iter()
+            .map(|unit| {
+                let current = unit.current();
+                let meta = &current.manifest.plugin;
+                ProviderInfo {
+                    plugin: unit.id.clone(),
+                    name: if meta.name.is_empty() { unit.id.clone() } else { meta.name.clone() },
+                    description: meta.description.clone(),
+                    version: meta.version.clone(),
+                    enabled: unit.enabled(),
+                    serving: unit.id == serving,
+                    machine: current.manifest.backend.as_ref().and_then(|backend| backend.machine.clone()),
+                    fits_machine: self.fits_machine(unit),
+                }
+            })
+            .collect();
+        ProvidersResult { category: category.to_owned(), serving, chosen_by, memory_bytes: self.memory_bytes, providers }
     }
 
     /// `.ccplugin` files waiting in `.incoming/` (oldest first).
@@ -272,7 +428,10 @@ impl Units {
 
     /// The plugin whose backend serves `category`.
     pub fn of_category(&self, category: &str) -> Option<Arc<Unit>> {
-        self.all().into_iter().find(|unit| unit.category().as_deref() == Some(category))
+        match self.serving_of(category) {
+            Some(plugin) => self.get(&plugin),
+            None => self.units_of(category).into_iter().next(),
+        }
     }
 
     pub fn override_of(&self, plugin: &str) -> PluginOverride {
@@ -283,15 +442,22 @@ impl Units {
         self.all().iter().filter(|u| !u.enabled()).map(|u| u.id.clone()).collect()
     }
 
-    /// Slot settings of every plugin with a backend, in start order.
+    /// Slot settings of every plugin with a backend that serves its category, in start order
+    /// (alternatives on standby get no slot).
     pub fn backends(&self) -> Vec<PluginConfig> {
-        self.all().iter().filter_map(|unit| backend_config(&unit.current(), &self.override_of(&unit.id))).collect()
+        self.all()
+            .iter()
+            .filter(|unit| !self.is_standby(unit))
+            .filter_map(|unit| backend_config(&unit.current(), &self.override_of(&unit.id)))
+            .collect()
     }
 
     /// UI bundle directories of every unit's running version (disabled ones included; the UI
     /// plugin table filters them).
     pub fn ui_sources(&self) -> Vec<(String, PathBuf)> {
-        self.all().iter().flat_map(|unit| unit.ui_of(&unit.current())).collect()
+        // An alternative on standby keeps its UI to itself: the category's panels and cards are the
+        // serving plugin's.
+        self.all().iter().filter(|unit| !self.is_standby(unit)).flat_map(|unit| unit.ui_of(&unit.current())).collect()
     }
 
     /// The disabled plugin whose shell module serves `category`, if any (its category must not be
@@ -368,7 +534,8 @@ impl Units {
     }
 
     fn persist(&self) -> Result<(), String> {
-        let mut file = PluginsFile { disabled: self.disabled(), installed: BTreeMap::new() };
+        let providers = self.providers.lock().map(|providers| providers.clone()).unwrap_or_default();
+        let mut file = PluginsFile { disabled: self.disabled(), installed: BTreeMap::new(), providers };
         for unit in self.all() {
             let state = unit.lock();
             file.installed.insert(
@@ -429,14 +596,15 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
     let current = unit.current();
     let ui_ids = Unit::ui_ids(&current);
     if unit.enabled() == enabled {
-        return Ok(PluginToggleResult { plugin: unit.info(), changed: false, steps, ui: Vec::new() });
+        return Ok(PluginToggleResult { plugin: frame.units.info_of(&unit), changed: false, steps, ui: Vec::new() });
     }
     unit.lock().enabled = enabled;
     if let Err(error) = frame.units.persist() {
         unit.lock().enabled = !enabled;
         return Err(RpcError::internal(error));
     }
-    let slot = unit.category().and_then(|category| frame.sup.slot(&category));
+    // A standby alternative has no slot of its own: the category's slot runs another plugin.
+    let slot = unit.category().and_then(|category| frame.sup.slot(&category)).filter(|slot| slot.plugin() == id);
     if enabled {
         if let Some(slot) = &slot {
             match exec_spec(&current, &frame.units.override_of(id)) {
@@ -463,7 +631,7 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
             steps.extend(supervisor::disable(frame, slot).await);
         }
     }
-    let info = unit.info();
+    let info = frame.units.info_of(&unit);
     publish_unit(frame, &info);
     tracing::info!(plugin = id, enabled, "plugin {}", if enabled { "enabled" } else { "disabled" });
     Ok(PluginToggleResult { plugin: info, changed: true, steps, ui: ui_ids })
@@ -510,14 +678,17 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
 /// A plugin new to this frame: add its unit (and its backend's slot).
 fn add_unit(frame: &Arc<Frame>, installed: Arc<Installed>) -> Result<Arc<Unit>, RpcError> {
     let backend = backend_config(&installed, &frame.units.override_of(installed.id()));
-    if let Some(backend) = &backend
-        && let Some(existing) = frame.sup.slot(&backend.category)
-    {
-        return Err(RpcError::invalid_params(format!("category `{}` is already served by plugin `{}`", backend.category, existing.plugin)));
-    }
     let unit = Arc::new(Unit::new(installed, true));
     if let Some(backend) = &backend {
-        frame.sup.add_slot(supervisor::Slot::new(backend, false)).map_err(RpcError::invalid_params)?;
+        if let Some(existing) = frame.sup.slot(&backend.category) {
+            // Another plugin serves the category: this one waits as its alternative.
+            tracing::info!(category = %backend.category, plugin = %unit.id, serving = %existing.plugin(), "installed an alternative; it is on standby");
+        } else {
+            frame.sup.add_slot(supervisor::Slot::new(backend, false)).map_err(RpcError::invalid_params)?;
+            if let Ok(mut serving) = frame.units.serving.lock() {
+                serving.insert(backend.category.clone(), (unit.id.clone(), "only"));
+            }
+        }
     }
     if let Ok(mut list) = frame.units.list.write() {
         list.push(unit.clone());
@@ -531,6 +702,11 @@ type Outcome = Result<Option<cc_protocol::contracts::frame::SwapResult>, (String
 /// Start a newly added plugin: its backend, then its UI packages and shell modules.
 async fn start_new(frame: &Arc<Frame>, unit: &Arc<Unit>, steps: &mut Vec<SwapStep>) -> Outcome {
     let mut backend_swap = None;
+    if let Some(category) = unit.category().filter(|_| frame.units.is_standby(unit)) {
+        let serving = frame.units.serving_of(&category).unwrap_or_default();
+        steps.push(SwapStep { step: "standby".into(), ok: true, ms: 0, detail: format!("`{category}` is served by {serving}; switch to {} with frame.plugins.switch", unit.id) });
+        return Ok(None);
+    }
     if let Some(category) = unit.category() {
         let slot = frame.sup.slot(&category).ok_or_else(|| (format!("no slot for `{category}`"), None))?;
         let spec = exec_spec(&unit.current(), &frame.units.override_of(&unit.id)).ok_or_else(|| ("the package has no runnable backend".to_owned(), None))?;
@@ -554,7 +730,9 @@ async fn start_new(frame: &Arc<Frame>, unit: &Arc<Unit>, steps: &mut Vec<SwapSte
 async fn switch(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>, why: &str, steps: &mut Vec<SwapStep>) -> Outcome {
     let enabled = unit.enabled();
     let mut backend_swap = None;
-    if let Some(category) = unit.category() {
+    if frame.units.is_standby(unit) {
+        steps.push(SwapStep { step: "backend".into(), ok: true, ms: 0, detail: "the plugin is on standby; the new version starts when it is switched to".into() });
+    } else if let Some(category) = unit.category() {
         let slot = frame.sup.slot(&category).ok_or_else(|| (format!("no slot for `{category}`"), None))?;
         let spec = exec_spec(&to, &frame.units.override_of(&unit.id)).ok_or_else(|| ("the version has no runnable backend".to_owned(), None))?;
         if enabled {
@@ -591,7 +769,7 @@ fn finish(frame: &Arc<Frame>, unit: &Arc<Unit>, from_version: String, mut steps:
     if let Err(error) = frame.units.persist() {
         steps.push(SwapStep { step: "persist".into(), ok: false, ms: 0, detail: error });
     }
-    let info = unit.info();
+    let info = frame.units.info_of(unit);
     publish_unit(frame, &info);
     let ui = served(frame, &info.ui);
     Ok(match outcome {
@@ -664,7 +842,80 @@ pub async fn backend_moved(frame: &Arc<Frame>, plugin: &str, to_version: &str) {
         tracing::error!(%error, "cannot record the fallback");
     }
     frame.units.prune(plugin);
-    publish_unit(frame, &unit.info());
+    publish_unit(frame, &frame.units.info_of(&unit));
+}
+
+/// Publish `plugin.unit` for every unit (a switch changes which ones are on standby).
+pub fn publish_units(frame: &Frame) {
+    for unit in frame.units.all() {
+        publish_unit(frame, &frame.units.info_of(&unit));
+    }
+}
+
+/// `frame.plugins.switch`: serve `category` with `plugin`, another installed plugin of it.
+pub async fn switch_provider(frame: &Arc<Frame>, category: &str, plugin: &str) -> Result<SwitchResult, RpcError> {
+    let _op = frame.units.op.lock().await;
+    let unit = frame.units.get(plugin).ok_or_else(|| RpcError::not_found(format!("no plugin `{plugin}`")))?;
+    if unit.category().as_deref() != Some(category) {
+        return Err(RpcError::invalid_params(format!("plugin `{plugin}` does not serve `{category}`")));
+    }
+    if !unit.enabled() {
+        return Err(RpcError::invalid_params(format!("plugin `{plugin}` is disabled; enable it before switching to it")));
+    }
+    let slot = frame.sup.slot(category).ok_or_else(|| RpcError::not_found(format!("`{category}` has no slot")))?;
+    let from = slot.plugin();
+    let unchanged = |ok: bool, error: Option<String>| SwitchResult {
+        ok,
+        category: category.to_owned(),
+        from_plugin: from.clone(),
+        to_plugin: plugin.to_owned(),
+        changed: false,
+        backend: None,
+        steps: Vec::new(),
+        error,
+    };
+    if from == plugin {
+        frame.units.choose(category, plugin).map_err(RpcError::internal)?;
+        return Ok(unchanged(true, None));
+    }
+    // A switch happens only while nothing runs: a running request would be cut off, and a
+    // conversation is never continued on another engine.
+    if !slot.is_disabled()
+        && let Some(running) = supervisor::in_flight(&slot).await
+        && running > 0
+    {
+        return Err(RpcError::new(
+            cc_protocol::codes::BUSY,
+            format!("{from} is serving {running} request(s) now: switch the engine when nothing runs"),
+        ));
+    }
+    let spec = frame.units.current_spec(plugin).ok_or_else(|| RpcError::not_found(format!("`{plugin}` has no installed backend")))?;
+    let mut steps = Vec::new();
+    let started = Instant::now();
+    let result = if slot.is_disabled() {
+        // The serving plugin is disabled: nothing runs to drain; the chosen one starts.
+        if let Some(cfg) = frame.units.backend_config_of(plugin) {
+            slot.serve_with(cfg);
+        }
+        frame.units.serving_changed(category, plugin);
+        steps.extend(supervisor::enable(frame, &slot, spec).await);
+        None
+    } else {
+        let note = format!("switch {category} from {from} to {plugin}");
+        Some(supervisor::swap_for_package(frame, &slot, spec, &note).await)
+    };
+    let ok = result.as_ref().is_none_or(|swap| swap.ok);
+    step(&mut steps, "backend", ok, started, if ok { format!("{plugin} serves `{category}`") } else { format!("{from} keeps serving `{category}`") });
+    if ok {
+        frame.units.choose(category, plugin).map_err(RpcError::internal)?;
+    }
+    let started = Instant::now();
+    let changes = frame.refresh_ui().await;
+    step(&mut steps, "ui", true, started, format!("{} UI package(s) changed", changes.len()));
+    publish_units(frame);
+    let error = result.as_ref().and_then(|swap| swap.error.clone());
+    tracing::info!(%category, %from, to = plugin, ok, "switch");
+    Ok(SwitchResult { ok, category: category.to_owned(), from_plugin: from, to_plugin: plugin.to_owned(), changed: ok, backend: result, steps, error })
 }
 
 /// Watch `.incoming/` and install every package that appears (debounced; a packer writes a

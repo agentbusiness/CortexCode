@@ -7,9 +7,14 @@
 //! - a generation the model plugin stopped as repeating itself (`finish_reason = repeated`) is one.
 //!
 //! The first repetition earns a corrective replanning message; a repetition after that stops the
-//! run with an honest status.
+//! run with an honest status. A repeated read never stops it: reading a file again changes
+//! nothing and costs one call, while stopping ends work that may be close to done (seen: a task
+//! stopped mid-fix for reading its own file twice). It earns the correction once.
 
 use std::collections::HashMap;
+
+/// The model's read tool (files, folders, URIs).
+const READ: &str = "read";
 
 /// FNV-1a 64: a stable fingerprint (mechanical; equality of bytes, not meaning).
 pub fn fingerprint(text: &str) -> u64 {
@@ -46,19 +51,27 @@ pub enum Verdict {
     Replan(String),
     /// Repeated again after a replan: stop.
     Stop(String),
+    /// The same read with the same result for the `READ_REPEAT_AT`-th time: told once that the
+    /// content is above (a reread is harmless; it never escalates or stops the run).
+    Reread(String),
 }
+
+/// Identical reads (same target, same content) before the model is told it has them already.
+const READ_REPEAT_AT: u32 = 3;
 
 #[derive(Debug)]
 pub struct Detector {
     seen: HashMap<(String, u64), u32>,
     corrected: bool,
+    /// A repeated read was corrected already (it is told once; reads never stop the run).
+    read_corrected: bool,
     /// How many identical (call, result) pairs make a repetition (data: `limits.repeat_at`).
     repeat_at: u32,
 }
 
 impl Detector {
     pub fn new(repeat_at: u32) -> Self {
-        Self { seen: HashMap::new(), corrected: false, repeat_at: repeat_at.max(2) }
+        Self { seen: HashMap::new(), corrected: false, read_corrected: false, repeat_at: repeat_at.max(2) }
     }
 
     /// Canonical signature of a call: arguments with object keys sorted (mechanical).
@@ -71,6 +84,26 @@ impl Detector {
             map.remove("i");
         }
         format!("{tool} {}", canonical(&args))
+    }
+
+    /// Record one executed tool call and its output: a read counts toward the correction only.
+    pub fn observe_call(&mut self, tool: &str, args: &serde_json::Value, output: &str) -> Verdict {
+        let signature = Self::signature(tool, args);
+        if tool != READ {
+            return self.observe(&signature, output);
+        }
+        let key = (signature.clone(), fingerprint(output));
+        let count = self.seen.entry(key).or_insert(0);
+        *count += 1;
+        if *count < self.repeat_at.max(READ_REPEAT_AT) {
+            return Verdict::Fine;
+        }
+        self.seen.retain(|(seen, _), _| seen != &signature);
+        if self.read_corrected {
+            return Verdict::Fine;
+        }
+        self.read_corrected = true;
+        Verdict::Reread(format!("`{}`", signature.chars().take(300).collect::<String>()))
     }
 
     /// Record one executed call and its output.
@@ -104,6 +137,7 @@ impl Detector {
     pub fn reset(&mut self) {
         self.seen.clear();
         self.corrected = false;
+        self.read_corrected = false;
     }
 
     /// The workspace changed (an edit, a command that wrote files): the same call returning the

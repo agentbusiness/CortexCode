@@ -2,7 +2,9 @@
 //!
 //! Each session gets a real bash process (its own session and process group, no controlling
 //! terminal, stdin of every command is /dev/null). Commands are written to a file and sourced in
-//! the shell, so `cd`, exported variables and functions persist. A sentinel line carrying a random
+//! the shell, so exported variables and functions persist. Every command starts in the workspace:
+//! a `cd` lasts for its own command (a directory carried over from an earlier one was the model's
+//! blind spot: it lost the project after one `cd` into a temp folder). A sentinel line carrying a random
 //! nonce and the exit status delimits each command's output. After every command the shell saves its
 //! working directory and exported environment, so a shell that had to be killed (timeout, cancel)
 //! or that exited is restarted transparently with the same state.
@@ -70,6 +72,17 @@ pub struct Capture {
 pub enum Captured {
     Mem(Vec<u8>),
     File { path: PathBuf, head: Vec<u8>, tail: Vec<u8>, total: u64, newlines: u64 },
+}
+
+impl Captured {
+    /// The whole output as text, when it is at most `limit` bytes (a spilled capture is read back
+    /// from its file).
+    pub fn whole(&self, limit: u64) -> Option<String> {
+        match self {
+            Captured::Mem(bytes) => (bytes.len() as u64 <= limit).then(|| String::from_utf8_lossy(bytes).into_owned()),
+            Captured::File { path, total, .. } => (*total <= limit).then(|| std::fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())).flatten(),
+        }
+    }
 }
 
 impl Capture {
@@ -236,6 +249,7 @@ impl Shells {
         let state = self.state_dir(&identity.session_id);
         std::fs::create_dir_all(&state)?;
         let start_dir = if identity.workspace.is_dir() { identity.workspace.clone() } else { std::env::temp_dir() };
+        let scratch = if identity.workspace.is_dir() { util::ensure_scratch(&identity.workspace) } else { std::env::temp_dir() };
         let (reader, writer) = std::io::pipe()?;
         let writer_err = writer.try_clone()?;
         let mut command = match &identity.sandbox {
@@ -260,10 +274,18 @@ impl Shells {
             .env("CORTEX_PROJECT_ID", &identity.project_id)
             .env("CORTEX_HOME", &identity.home)
             .env("CORTEX_WORKSPACE", &identity.workspace)
+            // The session's own scratch folder (throwaway checks; `edit` writes there too).
+            .env("TMPDIR", &scratch)
+            // A check written in the scratch folder imports the project's code as usual: Python
+            // looks next to the script and Node resolves packages from the script's folder.
+            .env("PYTHONPATH", &identity.workspace)
+            .env("NODE_PATH", identity.workspace.join("node_modules"))
             .env("PAGER", "cat")
             .env("GIT_PAGER", "cat")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("TERM", "dumb");
+            .env("TERM", "dumb")
+            // The project's own environment (`.cortex-env`): a toolchain this machine lacks on PATH.
+            .envs(util::project_env(&identity.workspace));
         // SAFETY: setsid is async-signal-safe; it makes the shell a session and process-group
         // leader without a controlling terminal, so the group can be killed as a whole and
         // programs cannot block on /dev/tty.
@@ -365,10 +387,12 @@ impl Shells {
                 prefix.push_str(&format!("export {key}={}; ", util::shell_quote(value)));
             }
         }
-        let body = match &request.cwd {
-            Some(cwd) => format!("( {prefix}cd -- {} && . {} ) </dev/null", q(cwd), q(&command_file)),
-            None if !prefix.is_empty() => format!("( {prefix}. {} ) </dev/null", q(&command_file)),
-            None => format!(". {} </dev/null", q(&command_file)),
+        // Every command starts in the workspace (or the directory asked for this call).
+        let start = request.cwd.clone().unwrap_or_else(|| identity.workspace.clone());
+        let body = if request.cwd.is_some() || !prefix.is_empty() {
+            format!("( {prefix}cd -- {} && . {} ) </dev/null", q(&start), q(&command_file))
+        } else {
+            format!("cd -- {} >/dev/null 2>&1; . {} </dev/null", q(&start), q(&command_file))
         };
         let marker = format!("__CX_DONE_{nonce}_");
         let activate = identity.venv.as_deref().map(crate::pyenv::activation).unwrap_or_default();

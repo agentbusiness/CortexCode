@@ -305,12 +305,13 @@ pub fn complete_json(raw: &str) -> String {
     out
 }
 
-/// A cache key for requests that bring none (the OpenAI endpoint): the first two messages (normally
-/// the system block and the first user turn), hashed. Requests continuing the same conversation share
-/// it. Structural (FNV-1a over bytes).
+/// A cache key for requests that bring none (the OpenAI endpoint): the conversation's start (the
+/// messages up to and including the first user turn, so any system block too), hashed. Requests
+/// continuing the same conversation share it; later turns never enter it. Structural (FNV-1a over bytes).
 pub fn derived_key(messages: &[Value]) -> String {
+    let start = messages.iter().position(|message| message["role"] == "user").map_or(messages.len(), |first| first + 1);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for message in messages.iter().take(2) {
+    for message in &messages[..start] {
         for byte in message.to_string().bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);

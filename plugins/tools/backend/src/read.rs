@@ -18,7 +18,9 @@ pub struct ReadConfig {
 
 impl Default for ReadConfig {
     fn default() -> Self {
-        Self { outline_lines: 600, outline_bytes: 64 * 1024 }
+        // A whole read shows at most 400 lines (about 4-6k tokens); a bigger file gives its outline
+        // and is read by range. A read never fills the model's context with one file.
+        Self { outline_lines: 300, outline_bytes: 24 * 1024 }
     }
 }
 
@@ -187,6 +189,11 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
                 continue;
             }
             let (end, continued) = match segment.end {
+                // An explicit range shows at most `outline_lines` lines; the rest is one read away.
+                Some(end) if end.min(total) >= segment.start + config.outline_lines => {
+                    let end = segment.start + config.outline_lines - 1;
+                    (end, Some(end + 1))
+                }
                 Some(end) => (end.min(total), None),
                 None => {
                     let end = (segment.start + config.outline_lines - 1).min(total);
@@ -271,7 +278,7 @@ pub fn render_outline(path: &Path, display: &str, text: &str, doc: &Doc, hint: b
             Some((row, following)) => format!("{display}:{}-{following}", row + 1),
             None => format!("{display}:1-{}", total.min(100)),
         };
-        let _ = write!(out, " Read a range to see them, e.g. {example}.");
+        let _ = write!(out, " Read one definition by its name, e.g. {display}#<name>, or a range, e.g. {example}.");
     }
     out.push('\n');
     out.push_str(&body);

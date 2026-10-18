@@ -6,7 +6,6 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
     "prepare-suites": "node prepare.mjs",
     "report": "node report.mjs"
   }

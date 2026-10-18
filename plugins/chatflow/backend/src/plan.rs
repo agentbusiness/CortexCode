@@ -379,7 +379,17 @@ pub fn diff(old: &Plan, new: &Plan) -> PlanDiff {
 
 /// The plan as the model reads it.
 pub fn render(ds: &Dataset, plan: &Plan) -> String {
-    let mut text = ds.text("plan_heading", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string()), ("status", &plan.status)]);
+    render_with(ds, plan, ds.text("plan_heading", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string()), ("status", &plan.status)]))
+}
+
+/// The heading of a plan shown in place: without its status, which changes while the plan is
+/// carried out (a changed message the model already read makes it read everything after it again).
+fn placed_heading(ds: &Dataset, plan: &Plan) -> String {
+    ds.text("plan_heading_placed", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string())])
+}
+
+fn render_with(ds: &Dataset, plan: &Plan, heading: String) -> String {
+    let mut text = heading;
     let doc = &plan.doc;
     if !doc.analysis.is_empty() {
         text.push_str(&ds.text("plan_analysis", &[("text", &doc.analysis)]));
@@ -424,22 +434,24 @@ pub fn render(ds: &Dataset, plan: &Plan) -> String {
     text
 }
 
-/// A plan entry as the model sees it in place: the newest version of its plan whole, older ones
-/// as one line.
-pub fn in_place(ds: &Dataset, entry: &JournalEntry, newest: &HashMap<String, u64>) -> Option<String> {
+/// A plan entry as the model sees it in place, never changed by later progress: whole, or its goal
+/// and task titles while it is carried out; one line once a version settled before `settled`
+/// replaced it (`newest`: the newest settled version of each plan; see [`crate::projection`]).
+pub fn in_place(ds: &Dataset, entry: &JournalEntry, newest: &HashMap<String, u64>, settled: u64) -> Option<String> {
     let plan = parse(entry)?;
-    if newest.get(&plan.plan_id) == Some(&entry.seq) {
-        let carried_out = entry.data.get("implement_run").and_then(Value::as_str).is_some_and(|run| !run.is_empty()) && plan.status == plan_status::IMPLEMENTING && plan.root_task.is_some();
-        Some(if carried_out { render_compact(ds, &plan) } else { render(ds, &plan) })
-    } else {
-        Some(ds.text("plan_superseded", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string())]))
+    if entry.seq <= settled && newest.get(&plan.plan_id).is_some_and(|&newest| newest > entry.seq) {
+        return Some(ds.text("plan_superseded", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string())]));
     }
+    // Set when its work starts, before a work step reads it; its status changes later, so the
+    // choice does not follow it.
+    let carried_out = entry.data.get("implement_run").and_then(Value::as_str).is_some_and(|run| !run.is_empty()) && plan.root_task.is_some();
+    Some(if carried_out { render_compact(ds, &plan) } else { render_with(ds, &plan, placed_heading(ds, &plan)) })
 }
 
 /// A plan task as the foreground loop gets it: only the task's own brief and the text of the spec
 /// requirements it serves (the whole work is framed once, in one sentence, by the step message).
-/// A task as its step states it: its brief, then the statement's requirements it must meet, in the
-/// statement's own words. The only task of a plan is the whole work, so it carries every live
+/// A task as its step states it: its brief, then the requirements it serves, in the user's own
+/// words. The only task of a plan is the whole work, so it carries every live
 /// requirement; a task among several carries the ones it covers.
 pub fn task_focus(ds: &Dataset, task: &PlanTask, spec: Option<&Spec>, whole: bool) -> String {
     let mut text = task.brief.trim().to_owned();
@@ -453,28 +465,35 @@ pub fn task_focus(ds: &Dataset, task: &PlanTask, spec: Option<&Spec>, whole: boo
         if !served.is_empty() {
             text.push_str(&ds.text("plan_task_requirements", &[("items", &served.join("\n"))]));
         }
+        text.push_str(&examples_block(ds, spec));
     }
     text
 }
 
+/// The request's own examples, right before the work: the check, with its values in view (seen: a
+/// task invented 20 cases with values it worked out, several wrong, then spent hours bending
+/// correct code to them). Empty when the request gave none.
+fn examples_block(ds: &Dataset, spec: &Spec) -> String {
+    if spec.examples.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = spec.examples.iter().map(|example| ds.text("list_item", &[("text", example)])).collect();
+    ds.text("plan_task_examples", &[("items", &items.join("\n"))])
+}
+
 /// A plan being carried out by the conversation's own loop, as the model sees it in place: the
-/// goal and the task titles with their state, not every task's brief (the briefs of later tasks
-/// pulled the first task into doing all the work).
+/// goal and the task titles, not every task's brief (the briefs of later tasks pulled the first
+/// task into doing all the work). No task states: they change at every task's end, and the step
+/// message says which task is now and which are done.
 pub fn render_compact(ds: &Dataset, plan: &Plan) -> String {
-    let mut text = ds.text("plan_heading", &[("plan_id", &plan.plan_id), ("version", &plan.version.to_string()), ("status", &plan.status)]);
+    let mut text = placed_heading(ds, plan);
     if !plan.doc.goal.is_empty() {
         text.push_str(&ds.text("plan_goal", &[("text", &plan.doc.goal)]));
     }
     if !plan.tasks.is_empty() {
         text.push_str(&ds.text("plan_tasks", &[]));
         for task in &plan.tasks {
-            let state = match plan.steps_done.iter().find(|done| done.n == task.n) {
-                Some(done) if done.outcome == "done" => "done",
-                Some(_) => "failed",
-                None if task.n as usize == plan.steps_done.len() + 1 => "now",
-                None => "later",
-            };
-            text.push_str(&ds.text("plan_task_compact", &[("number", &task.n.to_string()), ("title", &task.title), ("state", state)]));
+            text.push_str(&ds.text("plan_task_compact", &[("number", &task.n.to_string()), ("title", &task.title)]));
         }
     }
     text
@@ -495,6 +514,7 @@ pub fn task_brief(ds: &Dataset, plan: &Plan, task: &PlanTask, spec: Option<&Spec
         if !served.is_empty() {
             text.push_str(&ds.text("plan_task_requirements", &[("items", &served.join("\n"))]));
         }
+        text.push_str(&examples_block(ds, spec));
     }
     text
 }
@@ -526,33 +546,6 @@ pub fn foreground_decision(ds: &Dataset, plan: &Plan, spec: Option<&Spec>, effor
         skills: task.skills,
         note: String::new(),
     }
-}
-
-/// A plan the host makes from the spec when the planner wrote none worth the name (at most one
-/// task for a statement with several requirements): one task per live requirement, in the
-/// statement's order, each after the one before, named by the requirement's first words, with
-/// the requirement as its brief; the steps are the requirements. Checks are left to the last
-/// task's contract (the decision's, joined when the tasks are made).
-pub fn from_spec(spec: &Spec, files: &[String], max_tasks: usize) -> (Vec<String>, Vec<PlanTask>) {
-    let mut steps = Vec::new();
-    let mut tasks: Vec<PlanTask> = Vec::new();
-    for requirement in spec.live().take(max_tasks) {
-        let n = tasks.len() as u32 + 1;
-        let title = requirement.text.split_whitespace().take(6).collect::<Vec<_>>().join(" ").trim_end_matches(|c: char| !c.is_alphanumeric()).to_owned();
-        steps.push(requirement.text.trim().to_owned());
-        tasks.push(PlanTask {
-            n,
-            title,
-            brief: requirement.text.trim().to_owned(),
-            depends_on: if n > 1 { vec![n - 1] } else { Vec::new() },
-            touches: files.to_vec(),
-            checks: Vec::new(),
-            covers: vec![requirement.id.clone()],
-            skills: Vec::new(),
-            task_id: None,
-        });
-    }
-    (steps, tasks)
 }
 
 /// The task numbers the PLAN grammar offers for `depends_on`.

@@ -9,11 +9,18 @@
       "items": {
         "type": "string"
       }
+    },
+    "examples": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   },
   "required": [
     "title",
-    "requirements"
+    "requirements",
+    "examples"
   ],
   "additionalProperties": false
 }

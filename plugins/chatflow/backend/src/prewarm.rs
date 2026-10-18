@@ -59,17 +59,41 @@ pub fn state_key(cache_key: &str, messages: &[ChatMessage], tools: &[ToolSpec]) 
     hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// When a prefill runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// As soon as the model has room: the conversation is in front of the user, or at work.
+    Soon,
+    /// Only while the model serves no other conversation: a guess that the conversation goes on
+    /// (its turn just ended) must never slow work under way; another conversation's request
+    /// stops it, and what it prefilled until then is kept.
+    Idle,
+}
+
 /// Send `model.prewarm` for `messages` in the background. `ended(true)` when the model plugin
 /// prefilled them (or stopped for a real request), `ended(false)` when it refused or failed.
 /// Dropping the returned handle cancels it. `shared_only`: only the leading system block is
 /// prefilled, for a conversation not created yet ([`next_conversation`]).
-pub fn send(host: &Host, cache_key: &str, messages: Vec<ChatMessage>, tools: &[ToolSpec], what: &'static str, shared_only: bool, ended: impl FnOnce(bool) + Send + 'static) -> Prewarm {
+#[allow(clippy::too_many_arguments)]
+pub fn send(
+    host: &Host,
+    cache_key: &str,
+    messages: Vec<ChatMessage>,
+    tools: &[ToolSpec],
+    what: &'static str,
+    shared_only: bool,
+    when: When,
+    ended: impl FnOnce(bool) + Send + 'static,
+) -> Prewarm {
     let token = CancellationToken::new();
     let cancel = token.clone();
     let host = host.clone();
     let mut params = json!({"cache_key": cache_key, "messages": messages, "tools": tools});
     if shared_only {
         params["shared_only"] = json!(true);
+    }
+    if when == When::Idle {
+        params["idle_only"] = json!(true);
     }
     tokio::spawn(async move {
         let Ok(mut stream) = host.ctx().call_stream(model_methods::PREWARM, params) else {

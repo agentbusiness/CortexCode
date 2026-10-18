@@ -2,9 +2,8 @@
 //! checklist) and the decision log (decisions the discussion settled, proposed by the model and
 //! accepted by the user). See docs/IDEATION-WORKFLOW.md, parts 1 and 5.
 //!
-//! - A message becomes the spec structurally (its text is longer than `limits.spec_min_chars`
-//!   while the session has no spec, or the user marked it) or by the router's judgement (`spec`
-//!   new / amend). Its requirements come from one constrained SPEC call; a later message that
+//! - A message becomes the spec when the user marked it or by the router's judgement (`spec` new /
+//!   amend); by length (`limits.spec_min_chars`, off by default) only when that limit is set. Its requirements come from one constrained SPEC call; a later message that
 //!   changes them is one constrained SPEC_EDIT call (added, dropped and changed ids).
 //! - Every change is a new `spec` journal entry (a version); the newest is the spec. The user edits
 //!   it through `chatflow.spec.update` (a version `by: user`). A version's number is its place in
@@ -69,6 +68,9 @@ pub struct Spec {
     pub text: String,
     #[serde(default)]
     pub requirements: Vec<Requirement>,
+    /// The request's own worked examples, copied verbatim at SPEC: the check the work runs.
+    #[serde(default)]
+    pub examples: Vec<String>,
     #[serde(default)]
     pub decisions: Vec<Decided>,
     /// The user message the text came from.
@@ -186,25 +188,57 @@ fn decision_lines(ds: &Dataset, decisions: &[Decided]) -> String {
 /// or (without a spec) the accepted decisions. `None` when there is neither.
 pub fn pinned(ds: &Dataset, entries: &[JournalEntry]) -> Option<String> {
     if let Some((_, spec)) = current(entries) {
-        let mut text = ds.text("spec_pinned", &[("version", &spec.version.to_string()), ("title", spec.title.trim()), ("text", spec.text.trim())]);
-        let live: Vec<&Requirement> = spec.live().collect();
-        if !live.is_empty() {
-            text.push_str(&ds.text("spec_requirements", &[]));
-            for requirement in live {
-                text.push_str(&ds.text("spec_requirement", &[("id", &requirement.id), ("status", &requirement.status), ("text", requirement.text.trim())]));
-            }
-        }
-        if !spec.decisions.is_empty() {
-            text.push_str(&ds.text("spec_decisions", &[]));
-            text.push_str(&decision_lines(ds, &spec.decisions));
-        }
-        return Some(text);
+        return Some(whole(ds, &spec));
     }
     let accepted = accepted(entries);
     if accepted.is_empty() {
         return None;
     }
     Some(format!("{}{}", ds.text("decisions_pinned", &[]), decision_lines(ds, &accepted)))
+}
+
+/// A spec version whole: its text, live requirements and decisions.
+fn whole(ds: &Dataset, spec: &Spec) -> String {
+    let mut text = ds.text("spec_pinned", &[("version", &spec.version.to_string()), ("title", spec.title.trim()), ("text", spec.text.trim())]);
+    let live: Vec<&Requirement> = spec.live().collect();
+    if !live.is_empty() {
+        text.push_str(&ds.text("spec_requirements", &[]));
+        for requirement in live {
+            text.push_str(&ds.text("spec_requirement", &[("id", &requirement.id), ("status", &requirement.status), ("text", requirement.text.trim())]));
+        }
+    }
+    if !spec.examples.is_empty() {
+        text.push_str(&ds.text("spec_examples", &[]));
+        for example in &spec.examples {
+            text.push_str(&ds.text("list_item_line", &[("text", example)]));
+        }
+    }
+    if !spec.decisions.is_empty() {
+        text.push_str(&ds.text("spec_decisions", &[]));
+        text.push_str(&decision_lines(ds, &spec.decisions));
+    }
+    text
+}
+
+/// The `spec` entry `data` (version `version`) whole, as shown where it was made until a
+/// compaction pins it.
+pub fn whole_in_place(ds: &Dataset, version: u32, data: &Value) -> Option<String> {
+    let mut spec = serde_json::from_value::<Spec>(data.clone()).ok()?;
+    spec.version = version;
+    Some(whole(ds, &spec))
+}
+
+/// An accepted `decision` entry, as shown where it was made until a compaction pins it.
+pub fn accepted_in_place(ds: &Dataset, data: &Value) -> Option<String> {
+    (str_field(data, "state") == ACCEPTED).then(|| {
+        let decided = Decided {
+            decided: str_field(data, "decided").to_owned(),
+            because: str_field(data, "because").to_owned(),
+            rejected: str_field(data, "rejected").to_owned(),
+            seq: None,
+        };
+        format!("{}{}", ds.text("decisions_pinned", &[]), decision_lines(ds, &[decided]))
+    })
 }
 
 /// The text a user message is shown as when the current spec was made from it.
@@ -283,6 +317,7 @@ pub fn created(ds: &Dataset, previous: Option<&Spec>, accepted: Vec<Decided>, te
         text,
         changes: ds.text("spec_created", &[("count", &requirements.len().to_string())]),
         requirements,
+        examples: extract.examples.iter().map(|text| text.trim().to_owned()).filter(|text| !text.is_empty()).collect(),
         decisions: previous.map(|spec| spec.decisions.clone()).unwrap_or(accepted),
         source_seq: Some(source_seq),
         by: "model".into(),

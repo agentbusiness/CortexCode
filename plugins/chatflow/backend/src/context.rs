@@ -84,12 +84,14 @@ pub async fn model_info(host: &Host) -> Option<ModelInfo> {
     host.get::<ModelInfo>(model_methods::INFO, json!({})).await.ok()
 }
 
-/// Repository map budget: a share of one conversation's context (shapes the prefix, not output).
-/// Tokens one conversation may use: the whole pool, at most the native context (0: unknown).
-pub fn conversation_window(ctx_total: u32, ctx_native: u32) -> u32 {
-    if ctx_native == 0 { ctx_total } else { ctx_total.min(ctx_native) }
+/// Tokens one conversation may use: the whole pool, at most the native context, at most `cap`
+/// (`limits.context_tokens`; 0 = no cap). 0: unknown.
+pub fn conversation_window(ctx_total: u32, ctx_native: u32, cap: u32) -> u32 {
+    let window = if ctx_native == 0 { ctx_total } else { ctx_total.min(ctx_native) };
+    if cap == 0 { window } else { window.min(cap) }
 }
 
+/// Repository map budget: a share of one conversation's context (shapes the prefix, not output).
 pub fn repo_map_budget(data: &Dataset, ctx_window: u32) -> u32 {
     let limits = &data.limits;
     if ctx_window == 0 { limits.repo_map_min.max(2048).min(limits.repo_map_max) } else { (ctx_window / limits.repo_map_share).clamp(limits.repo_map_min, limits.repo_map_max) }
@@ -236,17 +238,22 @@ async fn always_section(host: &Host, data: &Dataset, always: &[(String, String)]
 }
 
 /// The session's prefix for `role`: from its `context` entry, or built now and journaled. A prefix
-/// built from another data set version, for another role or before the skills last changed
-/// (`skills_changed_ms`) is rebuilt once (the new prompts and catalog take effect on the next call).
+/// built from another data set version, for another role, before the skills last changed
+/// (`skills_changed_ms`) or before the project's languages were known is rebuilt once (the new
+/// prompts and catalog take effect on the next call); otherwise it stays byte-identical, so the
+/// conversation stays in the model's cache across turns.
 pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, role: &str, skills_changed_ms: u64) -> Result<Prefix, RpcError> {
     let project = ProjectFacts::read(journal.host(), project_id).await;
     let languages = project.languages.clone();
     if let Some(entry) = journal.context_entry()
         && entry.data.get("data_version").and_then(Value::as_str) == Some(data.version().as_str())
         && entry.data.get("role").and_then(Value::as_str) == Some(role)
-        // The catalog follows the project: a prefix built before the graph knew the languages (or
-        // for other ones) is rebuilt once they are known.
-        && (languages.is_empty() || entry.data.get("languages") == Some(&json!(languages)))
+        // The catalog follows the project once: a prefix built before the graph knew the languages
+        // is rebuilt when they are known. After that it stays frozen for the session: a language
+        // that shows up later (a text file, a build's output) rebuilt it mid-session, the project
+        // description came back reworded, and the whole conversation was read again (116k tokens,
+        // five minutes) for a catalog that had not changed. A new session takes the new languages.
+        && (languages.is_empty() || entry.data.get("languages").and_then(Value::as_array).is_some_and(|known| !known.is_empty()))
         && entry.data.get("created_ms").and_then(Value::as_u64).is_none_or(|created| created > skills_changed_ms)
         && let Some(prefix) = Prefix::from_entry(&entry.data)
     {
@@ -401,7 +408,7 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
 async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, mut project: ProjectFacts) -> Result<(Prefix, BuiltFacts), RpcError> {
     let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({})).await?;
     let info = model_info(host).await;
-    let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native)).unwrap_or(0);
+    let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native, data.limits.context_tokens)).unwrap_or(0);
 
     let mut rules = Vec::new();
     for scope in ["global", project_id] {
@@ -434,7 +441,7 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
         host.get::<KnowledgeBriefResult>(memory_methods::KNOWLEDGE_BRIEF, json!({"project_id": project_id, "budget_tokens": data.limits.brief_tokens})).await.unwrap_or_default()
     };
     let ProjectSkills { lines: skills, always } = project_skills(host, project_id, &mut project).await;
-    let mut system = system_prompt(data, role, &PrefixParts { tools_guide: &schemas.guide, rules: &rules, style: &style, brief: &brief.text, contract: &contract, repo_map: &map_text });
+    let mut system = system_prompt(data, role, &PrefixParts { project_root: &root, tools_guide: &schemas.guide, rules: &rules, style: &style, brief: &brief.text, contract: &contract, repo_map: &map_text });
     // The project's language guides: every session in the project (chat and agents) works with
     // them, so they sit in the byte-stable, cached system message, not in a choice.
     let guides = always_section(host, data, &always).await;

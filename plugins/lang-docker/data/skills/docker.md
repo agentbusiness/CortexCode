@@ -2,18 +2,19 @@ Docker here: get it right, build and lint it, Dockerfiles that run, common error
 
 ## 1. Get it right
 
-1. **Pin down what the image must do.** Read the statement, Dockerfile, compose file, `.dockerignore`, and how the app starts (README, package scripts, `CMD`).
+1. **Pin down what the image must do.** Read the request, then the Dockerfile, compose file, `.dockerignore`, and how the app starts (README, package scripts, `CMD`).
    - Note: base image and tag, needed files, listening port, command, user, environment.
-   - The statement decides, never a name: read what stage `prod` or service `api` really runs.
-   - Before editing, write the cases (section 2): one per sentence that states a behaviour, value, error or limit. A sentence with no case is a missed requirement.
-   - Unfamiliar domain, format or protocol: when the research plugin is available, learn its rules and copy them into the cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page with the rules.
+   - The request and the project decide, never a name alone: read what stage `prod` or service `api` really runs.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+   - Before editing, note the request's examples: they are the check, their values copied, never computed.
+   - Unfamiliar base image, tool or setting: look it up (the research plugin, the image's docs, how others solved it):
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole stages, in slices.**
    - First the image builds and the app starts.
    - Then each requirement (user, port, files, environment), build and run after each.
-   - Rewrite a stage from its `FROM` to the next `FROM`. Never leave an old `RUN`, `COPY` or `CMD` behind (a second `CMD` silently wins).
+   - Change only the lines the task needs; a stage that builds and runs stays exactly as it is, unless the user asks to change it. Never leave an old `RUN`, `COPY` or `CMD` behind when you replace one (a second `CMD` silently wins).
 3. **Build after every change.** Read the failing step (section 4).
-4. **Run what you built.** Compare output, user, files and port with the statement.
+4. **Run what you built.** Compare output, user, files and port with the request.
 
 ```bash
 docker build -t app:dev .
@@ -25,7 +26,6 @@ docker rm -f app-test
 
 5. **Before you finish**, check each requirement again (tag, user, port, entrypoint, environment, paths). Remove your containers.
 
-A check disagrees with the statement: the statement wins. Fix the Dockerfile, say which check is wrong.
 
 ## 2. Build, run, check
 
@@ -42,22 +42,22 @@ docker compose run --rm -T web pytest -q    # a one-off command in a service
 - `run` has no TTY and empty stdin: never `-it`; `-T` with `docker compose exec`/`run`. Interactive shells: `terminal`.
 - Project runs in a container: `run` is already inside it, `docker` is absent. Run the commands directly.
 - `Cannot connect to the Docker daemon`: `open -a Docker`, then `for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done`.
-- Offline, only local images work (`docker image ls`). A `# syntax=` first line pulls an image: delete it.
+- Pulling a base image needs the network; `docker image ls` shows what is already here.
 - This Mac is arm64. `no matching manifest for linux/arm64/v8`: multi-arch tag or `--platform linux/amd64`.
 - `docker compose down -v` deletes volumes (databases). Never `docker system prune`.
 
-**Checking your work.** Build once, run each case, one printed line per case:
+**Checking your work.** Run the project's own tests inside the image (`docker compose run --rm -T web pytest -q`, or the project's test command), then check what the change is about: the app starts, answers on its port, runs as its user, has its files.
 
 ```bash
-docker build -q -t app:check . && for given in "3 1 2" "1"; do
-  printf '%s -> %s\n' "$given" "$(docker run --rm app:check solve $given 2>&1)"
-done
+docker build -q -t app:check . && docker run --rm app:check sh -c 'id; ls -la /app'
+docker run -d --name app-check -p 8000:8000 app:check
+for i in $(seq 30); do curl -fsS 127.0.0.1:8000/health && break; sleep 1; done; docker logs --tail 50 app-check
+docker rm -f app-check
 ```
 
-- Expected values are copied from the statement, never worked out by hand.
-- After any fix, run every case again, passing ones too.
-- Remove the `app:check` image when the work is done.
-- A case fails: check the case first, against the statement. A case that breaks a stated rule, or holds a value you computed, is bad. Fix it, then the code.
+- Expected values come from the request or the project (README, compose file, docs), never from what the container printed.
+- After any fix, run every check again, passing ones too.
+- Remove the `app:check` image and your containers when the work is done.
 
 ## 3. Dockerfiles that run
 
@@ -87,7 +87,7 @@ Pin the base, run as a user:
 
 ```dockerfile
 FROM python                                # bad: latest, a different image next month
-FROM python:3.12-slim                      # good: the tag the project or statement names
+FROM python:3.12-slim                      # good: the tag the project or the request names
 RUN useradd --system --uid 10001 --no-log-init app   # before USER: create and chown what it writes
 COPY --chown=app:app . /app
 USER app

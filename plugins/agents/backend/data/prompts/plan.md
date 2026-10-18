@@ -13,6 +13,7 @@ Split the goal into tasks for background agents that work at the same time, each
 7. `effort`: how hard the task is to think through: none, low, medium, high or xhigh.
 
 Split rules:
+- Only what the goal asks: never a task for work it does not ask for.
 - One task is one change an agent can make and check alone. A goal that is one change is one task.
 - Tasks without a dependency between them run at the same time, so they must not change the same files or symbols, nor code that calls what another changes. When two parts touch the same code, one depends on the other.
 

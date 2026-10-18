@@ -170,6 +170,9 @@ impl Plugin for SourcePlugin {
             tokio::spawn(async move {
                 proposals::recover(&service, &ctx).await;
                 watch::update(&service, &ctx).await;
+                // The start-up merge is done: plugins that read live data from the code folder
+                // (they started beside this one) read it again now.
+                service.changed(&ctx);
                 watch::run(service, ctx, stop).await;
             });
             Ok(())

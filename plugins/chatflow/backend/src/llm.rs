@@ -174,6 +174,7 @@ async fn stream_once(
     let mut content = TextStream::new(kinds::ASSISTANT_MESSAGE, base.clone());
     let mut reasoning = TextStream::new(kinds::REASONING, base);
     let mut live = Live::new(journal, target, stage);
+    let mut writing = Writing::new(journal, target, stage);
     let mut stream = journal.host().ctx().call_stream(model_methods::CHAT, params.clone())?;
     loop {
         let item = tokio::select! {
@@ -192,10 +193,12 @@ async fn stream_once(
             "reasoning" => reasoning.push(journal, &delta.text).await?,
             "content" if target.content => content.push(journal, &delta.text).await?,
             "content" => live.push(journal, &delta.text, false),
+            "tool_call" => writing.push(journal, reasoning.seq(), &delta.text).await,
             _ => {}
         }
     }
     live.push(journal, "", true);
+    writing.finish(journal);
     let outcome = stream.finish().await;
     let result: ChatResult = match outcome {
         Ok(value) => parse_params(value)?,
@@ -215,6 +218,72 @@ async fn stream_once(
     let final_reasoning = (!result.reasoning.is_empty()).then_some(result.reasoning.as_str());
     reasoning.finish(journal, final_reasoning, &[]).await?;
     Ok(Called { content_seq: content.seq(), reasoning_seq: reasoning.seq(), result, wall_ms: 0 })
+}
+
+/// A tool call's arguments while they stream: a long write (a whole file, minutes of decoding) is
+/// otherwise a silent wait. The person sees what is being written and how far it got
+/// (`chatflow.live`, a `writing` line); the journal's step gets a `writing` field every few seconds
+/// on its reasoning entry (seen: a three-minute write with nothing recorded).
+struct Writing {
+    raw: String,
+    throttle: crate::live::Throttle,
+    journaled: Option<std::time::Instant>,
+    event: LiveFields,
+}
+
+/// Least interval between two journal updates of a tool call's progress.
+const WRITING_JOURNAL_EVERY: Duration = Duration::from_secs(5);
+
+impl Writing {
+    fn new(journal: &Journal, target: &StreamTo, stage: &str) -> Self {
+        Self {
+            raw: String::new(),
+            throttle: crate::live::Throttle::default(),
+            journaled: None,
+            event: LiveFields { session_id: journal.session_id().to_owned(), run_id: target.run_id.clone(), stage: stage.to_owned(), fields: Vec::new(), done: false },
+        }
+    }
+
+    /// What is being written so far, in words: the call's intent and target, and its size.
+    fn line(&self) -> String {
+        let fields = crate::live::string_fields(&self.raw);
+        let field = |name: &str| fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str()).filter(|value| !value.is_empty());
+        let what = field("intent").or(field("path")).or(field("command")).unwrap_or("a tool call");
+        let lines = self.raw.matches("\\n").count() + 1;
+        match field("path") {
+            Some(path) if field("intent").is_some() => format!("{what} ({path}): {lines} lines so far"),
+            _ => format!("{what}: {lines} lines so far"),
+        }
+    }
+
+    async fn push(&mut self, journal: &mut Journal, step_seq: Option<u64>, text: &str) {
+        self.raw.push_str(text);
+        let now = std::time::Instant::now();
+        let line = self.line();
+        if let Some(fields) = self.throttle.due(vec![("writing".to_owned(), line.clone())], now) {
+            self.event.fields = fields;
+            if let Ok(value) = serde_json::to_value(&self.event) {
+                journal.host().ctx().publish(chatflow_topics::LIVE, value);
+            }
+        }
+        if let Some(seq) = step_seq
+            && self.journaled.is_none_or(|last| now.duration_since(last) >= WRITING_JOURNAL_EVERY)
+        {
+            self.journaled = Some(now);
+            let _ = journal.set(seq, "writing", json!(line)).await;
+        }
+    }
+
+    fn finish(&mut self, journal: &Journal) {
+        if self.raw.is_empty() {
+            return;
+        }
+        self.event.fields = vec![("writing".to_owned(), self.line())];
+        self.event.done = true;
+        if let Ok(value) = serde_json::to_value(&self.event) {
+            journal.host().ctx().publish(chatflow_topics::LIVE, value);
+        }
+    }
 }
 
 /// A decision's free text as it streams (see [`crate::live`]).

@@ -42,6 +42,10 @@ pub fn stage_rules(data: &Dataset, role: &str, stage: &str) -> String {
 
 /// Parts of the system prompt besides the policy and the protocol. Empty parts are left out.
 pub struct PrefixParts<'a> {
+    /// The project's folder, where every command starts and every path is relative to. The model
+    /// `cd`s into the project before it runs tests (a habit from its training); without the path it
+    /// guesses one (seen: the user's home folder, a folder invented from an `ls` owner name).
+    pub project_root: &'a str,
     pub tools_guide: &'a str,
     pub rules: &'a [String],
     pub style: &'a [String],
@@ -59,6 +63,9 @@ fn list(data: &Dataset, items: &[String]) -> String {
 /// The session's system prompt for `role`. Contains nothing that changes during a session.
 pub fn system_prompt(data: &Dataset, role: &str, parts: &PrefixParts<'_>) -> String {
     let mut sections = vec![data.prompt("policy").to_owned(), stage_protocol(data, role)];
+    if !parts.project_root.trim().is_empty() {
+        sections.push(data.text("section_project", &[("root", parts.project_root.trim())]));
+    }
     if !parts.tools_guide.trim().is_empty() {
         sections.push(data.text("section_tools", &[("text", parts.tools_guide.trim())]));
     }

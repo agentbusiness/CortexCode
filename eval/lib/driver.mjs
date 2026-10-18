@@ -22,7 +22,8 @@ export const MODELS_DIR = path.join(os.homedir(), '.cortexcode', 'models');
 const CALIBRATION_CACHE_DIR = path.join(TOOLCHAINS, 'model-state');
 
 export const EDIT_FORMATS = ['hashline', 'replace', 'whole'];
-const TERMINAL = new Set(['done', 'failed', 'cancelled']);
+// A turn's last status: `stopped` is the chat flow's stop when the work repeats itself (a guard).
+const TERMINAL = new Set(['done', 'failed', 'cancelled', 'stopped']);
 
 /** The open app's frame (`run/frame.json` whose process is alive), or null. */
 export function runningApp() {
@@ -250,6 +251,12 @@ export class CortexSystem {
       if (fresh.length) { lastSeq = fresh.at(-1).seq; lastChange = Date.now(); }
       for (const e of fresh) {
         if (e.kind === 'status' && TERMINAL.has(e.data?.state) && (!e.data?.run_id || e.data.run_id === turn.run_id)) terminal = e;
+        // Nobody is here to answer an approval (a sandbox lift for an install or the network): it is
+        // denied at once, as a headless run denies every prompt, and the model works with the result.
+        // An approved lift would also drop the offline rules that hide the tests.
+        if (e.kind === 'approval' && e.data?.state === 'pending') {
+          await this.client.request('chatflow.approve', { session_id: session.id, seq: e.seq, approve: false }).catch(() => {});
+        }
       }
       if (terminal) {
         const state = await this.client.request('chatflow.state', { session_id: session.id }).catch(() => null);

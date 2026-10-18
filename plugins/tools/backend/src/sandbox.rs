@@ -17,6 +17,10 @@
 //! A workspace holding a `.cortex-offline` file is offline: its commands get no outbound network
 //! but localhost and unix sockets (a benchmark workspace, or a project its owner keeps offline).
 //!
+//! A command the user let past the sandbox (`lift:<command>` approvals, asked for by the model with
+//! `run`'s `permission`) runs without it: macOS refuses a sandbox inside a sandbox, and installers
+//! such as Homebrew apply their own.
+//!
 //! Inside CORTEX_HOME a few paths stay read-only for commands because writing them would grant
 //! authority outside the sandbox: the approvals file, the frame's plugin store (executables the frame
 //! runs unsandboxed), its run directory (token, socket, lock), the session journals, and background
@@ -34,7 +38,14 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Approval classes that widen the sandbox for a session: `write_outside:<absolute dir>`.
 pub const WRITE_CLASS_PREFIX: &str = cc_protocol::contracts::tools::approval_classes::WRITE_OUTSIDE_PREFIX;
 
-/// How one shell or job is confined: `sandbox-exec [-D key=value]... -p <profile> <program>`.
+/// Approval class that lets one command past the sandbox: `lift:<command>`.
+pub const LIFT_CLASS_PREFIX: &str = cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX;
+
+/// The approval class that lets `command` past the sandbox.
+pub fn lift_class(command: &str) -> String {
+    format!("{LIFT_CLASS_PREFIX}{}", command.trim())
+}
+
 /// The file whose presence makes a workspace offline (see the module doc).
 pub const OFFLINE_MARKER: &str = ".cortex-offline";
 
@@ -71,6 +82,7 @@ pub fn network_rules(workspace: &Path) -> String {
     rules
 }
 
+/// How one shell or job is confined: `sandbox-exec [-D key=value]... -p <profile> <program>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     pub exec: PathBuf,

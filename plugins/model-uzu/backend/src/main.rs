@@ -46,6 +46,8 @@ fn main() {
         hello.provides = PROVIDES.iter().map(|method| (*method).to_owned()).collect();
         // Two instances cannot hold the model at once: drain the old one first.
         hello.swap = SwapPolicy::DrainFirst;
+        // A deleted session's conversation is dropped, in memory and on disk.
+        hello.subscribes = vec![cc_protocol::contracts::frame::topics::SESSION_DELETED.to_owned()];
         match cc_protocol::run_plugin(hello, Arc::new(ModelPlugin::default())).await {
             Ok(()) => 0,
             Err(error) => {

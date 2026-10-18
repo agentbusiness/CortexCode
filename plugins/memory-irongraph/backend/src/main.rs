@@ -43,6 +43,8 @@ fn main() {
             cc_protocol::contracts::frame::topics::PLUGIN_SWAPPED.to_owned(),
             // A project the frame opens is opened here too.
             cc_protocol::contracts::frame::topics::PROJECT_CHANGED.to_owned(),
+            // A project the person deleted is dropped here too.
+            cc_protocol::contracts::frame::topics::PROJECT_DELETED.to_owned(),
         ];
         // One embedded IronGraph per data directory: two instances cannot coexist.
         hello.swap = SwapPolicy::DrainFirst;

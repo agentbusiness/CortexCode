@@ -206,6 +206,7 @@ impl Jobs {
             .stdin(Stdio::null())
             .stdout(output)
             .stderr(errors)
+            .envs(crate::util::project_env(request.cwd))
             .current_dir(request.cwd);
         // SAFETY: setsid is async-signal-safe; the job becomes its own session and group leader.
         unsafe {

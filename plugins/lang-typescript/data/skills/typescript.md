@@ -2,34 +2,38 @@ TypeScript and JavaScript here: get it right, run and test it, code that runs, e
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the statement and the code (signatures, stubs, tests).
+1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, JSDoc, types), its tests, docs and callers.
    - Per function or class: what it takes, returns (a value or a `Promise`) and throws.
-   - The statement decides, never the name. "whether" returns a boolean. "find" may return `undefined` or `null`, as stated. "count" returns a number.
-   - When there may be no answer and the statement does not name a value for it, the declared return type decides (`T | undefined` or `T | null`); without one, `undefined` is JavaScript's "no value" (`find`, `Map.get`). Not `false`, `-1` or `[]`, and not a value remembered from elsewhere.
-   - Keep existing names, signatures and export style (default or named): tests import them exactly.
-2. **Before coding, turn the statement into cases** for the check script (section 2).
-   - Each sentence that states a behaviour, value, error or limit is one case. A shown requirement list is that list.
-   - A sentence with no case is a requirement you will miss.
-   - Unsure of a domain, format or protocol? Learn its rules with the research plugin; copy them into cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that states them.
+   - The request and the project decide, never a name alone. "whether" returns a boolean. "find" may return `undefined` or `null`, as the project does. "count" returns a number.
+   - When there may be no answer and nothing names a value for it, the declared return type decides (`T | undefined` or `T | null`); without one, `undefined` is JavaScript's "no value" (`find`, `Map.get`). Not `false`, `-1` or `[]`.
+   - Keep existing names, signatures and export style (default or named): other modules import them exactly.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+2. **Before coding, note the request's examples: they are the check, their values copied, never computed.**
+   - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
+   - Unsure of a domain, format, protocol or package? Look it up: the research plugin, the package's docs, how others solved it:
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 3. **Write whole functions, in slices.**
-   - First the simplest complete path (one case, input to result). Run the check script.
-   - Add the next stated behaviour. Run again after every change.
-   - New file, or a stub you have not changed yet: send it whole once with `edit` `content`. After that: anchored `edits` only, every change in one call (a second whole write is refused).
-   - Rewrite a function: replace it from its first line to its closing `}`. Never leave part of the old body or a stray brace.
+   - First the simplest complete path (one case, input to result). Run the tests.
+   - Add the next behaviour. Run again after every change.
+   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - Change a function: replace it from its first line to its closing `}`. Never leave part of the old body or a stray brace.
    - Fix the errors the edit result shows before moving on.
 4. **Quick runs** of one example:
 
 ```bash
-node -e 'const { solve } = require("./src/solve.js"); console.log(solve([3, 1, 2]))'
-node --input-type=module -e 'import { solve } from "./src/solve.ts"; console.log(solve([3, 1, 2]))'
-npx --no -- tsx try.ts      # a scratch file in the project root; delete it before finishing
+node -e 'const { parseOrder } = require("./src/order.js"); console.log(parseOrder("2 pens"))'
+node --input-type=module -e 'import { parseOrder } from "./src/order.ts"; console.log(parseOrder("2 pens"))'
 ```
 
-5. **Run the project's tests** (section 2). Fix the first failure's cause, run again. Change only the code that failure runs through: a function whose cases pass stays as it is unless the task asks to change it.
-6. **Before you finish**, check each requirement against the code, including named errors (class and message).
+5. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests (section 2); fix the first failure's cause, run again.
+6. **Before you finish**, check each requirement against the code, including the errors the request or the project names (class and message).
 
-A check disagrees with the statement: the statement wins. Fix the code, name the wrong check.
+**How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
+- Objects and arrays are shared by reference: return a copy (`[...xs]`, `{ ...o }`, `structuredClone(o)`) when the caller must not change the stored one; `readonly` and `Readonly<T>` say it in the type.
+- A state with several values: a discriminated union on one `kind` field, not optional fields that can conflict.
+- Containers: `Map<K, V>` for lookup (any key type, insertion order), `Set` for uniqueness, an array for order; plain objects only for fixed string keys.
+- Integers beyond 2^53 lose precision as `number`: use `bigint`.
+- Standard building blocks first: array methods (`map`, `filter`, `reduce`, `flatMap`), `Map` and `Set`, `Intl`, `structuredClone`, and the project's dependencies, before writing your own.
 
 ## 2. Run, test, check
 
@@ -49,29 +53,18 @@ node --check src/a.js               # syntax check of plain JavaScript
 - `vitest` alone watches; use `vitest run`. pnpm and yarn take arguments without `--`.
 - Never `tsc file.ts`: it ignores `tsconfig.json`.
 - **Running `.ts`:** Node 22.18+ runs `.ts` directly when relative imports carry extensions. Else (enum, namespace, parameter properties, extensionless imports): `npx --no -- tsx file.ts` if installed.
-- **Offline:** no `node_modules`: `npm ci --offline` (or `pnpm install --offline`, `yarn install --offline`, per the lockfile).
-- Never `npm install <pkg>`: a missing package cannot be fetched. Say so.
+- No `node_modules`: `npm ci` (or `pnpm install`, `yarn install`, per the lockfile) installs what the project already lists.
+- A new package (`npm install <pkg>`) is a change to the user's project: ask before adding one.
 
-**Checking your work.** One scratch file, `check.mjs` (`check.ts` with tsx). Edit it; never re-type it.
-- Build inputs in code.
-- Copy expected values from the statement, never work them out yourself.
-- Print one line per case, no `assert`: one run shows every case.
-
-```js
-import { solve } from './src/solve.js';
-
-const cases = [[[3, 1, 2], [1, 2, 3]], [Array.from({ length: 10 }, (_, i) => i % 5), Array.from({ length: 10 }, (_, i) => i % 5)]];
-for (const [given, want] of cases) {
-  let got;
-  try { got = solve(given); } catch (error) { got = `${error.name}: ${error.message}`; }
-  console.log(JSON.stringify(got) === JSON.stringify(want) ? 'ok ' : 'BAD', given, '->', got, 'want', want);
-}
-```
-
-Run `node check.mjs` (`npx --no -- tsx check.ts` for TypeScript sources).
-- After any fix, run every case again, passing ones too. One fix can break another case.
-- A case fails: check the case before the code. Re-derive it from the statement. A case that breaks a stated rule or holds a value you computed is bad: fix it first.
-- Keep the file while the work can change. Delete it when the user is done.
+**Checking your work.**
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.test.mjs` with `node:test` and `node:assert`, importing the project's file by its path, run with `node --test tests/`; they stay in the project.
+2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
+3. Build a long input in code from its parts, never typed out: `Array(18).fill(0)`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+4. Each check shows what the code returned when it fails: `assert.deepStrictEqual(got, want)` from `node:assert`.
+5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
+6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
+7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
+8. A one-off try (call a function, print a value) goes in `tmp/probe.mjs`, run with `node tmp/probe.mjs`; git ignores `tmp/`.
 
 ## 3. Code that runs
 
@@ -116,7 +109,7 @@ const x = require("./x");            // bad in an ESM file: require is not defin
 import x from "./x.js";              // good: ESM needs the full file name at run time
 ```
 
-Throw `Error` objects with the stated class and message:
+Throw `Error` objects with the class and message the request or the project uses:
 
 ```ts
 throw "invalid width";                        // bad: not an Error, no stack, instanceof fails
@@ -126,7 +119,6 @@ throw new RangeError("width must be positive");
 - Return values, never print them.
 - Integer division: `Math.trunc(a / b)`. `-7 % 3` is `-1`. Floats: compare with a tolerance (`toBeCloseTo`).
 - `-0 === 0` is true, but deep equality (`toEqual`, `Object.is`) tells them apart.
-  Where a result can be zero, return `x || 0`. In check scripts compare with `Object.is`.
 - `as T` and `!` check nothing at run time.
 
 ## 4. Errors

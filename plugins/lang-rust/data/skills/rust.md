@@ -2,26 +2,32 @@ Rust here: get it right, build and test it, code that runs, common errors and th
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the statement and the code (signatures, `///` docs, `todo!()` stubs, `mod tests`, `tests/`).
+1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, `///` docs), `mod tests`, `tests/`, docs and callers.
    - Per function: argument types, return type, how it fails (`Err` variant, `None`, panic).
-   - The statement decides, never the name. "whether" returns `bool`. "find" may return `Option`. A named error is an `Err(...)`, not a panic.
-   - When there may be no answer and the statement does not name a value for it, the signature decides: `Option<T>` gives `None`, `Result<T, E>` gives `Err(...)`. Never a sentinel such as `-1`, `0` or an empty value in their place.
+   - The request and the project decide, never a name alone. "whether" returns `bool`. "find" may return `Option`. A named error is an `Err(...)`, not a panic.
+   - When there may be no answer and nothing names a value for it, the signature decides: `Option<T>` gives `None`, `Result<T, E>` gives `Err(...)`. Never a sentinel such as `-1`, `0` or an empty value in their place.
    - Keep existing names, signatures and error enums.
-2. **Before coding, turn the statement into cases** for the check script (section 2).
-   - Each sentence that states a behaviour, value, error or limit is one case. A shown requirement list is that list.
-   - A sentence with no case is a requirement you will miss.
-   - Unsure of a domain, format or protocol? Learn its rules with the research plugin; copy them into cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that states them.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+2. **Before coding, note the request's examples: they are the check, their values copied, never computed.**
+   - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
+   - Unsure of a domain, format, protocol or crate? Look it up: the research plugin, docs.rs, how others solved it:
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 3. **Write whole functions, in slices.**
-   - First the simplest complete path (one case, input to result). Run the check script.
-   - Add the next stated behaviour. Run again after every change.
-   - New file, or a stub you have not changed yet: send it whole once with `edit` `content`. After that: anchored `edits` only, every change in one call (a second whole write is refused).
-   - Rewrite a function: replace it from its attributes and `fn` line to its closing `}`. Never leave part of the old body or a `todo!()`.
+   - First the simplest complete path (one case, input to result). Run the tests.
+   - Add the next behaviour. Run again after every change.
+   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - Change a function: replace it from its attributes and `fn` line to its closing `}`. Never leave part of the old body or a `todo!()` of yours.
    - `unclosed delimiter` after an edit: a block was cut. Fix that first.
-4. **Run the project's tests** (section 2). Fix the first failure's cause, run again. Change only the code that failure runs through: a function whose cases pass stays as it is unless the task asks to change it.
-5. **Before you finish**, check each requirement against the code, including named errors (variant and message). `grep -rn "todo!\|dbg!" src tests` must be empty.
+4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests (section 2); fix the first failure's cause, run again.
+5. **Before you finish**, check each requirement against the code, including named errors (variant and message). Your own diff holds no `todo!()` or `dbg!`.
 
-A check disagrees with the statement: the statement wins. Fix the code, name the wrong check.
+**How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
+- One owner: a field or `Box<T>`. Shared and read-only: `&T`, `Rc<T>` (`Arc<T>` across threads). Shared and changed: `Rc<RefCell<T>>` (`Arc<Mutex<T>>` across threads).
+- `Cell<T>` only for small `Copy` values: it never lends `&T`. `RefCell<T>` lends through `borrow()` and `borrow_mut()`, checked at run time.
+- Nodes that point at each other and must hand out `&T` or `&mut T`: each node owned through `Box`, the links as `NonNull<Node<T>>` or raw pointers in `unsafe` blocks with the invariants in `// SAFETY:` comments, freed in `Drop`.
+- `Rc`, `Cell` and `RefCell` make a type neither `Send` nor `Sync`: across threads use `Arc` with `Mutex` or `RwLock`.
+- Containers: `HashMap`/`BTreeMap` for lookup, `VecDeque` for both ends, `BinaryHeap` for largest first, `HashSet` for uniqueness.
+- Standard building blocks first: allocate behind a raw pointer with `Box::into_raw`, take back and free with `Box::from_raw`, never `std::alloc` by hand; `NonNull<T>` for a non-null raw pointer.
 
 ## 2. Run, test, check
 
@@ -37,33 +43,20 @@ cargo clippy --all-targets -- -D warnings        # lint
 
 - Cargo flags (`-p`, `--lib`, `--test`, `--features`) go before `--`; test flags (`--exact`, `--nocapture`) after.
 - A filter matching nothing passes (`0 passed; 5 filtered out`). Real names: `cargo test -- --list`.
-- Offline: add `--offline`. `failed to download`, `no matching package`: not cached; use the standard library.
-- Only crates already in `Cargo.toml`. Never `cargo update`, never edit `Cargo.lock`.
+- Prefer the crates already in `Cargo.toml` and the standard library. A new crate is a new dependency of the user's project: ask before adding it. `cargo update` only when the user asks.
 - `[workspace]`: pick a member with `-p name`.
 - `tests/` sees only `pub` items of `src/lib.rs`, as `my_crate::item` (dashes become `_`).
 - A new file compiles only after `mod name;` in its parent.
 
-**Checking your work.** One scratch file, `examples/check.rs` (library crate). Edit it; never re-type it.
-- Build inputs in code.
-- Copy expected values from the statement, never work them out yourself.
-- Print one line per case, no `assert!`: one run shows every case.
-
-```rust
-use mycrate::solve;
-
-fn main() {
-    let cases: Vec<(Vec<i32>, Vec<i32>)> = vec![(vec![3, 1, 2], vec![1, 2, 3]), ((0..5).chain(0..5).collect(), (0..5).chain(0..5).collect())];
-    for (given, want) in cases {
-        let got = solve(&given);
-        println!("{} {:?} -> {:?} want {:?}", if got == want { "ok " } else { "BAD" }, given, got, want);
-    }
-}
-```
-
-Run `cargo run --example check`. Binary crate: put the loop in a `#[test] fn check()` in the existing `mod tests` (a second one is E0428); run `cargo test check -- --nocapture`.
-- After any fix, run every case again, passing ones too. One fix can break another case.
-- A case fails: check the case before the code. Re-derive it from the statement. A case that breaks a stated rule or holds a value you computed is bad: fix it first.
-- Keep the file while the work can change. Delete it when the user is done.
+**Checking your work.**
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.rs` that uses the crate, run with `cargo test`; they stay in the project.
+2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
+3. Build a long input in code from its parts, never typed out: `vec![0; 18]`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+4. Each check shows what the code returned when it fails: `assert_eq!(got, want)`.
+5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
+6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
+7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
+8. A one-off try (call a function, print a value) goes in `tmp/`; git ignores `tmp/`.
 
 ## 3. Code that runs
 
@@ -113,7 +106,7 @@ big as u8                     // silently truncates: u8::try_from(big)
 - `HashMap`/`HashSet` order is random: sort keys, or use `BTreeMap`.
 - `-7 % 3 == -1`; `(-7i32).rem_euclid(3)` is 2.
 - Iterators are lazy: `v.iter().map(f);` does nothing.
-- Types compared in tests need `#[derive(Debug, Clone, PartialEq)]`.
+- Types compared with `assert_eq!` need `Debug` and `PartialEq`.
 
 ## 4. Errors
 

@@ -118,6 +118,123 @@ pub fn simple_commands(script: &str) -> Vec<Vec<Option<String>>> {
     commands.into_iter().map(|(_, words)| words).collect()
 }
 
+/// A script that only shows one file through the terminal (`cat f`, `cat -n f`, `head -40 f`,
+/// `tail -n 20 f`, `sed -n '10,40p' f`, `nl f`): the file and the line range it asks for, so the run
+/// tool can answer it as a `read` (anchors for edit, tracked as a read). None for anything else: a
+/// pipe, a redirection, several commands, several files, a pattern, a variable.
+pub fn terminal_read(script: &str) -> Option<(String, Option<String>)> {
+    let trimmed = script.trim();
+    if trimmed.contains(['|', '>', '<', ';', '&', '$', '`', '*', '?']) || trimmed.contains('\n') {
+        return None;
+    }
+    let commands = simple_commands(trimmed);
+    let [words] = commands.as_slice() else { return None };
+    let words: Vec<&str> = words.iter().map(|word| word.as_deref()).collect::<Option<Vec<_>>>()?;
+    let (program, args) = words.split_first()?;
+    let operands: Vec<&str> = args.iter().copied().filter(|arg| !arg.starts_with('-')).collect();
+    let number = |text: &str| text.trim_start_matches(['-', '+']).parse::<usize>().ok();
+    match program_name(program) {
+        "cat" | "nl" | "bat" | "less" | "more" if args.iter().all(|arg| matches!(*arg, "-n" | "-b" | "-p" | "--plain")) => {
+            let [file] = operands.as_slice() else { return None };
+            Some(((*file).to_owned(), None))
+        }
+        "head" | "tail" => {
+            // `head -40 f`, `head -n 40 f`, `head f`; `tail` likewise (a `+N` start too).
+            let mut count: Option<String> = None;
+            let mut file: Option<&str> = None;
+            let mut index = 0;
+            while index < args.len() {
+                let arg = args[index];
+                if arg == "-n" {
+                    count = Some(args.get(index + 1)?.to_string());
+                    index += 2;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    number(arg)?;
+                    count = Some(arg.trim_start_matches('-').to_owned());
+                } else if file.is_none() {
+                    file = Some(arg);
+                } else {
+                    return None;
+                }
+                index += 1;
+            }
+            let file = file?;
+            let count = count.unwrap_or_else(|| "10".to_owned());
+            let range = if program_name(program) == "head" {
+                format!("1-{}", number(&count)?)
+            } else if let Some(start) = count.strip_prefix('+') {
+                format!("{}", start.parse::<usize>().ok()?)
+            } else {
+                format!("-{}", number(&count)?)
+            };
+            Some((file.to_owned(), Some(range)))
+        }
+        "sed" => {
+            // `sed -n '10,40p' f` or `sed -n 10,40p f`.
+            let [flag, script, file] = args else { return None };
+            if *flag != "-n" {
+                return None;
+            }
+            let body = script.trim_matches(['\'', '"']).strip_suffix('p')?;
+            let (start, end) = body.split_once(',').unwrap_or((body, body));
+            let (start, end) = (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?);
+            Some(((*file).to_owned(), Some(format!("{start}-{end}"))))
+        }
+        _ => None,
+    }
+}
+
+/// The file edits a script makes through the terminal, said for the model: a here-document written
+/// to a file (`cat > f <<EOF`), or a file changed in place (`sed -i`, `perl -i`). Structural: the
+/// parsed redirections and the programs' in-place flags. Empty when it makes none or does not parse.
+/// A here-document into a file `own` accepts (the scratch folder `tmp/`) is not one.
+pub fn terminal_edits(script: &str, own: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let Some(tree) = crate::lang::parse(crate::lang::Lang::Bash, script) else { return Vec::new() };
+    let source = script.as_bytes();
+    let mut found = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "redirected_statement" {
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.named_children(&mut cursor).collect();
+            if children.iter().any(|child| child.kind() == "heredoc_redirect") {
+                for redirect in children.iter().filter(|child| child.kind() == "file_redirect") {
+                    let mut inner = redirect.walk();
+                    let operator = redirect.children(&mut inner).find(|child| !child.is_named()).and_then(|child| child.utf8_text(source).ok()).unwrap_or("");
+                    if !matches!(operator, ">" | ">>" | ">|") {
+                        continue;
+                    }
+                    let Some(destination) = redirect.child_by_field_name("destination") else { continue };
+                    let target = destination.utf8_text(source).unwrap_or("").trim_matches(|c| c == '"' || c == '\'');
+                    if !target.starts_with("/dev/") && !own(target) {
+                        found.push(format!("writes {target} from a here-document"));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    for words in simple_commands(script) {
+        let Some(Some(program)) = words.first() else { continue };
+        let program = program_name(program);
+        let flags: Vec<&str> = words.iter().skip(1).flatten().map(String::as_str).filter(|word| word.starts_with('-')).collect();
+        let in_place = match program {
+            "sed" | "gsed" => flags.iter().any(|flag| flag.starts_with("-i") || flag.starts_with("--in-place") || (!flag.starts_with("--") && flag.len() <= 4 && flag[1..].contains('i'))),
+            "perl" => flags.iter().any(|flag| !flag.starts_with("--") && flag[1..].contains('i')),
+            _ => false,
+        };
+        if in_place {
+            found.push(format!("changes a file in place with `{program}`"));
+        }
+    }
+    found
+}
+
 /// Literal value of an argument node, or None when it depends on run-time expansion.
 fn literal(node: Node, source: &[u8]) -> Option<String> {
     let text = node.utf8_text(source).ok()?;

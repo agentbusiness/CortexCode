@@ -24,10 +24,12 @@ use cc_protocol::contracts::chatflow::{
 };
 use crate::{plan, spec};
 use cc_protocol::contracts::tools::topics as tools_topics;
-use cc_protocol::contracts::frame::{JournalEntry, Session, SessionKind, SessionStatus, kinds};
+use cc_protocol::contracts::frame::{
+    JournalEntry, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, topics as frame_topics,
+};
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{Task, methods as memory_methods};
-use cc_protocol::contracts::model::Priority;
+use cc_protocol::contracts::model::{Priority, methods as model_methods};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -59,14 +61,25 @@ pub fn hello() -> Hello {
         .iter()
         .map(|method| (*method).to_owned())
         .collect();
-    // Background jobs wake the session that started them; changed skills rebuild the prefixes.
-    hello.subscribes = vec![tools_topics::JOB_EVENT.to_owned(), SKILLS_CHANGED.to_owned()];
+    // Background jobs wake the session that started them; changed skills rebuild the prefixes; a
+    // merge of the code folder (the source manager's start-up update) reloads the data set.
+    hello.subscribes = vec![
+        tools_topics::JOB_EVENT.to_owned(),
+        SKILLS_CHANGED.to_owned(),
+        frame_topics::SESSION_DELETED.to_owned(),
+        SOURCE_CHANGED.to_owned(),
+    ];
     hello
 }
 
 /// Published by every plugin that serves skills when its skills changed: the catalog in the
 /// prefixes built before it is stale.
 const SKILLS_CHANGED: &str = cc_protocol::contracts::skills::topics::CHANGED;
+
+/// Published by the source manager when the code folder changed, among others once its start-up
+/// merge is done: this plugin starts beside it and may have read its live data before the merge
+/// (seen: the new prompts' data set rejected for a key the merge was about to bring).
+const SOURCE_CHANGED: &str = cc_protocol::contracts::source::topics::CHANGED;
 
 type RunOutcome = Option<Result<AgentRunResult, RpcError>>;
 type Done = watch::Receiver<RunOutcome>;
@@ -292,8 +305,30 @@ impl Chatflow {
         let skills_changed_ms = self.inner.skills_changed_ms.load(Ordering::SeqCst);
         let prefix: Prefix = context::ensure(journal, &project.id, &data, role, skills_changed_ms).await?;
         let workspace = if session.workspace.is_empty() { project.root.clone() } else { session.workspace.clone() };
+        let info = context::model_info(host).await;
+        // A session runs on one model: its first run records it, and a run on another model (after
+        // an engine or variant switch) is refused, so a conversation never continues on a model
+        // that did not write it.
+        if let Some(info) = &info {
+            match &session.model {
+                None => {
+                    let record = SessionUpdateParams { id: session.id.clone(), title: None, status: None, task_id: None, model: Some(info.model_id.clone()) };
+                    host.session_update(&record).await?;
+                }
+                Some(model) if model != &info.model_id => {
+                    return Err(RpcError::new(
+                        codes::CONFLICT,
+                        format!(
+                            "This session ran on {model}. The model is now {}, and a session is not continued on another model: start a new session, or switch the engine back in Settings > Model.",
+                            info.model_id
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         // Attached images are shown to the model only when it says it takes them.
-        let image_input = context::model_info(host).await.is_some_and(|info| info.accepts_images());
+        let image_input = info.is_some_and(|info| info.accepts_images());
         Ok(RunEnv {
             host: host.clone(),
             session_id: session.id.clone(),
@@ -347,7 +382,7 @@ impl Chatflow {
         }
         let this = self.clone();
         let owner = cache_key.clone();
-        let handle = crate::prewarm::send(&host, &cache_key, messages, &prefix.tools, "the next conversation's system block", true, move |_| {
+        let handle = crate::prewarm::send(&host, &cache_key, messages, &prefix.tools, "the next conversation's system block", true, crate::prewarm::When::Soon, move |_| {
             // Deduplicated only while in flight: the model may drop the block later (least recently
             // used), and asking for a block it keeps is answered at once, without a slot.
             if let Ok(mut warmed) = this.inner.warmed.lock() && warmed.get(&owner) == Some(&key) {
@@ -383,18 +418,25 @@ impl Chatflow {
         if self.active(&params.session_id).is_some() {
             return Ok(state("running"));
         }
-        Ok(self.warm(&host, &params.session_id, &prefix, &data, image_input, &journal.entries_vec()))
+        // The user opened the conversation: they are about to write in it.
+        Ok(self.warm(&host, &params.session_id, &prefix, &data, image_input, &journal.entries_vec(), crate::prewarm::When::Soon))
     }
 
     /// Send the prefill of the session's prefix unless this exact state was sent already.
-    fn warm(&self, host: &Host, session_id: &str, prefix: &Prefix, data: &Dataset, image_input: bool, entries: &[JournalEntry]) -> PrewarmResult {
+    #[allow(clippy::too_many_arguments)]
+    fn warm(&self, host: &Host, session_id: &str, prefix: &Prefix, data: &Dataset, image_input: bool, entries: &[JournalEntry], when: crate::prewarm::When) -> PrewarmResult {
         if prefix.ctx_window == 0 {
             // No model size known (model.info failed): the model is not there to prefill.
             return PrewarmResult { state: "skipped".into(), messages: 0 };
         }
         let messages = crate::prewarm::closed(crate::prewarm::conversation(prefix, data, entries, image_input));
         let count = messages.len() as u32;
-        let key = crate::prewarm::state_key(session_id, &messages, &prefix.tools);
+        // An idle-only prefill may have stopped early for other work: the same state asked for
+        // soon (the user opened the conversation) is sent again.
+        let mut key = crate::prewarm::state_key(session_id, &messages, &prefix.tools);
+        if when == crate::prewarm::When::Idle {
+            key.push_str("/idle");
+        }
         {
             let Ok(mut warmed) = self.inner.warmed.lock() else { return PrewarmResult { state: "skipped".into(), messages: 0 } };
             if warmed.get(session_id) == Some(&key) {
@@ -404,7 +446,7 @@ impl Chatflow {
         }
         let this = self.clone();
         let session = session_id.to_owned();
-        let handle = crate::prewarm::send(host, session_id, messages, &prefix.tools, "the conversation", false, move |ok| {
+        let handle = crate::prewarm::send(host, session_id, messages, &prefix.tools, "the conversation", false, when, move |ok| {
             // A refused or failed prefill may be asked for again.
             if !ok && let Ok(mut warmed) = this.inner.warmed.lock() && warmed.get(&session) == Some(&key) {
                 warmed.remove(&session);
@@ -495,6 +537,11 @@ impl Chatflow {
         let Some(_lock) = locks::lock(&data_dir(&ctx), session_id, &stops.park).await.map_err(|error| RpcError::internal(error.to_string()))? else {
             return Ok(());
         };
+        // The conversation stays resident while its turns run: waiting on a long tool (a build, a
+        // test suite) is not idle, and spilling it would write gigabytes to disk mid-turn. Released
+        // when the turns end; the model plugin also lets a hold lapse by itself.
+        let _ = host.call(model_methods::HOLD, json!({"cache_key": session_id, "hold": true})).await;
+        let result: Result<(), RpcError> = async {
         loop {
             // A prewarm since the last turn ended stops here: the turn continues from what it did.
             self.set_prewarm(session_id, None);
@@ -529,6 +576,22 @@ impl Chatflow {
                 return Ok(());
             }
             journal.sync().await?;
+            // The host, not the model, clears what the turn left behind that is nobody's work
+            // (the scratch folder, files its commands made); the change itself stays. Before the
+            // terminal status, so whoever waits for it sees the workspace as the turn leaves it.
+            if let Some(env) = &ran {
+                let since_ms = journal.get(status_seq).map(|entry| entry.ts_ms).unwrap_or(0);
+                let params = json!({"workspace": env.scope.workspace, "session_id": session_id, "since_ms": since_ms});
+                match host.call(cc_protocol::contracts::tools::methods::CLEANUP, params).await {
+                    Ok(result) => {
+                        let removed = result.get("removed").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                        if removed > 0 {
+                            tracing::info!(session = %session_id, removed, "cleared what the turn left behind");
+                        }
+                    }
+                    Err(error) => tracing::debug!(%error, "turn cleanup failed"),
+                }
+            }
             journal.append(kinds::STATUS, json!({"state": state, "detail": detail, "run_id": run_id, "data_version": self.inner.data.get().version()})).await?;
             let session_status = match state.as_str() {
                 "done" => SessionStatus::Done,
@@ -544,7 +607,7 @@ impl Chatflow {
             // it meanwhile, so the next turn starts warm.
             if let Some(env) = &ran {
                 let conversation = |entries: &[JournalEntry]| crate::prewarm::conversation(&env.prefix, &env.data, entries, env.image_input);
-                let prewarm = crate::fit::prepare(env, &mut journal, u64::MAX, env.data.limits.compact_idle_percent, conversation).await;
+                let prewarm = crate::fit::prepare(env, &mut journal, u64::MAX, env.data.limits.compact_idle_tokens, crate::prewarm::When::Idle, conversation).await;
                 self.set_prewarm(session_id, prewarm);
             }
             // Messages that arrived too late for this run, then queued follow-ups, each start a turn.
@@ -552,12 +615,13 @@ impl Chatflow {
             let Some(next) = next else {
                 let _ = host.session_status(session_id, session_status).await;
                 // The next turn's prefix is known now: prefill it while the user reads the answer
-                // (a compaction above prefilled its own already).
+                // (a compaction above prefilled its own already). Whether a next turn comes is a
+                // guess, so only while the model has nothing else to do.
                 if let Some(env) = &ran
                     && !self.prewarming(session_id)
                 {
                     let _ = journal.sync().await;
-                    self.warm(&host, session_id, &env.prefix, &env.data, env.image_input, &journal.entries_vec());
+                    self.warm(&host, session_id, &env.prefix, &env.data, env.image_input, &journal.entries_vec(), crate::prewarm::When::Idle);
                 }
                 return Ok(());
             };
@@ -580,6 +644,10 @@ impl Chatflow {
                 handle.run_id = run_id.clone();
             }
         }
+        }
+        .await;
+        let _ = host.call(model_methods::HOLD, json!({"cache_key": session_id, "hold": false})).await;
+        result
     }
 
     // ---- spec, decisions, plans ----------------------------------------------------------------
@@ -865,6 +933,19 @@ impl Chatflow {
         tokio::task::spawn_blocking(move || attachments::put(&home, &roots, params))
             .await
             .map_err(|error| RpcError::internal(format!("the attachment task failed: {error}")))?
+    }
+
+    /// A deleted session: its run stops, its prefill ends, and its lock file goes.
+    async fn forget_session(&self, ctx: &Ctx, session_id: &str) {
+        if let Some((_, stops, _, mut done)) = self.active(session_id) {
+            stops.cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), done.wait_for(|value| value.is_some())).await;
+        }
+        self.set_prewarm(session_id, None);
+        if let Ok(mut warmed) = self.inner.warmed.lock() {
+            warmed.remove(session_id);
+        }
+        locks::remove(&data_dir(ctx), session_id);
     }
 
     async fn cancel(&self, ctx: Ctx, params: SessionParams) -> Result<Value, RpcError> {
@@ -1373,12 +1454,25 @@ impl Plugin for Chatflow {
         if topic == SKILLS_CHANGED {
             self.inner.skills_changed_ms.store(cc_protocol::contracts::now_ms(), Ordering::SeqCst);
         }
+        if topic == SOURCE_CHANGED {
+            // Read the live data again whatever the file times say (a merge can keep sizes and
+            // times the watcher compares).
+            let before = self.inner.data.get().version();
+            let loaded = self.inner.data.reload(true);
+            if !matches!(&loaded, crate::data::Loaded::Activated(version) if *version == before) {
+                self.publish_data(&ctx, &loaded);
+            }
+        }
         let this = self.clone();
         Box::pin(async move {
-            if topic == tools_topics::JOB_EVENT
-                && let Err(error) = this.job_event(ctx, data).await
+            if topic == tools_topics::JOB_EVENT {
+                if let Err(error) = this.job_event(ctx, data).await {
+                    tracing::warn!(%error, "could not deliver a background job event");
+                }
+            } else if topic == frame_topics::SESSION_DELETED
+                && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data)
             {
-                tracing::warn!(%error, "could not deliver a background job event");
+                this.forget_session(&ctx, &deleted.session_id).await;
             }
         })
     }

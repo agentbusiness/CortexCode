@@ -18,6 +18,10 @@ struct FileState {
     /// The session changed this file (an edit or a whole write).
     #[serde(default)]
     changed: bool,
+    /// The session read the file since its last edit of it: that read is in the conversation, and
+    /// the next edit result says it is older (see [`ReadState::take_read_since_edit`]).
+    #[serde(default)]
+    read_since_edit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +53,7 @@ impl ReadState {
     pub fn record_read(&self, session: &str, path: &Path, hash: &str, lines: &[String]) {
         self.with(|sessions| {
             let state = sessions.entry(session.to_owned()).or_default().entry(path.to_path_buf()).or_default();
+            state.read_since_edit = true;
             state.seen.insert(hash.to_owned());
             state.view =
                 Some(StoredView { base_lines: lines.to_vec(), map: (0..lines.len()).map(Some).collect(), current_hash: hash.to_owned() });
@@ -82,7 +87,18 @@ impl ReadState {
     /// The session wrote the whole file (it knows every line of the new version).
     pub fn record_write(&self, session: &str, path: &Path, new_hash: &str, lines: &[String]) {
         self.record_read(session, path, new_hash, lines);
-        self.with(|sessions| sessions.entry(session.to_owned()).or_default().entry(path.to_path_buf()).or_default().changed = true);
+        self.with(|sessions| {
+            let state = sessions.entry(session.to_owned()).or_default().entry(path.to_path_buf()).or_default();
+            state.changed = true;
+            state.read_since_edit = false;
+        });
+    }
+
+    /// Whether the session read the file since its last edit of it; reset (asked once per edit).
+    pub fn take_read_since_edit(&self, session: &str, path: &Path) -> bool {
+        self.with(|sessions| {
+            sessions.get_mut(session).and_then(|files| files.get_mut(path)).is_some_and(|state| std::mem::take(&mut state.read_since_edit))
+        })
     }
 
     /// Whether the session already changed this file (an edit or a whole write).

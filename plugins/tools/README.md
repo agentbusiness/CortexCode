@@ -65,6 +65,15 @@ their first inline for later). The set of skills a session got lives with the pe
 another way (the chat flow's injected skills) is recorded there with `tools.skills.shown {session_id,
 uris}`, so a code that leads to it later brings nothing.
 
+The scratch folder is `tmp/` at the workspace root (`$TMPDIR` of its shells), listed in the project's
+`.gitignore` while it exists. When a turn ends the chat flow calls `tools.cleanup {workspace,
+session_id, since_ms}` (`cleanup.rs`): `tmp/` goes, the added `.gitignore` line is taken back, and
+new untracked files the turn's commands made (build output, logs) are removed; files `edit` wrote,
+ignored files, older files and `.cortex-*` stay, and nothing else is removed when the user let a
+command past the sandbox in the session. A `.cortex-env` file (`KEY=VALUE` lines, `$NAME`
+expanded) in the workspace or above it is loaded into its shells and jobs: a toolchain the machine
+does not have on its PATH.
+
 A host `tools.read` of `diagnostics://` may pass `wait_ms` (0: what the servers have now, nothing
 started or waited for, marked partial; the chat flow's reads) and `shown` (at most that many listed
 per server, errors first, the rest counted). A server that cannot answer is a line of the result.

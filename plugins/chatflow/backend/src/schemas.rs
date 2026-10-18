@@ -362,6 +362,10 @@ fn rule_for(shape: &Shape, rules: &mut Vec<String>) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouterDecision {
     pub work: String,
+    /// Each thing the message asks for, in its words (empty for small talk): what the flow
+    /// checks the turn's work against before the reply goes back.
+    #[serde(default)]
+    pub asks: Vec<String>,
     pub route: String,
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -414,13 +418,6 @@ pub struct Decision {
     pub note: String,
 }
 
-/// COVERAGE: the requirements a task's check script does not yet test both ways.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Coverage {
-    #[serde(default)]
-    pub missing: Vec<String>,
-}
-
 /// REVIEW: after a task, whether the tasks still to do fit what the work showed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Review {
@@ -443,6 +440,9 @@ pub struct SpecExtract {
     pub title: String,
     #[serde(default)]
     pub requirements: Vec<String>,
+    /// The request's own worked examples, copied: what the work is checked against.
+    #[serde(default)]
+    pub examples: Vec<String>,
 }
 
 /// SPEC_EDIT: how the latest message changes the spec's requirements.

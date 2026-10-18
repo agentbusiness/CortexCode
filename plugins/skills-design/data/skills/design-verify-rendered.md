@@ -17,8 +17,9 @@ cx browser console
 
 ## 2. Write the audit script once
 
-```bash
-cat > /tmp/ui-audit.js <<'EOF'
+Write it as `$TMPDIR/ui-audit.js` with `edit` (`content`):
+
+```js
 (()=>{const W=document.documentElement.clientWidth,out=[],seen=new Set(),cs=e=>getComputedStyle(e);
 const add=(k,e,m)=>{const id=e.tagName.toLowerCase()+(e.id?'#'+e.id:'')+(e.classList[0]?'.'+e.classList[0]:'');if(!seen.has(k+id)&&out.length<50){seen.add(k+id);out.push(k+' '+id+' '+m)}};
 const g=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
@@ -50,7 +51,6 @@ if(h.filter(x=>x===1).length!==1)out.push('HEADINGS h1 count '+h.filter(x=>x===1
 h.forEach((x,i)=>{if(i&&x>h[i-1]+1)out.push(`HEADINGS h${h[i-1]} then h${x}`)});
 out.push(`INFO ${W}x${innerHeight}, ${out.length} findings, loaded fonts: ${[...new Set([...document.fonts].filter(f=>f.status==='loaded').map(f=>f.family))].join(', ')||'none'}`);
 return out})()
-EOF
 ```
 
 One line per finding:
@@ -67,7 +67,7 @@ One line per finding:
 ```bash
 for vp in '390,844,true' '1440,900,false'; do IFS=, read w h m <<<"$vp"
   cx call browser.cdp '{"tab_id":"'$TAB'","method":"Emulation.setDeviceMetricsOverride","params":{"width":'$w',"height":'$h',"deviceScaleFactor":2,"mobile":'$m'}}' >/dev/null
-  cx call browser.reload '{"tab_id":"'$TAB'"}' >/dev/null; cx browser eval --tab-id $TAB @/tmp/ui-audit.js; done
+  cx call browser.reload '{"tab_id":"'$TAB'"}' >/dev/null; cx browser eval --tab-id $TAB @$TMPDIR/ui-audit.js; done
 ```
 
 Page with themes or motion: emulate dark mode and reduced motion, run the loop again, confirm the content shows:

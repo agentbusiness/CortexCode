@@ -97,7 +97,7 @@ git diff main -- src/app.py
 ```
 
 - `switch` refuses (changes would be overwritten): commit, or `git stash push -u -m "<what>"`, switch, `git stash pop`.
-- Second checkout: `git worktree add --detach "${TMPDIR:-/tmp}/wt" main`, later `git worktree remove --force "${TMPDIR:-/tmp}/wt"`.
+- Second checkout: `git worktree add --detach "$TMPDIR/wt" main`, later `git worktree remove --force "$TMPDIR/wt"`.
 
 Update from main (only when asked; needs network):
 
@@ -188,7 +188,7 @@ Which commit broke it: `git bisect` in `skill://skills-engineering/debugging`.
 ## 12. Agent workspace (background task)
 
 - The host commits and merges your work once the task's contract (check commands) passes.
-- Do not commit, branch, rebase or push. Scratch files: `${TMPDIR:-/tmp}`.
+- Do not commit, branch, rebase or push. Scratch files: `$TMPDIR` (write them with `edit`).
 - A conflict handed back: resolve as in section 7, rerun the contract.
 
 ## 13. GitHub with gh
@@ -214,9 +214,9 @@ gh pr list --state open --search "author:@me"
 
 Open a PR (only when asked; it pushes):
 
-```bash
-git push -u origin HEAD
-cat > "${TMPDIR:-/tmp}/pr.md" <<'EOF'
+Write the description as `$TMPDIR/pr.md` with `edit` (`content`):
+
+```markdown
 ## What
 <the change, one paragraph>
 
@@ -225,9 +225,14 @@ cat > "${TMPDIR:-/tmp}/pr.md" <<'EOF'
 
 ## How verified
 <exact commands run and their results>
-EOF
-gh pr create --base main --title "<imperative summary>" --body-file "${TMPDIR:-/tmp}/pr.md"    # add --draft if unfinished
-gh pr edit 123 --body-file "${TMPDIR:-/tmp}/pr.md"                                              # update the description later
+```
+
+Then:
+
+```bash
+git push -u origin HEAD
+gh pr create --base main --title "<imperative summary>" --body-file "$TMPDIR/pr.md"    # add --draft if unfinished
+gh pr edit 123 --body-file "$TMPDIR/pr.md"                                              # update the description later
 ```
 
 Without `--title` and `--body-file` (or `--fill`) gh prompts and fails.

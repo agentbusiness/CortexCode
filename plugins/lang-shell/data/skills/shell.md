@@ -2,28 +2,27 @@ Shell scripts here: get it right, run and check them, code that runs, common err
 
 ## 1. Get it right
 
-1. **Pin down what the script must do.** Read the statement, the script, its callers (Makefile, CI) and tests.
+1. **Pin down what the script must do.** Read the request, then what the project already says about it: the script, its callers (Makefile, CI), its tests and docs.
    - Note: arguments, input (stdin, files), exact output (stdout/stderr, format, final newline), exit status per case.
-   - The statement decides, never a name. Keep names, options and the shebang's dialect.
-   - "No result" in a script is a non-zero exit status with nothing on stdout (an error message goes to stderr), unless the statement names an output for it.
-   - Before coding, write the cases (section 2): one per sentence that states a behaviour, value, error or limit. A sentence with no case is a missed requirement.
-   - Unfamiliar domain, format or protocol: when the research plugin is available, learn its rules and copy them into the cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page with the rules.
+   - The request and the project decide, never a name alone. Keep names, options and the shebang's dialect.
+   - "No result" in a script is a non-zero exit status with nothing on stdout (an error message goes to stderr), unless the request or the project names an output for it.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+   - Before coding, note the request's examples: they are the check, their values copied, never computed.
+   - Unfamiliar tool, format or protocol: look it up (the research plugin, the man page, how others solved it):
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole units, in slices.**
    - Simplest complete path first (one case, input to result). Run it.
-   - Then each next behaviour from the statement, running after each.
-   - New script: whole once with `edit` `content`. After that: anchored `edits` only, every change in one call (a second whole write is refused).
+   - Then each next behaviour, running after each.
+   - A new script is written whole with `edit` `content`; an existing script is changed with anchored `edits` only, every change to it in one call.
    - Replace a function from `name() {` to its closing `}`. Never leave part of the old body, or a second definition (the last wins silently).
-3. **Run it after every change** on the statement's sample input; compare output and exit status:
+3. **Run it after every change** on a sample input; compare output and exit status:
 
 ```bash
 bash -n x.sh && printf 'a b\nc\n' | bash x.sh arg1; echo "exit=$?"
 ```
 
-4. **Run the project's tests** if any (bats, a test script, `make test`). Fix the first failure, run again. Change only the code that failure runs through: a function whose cases pass stays as it is unless the task asks to change it.
-5. **Before you finish**, check each requirement again, named error messages and exit codes included.
-
-A check disagrees with the statement: the statement wins. Fix the script, say which check is wrong.
+4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests if any (bats, a test script, `make test`); fix the first failure, run again.
+5. **Before you finish**, check each requirement again, error messages and exit codes included.
 
 ## 2. Run, test, check
 
@@ -43,26 +42,15 @@ bash x.sh args; echo "exit=$?"  # its set -e, cd and exit stay inside the script
 - Linux-only scripts (CI, containers) may use bash 4+; say they cannot run here.
 - `./x.sh` needs `chmod +x`; `sh x.sh` runs it as POSIX sh.
 
-**Checking your work.** One scratch file, `check.sh`. Edit it, never re-type it.
-- Cases in a table.
-- Expected output copied from the statement, never worked out by hand.
-- One printed line per case; never `exit` on a failure.
-
-```bash
-#!/bin/bash
-while IFS='|' read -r given want; do
-  got=$(./solve.sh "$given" 2>&1)
-  [ "$got" = "$want" ] && mark="ok " || mark="BAD"
-  printf '%s %s -> %s want %s\n' "$mark" "$given" "$got" "$want"
-done <<'CASES'
-3 1 2|1 2 3
-CASES
-```
-
-Run `bash check.sh`.
-- After any fix, run every case again, passing ones too.
-- Keep the file while the work can still change; delete it when the user is done.
-- A case fails: check the case first, against the statement. A case that breaks a stated rule, or holds a value you computed, is bad. Fix it, then the code.
+**Checking your work.**
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/test_<name>.sh` that runs the script with inputs and compares its output, run with `bash tests/test_<name>.sh`; they stay in the project.
+2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
+3. Build a long input in code from its parts, never typed out: `printf '0 %.0s' $(seq 18)`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+4. Each check shows what the code returned when it fails: `[ "$got" = "$want" ] || echo "got: $got"`.
+5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
+6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
+7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
+8. A one-off try (call a function, print a value) goes in `tmp/`; git ignores `tmp/`.
 
 ## 3. Code that runs
 

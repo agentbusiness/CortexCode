@@ -12,10 +12,11 @@ use crate::supervisor::{self, Instance, Slot, Supervisor};
 use crate::uiplugins::{UiChange, UiPlugins};
 use crate::units::Units;
 use cc_protocol::contracts::frame::{
-    InstallParams, JournalAppendParams, JournalAppendResult, JournalPatch, JournalPatchParams, JournalReadParams,
+    DeleteResult, InstallParams, JournalAppendParams, JournalAppendResult, JournalPatch, JournalPatchParams, JournalReadParams,
     JournalReadResult, KeepAwakeParams, KeepAwakeResult, Machine, PluginInfo, PluginListResult, PluginToggleParams,
-    ProjectGetParams, ProjectListResult, ProjectOpenParams, RollbackParams, SessionCreateParams, SessionGetParams,
-    SessionListParams, SessionListResult, SessionUpdateParams, SubscribeParams, SubscribeResult, SwapParams,
+    ProjectDeleted, ProjectGetParams, ProjectListResult, ProjectOpenParams, ProvidersParams, RollbackParams, SessionCreateParams, SessionDeleted,
+    SessionGetParams,
+    SessionListParams, SessionListResult, SessionUpdateParams, SubscribeParams, SubscribeResult, SwapParams, SwitchParams,
     UiOpenResult, UiPluginListResult, UiStatePutParams, UiStatePutResult, methods, topics,
 };
 use cc_protocol::contracts::lifecycle::{Hello, HelloAck};
@@ -282,10 +283,10 @@ impl Frame {
     pub fn disabled_error(&self, slot: &Slot) -> RpcError {
         RpcError::new(
             codes::UNAVAILABLE,
-            format!("`{}` is unavailable: the plugin `{}` is disabled (enable it in Settings > Plugins or with frame.plugins.enable)", slot.category, slot.plugin),
+            format!("`{}` is unavailable: the plugin `{}` is disabled (enable it in Settings > Plugins or with frame.plugins.enable)", slot.category, slot.plugin()),
         )
         .retryable()
-        .with_data(json!({"category": slot.category, "state": "disabled", "plugin": slot.plugin}))
+        .with_data(json!({"category": slot.category, "state": "disabled", "plugin": slot.plugin()}))
     }
 
     /// Publish `plugin.state` for a slot as `frame.plugins.list` shows it.
@@ -510,7 +511,7 @@ impl Frame {
 
     /// Every plugin as a unit (configured, installed and `[[ui_plugin_dir]]` owners).
     pub fn unit_list(&self) -> Vec<cc_protocol::contracts::frame::PluginUnit> {
-        self.units.all().iter().map(|unit| unit.info()).collect()
+        self.units.all().iter().map(|unit| self.units.info_of(unit)).collect()
     }
 
     pub fn plugin_list(&self) -> Vec<PluginInfo> {
@@ -574,6 +575,18 @@ impl Frame {
                 self.publish(topics::SESSION_CHANGED, &to_value(&session)?);
                 to_value(&session)
             }
+            methods::SESSION_DELETE => {
+                let params: SessionGetParams = parse_params(params)?;
+                let removed = self.state.delete_session(&params.id)?;
+                to_value(&DeleteResult { sessions: self.forget_sessions(removed) })
+            }
+            methods::PROJECT_DELETE => {
+                let params: ProjectGetParams = parse_params(params)?;
+                let (project, removed) = self.state.delete_project(&params.id)?;
+                let sessions = self.forget_sessions(removed);
+                self.publish(topics::PROJECT_DELETED, &to_value(&ProjectDeleted { project_id: project.id, root: project.root })?);
+                to_value(&DeleteResult { sessions })
+            }
             methods::JOURNAL_READ => {
                 let params: JournalReadParams = parse_params(params)?;
                 self.state.session(&params.session_id)?;
@@ -582,6 +595,10 @@ impl Frame {
             }
             methods::PLUGINS_LIST => to_value(&PluginListResult { plugins: self.plugin_list(), units: self.unit_list() }),
             methods::UI_PLUGINS_LIST => to_value(&UiPluginListResult { plugins: self.ui_plugins.list() }),
+            methods::PLUGINS_PROVIDERS => {
+                let params: ProvidersParams = parse_params(params)?;
+                to_value(&self.units.providers(&params.category))
+            }
             methods::UI_STATE_GET => to_value(&self.state.ui_state()),
             methods::UI_STATE_PUT => {
                 let params: UiStatePutParams = parse_params(params)?;
@@ -621,6 +638,7 @@ impl Frame {
                 | methods::PLUGINS_DISABLE
                 | methods::PLUGINS_ENABLE
                 | methods::PLUGINS_INSTALL
+                | methods::PLUGINS_SWITCH
         )
     }
 
@@ -658,6 +676,13 @@ impl Frame {
                 }
                 to_value(&crate::units::install(&self, &params.path).await?)
             }
+            methods::PLUGINS_SWITCH => {
+                let params: SwitchParams = parse_params(params)?;
+                if self.is_shutting_down() {
+                    return Err(RpcError::new(codes::UNAVAILABLE, "the frame is shutting down"));
+                }
+                to_value(&crate::units::switch_provider(&self, &params.category, &params.plugin).await?)
+            }
             methods::UI_OPEN => {
                 let (running, pid) = self.shell.open(&self).await?;
                 to_value(&UiOpenResult { running, pid })
@@ -686,6 +711,23 @@ impl Frame {
             })?;
             Ok((to_value(&JournalAppendResult { seq: params.seq })?, durable))
         }
+    }
+
+    /// Sessions removed from the state: their journals go, and every plugin is told (each drops
+    /// its own data about them). Returns their ids.
+    fn forget_sessions(&self, removed: Vec<cc_protocol::contracts::frame::Session>) -> Vec<String> {
+        let mut ids = Vec::with_capacity(removed.len());
+        for session in removed {
+            if let Err(error) = self.journal.remove(&session.id) {
+                tracing::warn!(session = %session.id, %error, "deleting a session's journal failed");
+            }
+            let deleted = SessionDeleted { session_id: session.id.clone(), project_id: session.project_id, workspace: session.workspace };
+            if let Ok(data) = to_value(&deleted) {
+                self.publish(topics::SESSION_DELETED, &data);
+            }
+            ids.push(session.id);
+        }
+        ids
     }
 
     fn publish_patch(&self, topic: &str, patch: &JournalPatch) {

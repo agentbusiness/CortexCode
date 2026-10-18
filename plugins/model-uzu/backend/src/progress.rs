@@ -7,6 +7,8 @@
 //! conversation, or one that finds no free slot, stops the running prewarm at its next step (what
 //! it prefilled stays in the conversation's state and checkpoints, so the real request continues
 //! from there), and a prewarm still waiting for a conversation that has a real request is dropped.
+//! An idle-only prewarm (a guess that a conversation goes on, sent when its turn ended) yields to
+//! every other conversation: it waits while one is served, and a request for one stops it.
 
 use cc_protocol::contracts::model::{PROGRESS_EVERY_MS, Priority, Progress};
 use std::time::{Duration, Instant};

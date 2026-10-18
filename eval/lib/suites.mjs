@@ -92,9 +92,18 @@ export const polyglot = {
     // the exercise sources with their reference solutions; a model was seen searching / for them).
     await materializeWorkspace(path.join(PG.taskDir(task.id), 'template'), dest, { links: PG.workspaceLinks(task), exclude: ['/.cortex-offline'] });
     await fsp.writeFile(path.join(dest, '.cortex-offline'), [HIDDEN, SRC, ...LOCAL_REFS].map((dir) => `${dir}\n`).join(''));
+    // The benchmark's toolchains (JDK, Go, the Python with the exercises' packages) for the app's
+    // commands, as a project environment file the tools load: an app the harness attaches to was
+    // not started with them on its PATH (seen: a Java task with no Java to run its tests).
+    const env = Object.entries(PG.agentEnvExtra()).filter(([, value]) => value != null).map(([key, value]) => `${key}=${value}`);
+    const bins = PG.agentPath().filter((dir) => fs.existsSync(dir));
+    await fsp.writeFile(path.join(dest, '.cortex-env'), [...env, `PATH=${bins.join(':')}:$PATH`].join('\n') + '\n');
     return { snapshot: await snapshotSha(dest) };
   },
   hiddenFiles: (task) => [...PG.hiddenFiles(task), ...PG.secretFiles(task)],
+  // The exercise's own name, as in aider's per-exercise directory: the C++ exercises' CMakeLists.txt
+  // derive the exercise and its test file from the folder name.
+  workspaceName: (task) => task.slug,
   async score(task, workspace, outDir, tag, scratch) {
     const res = await PG.polyglotScore(task, workspace, path.join(scratch, 'score'), outDir, tag);
     // aider: on a test timeout the follow-up text is "Tests timed out!".

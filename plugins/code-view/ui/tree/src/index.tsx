@@ -1,9 +1,9 @@
 /**
- * code.tree@1 — the code view's file tree. By default the changed files of the scope, with each
- * file's and folder's +A −R (a deleted-only file shows only −R), single-child folders folded into
- * one row; or every file, folders loading as they open. A filter narrows it; each file carries its
- * language mark and, when another working tree (an agent's) changed it too, who. Pressing a file
- * opens it in the editor at its first change.
+ * code.tree@1 — the code view's file tree. In the File view: every file (folders loading as they
+ * open) or only the changed ones, and pressing a file opens it at its first change. In the Changes
+ * view: only the changed files of the scope, and pressing one scrolls the diff to it. Changed files
+ * carry +A −R (a deleted-only file shows only −R), single-child folders fold into one row, a
+ * filter narrows the list, and a file another working tree (an agent's) changed too says who.
  */
 
 import { useEffect, useMemo } from 'react';
@@ -13,7 +13,6 @@ import {
   firstChangedLine,
   useCodeDiff,
   useCodeOpen,
-  useCodeOptions,
   useCodeTarget,
   useQueries,
   useQuery,
@@ -33,7 +32,12 @@ function Tree() {
   const { projectId, project } = useSelection();
   const diff = useCodeDiff();
   const [open, setOpen] = useCodeOpen();
-  const [options, setOptions] = useCodeOptions();
+  const [view] = useShared<'file' | 'changes'>('code.view', 'file');
+  const [fileTree, setFileTree] = useShared<'all' | 'changed'>('code.fileTree', 'all');
+  const [focus, setFocus] = useShared<{ path: string; at: number } | null>('code.diffFocus', null);
+  const changesView = view === 'changes';
+  // Every file only in the File view, when asked; the Changes view lists what changed.
+  const options = { allFiles: !changesView && fileTree === 'all' };
   const [filter, setFilter] = useSlotState<string>('filter', '');
   const [collapsedAll, setCollapsedAll] = useSlotState<Record<string, string[]>>('collapsed', {});
   const [expandedAll, setExpandedAll] = useSlotState<Record<string, string[]>>('expanded', {});
@@ -127,13 +131,13 @@ function Tree() {
       );
     }
     const info = counts.get(node.path);
-    const selected = open?.root === root && open.path === node.path;
+    const selected = changesView ? focus?.path === node.path : open?.root === root && open.path === node.path;
     const also = (shared.get(node.path) ?? []).filter((owner) => owner !== 'here');
     return (
       <li key={`f:${node.path}`} role="treeitem" className={selected ? 'sel' : undefined}>
         <button type="button" className="cx-row file" style={{ paddingLeft: 12 + depth * 12 + 12 }} title={node.path} data-path={node.path}
           aria-current={selected ? 'true' : undefined} data-added={info?.added ?? 0} data-removed={info?.removed ?? 0}
-          onClick={() => setOpen({ root, path: node.path, line: info ? firstChangedLine(info.hunks) : null })}>
+          onClick={() => (changesView ? setFocus({ path: node.path, at: Date.now() }) : setOpen({ root, path: node.path, line: info ? firstChangedLine(info.hunks) : null }))}>
           <span className="cx-lang ap origin">{langMark(node.path)}</span>
           <span className={`nm${info?.status === 'deleted' ? ' gone' : ''}`}>{node.label}</span>
           {also.length > 0 && <span className="ap hot cx-also" title={`Also changed in ${also.join(', ')}'s tree`}>also {also.join(' ')}</span>}
@@ -151,10 +155,12 @@ function Tree() {
           <svg viewBox="0 0 10 10" aria-hidden="true"><circle cx="4.2" cy="4.2" r="3.2" stroke="currentColor" fill="none" /><path d="M6.6 6.6L9 9" stroke="currentColor" /></svg>
           <input type="search" placeholder="Filter files…" aria-label="Filter files" value={filter} onChange={(event) => setFilter(event.target.value)} />
         </label>
-        <div className="seg-set" role="group" aria-label="Which files">
-          <button type="button" aria-pressed={!options.allFiles} onClick={() => setOptions({ allFiles: false })}>Changed</button>
-          <button type="button" aria-pressed={options.allFiles} onClick={() => setOptions({ allFiles: true })}>All</button>
-        </div>
+        {!changesView && (
+          <div className="seg-set" role="group" aria-label="Which files">
+            <button type="button" aria-pressed={options.allFiles} onClick={() => setFileTree('all')}>All</button>
+            <button type="button" aria-pressed={!options.allFiles} onClick={() => setFileTree('changed')}>Changed</button>
+          </div>
+        )}
       </div>
       <div className="cx-tree-scroll">
         {diff.error && !diff.data && <ServiceProblem service="vcs" state={diff} className="inline-error" />}

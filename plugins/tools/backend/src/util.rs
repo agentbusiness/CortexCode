@@ -58,6 +58,90 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Resolve a path given by the model or the UI against a base directory.
+/// The workspace's scratch folder, `tmp/` at its root: its shells' `$TMPDIR`, where throwaway
+/// checks live (short relative paths, removed with the workspace). Git ignores it.
+pub fn scratch_dir(workspace: &Path) -> PathBuf {
+    workspace.join("tmp")
+}
+
+/// The scratch folder, made and listed in the workspace's `.gitignore` (once: a line that already
+/// ignores `tmp` stays as it is).
+pub fn ensure_scratch(workspace: &Path) -> PathBuf {
+    let scratch = scratch_dir(workspace);
+    let _ = std::fs::create_dir_all(&scratch);
+    if workspace.join(".git").exists() {
+        let ignore = workspace.join(".gitignore");
+        let text = std::fs::read_to_string(&ignore).unwrap_or_default();
+        if !text.lines().any(|line| matches!(line.trim(), "tmp" | "tmp/" | "/tmp" | "/tmp/")) {
+            let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+            let _ = std::fs::write(&ignore, format!("{text}{separator}/tmp/\n"));
+        }
+    }
+    scratch
+}
+
+/// The project's own environment for its commands: `KEY=VALUE` lines of the nearest `.cortex-env`
+/// in `dir` or a folder above it (a toolchain the machine does not have on its PATH, e.g.
+/// `JAVA_HOME=/opt/jdk` and `PATH=$JAVA_HOME/bin:$PATH`). `#` starts a comment; `$NAME` and
+/// `${NAME}` take an earlier line's value or the process's. Empty when there is no such file.
+pub fn project_env(dir: &Path) -> Vec<(String, String)> {
+    let Some(file) = dir.ancestors().take(8).map(|folder| folder.join(".cortex-env")).find(|file| file.is_file()) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&file) else { return Vec::new() };
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        let lookup = |name: &str| {
+            vars.iter().rev().find(|(known, _)| known == name).map(|(_, value)| value.clone()).or_else(|| std::env::var(name).ok()).unwrap_or_default()
+        };
+        let mut expanded = String::new();
+        let mut rest = value;
+        while let Some(at) = rest.find('$') {
+            expanded.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let (name, tail) = if let Some(inner) = after.strip_prefix('{') {
+                match inner.find('}') {
+                    Some(end) => (&inner[..end], &inner[end + 1..]),
+                    None => ("", after),
+                }
+            } else {
+                let end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+                (&after[..end], &after[end..])
+            };
+            if name.is_empty() {
+                expanded.push('$');
+                rest = after;
+            } else {
+                expanded.push_str(&lookup(name));
+                rest = tail;
+            }
+        }
+        expanded.push_str(rest);
+        vars.push((key.to_owned(), expanded));
+    }
+    vars
+}
+
+/// `path` with a leading `$TMPDIR` or `${TMPDIR}` replaced by the session's scratch folder.
+pub fn expand_scratch(path: &str, scratch: &Path) -> String {
+    let path = path.trim();
+    for prefix in ["${TMPDIR}", "$TMPDIR"] {
+        if let Some(rest) = path.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return format!("{}{rest}", scratch.display());
+        }
+    }
+    path.to_owned()
+}
+
 pub fn resolve(base: &Path, path: &str) -> PathBuf {
     let expanded = expand_home(path.trim());
     let joined = if expanded.is_absolute() { expanded } else { base.join(expanded) };
@@ -143,4 +227,21 @@ pub fn shell_quote(text: &str) -> String {
         return text.to_owned();
     }
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Command output with the workspace's own absolute paths written relative to it (`<ws>/tests/a.py`
+/// becomes `tests/a.py`; macOS names temp folders both as `/var` and `/private/var`, so both
+/// spellings). A tool or traceback printing the long absolute path gave the model folder names to
+/// `cd` into and to repeat in file paths (seen: a copy of a file written at `<ws tail>/file.py`).
+pub fn relative_paths(text: &str, workspace: &Path) -> String {
+    let base = workspace.to_string_lossy().trim_end_matches('/').to_owned();
+    if base.is_empty() || base == "/" {
+        return text.to_owned();
+    }
+    let plain = base.strip_prefix("/private").unwrap_or(&base).to_owned();
+    let mut out = text.to_owned();
+    for form in [format!("/private{plain}/"), format!("{plain}/")] {
+        out = out.replace(&form, "");
+    }
+    out
 }

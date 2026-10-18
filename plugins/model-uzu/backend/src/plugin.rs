@@ -4,8 +4,8 @@ use crate::engine::Hibernated;
 use crate::runtime::{Config, Paths, Publisher, Runtime, expand_home};
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::{
-    CacheKeyParams, ChatMessage, ChatParams, CompleteParams, EndpointResult, PrewarmParams, Priority, Sampling,
-    SelectParams, Thinking, TokenizeParams, methods,
+    CacheKeyParams, ChatMessage, ChatParams, CompleteParams, EndpointResult, HoldParams, PrewarmParams, Priority, RenameParams,
+    Sampling, SelectParams, Thinking, TokenizeParams, methods,
 };
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, parse_params, to_value};
 use serde_json::{Value, json};
@@ -21,7 +21,9 @@ pub const PROVIDES: &[&str] = &[
     methods::COUNT,
     methods::SLOTS,
     methods::HIBERNATE,
+    methods::HOLD,
     methods::PREWARM,
+    methods::RENAME,
     methods::ENDPOINT,
     methods::VARIANTS,
     methods::SELECT,
@@ -118,9 +120,17 @@ async fn dispatch(runtime: Arc<Runtime>, call: Call) -> Result<Value, RpcError> 
             let params: CacheKeyParams = parse_params(params)?;
             runtime.hibernate(params).await
         }
+        methods::HOLD => {
+            let params: HoldParams = parse_params(params)?;
+            runtime.hold(params)
+        }
         methods::PREWARM => {
             let params: PrewarmParams = parse_params(params)?;
             runtime.prewarm(params, cancel).await
+        }
+        methods::RENAME => {
+            let params: RenameParams = parse_params(params)?;
+            runtime.rename(params)
         }
         methods::ENDPOINT => {
             let loaded = runtime.ready().await?;
@@ -235,6 +245,16 @@ impl Plugin for ModelPlugin {
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         let runtime = self.runtime(&ctx);
         Box::pin(async move { runtime.await.map(|_| ()) })
+    }
+
+    fn event(&self, _ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        if topic == cc_protocol::contracts::frame::topics::SESSION_DELETED
+            && let Ok(deleted) = serde_json::from_value::<cc_protocol::contracts::frame::SessionDeleted>(data)
+            && let Some(runtime) = self.runtime.get()
+        {
+            runtime.forget(deleted.session_id);
+        }
+        Box::pin(async {})
     }
 
     /// Hand the conversations to a successor: every idle one is hibernated to the plugin's data

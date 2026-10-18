@@ -108,6 +108,7 @@ impl StateStore {
             status: SessionStatus::Idle,
             created_ms: now,
             updated_ms: now,
+            model: None,
         };
         inner.sessions.insert(session.id.clone(), session.clone());
         if let Err(error) = self.persist_sessions(&inner) {
@@ -147,6 +148,9 @@ impl StateStore {
         if let Some(task_id) = params.task_id {
             session.task_id = Some(task_id);
         }
+        if let Some(model) = params.model {
+            session.model = Some(model);
+        }
         session.updated_ms = now_ms().max(previous.updated_ms);
         inner.sessions.insert(session.id.clone(), session.clone());
         if let Err(error) = self.persist_sessions(&inner) {
@@ -154,6 +158,43 @@ impl StateStore {
             return Err(error);
         }
         Ok(session)
+    }
+
+    /// Remove a session and every session started from it (children first). Returns them.
+    pub fn delete_session(&self, id: &str) -> Result<Vec<Session>, RpcError> {
+        let mut inner = self.lock();
+        if !inner.sessions.contains_key(id) {
+            return Err(RpcError::not_found(format!("no session `{id}`")));
+        }
+        let doomed = descendants(&inner.sessions, &[id.to_owned()]);
+        let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
+        if let Err(error) = self.persist_sessions(&inner) {
+            for session in removed {
+                inner.sessions.insert(session.id.clone(), session);
+            }
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
+    /// Remove a project and all of its sessions (children first). Returns them.
+    pub fn delete_project(&self, id: &str) -> Result<(Project, Vec<Session>), RpcError> {
+        let mut inner = self.lock();
+        let project = inner.projects.get(id).cloned().ok_or_else(|| RpcError::not_found(format!("no project `{id}`")))?;
+        let own: Vec<String> = inner.sessions.values().filter(|session| session.project_id == id).map(|session| session.id.clone()).collect();
+        let doomed = descendants(&inner.sessions, &own);
+        let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
+        inner.projects.remove(id);
+        // Sessions first: a project without its record but with sessions left would be worse than
+        // the reverse, which the next delete finishes.
+        if let Err(error) = self.persist_sessions(&inner).and_then(|()| self.persist_projects(&inner)) {
+            for session in removed {
+                inner.sessions.insert(session.id.clone(), session);
+            }
+            inner.projects.insert(project.id.clone(), project);
+            return Err(error);
+        }
+        Ok((project, removed))
     }
 
     /// `frame.ui_state.get`.
@@ -182,6 +223,27 @@ impl StateStore {
         let list: Vec<&Session> = inner.sessions.values().collect();
         write_json(&self.dir.join("sessions.json"), &list)
     }
+}
+
+/// `roots` and every session started from one of them, transitively, children before parents.
+fn descendants(sessions: &BTreeMap<String, Session>, roots: &[String]) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stack: Vec<(String, bool)> = roots.iter().rev().map(|id| (id.clone(), false)).collect();
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            order.push(id);
+            continue;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        stack.push((id.clone(), true));
+        for child in sessions.values().filter(|session| session.parent.as_deref() == Some(id.as_str())) {
+            stack.push((child.id.clone(), false));
+        }
+    }
+    order
 }
 
 /// Stable project id: a hash of the canonical root path.

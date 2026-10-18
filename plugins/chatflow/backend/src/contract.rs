@@ -40,23 +40,6 @@ fn tail(text: &str) -> String {
     format!("[{skipped} earlier characters not shown]\n{kept}")
 }
 
-/// The Seatbelt profile checks run under: everything as usual except outbound network beyond this
-/// machine. A contract check proves the work as it is; it must not download or install anything
-/// (a model once wrote `pip install --break-system-packages ...` as a "check").
-const OFFLINE_PROFILE: &str = "(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\"))(allow network-outbound (remote unix-socket))";
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-/// Wrap a check command so it runs without network. Returns the command to run and a note when
-/// the sandbox is unavailable (the check then runs unconfined, and the report says so).
-pub fn offline(command: &str) -> (String, Option<&'static str>) {
-    if cfg!(target_os = "macos") && std::path::Path::new(SANDBOX_EXEC).exists() {
-        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
-        (format!("{SANDBOX_EXEC} -p {} /bin/sh -c {}", quote(OFFLINE_PROFILE), quote(command)), None)
-    } else {
-        (command.to_owned(), Some("[network was not blocked for this check: no sandbox is available]"))
-    }
-}
-
 /// A check's exit status is its verdict, so a pipeline fails when any stage fails (`pytest | tail`
 /// would otherwise exit with `tail`'s status, 0, while the tests fail).
 pub fn strict(command: &str) -> String {
@@ -86,16 +69,26 @@ pub async fn run_check(
                     full_output: output,
                 });
             }
-            let (command, unconfined) = offline(&strict(&check.spec));
+            // The check runs like the model's own commands (the workspace's write sandbox), with
+            // the network: a project's tests may need to fetch what they build with.
+            let command = strict(&check.spec);
             let params = json!({"workspace": workspace, "command": command, "timeout_ms": CHECK_TIMEOUT_MS, "background": false});
             let outcome = host.call_with(tools_methods::RUN, params, crate::host::Effect::Idempotent, Some(cancel)).await?;
             let run: RunResult = cc_protocol::parse_params(outcome)?;
             let exit_ok = run.exit_code == Some(0) && !run.timed_out;
             let ok = exit_ok && expectation_holds(check.expect.as_deref(), &run.output);
-            let mut output = run.output.clone();
-            if let Some(note) = unconfined {
-                output.push_str(&format!("\n{note}"));
+            // The check's own tool is not installed here (`python -m pytest` without pytest, a
+            // command not found): the check is broken in itself, not a failure of the work to fix.
+            // INDETERMINATE, with the cause named (seen: a model sent to "fix" a missing pytest
+            // for ten minutes, then the turn ended as a repeated contract failure).
+            if !ok && missing_tool(&command, run.exit_code, &run.output) {
+                let output = format!("[this check cannot run here: {}; the work is not judged by it]", missing_tool_cause(&command, &run.output));
+                return Ok(Ran {
+                    result: CheckResult { name: check.name.clone(), ok: false, exit_code: run.exit_code, output_tail: output.clone(), duration_ms: started.elapsed().as_millis() as u64, indeterminate: true },
+                    full_output: output,
+                });
             }
+            let mut output = run.output.clone();
             if run.timed_out {
                 output.push_str("\n[the check timed out]");
             }
@@ -123,6 +116,36 @@ pub async fn run_check(
                 full_output: output,
             })
         }
+    }
+}
+
+/// Whether a check failed because its tool is not installed: `command not found` (exit 127), or
+/// Python's `No module named x` for the module the command runs with `-m x`.
+fn missing_tool(command: &str, exit_code: Option<i32>, output: &str) -> bool {
+    if exit_code == Some(127) || output.contains("command not found") {
+        return true;
+    }
+    match module_of(command) {
+        Some(module) => output.contains(&format!("No module named {module}")) || output.contains(&format!("No module named '{module}'")),
+        None => false,
+    }
+}
+
+/// The module a `python -m <module>` command runs.
+fn module_of(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "-m" {
+            return words.next();
+        }
+    }
+    None
+}
+
+fn missing_tool_cause(command: &str, output: &str) -> String {
+    match module_of(command) {
+        Some(module) if output.contains("No module named") => format!("`{module}` is not installed in this project's environment"),
+        _ => output.lines().find(|line| line.contains("command not found")).map(|line| line.trim().to_owned()).unwrap_or_else(|| "its command is not installed".to_owned()),
     }
 }
 

@@ -78,6 +78,9 @@ pub const PREFILL_CHUNK: usize = 1024;
 pub const DEFAULT_IDLE_SPILL_S: u64 = 30;
 /// Bytes the spill files may take on disk by default.
 pub const DEFAULT_HIBERNATE_LIMIT: u64 = 32 << 30;
+/// The longest a turn's hold keeps a conversation resident without being released (a holder
+/// that went away does not pin memory for good).
+pub const MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 /// Pool cells reserved for a request's generation when the caller set no `max_tokens`. Admission
 /// accounting only; it never limits the output.
 pub const GENERATION_RESERVE: u64 = 8192;
@@ -87,6 +90,8 @@ pub const PRESENCE_WINDOW: u32 = 4096;
 pub const REPETITION_WINDOW: u32 = 64;
 /// File header of a hibernated conversation.
 const HIBERNATION_MAGIC: &[u8; 8] = b"CCUZUHB1";
+/// A request that reads at least this many prompt tokens is logged with what it reused.
+const LONG_PREFILL_TOKENS: usize = 4096;
 
 pub type Publisher = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
@@ -190,6 +195,9 @@ pub struct Request {
     /// A prewarm of the leading block alone (`shared` is set): the prefill stops there, keeps the
     /// copy, and keeps no conversation under `key` (the conversation it is for does not exist yet).
     pub shared_only: bool,
+    /// A prewarm that runs only while no other conversation is served: it waits while another
+    /// conversation's request runs or waits, and such a request stops it at its next step.
+    pub idle_only: bool,
     /// Images in the prompt (their pad-token runs), in order.
     pub images: Vec<PromptImage>,
     /// The vision configuration (present when `images` is not empty).
@@ -293,6 +301,15 @@ pub type HibernateReply = tokio::sync::oneshot::Sender<Result<Value, (String, St
 pub enum Command {
     Run(Box<Request>),
     Hibernate { key: String, reply: HibernateReply },
+    /// Keep a conversation resident while its turn runs (`hold`), or let it go: a held one is not
+    /// spilled for being idle (it still can be when the pool needs the room).
+    Hold { key: String, hold: bool },
+    /// The idle state under `from` becomes `to`'s; an idle state of `to` is dropped first. Nothing
+    /// happens while either is busy or when `from` has no resident state.
+    Rename { from: String, to: String },
+    /// Drop a conversation for good (its session was deleted): its requests stop, its state and
+    /// checkpoints go, and so does its file on disk.
+    Forget(String),
     /// Hibernate every idle conversation (before a swap or shutdown); replies with the records.
     HibernateAll { reply: tokio::sync::oneshot::Sender<Vec<Hibernated>> },
     /// Adopt conversations a predecessor hibernated.
@@ -539,6 +556,10 @@ struct Slot<B: Backend> {
     busy: Option<Priority>,
     /// Images in the state's tokens (for prefix matching).
     images: Vec<ImageSpan>,
+    /// The length of the leading system block, whose checkpoint is never evicted: a rewrite of the
+    /// conversation then reuses at least that much (seen: a 220k prompt read from zero because the
+    /// block's checkpoint had been evicted as least recently used).
+    pinned: Option<usize>,
 }
 
 enum Phase<B: Backend> {
@@ -592,6 +613,11 @@ struct Worker<B: Backend> {
     waiting: VecDeque<Box<Request>>,
     hibernated: HashMap<String, Hibernated>,
     pending_hibernate: Vec<(String, HibernateReply)>,
+    /// Conversations to drop once their requests have stopped ([`Command::Forget`]).
+    pending_forget: Vec<String>,
+    /// Conversations held resident while their turn runs, until when (a hold that is never
+    /// released, its holder gone, lapses at `MAX_HOLD`).
+    held: HashMap<String, Instant>,
     view: Arc<Mutex<View>>,
     device: Arc<Mutex<DeviceFactsJson>>,
     publisher: Publisher,
@@ -667,6 +693,8 @@ impl<B: Backend> Worker<B> {
             waiting: VecDeque::new(),
             hibernated: HashMap::new(),
             pending_hibernate: Vec::new(),
+            pending_forget: Vec::new(),
+            held: HashMap::new(),
             view,
             device,
             publisher,
@@ -756,6 +784,7 @@ impl<B: Backend> Worker<B> {
             self.admit();
             stalled = self.active.is_empty() && !self.waiting.is_empty();
             self.run_pending_hibernations();
+            self.run_pending_forgets();
             if !self.active.is_empty() {
                 self.step();
             }
@@ -800,6 +829,48 @@ impl<B: Backend> Worker<B> {
                 }
             }
             Command::Hibernate { key, reply } => self.pending_hibernate.push((key, reply)),
+            Command::Hold { key, hold } => {
+                if hold {
+                    self.held.insert(key, Instant::now() + MAX_HOLD);
+                } else {
+                    self.held.remove(&key);
+                }
+            }
+            Command::Rename { from, to } => {
+                let busy = |slot: &Slot<B>| slot.busy.is_some();
+                let source = self.slots.iter().position(|slot| slot.key.as_deref() == Some(from.as_str()) && slot.state.is_some());
+                let target = self.slots.iter().position(|slot| slot.key.as_deref() == Some(to.as_str()));
+                let waiting = self.waiting.iter().any(|request| request.key == from || request.key == to);
+                match (source, target) {
+                    (Some(source), target) if !busy(&self.slots[source]) && !target.is_some_and(|target| busy(&self.slots[target])) && !waiting => {
+                        if let Some(target) = target
+                            && target != source
+                        {
+                            let slot = &mut self.slots[target];
+                            slot.key = None;
+                            slot.state = None;
+                            slot.checkpoints.clear();
+                            slot.n_tokens = 0;
+                            slot.images.clear();
+                            slot.pinned = None;
+                        }
+                        self.slots[source].key = Some(to.clone());
+                        self.slots[source].last_used = Instant::now();
+                        tracing::info!(from = %from, to = %to, tokens = self.slots[source].n_tokens, "took over a prepared state");
+                    }
+                    _ => tracing::debug!(from = %from, to = %to, "no prepared state to take over (busy or gone)"),
+                }
+            }
+            Command::Forget(key) => {
+                for request in self.waiting.iter().filter(|request| request.key == key) {
+                    request.stop.store(true, Ordering::SeqCst);
+                }
+                for active in self.active.iter().filter(|active| active.request.key == key) {
+                    active.request.stop.store(true, Ordering::SeqCst);
+                }
+                self.held.remove(&key);
+                self.pending_forget.push(key);
+            }
             Command::HibernateAll { reply } => {
                 let mut records = Vec::new();
                 for index in 0..self.slots.len() {
@@ -939,6 +1010,16 @@ impl<B: Backend> Worker<B> {
 
     /// Try to start the waiting request at `position`.
     fn place(&mut self, position: usize) -> Placement {
+        // Work for one conversation stops the idle-only prewarms of the others, and an idle-only
+        // prewarm waits while another conversation is served.
+        let key = self.waiting[position].key.clone();
+        if self.waiting[position].idle_only {
+            if self.serving_other(&key) {
+                return Placement::Wait;
+            }
+        } else if !matches!(self.waiting[position].work, Work::Prewarm) {
+            self.stop_idle_prewarms(&key);
+        }
         // A prewarm of a leading block that is kept already is done without a slot.
         if let Some(seed) = self.kept_seed(&self.waiting[position]) {
             self.seeds[seed].last_used = Instant::now();
@@ -959,7 +1040,6 @@ impl<B: Backend> Worker<B> {
             }));
             return Placement::Admitted;
         }
-        let key = self.waiting[position].key.clone();
         let priority = self.waiting[position].priority;
         // A higher class waiting for a slot blocks lower classes from taking one.
         let blocked_by_higher = self.waiting.iter().enumerate().any(|(index, other)| {
@@ -1037,6 +1117,20 @@ impl<B: Backend> Worker<B> {
         }
     }
 
+    /// Whether a request that is not a prewarm, for a conversation other than `key`, runs or waits.
+    fn serving_other(&self, key: &str) -> bool {
+        let real = |request: &Request| request.key != key && !matches!(request.work, Work::Prewarm);
+        self.active.iter().any(|active| real(&active.request)) || self.waiting.iter().any(|request| real(request))
+    }
+
+    /// Stop the running idle-only prewarms of conversations other than `key` (at their next step;
+    /// what they prefilled is kept).
+    fn stop_idle_prewarms(&mut self, key: &str) {
+        for active in self.active.iter().filter(|active| active.request.idle_only && active.request.key != key) {
+            active.request.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
     fn key_busy(&self, key: &str) -> bool {
         self.slots.iter().any(|slot| slot.key.as_deref() == Some(key) && slot.busy.is_some())
     }
@@ -1062,6 +1156,7 @@ impl<B: Backend> Worker<B> {
                 last_used: Instant::now(),
                 busy: None,
                 images: Vec::new(),
+                pinned: None,
             });
             return Some(self.slots.len() - 1);
         }
@@ -1229,6 +1324,11 @@ impl<B: Backend> Worker<B> {
                     return;
                 }
             }
+        }
+        // A long read is where waits come from: say how much of the prompt was reused.
+        let to_read = request.prompt.len().saturating_sub(cached as usize);
+        if to_read >= LONG_PREFILL_TOKENS {
+            tracing::info!(cache_key = %request.key, prompt_tokens = request.prompt.len(), reused_tokens = cached, to_read, prewarm = matches!(request.work, Work::Prewarm), "reading a long prompt");
         }
         // From here the state holds this prompt (as it is fed): its images describe it.
         self.slots[slot_index].images = spans;
@@ -1436,14 +1536,24 @@ impl<B: Backend> Worker<B> {
         let Some(state) = slot.state.as_ref().filter(|state| state.tokens().len() == length) else { return };
         match self.model.snapshot_state(state, SnapshotMode::Checkpoint) {
             Ok(snapshot) => {
+                let pinned = self.slots[slot_index].pinned;
                 let checkpoints = &mut self.slots[slot_index].checkpoints;
                 checkpoints.push(Checkpoint { snapshot, last_used: Instant::now() });
-                while checkpoints.len() > self.config.checkpoints.max(1) {
-                    if let Some(oldest) =
-                        checkpoints.iter().enumerate().min_by_key(|(_, checkpoint)| checkpoint.last_used).map(|(position, _)| position)
-                    {
-                        checkpoints.remove(oldest);
-                    }
+                // The leading block's checkpoint is kept on top of the fitted count: counted inside
+                // it, it pushed out the checkpoint of the conversation so far on every call (seen:
+                // every step re-read everything after the system block).
+                while checkpoints.iter().filter(|checkpoint| Some(checkpoint.snapshot.tokens().len()) != pinned).count() > self.config.checkpoints.max(1) {
+                    // The leading block's checkpoint stays; the least recently used other one goes.
+                    let Some(oldest) = checkpoints
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, checkpoint)| Some(checkpoint.snapshot.tokens().len()) != pinned)
+                        .min_by_key(|(_, checkpoint)| checkpoint.last_used)
+                        .map(|(position, _)| position)
+                    else {
+                        break;
+                    };
+                    checkpoints.remove(oldest);
                 }
             }
             Err(error) => tracing::warn!(%error, "taking a context checkpoint failed"),
@@ -1464,6 +1574,8 @@ impl<B: Backend> Worker<B> {
         if request.shared != Some(length) || request.images.iter().any(|image| image.start < length) {
             return;
         }
+        let pin_slot = self.active[index].slot;
+        self.slots[pin_slot].pinned = Some(length);
         let block = &request.prompt[..length];
         if let Some(seed) = self.seeds.iter_mut().find(|seed| seed.snapshot.tokens() == block) {
             seed.last_used = Instant::now();
@@ -1665,8 +1777,18 @@ impl<B: Backend> Worker<B> {
         }
         (0..self.slots.len())
             .filter(|&index| self.idle_conversation(index))
-            .map(|index| self.slots[index].last_used + self.config.idle_spill)
+            .map(|index| self.spill_due(index))
             .min()
+    }
+
+    /// When an idle resident conversation is due to be spilled: `idle_spill` after its last use,
+    /// or, while its turn holds it, when the hold lapses.
+    fn spill_due(&self, index: usize) -> Instant {
+        let idle = self.slots[index].last_used + self.config.idle_spill;
+        match self.slots[index].key.as_ref().and_then(|key| self.held.get(key)) {
+            Some(&until) => until.max(idle),
+            None => idle,
+        }
     }
 
     /// Spill every conversation idle for `idle_spill` to disk (an empty one is just freed).
@@ -1676,7 +1798,7 @@ impl<B: Backend> Worker<B> {
         }
         let now = Instant::now();
         let due: Vec<usize> = (0..self.slots.len())
-            .filter(|&index| self.idle_conversation(index) && self.slots[index].last_used + self.config.idle_spill <= now)
+            .filter(|&index| self.idle_conversation(index) && self.spill_due(index) <= now)
             .collect();
         if due.is_empty() {
             return;
@@ -1712,6 +1834,25 @@ impl<B: Backend> Worker<B> {
             let _ = std::fs::remove_file(&record.file);
             total = total.saturating_sub(record.bytes);
             tracing::info!(cache_key = %record.key, bytes = record.bytes, "deleted the oldest spilled conversation (disk bound)");
+        }
+    }
+
+    /// Drop the conversations asked for whose requests have stopped.
+    fn run_pending_forgets(&mut self) {
+        let pending = std::mem::take(&mut self.pending_forget);
+        for key in pending {
+            if self.slots.iter().any(|slot| slot.key.as_deref() == Some(key.as_str()) && slot.busy.is_some()) {
+                self.pending_forget.push(key);
+                continue;
+            }
+            if let Some(index) = self.slots.iter().position(|slot| slot.key.as_deref() == Some(key.as_str())) {
+                self.clear_slot(index);
+            }
+            if let Some(record) = self.hibernated.remove(&key) {
+                let _ = std::fs::remove_file(&record.file);
+            }
+            tracing::info!(cache_key = %key, "dropped a deleted conversation");
+            self.publish_view();
         }
     }
 
@@ -1852,6 +1993,7 @@ impl<B: Backend> Worker<B> {
                 slot.n_tokens = n_restored;
                 slot.key = Some(record.key.clone());
                 self.costs.restored(u64::from(n_restored), bytes, restore_ms);
+                tracing::info!(cache_key = %record.key, tokens = n_restored, bytes, restore_ms, "restored a spilled conversation from disk");
                 self.engine.trim_buffer_cache();
                 self.refresh_device();
                 json!({"cache_key": record.key, "slot": index, "ok": true, "n_restored": n_restored, "bytes": bytes, "restore_ms": restore_ms})

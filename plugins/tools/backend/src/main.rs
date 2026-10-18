@@ -16,7 +16,11 @@ fn main() {
         let mut hello = Hello::new("cc-tools", env!("CARGO_PKG_VERSION"), "tools", "tools@1");
         hello.provides = PROVIDES.iter().map(|method| (*method).to_owned()).collect();
         // Changed skills are asked again (the catalog and the code index).
-        hello.subscribes = vec![cc_tools::langs::SKILLS_CHANGED.to_owned()];
+        hello.subscribes = vec![
+            cc_tools::langs::SKILLS_CHANGED.to_owned(),
+            cc_protocol::contracts::frame::topics::SESSION_DELETED.to_owned(),
+            cc_protocol::contracts::frame::topics::PROJECT_DELETED.to_owned(),
+        ];
         cc_protocol::run_plugin(hello, Arc::new(ToolsPlugin::new())).await
     });
     if let Err(error) = outcome {

@@ -21,7 +21,7 @@ export async function materializeWorkspace(template, dest, { links = [], exclude
   await rmrf(path.join(dest, '.git'));
   const env = { ...process.env, ...GIT_ENV };
   await runOk('git', ['init', '-q', '-b', 'main'], { cwd: dest, env });
-  const excludeText = [...links.map((l) => `/${l.rel}`), ...exclude, '/.cortex-offline'].join('\n');
+  const excludeText = [...links.map((l) => `/${l.rel}`), ...exclude, '/.cortex-offline', '/.cortex-env'].join('\n');
   await ensureDir(path.join(dest, '.git', 'info'));
   await fsp.writeFile(path.join(dest, '.git', 'info', 'exclude'), excludeText ? excludeText + '\n' : '');
   await runOk('git', ['add', '-A'], { cwd: dest, env });

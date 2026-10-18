@@ -59,7 +59,7 @@ function checkRunDir(dir, { system, suite }) {
       const journals = JSON.parse(fs.readFileSync(path.join(tdir, 'journal.json'), 'utf8'));
       const entries = Object.values(journals).flatMap((j) => j.entries ?? []);
       assert.ok(entries.some((e) => e.kind === 'user_message'), `${id}: no user message in journal`);
-      assert.ok(entries.some((e) => e.kind === 'status' && ['done', 'failed', 'cancelled'].includes(e.data?.state)) || result.attempts.at(-1).timed_out, `${id}: run never ended`);
+      assert.ok(entries.some((e) => e.kind === 'status' && ['done', 'failed', 'cancelled', 'stopped'].includes(e.data?.state)) || result.attempts.at(-1).timed_out, `${id}: run never ended`);
       const usage = entries.filter((e) => e.kind === 'usage').length;
       assert.ok(usage > 0, `${id}: the model was never called`);
       stats.usage += usage;

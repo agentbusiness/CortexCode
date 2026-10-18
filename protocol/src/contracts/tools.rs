@@ -38,15 +38,23 @@ pub mod methods {
     /// Record skills whose text a session was shown outside the tools (the chat flow's injected
     /// skills), so a diagnostic code that leads to one later brings only its pointer.
     pub const SKILLS_SHOWN: &str = "tools.skills.shown";
+    /// A turn ended: `{workspace, session_id, since_ms}` removes what the turn left behind that is
+    /// nobody's work (the scratch folder `tmp/`, new untracked files commands made); returns
+    /// `{removed: [path]}`.
+    pub const CLEANUP: &str = "tools.cleanup";
 }
 
 /// Approval classes beyond the ask-mode action classes.
 pub mod approval_classes {
     /// `write_outside:<absolute dir or file>`: commands of the session may write there although it is
     /// outside the write sandbox (workspace, CORTEX_HOME, temp dirs, package caches, the session's
-    /// Python venv). Asked for by a `run` call's `write_outside` argument or implied by an ask-mode
-    /// deletion/overwrite outside the workspace; granted by `tools.approve`.
+    /// Python venv). Implied by an ask-mode deletion/overwrite outside the workspace; granted by
+    /// `tools.approve`.
     pub const WRITE_OUTSIDE_PREFIX: &str = "write_outside:";
+    /// `lift:<command>`: that command runs without the write sandbox (writes anywhere, and the
+    /// network, an offline workspace's too). Asked for by the model with a `run`
+    /// call's `permission`, in every mode; granted by `tools.approve`.
+    pub const LIFT_PREFIX: &str = "lift:";
 }
 
 pub mod topics {
@@ -115,9 +123,8 @@ pub struct ToolOutcome {
     /// Full output id when the model-facing output was offloaded.
     #[serde(default)]
     pub artifact: Option<String>,
-    /// True when the call needs user approval in ask mode (output then explains what was asked).
-    /// In auto mode a `run` whose `write_outside` is not approved is refused instead
-    /// (`error_kind: approval_required`, with the classes in `display.approval.classes`).
+    /// True when the call needs user approval (output then explains what was asked): in ask mode,
+    /// and in every mode when `display.approval.always` is set (a `run` with `permission`).
     #[serde(default)]
     pub needs_approval: bool,
     pub duration_ms: u64,
@@ -349,7 +356,7 @@ pub struct ApproveParams {
     pub session_id: String,
     /// Action classes from a `needs_approval` outcome (`display.approval.classes`): git_push,
     /// publish, network, delete_outside, overwrite_outside, unresolved, and
-    /// `write_outside:<path>` (see [`approval_classes::WRITE_OUTSIDE_PREFIX`]).
+    /// `write_outside:<path>` and `lift:<command>` (see [`approval_classes`]).
     pub classes: Vec<String>,
 }
 

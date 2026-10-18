@@ -35,7 +35,7 @@ fn intent() -> Value {
 }
 
 /// Every URI `read` takes, with what it gives. The one place they are listed for the model.
-const READ_PATH: &str = "What to read: a file or folder relative to the workspace (a file may end in a line range: src/app.ts:120-180), or one of these.\n\
+const READ_PATH: &str = "What to read: a file or folder relative to the workspace (a file may end in a line range: src/app.ts:120-180, or name one definition: src/app.ts#Cart::total), or one of these.\n\
 Find code by meaning: graph://search/<words>.\n\
 One function or class, by its name: symbol://<name> (its code, what it takes and returns), graph://used-by/<name> (every place that uses it), graph://uses/<name> (everything it uses), graph://impact/<name> (what a change to it reaches), graph://path/<name>/<name> (how two relate), outline://<path> (what a file contains).\n\
 Language server, at path:line:col: definition://<path:line:col>, references://<path:line:col> (every use), hover://<path:line:col> (type and docs), diagnostics://<path> (errors; diagnostics:// for every file).\n\
@@ -60,17 +60,17 @@ pub fn read_spec() -> ToolSpec {
 }
 
 pub fn edit_spec(format: EditFormat) -> ToolSpec {
-    let path = json!({"type": "string", "description": "File to change, relative to the workspace."});
-    let content = json!({"type": "string", "description": "The whole text of a new file, or of a stub you have not changed yet, without read's N:hh| prefixes. A file you already changed is changed by `edits`."});
+    let path = json!({"type": "string", "description": "File to change, relative to the workspace; a one-off probe: `tmp/<name>`."});
+    let content = json!({"type": "string", "description": "The whole text of a new file or a file of empty stubs, without read's N:hh| prefixes. An existing file is changed by `edits`, only where it needs changing."});
     let (description, properties) = match format {
         EditFormat::Hashline => (
-            "Change a file you have read, by its N:hh anchors. A new file or untouched stub: `content`.",
+            "Change a read file by N:hh anchors, at most two top-level definitions per call. New file: `content`.",
             json!({
                 "intent": intent(),
                 "path": path,
                 "edits": {
                     "type": "array",
-                    "description": "Every change to the file, in one call: checked against the current file and applied together, or none is. If the file changed since your read, nothing is written and you get its current lines with fresh anchors. E.g. {\"op\":\"replace\",\"at\":\"12:ab\",\"to\":\"14:cd\",\"text\":\"...\"}.",
+                    "description": "The changes to one or two top-level definitions of the file (a class with its methods is one): checked against the current file and applied together, or none is. If the file changed since your read, nothing is written and you get its current lines with fresh anchors. E.g. {\"op\":\"replace\",\"at\":\"12:ab\",\"to\":\"14:cd\",\"text\":\"...\"}.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -86,7 +86,7 @@ pub fn edit_spec(format: EditFormat) -> ToolSpec {
             }),
         ),
         EditFormat::Replace => (
-            "Change a file you have read, by exact text replacement. A new file or untouched stub: `content`.",
+            "Change a read file by exact text, at most two top-level definitions per call. New file: `content`.",
             json!({
                 "intent": intent(),
                 "path": path,
@@ -139,12 +139,12 @@ pub fn terminal_spec() -> ToolSpec {
 pub fn run_spec() -> ToolSpec {
     ToolSpec {
         name: "run".to_owned(),
-        description: "Run a bash command from the repository root: build, test, grep, scripts. No stdin.".to_owned(),
+        description: "Run bash: build, test, grep, scripts. Project files: read with read, change with edit; no cat, sed.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "intent": intent(),
-                "command": {"type": "string", "description": "The command line, run in your shell: cd and exports carry over to the next run. Long output is saved whole as artifact://<id>: you see its head and tail and can read any range of it."},
+                "command": {"type": "string", "description": "The command line. Every run starts in the repository root: a cd lasts for this command only, exports carry over. A failing test run shows its counts, one line per failing test and the first failure whole; the whole output is artifact://<id>. Long output is saved whole as artifact://<id>: you see its head and tail and can read any range of it."},
                 "timeout_ms": {"type": "integer", "description": "Kill the command and everything it started after this many milliseconds (default 600000)."},
                 "background": {"type": "boolean", "description": "Start as a background job (servers, watchers, long builds) and return at once; you are woken when it exits."},
                 "wake": {
@@ -152,12 +152,8 @@ pub fn run_spec() -> ToolSpec {
                     "description": "Background jobs: also wake you when output matches `pattern` (regex) or after `silence_s` seconds without output.",
                     "properties": {"pattern": {"type": "string"}, "silence_s": {"type": "number"}}
                 },
-                "cwd": {"type": "string", "description": "Run this one command in another directory (the shell's directory stays)."},
-                "write_outside": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Commands may write only in the workspace, temp dirs, package caches and your Python venv (python and pip use it, or the project's own venv, so `pip install` needs no flags); other writes fail with \"Operation not permitted\". Only when the task cannot be done inside that sandbox: the directories outside it this command must write to. The user must approve; the result says how."
-                }
+                "cwd": {"type": "string", "description": "Run this one command in another directory."},
+                "permission": {"type": "string", "description": "Only for an install, another write outside the workspace, or a program the sandbox cannot start: why this command needs it, e.g. \"install the image library the thumbnails need\". Commands may write only in the workspace, temp dirs, package caches and your Python venv (python and pip use it, so `pip install` needs no flags). An install changes the user's machine, so the user is asked; once approved the command runs with writes anywhere. Never for what commands may do already."}
             },
             "required": ["intent", "command"]
         }),
@@ -177,18 +173,30 @@ pub fn guide(format: EditFormat) -> String {
         EditFormat::Hashline => "each function it changed, whole, as it is now (other code: the changed lines and 2 around them), with new anchors; then any lines it removed",
         EditFormat::Replace | EditFormat::Whole => "each function it changed, whole, as it is now (other code: the changed lines and 2 around them); then any lines it removed",
     };
+    let (how, fresh) = match format {
+        EditFormat::Hashline => ("by anchors", ", with new anchors"),
+        EditFormat::Replace | EditFormat::Whole => ("by exact text (old, new)", ""),
+    };
     format!(
         "Which tool:\n\
-1. read: to see a file or folder, and to find code by meaning or by name (below). Read a file before you change it.\n\
-2. edit: to change a file, whole functions in one call. Do not read the file again afterwards unless a command changed it: the result shows what changed.\n\
-3. run: to build, test, run a script, list files or search exact text (`grep -rn`). Not to read or change a file (cat, sed -i): use read and edit.\n\
+1. read: to see a file or folder, and to find code by meaning or by name (below).\n\
+2. edit: to change or write a file (below).\n\
+3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Checks of your work are tests in the project (a project without tests gets them), run whole: no `| tail` or `| grep`, the result shows each failure; a one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
+5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Everything else is yours to use, the network included: search, read documentation, look for how others solved it.\n\
 Give every call a short `intent` first.\n\
+\n\
+Working with files:\n\
+1. Read a file before you change it: its lines come numbered (N:hh|). A long file shows its definitions; read one of them with `path#Name`.\n\
+2. Change an existing file with edit {how}, one or two top-level definitions per call (a class with its methods is one). Never rewrite, reformat or clean up code that works, and never write a file with working code whole again: code the task does not touch stays exactly as it is, unless the user asks to change it.\n\
+3. The result shows each changed function as it is now{fresh}: your next edit uses that. Read the file again only after a command changed it.\n\
+4. Write whole with `content` only a new file, a file of empty stubs, or a probe in the scratch folder `tmp/` (`tmp/<name>`, as often as you like; git ignores it).\n\
+5. A refused edit wrote nothing: its message shows the current lines and what to send instead.\n\
 \n\
 How results read:\n\
 - A file: `path:` and then its lines as N:hh|text.\n{anchors}\n  A long file shows only its definitions; ⋮ N-M marks lines left out: read path:N-M to see them.\n\
 - A folder: one entry per line; a name ending in / is a folder.\n\
-- edit: {change}, then the file's errors, or `No errors.`\n\
+- edit: {change}, then the file's errors, or `No errors.` and the next step.\n\
 - run: the command's output, then `[exit N]`: exit 0 means it succeeded. A long output is cut in the middle: `[N lines not shown: read artifact://<id>:A-B for them]`.\n\
 - A code result: one line, `path:line  signature — what it does`.\n\
 - A call result: `path:line  in <function>: <calling line>` (used-by) or `path:line  calls <function>: <calling line>` (uses).\n\

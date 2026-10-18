@@ -27,6 +27,16 @@ fn lock_path(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir.join("locks").join(format!("{safe}.lock"))
 }
 
+/// Delete a session's lock file (the session was deleted; its run has stopped). Best effort.
+pub fn remove(data_dir: &Path, session_id: &str) {
+    let path = lock_path(data_dir, session_id);
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "deleting a session lock file failed");
+    }
+}
+
 /// Try once.
 pub fn try_lock(data_dir: &Path, session_id: &str) -> std::io::Result<Option<SessionLock>> {
     let path = lock_path(data_dir, session_id);

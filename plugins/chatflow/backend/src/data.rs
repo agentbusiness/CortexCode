@@ -54,8 +54,6 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/check_rules.md", include_str!("../data/prompts/check_rules.md")),
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
-    ("prompts/coverage.md", include_str!("../data/prompts/coverage.md")),
-    ("schemas/coverage.json", include_str!("../data/schemas/coverage.json")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
     ("schemas/router.json", include_str!("../data/schemas/router.json")),
     ("schemas/decide.json", include_str!("../data/schemas/decide.json")),
@@ -73,7 +71,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "DESCRIBE", "REVIEW", "COVERAGE"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "DESCRIBE", "REVIEW"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -88,7 +86,6 @@ const SCHEMA_NEEDS: &[SchemaNeed] = &[
     ("DECISIONS", &["decisions"], None),
     ("KNOWLEDGE", &["items"], None),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
-    ("COVERAGE", &["missing"], None),
 ];
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
@@ -141,12 +138,32 @@ fn default_fix_think_tokens() -> u32 {
     384
 }
 
+fn default_same_error_edits() -> u32 {
+    3
+}
+
 fn default_fix_cycles() -> u32 {
     3
 }
 
+fn default_context_tokens() -> u32 {
+    0
+}
+
+fn default_stall_runs() -> u32 {
+    20
+}
+
 fn default_task_think_tokens() -> u32 {
     1024
+}
+
+fn default_loop_think_tokens() -> u32 {
+    1024
+}
+
+fn default_reasoning_steps() -> u32 {
+    0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,19 +183,34 @@ pub struct Limits {
     /// Tokens of one conversation's context kept free for the answer: a prompt is folded until it
     /// fits the rest.
     pub answer_reserve_tokens: u32,
-    /// A compaction brings the prompt down to this share (percent) of the conversation's context,
-    /// in one batch, so the next ones (each re-reads the conversation) are far apart.
-    #[serde(default = "compact_target_percent")]
-    pub compact_target_percent: u32,
-    /// At a wait (the run's tools executing, the turn ended) a prompt past this share (percent) is
-    /// compacted then and its re-read runs in the background ([`crate::fit::prepare`]). 0 = never.
-    #[serde(default = "compact_early_percent")]
-    pub compact_early_percent: u32,
-    /// When a turn ends (the user reads the answer, the model is idle) a prompt past this share
-    /// (percent) is compacted then, so the next turn starts with room and rarely compacts mid-run,
-    /// where fast tools leave no time to hide the re-read. 0 = only at the early share.
-    #[serde(default = "compact_idle_percent")]
-    pub compact_idle_percent: u32,
+    /// A compaction brings the prompt down to at most this many tokens; one that cannot is not
+    /// made (the next layer is). A fixed size, not a share of the window: what the model works
+    /// from stays small whatever the window holds (seen: shares of a 230k window let a turn grow to
+    /// 220k, each compaction saving 2k and costing a 15-minute re-read).
+    #[serde(default = "compact_target_tokens")]
+    pub compact_target_tokens: u32,
+    /// At a wait (the run's tools executing) a prompt past this many tokens is compacted then and
+    /// its re-read runs in the background ([`crate::fit::prepare`]). 0 = never.
+    #[serde(default = "compact_early_tokens")]
+    pub compact_early_tokens: u32,
+    /// When a turn ends (the user reads the answer, the model is idle) a prompt past this many
+    /// tokens is compacted then, so the next turn starts with room. 0 = only at the early size.
+    #[serde(default = "compact_idle_tokens")]
+    pub compact_idle_tokens: u32,
+    /// Steps of an agent loop between settles: a settle applies the in-place rewrites (outdated
+    /// reads, earlier edit echoes and run outputs of a command run again) up to the newest entry.
+    /// Between settles the prompt only grows, so the engine continues its state; a settle makes it
+    /// re-read the (small) rewritten history once. 0 = only at compactions.
+    #[serde(default = "default_settle_steps")]
+    pub settle_steps: u32,
+    /// A settle is made only when it shrinks the prompt by at least this many tokens: it costs one
+    /// re-read of the history after the system block.
+    #[serde(default = "default_settle_min_tokens")]
+    pub settle_min_tokens: u32,
+    /// Steps of the running turn a compaction keeps whole (the newest); older steps of it may become
+    /// one note listing their calls when folding outputs is not enough (see [`crate::fit`]).
+    #[serde(default = "default_history_tail_steps")]
+    pub history_tail_steps: u32,
     /// Skills a decision may choose for its work; 0 removes the choice (the model reads on its own).
     pub skills_per_turn: usize,
     /// Times the plan of a decided change is written again after a task ended badly, per turn.
@@ -194,9 +226,33 @@ pub struct Limits {
     /// Most thinking tokens per step once the task has changed a file (a fix, not the design).
     #[serde(default = "default_fix_think_tokens")]
     pub fix_think_tokens: u32,
+    /// Most thinking tokens per step of any other agent loop (a question, a follow-up): every
+    /// generating call carries a budget, so the model plugin's own effort table (4096 for medium)
+    /// is never what a step gets (seen: a loop without a plan step ran 4k-token thoughts for hours).
+    #[serde(default = "default_loop_think_tokens")]
+    pub loop_think_tokens: u32,
+    /// Steps, newest first, whose reasoning the prompt still carries; older steps show their answer
+    /// and calls only, as the model's own template renders earlier turns (seen: 4k tokens of
+    /// thinking per step kept for 280 steps filled the window). The engine resumes from the
+    /// checkpoint it took before generating, so a dropped thought costs no re-read of its own.
+    #[serde(default = "default_reasoning_steps")]
+    pub reasoning_steps: u32,
     /// Edit-then-rerun cycles after which the same command still failing makes a plan task stuck.
     #[serde(default = "default_fix_cycles")]
     pub fix_cycles: u32,
+    /// Failing runs the same error may come back in (with other calls between) before the host
+    /// says its cause is not on its line ([`crate::typeerrors`]); 0 = never.
+    #[serde(default = "default_same_error_edits")]
+    pub same_error_edits: u32,
+    /// Commands run while a check fails, none of them turning a failing command to pass, after which
+    /// a plan task is stuck (0 = no limit): debugging runs and traces that never land (fix cycles
+    /// alone miss them, as no edit sits between them).
+    #[serde(default = "default_stall_runs")]
+    pub stall_runs: u32,
+    /// Tokens one conversation may use at most, whatever the model could hold (0 = its window):
+    /// the compaction shares apply to this.
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
     /// The skills catalog is part of a chat session's system message (session order; cached across
     /// turns and prewarmed) instead of the choosing stages' trailing message (previous turn's
     /// skills first; re-read by every ROUTE). The previous turn's skills are named in ROUTE's stage
@@ -237,7 +293,7 @@ pub struct Limits {
 
 // Defaults for limits added after the first data sets (an older override stays valid).
 fn spec_min_chars() -> usize {
-    1500
+    0
 }
 fn spec_max_chars() -> usize {
     24000
@@ -267,14 +323,23 @@ fn brief_tokens() -> u32 {
 fn skills_in_prefix() -> bool {
     true
 }
-fn compact_target_percent() -> u32 {
-    50
+fn compact_target_tokens() -> u32 {
+    24576
 }
-fn compact_early_percent() -> u32 {
-    70
+fn compact_early_tokens() -> u32 {
+    49152
 }
-fn compact_idle_percent() -> u32 {
-    55
+fn compact_idle_tokens() -> u32 {
+    32768
+}
+fn default_settle_steps() -> u32 {
+    8
+}
+fn default_settle_min_tokens() -> u32 {
+    3072
+}
+fn default_history_tail_steps() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize)]

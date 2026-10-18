@@ -4,16 +4,14 @@ Doing a multi-step feature or migration now, alone or via cx tasks for agents; n
 
 1. Turn the goal into outcomes, each proved by a command (a test, a build, a CLI run with expected output). None yet: writing that test is step 1.
 2. Map what it touches: `read graph://search/<words>`, `symbol://<name>`, `graph://impact/<name>`. Run those tests once: what already fails?
-3. Keep the plan in a file; your memory fades in a long conversation:
+3. Keep the plan in a file; your memory fades in a long conversation. Write `$TMPDIR/plan-<topic>.md` with `edit`:
 
-```bash
-cat > "${TMPDIR:-/tmp}/plan-<topic>.md" <<'EOF'
+```markdown
 Goal: <one line>. Done when: <check commands>
 1. [ ] <step> | check: <command> | cp: <checkpoint sha>
 2. [ ] <step> | check: <command>
 Facts: <path:line findings needed later>
 Dead ends: <approach, why it failed>
-EOF
 ```
 
 Reread and update it after each step.

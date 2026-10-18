@@ -75,7 +75,7 @@ Contrast (WCAG AA) by OKLCH lightness, on a light bg (L >= 97%) or dark bg (L 16
 
 ## Type
 
-Use the fonts the project ships (`*.woff2`, `@fontsource*`, `next/font`). Network may be off: never add a new font `<link>`. Otherwise a system stack:
+Use the fonts the project ships (`*.woff2`, `@fontsource*`, `next/font`). A hosted font is a new dependency of the user's project: ask before adding a font `<link>`. Otherwise a system stack:
 
 | Character | Stack |
 |---|---|

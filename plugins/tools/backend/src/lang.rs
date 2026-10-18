@@ -364,14 +364,18 @@ pub fn syntax_issues(lang: Lang, text: &str) -> Option<Vec<SyntaxIssue>> {
             continue;
         }
         if node.is_error() {
-            let snippet: String = node.utf8_text(source).unwrap_or("").chars().take(40).collect();
-            let snippet = snippet.split('\n').next().unwrap_or("").to_owned();
-            issues.push(SyntaxIssue {
-                line: node.start_position().row + 1,
-                column: node.start_position().column + 1,
-                kind: "error",
-                detail: format!("cannot parse `{snippet}`"),
-            });
+            // A bracket that closes nothing or the wrong opener is named where it is; the parser
+            // only knows the region it could not read.
+            let (start, end) = (node.start_position(), node.end_position());
+            let issue = match bracket_fault(lang, text, (start.row + 1, start.column + 1), (end.row + 1, end.column + 1)) {
+                Some(fault) => SyntaxIssue { line: fault.line, column: fault.column, kind: "error", detail: fault.detail },
+                None => {
+                    let snippet: String = node.utf8_text(source).unwrap_or("").chars().take(40).collect();
+                    let snippet = snippet.split('\n').next().unwrap_or("").to_owned();
+                    SyntaxIssue { line: start.row + 1, column: start.column + 1, kind: "error", detail: format!("cannot parse `{snippet}`") }
+                }
+            };
+            issues.push(issue);
             continue;
         }
         if node.has_error() {
@@ -384,6 +388,105 @@ pub fn syntax_issues(lang: Lang, text: &str) -> Option<Vec<SyntaxIssue>> {
     }
     issues.sort_by_key(|issue| (issue.line, issue.column));
     Some(issues)
+}
+
+/// A bracket fault: where it is and what is wrong, in words.
+struct BracketFault {
+    line: usize,
+    column: usize,
+    detail: String,
+}
+
+/// The first bracket fault inside the region `from`..`to` (1-based line and column) of `text`: a
+/// closing bracket that closes nothing, or one that closes another kind of bracket. The whole text
+/// up to the region's end is scanned, so brackets opened on earlier lines count. Strings and
+/// comments are skipped. Mechanical: brackets only, no grammar; None when it finds no fault there.
+fn bracket_fault(lang: Lang, text: &str, from: (usize, usize), to: (usize, usize)) -> Option<BracketFault> {
+    let hash_comments = matches!(lang, Lang::Python | Lang::Bash | Lang::Ruby | Lang::Toml | Lang::Yaml);
+    let slash_comments = matches!(lang, Lang::Rust | Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Go | Lang::Java | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Css);
+    let chars: Vec<char> = text.chars().collect();
+    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+    let (mut line, mut column) = (1usize, 1usize);
+    let mut index = 0;
+    // Advance over `count` characters, keeping the position.
+    let step = |index: &mut usize, line: &mut usize, column: &mut usize, count: usize| {
+        for _ in 0..count {
+            if *index >= chars.len() {
+                return;
+            }
+            if chars[*index] == '\n' {
+                *line += 1;
+                *column = 1;
+            } else {
+                *column += 1;
+            }
+            *index += 1;
+        }
+    };
+    let starts = |index: usize, pattern: &str| pattern.chars().enumerate().all(|(offset, c)| chars.get(index + offset) == Some(&c));
+    while index < chars.len() && (line, column) <= to {
+        let c = chars[index];
+        // Comments: to the end of the line, or to `*/`.
+        if (hash_comments && c == '#') || (slash_comments && starts(index, "//")) {
+            while index < chars.len() && chars[index] != '\n' {
+                step(&mut index, &mut line, &mut column, 1);
+            }
+            continue;
+        }
+        if slash_comments && starts(index, "/*") {
+            step(&mut index, &mut line, &mut column, 2);
+            while index < chars.len() && !starts(index, "*/") {
+                step(&mut index, &mut line, &mut column, 1);
+            }
+            step(&mut index, &mut line, &mut column, 2);
+            continue;
+        }
+        // Strings: Python's triple quotes and backtick strings may span lines, others end at the line.
+        let triple = lang == Lang::Python && (starts(index, "\"\"\"") || starts(index, "\'\'\'"));
+        // A Rust `'` is a char literal only when it closes within a character or an escape; else a lifetime.
+        let rust_lifetime = lang == Lang::Rust && c == '\'' && chars.get(index + 2) != Some(&'\'') && chars.get(index + 1) != Some(&'\\');
+        if triple || c == '`' || c == '"' || (c == '\'' && !rust_lifetime) {
+            let quote: String = if triple { chars[index..index + 3].iter().collect() } else { c.to_string() };
+            let multiline = triple || c == '`';
+            step(&mut index, &mut line, &mut column, quote.chars().count());
+            while index < chars.len() && !starts(index, &quote) && (multiline || chars[index] != '\n') {
+                let skip = if chars[index] == '\\' { 2 } else { 1 };
+                step(&mut index, &mut line, &mut column, skip);
+            }
+            if starts(index, &quote) {
+                step(&mut index, &mut line, &mut column, quote.chars().count());
+            }
+            continue;
+        }
+        let inside = (line, column) >= from;
+        match c {
+            '(' | '[' | '{' => stack.push((c, line, column)),
+            ')' | ']' | '}' => {
+                let opener = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                match stack.pop() {
+                    Some((open, ..)) if open == opener => {}
+                    Some((open, open_line, open_column)) if inside => {
+                        let at = if open_line == line { format!("column {open_column}") } else { format!("line {open_line}, column {open_column}") };
+                        let detail = format!("`{c}` at column {column} closes the `{open}` opened at {at}: one `{c}` too many, or a closing bracket missing before it");
+                        return Some(BracketFault { line, column, detail });
+                    }
+                    None if inside => {
+                        return Some(BracketFault { line, column, detail: format!("`{c}` at column {column} closes nothing: one `{c}` too many") });
+                    }
+                    // A fault before the region is not this error: take the closer as the stray one.
+                    Some(open) => stack.push(open),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        step(&mut index, &mut line, &mut column, 1);
+    }
+    None
 }
 
 /// Syntax issues present after an edit that were not present before, matched by

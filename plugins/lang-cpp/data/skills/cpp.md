@@ -2,25 +2,31 @@ C and C++ here: get it right, build and test it, code that runs, common errors a
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the statement, headers, sources and tests.
+1. **Pin down what the code must do.** Read the request, then what the project already says about it: headers, sources, tests, docs and callers.
    - Per function: parameters, return type, how it fails (exception type, return code, `std::optional`, `NULL` in C).
-   - The statement decides, never the name. "whether" returns `bool`; "find" may return an empty `std::optional` or `end()`.
-   - When there may be no answer and the statement does not name a value for it, the declared return type decides: `std::optional<T>` gives `std::nullopt`, an iterator gives `end()`, a pointer gives `nullptr`. Never a made-up sentinel such as `-1`.
+   - The request and the project decide, never a name alone. "whether" returns `bool`; "find" may return an empty `std::optional` or `end()`.
+   - When there may be no answer and nothing names a value for it, the declared return type decides: `std::optional<T>` gives `std::nullopt`, an iterator gives `end()`, a pointer gives `nullptr`. Never a made-up sentinel such as `-1`.
    - Keep the header's names and signatures.
-   - Before coding, write the cases (section 2): one per sentence that states a behaviour, value, error or limit. A sentence with no case is a missed requirement.
-   - Unfamiliar domain, format or protocol: when the research plugin is available, learn its rules and copy them into the cases:
-     `read research://search/<topic> rules?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page with the rules.
+   - The request and the project disagree: say so and ask, instead of silently picking one.
+   - Before coding, note the request's examples: they are the check, their values copied, never computed.
+   - Unfamiliar domain, format, protocol or library: look it up (the research plugin, the docs, how others solved it):
+     `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole functions, in slices.**
    - Simplest complete path first (one case, input to result). Run it.
-   - Then each next behaviour from the statement, running after each.
-   - New file, or a stub you have not changed yet: whole once, with its `#include`s, via `edit` `content`. After that: anchored `edits` only, every change in one call (a second whole write is refused).
-   - Rewrite a function from its signature line to its closing `}`. Never leave part of the old body.
+   - Then each next behaviour, running after each.
+   - A new file is written whole, with its `#include`s, via `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - Change a function from its signature line to its closing `}`. Never leave part of the old body.
    - A signature change: edit header and source in the same step.
-3. **Run the check file after every change** (section 2).
-4. **Build and run the project's tests** (section 2). Fix the first error, run again.
+3. **Run the tests after every change** (section 2).
+4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Build and run the project's tests (section 2); fix the first error, run again.
 5. **Before you finish**, check each requirement against the code, named errors included (exception type, message, return code).
 
-A check disagrees with the statement: the statement wins. Fix the code, say which check is wrong.
+**How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
+- One owner: a member value or `std::unique_ptr<T>`. Shared ownership only when the lifetime truly is shared: `std::shared_ptr<T>`. Observers: a reference or raw pointer that never owns.
+- A pointer, reference or iterator into a `std::vector` dies when it grows: keep an index, or use `std::deque` or `std::list` when elements must not move.
+- Rule of zero: members own the resources, so the class needs no destructor, copy or move of its own; a class that owns a raw resource writes all five or deletes copying.
+- Containers: `std::unordered_map`/`std::map` for lookup, `std::deque` for both ends, `std::priority_queue` for largest first, `std::set` for uniqueness.
+- Standard building blocks first: `std::` containers, `std::make_unique`, `<algorithm>`, `std::chrono`, `std::string_view`; never hand-written `new`/`delete` bookkeeping.
 
 ## 2. Run, test, check
 
@@ -42,37 +48,17 @@ cc -std=c11 -Wall -Wextra -g a.c -o /tmp/t && /tmp/t           # C, no build sys
 - Add a new `.cpp`/`.c` to the target's sources (`add_library`, `target_sources`, Make `SRCS`), or linking fails.
 - clangd needs `compile_commands.json` from configure, else `no-compile-commands` and false errors. No CMake: `compile_flags.txt` at the root, one flag per line (`-std=c++17`, `-Iinclude`).
 - clangd and the build disagree: the build is right.
-- Offline, `FetchContent` fails. If `build/_deps/<name>-src` exists, add `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`; else use the standard library.
+- `FetchContent` downloads at configure time. A new dependency is a change to the user's project: ask before adding one.
 
-**Checking your work.** One scratch file, `check.cpp`. Edit it, never re-type it.
-- Inputs built in code.
-- Expected values copied from the statement, never worked out by hand.
-- One printed line per case, never `assert`.
-
-```cpp
-#include "solve.h"
-#include <iostream>
-#include <vector>
-
-int main() {
-    struct Case { std::vector<int> given, want; };
-    std::vector<Case> cases{{{3, 1, 2}, {1, 2, 3}}};
-    for (const auto& c : cases) {
-        auto got = solve(c.given);
-        std::cout << (got == c.want ? "ok " : "BAD") << " ->";
-        for (int x : got) std::cout << ' ' << x;
-        std::cout << "\n";
-    }
-}
-```
-
-```bash
-c++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined -Iinclude check.cpp src/solve.cpp -o /tmp/check && /tmp/check
-```
-
-- After any fix, run every case again, passing ones too.
-- Keep the file while the work can still change; delete it when the user is done.
-- A case fails: check the case first, against the statement. A case that breaks a stated rule, or holds a value you computed, is bad. Fix it, then the code.
+**Checking your work.**
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/test_<name>.cpp` with a `main` that includes the project's header and checks each example, built and run from the project; they stay in the project.
+2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
+3. Build a long input in code from its parts, never typed out: `std::vector<int>(18, 0)`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+4. Each check shows what the code returned when it fails: `if (got != want) std::cout << got << "\n";`.
+5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
+6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
+7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
+8. A one-off try (call a function, print a value) goes in `tmp/`; git ignores `tmp/`.
 
 ## 3. Code that runs
 
