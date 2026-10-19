@@ -741,12 +741,35 @@ fn replaced_definitions(path: &Path, old: &str, line_map: &[Option<usize>], writ
     }
     let mut tops = Vec::new();
     top_level(&items, &mut tops);
-    let names = tops
-        .into_iter()
-        .filter(|item| any_replaced(item, &replaced))
-        .map(|item| lines.get(item.start).map(|line| line.trim().chars().take(50).collect::<String>()).unwrap_or_default())
-        .collect();
+    // Methods defined outside their class (`int Buffer<T>::read() {` in C++) are that class's, as
+    // methods written inside it are: one definition per class (seen: a fix to three methods of one
+    // class refused as three).
+    let mut owners: Vec<String> = Vec::new();
+    let mut names = Vec::new();
+    for item in tops.into_iter().filter(|item| any_replaced(item, &replaced)) {
+        let header = lines.get(item.start).map(|line| line.trim()).unwrap_or_default();
+        match method_owner(header) {
+            Some(owner) if owners.contains(&owner) => {}
+            Some(owner) => {
+                names.push(format!("{owner}::…"));
+                owners.push(owner);
+            }
+            None => names.push(header.chars().take(50).collect()),
+        }
+    }
     Some(names)
+}
+
+/// The class a definition outside it belongs to: in `int Buffer<T>::read() const {`, `Buffer`
+/// (the name before the last `::` of the defined name, without template arguments). None for a
+/// plain function.
+fn method_owner(header: &str) -> Option<String> {
+    let before_call = &header[..header.find('(')?];
+    let name = before_call.split_whitespace().last()?.trim_start_matches(['*', '&']);
+    let qualifier = &name[..name.rfind("::")?];
+    let owner = qualifier.rsplit("::").next().unwrap_or(qualifier);
+    let owner = owner.split('<').next().unwrap_or(owner).trim();
+    (!owner.is_empty()).then(|| owner.to_owned())
 }
 
 fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Commit) -> Out {
@@ -855,10 +878,28 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         let _ = writeln!(output, "{verb} {display}.");
         output.push_str(&read::render_outline(&absolute, &display, &new, &doc, false));
     }
+    // A whole write over the user's file of stubs (the one existing file `content` may write) leaves
+    // working code: the rule that now holds goes with the result, where the model looks back at the
+    // file (seen: the whole write repeated twice on the filled file, refused each time).
+    let own_draft = core.created.lock().is_ok_and(|created| created.get(&session.context.session_id).is_some_and(|files| files.contains(&absolute)));
+    if line_map.is_none()
+        && old.as_deref().is_some_and(|text| !text.trim().is_empty())
+        && !own_draft
+        && edit_format(session.context) != EditFormat::Whole
+        && !util::is_inside(&absolute, &util::scratch_dir(&session.workspace))
+    {
+        let _ = writeln!(output, "{display} now holds working code: change it from here with anchored edits, one or two definitions per call.");
+    }
     let (syntax_issues, syntax) = syntax_check(&absolute, &old_text, &new);
-    // The model's work: a turn's cleanup keeps what `edit` wrote.
+    // The model's work: a turn's cleanup keeps what `edit` wrote; a file it created this turn may
+    // be written whole again.
     if let Ok(mut edited) = core.edited.lock() {
         edited.entry(session.context.session_id.clone()).or_default().insert(absolute.clone());
+    }
+    if old.is_none()
+        && let Ok(mut created) = core.created.lock()
+    {
+        created.entry(session.context.session_id.clone()).or_default().insert(absolute.clone());
     }
     host.publish(
         topics::FILES_CHANGED,
@@ -946,8 +987,12 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
     // A throwaway file in the session's scratch folder is the model's own: written whole freely
     // (nothing of the user's to protect there).
     let in_scratch = util::is_inside(&absolute, &util::scratch_dir(&session.workspace));
+    // A file this turn created is the model's own draft: written whole again freely (seen: a test
+    // file it had just written refused twice when it rewrote it).
+    let own_draft = core.created.lock().is_ok_and(|created| created.get(session_id).is_some_and(|files| files.contains(&absolute)));
     let rewrite_refused = |existing: &Option<String>| {
         !in_scratch
+            && !own_draft
             && existing.as_ref().is_some_and(|text| !text.trim().is_empty() && !is_skeleton(&absolute, text))
             && edit_format(session.context) != EditFormat::Whole
     };
@@ -960,6 +1005,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         // anchors for the next call.
         if let Some(existing) = &current
             && !in_scratch
+            && !own_draft
             && !existing.trim().is_empty()
             && !is_skeleton(&absolute, existing)
             && edit_format(session.context) != EditFormat::Whole
@@ -1435,9 +1481,12 @@ fn searches_whole_disk(command: &str) -> bool {
         let name = program.rsplit('/').next().unwrap_or(program);
         // `/` or the home folder: both hold the whole machine's files (seen: `find ~` for minutes).
         let home = std::env::var("HOME").unwrap_or_default();
+        // `/` (also `//`), never an empty word: `grep -rn "" tests/` searches `tests/`.
         let whole = |word: &str| {
-            let word = word.trim_end_matches('/');
-            word.is_empty() || matches!(word, "~" | "$HOME" | "${HOME}") || (!home.is_empty() && word == home.trim_end_matches('/'))
+            let trimmed = word.trim_end_matches('/');
+            (!word.is_empty() && trimmed.is_empty())
+                || matches!(trimmed, "~" | "$HOME" | "${HOME}")
+                || (!home.is_empty() && !trimmed.is_empty() && trimmed == home.trim_end_matches('/'))
         };
         SEARCHERS.contains(&name) && (raw_home || words.iter().skip(1).any(|word| word.as_deref().is_some_and(whole)))
     })
@@ -1457,7 +1506,7 @@ fn is_program(path: &Path) -> bool {
 }
 
 /// The step after the sandbox stopped a command.
-const LIFT_STEP: &str = "If the task cannot be done without it (an install), run the command that does it with `permission` saying why: an install changes the user's machine, so the user is asked first; once they approve it runs. Never ask for what commands may do already.";
+const LIFT_STEP: &str = "If the task cannot be done without it (an install), run the command that does it with `permission` saying why: an install changes the user's machine, so the user is asked first; once they approve it runs. Never ask for what commands may do already, and never change the user's shell setup, tool settings or files outside the project to get around it.";
 
 /// The programs a shell reported missing in command output (`command not found`, as sh, bash and
 /// zsh word it), in order, once each.
@@ -1896,11 +1945,15 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         reasons = concerns.iter().map(|concern| format!("{} ({})", describe_class(concern.class), concern.detail)).collect();
         reasons.extend(write_classes.iter().map(|class| describe_class(class)));
     }
-    // An offline workspace (the marker file) has no network for anyone: an install or a download
-    // cannot run here whoever approves it, so it is a result, not a question (seen: an unattended
-    // run waiting for a human on a `pip install`).
+    // An offline workspace (the marker file) lets nothing past the sandbox: an install, a download
+    // or a write outside the project cannot run here whoever approves it, so it is a result, not a
+    // question (seen: an unattended run waiting for a human on a `pip install`). Said as what it
+    // is: a write outside the project was refused as "offline" and read as a network problem.
     if permission.is_some() && !lifted && session.workspace.join(crate::sandbox::OFFLINE_MARKER).exists() {
-        return Out::fail("offline", "Not run: this workspace is offline, so a command that needs the network or an install cannot run here. Work with what the project has.".to_owned());
+        return Out::fail(
+            "offline",
+            "Not run: in this workspace no command runs past the sandbox, so nothing can be installed, downloaded or written outside the project. Work with what the project has; when a check cannot run here, say so.".to_owned(),
+        );
     }
     let asks_lift = permission.is_some() && !lifted;
     if let Some(why) = permission

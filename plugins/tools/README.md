@@ -70,7 +70,8 @@ The scratch folder is `tmp/` at the workspace root (`$TMPDIR` of its shells), li
 session_id, since_ms}` (`cleanup.rs`): `tmp/` goes, the added `.gitignore` line is taken back, and
 new untracked files the turn's commands made (build output, logs) are removed; files `edit` wrote,
 ignored files, older files and `.cortex-*` stay, and nothing else is removed when the user let a
-command past the sandbox in the session. A `.cortex-env` file (`KEY=VALUE` lines, `$NAME`
+command past the sandbox in the session. A file `edit` created in the running turn may be written
+whole again (the model's own draft); the list is cleared when the turn ends. A `.cortex-env` file (`KEY=VALUE` lines, `$NAME`
 expanded) in the workspace or above it is loaded into its shells and jobs: a toolchain the machine
 does not have on its PATH.
 

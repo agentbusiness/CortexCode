@@ -21,7 +21,7 @@ export async function materializeWorkspace(template, dest, { links = [], exclude
   await rmrf(path.join(dest, '.git'));
   const env = { ...process.env, ...GIT_ENV };
   await runOk('git', ['init', '-q', '-b', 'main'], { cwd: dest, env });
-  const excludeText = [...links.map((l) => `/${l.rel}`), ...exclude, '/.cortex-offline', '/.cortex-env'].join('\n');
+  const excludeText = [...links.map((l) => `/${l.rel}`), ...exclude, '/.cortex-offline', '/.cortex-env', '/.cortex-cache'].join('\n');
   await ensureDir(path.join(dest, '.git', 'info'));
   await fsp.writeFile(path.join(dest, '.git', 'info', 'exclude'), excludeText ? excludeText + '\n' : '');
   await runOk('git', ['add', '-A'], { cwd: dest, env });
@@ -58,7 +58,7 @@ export async function hiddenIndex(files) {
  * `path_collisions`, which are not leaks. Symlinks are not followed; `.git` is skipped (packed
  * objects are compressed, and the agent cannot read hidden files to commit them).
  */
-export async function checkHiddenAbsent(workspace, hidden, { skipDirs = ['.git', 'node_modules', 'target', '.venv', '__pycache__'] } = {}) {
+export async function checkHiddenAbsent(workspace, hidden, { skipDirs = ['.git', 'node_modules', 'target', '.venv', '__pycache__', '.cortex-cache'] } = {}) {
   // Nothing hidden to look for (the container suites' tests never leave their harness): no file can leak.
   if (!hidden.length) return { ok: true, leaks: [], path_collisions: [], files_checked: 0, hidden_files: 0 };
   const byHash = new Map();

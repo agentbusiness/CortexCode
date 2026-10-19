@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { DiffView, duration, hunkCounts, parseUnifiedDiff, useNow, type FileDiff, type Json, type JournalEntry } from '@cortex/sdk';
 import { useContext } from 'react';
 import { RevealContext, holds } from './TurnView';
-import { str, type Step } from './transcript';
+import { isFailure, str, type Step } from './transcript';
 
 /** The tool's name as the row's label. */
 const TOOL_LABEL: Record<string, string> = {
@@ -110,7 +110,7 @@ export function StepRow({ step, onOpenFile }: { step: Step; onOpenFile: (path: s
   const { call, result } = step;
   const isResultOnly = call === result;
   const running = !result;
-  const ok = result ? result.data.ok !== false : true;
+  const ok = result ? !isFailure(result.data) : true;
   const status = running ? 'running' : ok ? 'done' : 'failed';
   const now = useNow(1000, running);
   // A step something asked to show opens by itself; the person's choice wins after that.

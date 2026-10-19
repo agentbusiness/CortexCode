@@ -105,6 +105,9 @@ pub struct Core {
     pub edits_since_run: Mutex<HashMap<String, usize>>,
     /// Per session: the files `edit` wrote (the model's work, which a turn's cleanup keeps).
     pub edited: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
+    /// Per session: the files `edit` created in the running turn (cleared when it ends). The model
+    /// may write those whole again: nothing of the user's is in them.
+    pub created: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
     /// Where the `cx` binary was found (linked into `<home>/bin`).
     pub cx: Option<PathBuf>,
     /// The write sandbox's machine-wide policy.
@@ -192,6 +195,7 @@ impl Core {
             approvals: Mutex::new(approvals),
             edits_since_run: Mutex::new(HashMap::new()),
             edited: Mutex::new(HashMap::new()),
+            created: Mutex::new(HashMap::new()),
             sandbox: crate::sandbox::Policy::new(home, data_dir, &config.sandbox_write_paths),
             config,
             cx,

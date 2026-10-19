@@ -136,10 +136,6 @@ Mirai ships it only as its own prebuilt server binary.
   The highest priority class always steps first (foreground preempts agent work within one forward
   pass); requests rotate within a class; requests beyond the slots (or for a busy key) queue by
   priority, first come first served.
-- **Taking over a prepared state**: `model.rename {from, to}` makes the idle state kept under
-  `from` the state of `to` (an idle state of `to` is dropped); nothing happens while either is busy.
-  The chat flow prefills a conversation's compacted prompt under `<session>:compact` while the
-  conversation goes on, then takes it over.
 - **Prewarm and progress** (`backend/src/progress.rs`): `model.prewarm` prefills a prompt at
   background priority without generating. A real request never waits for one: a request of a
   higher class for the same conversation stops the running prewarm at its next step and continues

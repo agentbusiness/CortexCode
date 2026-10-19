@@ -32,6 +32,35 @@ export function str(value: Json | undefined): string {
 }
 
 /** Group a session's entries into turns. */
+/**
+ * Whether a tool result is a failure to show in red. A command's non-zero exit alone is not: many
+ * commands answer with one (`ls` of a missing folder, `grep` with no match, `diff` of files that
+ * differ). A command fails when its tests failed, it was not found (exit 127), the sandbox stopped
+ * it, it timed out or a signal ended it (no exit code, or above 128). Any other result that is not
+ * ok (a refused or failed call) is a failure. Only the label changes; the model's output does not.
+ */
+export function isFailure(data: Record<string, Json>): boolean {
+  if (data.ok !== false) return false;
+  const display = data.display;
+  if (!display || typeof display !== 'object' || Array.isArray(display) || !('exit_code' in display)) return true;
+  const kind = str(data.error_kind);
+  if (kind && kind !== 'nonzero_exit') return true;
+  const exit = display.exit_code;
+  const tests = display.tests;
+  const sandbox = display.sandbox;
+  if (display.timed_out === true) return true;
+  if (sandbox && typeof sandbox === 'object' && !Array.isArray(sandbox) && sandbox.eperm === true) return true;
+  if (tests && typeof tests === 'object' && !Array.isArray(tests) && typeof tests.failed === 'number' && tests.failed > 0) return true;
+  return typeof exit !== 'number' || exit === 127 || exit > 128;
+}
+
+/** The exit code of a command that ended without failing (`exit 1` for `grep` with no match), else null. */
+export function quietExit(data: Record<string, Json>): number | null {
+  const display = data.display;
+  if (data.ok !== false || isFailure(data) || !display || typeof display !== 'object' || Array.isArray(display)) return null;
+  return typeof display.exit_code === 'number' ? display.exit_code : null;
+}
+
 export function buildTurns(entries: readonly JournalEntry[]): Turn[] {
   const results = new Map<string, JournalEntry>();
   const calls = new Set<string>();

@@ -680,9 +680,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         messages.push(prompts::stage_message(&env.data, &env.prefix.role, stage, &live));
         messages
     };
-    // The compacted conversation being prefilled under the second cache key while the work goes on
-    // (crate::fit::prepare_aside), taken over before a call once ready (crate::fit::adopt).
-    let mut aside: Option<crate::fit::Aside> = None;
+    // The compacted conversation being prefilled while the step's tools run (crate::fit::prepare).
+    let mut prewarm: Option<crate::fit::Prewarm> = None;
     let mut steps_since_settle = 0u32;
     loop {
         if env.stops.park.is_cancelled() {
@@ -699,9 +698,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         if let LoopKind::Agent { name } = &spec.kind {
             deliver_board(journal, env, name).await?;
         }
-        // A compaction prepared aside whose prefill is done is written now and its state taken
-        // over; one still prefilling keeps going while this call continues the conversation as is.
-        aside = crate::fit::adopt(env, journal, aside.take()).await;
+        // A prewarm still running ends here: the call continues from what it prefilled.
+        drop(prewarm.take());
         // Every `settle_steps` steps the in-place rewrites apply up to the newest entry (outdated
         // reads, earlier edit echoes, outputs of a command run again): the history the model
         // continues from stays small, at one re-read of that history per settle.
@@ -891,11 +889,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 .await?;
             call_seqs.push(seq);
         }
-        // The tools take a while: when the conversation is getting long, prepare its compaction
-        // aside (the next steps keep their cache until it is ready).
-        if aside.is_none() {
-            aside = crate::fit::prepare_aside(env, journal, step_start, env.data.limits.compact_early_tokens, conversation).await;
-        }
+        // The tools take a while: compact now if the conversation is getting long, and let the
+        // model re-read it meanwhile.
+        prewarm = crate::fit::prepare(env, journal, step_start, env.data.limits.compact_early_tokens, crate::prewarm::When::Soon, conversation).await;
         let mut verdicts = Vec::new();
         let mut stopped = false;
         for (index, call) in result.tool_calls.iter().enumerate() {

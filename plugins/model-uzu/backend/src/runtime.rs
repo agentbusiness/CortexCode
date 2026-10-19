@@ -965,14 +965,6 @@ impl Runtime {
         Ok(json!({"held": params.hold}))
     }
 
-    /// The state kept under `from` becomes `to`'s (`model.rename`): a conversation's compacted prompt
-    /// prefilled under a second key is taken over without re-reading it.
-    pub fn rename(&self, params: cc_protocol::contracts::model::RenameParams) -> Result<Value, RpcError> {
-        let Some(loaded) = self.current() else { return Ok(json!({"renamed": false})) };
-        loaded.engine.send(Command::Rename { from: params.from, to: params.to }).map_err(unavailable)?;
-        Ok(json!({"renamed": true}))
-    }
-
     /// Drop a conversation for good (its session was deleted), resident or on disk.
     pub fn forget(&self, cache_key: String) {
         if let Some(loaded) = self.current() {

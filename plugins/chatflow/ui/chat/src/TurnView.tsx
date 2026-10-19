@@ -240,6 +240,19 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
     }
     case kinds.STATUS: {
       const state = str(data.state);
+      // A turn that ended waiting for the person (`blocked`: it needs something only they can give;
+      // `stopped`: a guard ended work that repeated itself) says so as a card, with what it needs;
+      // the session list shows "needs you", and this is where the answer is asked for.
+      if (state === 'blocked' || state === 'stopped') {
+        return (
+          <div className="notice commitment cx-needs-you" data-seq={entry.seq} role="alert">
+            <span className="kindmark" />
+            <span className="ap lbl">{state === 'blocked' ? 'Needs you' : 'Stopped · needs you'}</span>
+            <p>{str(data.detail) || 'The work cannot go on without you.'}</p>
+            <p className="cx-needs-you-hint">Answer in the message box below; the work goes on from your answer.</p>
+          </div>
+        );
+      }
       if (state !== 'failed' && state !== 'cancelled') return null;
       return (
         <div className={`notice ${state === 'failed' ? 'contradiction' : 'context'}`} data-seq={entry.seq}>

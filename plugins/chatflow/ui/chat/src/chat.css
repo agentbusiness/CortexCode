@@ -60,6 +60,8 @@
 #cc .cx-approval .cx-approval-args{grid-column:2;margin-top:8px;}
 #cc .cx-approval .cx-approval-args summary{cursor:pointer;}
 #cc .cx-approval .cx-approval-args pre{margin:4px 0 0;max-height:240px;overflow:auto;}
+#cc .cx-needs-you p{white-space:pre-wrap;}
+#cc .cx-needs-you .cx-needs-you-hint{grid-column:2;margin-top:8px;opacity:.75;}
 /* a code change to CortexCode: the plain-English summary first, then why and the risk; the diff on demand */
 #cc .cx-change .cx-change-title{font-weight:500;}
 #cc .cx-change .cx-change-line{color:var(--ink-2);margin-top:4px;}

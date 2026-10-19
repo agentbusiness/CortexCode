@@ -213,13 +213,16 @@ rules = "reply"
 effort = "decided"
 sampling = "auto"
 
+# EXPERIMENT (2026-10-19, rule checks): `experiment_rule_checks` asks for one check per rule the
+# request states only in words (seen: a rule with no example broken unnoticed). To switch it off,
+# remove the id from DO's and TASK's rules (the prompt file can stay).
 [stage.DO]
-rules = "do"
+rules = ["do", "experiment_rule_checks"]
 effort = "decided"
 sampling = "auto"
 
 [stage.TASK]
-rules = "task"
+rules = ["task", "experiment_rule_checks"]
 effort = "decided"
 sampling = "auto"
 

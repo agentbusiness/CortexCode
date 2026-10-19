@@ -5,8 +5,8 @@ import path from 'node:path';
 import { LOCAL_REFS, HIDDEN, SRC } from './paths.mjs';
 import { formatSource } from './formatters.mjs';
 import { materializeWorkspace, snapshotSha } from './workspace.mjs';
-import { offlineEnv } from './toolchains.mjs';
-import { readJson, sha256, walk, writeJson, writeText, ensureDir } from './util.mjs';
+import { offlineEnv, T } from './toolchains.mjs';
+import { readJson, sha256, walk, writeJson, writeText, ensureDir, cloneTree } from './util.mjs';
 import { balancedLimit, filterTasks } from './adapter.mjs';
 import * as PG from '../suites/polyglot/suite.mjs';
 import * as RL from '../suites/realistic/suite.mjs';
@@ -94,8 +94,22 @@ export const polyglot = {
     await fsp.writeFile(path.join(dest, '.cortex-offline'), [HIDDEN, SRC, ...LOCAL_REFS].map((dir) => `${dir}\n`).join(''));
     // The benchmark's toolchains (JDK, Go, the Python with the exercises' packages) for the app's
     // commands, as a project environment file the tools load: an app the harness attaches to was
-    // not started with them on its PATH (seen: a Java task with no Java to run its tests).
-    const env = Object.entries(PG.agentEnvExtra()).filter(([, value]) => value != null).map(([key, value]) => `${key}=${value}`);
+    // not started with them on its PATH (seen: a Java task with no Java to run its tests). The
+    // caches the build tools write go in the workspace (`.cortex-cache/`, a copy-on-write clone of
+    // the warm shared one): the sandbox lets commands write only there (seen: every Go and Gradle
+    // build stopped by "Operation not permitted", and the model chasing it for half an hour).
+    const caches = path.join(dest, '.cortex-cache');
+    const extra = { ...PG.agentEnvExtra() };
+    extra.GOCACHE = path.join(caches, 'go');
+    if (fs.existsSync(T.goAgentCache)) await cloneTree(T.goAgentCache, extra.GOCACHE);
+    else await ensureDir(extra.GOCACHE);
+    if (task.lang === 'java' && fs.existsSync(T.gradleAgentHome)) {
+      extra.GRADLE_USER_HOME = path.join(caches, 'gradle');
+      await cloneTree(T.gradleAgentHome, extra.GRADLE_USER_HOME);
+    } else {
+      delete extra.GRADLE_USER_HOME;
+    }
+    const env = Object.entries(extra).filter(([, value]) => value != null).map(([key, value]) => `${key}=${value}`);
     const bins = PG.agentPath().filter((dir) => fs.existsSync(dir));
     await fsp.writeFile(path.join(dest, '.cortex-env'), [...env, `PATH=${bins.join(':')}:$PATH`].join('\n') + '\n');
     return { snapshot: await snapshotSha(dest) };

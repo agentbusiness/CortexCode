@@ -2,7 +2,7 @@ import { useContext, useState } from 'react';
 import { Caret, duration, kinds, useNow, type Json, type JournalEntry } from '@cortex/sdk';
 import { StepRow, editCounts, toolLabel } from './StepRow';
 import { RevealContext, holds } from './TurnView';
-import { latestLine, str, type Block, type Step, type Turn } from './transcript';
+import { isFailure, latestLine, quietExit, str, type Block, type Step, type Turn } from './transcript';
 
 /**
  * The scaffolding of a turn's work — its steps, its reasoning, the notes the host wrote for the
@@ -66,7 +66,9 @@ export function stepText(step: Step): string {
   const tool = str(step.call.data.tool) || str(step.result?.data.tool) || 'tool';
   const words = [toolLabel(tool).toLowerCase(), target(step)].filter(Boolean).join(' ');
   if (!step.result) return `${words} …`;
-  if (step.result.data.ok === false) return `${words} ✗`;
+  if (isFailure(step.result.data)) return `${words} ✗`;
+  const exit = quietExit(step.result.data);
+  if (exit !== null) return `${words} · exit ${exit}`;
   const counts = editCounts(step.result);
   if (counts) return `${words} +${counts.added} -${counts.removed}`;
   return tool === 'run' ? `${words} ✓` : words;
@@ -132,7 +134,7 @@ export function facts(turn: Turn, items: readonly ActivityItem[]): Facts {
   const start = turn.user?.ts_ms ?? turn.startedMs;
   return {
     steps: steps.length,
-    failed: steps.filter((item) => item.step.result?.data.ok === false).length,
+    failed: steps.filter((item) => item.step.result && isFailure(item.step.result.data)).length,
     ms: Math.max(0, Math.max(start, ...stamps) - start),
     tokens: turn.usage.reduce((sum, entry) => sum + (typeof entry.data.completion_tokens === 'number' ? entry.data.completion_tokens : 0), 0),
   };

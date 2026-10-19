@@ -183,7 +183,7 @@ pub fn guide(format: EditFormat) -> String {
 2. edit: to change or write a file (below).\n\
 3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Checks of your work are tests in the project (a project without tests gets them), run whole: no `| tail` or `| grep`, the result shows each failure; a one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
-5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Everything else is yours to use, the network included: search, read documentation, look for how others solved it.\n\
+5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through. Everything else is yours to use, the network included: search, read documentation, look for how others solved it.\n\
 Give every call a short `intent` first.\n\
 \n\
 Working with files:\n\
