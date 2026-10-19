@@ -52,6 +52,8 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/describe.md", include_str!("../data/prompts/describe.md")),
     ("prompts/knowledge.md", include_str!("../data/prompts/knowledge.md")),
     ("prompts/check_rules.md", include_str!("../data/prompts/check_rules.md")),
+    // EXPERIMENT (2026-10-19, rule checks): see `[stage.DO]` in stages.toml to switch it off.
+    ("prompts/experiment_rule_checks.md", include_str!("../data/prompts/experiment_rule_checks.md")),
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),

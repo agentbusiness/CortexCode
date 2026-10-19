@@ -304,9 +304,6 @@ pub enum Command {
     /// Keep a conversation resident while its turn runs (`hold`), or let it go: a held one is not
     /// spilled for being idle (it still can be when the pool needs the room).
     Hold { key: String, hold: bool },
-    /// The idle state under `from` becomes `to`'s; an idle state of `to` is dropped first. Nothing
-    /// happens while either is busy or when `from` has no resident state.
-    Rename { from: String, to: String },
     /// Drop a conversation for good (its session was deleted): its requests stop, its state and
     /// checkpoints go, and so does its file on disk.
     Forget(String),
@@ -834,31 +831,6 @@ impl<B: Backend> Worker<B> {
                     self.held.insert(key, Instant::now() + MAX_HOLD);
                 } else {
                     self.held.remove(&key);
-                }
-            }
-            Command::Rename { from, to } => {
-                let busy = |slot: &Slot<B>| slot.busy.is_some();
-                let source = self.slots.iter().position(|slot| slot.key.as_deref() == Some(from.as_str()) && slot.state.is_some());
-                let target = self.slots.iter().position(|slot| slot.key.as_deref() == Some(to.as_str()));
-                let waiting = self.waiting.iter().any(|request| request.key == from || request.key == to);
-                match (source, target) {
-                    (Some(source), target) if !busy(&self.slots[source]) && !target.is_some_and(|target| busy(&self.slots[target])) && !waiting => {
-                        if let Some(target) = target
-                            && target != source
-                        {
-                            let slot = &mut self.slots[target];
-                            slot.key = None;
-                            slot.state = None;
-                            slot.checkpoints.clear();
-                            slot.n_tokens = 0;
-                            slot.images.clear();
-                            slot.pinned = None;
-                        }
-                        self.slots[source].key = Some(to.clone());
-                        self.slots[source].last_used = Instant::now();
-                        tracing::info!(from = %from, to = %to, tokens = self.slots[source].n_tokens, "took over a prepared state");
-                    }
-                    _ => tracing::debug!(from = %from, to = %to, "no prepared state to take over (busy or gone)"),
                 }
             }
             Command::Forget(key) => {

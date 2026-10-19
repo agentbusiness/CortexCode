@@ -15,6 +15,10 @@ use std::time::UNIX_EPOCH;
 /// returns the removed paths, relative to the workspace.
 pub fn turn_end(core: &Core, workspace: &Path, session_id: &str, since_ms: u64) -> Vec<String> {
     let mut removed = Vec::new();
+    // A new turn's drafts start empty: what this turn created is the user's to judge now.
+    if let Ok(mut created) = core.created.lock() {
+        created.remove(session_id);
+    }
     if !workspace.is_dir() {
         return removed;
     }

@@ -22,8 +22,10 @@ export const MODELS_DIR = path.join(os.homedir(), '.cortexcode', 'models');
 const CALIBRATION_CACHE_DIR = path.join(TOOLCHAINS, 'model-state');
 
 export const EDIT_FORMATS = ['hashline', 'replace', 'whole'];
-// A turn's last status: `stopped` is the chat flow's stop when the work repeats itself (a guard).
-const TERMINAL = new Set(['done', 'failed', 'cancelled', 'stopped']);
+// A turn's last status: `stopped` is the chat flow's stop when the work repeats itself (a guard);
+// `blocked` is a turn that ended waiting for the user, who never answers in a benchmark: the attempt
+// is graded as it stands and the run goes on.
+const TERMINAL = new Set(['done', 'failed', 'cancelled', 'stopped', 'blocked']);
 
 /** The open app's frame (`run/frame.json` whose process is alive), or null. */
 export function runningApp() {

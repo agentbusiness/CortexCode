@@ -25,9 +25,6 @@ pub mod methods {
     pub const HOLD: &str = "model.hold";
     /// Warm a cache key's prefix (prefill without generating), e.g. the shared system block.
     pub const PREWARM: &str = "model.prewarm";
-    /// `{from, to}`: the state kept under `from` becomes `to`'s (an idle `to` state is dropped);
-    /// a conversation's compacted prompt prefilled under a second key is taken over this way.
-    pub const RENAME: &str = "model.rename";
     /// Local OpenAI-compatible HTTP endpoint serving the same weights (used by baseline harnesses).
     pub const ENDPOINT: &str = "model.endpoint";
     /// Available model variants and the active one (e.g. stock vs. uncensored).
@@ -500,12 +497,6 @@ pub struct CacheKeyParams {
 pub struct HoldParams {
     pub cache_key: String,
     pub hold: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RenameParams {
-    pub from: String,
-    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

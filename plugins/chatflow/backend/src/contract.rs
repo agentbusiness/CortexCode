@@ -88,6 +88,17 @@ pub async fn run_check(
                     full_output: output,
                 });
             }
+            // The sandbox stopped the check itself ("Operation not permitted": it writes where commands
+            // may not, e.g. a build cache outside the project): the environment, not the work, so it
+            // cannot judge the work. INDETERMINATE with the line that says so (seen: a model trying
+            // to change the user's Go and shell settings for half an hour to turn such a check green).
+            if !ok && let Some(line) = sandbox_refused(&run.output) {
+                let output = format!("[this check cannot run here: the sandbox stopped it ({line}); the work is not judged by it]");
+                return Ok(Ran {
+                    result: CheckResult { name: check.name.clone(), ok: false, exit_code: run.exit_code, output_tail: output.clone(), duration_ms: started.elapsed().as_millis() as u64, indeterminate: true },
+                    full_output: output,
+                });
+            }
             let mut output = run.output.clone();
             if run.timed_out {
                 output.push_str("\n[the check timed out]");
@@ -129,6 +140,15 @@ fn missing_tool(command: &str, exit_code: Option<i32>, output: &str) -> bool {
         Some(module) => output.contains(&format!("No module named {module}")) || output.contains(&format!("No module named '{module}'")),
         None => false,
     }
+}
+
+/// The first output line that says the sandbox refused an operation (the OS words it "Operation not
+/// permitted", Go and others in lower case), shortened.
+fn sandbox_refused(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| line.to_ascii_lowercase().contains("operation not permitted"))
+        .map(|line| line.trim().chars().take(160).collect())
 }
 
 /// The module a `python -m <module>` command runs.
