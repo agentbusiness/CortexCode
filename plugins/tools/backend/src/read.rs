@@ -228,6 +228,27 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
         return Ok(view(out, "file"));
     }
 
+    // Text with no definitions (a log, test output, an attachment, prose): an outline of its
+    // indentation hides what matters (seen: a 562-line test log read three times to reach its
+    // failures). It is shown whole up to four times the limit, else from the top with the next
+    // range named.
+    if Lang::detect(path, &text).is_none() {
+        let (mut end, mut size) = (0usize, 0usize);
+        while end < total && end < config.outline_lines * 4 && size + doc.lines[end].len() < config.outline_bytes * 4 {
+            size += doc.lines[end].len() + 1;
+            end += 1;
+        }
+        let end = end.max(1);
+        let mut out = format!("{display}:\n");
+        out.push_str(&doc.render(1, end));
+        if end < total {
+            let _ = writeln!(out, "[more: read {display}:{}]", end + 1);
+        } else {
+            let _ = writeln!(out, "[end of file: the whole file as it is now]");
+        }
+        return Ok(view(out, if end < total { "range" } else { "file" }));
+    }
+
     Ok(view(render_outline(path, display, &text, &doc, true), "outline"))
 }
 

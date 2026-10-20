@@ -71,6 +71,7 @@ pub fn extract(path: &str, src: &str, facts: &mut FileFacts) {
     for node in &nodes {
         walker.member(*node, &scope);
     }
+    attach_notes(root, src, walker.facts);
 }
 
 /// `a.b.C<T>` / `C[]` -> `C`.

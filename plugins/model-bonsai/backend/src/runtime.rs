@@ -565,7 +565,7 @@ impl Runtime {
                 close: loaded.think_close.clone(),
             }),
         };
-        let generated = self.generate(&loaded, key, prompt, false, false, params.priority, work, parser, &params.stop, sink, &cancel).await?;
+        let generated = self.generate(&loaded, key, prompt, false, params.idle_only, params.priority, work, parser, &params.stop, sink, &cancel).await?;
         Ok(chat_result(generated))
     }
 

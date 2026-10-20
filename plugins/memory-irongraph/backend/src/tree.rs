@@ -12,6 +12,7 @@ use crate::db::{Graph, Rows, layer};
 use crate::facts::{self, BINARY, FileFacts, Origin, TEXT, hash_hex};
 use crate::langs::{Languages, Snapshot, Source};
 use crate::linestore::LineStore;
+use crate::summary;
 use crate::model::{self, EdgeRow, Index, Model, NodeRow, label_of};
 use crate::params;
 use cc_protocol::RpcError;
@@ -94,6 +95,10 @@ pub struct CodeTree {
     edge_total: Mutex<u64>,
     /// Last written symbol (sid, text) for the embedding readiness probe.
     pub last_written: Mutex<Vec<(String, String)>>,
+    /// `summary_hash` stored per definition, by the hash of its sid (loaded on the first sync).
+    summary_hashes: Mutex<Option<HashMap<u64, u64>>>,
+    /// The definitions each file's words reach (call-site comments, tests, mentions), by path.
+    summary_reach: Mutex<HashMap<String, Vec<String>>>,
     /// The language plugins.
     pub langs: Arc<Languages>,
     /// [`Snapshot::key`] of the language plugins every file was last matched against.
@@ -293,7 +298,8 @@ fn keep_extracted(facts: FileFacts, stored: Option<&StoredFile>) -> FileFacts {
         content_hash: facts.content_hash,
         size: facts.size,
         lines: facts.lines,
-        text: facts.text,
+        // A parsed file keeps no leading text (code is read from the file).
+        text: None,
         origin: Origin::Kept { plugin, reason },
         ..FileFacts::default()
     }
@@ -352,6 +358,8 @@ impl CodeTree {
             shared_hashes: Mutex::new(HashMap::new()),
             edge_total: Mutex::new(0),
             last_written: Mutex::new(Vec::new()),
+            summary_hashes: Mutex::new(None),
+            summary_reach: Mutex::new(HashMap::new()),
             langs,
             coverage_key: Mutex::new(None),
             files_total: AtomicU64::new(0),
@@ -423,6 +431,12 @@ impl CodeTree {
         }
         self.load_history().await;
         let mut report = self.sync(changed, deleted).await?;
+        if let Err(error) = self.drop_code().await {
+            tracing::warn!(%error, "removing stored definition code failed");
+        }
+        if let Err(error) = self.move_descriptions().await {
+            tracing::warn!(%error, "moving descriptions onto their symbols failed");
+        }
         *self.coverage_key.lock().await = Some(snapshot.key.clone());
         report.parse_ms += parse_ms;
         report.total_ms = started.elapsed().as_millis() as u64;
@@ -657,10 +671,6 @@ impl CodeTree {
                 self.run(&format!("{} UNWIND $rows AS r MATCH (n:Code {{sid: r.old}}) SET n.sid = r.new", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
                 statements += 1;
             }
-            // The KNOWLEDGE description of a renamed symbol follows it.
-            let rows: Vec<Value> = renames.iter().map(|(o, n)| json!({"old": o, "new": n})).collect();
-            self.run(&format!("{} UNWIND $rows AS r MATCH (d:Description {{sid: r.old}}) SET d.sid = r.new", layer::KNOWLEDGE_WRITE), params! { "rows" => rows }).await?;
-            statements += 1;
         }
         // 5. Delete removed nodes (and files that are gone).
         if !removed.is_empty() {
@@ -668,9 +678,6 @@ impl CodeTree {
                 self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
                 statements += 1;
             }
-            // Orphaned descriptions of deleted symbols.
-            self.run(&format!("{} UNWIND $sids AS s MATCH (d:Description {{sid: s}}) DETACH DELETE d", layer::KNOWLEDGE_WRITE), params! { "sids" => removed }).await?;
-            statements += 1;
         }
         report.nodes_deleted = removed.len();
 
@@ -700,6 +707,12 @@ impl CodeTree {
             statements += 1;
         }
 
+        // 6b. Summaries (src/summary.rs), recomposed only for definitions whose words may have
+        // changed: those of changed files, and those the words of re-resolved files reach (now or
+        // before). Written only when the text differs from the stored one.
+        let mut pending = self.summaries(&all_edges, &changed_paths, &dirty, &deleted).await?;
+        let mut summary_updates: Vec<(u64, u64)> = Vec::with_capacity(pending.len());
+
         // 7. Upsert nodes whose properties changed. Symbols first: IronGraph embeds in write order,
         // so the searchable definitions become searchable before parameters and files.
         let edge_hash_of: HashMap<&str, &str> = all_edges.iter().map(|(p, _, h)| (p.as_str(), h.as_str())).collect();
@@ -713,6 +726,12 @@ impl CodeTree {
             let unchanged = old.get(&node.sid).is_some_and(|(kind, _, ph, _)| *kind == node.kind && *ph == hash) && !renamed_new.contains(node.sid.as_str());
             if !unchanged {
                 props.insert("props_hash".into(), json!(hash));
+                // A summary rides along with its node's write (one embedding, not two).
+                if let Some((text, summary_hash)) = pending.remove(&node.sid) {
+                    props.insert("summary".into(), json!(text));
+                    props.insert("summary_hash".into(), summary_hash_value(summary_hash));
+                    summary_updates.push((summary::hash64(&node.sid), summary_hash));
+                }
                 to_write.push(NodeRow { sid: node.sid.clone(), kind: node.kind.clone(), file: node.file.clone(), props });
             }
         }
@@ -730,6 +749,32 @@ impl CodeTree {
         });
         report.nodes_written = to_write.len();
         statements += self.write_nodes(&to_write).await?;
+        // Summaries of definitions whose node is not written otherwise.
+        if !pending.is_empty() {
+            let rows: Vec<Value> = pending
+                .into_iter()
+                .map(|(sid, (text, summary_hash))| {
+                    summary_updates.push((summary::hash64(&sid), summary_hash));
+                    json!({"sid": sid, "s": text, "h": summary_hash_value(summary_hash)})
+                })
+                .collect();
+            for chunk in chunk_rows(rows) {
+                self.run(&format!("{} UNWIND $rows AS r MATCH (n:Sym {{sid: r.sid}}) SET n.summary = r.s, n.summary_hash = r.h", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
+                statements += 1;
+            }
+        }
+        if let Some(stored) = self.summary_hashes.lock().await.as_mut() {
+            for sid in removed.iter().chain(renames.iter().map(|(old_sid, _)| old_sid)) {
+                stored.remove(&summary::hash64(sid));
+            }
+            for (key, summary_hash) in summary_updates {
+                if summary_hash == 0 {
+                    stored.remove(&key);
+                } else {
+                    stored.insert(key, summary_hash);
+                }
+            }
+        }
         // Embedding probes: the last symbol of every label written (one statement group each).
         {
             let mut probes = self.last_written.lock().await;
@@ -830,6 +875,82 @@ impl CodeTree {
             }
         }
         Ok(report)
+    }
+
+    /// The summaries to write, by sid: (text, its hash; none and 0 when nothing is said any more).
+    /// The first sync of a tree loads the stored hashes and considers every definition.
+    async fn summaries(
+        &self,
+        all_edges: &[(String, Vec<EdgeRow>, String)],
+        changed_paths: &[String],
+        dirty: &[&(String, Vec<EdgeRow>, String)],
+        deleted: &[String],
+    ) -> Result<HashMap<String, (Option<String>, u64)>, RpcError> {
+        let mut stored_guard = self.summary_hashes.lock().await;
+        let first = stored_guard.is_none();
+        if first {
+            *stored_guard = Some(self.stored_summary_hashes().await?);
+        }
+        let Some(stored) = stored_guard.as_ref() else { return Ok(HashMap::new()) };
+        let model = self.model.read().await;
+        let (heard, reach) = summary::heard(&model, all_edges);
+        let mut pending: HashMap<String, (Option<String>, u64)> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut consider = |sid: String, symbol: &crate::facts::SymbolFact| {
+            if !model::SYMBOL_KINDS.contains(&symbol.kind.as_str()) || !seen.insert(sid.clone()) {
+                return;
+            }
+            let text = summary::compose(symbol, heard.get(sid.as_str()));
+            let hash = text.as_deref().map(summary::hash64).unwrap_or(0);
+            if stored.get(&summary::hash64(&sid)).copied().unwrap_or(0) != hash {
+                pending.insert(sid, (text, hash));
+            }
+        };
+        // Definitions of changed files (every file on the first sync), from their facts directly.
+        let own: Vec<&str> = if first { model.files.keys().map(String::as_str).collect() } else { changed_paths.iter().map(String::as_str).collect() };
+        for path in own {
+            if let Some(file) = model.files.get(path) {
+                for symbol in &file.symbols {
+                    consider(model::symbol_sid(model::sid_prefix(file), &file.path, &symbol.qname), symbol);
+                }
+            }
+        }
+        // Definitions the words of re-resolved or deleted files reach, now or before.
+        let mut reached = self.summary_reach.lock().await;
+        let mut targets: Vec<String> = Vec::new();
+        for path in dirty.iter().map(|(path, _, _)| path.as_str()).chain(deleted.iter().map(String::as_str)) {
+            if let Some(before) = reached.remove(path) {
+                targets.extend(before);
+            }
+            if let Some(now) = reach.get(path) {
+                targets.extend(now.iter().map(|sid| sid.to_string()));
+                reached.insert(path.to_owned(), now.iter().map(|sid| sid.to_string()).collect());
+            }
+        }
+        if first {
+            reached.clear();
+            reached.extend(reach.iter().map(|(path, sids)| (path.to_string(), sids.iter().map(|sid| sid.to_string()).collect())));
+        }
+        for sid in targets {
+            if let Some(symbol) = summary::lookup(&model, &sid) {
+                consider(sid, symbol);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// `summary_hash` of every definition that has one, by the hash of its sid.
+    async fn stored_summary_hashes(&self) -> Result<HashMap<u64, u64>, RpcError> {
+        let rows = self.run(&format!("{} MATCH (n:Sym) WHERE n.summary_hash IS NOT NULL RETURN n.sid, n.summary_hash", layer::OBSERVED_READ), Map::new()).await?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let sid = row.first()?.as_str()?;
+                let hash = u64::from_str_radix(row.get(1)?.as_str()?, 16).ok()?;
+                Some((summary::hash64(sid), hash))
+            })
+            .collect())
     }
 
     async fn write_nodes(&self, nodes: &[NodeRow]) -> Result<usize, RpcError> {
@@ -941,6 +1062,30 @@ impl CodeTree {
         self.run(&format!("{} MATCH (x:ExternalSymbol) DETACH DELETE x", layer::OBSERVED_WRITE), Map::new()).await?;
         Ok(())
     }
+
+    /// Remove the code earlier versions stored on nodes: definitions' code and the leading text of
+    /// files a language plugin parsed (code is read from the files).
+    async fn drop_code(&self) -> Result<(), RpcError> {
+        self.run(&format!("{} MATCH (n:Code) WHERE n.code IS NOT NULL REMOVE n.code", layer::OBSERVED_WRITE), Map::new()).await?;
+        self.run(&format!("{} MATCH (f:File) WHERE f.extractor IS NOT NULL AND f.text IS NOT NULL REMOVE f.text", layer::OBSERVED_WRITE), Map::new()).await?;
+        Ok(())
+    }
+
+    /// Move the `Description` nodes earlier versions wrote onto the symbols they describe
+    /// (`description`, `described_hash`), then delete them.
+    async fn move_descriptions(&self) -> Result<(), RpcError> {
+        let rows = self.run(&format!("{} MATCH (d:Description)-[:DESCRIBES]->(s:Code) RETURN s.sid, d.text, d.body_hash, d.updated_ms", layer::CODE_READ), Map::new()).await?;
+        let moved: Vec<Value> = rows.rows.iter().map(|r| json!({"sid": r.first(), "text": r.get(1), "hash": r.get(2), "ms": r.get(3)})).collect();
+        if !moved.is_empty() {
+            self.run(
+                &format!("{} UNWIND $rows AS r MATCH (s:Code {{sid: r.sid}}) WHERE s.description IS NULL SET s.description = r.text, s.described_hash = r.hash, s.described_ms = r.ms", layer::OBSERVED_WRITE),
+                params! { "rows" => moved },
+            )
+            .await?;
+        }
+        self.run(&format!("{} MATCH (d:Description) DETACH DELETE d", layer::KNOWLEDGE_WRITE), Map::new()).await?;
+        Ok(())
+    }
 }
 
 impl CodeTree {
@@ -1031,6 +1176,11 @@ pub fn included(root: &Path, rel: &str) -> bool {
     }
     let Ok(matcher) = builder.build() else { return true };
     !matcher.matched_path_or_any_parents(root.join(rel), false).is_ignore()
+}
+
+/// A summary's hash as stored: hex, or null when there is no summary.
+fn summary_hash_value(hash: u64) -> Value {
+    if hash == 0 { Value::Null } else { json!(format!("{hash:016x}")) }
 }
 
 pub fn edge_hash(edges: &[EdgeRow]) -> String {

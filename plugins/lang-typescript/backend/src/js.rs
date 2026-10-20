@@ -63,6 +63,7 @@ pub fn extract(dialect: Dialect, src: &str, facts: &mut FileFacts) {
         }
     }
     resolve_component_props(walker.facts);
+    attach_notes(root, src, walker.facts);
 }
 
 impl<'a> Walker<'a> {

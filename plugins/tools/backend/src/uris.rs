@@ -85,20 +85,45 @@ fn abs(scope: &Scope, path: &str) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { scope.workspace.join(path) }
 }
 
-/// Hashline-render lines `start..=end` (1-based) of a workspace file, if it is readable text.
 /// One line of a file as plain text (no anchor): result lines already say `path:line`.
 fn source_line(scope: &Scope, path: &str, line: u32) -> Option<String> {
     let text = std::fs::read_to_string(abs(scope, path)).ok()?;
     text.lines().nth((line as usize).checked_sub(1)?).map(|line| line.trim_end().to_owned())
 }
 
-fn file_lines(scope: &Scope, path: &str, start: u32, end: u32) -> Option<String> {
-    let text = std::fs::read_to_string(abs(scope, path)).ok()?;
-    let doc = crate::doc::Doc::parse(&text);
-    if start == 0 || start as usize > doc.len() {
-        return None;
+/// A definition's code as its file on disk has it now (the graph keeps only where it is).
+enum Definition {
+    /// Its lines, hashline-rendered: editable anchors.
+    Lines(String),
+    /// Lines whose first ones no longer name the definition: the file changed since it was indexed.
+    Moved(String),
+    /// The file does not exist.
+    Gone,
+    /// The file is not readable text.
+    NotText,
+    /// The file is shorter than the definition's first line: (its lines now).
+    PastEnd(usize),
+}
+
+/// Lines a definition's header may span (decorators, attributes, a wrapped signature).
+const HEADER_LINES: usize = 4;
+
+/// Read lines `start_line..=end_line` (1-based) of a symbol's file.
+fn read_definition(scope: &Scope, symbol: &SymbolRef) -> Definition {
+    let path = abs(scope, &symbol.path);
+    if !path.is_file() {
+        return Definition::Gone;
     }
-    Some(doc.render(start as usize, end.max(start) as usize))
+    let Ok(text) = std::fs::read_to_string(&path) else { return Definition::NotText };
+    let doc = crate::doc::Doc::parse(&text);
+    let (start, end) = (symbol.start_line as usize, symbol.end_line.max(symbol.start_line) as usize);
+    if start == 0 || start > doc.len() {
+        return Definition::PastEnd(doc.len());
+    }
+    let rendered = doc.render(start, end);
+    let header_end = end.min(start + HEADER_LINES - 1).min(doc.len());
+    // A file (from line 1) has no header that names it.
+    if symbol.name.is_empty() || symbol.kind == "file" || doc.lines[start - 1..header_end].iter().any(|line| line.contains(&symbol.name)) { Definition::Lines(rendered) } else { Definition::Moved(rendered) }
 }
 
 /// One code result as the model reads it: `path:line  signature — description` (the signature's
@@ -392,13 +417,29 @@ async fn split_pair(host: &dyn Host, scope: &Scope<'_>, rest: &str) -> Result<(S
     }
 }
 
+async fn lookup_symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<SymbolMatches, UriError> {
+    let request = merge(scope_params(scope), json!({ "name": name }));
+    parse(host.call("memory.symbol", request).await.map_err(|e| rpc(e, CODE_GRAPH))?, "memory.symbol")
+}
+
 async fn symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String, UriError> {
     if name.trim().is_empty() {
         return Err(UriError::new("bad_uri", "symbol://<name> needs a name, qualified name or sid"));
     }
-    let request = merge(scope_params(scope), json!({ "name": name }));
-    let result: SymbolMatches = parse(host.call("memory.symbol", request).await.map_err(|e| rpc(e, CODE_GRAPH))?, "memory.symbol")?;
+    let mut result = lookup_symbol(host, scope, name).await?;
+    // A definition its file no longer has where the graph says: the index is behind the files.
+    // Re-index those files (a deleted file leaves the graph) and look the name up again.
+    let mut stale: Vec<String> = result.matches.iter().filter(|detail| !matches!(read_definition(scope, &detail.symbol), Definition::Lines(_))).map(|detail| detail.symbol.path.clone()).collect();
+    stale.sort();
+    stale.dedup();
+    if !stale.is_empty() && host.call("memory.refresh", merge(scope_params(scope), json!({ "paths": stale }))).await.is_ok() {
+        result = lookup_symbol(host, scope, name).await?;
+    }
     if result.matches.is_empty() {
+        if !stale.is_empty() {
+            let files: Vec<String> = stale.iter().map(|path| rel(scope, path)).collect();
+            return Err(UriError::new("not_found", format!("symbol://{name}: {} no longer has it. Search for it: graph://search/{name}", files.join(", "))));
+        }
         return Err(UriError::new("not_found", format!("symbol://{name}: no such symbol (try graph://search/{name})")));
     }
     // Each match: its line, what it takes and returns, where it goes next (by name), its code.
@@ -406,6 +447,10 @@ async fn symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String
     for detail in &result.matches {
         let symbol = &detail.symbol;
         let _ = writeln!(out, "{}", symbol_head(scope, symbol));
+        // The rest of what is said about it (its head line shows the first).
+        for said in symbol.description.as_deref().unwrap_or("").lines().skip(1).map(str::trim).filter(|line| !line.is_empty()) {
+            let _ = writeln!(out, "{said}");
+        }
         if !detail.params.is_empty() {
             let params: Vec<String> = detail
                 .params
@@ -439,12 +484,17 @@ async fn symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String
             let tests: Vec<String> = detail.tests.iter().map(|test| test.qname.clone()).collect();
             let _ = writeln!(out, "Tested by: {}", tests.join(", "));
         }
-        match file_lines(scope, &symbol.path, symbol.start_line, symbol.end_line) {
-            Some(code) => out.push_str(&code),
-            None => {
-                if let Some(code) = &detail.code {
-                    let _ = writeln!(out, "{code}");
-                }
+        let file = rel(scope, &symbol.path);
+        match read_definition(scope, symbol) {
+            Definition::Lines(code) | Definition::Moved(code) => out.push_str(&code),
+            Definition::Gone => {
+                let _ = writeln!(out, "{file} does not exist any more. Search for it: graph://search/{}", symbol.name);
+            }
+            Definition::NotText => {
+                let _ = writeln!(out, "{file} is not readable text, so its code cannot be shown. Search for it: graph://search/{}", symbol.name);
+            }
+            Definition::PastEnd(lines) => {
+                let _ = writeln!(out, "{file} has {lines} lines now, fewer than where this definition starts. Read the file: {file}");
             }
         }
         out.push('\n');

@@ -186,6 +186,25 @@ pub fn terminal_read(script: &str) -> Option<(String, Option<String>)> {
     }
 }
 
+/// The project files a script prints with a file reader (`cat`, `head`, `tail`, `nl`, `sed -n`)
+/// among other commands (`ls && cat a.py`), as written; the script itself is not a read.
+pub fn printed_files(script: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for words in simple_commands(script) {
+        let Some(Some(program)) = words.first() else { continue };
+        let program = program_name(program);
+        let sed_print = program == "sed" && words.iter().skip(1).flatten().any(|word| word == "-n");
+        if !matches!(program, "cat" | "head" | "tail" | "nl") && !sed_print {
+            continue;
+        }
+        // Every word that is not a flag may name a file (`head -n 20 a.py`: `20` is no file, and
+        // the caller keeps only files that exist); `sed -n`'s first such word is its script.
+        let operands = words.iter().skip(1).flatten().filter(|word| !word.is_empty() && !word.starts_with('-'));
+        files.extend(operands.skip(usize::from(program == "sed")).cloned());
+    }
+    files
+}
+
 /// The file edits a script makes through the terminal, said for the model: a here-document written
 /// to a file (`cat > f <<EOF`), or a file changed in place (`sed -i`, `perl -i`). Structural: the
 /// parsed redirections and the programs' in-place flags. Empty when it makes none or does not parse.
@@ -551,6 +570,67 @@ fn classify(words: &[Option<String>], context: &Context, depth: usize, out: &mut
         }
         _ => {}
     }
+}
+
+/// Git subcommands that only read the repository (history, state, contents).
+const GIT_READS: &[&str] = &[
+    "status", "diff", "log", "show", "blame", "annotate", "ls-files", "ls-tree", "rev-parse", "rev-list", "describe", "shortlog", "grep",
+    "cat-file", "show-ref", "for-each-ref", "name-rev", "merge-base", "whatchanged", "check-ignore", "check-attr", "count-objects", "var",
+    "diff-tree", "diff-files", "diff-index", "help", "version",
+];
+
+/// The first `git` command of a script that would change the repository (commit, checkout,
+/// restore, reset, branch, stash, merge, rebase, clean, ...), as written; None when every git
+/// command only reads. Repository changes are the user's to make, never the model's: a model's
+/// `git checkout <file>` once threw away twenty minutes of its own work. Programs run through
+/// wrappers (`env`, `timeout`, `xargs`) and `bash -c` scripts are looked into.
+pub fn git_change(script: &str) -> Option<String> {
+    git_change_in(script, 0)
+}
+
+fn git_change_in(script: &str, depth: usize) -> Option<String> {
+    if depth > 3 {
+        return None;
+    }
+    for words in simple_commands(script) {
+        let mut words: &[Option<String>] = &words;
+        while let Some((index, _)) = unwrap(words) {
+            words = words.get(index..).unwrap_or(&[]);
+        }
+        let Some(Some(first)) = words.first() else { continue };
+        let program = program_name(first);
+        let args = &words[1..];
+        if matches!(program, "bash" | "sh" | "zsh" | "dash" | "ksh")
+            && let Some(position) = args.iter().position(|arg| arg.as_deref().is_some_and(|a| a.starts_with('-') && a.contains('c') && !a.starts_with("--")))
+            && let Some(Some(inner)) = args.get(position + 1)
+            && let Some(found) = git_change_in(inner, depth + 1)
+        {
+            return Some(found);
+        }
+        if program != "git" {
+            continue;
+        }
+        let Some(sub) = git_subcommand(args) else { continue };
+        let after: Vec<&str> = args.iter().flatten().map(String::as_str).skip_while(|arg| *arg != sub).skip(1).collect();
+        let only = |allowed: &[&str]| after.iter().all(|arg| allowed.contains(arg) || arg.starts_with("--format") || arg.starts_with("--sort"));
+        let reads = GIT_READS.contains(&sub.as_str())
+            || match sub.as_str() {
+                // Listing forms only: a name after them creates, deletes or moves.
+                "branch" => only(&["-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "-l", "--show-current", "--no-color", "--color"]),
+                "tag" => only(&["-l", "--list", "-n"]),
+                "stash" => matches!(after.first(), Some(&"list") | Some(&"show")),
+                "remote" => after.is_empty() || matches!(after.first(), Some(&"-v") | Some(&"show") | Some(&"get-url")),
+                "config" => after.iter().any(|arg| matches!(*arg, "--get" | "--get-all" | "--get-regexp" | "--list" | "-l")),
+                "reflog" => after.is_empty() || after.first() == Some(&"show"),
+                "worktree" => after.first() == Some(&"list"),
+                _ => false,
+            };
+        if !reads {
+            let shown: Vec<&str> = words.iter().flatten().map(String::as_str).collect();
+            return Some(shown.join(" "));
+        }
+    }
+    None
 }
 
 fn git_subcommand(args: &[Option<String>]) -> Option<String> {

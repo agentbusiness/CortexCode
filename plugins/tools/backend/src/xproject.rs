@@ -62,17 +62,10 @@ fn known(info: &ProjectInfo) -> Known {
     Known { id: info.project_id.clone(), name: info.name.clone(), root: PathBuf::from(&info.root), state: info.state.clone() }
 }
 
-fn listing(projects: &[ProjectInfo]) -> String {
-    if projects.is_empty() {
-        return "none yet".to_owned();
-    }
-    projects.iter().map(|p| format!("{} ({})", p.name, p.root)).collect::<Vec<_>>().join(", ")
-}
-
-fn unknown(qualifier: &str, projects: &[ProjectInfo]) -> UriError {
+fn unknown(qualifier: &str, _projects: &[ProjectInfo]) -> UriError {
     error(
         "not_found",
-        format!("no project `{qualifier}`; known projects: {}. An absolute directory path opens another repository read-only.", listing(projects)),
+        format!("no project `{qualifier}`. A file of this project is read by its path (`src/a.rs`); another repository by its absolute directory path."),
     )
 }
 

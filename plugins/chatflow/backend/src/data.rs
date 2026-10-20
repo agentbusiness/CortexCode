@@ -51,6 +51,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/decisions.md", include_str!("../data/prompts/decisions.md")),
     ("prompts/describe.md", include_str!("../data/prompts/describe.md")),
     ("prompts/knowledge.md", include_str!("../data/prompts/knowledge.md")),
+    ("prompts/learn.md", include_str!("../data/prompts/learn.md")),
     ("prompts/check_rules.md", include_str!("../data/prompts/check_rules.md")),
     // EXPERIMENT (2026-10-19, rule checks): see `[stage.DO]` in stages.toml to switch it off.
     ("prompts/experiment_rule_checks.md", include_str!("../data/prompts/experiment_rule_checks.md")),
@@ -65,6 +66,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("schemas/plan.json", include_str!("../data/schemas/plan.json")),
     ("schemas/decisions.json", include_str!("../data/schemas/decisions.json")),
     ("schemas/knowledge.json", include_str!("../data/schemas/knowledge.json")),
+    ("schemas/learn.json", include_str!("../data/schemas/learn.json")),
 ];
 
 /// Roles a session's system prompt is built for: `chat` (the foreground flow) and `agent` (a
@@ -73,7 +75,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "DESCRIBE", "REVIEW"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -87,6 +89,7 @@ const SCHEMA_NEEDS: &[SchemaNeed] = &[
     ("PLAN_EDIT", &["goal", "tasks"], None),
     ("DECISIONS", &["decisions"], None),
     ("KNOWLEDGE", &["items"], None),
+    ("LEARN", &["useful"], Some(("useful", &["no", "yes"]))),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
 ];
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
@@ -287,6 +290,18 @@ pub struct Limits {
     /// The project's knowledge brief in the system prompt, in tokens; 0 = none (P4).
     #[serde(default = "brief_tokens")]
     pub brief_tokens: u32,
+    /// Lessons (global) shown with the knowledge note after ROUTE, best first; 0 = none.
+    #[serde(default = "lessons_per_turn")]
+    pub lessons_per_turn: u32,
+    /// Episodes one finished run is learned from, at most.
+    #[serde(default = "learn_episodes_per_run")]
+    pub learn_episodes_per_run: usize,
+    /// A new lesson at least this similar to a stored one (search score) is that lesson again.
+    #[serde(default = "lesson_merge_score")]
+    pub lesson_merge_score: f64,
+    /// Earlier runs without a learned mark taken up after a run is learned.
+    #[serde(default = "learn_backlog_runs")]
+    pub learn_backlog_runs: usize,
     /// The project's own contract (its `AGENTS.md`, else `CLAUDE.md`) in the system prompt, in
     /// characters; 0 = none.
     #[serde(default = "contract_chars")]
@@ -321,6 +336,18 @@ fn contract_chars() -> usize {
 
 fn brief_tokens() -> u32 {
     1024
+}
+fn lessons_per_turn() -> u32 {
+    4
+}
+fn learn_episodes_per_run() -> usize {
+    6
+}
+fn lesson_merge_score() -> f64 {
+    0.56
+}
+fn learn_backlog_runs() -> usize {
+    3
 }
 fn skills_in_prefix() -> bool {
     true

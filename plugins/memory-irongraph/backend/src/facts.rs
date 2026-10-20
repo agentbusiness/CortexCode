@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub use lang::{
     CommandFact, DependencyFact, ImplFact, ImportFact, IpcCallFact, LocalFact, ParamFact, RefFact, RefKind, RefTarget, RequestFact, RunFact, SymbolFact,
-    TEXT_EXCERPT_CHARS,
+    LineNote, TEXT_EXCERPT_CHARS,
 };
 
 /// The language name of a text file no language plugin covers (Markdown, JSON, YAML, configs, plain
@@ -77,6 +77,9 @@ pub struct FileFacts {
     /// The file's leading text (what its file node is searched by), at most
     /// [`TEXT_EXCERPT_CHARS`] characters; none for binary files.
     pub text: Option<String>,
+    /// Comments directly above calls, by the call's line (what callers say a call does).
+    #[serde(default)]
+    pub line_notes: Vec<LineNote>,
     /// Prefix of the file's symbol ids (`<prefix>:<path>#<qname>`): the language's, from its
     /// plugin's `describe`.
     pub sid_prefix: String,
@@ -101,11 +104,14 @@ impl FileFacts {
         }
     }
 
-    /// Take what a language plugin extracted; the caller's fields (path, hash, size, lines,
-    /// excerpt) stay this file's.
+    /// Take what a language plugin extracted; the caller's fields (path, hash, size, lines) stay
+    /// this file's.
     pub fn absorb(&mut self, extracted: lang::FileFacts, sid_prefix: &str, origin: Origin) {
         self.language = extracted.language;
-        self.symbols = extracted.symbols;
+        // Code is read from the file at its lines, never kept here or in the graph: a parsed file
+        // is found by its symbols (name, signature, doc), not by its leading text.
+        self.symbols = extracted.symbols.into_iter().map(|symbol| lang::SymbolFact { code: String::new(), ..symbol }).collect();
+        self.text = None;
         self.refs = extracted.refs;
         self.imports = extracted.imports;
         self.exports = extracted.exports;
@@ -119,6 +125,7 @@ impl FileFacts {
         self.impls = extracted.impls;
         self.locals = extracted.locals;
         self.parse_errors = extracted.parse_errors;
+        self.line_notes = extracted.line_notes;
         self.sid_prefix = sid_prefix.to_owned();
         self.origin = origin;
     }

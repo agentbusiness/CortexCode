@@ -415,6 +415,16 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
+/// How long the engine must have served nothing else before an idle-only generation may take
+/// room the way any request does (spill or drop an idle conversation, drop a shared block): until
+/// then it uses only free room, so work under way and its caches are never touched.
+const IDLE_ROOM_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// An idle-only generation (learning after a turn), as opposed to an idle-only prewarm.
+fn idle_generation(request: &Request) -> bool {
+    request.idle_only && !matches!(request.work, Work::Prewarm)
+}
+
 struct Worker {
     context: Context,
     compiler: GrammarCompiler,
@@ -433,6 +443,10 @@ struct Worker {
     shutting_down: bool,
     next_id: u64,
     logits: Vec<f32>,
+    /// When the engine last had other work than idle-only generations ([`IDLE_ROOM_AFTER`]).
+    last_work: Instant,
+    /// The idle-only request whose wait for room was last logged.
+    idle_wait_logged: Option<u64>,
 }
 
 impl Worker {
@@ -457,6 +471,8 @@ impl Worker {
             shutting_down: false,
             next_id: 1,
             logits: Vec::new(),
+            last_work: Instant::now(),
+            idle_wait_logged: None,
         };
         worker.publish_view();
         worker
@@ -467,10 +483,20 @@ impl Worker {
         loop {
             // Block for a command only when nothing runs and nothing waiting can start.
             let idle = self.active.is_empty() && (self.waiting.is_empty() || stalled);
+            // An idle-only generation waiting for the quiet period wakes the worker when it ends.
+            let wake = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER);
             let command = if idle && !self.shutting_down {
-                match self.rx.recv() {
-                    Ok(command) => Some(command),
-                    Err(_) => {
+                let received = match wake {
+                    Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                        Ok(command) => Ok(Some(command)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+                    },
+                    None => self.rx.recv().map(Some).map_err(|_| ()),
+                };
+                match received {
+                    Ok(command) => command,
+                    Err(()) => {
                         self.shutting_down = true;
                         None
                     }
@@ -579,6 +605,10 @@ impl Worker {
     }
 
     fn admit(&mut self) {
+        // The last moment the engine had other work than idle-only generations.
+        if self.active.iter().map(|active| &*active.request).chain(self.waiting.iter().map(|request| &**request)).any(|request| !idle_generation(request)) {
+            self.last_work = Instant::now();
+        }
         // Drop requests whose caller is gone before they start, and prewarms made moot by a real
         // request for the same conversation.
         let mut index = 0;
@@ -618,6 +648,11 @@ impl Worker {
 
     fn place(&mut self, position: usize) -> Placement {
         let key = self.waiting[position].key.clone();
+        // Quiet long enough, an idle-only generation is placed like any request (it still waits
+        // while another conversation is served); before that, only in free room.
+        if idle_generation(&self.waiting[position]) && self.last_work.elapsed() < IDLE_ROOM_AFTER {
+            return self.place_idle(position, &key);
+        }
         if self.waiting[position].idle_only {
             if self.serving_other(&key) {
                 return Placement::Wait;
@@ -693,6 +728,27 @@ impl Worker {
         Placement::Admitted
     }
 
+    /// An idle-only generation (learning after a turn) takes nothing from anyone: it starts only
+    /// while no other request runs or waits, on its own conversation's slot or an empty one, in the
+    /// room the pool has (no conversation is dropped for it). Once running, the scheduling class
+    /// puts every other request first.
+    fn place_idle(&mut self, position: usize, key: &str) -> Placement {
+        let others = self.active.iter().any(|active| active.request.key != key) || self.waiting.iter().enumerate().any(|(index, other)| index != position && !other.idle_only);
+        let slot = self.slots.iter().position(|slot| slot.busy.is_none() && slot.key.as_deref() == Some(key)).or_else(|| self.slots.iter().position(|slot| slot.busy.is_none() && slot.key.is_none()));
+        let reserve = self.reserve_for(&self.waiting[position]);
+        let Some(slot) = slot else { return Placement::Wait };
+        if others || self.pool_used() + reserve > self.pool_tokens {
+            if !others && self.idle_wait_logged != Some(self.waiting[position].id) {
+                self.idle_wait_logged = Some(self.waiting[position].id);
+                tracing::info!(pool_used = self.pool_used(), reserve, pool = self.pool_tokens, "an idle-only request waits for room in the pool");
+            }
+            return Placement::Wait;
+        }
+        let Some(request) = self.waiting.remove(position) else { return Placement::Wait };
+        self.start(slot, request, reserve);
+        Placement::Admitted
+    }
+
     fn preempt_prewarm(&mut self, key: &str, priority: Priority, slot_free: bool) {
         let running: Vec<crate::progress::Running<'_>> = self
             .active
@@ -714,7 +770,7 @@ impl Worker {
     }
 
     fn stop_idle_prewarms(&mut self, key: &str) {
-        for active in self.active.iter().filter(|active| active.request.idle_only && active.request.key != key) {
+        for active in self.active.iter().filter(|active| active.request.idle_only && matches!(active.request.work, Work::Prewarm) && active.request.key != key) {
             active.request.stop.store(true, Ordering::SeqCst);
         }
     }
@@ -1030,6 +1086,10 @@ impl Worker {
 
     fn finish(&mut self, index: usize, finish: Finish) {
         let active = self.release(index);
+        // An idle-only generation leaves nothing in the pool.
+        if active.request.idle_only && !matches!(active.request.work, Work::Prewarm) {
+            self.clear_slot(active.slot);
+        }
         let prefill_ms = active.first_token.map_or(ms(active.admitted), |first| first.duration_since(active.admitted).as_secs_f64() * 1000.0);
         let decode_ms = match (active.first_token, active.last_token) {
             (Some(first), Some(last)) => last.duration_since(first).as_secs_f64() * 1000.0,

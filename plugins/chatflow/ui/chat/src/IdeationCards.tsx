@@ -39,7 +39,6 @@ export interface IdeationActions {
   /** `chatflow.decision.answer`. */
   answerDecision: (seq: number, accept: boolean) => Promise<void>;
   /** `chatflow.knowledge.answer`: accept with the text as edited, or reject. */
-  answerKnowledge: (seq: number, accept: boolean, text?: string) => Promise<void>;
   /** `chatflow.plan.update` (approved | draft). */
   setPlanStatus: (planId: string, status: 'approved' | 'draft') => Promise<void>;
   /** `chatflow.plan.implement`. */
@@ -207,48 +206,6 @@ export function DecisionCard({ entry, actions }: { entry: JournalEntry; actions:
         <div className="acts">
           <button type="button" className="detent" data-action="accept" disabled={busy !== null} onClick={() => void act('accept', () => actions.answerDecision(entry.seq, true))}>{busy === 'accept' ? 'Accepting…' : 'Accept'}</button>
           <button type="button" className="detent warn" data-action="reject" disabled={busy !== null} onClick={() => void act('reject', () => actions.answerDecision(entry.seq, false))}>{busy === 'reject' ? 'Rejecting…' : 'Reject'}</button>
-        </div>
-      )}
-      {error && <p className="inline-error" role="alert">Not answered: {error}</p>}
-    </div>
-  );
-}
-
-const KNOWLEDGE_KIND_LABELS: Record<string, string> = { concept: 'Concept', fact: 'Fact', hypothesis: 'Theory', question: 'Open question' };
-
-/**
- * A knowledge item the model proposed from what the user said (docs/PROJECT-KNOWLEDGE-PLAN.md P3):
- * its kind, name, text (editable until answered), state for a theory or a question, and the code it
- * binds to, with Keep / Don't keep. Answered cards keep the answer; a kept one names where it went.
- */
-export function KnowledgeCard({ entry, actions }: { entry: JournalEntry; actions: IdeationActions }) {
-  const [busy, error, act] = useAct();
-  const [text, setText] = useState(str(entry.data.text));
-  const state = str(entry.data.state) || 'proposed';
-  const pending = state === 'proposed';
-  const kind = str(entry.data.kind);
-  const itemState = str(entry.data.item_state);
-  const bindsRaw = entry.data.binds;
-  const binds = Array.isArray(bindsRaw) ? bindsRaw.map((item) => str(item)).filter(Boolean) : [];
-  const stored = str(entry.data.knowledge_id);
-  const label = KNOWLEDGE_KIND_LABELS[kind] ?? 'Knowledge';
-  const stateNote = (kind === 'hypothesis' || kind === 'question') && itemState ? ` · ${itemState}` : '';
-  return (
-    <div className={`notice cx-decision cx-knowledge ${pending ? 'commitment' : state === 'accepted' ? 'context' : 'overdue'}`} data-seq={entry.seq} data-state={state} data-kind={kind}>
-      <span className="kindmark" />
-      <span className="ap lbl">{pending ? `${label} to remember${stateNote}` : state === 'accepted' ? `${label} kept${stateNote}` : `${label} not kept`}</span>
-      <p className="cx-decided">{str(entry.data.name)}</p>
-      {pending ? (
-        <textarea className="cx-knowledge-text" aria-label="Text" value={text} rows={2} onChange={(event) => setText(event.target.value)} />
-      ) : (
-        <p className="prose">{str(entry.data.text)}</p>
-      )}
-      {binds.length > 0 && <p className="ap faint">Code: {binds.join(', ')}</p>}
-      {stored && <p className="ap faint">knowledge://{stored}</p>}
-      {pending && (
-        <div className="acts">
-          <button type="button" className="detent" data-action="accept" disabled={busy !== null || text.trim() === ''} onClick={() => void act('accept', () => actions.answerKnowledge(entry.seq, true, text.trim()))}>{busy === 'accept' ? 'Keeping…' : 'Keep'}</button>
-          <button type="button" className="detent warn" data-action="reject" disabled={busy !== null} onClick={() => void act('reject', () => actions.answerKnowledge(entry.seq, false))}>{busy === 'reject' ? 'Dropping…' : "Don't keep"}</button>
         </div>
       )}
       {error && <p className="inline-error" role="alert">Not answered: {error}</p>}

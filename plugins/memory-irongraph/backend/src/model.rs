@@ -1482,7 +1482,6 @@ pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
         p.insert("language".into(), json!(file.language));
         p.insert("signature".into(), json!(symbol.signature));
         p.insert("doc".into(), opt(&symbol.doc));
-        p.insert("code".into(), json!(symbol.code));
         p.insert("start_line".into(), json!(symbol.start_line));
         p.insert("end_line".into(), json!(symbol.end_line));
         p.insert("body_hash".into(), json!(symbol.body_hash));
@@ -1528,7 +1527,6 @@ pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
         p.insert("path".into(), json!(file.path));
         p.insert("language".into(), json!(file.language));
         p.insert("signature".into(), json!(format!("{}: {}", command.name, command.command)));
-        p.insert("code".into(), json!(command.command));
         p.insert("start_line".into(), json!(command.line));
         p.insert("end_line".into(), json!(command.line));
         p.insert("entry_point".into(), opt(&command.entry_point));

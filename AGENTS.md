@@ -33,6 +33,12 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 - **The host decides what it can decide from structural facts** (code side over model side); the
   model's steps stay small. Gates should let the model flow: prefer a call that runs with a note over
   a refusal that costs it a step; keep only refusals that protect work or safety.
+- **What the host can repair, it repairs.** A call whose meaning is clear from its shape (a read of
+  `run:<command>`, a duplicated line named by its shown anchor) is carried out, with a note, instead
+  of failing and costing a step. A failure stays only where the model has to decide something.
+- **The repository changes only on the user's word.** A git command that changes it (commit, add,
+  checkout, restore, reset, stash, branch, merge, rebase, clean, push) waits for the user's approval
+  of that command, in every mode; reading history runs at once.
 
 ## Rules for the model-facing text
 

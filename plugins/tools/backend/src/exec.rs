@@ -132,6 +132,19 @@ pub async fn execute_in(
     {
         canonical.notes.push(note);
     }
+    // A read of `run:<command>` (no such file) means the command: it runs now, one step instead
+    // of a refusal and a second call (seen: `read run:find . -name '*Test*.java'`).
+    if canonical.tool == "read"
+        && let Some(Value::String(path)) = canonical.args.get("path")
+        && let Some(command) = path.strip_prefix("run:").map(str::trim).filter(|command| !command.is_empty())
+        && !util::resolve(&session.workspace, path).exists()
+    {
+        let command = command.to_owned();
+        canonical.args.remove("path");
+        canonical.args.insert("command".to_owned(), Value::String(command));
+        canonical.tool = "run";
+        canonical.notes.push("a read of `run:<command>` ran as run".to_owned());
+    }
     let intent = canonical.args.get("intent").and_then(Value::as_str).unwrap_or("").to_owned();
     let mut out = match canonical.tool {
         "read" => exec_read(core, host, &session, &canonical.args).await,
@@ -151,6 +164,7 @@ pub async fn execute_in(
         out.code_hits.extend(hits);
     }
     next_step(core, &session, canonical.tool, &mut out);
+    read_hint(&session, canonical.tool, &canonical.args, &mut out);
     attach_code_skills(core, host.as_ref(), &session.context.session_id, &mut out).await;
     // What the repair changed in the call's meaning comes first (a rename says nothing).
     if !canonical.shown.is_empty() {
@@ -461,6 +475,27 @@ fn syntax_check(path: &Path, old: &str, new: &str) -> (Option<Vec<lang::SyntaxIs
     }
 }
 
+/// A run that printed a project file with `cat`/`head`/`tail`/`sed -n` among other commands (a
+/// plain one is answered as a read already) ends with where file text comes from: it runs, with a
+/// note, never refused (seen: `ls -la && cat bowling.js`, then edits without anchors to copy).
+fn read_hint(session: &Session<'_>, tool: &str, args: &Map<String, Value>, out: &mut Out) {
+    if tool != "run" {
+        return;
+    }
+    let Some(command) = args.get("command").and_then(Value::as_str) else { return };
+    if approval::terminal_read(command).is_some() {
+        return;
+    }
+    let scratch = util::scratch_dir(&session.workspace);
+    let printed = approval::printed_files(command).into_iter().any(|file| {
+        let absolute = util::resolve(&session.workspace, &file);
+        absolute.is_file() && util::is_inside(&absolute, &session.workspace) && !util::is_inside(&absolute, &scratch)
+    });
+    if printed {
+        out.output.push_str("Read project files with `read`: its lines carry the anchors `edit` needs.\n");
+    }
+}
+
 /// An edit result ends with the step to take next: run the check (seen: seven edits in a row from
 /// re-reading the file shown after each one, never run). After two edits of project files without a
 /// run it says so. A run starts the count again.
@@ -684,6 +719,71 @@ const WHOLE_AFTER_EDIT: usize = 300;
 
 /// Top-level definitions one edit may replace in an existing file.
 const MAX_DEFINITIONS_PER_EDIT: usize = 2;
+
+/// The one-line correction of a refused edit: each replace whose range ends one line before a
+/// closing line (`}`, `)`, `]`, `end`...) that its text also ends with gets `to` on that line. Only
+/// an edit that then passes every check (the definitions limit, the syntax check) is written, with
+/// a note naming the anchor used; None otherwise, and the refusal stands.
+#[allow(clippy::too_many_arguments)]
+fn retry_with_closing_line(
+    core: &Core,
+    host: &Arc<dyn Host>,
+    session: &Session<'_>,
+    doc: &Doc,
+    view: Option<&hashedit::View>,
+    ops: &[hashedit::EditOp],
+    in_scratch: bool,
+    (absolute, display, old, notes): (PathBuf, String, Option<String>, Vec<String>),
+) -> Option<Out> {
+    let closing = |text: &str| !text.is_empty() && (text.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ',')) || text == "end");
+    let mut fixed: Vec<hashedit::EditOp> = ops.to_vec();
+    let mut moved: Vec<String> = Vec::new();
+    for op in fixed.iter_mut() {
+        let last = op.lines.iter().rev().map(|line| line.trim()).find(|line| !line.is_empty()).unwrap_or("");
+        if op.kind != hashedit::OpKind::Replace || !closing(last) {
+            continue;
+        }
+        let Some(hashedit::LineRef::Tagged(to)) = &op.to else { continue };
+        let next = to.line + 1;
+        if doc.lines.get(next - 1).map(|line| line.trim()) != Some(last) {
+            continue;
+        }
+        let tag = doc.tag(next - 1);
+        let bytes = tag.as_bytes();
+        if bytes.len() != 2 {
+            continue;
+        }
+        op.to = Some(hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line: next, tag: [bytes[0], bytes[1]] }));
+        moved.push(format!("`{next}:{tag}`"));
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    let applied = hashedit::apply(doc, view, &fixed).ok()?;
+    let written: Vec<(usize, usize)> = fixed
+        .iter()
+        .filter(|op| op.lines.len() > 2)
+        .filter_map(|op| match (&op.at, &op.to) {
+            (hashedit::LineRef::Tagged(at), Some(hashedit::LineRef::Tagged(to))) => Some((at.line, to.line)),
+            (hashedit::LineRef::Tagged(at), _) => Some((at.line, at.line)),
+            _ => None,
+        })
+        .collect();
+    let text = old.clone().unwrap_or_default();
+    if !in_scratch
+        && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
+        && replaced.len() > MAX_DEFINITIONS_PER_EDIT
+    {
+        return None;
+    }
+    let new = applied.doc.to_text();
+    let mut out = commit(core, host, session, Commit { absolute, display, old, new, line_map: Some(applied.line_map), changed: applied.changed, notes });
+    if !out.ok {
+        return None;
+    }
+    out.output.insert_str(0, &format!("Applied with `to` as {}: the range ended one line before the closing line its text ends with.\n", moved.join(", ")));
+    Some(out)
+}
 
 /// Lines of a definition's body that hold code: after its header, neither blank nor only closing
 /// brackets. A stub (`pass`, `todo!()`, one `throw`) or a one-line function has at most one.
@@ -1130,6 +1230,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                         .push(format!("anchors from your earlier read, mapped through your own edits: {}", applied.relocations.join(", ")));
                 }
                 let new = applied.doc.to_text();
+                let retry = (absolute.clone(), display.clone(), current.as_ref().map(|_| text.clone()), notes.clone());
                 let old = current.map(|_| text);
                 let mut out = commit(
                     core,
@@ -1137,6 +1238,16 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                     session,
                     Commit { absolute, display, old, new, line_map: Some(applied.line_map), changed: applied.changed, notes },
                 );
+                // A range that ends one line before the closing line its text also ends with: the
+                // edit is written with `to` on that closing line when that is what makes it parse,
+                // said in a note (seen: the exact anchor named three times and the same range sent
+                // again each time). Any other refusal stays as it is.
+                if !out.ok
+                    && out.error_kind.as_deref() == Some("syntax_error")
+                    && let Some(fixed) = retry_with_closing_line(core, host, session, &doc, view.as_ref(), &ops, in_scratch, retry)
+                {
+                    return fixed;
+                }
                 // Operations whose anchors no longer named their line: the rest was written.
                 if !applied.skipped.is_empty() {
                     out.output.push_str(&applied.skipped);
@@ -1180,6 +1291,12 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 out
             }
             Err(rejection) => {
+                // The rejection shows the current lines with their anchors: those are the session's
+                // view now, so the same anchors sent again name exactly what was shown (seen: one
+                // ambiguous anchor sent back twice, refused the same way each time).
+                if matches!(rejection.error_kind, "ambiguous_anchor" | "stale_anchor") {
+                    core.read_state.record_read(session_id, &absolute, &hash, &doc.lines);
+                }
                 let mut out = Out::fail(rejection.error_kind, rejection.message);
                 out.display = json!({ "path": display, "problems": format!("{:?}", rejection.problems) });
                 out
@@ -1444,6 +1561,12 @@ const TEST_VIEW_BYTES: u64 = 1 << 20;
 /// for the rest. Any other output is `text` as given.
 fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
     let Some(whole) = whole else { return (text, artifact) };
+    // A runner that found nothing to run: what that means, and the step after it (seen: `npm test`
+    // run twice, then a search of the whole disk for the tests).
+    if crate::testout::found_none(&whole) {
+        let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+        return (format!("{text}{gap}[No tests ran: this command found none in the project. Add tests to the project, or check the change with a probe in `tmp/`.]\n"), artifact);
+    }
     let Some(summary) = crate::testout::present(&whole) else { return (text, artifact) };
     let id = match artifact {
         Some(id) => id,
@@ -1913,6 +2036,25 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let venv_path = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
     let writable = |path: &Path| core.sandbox.writable(path, &session.workspace, venv_path.as_deref(), &runtime.grants);
     let session_id = &session.context.session_id;
+    // Platform rule: the repository's state (commits, branches, files git restores) changes only on
+    // the user's word, never on the model's decision. Each such command waits for the user's
+    // approval of that exact command, in every mode; reading history runs at once (seen: a model's
+    // `git checkout <file>` threw away twenty minutes of its own work).
+    if let Some(git) = crate::approval::git_change(command) {
+        let class = format!("git_change:{git}");
+        // An approval runs the command once; the next one is asked again.
+        if !core.take_approval(session_id, &class) {
+            let mut out = Out::fail(
+                "needs_approval",
+                format!(
+                    "Not run: `{git}` changes the repository, which only the user decides; they have been asked about this command. Meanwhile read with git (status, diff, log, show, blame) and keep working with edit; a file's committed text is `git show HEAD:<path>`."
+                ),
+            );
+            out.needs_approval = true;
+            out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false } });
+            return out;
+        }
+    }
     // Past the sandbox: the model asks with `permission` (why the command needs it); the user decides
     // in every mode, and the approved command runs without the sandbox.
     let permission = args.get("permission").and_then(Value::as_str).map(str::trim).filter(|why| !why.is_empty());

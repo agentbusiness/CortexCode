@@ -61,6 +61,7 @@ pub async fn write(ctx: &Ctx, plugins: &[String], diffs: &[FileDiff]) -> Option<
         priority: Priority::Background,
         cache_key: Some("source-manager.summary".into()),
         max_tokens: Some(400),
+        idle_only: false,
         tools: Vec::new(),
         tool_choice: None,
         grammar: None,

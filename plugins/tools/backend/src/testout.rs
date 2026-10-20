@@ -44,7 +44,9 @@ pub fn summary(text: &str) -> Option<Tests> {
     static PYTEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^=+ (.*\b(?:passed|failed|errors?)\b.*) in [\d.]+s =+$").expect("valid"));
     static PYTEST_N: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)").expect("valid"));
     static CARGO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^test result: \w+\. (\d+) passed; (\d+) failed").expect("valid"));
-    static GO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(ok|FAIL)\s+\S+\s").expect("valid"));
+    // A package line as `go test` prints it: `ok`/`FAIL`, the package, then a time or `(cached)`
+    // (seen: a node script's `ok ...` lines read as a Go report).
+    static GO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(ok|FAIL)\s+\S+\s+(?:[\d.]+s|\(cached\))").expect("valid"));
     static GO_FAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*--- FAIL: (\S+)").expect("valid"));
     static GO_PASS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*--- PASS: ").expect("valid"));
     static JEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*Tests:\s+(.*)$").expect("valid"));
@@ -106,6 +108,17 @@ pub fn summary(text: &str) -> Option<Tests> {
         return Some(Tests { runner: "go", ran: passed + failed, failed, names: names(gotest(text)) });
     }
     None
+}
+
+/// Whether a runner reported that it found no tests to run (jest, vitest, pytest, unittest,
+/// go test, Gradle, node:test, mocha, cargo). A name filter that matched nothing is not this:
+/// the tests exist.
+pub fn found_none(text: &str) -> bool {
+    static NONE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?mi)No tests found|No test files found|\bno tests ran\b|\[no test files\]|:test NO-SOURCE|^# tests 0$|^\s*0 passing\b").expect("valid")
+    });
+    static FILTERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[1-9]\d* filtered out").expect("valid"));
+    NONE.is_match(text) || (!FILTERED.is_match(text) && summary(text).is_some_and(|tests| tests.ran == 0))
 }
 
 /// The compact form of a failing test run, or `None` when `text` is not a recognised runner's

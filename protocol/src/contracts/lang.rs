@@ -427,6 +427,10 @@ pub struct SymbolFact {
     pub handler: Option<RefTarget>,
     /// For tests: the framework (`rust`, `pytest`, `js`, `go`, `junit`, `testng`, `gtest`, `catch2`...).
     pub framework: Option<String>,
+    /// What its own body says in words, in order: comments and message strings (not those of
+    /// definitions nested in it, not its doc), [`NOTES_PER_SYMBOL`] at most.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// A name as written at a reference site: `name`, optionally qualified (`a::b`, `obj.`).
@@ -584,7 +588,22 @@ pub struct FileFacts {
     /// The file's leading text (what its file node is searched by), at most
     /// [`TEXT_EXCERPT_CHARS`] characters; none for binary files.
     pub text: Option<String>,
+    /// Comments written on their own lines directly above a call: what the caller says the call
+    /// does, by the call's line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_notes: Vec<LineNote>,
 }
+
+/// A comment on its own line(s) directly above `line` (1-based), as words.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LineNote {
+    pub line: u32,
+    pub text: String,
+}
+
+/// Body notes kept per definition ([`SymbolFact::notes`]) and characters kept per note.
+pub const NOTES_PER_SYMBOL: usize = 6;
+pub const NOTE_CHARS: usize = 160;
 
 /// Leading characters of a text file kept on its node for search: IronGraph's embedding reads a
 /// bounded input, and a file's beginning (title, header, first keys) is what says what it is.

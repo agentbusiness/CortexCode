@@ -109,6 +109,8 @@ struct Inner {
     /// When a plugin's skills last changed (ms, 0: not since the start): a session's prefix built
     /// before it is rebuilt on its next turn.
     skills_changed_ms: AtomicU64,
+    /// Learns every finished run, one at a time at idle priority (started on activation).
+    learner: std::sync::OnceLock<crate::learn::Learner>,
 }
 
 #[derive(Clone)]
@@ -129,6 +131,7 @@ impl Chatflow {
                 prewarms: Mutex::new(HashMap::new()),
                 warmed: Mutex::new(HashMap::new()),
                 skills_changed_ms: AtomicU64::new(0),
+                learner: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -248,6 +251,13 @@ impl Chatflow {
     }
 
     /// Keep `prewarm` as the session's (None ends the one kept; dropping a prewarm cancels it).
+    /// Queue a finished run for learning (nothing before activation started the learner).
+    fn learn(&self, session_id: &str, run_id: &str) {
+        if let Some(learner) = self.inner.learner.get() {
+            learner.learn(session_id, run_id);
+        }
+    }
+
     fn set_prewarm(&self, session_id: &str, prewarm: Option<crate::fit::Prewarm>) {
         if let Ok(mut prewarms) = self.inner.prewarms.lock() {
             match prewarm {
@@ -593,6 +603,7 @@ impl Chatflow {
                 }
             }
             journal.append(kinds::STATUS, json!({"state": state, "detail": detail, "run_id": run_id, "data_version": self.inner.data.get().version()})).await?;
+            self.learn(session_id, &run_id);
             let session_status = match state.as_str() {
                 "done" => SessionStatus::Done,
                 "cancelled" => SessionStatus::Cancelled,
@@ -1213,12 +1224,8 @@ impl Chatflow {
                 LoopOutcome { outcome: "failed".into(), summary: error.message.clone(), turns: 0, tool_calls: 0, changed_files: vec![], verified: None }
             }
         };
-        // The run goes into the graph, and a signalled run with a contract is asked what it showed
-        // about the project's world (docs/PROJECT-KNOWLEDGE-PLAN.md P5). Neither can fail the run.
-        let run_ref = crate::afteraction::record_run(&env, &journal, Some(&task.id), &outcome).await;
-        if let Err(error) = crate::afteraction::learn(&env, &mut journal, run_ref.as_deref(), &outcome, !task.contract.checks.is_empty()).await {
-            tracing::warn!(%error, run_id, "after-action knowledge skipped");
-        }
+        // The run goes into the graph (docs/PROJECT-KNOWLEDGE-PLAN.md P5); it cannot fail the run.
+        let _ = crate::afteraction::record_run(&env, &journal, Some(&task.id), &outcome).await;
         let result = AgentRunResult {
             outcome: outcome.outcome.clone(),
             summary: outcome.summary.clone(),
@@ -1230,6 +1237,7 @@ impl Chatflow {
         journal
             .append(kinds::STATUS, json!({"state": outcome.outcome, "detail": outcome.summary, "run_id": run_id, "task_id": task.id, "result": result, "data_version": env.data.version()}))
             .await?;
+        self.learn(&params.session_id, &run_id);
         let status = match outcome.outcome.as_str() {
             "done" => SessionStatus::Done,
             "cancelled" => SessionStatus::Cancelled,
@@ -1439,6 +1447,9 @@ impl Plugin for Chatflow {
         let this = self.clone();
         Box::pin(async move {
             this.start_data(&ctx);
+            // Learning from finished runs, first the ones no instance learned yet.
+            let learner = this.inner.learner.get_or_init(|| crate::learn::Learner::start(Host::new(ctx.clone()), this.inner.data.clone(), this.inner.park.clone()));
+            learner.backlog();
             // Resume in the background: activation must not wait for a predecessor's lock.
             let task_ctx = ctx.clone();
             tokio::spawn(async move {

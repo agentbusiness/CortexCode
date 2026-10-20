@@ -185,6 +185,9 @@ fn resolve(doc: &Doc, view: Option<&View>, reference: LineRef, op: usize, reloca
             match (direct, relocated) {
                 (true, None) => Ok(Resolved::Line(index)),
                 (true, Some(other)) if other == index => Ok(Resolved::Line(index)),
+                // Both readings name a line with the same text (a duplicated line): the line the
+                // anchor's number names now is the one shown last.
+                (true, Some(other)) if doc.lines.get(other) == doc.lines.get(index) => Ok(Resolved::Line(index)),
                 (true, Some(other)) => Err(Problem::Ambiguous { op, anchor: anchor.to_string(), direct: index + 1, relocated: other + 1 }),
                 (false, Some(other)) => {
                     relocations.push(format!("{anchor} -> line {}", other + 1));

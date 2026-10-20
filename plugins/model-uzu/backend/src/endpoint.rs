@@ -295,6 +295,7 @@ pub fn chat_params(
             cache_key,
             stop,
             max_tokens,
+            idle_only: false,
         },
         stream,
     ))

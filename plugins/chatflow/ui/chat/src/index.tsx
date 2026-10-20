@@ -213,10 +213,6 @@ function Chat() {
       if (!sessionId) return;
       await client.call('chatflow.decision.answer', { session_id: sessionId, seq, accept });
     },
-    answerKnowledge: async (seq, accept, text) => {
-      if (!sessionId) return;
-      await client.call('chatflow.knowledge.answer', { session_id: sessionId, seq, accept, ...(text !== undefined ? { text } : {}) });
-    },
     setPlanStatus: async (planId, status) => {
       if (!sessionId) return;
       await client.call('chatflow.plan.update', { session_id: sessionId, plan_id: planId, status });

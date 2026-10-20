@@ -87,6 +87,7 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
         cache_key: Some(spec.cache_key),
         stop: Vec::new(),
         max_tokens: None,
+        idle_only: false,
     };
     let params = serde_json::to_value(&params)?;
     dump(&spec.stage, &params);

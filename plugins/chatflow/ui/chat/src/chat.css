@@ -101,7 +101,6 @@
 #cc .cx-chat .cx-spec-field textarea{font:inherit;resize:vertical;}
 #cc .cx-chat .cx-decisions{margin:8px 0 0;padding-left:1.2em;grid-column:2;}
 #cc .cx-chat .cx-decided{color:var(--ink);margin:4px 0 0;}
-#cc .cx-chat .cx-knowledge-text{display:block;width:100%;box-sizing:border-box;margin:4px 0 0;font:inherit;color:var(--ink);background:transparent;border:1px solid var(--line);padding:4px 6px;resize:vertical;}
 #cc .cx-chat .cx-plan-goal{font-size:16px;color:var(--ink);margin:4px 0 0;}
 #cc .cx-chat .cx-plan-steps,#cc .cx-chat .cx-plan-risks{margin:8px 0 0;padding-left:1.4em;grid-column:2;}
 #cc .cx-chat .cx-plan-tasks li{padding:8px 0;border-top:1px solid var(--rule);}

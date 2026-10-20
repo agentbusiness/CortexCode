@@ -36,6 +36,7 @@ pub fn extract(src: &str, facts: &mut FileFacts) {
     facts.parse_errors = has_error(root);
     let mut walker = Walker { src, facts };
     walker.items(root, &Scope::default());
+    attach_notes(root, src, walker.facts);
 }
 
 impl<'a> Walker<'a> {

@@ -2,7 +2,8 @@
   "type": "object",
   "properties": {
     "analysis": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 1500
     },
     "goal": {
       "type": "string"
