@@ -21,6 +21,7 @@ pub mod flow;
 pub mod host;
 pub mod impact;
 pub mod journal;
+pub mod learn;
 pub mod live;
 pub mod llm;
 pub mod plan;

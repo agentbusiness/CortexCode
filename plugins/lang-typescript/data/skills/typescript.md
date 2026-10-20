@@ -44,12 +44,15 @@ npx --no -- tsc --noEmit            # type-check the whole project (uses tsconfi
 npm test                            # the package's test script
 npm test -- -t "adds"               # jest or vitest: tests whose name matches
 npm test -- src/sum.test.ts         # one file
-node --test --test-name-pattern="adds" test/sum.test.js   # node:test
+node --test tests/*.test.mjs         # node:test, every Node 18+ (the shell lists the files)
+node --test --test-name-pattern="adds" tests/sum.test.mjs  # node:test, by name
 npx --no -- mocha --grep "adds" test/sum.test.js          # mocha
 node --check src/a.js               # syntax check of plain JavaScript
 ```
 
-- **Which runner:** see `scripts.test` and `devDependencies` in `package.json`.
+- **Which runner:** see `scripts.test` and `devDependencies` in `package.json`; the project's own setup wins.
+- `npm test` says no tests were found: the project has none of its own. Add them (Checking your work, 1); never search the machine for others.
+- `node --test` takes files, not a folder: `node --test tests/` fails on Node 21 and later.
 - `vitest` alone watches; use `vitest run`. pnpm and yarn take arguments without `--`.
 - Never `tsc file.ts`: it ignores `tsconfig.json`.
 - **Running `.ts`:** Node 22.18+ runs `.ts` directly when relative imports carry extensions. Else (enum, namespace, parameter properties, extensionless imports): `npx --no -- tsx file.ts` if installed.
@@ -57,7 +60,7 @@ node --check src/a.js               # syntax check of plain JavaScript
 - A new package (`npm install <pkg>`) is a change to the user's project: ask before adding one.
 
 **Checking your work.**
-1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.test.mjs` with `node:test` and `node:assert`, importing the project's file by its path, run with `node --test tests/`; they stay in the project.
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.test.mjs` with `node:test` and `node:assert`, importing the project's file by its path, run with `node --test tests/*.test.mjs`; they stay in the project.
 2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
 3. Build a long input in code from its parts, never typed out: `Array(18).fill(0)`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
 4. Each check shows what the code returned when it fails: `assert.deepStrictEqual(got, want)` from `node:assert`.

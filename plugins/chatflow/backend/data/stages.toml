@@ -171,6 +171,16 @@ knowledge_items_per_turn = 3
 knowledge_per_turn = 5
 # The project's knowledge brief in the byte-stable system prompt (tokens; 0 = none) (P4).
 brief_tokens = 1024
+# Lessons (global, learned from earlier runs) shown with that note, best first; 0 = none.
+lessons_per_turn = 4
+# Episodes (a failure and what came after it) one run is learned from, at most.
+learn_episodes_per_run = 6
+# A new lesson this similar to a stored one (search score) is that lesson learned again. Measured
+# with the memory plugin's embedding: a lesson against itself 0.85, rewordings of one lesson
+# 0.57-0.72, different lessons 0.29-0.49.
+lesson_merge_score = 0.56
+# Earlier runs without a learned mark taken up after a run is learned (the backlog).
+learn_backlog_runs = 3
 # The project's own contract (its AGENTS.md, else CLAUDE.md) in the system prompt, in characters;
 # 0 = none.
 contract_chars = 6000
@@ -274,9 +284,17 @@ schema = "schemas/decisions.json"
 effort = "none"
 sampling = "decision"
 
-# Knowledge the latest message stated about the project's world, proposed for the user to keep.
+# Knowledge the latest message stated about the project's world, kept at once.
 [stage.KNOWLEDGE]
 rules = "knowledge"
 schema = "schemas/knowledge.json"
+effort = "none"
+sampling = "decision"
+
+# After a turn, one call per episode (a failure and what came after it), at idle priority:
+# the lesson it teaches for other projects, or none.
+[stage.LEARN]
+rules = "learn"
+schema = "schemas/learn.json"
 effort = "none"
 sampling = "decision"

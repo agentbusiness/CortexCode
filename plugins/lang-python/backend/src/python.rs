@@ -34,6 +34,7 @@ pub fn extract(path: &str, src: &str, facts: &mut FileFacts) {
     let test_file = file_name.starts_with("test_") || file_name.ends_with("_test.py") || path.split('/').any(|seg| seg == "tests" || seg == "test");
     let mut walker = Walker { src, facts, router_prefixes: HashMap::new(), test_file };
     walker.block(root, None, "", None);
+    attach_notes(root, src, walker.facts);
 }
 
 impl<'a> Walker<'a> {

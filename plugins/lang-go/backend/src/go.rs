@@ -67,6 +67,7 @@ pub fn extract(path: &str, src: &str, facts: &mut FileFacts) {
         }
     }
     walker.attach_methods();
+    attach_notes(root, src, walker.facts);
 }
 
 /// Go export rule: an identifier is exported when its first character is an upper-case letter.

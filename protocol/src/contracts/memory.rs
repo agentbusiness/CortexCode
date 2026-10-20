@@ -53,6 +53,7 @@ pub mod methods {
     pub const SKILLS: &str = "memory.skills";
     /// [`super::super::skills::SkillParams`] -> [`super::super::skills::SkillResult`]: one skill's text.
     pub const SKILL: &str = "memory.skill";
+    /// Store what a symbol does on its node (`description`, stale once its body changes).
     pub const DESCRIBE: &str = "memory.describe";
     /// Symbols that still need a description, most central first.
     pub const UNDESCRIBED: &str = "memory.undescribed";
@@ -145,6 +146,9 @@ pub mod methods {
     /// project should know, one line per item, within a token budget: accepted decisions, user
     /// facts, concepts by how much code they bind, open questions.
     pub const KNOWLEDGE_BRIEF: &str = "memory.knowledge.brief";
+    /// [`super::KnowledgeCountParams`] -> [`super::KnowledgeItem`]: add to an item's `seen`,
+    /// `helped` and `hurt` counters (how a lesson fared where it was shown).
+    pub const KNOWLEDGE_COUNT: &str = "memory.knowledge.count";
 }
 
 pub mod topics {
@@ -337,6 +341,8 @@ pub struct SymbolRef {
     pub end_line: u32,
     #[serde(default)]
     pub signature: String,
+    /// What it does: written by `memory.describe`, else the index's summary (the words around it:
+    /// doc, callers' comments, test names, docs, its own comments and messages), first line first.
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -381,6 +387,8 @@ pub struct SymbolParams {
     pub name: String,
 }
 
+/// What the graph knows of a symbol. Its code is not here: it is read from the file on disk at
+/// `symbol.path`, lines `start_line..=end_line`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SymbolDetail {
     pub symbol: SymbolRef,
@@ -388,9 +396,6 @@ pub struct SymbolDetail {
     pub params: Vec<ParamInfo>,
     #[serde(default)]
     pub returns: Option<String>,
-    /// The code text of the definition.
-    #[serde(default)]
-    pub code: Option<String>,
     #[serde(default)]
     pub callers: u32,
     #[serde(default)]
@@ -1118,7 +1123,7 @@ pub struct NoteRemoveResult {
 
 /// The kinds of a [`KnowledgeItem`] and the states each kind may be in.
 pub mod knowledge {
-    pub const KINDS: &[&str] = &[DESCRIPTION, CONCEPT, FACT, DECISION, HYPOTHESIS, QUESTION];
+    pub const KINDS: &[&str] = &[DESCRIPTION, CONCEPT, FACT, DECISION, HYPOTHESIS, QUESTION, LESSON];
     /// What the software is, in a short paragraph without code (what it does, its core features,
     /// how it is built, run and tested): one per project, written by the model from the
     /// repository's own documents, shown first in the brief.
@@ -1133,6 +1138,10 @@ pub mod knowledge {
     pub const HYPOTHESIS: &str = "hypothesis";
     /// A known unknown.
     pub const QUESTION: &str = "question";
+    /// How to work, learned from what happened in a run (a tool's behaviour, a language's trap,
+    /// an approach that worked or failed): one sentence, kept in the global scope so every project
+    /// gets it; its name starts with its anchor (`tool:edit: ...`, `lang:rust: ...`, `approach: ...`).
+    pub const LESSON: &str = "lesson";
 
     /// States shared by every kind.
     pub const WITHDRAWN: &str = "withdrawn";
@@ -1141,7 +1150,7 @@ pub mod knowledge {
     /// refuted`; question: `open | answered`.
     pub fn states(kind: &str) -> &'static [&'static str] {
         match kind {
-            DESCRIPTION | CONCEPT | FACT => &["asserted", SUPERSEDED, WITHDRAWN],
+            DESCRIPTION | CONCEPT | FACT | LESSON => &["asserted", SUPERSEDED, WITHDRAWN],
             DECISION => &["accepted", SUPERSEDED, WITHDRAWN],
             HYPOTHESIS => &["open", "supported", "refuted", SUPERSEDED, WITHDRAWN],
             QUESTION => &["open", "answered", SUPERSEDED, WITHDRAWN],
@@ -1214,6 +1223,14 @@ pub struct KnowledgeItem {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub links: Vec<KnowledgeLink>,
+    /// How often the item was learned again, and how it fared where it was shown: the error it
+    /// is about did not come back in a run that went well (`helped`), or came back (`hurt`).
+    #[serde(default)]
+    pub seen: u32,
+    #[serde(default)]
+    pub helped: u32,
+    #[serde(default)]
+    pub hurt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     /// Why it was withdrawn.
@@ -1334,6 +1351,20 @@ pub struct KnowledgeSupersedeParams {
     pub id: String,
     /// The item that supersedes it.
     pub by: String,
+}
+
+/// [`methods::KNOWLEDGE_COUNT`] parameters: what to add to each counter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeCountParams {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub id: String,
+    #[serde(default)]
+    pub seen: u32,
+    #[serde(default)]
+    pub helped: u32,
+    #[serde(default)]
+    pub hurt: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

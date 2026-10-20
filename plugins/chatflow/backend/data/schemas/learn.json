@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "properties": {
+    "lesson": {
+      "type": "string",
+      "maxLength": 320
+    },
+    "anchor": {
+      "enum": [
+        "@anchors"
+      ]
+    },
+    "kind": {
+      "enum": [
+        "tool-use",
+        "pitfall",
+        "approach",
+        "language"
+      ]
+    },
+    "useful": {
+      "enum": [
+        "no",
+        "yes"
+      ]
+    }
+  },
+  "required": [
+    "lesson",
+    "anchor",
+    "kind",
+    "useful"
+  ],
+  "additionalProperties": false
+}

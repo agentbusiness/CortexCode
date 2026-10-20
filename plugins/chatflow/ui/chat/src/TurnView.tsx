@@ -5,7 +5,7 @@ import { Attachments } from './Attachments';
 import { ChangeCard } from './Change';
 import { Edits, type EditedFile } from './Edits';
 import { DECISION, KNOWLEDGE, PLAN, SPEC } from './ideation';
-import { DecisionCard, KnowledgeCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
+import { DecisionCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
 import { MarkdownBlock } from './Markdown';
 import { routeText, str, type Block, type Step, type Turn } from './transcript';
 
@@ -318,8 +318,9 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
       return <PlanCard entry={entry} actions={actions} />;
     case DECISION:
       return <DecisionCard entry={entry} actions={actions} />;
+    // Knowledge is kept at once; the run's learned line counts it.
     case KNOWLEDGE:
-      return <KnowledgeCard entry={entry} actions={actions} />;
+      return null;
     default:
       return null;
   }

@@ -7,7 +7,7 @@ One symbol or file: `read` a URI. Questions about the whole repository: a Cypher
 | URI | Gives |
 |---|---|
 | `graph://search/<words>` (`?kinds=function,method`, `?limit=10`) | code by name, then by meaning (at most 10) |
-| `symbol://<name>` | a symbol's signature, description, caller and callee counts, code |
+| `symbol://<name>` | a symbol's signature, description, caller and callee counts, its code from the file |
 | `graph://used-by/<name>` (every place that uses it), `graph://uses/<name>` (everything it uses) (`?depth=2`) | each call site with its line |
 | `graph://impact/<name>` or `graph://impact?paths=src/a.rs,src/b.rs` (`?depth=3`) | call sites, tests, tasks and rules a change affects |
 | `graph://path/<name>/<name>` (`?max_hops=8`) | how one symbol reaches another |
@@ -25,7 +25,7 @@ EOF
 - Output: `{"columns": [...], "rows": [[...]]}`. Read-only: a write is refused.
 - `workspace` adds your own edited files to the graph.
 - Strings in single quotes. Parameters: `\$name` in this heredoc plus `"params":{"name":"..."}`.
-- Return properties, not whole nodes (`code` holds whole bodies). Add `LIMIT`.
+- Return properties, not whole nodes. Add `LIMIT`. Code is not in the graph: read `path:start_line-end_line`.
 - Zero rows: check the spelling against the schema below. Paths are repository-relative.
 
 ## 3. Layers
@@ -50,7 +50,7 @@ Labels:
 
 Properties:
 - All: `sid kind name qname`. Code and files also: `path start_line end_line`.
-- `Sym`: `language signature doc code return_type type_text value is_async is_static exported visibility decorators param_count body_hash`. `Route` adds `http_method route_path framework`.
+- `Sym`: `language signature doc return_type type_text value is_async is_static exported visibility decorators param_count body_hash description described_hash summary`. `Route` adds `http_method route_path framework`.
 - `File`: `language line_count size package parse_errors note` (`note`: why a file was read as text).
 - `Param`: `position type_text default_value optional variadic`.
 - `Dependency`: `ecosystem installed_version`.
@@ -105,7 +105,7 @@ USE LAYER OBSERVED MATCH (f:File {path: 'src/db.ts'})-[:MODIFIED_IN]->(c:Commit)
 // documentation sections that mention a symbol
 USE LAYER OBSERVED MATCH (s:Section)-[:MENTIONS]->(c:Code {name: 'save_order'}) RETURN s.path, s.signature, s.start_line
 // descriptions gone stale after a code change
-USE LAYER OBSERVED, KNOWLEDGE MATCH (d:Description)-[:DESCRIBES]->(s:Sym) WHERE d.body_hash <> s.body_hash RETURN s.sid LIMIT 200
+USE LAYER OBSERVED MATCH (s:Sym) WHERE s.description IS NOT NULL AND s.described_hash <> s.body_hash RETURN s.sid LIMIT 200
 // decisions and facts about a file's code
 USE LAYER OBSERVED, KNOWLEDGE MATCH (k:Knowledge)-[r]->(c:Code {path: 'server/store.py'}) WHERE k.state IN ['asserted', 'accepted'] RETURN k.kind, k.name, k.text, type(r), c.sid
 // open tasks and rules on a file's code

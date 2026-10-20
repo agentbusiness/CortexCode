@@ -316,6 +316,20 @@ impl Core {
         let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, workspace));
     }
 
+    /// Use up a one-time approval (a repository change the user allowed once): true when it was
+    /// given, and it is gone afterwards.
+    pub fn take_approval(&self, session: &str, class: &str) -> bool {
+        let mut approvals = match self.approvals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let taken = approvals.get_mut(session).is_some_and(|entry| entry.remove(class));
+        if taken && let Ok(bytes) = serde_json::to_vec(&*approvals) {
+            let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
+        }
+        taken
+    }
+
     pub fn approved(&self, session: &str) -> BTreeSet<String> {
         match self.approvals.lock() {
             Ok(guard) => guard.get(session).cloned().unwrap_or_default(),

@@ -599,6 +599,16 @@ struct Generation<B: Backend> {
     stop_tokens: Vec<u64>,
 }
 
+/// How long the engine must have served nothing else before an idle-only generation may take
+/// room the way any request does (spill or drop an idle conversation, drop a shared block): until
+/// then it uses only free room, so work under way and its caches are never touched.
+const IDLE_ROOM_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// An idle-only generation (learning after a turn), as opposed to an idle-only prewarm.
+fn idle_generation(request: &Request) -> bool {
+    request.idle_only && !matches!(request.work, Work::Prewarm)
+}
+
 struct Worker<B: Backend> {
     config: EngineConfig,
     engine: Arc<Engine<B>>,
@@ -636,6 +646,10 @@ struct Worker<B: Backend> {
     next_id: u64,
     /// Shared leading blocks, least recently used dropped first.
     seeds: Vec<Seed<B>>,
+    /// When the engine last had other work than idle-only generations ([`IDLE_ROOM_AFTER`]).
+    last_work: Instant,
+    /// The idle-only request whose wait for room was last logged.
+    idle_wait_logged: Option<u64>,
 }
 
 fn class(priority: Priority) -> usize {
@@ -706,6 +720,8 @@ impl<B: Backend> Worker<B> {
             embeddings: VecDeque::new(),
             next_id: 1,
             seeds: Vec::new(),
+            last_work: Instant::now(),
+            idle_wait_logged: None,
         };
         worker.publish_view();
         worker
@@ -734,7 +750,9 @@ impl<B: Backend> Worker<B> {
             }
             self.spill_idle();
             // An idle worker also wakes when the next resident conversation is due to be spilled.
-            let wake = [unload_at.filter(|_| self.vision.is_some()), self.next_spill()].into_iter().flatten().min();
+            // ... and when an idle-only generation's wait for the quiet period ends.
+            let idle_room = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER);
+            let wake = [unload_at.filter(|_| self.vision.is_some()), self.next_spill(), idle_room].into_iter().flatten().min();
             let command = if idle && !self.shutting_down {
                 let received = match wake {
                     Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
@@ -934,6 +952,10 @@ impl<B: Backend> Worker<B> {
     }
 
     fn admit(&mut self) {
+        // The last moment the engine had other work than idle-only generations.
+        if self.active.iter().map(|active| &*active.request).chain(self.waiting.iter().map(|request| &**request)).any(|request| !idle_generation(request)) {
+            self.last_work = Instant::now();
+        }
         // Drop requests whose caller is gone before they start.
         let mut index = 0;
         while index < self.waiting.len() {
@@ -985,6 +1007,11 @@ impl<B: Backend> Worker<B> {
         // Work for one conversation stops the idle-only prewarms of the others, and an idle-only
         // prewarm waits while another conversation is served.
         let key = self.waiting[position].key.clone();
+        // Quiet long enough, an idle-only generation is placed like any request (it still waits
+        // while another conversation is served); before that, only in free room.
+        if idle_generation(&self.waiting[position]) && self.last_work.elapsed() < IDLE_ROOM_AFTER {
+            return self.place_idle(position, &key);
+        }
         if self.waiting[position].idle_only {
             if self.serving_other(&key) {
                 return Placement::Wait;
@@ -1097,8 +1124,30 @@ impl<B: Backend> Worker<B> {
 
     /// Stop the running idle-only prewarms of conversations other than `key` (at their next step;
     /// what they prefilled is kept).
+    /// An idle-only generation (learning after a turn) takes nothing from anyone: it starts only
+    /// while no other request runs or waits, on its own conversation's slot or an empty one, in the
+    /// room the pool has (no conversation is spilled for it). Once running, the scheduling class
+    /// puts every other request first.
+    fn place_idle(&mut self, position: usize, key: &str) -> Placement {
+        let others = self.active.iter().any(|active| active.request.key != key) || self.waiting.iter().enumerate().any(|(index, other)| index != position && !other.idle_only);
+        let slot = self.slots.iter().position(|slot| slot.busy.is_none() && slot.key.as_deref() == Some(key)).or_else(|| self.slots.iter().position(|slot| slot.busy.is_none() && slot.key.is_none()));
+        let reserve = self.reserve_for(&self.waiting[position]);
+        let Some(slot) = slot else { return Placement::Wait };
+        let need = reserve + if self.slots[slot].state.is_none() { self.config.conversation_tokens } else { 0 };
+        if others || self.pool_used() + need > self.config.pool_tokens {
+            if !others && self.idle_wait_logged != Some(self.waiting[position].id) {
+                self.idle_wait_logged = Some(self.waiting[position].id);
+                tracing::info!(pool_used = self.pool_used(), need, pool = self.config.pool_tokens, seeds = self.seed_tokens(), vision = self.vision_tokens(), "an idle-only request waits for room in the pool");
+            }
+            return Placement::Wait;
+        }
+        let Some(request) = self.waiting.remove(position) else { return Placement::Wait };
+        self.start(slot, request, reserve);
+        Placement::Admitted
+    }
+
     fn stop_idle_prewarms(&mut self, key: &str) {
-        for active in self.active.iter().filter(|active| active.request.idle_only && active.request.key != key) {
+        for active in self.active.iter().filter(|active| active.request.idle_only && matches!(active.request.work, Work::Prewarm) && active.request.key != key) {
             active.request.stop.store(true, Ordering::SeqCst);
         }
     }
@@ -1664,7 +1713,8 @@ impl<B: Backend> Worker<B> {
 
     fn finish(&mut self, index: usize, finish: Finish) {
         let active = self.release(index);
-        if active.request.shared_only {
+        // An idle-only generation leaves nothing in the pool, like a leading block's prewarm.
+        if active.request.shared_only || (active.request.idle_only && !matches!(active.request.work, Work::Prewarm)) {
             // The block lives on as a seed (when it was reached); no conversation has this key.
             self.clear_slot(active.slot);
             self.engine.trim_buffer_cache();

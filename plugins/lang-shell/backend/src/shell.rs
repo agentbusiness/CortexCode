@@ -24,6 +24,7 @@ pub fn extract(src: &str, facts: &mut FileFacts) {
     collect_assigned(root, src, &mut assigned);
     let mut walker = Walker { src, facts, assigned };
     walker.block(root, None);
+    attach_notes(root, src, walker.facts);
 }
 
 struct Walker<'a> {

@@ -2,6 +2,10 @@ Git and GitHub: commit, branch, resolve conflicts, undo or recover, review a dif
 
 ## 1. Only when the user asks
 
+Any git command that changes the repository (commit, add, checkout, restore, reset, stash, branch, merge, rebase, clean, push, tag) runs only when the user asked for it: the user approves each one before it runs. Reading (`status`, `diff`, `log`, `show`, `blame`) runs at once. A file's committed text: `git show HEAD:<path>`, then edit.
+
+Never on your own, even when asked to tidy up:
+
 - `reset --hard`, `clean -fd`
 - `restore` or `checkout --` on files you did not change
 - `stash drop`/`clear`, `branch -D`, deleting tags
@@ -57,14 +61,7 @@ Check each hunk against:
 - **Compatibility**: public API, CLI flags, config keys, file and wire formats unchanged unless asked.
 - **Stale text**: comments, docs, help text still describing old behaviour.
 
-Prove the new test tests the change:
-
-```bash
-git stash push -- <changed-source-file>
-<one-test-command>          # must fail
-git stash pop
-<one-test-command>          # must pass
-```
+Prove the new test tests the change: run it before the change (it must fail), then after (it must pass).
 
 Then run fresh: the decision's checks, build, lint, touched modules' tests. `read diagnostics://<path>` per edited file: no new errors. Report commands and results; never claim a check you did not run.
 
@@ -149,21 +146,7 @@ git diff --check                                         # leftover markers, whi
 | undo a pushed merge | `git revert --no-edit -m 1 <merge-sha>` (keeps first parent) |
 | restore a file as of a commit | `git restore --source <sha> -- <path>` |
 
-## 9. Checkpoint and roll back
-
-Save a stash entry; files stay (all become staged; no sha = nothing to save):
-
-```bash
-git add -A && cp=$(git stash create "cp: <step>") && git stash store -m "cp: <step>" "$cp" && echo "$cp"
-```
-
-Shelve the attempt, return to a checkpoint:
-
-```bash
-git stash push -u -m "dead end: <why>" && git stash apply --index <cp-sha>
-```
-
-## 10. Recover
+## 9. Recover
 
 | Lost | Recover |
 |---|---|
@@ -173,7 +156,7 @@ git stash push -u -m "dead end: <why>" && git stash apply --index <cp-sha>
 | an old file version | `git show <sha>:<path>`; commits that touched it: `git log --oneline --follow -- <path>` |
 | a state you do not understand | stop, `git status`, report; never force |
 
-## 11. History questions
+## 10. History questions
 
 ```bash
 git log --oneline -S 'parse_date' -- src/        # commits adding or removing that string
@@ -185,13 +168,13 @@ git show --stat <sha>; git show <sha> -- <path>
 
 Which commit broke it: `git bisect` in `skill://skills-engineering/debugging`.
 
-## 12. Agent workspace (background task)
+## 11. Agent workspace (background task)
 
 - The host commits and merges your work once the task's contract (check commands) passes.
 - Do not commit, branch, rebase or push. Scratch files: `$TMPDIR` (write them with `edit`).
 - A conflict handed back: resolve as in section 7, rerun the contract.
 
-## 13. GitHub with gh
+## 12. GitHub with gh
 
 Needs network and login: `gh auth status` first; on failure report it, never log in. `gh api` fills `{owner}` and `{repo}` itself.
 
@@ -244,7 +227,7 @@ Review someone else's PR (post only when asked):
 3. Findings: `path:line`, what is wrong, a triggering input, the fix. Blocking first (wrong result, data loss, security, broken API); style last, only what linters miss.
 4. Post: `gh pr review 123 --comment --body-file <file>` (or `--request-changes`, `--approve`); one comment: `gh pr comment 123 --body-file <file>`.
 
-## 14. Secrets
+## 13. Secrets
 
 Before committing, this must print nothing:
 

@@ -430,6 +430,16 @@ async fn execute(host: &Host, scope: &Scope, req: ReadReq, call_id: String) -> D
                 paths.push(path.to_owned());
             }
             let mut output = render(&req.tool, &value);
+            // A symbol's code comes from its file on disk, rendered as the model's own
+            // `symbol://` read (anchors, repaired index); that read carries its knowledge lines.
+            if req.tool == memory_methods::SYMBOL
+                && let Some(name) = req.args.get("name").and_then(Value::as_str)
+                && let Ok(read) = host.ctx().call(tools_methods::READ, file_read_args(scope, "", &format!("symbol://{name}"))).await
+                && let Ok(read) = serde_json::from_value::<ReadResult>(read)
+            {
+                output = read.text;
+                sids.clear();
+            }
             // What the project knows about the code served rides along with it, decided by the
             // graph's edges (docs/PROJECT-KNOWLEDGE-PLAN.md P2); nothing when memory has none.
             for line in knowledge_lines(host, scope, &sids, &paths).await {
@@ -503,9 +513,6 @@ pub fn render(tool: &str, value: &Value) -> String {
                     if !detail.tests.is_empty() {
                         let tests: Vec<String> = detail.tests.iter().map(|test| test.qname.clone()).collect();
                         text.push_str(&format!("\nTested by: {}", tests.join(", ")));
-                    }
-                    if let Some(code) = detail.code.as_deref().filter(|code| !code.is_empty()) {
-                        text.push_str(&format!("\n```\n{}\n```", code.trim_end()));
                     }
                     text
                 })

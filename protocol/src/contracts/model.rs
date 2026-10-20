@@ -331,6 +331,11 @@ pub struct ChatParams {
     /// None = no cap (the model stops by itself or at context end).
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Work nobody waits for (learning after a turn): it starts only while the model serves no
+    /// other request, only in a free slot, never drops another conversation's cache for room, and
+    /// leaves nothing in the pool when it ends. Once running, any other request goes first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

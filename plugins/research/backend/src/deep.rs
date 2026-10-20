@@ -434,6 +434,7 @@ impl Run {
             cache_key: Some(format!("research-{}", self.state.job.job_id)),
             stop: Vec::new(),
             max_tokens: Some(self.config().model_max_tokens),
+            idle_only: false,
         };
         let result = self.jobs.tools.chat(params, self.cancel.clone()).await.map_err(|error| {
             if error.code == codes::CANCELLED {

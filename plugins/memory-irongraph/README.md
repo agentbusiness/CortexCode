@@ -77,9 +77,11 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   `IMPORTS`, `EXPORTS`, `DEFINES`, `CONTAINS`, `HANDLES`, `REQUESTS {method, url}` (fetch/axios →
   FastAPI/Flask/axum/actix/Express routes), `INVOKES {channel}` (Electron/Tauri IPC), `RUNS`
   (npm/cargo/pyproject commands → scripts → functions), `READS_CONFIG`, `TESTS`, `DEPENDS_ON`.
-- **KNOWLEDGE** — derived facts: model-written `Description` nodes (`DESCRIBES` a symbol; stale
-  when the symbol's `body_hash` changes; they follow a symbol through renames), and cited notes:
-  `Note` (`CITES` a `Source {url}`; see Notes).
+- **KNOWLEDGE** — derived facts: cited notes, `Note` (`CITES` a `Source {url}`; see Notes), and
+  knowledge items. A symbol's model-written description is not a node: it is the symbol's own
+  `description` with `described_hash` (the `body_hash` it was written for; stale when they differ),
+  written by `memory.describe`. The indexer never writes these properties, so they stay through
+  re-indexing and renames and go with the symbol when it is deleted.
 - **WORKSPACE** — `Task` (with `ContractCheck` nodes, `HAS_SUBTASK`, `DEPENDS_ON`, `TOUCHES` code),
   `BoardMessage` (`REFERS_TO`), `Agent` (`WORKS_ON`), `Rule` (`CONSTRAINS` code; CORTEX.md items
   have source `cortex_md`), `Style`, `Run` (code `MODIFIED_IN` run), settings, registry.
@@ -144,15 +146,16 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   plugin's `lang-markdown` backend (`lang@1`) covers `*.md`, `*.mdx`, `*.markdown`, `README`,
   `CHANGELOG`, `CONTRIBUTING`, `AGENTS` and `CLAUDE`; every heading is a `section` symbol (label
   `Code:Section`, not `Sym`, so sections stay out of the repository map and name lookups) with the
-  heading path as `signature`, its own text as `code` and `doc`, nested by level (a section's span
+  heading path as `signature`, its first paragraph as `doc`, nested by level (a section's span
   encloses its subsections). A backtick identifier in a section's prose is a `Mention` reference:
   `model::Index::resolve_mention` links it (`MENTIONS {line, confidence}`) to the one symbol of the
   project with that name, else the one with that qualified name; several or none link nothing.
   `memory.search` ranks sections with the code (kind `section`). `tests/docs.rs`.
 - Third-party code is not mapped: only the project's own files are indexed, and `ExternalSymbol`
   nodes an earlier version wrote (its offline docs layer) are removed when a project opens.
-- Semantic search is IronGraph's automatic embedding index (`semantic_nodes`) bound to `Sym` and
-  `Description` nodes, after exact name / qualified name / sid matches. No embedder is added, so a
+- Semantic search is IronGraph's automatic embedding index (`semantic_nodes`) bound to `Sym`,
+  `File` and `Section` nodes (a symbol's description is on its node), after exact name / qualified
+  name / sid matches. No embedder is added, so a
   faster IronGraph embedding engine arrives with a version bump (as Bekko a8m did in 0.1.8). `memory.project.status.embedding`
   reports whether the latest written symbols are already retrievable.
 - Repository map (`memory.repo_map`, `src/queries.rs`): PageRank-ranked paths and signatures,
@@ -161,6 +164,30 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   answers). Files the repository declares `linguist-vendored` or `linguist-generated` in its
   `.gitattributes` (or `.git/info/attributes`) are left out of the map, not out of the graph
   (`src/attributes.rs`, git's precedence rules).
+
+## Summaries (what a definition does, without a model)
+
+Every definition gets a `summary` (and `summary_hash`) from the words already written around it,
+composed in `src/summary.rs`, first line first (what one-line results show):
+
+1. its doc comment's first sentence;
+2. `Callers:` comments on their own lines right above calls to it (the language plugins'
+   `line_notes`);
+3. `Tests:` what its tests' names say beyond its own name (`TESTS` edges);
+4. `Docs:` heading paths of documentation sections that mention it (`MENTIONS` edges);
+5. `Says:` its own body's comments and message strings (the language plugins' `notes`; not those
+   of nested definitions, not its doc).
+
+The language plugins gather `notes` and `line_notes` in one walk of the tree
+(`cc_lang_kit::syntax::attach_notes`, linear in the tree): comment and string nodes by kind, each
+given to the innermost definition by byte range; only worded text is kept (two or more words,
+mostly letters, no statement punctuation at the end), at most 6 notes of 160 characters.
+
+A sync recomposes only the summaries whose words may have changed: the definitions of changed
+files, and those the words of re-resolved or deleted files reach, now or before. It writes only
+those whose text hash differs from the stored one, on the node's own write when there is one (one
+embedding). The first sync of a tree loads the stored hashes and considers every definition.
+Results show `description` when one was written (`memory.describe`), else `summary`.
 
 ## Workspaces (BRAINSTORM §4.3)
 

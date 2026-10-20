@@ -40,11 +40,11 @@ pub const CALL_LIKE: &[&str] = &["CALLS", "INSTANTIATES", "RENDERS", "USES_HOOK"
 /// Projection of a node into the columns a [`SymbolRef`] needs.
 pub fn sym_cols(var: &str) -> String {
     format!(
-        "{v}.sid, {v}.kind, {v}.name, {v}.qname, coalesce({v}.path, {v}.pkg_path), {v}.start_line, {v}.end_line, {v}.signature, {v}.doc, coalesce({v}.language, {v}.ecosystem)",
+        "{v}.sid, {v}.kind, {v}.name, {v}.qname, coalesce({v}.path, {v}.pkg_path), {v}.start_line, {v}.end_line, {v}.signature, {v}.doc, coalesce({v}.language, {v}.ecosystem), coalesce({v}.description, {v}.summary)",
         v = var
     )
 }
-const SYM_WIDTH: usize = 10;
+const SYM_WIDTH: usize = 11;
 
 fn s(row: &[Value], i: usize) -> String {
     row.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned()
@@ -64,29 +64,13 @@ pub fn sym_from(row: &[Value], at: usize) -> SymbolRef {
         start_line: u(row, at + 5),
         end_line: u(row, at + 6),
         signature: s(row, at + 7),
-        description: None,
+        description: row.get(at + 10).and_then(|v| v.as_str()).filter(|text| !text.is_empty()).map(str::to_owned),
         doc: row.get(at + 8).and_then(|v| v.as_str()).map(str::to_owned),
         language: s(row, at + 9),
     }
 }
 
 impl CodeTree {
-    /// Attach model-written descriptions (KNOWLEDGE) to symbol refs.
-    pub async fn describe_refs(&self, refs: &mut [&mut SymbolRef]) -> Result<(), RpcError> {
-        let sids: Vec<String> = refs.iter().map(|r| r.sid.clone()).collect::<HashSet<_>>().into_iter().collect();
-        if sids.is_empty() {
-            return Ok(());
-        }
-        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (d:Description {{sid: s}}) RETURN d.sid, d.text", layer::CODE_READ), params! { "sids" => sids }).await?;
-        let map: HashMap<String, String> = rows.rows.iter().map(|r| (s(r, 0), s(r, 1))).collect();
-        for r in refs.iter_mut() {
-            if let Some(text) = map.get(&r.sid) {
-                r.description = Some(text.clone());
-            }
-        }
-        Ok(())
-    }
-
     /// Resolve a sid, qualified name, path or bare name to symbol sids.
     pub async fn resolve_name(&self, name: &str) -> Result<Vec<SymbolRef>, RpcError> {
         let cols = sym_cols("n");
@@ -144,10 +128,10 @@ impl CodeTree {
                 }
             }
         }
-        // IronGraph semantic search over the automatic node index, bound to code symbols and their
-        // descriptions (bind first, then rank: the eligible corpus is chosen before SEARCH).
+        // IronGraph semantic search over the automatic node index, bound to code symbols (their
+        // descriptions are on them) and files (bind first, then rank: the corpus is chosen before SEARCH).
         // Document sections (`lang-markdown`, label `Section`, kind `section`) rank with the code.
-        let label_filter = if include_external { "n:Sym OR n:Description OR n:File OR n:Section OR n:ExternalSymbol" } else { "n:Sym OR n:Description OR n:File OR n:Section" };
+        let label_filter = if include_external { "n:Sym OR n:File OR n:Section OR n:ExternalSymbol" } else { "n:Sym OR n:File OR n:Section" };
         let want = (limit * 3).max(limit + 10);
         let rows = self
             .run(
@@ -184,8 +168,6 @@ impl CodeTree {
             }
         }
         hits.truncate(limit);
-        let mut refs: Vec<&mut SymbolRef> = hits.iter_mut().map(|h| &mut h.symbol).collect();
-        self.describe_refs(&mut refs).await?;
         Ok(SearchResult { hits })
     }
 
@@ -197,7 +179,7 @@ impl CodeTree {
             let detail = self
                 .run(
                     &format!(
-                        "{} MATCH (n:Code {{sid: $sid}}) RETURN n.code, n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1])",
+                        "{} MATCH (n:Code {{sid: $sid}}) RETURN n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1])",
                         layer::OBSERVED_READ
                     ),
                     params! { "sid" => sid, "calls" => CALL_LIKE },
@@ -223,15 +205,12 @@ impl CodeTree {
             matches.push(SymbolDetail {
                 symbol,
                 params,
-                returns: row.get(1).and_then(|v| v.as_str()).map(str::to_owned),
-                code: row.first().and_then(|v| v.as_str()).map(str::to_owned),
-                callers: u(&row, 2),
-                callees: u(&row, 3),
+                returns: row.first().and_then(|v| v.as_str()).map(str::to_owned),
+                callers: u(&row, 1),
+                callees: u(&row, 2),
                 tests,
             });
         }
-        let mut refs: Vec<&mut SymbolRef> = matches.iter_mut().map(|m| &mut m.symbol).collect();
-        self.describe_refs(&mut refs).await?;
         Ok(SymbolMatches { matches })
     }
 
@@ -283,12 +262,6 @@ impl CodeTree {
             frontier = next;
         }
         sites.sort_by(|a, b| (a.depth, &a.path, a.line, &a.callee.sid).cmp(&(b.depth, &b.path, b.line, &b.callee.sid)));
-        let mut refs: Vec<&mut SymbolRef> = Vec::new();
-        for site in sites.iter_mut() {
-            refs.push(&mut site.caller);
-            refs.push(&mut site.callee);
-        }
-        self.describe_refs(&mut refs).await?;
         Ok(EdgesResult { sites })
     }
 
@@ -401,8 +374,6 @@ impl CodeTree {
             }
         }
         symbols.sort_by(|a, b| (a.start_line, std::cmp::Reverse(a.end_line), &a.qname).cmp(&(b.start_line, std::cmp::Reverse(b.end_line), &b.qname)));
-        let mut refs: Vec<&mut SymbolRef> = symbols.iter_mut().collect();
-        self.describe_refs(&mut refs).await?;
         Ok(OutlineResult { path: path.to_owned(), language, symbols })
     }
 
@@ -654,30 +625,17 @@ pub async fn read_only_query(graph: &crate::db::Graph, ig_id: &str, cypher: &str
 }
 
 impl CodeTree {
+    /// Store what a symbol does on its own node: `description`, and `described_hash` (the body it
+    /// was written for; a different `body_hash` makes it stale). The indexer never writes these, so
+    /// they stay through re-indexing and renames, and go with the symbol when it is deleted.
     pub async fn describe(&self, sid: &str, description: &str) -> Result<SymbolRef, RpcError> {
         let found = self.resolve_name(sid).await?;
-        let Some(symbol) = found.into_iter().next() else { return Err(RpcError::not_found(format!("no symbol {sid}"))) };
-        let now = cc_protocol::contracts::now_ms();
-        let existing = self.run(&format!("{} MATCH (d:Description {{sid: $sid}}) RETURN d.sid", layer::CODE_READ), params! { "sid" => symbol.sid }).await?;
-        if existing.rows.is_empty() {
-            // KNOWLEDGE nodes need their `name` at creation.
-            self.run(
-                &format!(
-                    "{} MATCH (s:Code {{sid: $sid}}) CREATE (d:Description {{sid: $sid, name: $name, text: $text, body_hash: s.body_hash, updated_ms: $now}})-[:DESCRIBES]->(s)",
-                    layer::KNOWLEDGE_WRITE
-                ),
-                params! { "sid" => symbol.sid, "name" => symbol.name, "text" => description, "now" => now },
-            )
-            .await?;
-        } else {
-            self.run(
-                &format!("{} MATCH (s:Code {{sid: $sid}}), (d:Description {{sid: $sid}}) SET d.name = s.name, d.text = $text, d.body_hash = s.body_hash, d.updated_ms = $now", layer::KNOWLEDGE_WRITE),
-                params! { "sid" => symbol.sid, "text" => description, "now" => now },
-            )
-            .await?;
-        }
-        self.graph.ensure_index(&self.ig_id, "description_sid", "Description", "sid").await?;
-        let mut symbol = symbol;
+        let Some(mut symbol) = found.into_iter().next() else { return Err(RpcError::not_found(format!("no symbol {sid}"))) };
+        self.run(
+            &format!("{} MATCH (s:Code {{sid: $sid}}) SET s.description = $text, s.described_hash = s.body_hash, s.described_ms = $now", layer::OBSERVED_WRITE),
+            params! { "sid" => symbol.sid, "text" => description, "now" => cc_protocol::contracts::now_ms() },
+        )
+        .await?;
         symbol.description = Some(description.to_owned());
         Ok(symbol)
     }
@@ -686,7 +644,7 @@ impl CodeTree {
     /// central first (PageRank).
     pub async fn undescribed(&self, limit: u32) -> Result<SearchResult, RpcError> {
         let scores = self.pagerank().await?;
-        let described = self.run(&format!("{} MATCH (d:Description)-[:DESCRIBES]->(s:Code) RETURN s.sid, d.body_hash = s.body_hash", layer::CODE_READ), Map::new()).await?;
+        let described = self.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL RETURN s.sid, s.described_hash = s.body_hash", layer::OBSERVED_READ), Map::new()).await?;
         let fresh: HashSet<String> = described.rows.iter().filter(|r| r.get(1).and_then(|v| v.as_bool()) == Some(true)).map(|r| s(r, 0)).collect();
         let candidates: Vec<(String, f64)> = scores.into_iter().filter(|(sid, _)| !fresh.contains(sid)).collect();
         let sids: Vec<String> = candidates.iter().map(|(sid, _)| sid.clone()).collect();

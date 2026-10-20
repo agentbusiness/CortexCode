@@ -1,6 +1,6 @@
 //! Project knowledge in the KNOWLEDGE layer (docs/PROJECT-KNOWLEDGE-PLAN.md P0): what the harness
 //! knows about a project's world. One `(:Knowledge:<Kind> {id, name, text, state, source, ...})`
-//! node per item, kinds `Concept | Fact | Decision | Hypothesis | Question`, in the project's own
+//! node per item, kinds `Concept | Fact | Decision | Hypothesis | Question | Lesson`, in the project's own
 //! IronGraph project (the global scope's in `main`). Links are edges whose `rel` property names the
 //! relation: `IMPLEMENTED_BY` / `ABOUT` (-> `Code`), `DESCRIBED_IN` (-> a document `Section`),
 //! `SUPPORTED_BY` (-> `Note`), `TESTED_BY` (-> `Run`, a WORKSPACE node), `ANSWERS` and
@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-const COLS: &str = "k.id, k.project_id, k.kind, k.name, k.text, k.state, k.source, k.confidence, k.as_of, k.by, k.evidence, k.aliases, k.superseded_by, k.reason, k.created_ms, k.updated_ms";
+const COLS: &str = "k.id, k.project_id, k.kind, k.name, k.text, k.state, k.source, k.confidence, k.as_of, k.by, k.evidence, k.aliases, k.superseded_by, k.reason, k.created_ms, k.updated_ms, k.seen, k.helped, k.hurt";
 
 fn s(row: &[Value], i: usize) -> String {
     row.get(i).and_then(Value::as_str).unwrap_or("").to_owned()
@@ -113,6 +113,9 @@ fn item_from(row: &[Value]) -> KnowledgeItem {
         created_ms: n(row, 14),
         updated_ms: n(row, 15),
         links: Vec::new(),
+        seen: n(row, 16) as u32,
+        helped: n(row, 17) as u32,
+        hurt: n(row, 18) as u32,
         score: None,
     }
 }
@@ -124,6 +127,7 @@ fn kind_label(kind: &str) -> &'static str {
         k::DECISION => "Decision",
         k::HYPOTHESIS => "Hypothesis",
         k::QUESTION => "Question",
+        k::LESSON => "Lesson",
         _ => "Knowledge",
     }
 }
@@ -465,6 +469,17 @@ impl WorkStore {
             )
             .await?;
         }
+        self.must_get(id).await
+    }
+
+    /// Add to the item's counters (absent ones count from 0).
+    pub async fn knowledge_count(&self, id: &str, seen: u32, helped: u32, hurt: u32) -> Result<KnowledgeItem, RpcError> {
+        let existing = self.must_get(id).await?;
+        self.k_run(
+            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.seen = $seen, k.helped = $helped, k.hurt = $hurt", layer::KNOWLEDGE_WRITE),
+            params! { "id" => id, "seen" => existing.seen + seen, "helped" => existing.helped + helped, "hurt" => existing.hurt + hurt },
+        )
+        .await?;
         self.must_get(id).await
     }
 

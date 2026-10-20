@@ -19,6 +19,7 @@ pub mod queries;
 pub mod service;
 pub mod settings;
 pub mod skills;
+pub mod summary;
 pub mod tree;
 pub mod watch;
 pub mod work;

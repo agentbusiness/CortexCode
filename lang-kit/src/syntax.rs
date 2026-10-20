@@ -3,7 +3,7 @@
 //! Everything here is structural: node kinds, fields and byte ranges of a syntax tree, quoting
 //! rules of string literals and bracket nesting. The extractors decide what a construct is.
 
-use cc_protocol::contracts::lang::{ParamFact, RefFact, RefKind, RefTarget, SymbolFact, TEXT_EXCERPT_CHARS};
+use cc_protocol::contracts::lang::{FileFacts, LineNote, NOTE_CHARS, NOTES_PER_SYMBOL, ParamFact, RefFact, RefKind, RefTarget, SymbolFact, TEXT_EXCERPT_CHARS};
 use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Parse `text` with `language`. None only when the grammar cannot be loaded (ABI mismatch) or the
@@ -382,3 +382,181 @@ pub fn looks_like_script_path(literal: &str) -> bool {
 /// HTTP verbs used by router APIs (axum, actix, FastAPI, Flask, Express): an API-name list, not a
 /// meaning heuristic.
 pub const HTTP_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+
+/// A comment or a string literal, as words.
+struct Said {
+    byte: usize,
+    /// Bytes of the comment or string as written.
+    len: usize,
+    first_row: usize,
+    last_row: usize,
+    /// A comment with nothing but whitespace before it on its first line.
+    own_line: bool,
+    comment: bool,
+    text: String,
+}
+
+/// What the code says in words, attached in one walk of the tree after the extractor ran:
+/// each definition's [`SymbolFact::notes`] (comments and message strings of its own body, not of
+/// definitions nested in it) and the file's [`FileFacts::line_notes`] (comments on their own lines
+/// directly above a call). Structural: comment and string nodes by kind, owners by byte range.
+/// Linear in the tree plus `n log n` in the definitions; strings are copied only when worded.
+pub fn attach_notes(root: Node, src: &str, facts: &mut FileFacts) {
+    let said = collect_said(root, src);
+    if said.is_empty() {
+        return;
+    }
+    attach_line_notes(&said, facts);
+    attach_symbol_notes(&said, &mut facts.symbols);
+}
+
+/// Comment and string nodes in document order (the walk does not enter them).
+fn collect_said(root: Node, src: &str) -> Vec<Said> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        let comment = node.is_named() && kind.contains("comment");
+        let string = node.is_named() && !comment && (kind.ends_with("string") || kind.ends_with("string_literal"));
+        if comment || string {
+            if let Some(text) = said_text(node, src, comment) {
+                let start = node.start_byte();
+                let column = node.start_position().column;
+                let own_line = comment && src.get(start - column.min(start)..start).is_some_and(|before| before.trim().is_empty());
+                out.push(Said { byte: start, len: node.end_byte() - start, first_row: node.start_position().row, last_row: last_row(node), own_line, comment, text });
+            }
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'walk;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    out
+}
+
+/// The words of a comment (markers stripped) or of a string literal (quotes stripped); None when
+/// a string cannot be a sentence (no space, too short or too long), checked before copying it.
+fn said_text(node: Node, src: &str, comment: bool) -> Option<String> {
+    let raw = text(node, src);
+    if comment {
+        let cleaned = clean_doc(&[raw])?;
+        let text = squash(&cleaned);
+        return (!text.is_empty()).then_some(text);
+    }
+    if raw.len() < 10 || raw.len() > 4 * NOTE_CHARS || !raw.contains(' ') {
+        return None;
+    }
+    Some(squash(&strip_quotes(raw)))
+}
+
+/// Prose, not code or data: at least two words that are mostly letters, letters the bulk of the
+/// text, and no statement or block punctuation at its end.
+fn worded(text: &str) -> bool {
+    let (mut words, mut letters, mut visible) = (0usize, 0usize, 0usize);
+    for word in text.split_whitespace() {
+        let chars = word.chars().count();
+        let alpha = word.chars().filter(|c| c.is_alphabetic()).count();
+        visible += chars;
+        letters += alpha;
+        if alpha >= 2 && alpha * 2 >= chars {
+            words += 1;
+        }
+    }
+    words >= 2 && letters * 10 >= visible * 6 && !text.ends_with([';', '{', '}', ')', ','])
+}
+
+fn clip(text: &str) -> String {
+    match text.char_indices().nth(NOTE_CHARS) {
+        Some((at, _)) => format!("{}…", text[..at].trim_end()),
+        None => text.to_owned(),
+    }
+}
+
+/// Bytes a definition may hold besides its signature and one string for that string to be a
+/// placeholder body (`throw new UnsupportedOperationException("...");` with its braces and indent).
+const PLACEHOLDER_REST: usize = 96;
+
+/// Runs of own-line comments (adjacent rows) directly above a line with a call or instantiation.
+fn attach_line_notes(said: &[Said], facts: &mut FileFacts) {
+    let call_lines: std::collections::HashSet<u32> = facts.refs.iter().filter(|r| matches!(r.kind, RefKind::Call | RefKind::Instantiate)).map(|r| r.line).collect();
+    if call_lines.is_empty() {
+        return;
+    }
+    let mut run: Option<(usize, String)> = None; // (last row, words)
+    let flush = |run: &mut Option<(usize, String)>, facts: &mut FileFacts| {
+        if let Some((last, words)) = run.take() {
+            let line = last as u32 + 2;
+            if call_lines.contains(&line) && worded(&words) {
+                facts.line_notes.push(LineNote { line, text: clip(&words) });
+            }
+        }
+    };
+    for item in said {
+        if !(item.comment && item.own_line) {
+            flush(&mut run, facts);
+            continue;
+        }
+        if let Some((last, words)) = run.as_mut().filter(|(last, _)| item.first_row == *last + 1) {
+            words.push(' ');
+            words.push_str(&item.text);
+            *last = item.last_row;
+        } else {
+            flush(&mut run, facts);
+            run = Some((item.last_row, item.text.clone()));
+        }
+    }
+    flush(&mut run, facts);
+}
+
+/// Each worded comment or string goes to the innermost definition whose byte range holds it: one
+/// sweep over the definitions sorted by start (outer before inner) with a stack of open ones.
+fn attach_symbol_notes(said: &[Said], symbols: &mut [SymbolFact]) {
+    // A comment on the line right above a definition is that definition's doc, not its owner's note.
+    let starts: std::collections::HashSet<usize> = symbols.iter().filter_map(|s| (s.start_line as usize).checked_sub(1)).collect();
+    let mut order: Vec<usize> = (0..symbols.len()).filter(|&i| symbols[i].end_byte > symbols[i].start_byte).collect();
+    order.sort_by_key(|&i| (symbols[i].start_byte, std::cmp::Reverse(symbols[i].end_byte)));
+    let mut open: Vec<usize> = Vec::new();
+    let mut next = 0;
+    for item in said {
+        let at = item.byte as u32;
+        while next < order.len() && symbols[order[next]].start_byte <= at {
+            let start = symbols[order[next]].start_byte;
+            while open.last().is_some_and(|&top| symbols[top].end_byte <= start) {
+                open.pop();
+            }
+            open.push(order[next]);
+            next += 1;
+        }
+        while open.last().is_some_and(|&top| symbols[top].end_byte <= at) {
+            open.pop();
+        }
+        let Some(&owner) = open.last() else { continue };
+        if item.own_line && starts.contains(&(item.last_row + 1)) {
+            continue;
+        }
+        // A body that is little more than this string is a placeholder (`throw new Error('Remove
+        // this statement...')`, `todo!("...")`): its text says what to replace, not what the code does.
+        let span = (symbols[owner].end_byte - symbols[owner].start_byte) as usize;
+        if !item.comment && span.saturating_sub(symbols[owner].signature.len() + item.len) <= PLACEHOLDER_REST {
+            continue;
+        }
+        let symbol = &mut symbols[owner];
+        if symbol.notes.len() >= NOTES_PER_SYMBOL || !worded(&item.text) {
+            continue;
+        }
+        let note = clip(&item.text);
+        // Its doc (a docstring is a string in the body) and repeats say nothing new.
+        let head: String = note.chars().take(40).collect();
+        if symbol.doc.as_deref().is_some_and(|doc| squash(doc).contains(head.as_str())) || symbol.notes.contains(&note) {
+            continue;
+        }
+        symbol.notes.push(note);
+    }
+}

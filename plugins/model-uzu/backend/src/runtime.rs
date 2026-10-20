@@ -835,7 +835,8 @@ impl Runtime {
                 "json_schema, grammar and a forcing tool_choice are exclusive; send one constraint",
             ));
         }
-        let prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking).await?;
+        let mut prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking).await?;
+        prompt.idle_only = params.idle_only;
         let key = params.cache_key.clone().unwrap_or_else(|| {
             template::derived_key(&params.messages.iter().map(template::message_value).collect::<Vec<_>>())
         });

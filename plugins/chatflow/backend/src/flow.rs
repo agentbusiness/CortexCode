@@ -493,7 +493,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let any = env.stops.any();
                 let max = env.data.limits.reads_per_round;
                 let ran = reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, max).await?;
-                knowledge_note(env, journal, &entry).await?;
+                knowledge_note(env, journal).await?;
                 match ran {
                     (0, 0) => journal
                         .note(&env.run_id, "no_reads", &env.data.text("no_reads", &[]), true)
@@ -529,6 +529,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                     let mut fresh: HashSet<String> = HashSet::new();
                     reads::run(journal, &env.run_id, &env.scope, named, &mut fresh, &any, env.data.limits.reads_per_round).await?;
                 }
+                knowledge_note(env, journal).await?;
                 let decision = json!({
                     "missing": "",
                     "route": "DO",
@@ -1364,36 +1365,55 @@ fn knowledge_line(item: &KnowledgeItem) -> String {
     format!("{}{state} ({}{date}): {}  knowledge://{}", item.kind, item.source, item.text, item.id)
 }
 
-/// What the project knows about the turn's work (docs/PROJECT-KNOWLEDGE-PLAN.md P4): after the
-/// first round's reads, one `memory.knowledge.search` with ROUTE's `work` sentence, at most
-/// `limits.knowledge_per_turn` items, as one host note (`purpose: knowledge`), one line each. Items
-/// whose text the prefix's brief already holds are left out; nothing when nothing is found, when
-/// memory is away, or when the note exists (a resumed run). Code attached to the reads themselves
-/// arrives with them (`reads::knowledge_lines`); this is the search by meaning.
-async fn knowledge_note(env: &RunEnv, journal: &mut Journal, decision: &JournalEntry) -> Result<(), RpcError> {
-    let limit = env.data.limits.knowledge_per_turn;
-    if limit == 0 || str_field(&decision.data, "stage") != "route" {
+/// What the project knows about the turn's work (docs/PROJECT-KNOWLEDGE-PLAN.md P4) and what
+/// earlier runs taught about work like it, as one host note (`purpose: knowledge`) after ROUTE,
+/// before the work: a `memory.knowledge.search` of the project with ROUTE's `work` sentence (at
+/// most `limits.knowledge_per_turn` items, those whose text the prefix's brief holds left out),
+/// then the lessons that fit ([`crate::learn::recall`], at most `limits.lessons_per_turn`). The
+/// lessons shown are kept on the note (`lessons`), so learning after the run can tell whether the
+/// error each is about came back. Nothing when nothing is found, when memory is away, or when the
+/// note exists (a resumed run). Code attached to reads arrives with them
+/// (`reads::knowledge_lines`); this is the search by meaning.
+async fn knowledge_note(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
+    let entries = journal.entries_vec();
+    let run = of_run(&entries, &env.run_id);
+    let Some(route) = run.iter().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route") else { return Ok(()) };
+    if note_after(&run, route.seq, "knowledge") {
         return Ok(());
     }
-    let work = decision.data.get("detail").map(|detail| str_field(detail, "work").trim().to_owned()).unwrap_or_default();
+    let route_seq = route.seq;
+    let work = route.data.get("detail").map(|detail| str_field(detail, "work").trim().to_owned()).unwrap_or_default();
     if work.is_empty() {
         return Ok(());
     }
-    let entries = journal.entries_vec();
-    if note_after(&of_run(&entries, &env.run_id), decision.seq, "knowledge") {
+    let mut parts: Vec<String> = Vec::new();
+    let limit = env.data.limits.knowledge_per_turn;
+    if limit > 0
+        && let Ok(found) = env.host.get::<KnowledgeSearchResult>(memory_methods::KNOWLEDGE_SEARCH, json!({"project_id": env.scope.project_id, "text": work, "limit": limit})).await
+    {
+        let lines: Vec<String> = found.items.iter().filter(|item| !item.text.trim().is_empty() && !env.prefix.system.contains(item.text.trim())).map(knowledge_line).collect();
+        if !lines.is_empty() {
+            parts.push(env.data.text("knowledge_note", &[("text", &lines.join("\n"))]));
+        }
+    }
+    let languages: Vec<String> = journal
+        .context_entry()
+        .and_then(|entry| entry.data.get("languages").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|language| language.as_str().map(str::to_owned))
+        .collect();
+    let lessons = crate::learn::recall(&env.host, &env.data, &work, &languages).await;
+    if !lessons.is_empty() {
+        let lines: Vec<String> = lessons.iter().map(|item| env.data.text("list_item", &[("text", item.text.trim())])).collect();
+        parts.push(env.data.text("lessons_note", &[("text", &lines.join("\n"))]));
+    }
+    if parts.is_empty() {
         return Ok(());
     }
-    let found = match env.host.get::<KnowledgeSearchResult>(memory_methods::KNOWLEDGE_SEARCH, json!({"project_id": env.scope.project_id, "text": work, "limit": limit})).await {
-        Ok(found) => found,
-        Err(_) => return Ok(()),
-    };
-    let lines: Vec<String> = found.items.iter().filter(|item| !item.text.trim().is_empty() && !env.prefix.system.contains(item.text.trim())).map(knowledge_line).collect();
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let text = env.data.text("knowledge_note", &[("text", &lines.join("\n"))]);
+    let shown: Vec<&str> = lessons.iter().map(|item| item.id.as_str()).collect();
     journal
-        .append(kinds::NOTE, json!({"text": text, "purpose": "knowledge", "run_id": env.run_id, "host_message": true, "decision_seq": decision.seq}))
+        .append(kinds::NOTE, json!({"text": parts.join("\n\n"), "purpose": "knowledge", "run_id": env.run_id, "host_message": true, "decision_seq": route_seq, "lessons": shown}))
         .await
         .map(|_| ())
 }
@@ -1433,10 +1453,10 @@ pub(crate) fn turn_binds(entries: &[JournalEntry], run_id: &str, route_seq: u64,
     out
 }
 
-/// KNOWLEDGE: the items the latest message stated about the project's world, as `knowledge`
-/// entries (cards) the user accepts or rejects; nothing is stored before an answer. The schema's
-/// `binds` pick holds only the code the turn saw ([`turn_binds`]); the model's `state` is kept
-/// only when the kind allows it.
+/// KNOWLEDGE: the items the latest message stated about the project's world, kept at once in the
+/// project's knowledge (source `user`, the journal entry as evidence, linked to the code they bind)
+/// and journaled as `knowledge` entries with their id. The schema's `binds` pick holds only the code
+/// the turn saw ([`turn_binds`]); the model's `state` is kept only when the kind allows it.
 async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
     let binds = turn_binds(&entries, &env.run_id, route_seq, 12);
@@ -1471,12 +1491,26 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
             _ => "asserted",
         };
         let bound: Vec<&str> = item.binds.iter().map(String::as_str).filter(|name| binds.iter().any(|b| b == name)).collect();
-        journal
+        let seq = journal
             .append(
                 chatflow_kinds::KNOWLEDGE,
-                json!({"kind": kind, "name": name, "text": text, "item_state": state, "binds": bound, "state": spec::PROPOSED, "run_id": env.run_id}),
+                json!({"kind": kind, "name": name, "text": text, "item_state": state, "binds": bound, "state": spec::ACCEPTED, "run_id": env.run_id}),
             )
             .await?;
+        let rel = if kind == "concept" { "implemented_by" } else { "about" };
+        let links: Vec<Value> = bound.iter().map(|name| json!({"rel": rel, "target": name})).collect();
+        let upsert = json!({
+            "project_id": env.scope.project_id, "kind": kind, "name": name, "text": text, "state": state, "source": "user", "by": "user",
+            "evidence": [format!("journal://{}/{}", env.session_id, seq)], "links": links
+        });
+        match env.host.call(memory_methods::KNOWLEDGE_UPSERT, upsert).await {
+            Ok(stored) => {
+                if let Some(id) = stored.get("id").and_then(Value::as_str) {
+                    journal.set(seq, "knowledge_id", json!(id)).await?;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "a knowledge item was not stored"),
+        }
         known.push(key(name));
         count += 1;
     }

@@ -194,6 +194,7 @@ async fn probe(runtime: Arc<Runtime>) -> ProbeReport {
         stop: Vec::new(),
         // A self-test bound, not a cap on product output: a sane answer is a few tokens.
         max_tokens: Some(32),
+        idle_only: false,
     };
     let generated = runtime.chat(params, None, CancellationToken::new()).await;
     checks.push(check(

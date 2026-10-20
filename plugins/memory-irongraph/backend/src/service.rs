@@ -13,7 +13,7 @@ use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{
     ExtractProblem, LanguagePlugin, UncoveredFiles,
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
-    KnowledgeBriefParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
+    KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
     RunRecordResult, Scope, SearchParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
     TaskListResult, TaskUpdateParams, UndescribedParams, WorkspaceParams, methods, topics,
@@ -182,6 +182,7 @@ pub const PROVIDES: &[&str] = &[
     methods::KNOWLEDGE_SUPERSEDE,
     methods::KNOWLEDGE_LINKED,
     methods::KNOWLEDGE_BRIEF,
+    methods::KNOWLEDGE_COUNT,
 ];
 
 fn short_hash(text: &str) -> String {
@@ -842,7 +843,7 @@ impl Memory {
 
     async fn status_of(&self, project_id: &str, tree: &CodeTree) -> Result<ProjectStatus, RpcError> {
         let status = tree.status.lock().await.clone();
-        let described = tree.run(&format!("{} MATCH (d:Description) RETURN count(d)", layer::CODE_READ), Map::new()).await?;
+        let described = tree.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL RETURN count(s)", layer::OBSERVED_READ), Map::new()).await?;
         let count = |rows: &crate::db::Rows| rows.rows.first().and_then(|r| r.first()).and_then(|v| v.as_u64()).unwrap_or(0);
         let embedding = if tree.embedding_ready().await? { "ready" } else { "pending" };
         Ok(ProjectStatus {
@@ -1239,6 +1240,13 @@ impl Memory {
                 let store = self.scoped_store(p.project_id.as_deref(), true, "knowledge").await?;
                 let item = if method == methods::KNOWLEDGE_LINK { store.knowledge_link(&p.id, &p.rel, &p.target).await? } else { store.knowledge_unlink(&p.id, &p.rel, &p.target).await? };
                 self.knowledge_changed(&item, if method == methods::KNOWLEDGE_LINK { "link" } else { "unlink" });
+                to_value(&item)
+            }
+            methods::KNOWLEDGE_COUNT => {
+                let p: KnowledgeCountParams = parse_params(params)?;
+                let store = self.scoped_store(p.project_id.as_deref(), true, "knowledge").await?;
+                let item = store.knowledge_count(&p.id, p.seen, p.helped, p.hurt).await?;
+                self.knowledge_changed(&item, "count");
                 to_value(&item)
             }
             methods::KNOWLEDGE_WITHDRAW => {

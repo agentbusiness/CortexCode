@@ -26,6 +26,7 @@ Rust here: get it right, build and test it, code that runs, common errors and th
 - `Cell<T>` only for small `Copy` values: it never lends `&T`. `RefCell<T>` lends through `borrow()` and `borrow_mut()`, checked at run time.
 - Nodes that point at each other and must hand out `&T` or `&mut T`: each node owned through `Box`, the links as `NonNull<Node<T>>` or raw pointers in `unsafe` blocks with the invariants in `// SAFETY:` comments, freed in `Drop`.
 - `Rc`, `Cell` and `RefCell` make a type neither `Send` nor `Sync`: across threads use `Arc` with `Mutex` or `RwLock`.
+- Variance: `NonNull<T>`, `*const T` and `PhantomData<T>` are covariant in `T`, `*mut T` is invariant. A property the compiler decides is checked by code that compiles only when it holds, in a test: `fn _covariant<'a>(x: List<&'static str>) -> List<&'a str> { x }`; `fn _is_send<T: Send>() {}` called as `_is_send::<List<i32>>()`. It compiles: the property holds.
 - Containers: `HashMap`/`BTreeMap` for lookup, `VecDeque` for both ends, `BinaryHeap` for largest first, `HashSet` for uniqueness.
 - Standard building blocks first: allocate behind a raw pointer with `Box::into_raw`, take back and free with `Box::from_raw`, never `std::alloc` by hand; `NonNull<T>` for a non-null raw pointer.
 
@@ -49,7 +50,7 @@ cargo clippy --all-targets -- -D warnings        # lint
 - A new file compiles only after `mod name;` in its parent.
 
 **Checking your work.**
-1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.rs` that uses the crate, run with `cargo test`; they stay in the project.
+1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.rs` that uses the crate, run with `cargo test`; they stay in the project. Tests behind a feature run with `cargo test --all-features`; never change `Cargo.toml` (features, dependencies, settings) unless the request asks.
 2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
 3. Build a long input in code from its parts, never typed out: `vec![0; 18]`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
 4. Each check shows what the code returned when it fails: `assert_eq!(got, want)`.

@@ -66,6 +66,7 @@ pub fn extract(src: &str, facts: &mut FileFacts) {
         }
     }
     walker.attach_out_of_line();
+    attach_notes(root, src, walker.facts);
 }
 
 fn collect_namespaces(node: Node, src: &str, out: &mut HashSet<String>) {

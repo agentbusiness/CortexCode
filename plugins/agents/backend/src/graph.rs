@@ -50,9 +50,6 @@ pub fn render(tool: &str, value: &Value) -> String {
                         let tests: Vec<String> = detail.tests.iter().map(|test| format!("{} ({})", test.qname, test.path)).collect();
                         text.push_str(&format!("\n  tests: {}", tests.join(", ")));
                     }
-                    if let Some(code) = detail.code.as_deref().filter(|code| !code.is_empty()) {
-                        text.push_str(&format!("\n```\n{}\n```", code.trim_end()));
-                    }
                     text
                 })
                 .collect::<Vec<_>>()
