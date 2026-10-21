@@ -41,6 +41,7 @@ pub const PROVIDES: &[&str] = &[
     methods::SKILLS_SHOWN,
     methods::CLEANUP,
     methods::TESTS_REPORT,
+    methods::TESTS_BASELINE,
 ];
 
 pub struct ToolsPlugin {
@@ -106,7 +107,7 @@ fn job_status(core: &Core, job_id: &str) -> Result<JobStatus, RpcError> {
     Ok(JobStatus { job_id: meta.job_id, state: meta.state, exit_code: meta.exit_code, output_tail: tail, started_ms: meta.started_ms })
 }
 
-fn host_context(workspace: &str, project_id: Option<&str>, session_id: Option<&str>) -> ExecContext {
+pub(crate) fn host_context(workspace: &str, project_id: Option<&str>, session_id: Option<&str>) -> ExecContext {
     ExecContext {
         project_id: project_id.unwrap_or("").to_owned(),
         session_id: session_id.map(str::to_owned).unwrap_or_else(|| format!("host-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])),
@@ -390,6 +391,11 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 .map_err(|error| RpcError::internal(error.to_string()))?;
             Ok(json!({ "removed": removed }))
         }
+        methods::TESTS_BASELINE => {
+            let field = |name: &str| params.get(name).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let timeout_ms = params.get("timeout_ms").and_then(Value::as_u64);
+            crate::baseline::check(&core, &field("session_id"), &field("workspace"), &field("command"), timeout_ms, cancel.clone()).await
+        }
         methods::TESTS_REPORT => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
             let (report, notes) = tokio::task::spawn_blocking(move || crate::exec::tests_report(&text)).await.map_err(|error| RpcError::internal(error.to_string()))?;
@@ -671,7 +677,17 @@ impl Plugin for ToolsPlugin {
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         let core = self.core(&ctx);
         Box::pin(async move {
-            core.await.jobs.adopt();
+            let core = core.await;
+            core.jobs.adopt();
+            // The approvals come from the store (or once from the file they were kept in); the
+            // store's plugin may start later, so this does not hold up serving.
+            let loading = core.clone();
+            tokio::spawn(async move {
+                let legacy = loading.data_dir.join("approvals.json");
+                if let Err(error) = loading.approvals.load(&ctx, Some(legacy)).await {
+                    tracing::error!(error = %error.message, "the approvals could not be read from the store");
+                }
+            });
             Ok(())
         })
     }

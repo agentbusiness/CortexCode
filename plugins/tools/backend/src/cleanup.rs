@@ -19,6 +19,9 @@ pub fn turn_end(core: &Core, workspace: &Path, session_id: &str, since_ms: u64) 
     if let Ok(mut created) = core.created.lock() {
         created.remove(session_id);
     }
+    if let Ok(mut originals) = core.originals.lock() {
+        originals.remove(session_id);
+    }
     if !workspace.is_dir() {
         return removed;
     }

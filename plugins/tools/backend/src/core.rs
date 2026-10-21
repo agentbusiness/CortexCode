@@ -100,7 +100,9 @@ pub struct Core {
     pub artifacts: Artifacts,
     pub workspaces: Workspaces,
     file_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-    approvals: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// What each session's user let its commands do, kept in the app's main store
+    /// (`tools.approvals`; see [`cc_protocol::stored`]).
+    pub approvals: cc_protocol::stored::Stored<HashMap<String, BTreeSet<String>>>,
     /// Per session: edits of project files since its last run (an edit result names the next step).
     pub edits_since_run: Mutex<HashMap<String, usize>>,
     /// Per session: the files `edit` wrote (the model's work, which a turn's cleanup keeps).
@@ -108,6 +110,13 @@ pub struct Core {
     /// Per session: the files `edit` created in the running turn (cleared when it ends). The model
     /// may write those whole again: nothing of the user's is in them.
     pub created: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
+    /// Per session: each file `edit` changed in the running turn, as it was before the turn's first
+    /// change (None: the turn created it). The baseline check runs the tests on these (cleared when
+    /// the turn ends).
+    pub originals: Mutex<HashMap<String, std::collections::BTreeMap<PathBuf, Option<String>>>>,
+    /// Per session: the last refused call (tool and arguments) and how it was refused, so the same
+    /// call refused again the same way says so.
+    pub refused: Mutex<HashMap<String, (String, String)>>,
     /// Where the `cx` binary was found (linked into `<home>/bin`).
     pub cx: Option<PathBuf>,
     /// The write sandbox's machine-wide policy.
@@ -179,10 +188,6 @@ impl Core {
         if let Some(pack) = find_pack(config.pack_path.as_deref()) {
             link_program(&bin_dir, "cortex-pack", &pack);
         }
-        let approvals = std::fs::read(data_dir.join("approvals.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<HashMap<String, BTreeSet<String>>>(&bytes).ok())
-            .unwrap_or_default();
         let core = Arc::new(Core {
             home: home.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
@@ -192,10 +197,12 @@ impl Core {
             workspaces: Workspaces::new(home),
             read_state: ReadState::default(),
             file_locks: Mutex::new(HashMap::new()),
-            approvals: Mutex::new(approvals),
+            approvals: cc_protocol::stored::Stored::new("tools.approvals"),
             edits_since_run: Mutex::new(HashMap::new()),
             edited: Mutex::new(HashMap::new()),
             created: Mutex::new(HashMap::new()),
+            originals: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
             sandbox: crate::sandbox::Policy::new(home, data_dir, &config.sandbox_write_paths),
             config,
             cx,
@@ -227,20 +234,13 @@ impl Core {
     }
 
     pub fn approve(&self, session: &str, classes: &[String]) -> Vec<String> {
-        let mut approvals = match self.approvals.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let entry = approvals.entry(session.to_owned()).or_default();
-        for class in classes {
-            entry.insert(class.clone());
-        }
-        let result = entry.iter().cloned().collect();
-        if let Ok(bytes) = serde_json::to_vec(&*approvals) {
-            let _ = std::fs::create_dir_all(&self.data_dir);
-            let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
-        }
-        result
+        self.approvals.update(|approvals| {
+            let entry = approvals.entry(session.to_owned()).or_default();
+            for class in classes {
+                entry.insert(class.clone());
+            }
+            entry.iter().cloned().collect()
+        })
     }
 
     /// The sandbox and Python environment for commands of `session` in `workspace`. With
@@ -284,16 +284,8 @@ impl Core {
         for job in self.jobs.list(Some(session)) {
             self.jobs.kill(&job.job_id).await;
         }
-        {
-            let mut approvals = match self.approvals.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if approvals.remove(session).is_some()
-                && let Ok(bytes) = serde_json::to_vec(&*approvals)
-            {
-                let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
-            }
+        if self.approvals.get().contains_key(session) {
+            self.approvals.update(|approvals| approvals.remove(session));
         }
         if inside(self.workspaces.root(), workspace) {
             self.forget_workspace(workspace);
@@ -319,21 +311,13 @@ impl Core {
     /// Use up a one-time approval (a repository change the user allowed once): true when it was
     /// given, and it is gone afterwards.
     pub fn take_approval(&self, session: &str, class: &str) -> bool {
-        let mut approvals = match self.approvals.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let taken = approvals.get_mut(session).is_some_and(|entry| entry.remove(class));
-        if taken && let Ok(bytes) = serde_json::to_vec(&*approvals) {
-            let _ = crate::util::atomic_write(&self.data_dir.join("approvals.json"), &bytes);
+        if !self.approvals.get().get(session).is_some_and(|entry| entry.contains(class)) {
+            return false;
         }
-        taken
+        self.approvals.update(|approvals| approvals.get_mut(session).is_some_and(|entry| entry.remove(class)))
     }
 
     pub fn approved(&self, session: &str) -> BTreeSet<String> {
-        match self.approvals.lock() {
-            Ok(guard) => guard.get(session).cloned().unwrap_or_default(),
-            Err(poisoned) => poisoned.into_inner().get(session).cloned().unwrap_or_default(),
-        }
+        self.approvals.get().get(session).cloned().unwrap_or_default()
     }
 }

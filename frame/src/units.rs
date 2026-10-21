@@ -1,9 +1,13 @@
 //! Plugins as units: an installed package version holds a backend, UI packages and shell modules,
 //! and the frame enables, disables, installs and rolls back all of it together.
 //!
-//! - The frame runs every installed plugin (`<home>/plugins/<id>/<version>/`) that is not disabled;
-//!   `<home>/state/plugins.json` records each plugin's current, previous and last known good
-//!   version and the disabled plugins.
+//! - The frame runs every installed plugin (`<home>/plugins/<id>/<version>/`) that is not disabled.
+//!   Each plugin's folder records its install state in plain files the frame reads before any
+//!   plugin runs: `.current`, `.previous` and `.known_good` hold a version, `.disabled` marks a
+//!   disabled plugin, `.chosen` the person's choice for its category. Not in the main store: the
+//!   frame needs them to start the memory plugin that opens it, and emptying the store (a clean
+//!   test slate) must not forget what is installed. A `state/plugins.json` from before is read once
+//!   into these files and removed.
 //! - install: the package's version becomes the plugin's: the backend is hot-swapped to it
 //!   (blue/green or drain-first, with the swap engine's probe and rollback), then its UI packages
 //!   and shell modules switch. A plugin new to the frame is added and started. The version it
@@ -17,8 +21,8 @@
 //!   the packer that waits for it.
 //! - Alternatives: several plugins may serve one category (two model engines). One serves it;
 //!   the others are on standby (installed, not started, their UI packages not served). The one
-//!   that serves is the person's choice (`frame.plugins.switch`, kept in `plugins.json` under
-//!   `providers`), else the one whose declared `[backend.machine]` range holds this machine's
+//!   that serves is the person's choice (`frame.plugins.switch`, kept as the chosen plugin's
+//!   `.chosen` marker), else the one whose declared `[backend.machine]` range holds this machine's
 //!   memory, else the first enabled one. A switch is a swap of the category's slot to the other
 //!   plugin, with the swap engine's drain, probe and restore.
 
@@ -153,7 +157,7 @@ fn start_rank(installed: &Installed) -> (usize, String) {
     (rank, installed.id().to_owned())
 }
 
-/// `<home>/state/plugins.json`.
+/// `<home>/state/plugins.json`, the record before the per-plugin files (read once, then removed).
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PluginsFile {
     #[serde(default)]
@@ -176,7 +180,6 @@ struct InstalledRecord {
 
 pub struct Units {
     list: RwLock<Vec<Arc<Unit>>>,
-    file: PathBuf,
     /// `<home>/plugins`.
     pub root: PathBuf,
     overrides: BTreeMap<String, PluginOverride>,
@@ -194,11 +197,11 @@ impl Units {
     /// Build the units from `plugins.json`, then install what waits in `.incoming/` (the frame is
     /// not serving yet, so a newer version simply becomes current).
     pub fn load(root: &Path, state_dir: &Path, overrides: BTreeMap<String, PluginOverride>, memory_bytes: u64) -> Result<Units, String> {
-        let file = state_dir.join("plugins.json");
-        let saved: PluginsFile = match std::fs::read(&file) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", file.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PluginsFile::default(),
-            Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
+        let legacy = state_dir.join("plugins.json");
+        let saved: PluginsFile = match std::fs::read(&legacy) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", legacy.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => read_records(root),
+            Err(error) => return Err(format!("cannot read {}: {error}", legacy.display())),
         };
         let resolve = |id: &str, version: &str| match crate::package::load(root, id, version) {
             Ok(installed) => Some(Arc::new(installed)),
@@ -221,7 +224,6 @@ impl Units {
         }
         let units = Units {
             list: RwLock::new(list),
-            file,
             root: root.to_path_buf(),
             overrides,
             op: tokio::sync::Mutex::new(()),
@@ -242,6 +244,12 @@ impl Units {
         units.sort();
         units.choose_serving();
         units.persist()?;
+        // Read into the per-plugin files: the old record goes.
+        if legacy.exists()
+            && let Err(error) = std::fs::remove_file(&legacy)
+        {
+            tracing::warn!(%error, "cannot remove the old plugins.json");
+        }
         Ok(units)
     }
 
@@ -533,23 +541,76 @@ impl Units {
         crate::package::prune(&self.root, id, &keep.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
+    /// Write each plugin's install state into its folder (see the module notes).
     fn persist(&self) -> Result<(), String> {
         let providers = self.providers.lock().map(|providers| providers.clone()).unwrap_or_default();
-        let mut file = PluginsFile { disabled: self.disabled(), installed: BTreeMap::new(), providers };
+        let disabled = self.disabled();
         for unit in self.all() {
-            let state = unit.lock();
-            file.installed.insert(
-                unit.id.clone(),
-                InstalledRecord {
-                    current: state.current.version().to_owned(),
-                    previous: state.previous.as_ref().map(|p| p.version().to_owned()),
-                    known_good: state.known_good.clone(),
-                },
-            );
+            let dir = self.root.join(&unit.id);
+            let (current, previous, known_good) = {
+                let state = unit.lock();
+                (state.current.version().to_owned(), state.previous.as_ref().map(|p| p.version().to_owned()), state.known_good.clone())
+            };
+            let chosen = unit.category().is_some_and(|category| providers.get(&category) == Some(&unit.id));
+            write_record(&dir, CURRENT, Some(&current))?;
+            write_record(&dir, PREVIOUS, previous.as_deref())?;
+            write_record(&dir, KNOWN_GOOD, known_good.as_deref())?;
+            write_record(&dir, DISABLED, disabled.contains(&unit.id).then_some(""))?;
+            write_record(&dir, CHOSEN, chosen.then_some(""))?;
         }
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
-        write_atomic(&self.file, &bytes).map_err(|e| format!("cannot write {}: {e}", self.file.display()))
+        Ok(())
     }
+}
+
+/// A plugin folder's install-state files.
+const CURRENT: &str = ".current";
+const PREVIOUS: &str = ".previous";
+const KNOWN_GOOD: &str = ".known_good";
+const DISABLED: &str = ".disabled";
+const CHOSEN: &str = ".chosen";
+
+/// Write one install-state file (`Some`: its text, `None`: removed).
+fn write_record(dir: &Path, name: &str, text: Option<&str>) -> Result<(), String> {
+    let path = dir.join(name);
+    match text {
+        Some(text) => {
+            if std::fs::read_to_string(&path).is_ok_and(|stored| stored == text) {
+                return Ok(());
+            }
+            write_atomic(&path, text.as_bytes()).map_err(|e| format!("cannot write {}: {e}", path.display()))
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+        },
+    }
+}
+
+/// The install state of every plugin folder under `root` that records a current version.
+fn read_records(root: &Path) -> PluginsFile {
+    let mut saved = PluginsFile::default();
+    let Ok(entries) = std::fs::read_dir(root) else { return saved };
+    let read = |dir: &Path, name: &str| std::fs::read_to_string(dir.join(name)).ok().map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let dir = entry.path();
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if id.starts_with('.') || !dir.is_dir() {
+            continue;
+        }
+        let Some(current) = read(&dir, CURRENT) else { continue };
+        if dir.join(DISABLED).exists() {
+            saved.disabled.insert(id.clone());
+        }
+        if dir.join(CHOSEN).exists()
+            && let Ok(installed) = crate::package::load(root, &id, &current)
+            && let Some(category) = installed.manifest.backend.as_ref().map(|backend| backend.category.clone())
+        {
+            saved.providers.insert(category, id.clone());
+        }
+        saved.installed.insert(id, InstalledRecord { current, previous: read(&dir, PREVIOUS), known_good: read(&dir, KNOWN_GOOD) });
+    }
+    saved
 }
 
 fn check_same_category(unit: &Unit, installed: &Installed) -> Result<(), String> {

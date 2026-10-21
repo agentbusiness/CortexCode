@@ -7,7 +7,7 @@
 
 use cc_protocol::RpcError;
 use crate::engine::EnginePaths;
-use irongraph_sdk::{EmbeddedDatabase, EmbeddedOptions, EmbeddingPolicy, OperationOptions, Query};
+use irongraph_sdk::{EmbeddedDatabase, EmbeddedOptions, EmbeddingPolicy, OperationOptions, Query, StreamAppend, StreamFetch, StreamRecord};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -177,11 +177,87 @@ impl Graph {
         Ok(())
     }
 
+    /// Append records to a stream (one partition), creating its topic on first use. Returns the
+    /// offset after the last record.
+    pub async fn stream_append(&self, project: &str, topic: &str, records: Vec<Vec<u8>>) -> Result<u64, RpcError> {
+        if records.is_empty() {
+            return self.stream_end(project, topic).await;
+        }
+        let request = |records: Vec<Vec<u8>>| StreamAppend {
+            project_id: project.to_owned(),
+            topic: topic.to_owned(),
+            partition: 0,
+            records: records.into_iter().map(|value| StreamRecord { key: None, headers: Default::default(), value: Some(value), create_time_ms: None }).collect(),
+        };
+        let acknowledged = match self.db.stream_append_async(request(records.clone()), OperationOptions::default()).await {
+            Ok(acknowledged) => acknowledged,
+            Err(error) if missing_topic(&error) => {
+                self.create_topic(project, topic).await?;
+                self.db.stream_append_async(request(records), OperationOptions::default()).await.map_err(ig_error)?
+            }
+            Err(error) => return Err(ig_error(error)),
+        };
+        Ok(acknowledged.first_offset + u64::from(acknowledged.record_count))
+    }
+
+    /// Records of a stream from `offset`: each record's offset and bytes, the offset after them,
+    /// and the offset after the last record of the stream. A topic that does not exist is empty.
+    pub async fn stream_fetch(&self, project: &str, topic: &str, offset: u64, max_records: usize, max_bytes: usize) -> Result<(Vec<(u64, Vec<u8>)>, u64, u64), RpcError> {
+        let request = StreamFetch { project_id: project.to_owned(), topic: topic.to_owned(), partition: 0, offset, max_records, max_bytes };
+        match self.db.stream_fetch_async(request, OperationOptions::default()).await {
+            Ok(page) => {
+                let records = page.records.into_iter().map(|(offset, payload)| (offset, payload.payload)).collect();
+                Ok((records, page.next_offset, page.high_watermark))
+            }
+            Err(error) if missing_topic(&error) => Ok((Vec::new(), offset, offset)),
+            Err(error) => Err(ig_error(error)),
+        }
+    }
+
+    /// The offset after the last record of a stream (0 when it does not exist).
+    async fn stream_end(&self, project: &str, topic: &str) -> Result<u64, RpcError> {
+        Ok(self.stream_fetch(project, topic, 0, 1, 1).await?.2)
+    }
+
+    async fn create_topic(&self, project: &str, topic: &str) -> Result<(), RpcError> {
+        validate_topic(topic)?;
+        match self.run(project, &format!("CREATE TOPIC `{topic}` PARTITIONS 1"), Map::new()).await {
+            Ok(_) => Ok(()),
+            // Created meanwhile by a concurrent append.
+            Err(error) if error.message.to_lowercase().contains("exist") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Delete a stream and its records; a topic that does not exist is already gone.
+    pub async fn drop_topic(&self, project: &str, topic: &str) -> Result<(), RpcError> {
+        validate_topic(topic)?;
+        match self.run(project, &format!("DROP TOPIC `{topic}`"), Map::new()).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.message.to_lowercase().contains("does not exist") || error.message.to_lowercase().contains("not found") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Engine-owned read-only validation of a statement.
     pub async fn check_read_only(&self, project: &str, cypher: &str) -> Result<(), RpcError> {
         let query = Query::new("CHECK READ ONLY").with_project(project).with_parameter("statement", cypher);
         self.db.query_async(query).await.map(|_| ()).map_err(|e| RpcError::invalid_params(format!("statement is not read-only: {}: {}", e.code, e.message)))
     }
+}
+
+/// A stream error that means its topic does not exist yet.
+fn missing_topic(error: &irongraph_sdk::Error) -> bool {
+    let message = error.message.to_lowercase();
+    message.contains("does not exist") || message.contains("unknown topic") || message.contains("not found")
+}
+
+/// Topic names are quoted identifiers in statements: letters, digits, `.`, `_` and `-` only.
+fn validate_topic(topic: &str) -> Result<(), RpcError> {
+    if topic.is_empty() || topic.len() > 200 || !topic.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Err(RpcError::internal(format!("invalid topic name {topic}")));
+    }
+    Ok(())
 }
 
 /// Project names are identifiers in Cypher statements; only `[a-z0-9_]` is accepted.

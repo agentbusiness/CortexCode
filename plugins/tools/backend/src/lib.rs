@@ -4,6 +4,7 @@
 
 pub mod approval;
 pub mod artifacts;
+pub mod baseline;
 pub mod cleanup;
 pub mod codeskills;
 pub mod core;

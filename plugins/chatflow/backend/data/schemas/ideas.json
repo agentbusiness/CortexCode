@@ -1,0 +1,171 @@
+{
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      }
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 120
+      }
+    },
+    "ideas": {
+      "type": "object",
+      "properties": {
+        "first": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "two_choices_flipped": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "constraint_relaxed": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "inverted": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "component_removed": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "borrowed": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        },
+        "prior_art": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "mechanism": {
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "name",
+            "mechanism"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "first",
+        "two_choices_flipped",
+        "constraint_relaxed",
+        "inverted",
+        "component_removed",
+        "borrowed",
+        "prior_art"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "question",
+    "constraints",
+    "criteria",
+    "ideas"
+  ],
+  "additionalProperties": false
+}

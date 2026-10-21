@@ -48,6 +48,12 @@ pub mod methods {
     /// where the runner's words hide it and the tests it could not reach (for output shown whole),
     /// else null.
     pub const TESTS_REPORT: &str = "tools.tests.report";
+    /// `{session_id, workspace, command}`: runs the test command once on the code as it was before
+    /// the session's running turn changed it (each code file `edit` changed put back as it was,
+    /// test files left as they are; everything restored after), and returns
+    /// `{checked, ran, failed, exit_code, timed_out}`; `checked: false` with `reason` when the turn
+    /// changed no code file.
+    pub const TESTS_BASELINE: &str = "tools.tests.baseline";
 }
 
 /// Approval classes beyond the ask-mode action classes.

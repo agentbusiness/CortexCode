@@ -37,6 +37,13 @@ impl Plugin for VcsPlugin {
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         self.remember(&ctx);
+        let vcs = self.vcs.clone();
+        // The GitHub account comes from the store, whose plugin may start later.
+        tokio::spawn(async move {
+            if let Err(error) = vcs.github.load(&ctx).await {
+                tracing::error!(error = %error.message, "the GitHub settings could not be read from the store");
+            }
+        });
         Box::pin(async { Ok(()) })
     }
 

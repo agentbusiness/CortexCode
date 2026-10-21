@@ -5,6 +5,7 @@
 //! KNOWLEDGE layer (global, or a project's). The code graph's facts come from the
 //! language plugins (`lang@1`), one per language.
 
+pub mod app;
 pub mod attributes;
 pub mod db;
 pub mod engine;

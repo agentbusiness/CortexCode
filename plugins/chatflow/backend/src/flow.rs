@@ -27,7 +27,7 @@ use crate::prompts;
 use crate::reads::{self, ReadReq, Wanted};
 use crate::skillsel;
 use crate::schemas::{self, Decision, KnowledgeProposed, PlanOutput, Proposed, RouterDecision, Shape, SpecEdit, SpecExtract, parse_json};
-use crate::{plan, spec};
+use crate::{ideation, plan, spec};
 use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, plan_status};
 use cc_protocol::contracts::agents::{DelegateResult, methods as agents_methods};
 use cc_protocol::contracts::frame::{JournalEntry, kinds};
@@ -81,6 +81,13 @@ enum Stage {
     Plan { decision_seq: u64, auto: bool },
     /// IMPLEMENT: the open plan goes to the task machinery.
     Implement { route_seq: u64 },
+    /// IDEATE: the host grounds the question (a code-graph search for it, the files it names,
+    /// what the project knows, earlier notes), before the ideas are written.
+    IdeateReads { route_seq: u64 },
+    /// IDEATE: one idea per principle, then the host looks each up ([`crate::ideation`]).
+    Ideas,
+    /// IDEATE: the critique, the options and a recommendation: the turn's answer.
+    Options,
     /// After the answer, when the router judged that the message settles something.
     Decisions { route_seq: u64 },
     /// After the answer (and the decisions), when the router judged that the message states
@@ -246,6 +253,15 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
             "STATUS" => Stage::StatusReads,
             "IMPLEMENT" if note_after(&run, last.seq, "implement_done") => Stage::Done,
             "IMPLEMENT" => Stage::Implement { route_seq: last.seq },
+            // A plan card's Revise names its plan: the comments are the change, PLAN_EDIT writes it.
+            "PLAN" if !str_field(&last.data, "plan_id").is_empty() && plan_written(&run, last.seq) => Stage::Done,
+            "PLAN" if !str_field(&last.data, "plan_id").is_empty() => Stage::Plan { decision_seq: last.seq, auto: false },
+            "IDEATE" => match ideation::phase_after(&run, last.seq).as_deref() {
+                Some(ideation::PHASE_OPTIONS) => Stage::Done,
+                Some(_) => Stage::Options,
+                None if ideation::grounded(&run, last.seq) => Stage::Ideas,
+                None => Stage::IdeateReads { route_seq: last.seq },
+            },
             // A change: plan first, from the conversation and the repository map in the prefix (no
             // discovery before it); each task then reads what it needs.
             "DO" => Stage::Commit { route_seq: last.seq },
@@ -929,6 +945,25 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 set_stage(env, journal, status_seq, "implement").await?;
                 implement(env, journal, route_seq).await
             }
+            Stage::IdeateReads { route_seq } => {
+                set_stage(env, journal, status_seq, "read").await?;
+                let Some(entry) = journal.get(route_seq).cloned() else { return Err(RpcError::internal("route entry vanished")) };
+                let planned = round_reads(&env.scope, &env.session_id, &entry, "IDEATE", &env.data.limits, &[]);
+                let any = env.stops.any();
+                reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await?;
+                knowledge_note(env, journal).await?;
+                let work = entry.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default();
+                ideation::notes_note(env, journal, &work).await?;
+                journal.note(&env.run_id, ideation::GROUNDED, "", false).await.map(|_| ())
+            }
+            Stage::Ideas => {
+                set_stage(env, journal, status_seq, "ideas").await?;
+                ideation::run_ideas(env, journal).await
+            }
+            Stage::Options => {
+                set_stage(env, journal, status_seq, "options").await?;
+                ideation::run_options(env, journal).await
+            }
             Stage::Decisions { .. } => {
                 set_stage(env, journal, status_seq, "decisions").await?;
                 propose_decisions(env, journal).await
@@ -958,7 +993,9 @@ fn decide_catalog(catalog: &[String], used: &[String]) -> Vec<String> {
 ///. Measured: a plan request became DO on the 27B.
 /// A stuck task's attempt leaves the context: one host note says what did not work (each command
 /// that still failed, with the end of its last output) and marks the attempt's entries, which the
-/// projection drops from then on.
+/// projection drops from then on. The next attempt does not start as the last one did: the note
+/// carries what earlier work learned from those failures (`learn::at_failure` by each failure's
+/// key) and the skills the attempt's errors brought (`display.skills`, gone with its steps).
 async fn fresh_start(env: &RunEnv, journal: &mut Journal, task_id: &str, n: u32, title: &str, summary: &str) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
     let Some(from) = entries
@@ -988,14 +1025,62 @@ async fn fresh_start(env: &RunEnv, journal: &mut Journal, task_id: &str, n: u32,
         last.retain(|(known, _)| known != &command);
         last.push((command, failed));
     }
+    // The next attempt does not start as the last one did: what was learned from these failures
+    // before, and the skills their errors brought, which go with the dropped steps.
+    let languages: Vec<String> = journal
+        .context_entry()
+        .and_then(|entry| entry.data.get("languages").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|language| language.as_str().map(str::to_owned))
+        .collect();
+    let mut learned: Vec<Value> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some((arm, lesson, _)) = crate::replay::arm(&entries)
+        && arm == "without"
+    {
+        seen.insert(lesson);
+    }
+    for output in last.iter().filter_map(|(_, failed)| failed.as_deref()) {
+        let Some(key) = crate::learn::failure_key("run", "", output) else { continue };
+        for (item, project) in crate::learn::at_failure(&env.host, &env.data, &env.scope.project_id, &key, &languages, &seen).await {
+            seen.insert(item.id.clone());
+            lines.push(env.data.text("list_item", &[("text", item.text.trim())]));
+            learned.push(json!({"id": item.id, "project": project, "key": key}));
+        }
+    }
+    let mut extra = if lines.is_empty() { String::new() } else { env.data.text("attempt_learned", &[("text", &lines.join("\n"))]) };
+    let mut skills: Vec<String> = Vec::new();
+    for result in entries.iter().filter(|entry| entry.seq > from && entry.kind == kinds::TOOL_RESULT) {
+        for uri in result.data.get("display").and_then(|display| display.get("skills")).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            if !skills.iter().any(|known| known == uri) {
+                skills.push(uri.to_owned());
+            }
+        }
+    }
+    if let Some((first, rest)) = skills.split_first() {
+        if let Some((category, name)) = first.strip_prefix("skill://").and_then(|rest| rest.split_once('/'))
+            && let Ok(skill) = env.host.get::<Value>(&format!("{category}.skill"), json!({"name": name})).await
+        {
+            extra.push_str(&env.data.text("attempt_skill", &[("uri", first), ("text", str_field(&skill, "text").trim())]));
+        }
+        if !rest.is_empty() {
+            let uris: Vec<String> = rest.iter().map(|uri| env.prefix.skill_line(uri)).collect();
+            extra.push_str(&env.data.text("attempt_skills_also", &[("uris", &uris.join("\n"))]));
+        }
+    }
     let failures: Vec<String> = last
         .into_iter()
         .filter_map(|(command, failed)| failed.map(|output| env.data.text("attempt_failure", &[("command", &command), ("output", &output)])))
         .collect();
     let failures = if failures.is_empty() { env.data.text("attempt_no_failure", &[]) } else { failures.join("\n") };
-    let text = env.data.text("attempt_failed", &[("n", &n.to_string()), ("title", title), ("summary", summary.trim()), ("failures", &failures)]);
+    let text = env.data.text("attempt_failed", &[("n", &n.to_string()), ("title", title), ("summary", summary.trim()), ("failures", &failures), ("learned", &extra)]);
     journal
-        .append(kinds::NOTE, json!({"text": text, "purpose": "attempt_failed", "run_id": env.run_id, "host_message": true, "task_id": task_id, "drop_from": from, "drop_to": to}))
+        .append(
+            kinds::NOTE,
+            json!({"text": text, "purpose": "attempt_failed", "run_id": env.run_id, "host_message": true, "task_id": task_id, "drop_from": from, "drop_to": to, "learned": learned, "skills": skills}),
+        )
         .await?;
     Ok(())
 }
@@ -1170,7 +1255,10 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let live = joined(&[edit, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (doc, tasks) = plan::from_output(&output, max, plan::Known { requirements: &requirement_ids, skills: &catalog, skills_max });
-    let tasks = plan::merge_same_touches(tasks);
+    let mut tasks = plan::merge_same_touches(tasks);
+    if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
+        plan::keep_dependencies(previous, &mut tasks);
+    }
     // One task is the default: the request is split only where it names several parts (the
     // planner's call); several requirements of one part stay one task.
     let mut made = match (&mode, &previous) {
@@ -1186,6 +1274,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             root_task: None,
             steps_done: Vec::new(),
             replans: 0,
+            by: String::new(),
         },
     };
     if let Some(previous) = &previous {
@@ -1403,7 +1492,14 @@ async fn knowledge_note(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcEr
         .iter()
         .filter_map(|language| language.as_str().map(str::to_owned))
         .collect();
-    let lessons = crate::learn::recall(&env.host, &env.data, &work, &languages).await;
+    let mut lessons = crate::learn::recall(&env.host, &env.data, &work, &languages).await;
+    // A replay (`replay.rs`) shows its lesson first, or never.
+    if let Some((arm, lesson, text)) = crate::replay::arm(&entries) {
+        lessons.retain(|item| item.id != lesson);
+        if arm == "with" && !text.trim().is_empty() {
+            lessons.insert(0, cc_protocol::contracts::memory::KnowledgeItem { id: lesson, text, ..Default::default() });
+        }
+    }
     if !lessons.is_empty() {
         let lines: Vec<String> = lessons.iter().map(|item| env.data.text("list_item", &[("text", item.text.trim())])).collect();
         parts.push(env.data.text("lessons_note", &[("text", &lines.join("\n"))]));

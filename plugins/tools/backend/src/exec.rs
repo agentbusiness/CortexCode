@@ -165,6 +165,7 @@ pub async fn execute_in(
     }
     next_step(core, &session, canonical.tool, &mut out);
     read_hint(&session, canonical.tool, &canonical.args, &mut out);
+    same_refusal(core, &session, canonical.tool, &canonical.args, &mut out);
     attach_code_skills(core, host.as_ref(), &session.context.session_id, &mut out).await;
     // What the repair changed in the call's meaning comes first (a rename says nothing).
     if !canonical.shown.is_empty() {
@@ -191,6 +192,27 @@ pub async fn execute_in(
         duration_ms: started.elapsed().as_millis() as u64,
         error_kind: out.error_kind,
     }
+}
+
+/// A call refused again the same way as the session's last refusal: said last, since the message
+/// above already names what to change (seen: one refused edit sent three times unchanged). A run
+/// that only exits non-zero is no refusal.
+fn same_refusal(core: &Core, session: &Session<'_>, tool: &str, args: &serde_json::Map<String, Value>, out: &mut Out) {
+    let Ok(mut refused) = core.refused.lock() else { return };
+    let session_id = &session.context.session_id;
+    let kind = out.error_kind.clone().filter(|kind| !out.ok && !matches!(kind.as_str(), "nonzero_exit" | "timeout" | "cancelled"));
+    let Some(kind) = kind else {
+        refused.remove(session_id);
+        return;
+    };
+    let mut call = args.clone();
+    call.remove("intent");
+    let call = format!("{tool} {}", Value::Object(call));
+    if refused.get(session_id).is_some_and(|(previous, previous_kind)| *previous == call && *previous_kind == kind) {
+        let gap = if out.output.ends_with('\n') { "" } else { "\n" };
+        let _ = writeln!(out.output, "{gap}You sent this same call before and it was refused the same way: change what the message above names before you send it again.");
+    }
+    refused.insert(session_id.clone(), (call, kind));
 }
 
 /// A diagnostic code a plugin declared a skill for: the skill comes with the result (its text the
@@ -817,6 +839,48 @@ const WHOLE_AFTER_EDIT: usize = 300;
 /// Top-level definitions one edit may replace in an existing file.
 const MAX_DEFINITIONS_PER_EDIT: usize = 2;
 
+/// An edit that writes at most this many lines is small enough to lose: the definitions limit does
+/// not apply (seen: four small type definitions changed together refused six times in one task).
+const SMALL_EDIT_LINES: usize = 60;
+
+/// Two replaces of one call where one's range holds the other's and both end on the same line: the
+/// outer one is taken to stop where the inner one starts, said in the result (seen: lines 63-95 and
+/// 90-95 sent together twice, refused as overlapping each time). Only anchors that name their line
+/// in the file as it is now are moved.
+fn shorten_nested(doc: &Doc, ops: &mut [hashedit::EditOp]) -> Vec<String> {
+    let direct = |reference: &hashedit::LineRef| match reference {
+        hashedit::LineRef::Tagged(anchor) if anchor.line >= 1 && anchor.line <= doc.len() && doc.tag(anchor.line - 1).as_bytes() == anchor.tag => Some(anchor.line),
+        _ => None,
+    };
+    let mut said = Vec::new();
+    for outer in 0..ops.len() {
+        for inner in 0..ops.len() {
+            if outer == inner || ops[outer].kind != hashedit::OpKind::Replace || ops[inner].kind != hashedit::OpKind::Replace {
+                continue;
+            }
+            let (Some(outer_at), Some(inner_at)) = (direct(&ops[outer].at), direct(&ops[inner].at)) else { continue };
+            let outer_to = ops[outer].to.as_ref().and_then(direct).unwrap_or(outer_at);
+            let inner_to = ops[inner].to.as_ref().and_then(direct).unwrap_or(inner_at);
+            if outer_at < inner_at && outer_to == inner_to {
+                let end = inner_at - 1;
+                let tag = doc.tag(end - 1);
+                let bytes = tag.as_bytes();
+                if bytes.len() != 2 {
+                    continue;
+                }
+                ops[outer].to = Some(hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line: end, tag: [bytes[0], bytes[1]] }));
+                said.push(format!("Edit #{} now ends at line {end}, where edit #{} starts: their ranges overlapped.", outer + 1, inner + 1));
+            }
+        }
+    }
+    said
+}
+
+/// The lines an edit writes in all.
+fn written_lines(ops: &[hashedit::EditOp]) -> usize {
+    ops.iter().map(|op| op.lines.len()).sum()
+}
+
 /// The corrections of a refused edit whose range ends in the wrong place (seen: seven refusals of
 /// this kind in one run, each costing a step and often fixed the wrong way). Tried in order; the
 /// first that passes every check (the definitions limit, the syntax check) is written, with a note
@@ -923,6 +987,7 @@ fn retry_with_range_fix(
             .collect();
         let text = old.clone().unwrap_or_default();
         if !in_scratch
+            && written_lines(&fixed) > SMALL_EDIT_LINES
             && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
             && replaced.len() > MAX_DEFINITIONS_PER_EDIT
         {
@@ -1093,6 +1158,13 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
             return Out::fail("syntax_error", text);
         }
     }
+    // The file as it was before the turn's first change of it (None: the turn creates it): the
+    // baseline check runs the tests on these. A one-off try in `tmp/` is no project code.
+    if !util::is_inside(&absolute, &util::scratch_dir(&session.workspace))
+        && let Ok(mut originals) = core.originals.lock()
+    {
+        originals.entry(session.context.session_id.clone()).or_default().entry(absolute.clone()).or_insert_with(|| old.clone());
+    }
     if let Err(error) = util::atomic_write(&absolute, new.as_bytes()) {
         return Out::fail("io_error", format!("{display}: {error}"));
     }
@@ -1193,6 +1265,8 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
 fn line_ref(value: &Value) -> Option<LineRef> {
     match value {
         Value::Number(number) if number.as_u64() == Some(0) => Some(LineRef::Start),
+        // A bare line number (see the repair of anchors): valid only while the file is as last read.
+        Value::Number(number) => number.as_u64().map(|line| LineRef::Bare(line as usize)),
         Value::String(text) => LineRef::parse(text),
         _ => None,
     }
@@ -1376,6 +1450,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         let doc = Doc::parse(&text);
         let hash = util::content_hash(text.as_bytes());
         let view = core.read_state.view(session_id, &absolute, &hash);
+        reversed.extend(shorten_nested(&doc, &mut ops));
         return match hashedit::apply(&doc, view.as_ref(), &ops) {
             Ok(applied) => {
                 // One edit replaces at most two definitions of an existing file: a whole rewrite
@@ -1397,6 +1472,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                     })
                     .collect();
                 if !in_scratch
+                    && written_lines(&ops) > SMALL_EDIT_LINES
                     && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
                     && replaced.len() > MAX_DEFINITIONS_PER_EDIT
                 {

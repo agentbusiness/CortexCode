@@ -11,6 +11,10 @@ export const PLAN = 'plan';
 export const DECISION = 'decision';
 /** A knowledge item the model proposed from the user's message (`chatflow.knowledge.answer`). */
 export const KNOWLEDGE = 'knowledge';
+/** An open design question worked through: its `ideas` phase, then its `options` phase. */
+export const IDEATION = 'ideation';
+/** A comment on an open plan, sent with `chatflow.plan.revise`. */
+export const PLAN_COMMENT = 'plan_comment';
 export const REQUIREMENT_STATUSES = ['open', 'met', 'dropped'] as const;
 
 export interface Requirement {
@@ -40,6 +44,8 @@ export interface PlanTask {
   n: number;
   title: string;
   brief: string;
+  /** The request's rules this task makes true. */
+  rules: string[];
   depends_on: number[];
   touches: string[];
   checks: string[];
@@ -84,6 +90,8 @@ export interface PlanView {
   diff: PlanDiff | null;
   note: string;
   rootTask: string | null;
+  /** `user` when the user edited this version by hand. */
+  by: string;
 }
 
 function record(value: Json | undefined): Record<string, Json> {
@@ -169,6 +177,7 @@ export function planOf(entry: JournalEntry): PlanView {
         n: num(task.n),
         title: str(task.title),
         brief: str(task.brief),
+        rules: strings(task.rules),
         depends_on: list(task.depends_on).filter((n): n is number => typeof n === 'number'),
         touches: strings(task.touches),
         checks: strings(task.checks),
@@ -192,6 +201,7 @@ export function planOf(entry: JournalEntry): PlanView {
       : null,
     note: str(data.note),
     rootTask: str(data.root_task) || null,
+    by: str(data.by),
   };
 }
 
@@ -250,4 +260,113 @@ export function planProgress(plan: PlanView, entries: readonly JournalEntry[]): 
     }
   }
   return { status, tasks };
+}
+
+export interface PlanCommentView {
+  seq: number;
+  /** The task it is about (absent: the plan). */
+  task: number | null;
+  taskTitle: string;
+  text: string;
+  /** open | sent | removed */
+  state: string;
+}
+
+/** The comments on a plan that are not taken back, oldest first. */
+export function planComments(entries: readonly JournalEntry[], planId: string): PlanCommentView[] {
+  return entries
+    .filter((entry) => entry.kind === PLAN_COMMENT && str(entry.data.plan_id) === planId && str(entry.data.state) !== 'removed')
+    .map((entry) => ({
+      seq: entry.seq,
+      task: typeof entry.data.task === 'number' ? entry.data.task : null,
+      taskTitle: str(entry.data.task_title),
+      text: str(entry.data.text),
+      state: str(entry.data.state) || 'open',
+    }));
+}
+
+export interface FoundView {
+  kind: string;
+  ref: string;
+  text: string;
+}
+
+export interface IdeaView {
+  n: number;
+  principle: string;
+  name: string;
+  mechanism: string;
+  found: FoundView[];
+}
+
+export interface CritiqueView {
+  idea: number;
+  verdict: string;
+  why: string;
+}
+
+export interface ChoiceView {
+  letter: string;
+  idea: number;
+  name: string;
+  mechanism: string;
+  why: string;
+  grounding: FoundView[];
+  priorArt: string;
+  cost: string;
+  risk: string;
+  settleBy: string;
+}
+
+export interface IdeationView {
+  seq: number;
+  phase: string;
+  question: string;
+  constraints: string[];
+  criteria: string[];
+  ideas: IdeaView[];
+  critique: CritiqueView[];
+  options: ChoiceView[];
+  radical: { name: string; drops: string; buys: string; wins_if: string } | null;
+  recommend: string;
+  because: string;
+  wouldChangeIf: string;
+  chosen: string | null;
+}
+
+function found(value: Json): FoundView {
+  const data = record(value);
+  return { kind: str(data.kind), ref: str(data.ref), text: str(data.text) };
+}
+
+export function ideationOf(entry: JournalEntry): IdeationView {
+  const data = entry.data;
+  const radical = data.radical ? record(data.radical) : null;
+  return {
+    seq: entry.seq,
+    phase: str(data.phase),
+    question: str(data.question),
+    constraints: strings(data.constraints),
+    criteria: strings(data.criteria),
+    ideas: list(data.ideas).map((item) => {
+      const idea = record(item);
+      return { n: num(idea.n), principle: str(idea.principle).replace(/_/g, ' '), name: str(idea.name), mechanism: str(idea.mechanism), found: list(idea.found).map(found) };
+    }),
+    critique: list(data.critique).map((item) => {
+      const critique = record(item);
+      return { idea: num(critique.idea), verdict: str(critique.verdict), why: str(critique.why) };
+    }),
+    options: list(data.options).map((item) => {
+      const option = record(item);
+      return {
+        letter: str(option.letter), idea: num(option.idea), name: str(option.name), mechanism: str(option.mechanism), why: str(option.why),
+        grounding: list(option.grounding).map(found), priorArt: str(option.prior_art), cost: str(option.cost), risk: str(option.risk), settleBy: str(option.settle_by),
+      };
+    }),
+    radical: radical && str(radical.name) ? { name: str(radical.name), drops: str(radical.drops), buys: str(radical.buys), wins_if: str(radical.wins_if) } : null,
+    recommend: str(data.recommend),
+    because: str(data.because),
+    wouldChangeIf: str(data.would_change_if),
+    chosen: str(data.chosen) || null,
+  };
 }

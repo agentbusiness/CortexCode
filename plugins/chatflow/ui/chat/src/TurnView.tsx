@@ -4,8 +4,8 @@ import { Activity, activityItems, isScaffolding } from './Activity';
 import { Attachments } from './Attachments';
 import { ChangeCard } from './Change';
 import { Edits, type EditedFile } from './Edits';
-import { DECISION, KNOWLEDGE, PLAN, SPEC } from './ideation';
-import { DecisionCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
+import { DECISION, IDEATION, KNOWLEDGE, PLAN, SPEC } from './ideation';
+import { DecisionCard, IdeasCard, OptionsCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
 import { MarkdownBlock } from './Markdown';
 import { routeText, str, type Block, type Step, type Turn } from './transcript';
 
@@ -317,7 +317,11 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
     case PLAN:
       return <PlanCard entry={entry} actions={actions} />;
     case DECISION:
+      // A decision made by choosing an option is shown by the options card.
+      if (typeof data.ideation_seq === 'number') return null;
       return <DecisionCard entry={entry} actions={actions} />;
+    case IDEATION:
+      return str(data.phase) === 'options' ? <OptionsCard entry={entry} actions={actions} /> : <IdeasCard entry={entry} />;
     // Knowledge is kept at once; the run's learned line counts it.
     case KNOWLEDGE:
       return null;

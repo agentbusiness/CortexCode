@@ -215,3 +215,38 @@
 #cc .cx-verdict[data-passed="false"] .cx-verdict-mark,#cc .cx-verdict[data-passed="false"] .cx-verdict-text{color:var(--rubric);}
 #cc .cx-verdict-text{font-weight:600;color:var(--counter);}
 #cc .cx-verdict-facts{font-variant-numeric:tabular-nums;opacity:.8;}
+
+/* Plan editing and comments (the plan card's Edit and Comment). */
+#cc .cx-chat .cx-plan-edit-tasks li{display:flex;flex-direction:column;gap:6px;}
+#cc .cx-chat .cx-plan-edit-tasks textarea,#cc .cx-chat .cx-plan-edit-tasks input{font:inherit;width:100%;box-sizing:border-box;}
+#cc .cx-chat .cx-plan-edit-tasks textarea{resize:vertical;}
+#cc .cx-chat .cx-plan-edit-head{display:flex;gap:6px;align-items:center;}
+#cc .cx-chat .cx-plan-edit-head input{flex:1;min-width:0;}
+#cc .cx-chat .cx-plan-edit-after{display:flex;flex-wrap:wrap;gap:4px;align-items:center;}
+#cc .cx-chat .cx-plan-edit-after .detent[data-on="true"]{border-color:var(--accent,#e8873a);color:var(--ink);}
+#cc .cx-chat .cx-plan-edit-after .detent[data-on="false"]{opacity:.6;}
+#cc .cx-chat .cx-plan-rules{margin:4px 0 0;padding-left:1.2em;font-size:.95em;}
+#cc .cx-chat .cx-plan-comments{list-style:none;margin:6px 0 0;padding:0;grid-column:2;}
+#cc .cx-chat .cx-plan-comments li{display:flex;gap:8px;align-items:baseline;padding:4px 8px;margin-top:4px;border-left:2px solid var(--accent,#e8873a);background:var(--paper-2,rgba(127,127,127,.06));}
+#cc .cx-chat .cx-plan-comment-text{flex:1;min-width:0;white-space:pre-wrap;}
+#cc .cx-chat .cx-plan-comment-box{display:flex;gap:6px;align-items:center;margin-top:6px;grid-column:2;flex-wrap:wrap;}
+#cc .cx-chat .cx-plan-comment-box input{flex:1;min-width:12em;font:inherit;}
+#cc .cx-chat .cx-plan-comment-add{margin-top:4px;font-size:.9em;}
+
+/* Ideation: the ideas weighed (folded) and the options card. */
+#cc .cx-chat .cx-ideas{margin:8px 0;}
+#cc .cx-chat .cx-ideas summary{cursor:pointer;}
+#cc .cx-chat .cx-ideas-list{margin:6px 0 0;padding-left:1.4em;}
+#cc .cx-chat .cx-ideas-list li{padding:4px 0;}
+#cc .cx-chat .cx-idea-name,#cc .cx-chat .cx-option-name{font-weight:600;color:var(--ink);}
+#cc .cx-chat .cx-idea-mechanism,#cc .cx-chat .cx-option-mechanism{margin:2px 0;}
+#cc .cx-chat .cx-findings{list-style:none;margin:2px 0 0;padding:0;font-size:.92em;}
+#cc .cx-chat .cx-findings code{font-size:.95em;}
+#cc .cx-chat .cx-options{margin:12px 0;}
+#cc .cx-chat .cx-option-list{list-style:none;margin:8px 0 0;padding:0;grid-column:2;}
+#cc .cx-chat .cx-option-list > li{padding:8px 0;border-top:1px solid var(--rule);}
+#cc .cx-chat .cx-option-list > li[data-recommended="true"]{border-left:2px solid var(--accent,#e8873a);padding-left:8px;}
+#cc .cx-chat .cx-options[data-chosen]:not([data-chosen=""]) .cx-option-list > li[data-chosen="false"]{opacity:.55;}
+#cc .cx-chat .cx-option-head{display:flex;gap:8px;align-items:baseline;}
+#cc .cx-chat .cx-option-head .cx-option-name{flex:1;min-width:0;}
+#cc .cx-chat .cx-option-badge{color:var(--accent,#e8873a);}

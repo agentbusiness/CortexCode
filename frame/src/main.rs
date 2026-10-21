@@ -19,6 +19,7 @@ mod package;
 mod power;
 mod shell;
 mod state;
+mod store;
 mod supervisor;
 mod uiplugins;
 mod units;
@@ -153,8 +154,12 @@ async fn run(cli: Cli, config: Config, home: Home) -> ExitCode {
 
 async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
-    let journal = journal::Journal::open(home.journal()).map_err(|e| format!("journal: {e}"))?;
-    let state = state::StateStore::open(home.state()).map_err(|e| format!("state: {e}"))?;
+    // The frame's records live in the memory plugin's store, written through one ordered outbox.
+    let memory = store::MemoryLink::new();
+    let (outbox, outgoing) = store::Outbox::new();
+    store::spawn_writer(memory.clone(), outgoing);
+    let journal = journal::Journal::open(outbox.clone(), memory.clone());
+    let state = state::StateStore::open(outbox);
     let units = units::Units::load(&home.plugins(), &home.state(), config.overrides.clone(), machine.memory_bytes).map_err(|e| format!("plugins: {e}"))?;
     let token = home::random_token(32).map_err(|e| format!("token: {e}"))?;
 
@@ -173,7 +178,7 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     if cli.safe {
         tracing::warn!("safe mode: plugins read their packaged data only");
     }
-    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, units, code, safe: cli.safe });
+    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, code, safe: cli.safe });
     frame.port.store(port, Ordering::SeqCst);
     // The Mac does not idle-sleep while the frame runs (window open or not); shutdown releases it.
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {
@@ -274,10 +279,15 @@ async fn shutdown(frame: &Arc<Frame>) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Every plugin but the memory plugin first; then the records still in the outbox go to its
+    // store, and it stops last.
+    supervisor::stop_all_except(frame, store::MEMORY).await;
+    if tokio::time::timeout(Duration::from_secs(30), frame.journal.close()).await.is_err() {
+        tracing::error!("the store did not take the last changes within 30 s");
+    }
     supervisor::stop_all(frame).await;
     supervisor::kill_remaining(frame).await;
     frame.close_clients();
-    frame.journal.close().await;
     frame.power.release_all();
 }
 

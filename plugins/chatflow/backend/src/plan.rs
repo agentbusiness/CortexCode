@@ -12,7 +12,7 @@
 use crate::data::Dataset;
 use crate::schemas::{Decision, PlanOutput};
 use crate::spec::Spec;
-use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, plan_status};
+use cc_protocol::contracts::chatflow::{PlanEditParams, kinds as chatflow_kinds, plan_status};
 use cc_protocol::contracts::frame::JournalEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +42,10 @@ pub struct PlanTask {
     pub title: String,
     #[serde(default)]
     pub brief: String,
+    /// The request's rules this task makes true (a behaviour, a value, an error, a limit), each to
+    /// get its own test in the project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
     /// Numbers of earlier tasks.
     #[serde(default)]
     pub depends_on: Vec<u32>,
@@ -129,6 +133,9 @@ pub struct Plan {
     /// How many times this plan was written again after one of its tasks ended badly.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub replans: u32,
+    /// `user` for a version the user edited by hand (`chatflow.plan.edit`); empty for the planner's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -201,6 +208,7 @@ pub fn replanned(previous: &Plan, doc: PlanDoc, new_tasks: Vec<PlanTask>, note: 
         root_task: previous.root_task.clone(),
         steps_done: done,
         replans: previous.replans + 1,
+        by: String::new(),
     }
 }
 
@@ -277,7 +285,7 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
             if !task.brief.trim().is_empty() {
                 first.brief = format!("{}\n{}", first.brief.trim_end(), task.brief.trim());
             }
-            for (into, from) in [(&mut first.checks, task.checks), (&mut first.covers, task.covers), (&mut first.skills, task.skills)] {
+            for (into, from) in [(&mut first.rules, task.rules), (&mut first.checks, task.checks), (&mut first.covers, task.covers), (&mut first.skills, task.skills)] {
                 for item in from {
                     if !into.contains(&item) {
                         into.push(item);
@@ -334,6 +342,7 @@ pub fn from_output(output: &PlanOutput, max_tasks: usize, known: Known) -> (Plan
             n,
             title: if title.is_empty() { brief.lines().next().unwrap_or("").to_owned() } else { title.to_owned() },
             brief: brief.to_owned(),
+            rules: clean(&task.rules),
             depends_on,
             touches: clean(&task.touches),
             checks: clean(&task.checks),
@@ -343,6 +352,90 @@ pub fn from_output(output: &PlanOutput, max_tasks: usize, known: Known) -> (Plan
         });
     }
     (doc, tasks)
+}
+
+/// The next version of an open plan after the user's own edit (`chatflow.plan.edit`): the fields
+/// given replace the plan's; `tasks`, when given, is the whole new list, numbered in its order,
+/// each `depends_on` kept to earlier positions; a task without a title is left out (its
+/// dependents lose that dependency). Back to draft: an edited plan is approved again.
+pub fn user_edit(current: &Plan, edit: &PlanEditParams) -> Result<Plan, String> {
+    if !current.is_open() {
+        return Err(format!("the plan is {}", current.status));
+    }
+    let text = |given: &Option<String>, now: &str| given.as_deref().map(str::trim).unwrap_or(now).to_owned();
+    let mut next = current.clone();
+    next.version = current.version + 1;
+    next.status = plan_status::DRAFT.into();
+    next.by = "user".into();
+    next.note = String::new();
+    next.doc.goal = text(&edit.goal, &current.doc.goal);
+    next.doc.approach = text(&edit.approach, &current.doc.approach);
+    next.doc.architecture = text(&edit.architecture, &current.doc.architecture);
+    if let Some(risks) = &edit.risks {
+        next.doc.risks = clean(risks);
+    }
+    if let Some(tasks) = &edit.tasks {
+        // Positions in the edited list -> the numbers of the tasks kept.
+        let mut numbers: HashMap<u32, u32> = HashMap::new();
+        let mut kept: Vec<PlanTask> = Vec::new();
+        for (index, task) in tasks.iter().enumerate() {
+            let title = task.title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            let n = kept.len() as u32 + 1;
+            numbers.insert(index as u32 + 1, n);
+            let mut depends_on: Vec<u32> = Vec::new();
+            for position in &task.depends_on {
+                if let Some(&target) = numbers.get(position)
+                    && target < n
+                    && !depends_on.contains(&target)
+                {
+                    depends_on.push(target);
+                }
+            }
+            kept.push(PlanTask {
+                n,
+                title: title.to_owned(),
+                brief: task.brief.trim().to_owned(),
+                rules: clean(&task.rules),
+                depends_on,
+                touches: clean(&task.touches),
+                checks: clean(&task.checks),
+                covers: clean(&task.covers),
+                skills: clean(&task.skills),
+                task_id: None,
+            });
+        }
+        if kept.is_empty() {
+            return Err("a plan needs at least one task with a title".into());
+        }
+        next.tasks = kept;
+        next.doc.steps = next.tasks.iter().map(|task| task.title.clone()).collect();
+    }
+    next.diff = Some(diff(current, &next));
+    if next.diff.as_ref().is_some_and(PlanDiff::is_empty) {
+        return Err("nothing changed".into());
+    }
+    Ok(next)
+}
+
+/// A next version's tasks keep the dependencies of the tasks they carry over: a task with the
+/// title of a task of `previous` that names no dependency gets that task's, mapped by title to the
+/// new numbers (earlier tasks only). A version is written whole, and the planner was seen dropping
+/// a kept task's dependency the change did not touch.
+pub fn keep_dependencies(previous: &Plan, tasks: &mut [PlanTask]) {
+    let numbers: HashMap<String, u32> = tasks.iter().map(|task| (task.title.trim().to_lowercase(), task.n)).collect();
+    for task in tasks.iter_mut().filter(|task| task.depends_on.is_empty()) {
+        let Some(before) = previous.tasks.iter().find(|before| before.title.trim().eq_ignore_ascii_case(task.title.trim())) else { continue };
+        task.depends_on = before
+            .depends_on
+            .iter()
+            .filter_map(|n| previous.tasks.iter().find(|other| other.n == *n))
+            .filter_map(|other| numbers.get(&other.title.trim().to_lowercase()).copied())
+            .filter(|n| *n < task.n)
+            .collect();
+    }
 }
 
 /// What `new` changed against `old`.
@@ -365,6 +458,7 @@ pub fn diff(old: &Plan, new: &Plan) -> PlanDiff {
     for task in &new.tasks {
         if let Some(before) = old.tasks.iter().find(|before| before.title == task.title)
             && (before.brief != task.brief
+                || before.rules != task.rules
                 || before.touches != task.touches
                 || before.checks != task.checks
                 || before.covers != task.covers
@@ -455,6 +549,12 @@ pub fn in_place(ds: &Dataset, entry: &JournalEntry, newest: &HashMap<String, u64
 /// requirement; a task among several carries the ones it covers.
 pub fn task_focus(ds: &Dataset, task: &PlanTask, spec: Option<&Spec>, whole: bool) -> String {
     let mut text = task.brief.trim().to_owned();
+    // The rules, each with its own test: a test written for the code (seen: tests that passed on
+    // wrong code) checks less than one written for each thing the request says must hold.
+    if !task.rules.is_empty() {
+        let items: Vec<String> = task.rules.iter().map(|rule| ds.text("list_item", &[("text", rule)])).collect();
+        text.push_str(&ds.text("plan_task_rules", &[("items", &items.join("\n"))]));
+    }
     if let Some(spec) = spec {
         let item = |requirement: &crate::spec::Requirement| ds.text("list_item", &[("text", &format!("{}: {}", requirement.id, requirement.text))]);
         let served: Vec<String> = if whole {
@@ -546,6 +646,51 @@ pub fn foreground_decision(ds: &Dataset, plan: &Plan, spec: Option<&Spec>, effor
         skills: task.skills,
         note: String::new(),
     }
+}
+
+/// A comment on a plan the user has not sent yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub seq: u64,
+    pub task: Option<u32>,
+    pub task_title: String,
+    pub text: String,
+}
+
+/// The open comments on `plan_id`, oldest first.
+pub fn open_comments(entries: &[JournalEntry], plan_id: &str) -> Vec<Comment> {
+    let field = |entry: &JournalEntry, name: &str| entry.data.get(name).and_then(Value::as_str).unwrap_or("").to_owned();
+    entries
+        .iter()
+        .filter(|entry| entry.kind == chatflow_kinds::PLAN_COMMENT && field(entry, "plan_id") == plan_id && field(entry, "state") == "open")
+        .map(|entry| Comment {
+            seq: entry.seq,
+            task: entry.data.get("task").and_then(Value::as_u64).map(|n| n as u32),
+            task_title: field(entry, "task_title"),
+            text: field(entry, "text"),
+        })
+        .collect()
+}
+
+/// The change request the comments make: the comments on the plan first, then each task's in the
+/// plan's order, each under the task's current number and title (a comment on a task removed
+/// since names the title it was made on).
+pub fn revise_request(ds: &Dataset, plan: &Plan, comments: &[Comment]) -> String {
+    let mut lines: Vec<String> = comments.iter().filter(|comment| comment.task.is_none()).map(|comment| ds.text("plan_revise_on_plan", &[("text", comment.text.trim())])).collect();
+    let mut on_tasks: Vec<(u32, String, &Comment)> = comments
+        .iter()
+        .filter(|comment| comment.task.is_some())
+        .map(|comment| match plan.tasks.iter().find(|task| task.title == comment.task_title).or_else(|| plan.tasks.iter().find(|task| Some(task.n) == comment.task)) {
+            Some(task) => (task.n, task.title.clone(), comment),
+            None => (u32::MAX, comment.task_title.clone(), comment),
+        })
+        .collect();
+    on_tasks.sort_by_key(|(n, _, comment)| (*n, comment.seq));
+    for (n, title, comment) in on_tasks {
+        let number = if n == u32::MAX { "-".to_owned() } else { n.to_string() };
+        lines.push(ds.text("plan_revise_on_task", &[("number", &number), ("title", &title), ("text", comment.text.trim())]));
+    }
+    ds.text("plan_revise_request", &[("items", &lines.join("\n"))])
 }
 
 /// The task numbers the PLAN grammar offers for `depends_on`.

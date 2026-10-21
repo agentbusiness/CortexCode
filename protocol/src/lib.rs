@@ -12,6 +12,7 @@ pub mod envelope;
 pub mod hashline;
 pub mod plugin;
 pub mod sha256;
+pub mod stored;
 
 pub use conn::{BoxFuture, CallStream, Connection, Handler, IncomingRequest, ItemSink, NoHandler, Responder};
 pub use envelope::{Message, RpcError, codes, parse_params, to_value};

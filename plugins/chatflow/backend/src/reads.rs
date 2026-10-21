@@ -44,7 +44,7 @@ impl Scope {
         }
     }
 
-    fn with(&self, extra: Value) -> Value {
+    pub(crate) fn with(&self, extra: Value) -> Value {
         let mut value = self.memory();
         if let (Some(map), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
             for (key, item) in extra {

@@ -7,8 +7,8 @@ use std::path::Path;
 const ITEMS: &[(&str, &str)] = &[
     ("Models", "models"),
     ("Installed plugins", "plugins"),
-    ("Plugin data (index, saved conversations, caches)", "plugins-data"),
-    ("Conversations", "journal"),
+    ("Plugin data (caches, saved model states)", "plugins-data"),
+    ("Store (projects, conversations, settings, code graph)", "irongraph"),
     ("Attachments", "attachments"),
     ("Logs", "logs"),
 ];

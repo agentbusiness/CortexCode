@@ -51,6 +51,8 @@ function Chat() {
   const [scrolls, setScrolls] = useSlotState<Record<string, number>>('scroll', {});
   const [error, setError] = useState<string | null>(null);
   const [stick] = useShared<number>('chat.stick', 0);
+  // The mode a turn started from a card runs in (the composer's default for new work).
+  const [defaultMode] = useShared<'ask' | 'auto'>('agents.defaultMode', 'auto');
   const [focus, setFocus] = useShared<ChatFocus | null>('chat.focus', null);
   // What was last asked to be shown: folded steps holding it stay open; the element is marked.
   const [reveal, setReveal] = useState<Reveal & { sessionId: string | null; landed: boolean }>({ seq: null, sessionId: null, landed: false });
@@ -222,8 +224,33 @@ function Chat() {
       setShared('chat.stick', Date.now());
       await client.call('chatflow.plan.implement', { session_id: sessionId, plan_id: planId });
     },
-    editInChat: () => setShared('composer.focus', Date.now()),
-  }), [workspace, client, sessionId, projectId, selection, host]);
+    editPlan: async (change) => {
+      if (!sessionId) return;
+      await client.call('chatflow.plan.edit', { session_id: sessionId, ...change });
+    },
+    commentPlan: async (planId, task, text) => {
+      if (!sessionId) return;
+      await client.call('chatflow.plan.comment', { session_id: sessionId, plan_id: planId, text, ...(task === null ? {} : { task }) });
+    },
+    removeComment: async (planId, seq) => {
+      if (!sessionId) return;
+      await client.call('chatflow.plan.comment', { session_id: sessionId, plan_id: planId, remove: seq });
+    },
+    revisePlan: async (planId) => {
+      if (!sessionId) return;
+      setShared('chat.stick', Date.now());
+      await client.call('chatflow.plan.revise', { session_id: sessionId, plan_id: planId, mode: defaultMode });
+    },
+    chooseOption: async (seq, option) => {
+      if (!sessionId) return;
+      await client.call('chatflow.ideation.choose', { session_id: sessionId, seq, option });
+    },
+    sendMessage: async (text) => {
+      if (!sessionId) return;
+      setShared('chat.stick', Date.now());
+      await client.call('chatflow.turn', { session_id: sessionId, text, mode: defaultMode });
+    },
+  }), [workspace, client, sessionId, projectId, selection, host, defaultMode]);
   const spec = useMemo(() => currentSpec(entries), [entries]);
   const decisions = useMemo(() => acceptedDecisions(entries), [entries]);
   const ideation = useMemo<IdeationContextValue>(() => ({ entries, running, newestPlans: newestPlans(entries), specVersions: specVersions(entries) }), [entries, running]);

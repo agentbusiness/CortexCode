@@ -16,7 +16,7 @@ import path from 'node:path';
 import { appHome, buildFrameConfig, folderDefault, Frame, FrameClient } from './frame.mjs';
 import { TOOLCHAINS } from './paths.mjs';
 import { ensureDir, sleep } from './util.mjs';
-import { requireCleanSlate } from './cleanslate.mjs';
+import { requireCleanSlate, withdrawBenchmarkLessons } from './cleanslate.mjs';
 
 export const MODELS_DIR = path.join(os.homedir(), '.cortexcode', 'models');
 const CALIBRATION_CACHE_DIR = path.join(TOOLCHAINS, 'model-state');
@@ -173,7 +173,9 @@ export class CortexSystem {
   }
 
   async openTask(workspace, title) {
-    // Every task starts from a clean slate: the shipped skills, no learned state (cleanslate.mjs).
+    // Every task starts from a clean slate: the shipped skills, no learned state (cleanslate.mjs);
+    // what earlier benchmark tasks taught is withdrawn first.
+    await withdrawBenchmarkLessons((method, params) => this.client.request(method, params));
     this.slate = await requireCleanSlate((method, params) => this.client.request(method, params), { codeDir: path.join(this.frame.home, 'code') });
     const project = await this.client.request('frame.project.open', { root: workspace });
     const session = await this.client.request('frame.session.create', { project_id: project.id, kind: 'chat', title });

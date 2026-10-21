@@ -57,6 +57,8 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/experiment_rule_checks.md", include_str!("../data/prompts/experiment_rule_checks.md")),
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
+    ("prompts/ideas.md", include_str!("../data/prompts/ideas.md")),
+    ("prompts/options.md", include_str!("../data/prompts/options.md")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
     ("schemas/router.json", include_str!("../data/schemas/router.json")),
     ("schemas/decide.json", include_str!("../data/schemas/decide.json")),
@@ -67,6 +69,8 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("schemas/decisions.json", include_str!("../data/schemas/decisions.json")),
     ("schemas/knowledge.json", include_str!("../data/schemas/knowledge.json")),
     ("schemas/learn.json", include_str!("../data/schemas/learn.json")),
+    ("schemas/ideas.json", include_str!("../data/schemas/ideas.json")),
+    ("schemas/options.json", include_str!("../data/schemas/options.json")),
 ];
 
 /// Roles a session's system prompt is built for: `chat` (the foreground flow) and `agent` (a
@@ -75,12 +79,12 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "IDEAS", "OPTIONS"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
 const SCHEMA_NEEDS: &[SchemaNeed] = &[
-    ("ROUTE", &["work", "route"], Some(("route", &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "PLAN", "IMPLEMENT"]))),
+    ("ROUTE", &["work", "route"], Some(("route", &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "PLAN", "IDEATE", "IMPLEMENT"]))),
     ("DECIDE", &["missing", "route"], Some(("route", &["MORE", "ANSWER", "DO", "DELEGATE", "PLAN"]))),
     ("CHECKS", &["checks"], None),
     ("SPEC", &["title", "requirements"], None),
@@ -91,6 +95,8 @@ const SCHEMA_NEEDS: &[SchemaNeed] = &[
     ("KNOWLEDGE", &["items"], None),
     ("LEARN", &["useful"], Some(("useful", &["no", "yes"]))),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
+    ("IDEAS", &["question", "ideas"], None),
+    ("OPTIONS", &["critique", "options", "recommend"], None),
 ];
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
@@ -293,6 +299,9 @@ pub struct Limits {
     /// Lessons (global) shown with the knowledge note after ROUTE, best first; 0 = none.
     #[serde(default = "lessons_per_turn")]
     pub lessons_per_turn: u32,
+    /// Lessons learned from a failure shown right under that failure when it comes again; 0 = none.
+    #[serde(default = "lessons_per_failure")]
+    pub lessons_per_failure: u32,
     /// Episodes one finished run is learned from, at most.
     #[serde(default = "learn_episodes_per_run")]
     pub learn_episodes_per_run: usize,
@@ -339,6 +348,9 @@ fn brief_tokens() -> u32 {
 }
 fn lessons_per_turn() -> u32 {
     4
+}
+fn lessons_per_failure() -> u32 {
+    1
 }
 fn learn_episodes_per_run() -> usize {
     6
