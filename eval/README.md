@@ -54,6 +54,15 @@ Skill names in the bank are data; the bank refuses to load a URI missing from
 `plugins/lang-*/data/skills` or `plugins/skills-*/data/skills`. Each run directory also gets
 `summary.md` (one row per turn) and `results.jsonl` (one row per turn as it ends).
 
+`node eval/divergence.mjs [--suite S] [--model V] [--out FILE]` lists, for every task that passed in
+some runs and failed in others, where a failing run's journal first parts from a passing one's
+(the steps both took, then each side's next steps; stage decisions, model tool calls, host notes).
+No model is involved: it points at the step whose cue left the outcome to chance.
+
+Before every task the harness withdraws the global lessons earlier benchmark tasks taught
+(`cleanslate.mjs`: lessons by a `cceval-*` session; the app learns after every run) and refuses
+to start while any other lesson is live.
+
 Results: `eval/results/<suite>/<system>/<model>/run-<n>/` holds `run.json`, `frame.toml`, the
 frame and plugin logs, and per task `tasks/<id>/result.json` with `attempt-<k>/` (prompt, journal,
 diff, integrity check, `score/` with the grader's raw output).

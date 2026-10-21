@@ -7,7 +7,8 @@
 //! failing run's error, the declarations of the project's types that the error's line uses (its
 //! fields' owners and the types it names), read from the code graph's outline and the file. And it
 //! keys each failure by its error lines without numbers, so the same error after several edits is
-//! known structurally, whatever the command or the line numbers.
+//! known structurally, whatever the command or the line numbers. The shape of the first error line
+//! (`error_shape`) is what a lesson learned from a failure is found by when it comes again.
 
 use crate::host::Host;
 use crate::impact::{relative, scope_args};
@@ -207,5 +208,29 @@ pub fn error_key(output: &str) -> Option<u64> {
         .map(|line| line.chars().filter(|c| !c.is_ascii_digit()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
     (!heads.is_empty()).then(|| crate::repetition::fingerprint(&heads.join("\n")))
+}
+
+/// A path-like word: one with a `/` or `\`.
+static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\S*[/\\]\S*").expect("valid"));
+/// A number standing alone (`E0382` and `TS2322` are words and stay).
+static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").expect("valid"));
+
+/// The error itself, over a runner's header for it (`ERROR: test_total (...)` names the test):
+/// an exception's `Name: message`, a compiler's `error: ...` or `error[E0382]: ...`, a panic.
+static STATEMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]\w*(Error|Exception):|^\s*(error|fatal error)(\[\w+\])?:|panicked at").expect("valid"));
+
+/// The shape of a failing run's error, the same in any project: its first error statement (else its
+/// first error line), with locations, quoted names, paths and numbers taken out (`error[E0382]:
+/// borrow of moved value: `_``). `None` when the output has no error line.
+pub fn error_shape(output: &str) -> Option<String> {
+    // From the statement on: a digest's `ERROR test_total: TypeError: ...` keeps no test name.
+    let statement = output.lines().find_map(|line| STATEMENT.find(line).map(|found| &line[found.start()..]));
+    let line = statement.or_else(|| output.lines().find(|line| HEAD.is_match(line)))?;
+    let line = LOCATION.replace_all(line, "<file>");
+    let line = QUOTED.replace_all(&line, "`_`");
+    let line = PATHLIKE.replace_all(&line, "<path>");
+    let line = NUMBER.replace_all(&line, "N");
+    let shape: String = line.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+    (!shape.is_empty()).then_some(shape)
 }
 

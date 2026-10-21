@@ -173,6 +173,10 @@ knowledge_per_turn = 5
 brief_tokens = 1024
 # Lessons (global, learned from earlier runs) shown with that note, best first; 0 = none.
 lessons_per_turn = 4
+# Lessons learned from a failure (found by its key: the refusal's tool and kind, or the shape of the
+# first error line) shown right under that failure when it comes again; one, so what the run does
+# next is credited to it alone.
+lessons_per_failure = 1
 # Episodes (a failure and what came after it) one run is learned from, at most.
 learn_episodes_per_run = 6
 # A new lesson this similar to a stored one (search score) is that lesson learned again. Measured
@@ -267,6 +271,23 @@ sampling = "auto"
 [stage.PLAN_EDIT]
 rules = ["plan_edit", "plan_fields", "check_rules"]
 schema = "schemas/plan.json"
+effort = "none"
+sampling = "auto"
+
+# An open design question (route IDEATE), in two calls around a host step. IDEAS: the question,
+# its constraints and criteria, and one idea per generating principle (the schema's field names
+# are the principles, so the ideas differ by construction). The host then looks every idea up
+# (code graph, research notes, work elsewhere when online). OPTIONS: critique, the two or three
+# options with their grounding picked from what the host found, a radical one and a recommendation.
+[stage.IDEAS]
+rules = "ideas"
+schema = "schemas/ideas.json"
+effort = "none"
+sampling = "auto"
+
+[stage.OPTIONS]
+rules = "options"
+schema = "schemas/options.json"
 effort = "none"
 sampling = "auto"
 

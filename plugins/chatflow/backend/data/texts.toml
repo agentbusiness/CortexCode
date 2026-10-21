@@ -17,6 +17,10 @@ section_knowledge = "## What the project knows\n{text}"
 knowledge_note = "What the project knows about this work (`read knowledge://<id>` for an item's evidence and the code it concerns):\n{text}"
 # Lessons learned in earlier runs (any project) that fit the turn's work, one line each, with that note.
 lessons_note = "Lessons from earlier work, each learned where it went wrong before:\n{text}"
+# Under a failure: what was learned the last time this failure came (one line each).
+# A replay of a lesson (replay.rs) asks nobody for approval.
+replay_denied = "Not run: this is a replay with nobody to approve it. Continue without this command."
+lessons_failure = "This failed the same way in earlier work; what worked then:\n{text}"
 # LEARN: one episode of a finished run, in host words (the stage's user message).
 learn_card = "Languages: {languages}. The run ended {outcome}.\n{body}\nWrite the lesson this episode teaches, then judge it."
 learn_refused = "A `{tool}` call was refused:\n{error}\nThe call: {call}\nThe next `{tool}` call, which worked: {fix}"
@@ -24,8 +28,6 @@ learn_repeated = "This command failed {times} times the same way: {command}\n{er
 learn_red_green = "This command failed: {command}\n{error}\nThese edits made it pass:\n{edits}"
 learn_retry = "The earlier attempt ended done; then this message said it was wrong:\n{message}\nWhat the work found:\n{found}\nThese edits fixed it, and the run ended done:\n{edits}"
 learn_steer = "While the work ran, the user said: {message}\nThe steps before it: {before}\nThe steps after it: {after}"
-# LEARN, once more: the lesson named something of the project's own.
-learn_rename = "The lesson names `{word}`, which belongs to this project; the next project has other names. Write the lesson again in words that hold in any project, then judge it."
 # The one line after a learned run (the transcript only).
 learned_note = "Learned {count} {items}."
 # The skills catalog, in the stage messages of the stages that choose skills (ROUTE, PLAN).
@@ -158,6 +160,8 @@ attachment_listing_unreadable = "(the folder could not be listed)"
 attachment_shown = "The image itself is part of this message."
 attachment_pasted_whole = "- pasted text {name}: `{path}` ({size}, {lines} lines), shown whole:\n{preview}"
 attachment_test_output = "- test output {name}: `{path}` ({size}). The failures it reports, one line each, then the first one whole; read or search the file for any other failure whole:\n{report}"
+done_tests_pass_before = "The host ran `{command}` on the code as it was before your change, and every test passed there too, so none of them checks what you changed. Add a test that fails without your change and passes with it, run it, then finish."
+done_after_edit = "You changed the code after your last passing test run, so nothing shows the change works. Run the tests, then finish."
 done_without_tests = "Your last check ran no tests, so nothing shows the work is right. Add a test of the case the request is about to the project, run it, then finish."
 attachment_test_notes = "  What the test output above means:\n{notes}"
 attachment_pasted = "- pasted text {name}: `{path}` ({size}, {lines} lines). Only its first and last lines are shown here; read or search the file for the rest:\n{preview}"
@@ -236,15 +240,44 @@ plan_superseded = "(Plan {plan_id}, version {version}: replaced by a later versi
 plan_live_edit = "The open plan is {plan_id}, version {version}."
 plan_task_context = "\n\nPart of plan {plan_id}. Goal: {goal}\nApproach: {approach}"
 plan_task_examples = "\nThe request's examples, the check for this task (run only these; inputs and values as given, never computed or changed):\n{items}"
+plan_task_rules = "\nThe rules this task makes true. Give each its own test in the project, written from the rule, and name in your reply the test for each:\n{items}"
 plan_task_requirements = "\nThe requirements this task serves:\n{items}\nA general rule also holds inside each special case the request names (a first or last item, an empty input, a boundary): test it there too."
 implement_request = "Implement the approved plan."
+# Ideation (route IDEATE, `ideation.rs`). The ideas are host words; the options are the turn's
+# answer, read by the model as its own message and drawn by the options card.
+ideation_notes = "Earlier research notes on this question:\n{items}"
+ideas_heading = "Ideas for: {question}"
+ideas_constraints = "\nConstraints:\n{items}"
+ideas_criteria = "\nCriteria:\n{items}"
+ideas_idea = "\n{number}. {name} ({principle}): {mechanism}"
+ideas_found_code = "\n   in this repository: {ref} {text}"
+ideas_found_note = "\n   earlier note: {text} ({ref})"
+ideas_found_none = "\n   found: nothing"
+options_heading = "Options for: {question}"
+options_criteria = "\nCompared by: {items}"
+options_none = "\nNo idea held up:\n{items}"
+options_option = "\n\n{letter}. {name}: {mechanism}\nWhy: {why}"
+options_grounding = "\nBuilds on: {items}"
+options_prior_art = "\nDone before: {text}"
+options_cost = "\nCost: {text}"
+options_risk = "\nRisk: {text}"
+options_settle = "\nSettle early by: {text}"
+options_radical = "\n\nRadical: {name}: drops {drops}; buys {buys}; wins if {wins_if}"
+options_recommend = "\n\nRecommended: {letter}, because {because}. Would change if {would_change_if}."
+options_choose = "\n\nChoose an option, or say what to change."
+# Plan comments (`chatflow.plan.revise`): the change request is the comments, each under the part
+# of the plan it is about, so the planner reads them next to the names it changes.
+plan_revise_request = "My comments on the open plan, each about the part it names:\n{items}\nWrite the plan's next version with each comment applied to its part. Every task stays unless a comment says to remove it."
+plan_revise_on_plan = "- On the whole plan: {text}"
+plan_revise_on_task = "- On task {number} \"{title}\": {text}"
+plan_edited_note = "You edited the plan by hand: version {version}."
 implement_none = "There is no open plan to implement; ask for a plan first."
 implement_started = "Implementing plan {plan_id}, version {version}: {count} task(s)."
 implement_failed = "The plan could not be handed to the agents ({error}); it stays approved."
 # A decided change is planned first (PLAN, told so) and carried out one step per run of the DO
 # loop: the loop is given its step and what the earlier steps did; its reply ends the step.
 plan_auto_live = "This plan is done right after you write it, here, one task at a time in order, with short thinking for each: do the thinking now. Write each task as what must be true when it is done, never as code; reading and checking are steps inside each task, never tasks of their own. Give a task only the checks that can pass once it is done. One task for the whole work, unless the request names several parts: then one task per part, each after the one it builds on."
-do_step = "{goal}Your job now is only task {n} of {of}: {text}\n{later}{done}Do this task only:\n1. The files it touches are shown above as they are now; read them again only if a command changed them.\n2. Decide the data types first, so that each function can return what it must; then think the whole change through and make it with edit: a new file is written whole with `content`; an existing file is changed only where it needs changing. Strict rule: an existing file is never written whole again; change it with anchored edits, one or two functions per edit: write those, then move to the next ones. A class with its methods counts as one; the anchors of lines you do not change stay valid between edits. Read project files only with read and change them only with edit: cat, sed and here-documents on project files are blocked in run.\n3. Check the change by running only the request's examples: one line per example, input and expected value copied from the request, never computed or changed; no case the request does not give. When the project has tests, run them before and after the change and add the request's examples there. A project without tests gets them, in the place its language skill names (usually `tests/`); they stay in the project. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2), never hand-computed values, in those tests. A one-off try (call a function, print a value) goes in `tmp/`, which git ignores. Build inputs with a small helper that assembles a complete input from its parts, or in code, never by writing long lists or counting in your thinking.\n4. When a test fails, find out from the request and the project whether the code, the input you built or the expected value is wrong (an error your code raises on purpose often means the input is wrong); never change an expected value just to match what the code printed. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line. When a check cannot run here (the sandbox stops it), say so: never change the user's shell setup, tool settings or files outside the project to get it through. Never change the project's build configuration (build files, dependencies, features) unless the request asks. Then change only the code that test runs through. Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs. Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it.\n5. Reply with what changed, what the tests showed, anything you found that a later task must take into account, and what more should be done that the user did not ask for.\nThink in a few lines; code goes into edit, results come from running."
+do_step = "{goal}Your job now is only task {n} of {of}: {text}\n{later}{done}Do this task only:\n1. The files it touches are shown above as they are now; read them again only if a command changed them.\n2. Decide the data types first, so that each function can return what it must; then think the whole change through and make it with edit: a new file is written whole with `content`; an existing file is changed only where it needs changing. Strict rule: an existing file is never written whole again; change it with anchored edits, one or two functions per edit: write those, then move to the next ones. A class with its methods counts as one; the anchors of lines you do not change stay valid between edits. Read project files only with read and change them only with edit: cat, sed and here-documents on project files are blocked in run.\n3. Check the change by running only the request's examples: one line per example, input and expected value copied from the request, never computed or changed; no case the request does not give. When the project has tests, run them before and after the change and add the request's examples there. A project without tests gets them, in the place its language skill names (usually `tests/`); they stay in the project. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2), never hand-computed values, in those tests. A one-off try (call a function, print a value) goes in `tmp/`, which git ignores. Build inputs with a small helper that assembles a complete input from its parts, or in code, never by writing long lists or counting in your thinking.\n4. When a test fails, find out from the request and the project whether the code, the input you built or the expected value is wrong (an error your code raises on purpose often means the input is wrong); never change an expected value just to match what the code printed. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line. When a check cannot run here (the sandbox stops it), say so: never change the user's shell setup, tool settings or files outside the project to get it through. Never change the project's build configuration (build files, dependencies, features) unless the request asks. When the request and every output you have seen leave a value open (an exact message, a format, a name), never guess it silently: use the request's closest words and list each such choice in your reply as `Assumed: …`. Then change only the code that test runs through. Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs. Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it.\n5. Reply with what changed, what the tests showed (the test for each rule of the task), every value you assumed (`Assumed: …`), anything you found that a later task must take into account, and what more should be done that the user did not ask for.\nThink in a few lines; code goes into edit, results come from running."
 do_step_goal = "The whole work: {goal}\n"
 do_step_later = "Later tasks, not now: {titles}.\n"
 do_step_last = " This is the last task; after your reply the host runs its checks."
@@ -265,8 +298,13 @@ read_repeated = "(An older read of {path}; your latest read of it, below, shows 
 edit_superseded = "(An earlier edit of {path}; your latest edit result, below, shows it as it is now.)"
 run_superseded = "(An earlier run of `{command}`; the newest run's output, below, is the one that counts.)"
 read_superseded = "(An older view of {path}: your own edit changed it after this read; your latest edit result, below, shows it as it is now.)"
-attempt_failed = "Task {n} ({title}) was stopped and its steps are no longer shown: {summary}\nWhat did not work in that attempt:\n{failures}\nThe files are as that attempt left them: read what you change before you change it, and take a different approach. Code that works and that the failure does not run through stays as it is."
+attempt_failed = "Task {n} ({title}) was stopped and its steps are no longer shown: {summary}\nWhat did not work in that attempt:\n{failures}{learned}\nThe files are as that attempt left them: read what you change before you change it, and take a different approach. Code that works and that the failure does not run through stays as it is."
 attempt_failure = "- `{command}` still failed; the end of its output:\n{output}"
+# The next attempt starts with what earlier work learned from its failures, and the skills the
+# stopped attempt's errors brought (they were in its dropped steps).
+attempt_learned = "\nWhat worked when these failures came in earlier work:\n{text}"
+attempt_skill = "\nSkill the failures led to ({uri}):\n{text}"
+attempt_skills_also = "\nAlso led to; read each with `read` when you reach that part:\n{uris}"
 attempt_no_failure = "- no command was left failing; the work did not reach a passing check."
 task_stuck = "it did not finish in {calls} tool calls. Where it stood: {last}"
 task_stuck_fixes = "its failing command still failed after {fixes} fixes ({calls} tool calls). Where it stood: {last}"

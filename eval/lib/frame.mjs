@@ -120,13 +120,22 @@ export function appHome() {
 }
 
 /**
- * The plugins installed in `home` (`<home>/state/plugins.json`, `<home>/plugins/<id>/<version>/`):
+ * The plugins installed in `home` (each `<home>/plugins/<id>/` records its current version in
+ * `.current`; a frame from before kept them in `<home>/state/plugins.json`):
  * `{ id, version, dir, category, dataName, config }`, where `dataName` is the plugin's data folder
  * under `plugins-data` (the packed executable's name) and `config` its `[backend.config]` defaults.
  */
 export function installedPlugins(home = appHome()) {
-  const state = readJsonSync(path.join(home, 'state', 'plugins.json')) ?? {};
-  return Object.entries(state.installed ?? {}).flatMap(([id, record]) => {
+  const current = new Map();
+  const legacy = readJsonSync(path.join(home, 'state', 'plugins.json'));
+  for (const [id, record] of Object.entries(legacy?.installed ?? {})) current.set(id, record.current);
+  let ids = [];
+  try { ids = fs.readdirSync(path.join(home, 'plugins')).filter((name) => !name.startsWith('.')); } catch { /* no plugins yet */ }
+  for (const id of ids) {
+    try { current.set(id, fs.readFileSync(path.join(home, 'plugins', id, '.current'), 'utf8').trim()); } catch { /* not installed by a frame */ }
+  }
+  return [...current.entries()].filter(([, version]) => version).flatMap(([id, version]) => {
+    const record = { current: version };
     const dir = path.join(home, 'plugins', id, record.current);
     const manifest = readJsonSync(path.join(dir, 'manifest.json'));
     if (!manifest) return [];
@@ -180,13 +189,13 @@ function linkTree(from, to) {
   }
 }
 
-/** Give a private home the installed plugins: their package versions and a plugins.json. */
+/** Give a private home the installed plugins: their package versions, each recorded as current. */
 export function seedPlugins(home, installed) {
   if (!installed.length) throw new Error(`no plugins are installed in ${appHome()}: start ./cortexcode once (it installs them), or cortex-pack build plugins/<name> --install`);
-  for (const p of installed) linkTree(p.dir, path.join(home, 'plugins', p.id, p.version));
-  const state = { disabled: [], installed: Object.fromEntries(installed.map((p) => [p.id, { current: p.version }])) };
-  fs.mkdirSync(path.join(home, 'state'), { recursive: true });
-  fs.writeFileSync(path.join(home, 'state', 'plugins.json'), JSON.stringify(state, null, 2));
+  for (const p of installed) {
+    linkTree(p.dir, path.join(home, 'plugins', p.id, p.version));
+    fs.writeFileSync(path.join(home, 'plugins', p.id, '.current'), p.version);
+  }
 }
 
 export class Frame {

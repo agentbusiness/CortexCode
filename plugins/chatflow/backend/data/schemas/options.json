@@ -1,0 +1,146 @@
+{
+  "type": "object",
+  "properties": {
+    "critique": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "idea": {
+            "enum": [
+              "@ideas"
+            ]
+          },
+          "verdict": {
+            "enum": [
+              "keep",
+              "drop"
+            ]
+          },
+          "why": {
+            "type": "string",
+            "maxLength": 320
+          }
+        },
+        "required": [
+          "idea",
+          "verdict",
+          "why"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "idea": {
+            "enum": [
+              "@ideas"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "mechanism": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "why": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "grounding": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "@grounding"
+              ]
+            },
+            "maxItems": 3
+          },
+          "prior_art": {
+            "type": "string",
+            "maxLength": 320
+          },
+          "cost": {
+            "type": "string",
+            "maxLength": 320
+          },
+          "risk": {
+            "type": "string",
+            "maxLength": 320
+          },
+          "settle_by": {
+            "type": "string",
+            "maxLength": 320
+          }
+        },
+        "required": [
+          "idea",
+          "name",
+          "mechanism",
+          "why",
+          "grounding",
+          "prior_art",
+          "cost",
+          "risk",
+          "settle_by"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "radical": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "drops": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "buys": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "wins_if": {
+          "type": "string",
+          "maxLength": 240
+        }
+      },
+      "required": [
+        "name",
+        "drops",
+        "buys",
+        "wins_if"
+      ],
+      "additionalProperties": false
+    },
+    "recommend": {
+      "enum": [
+        "@ideas"
+      ]
+    },
+    "because": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "would_change_if": {
+      "type": "string",
+      "maxLength": 240
+    }
+  },
+  "required": [
+    "critique",
+    "options",
+    "radical",
+    "recommend",
+    "because",
+    "would_change_if"
+  ],
+  "additionalProperties": false
+}

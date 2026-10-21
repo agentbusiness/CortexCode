@@ -241,9 +241,10 @@ impl Policy {
         let files = dedup(files.iter().map(|path| real(path)).collect());
         let home = real(cortex_home);
         let data = real(data_dir);
-        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal")];
-        let mut protected_literals =
-            vec![data.join("approvals.json"), home.clone(), home.join("plugins-data"), data.clone(), home.join("jobs")];
+        // The main store (projects, conversations, settings, approvals) is the app's, never a
+        // command's to write.
+        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph")];
+        let mut protected_literals = vec![home.clone(), home.join("plugins-data"), data.clone(), home.join("jobs")];
         protected_literals.extend(protected_subpaths.iter().cloned());
         let protected_regexes = regex_escape(&home.join("jobs"))
             .map(|jobs| vec![format!("^{jobs}/[^/]+/(meta\\.json|cmd\\.sh|runner\\.sh)$")])

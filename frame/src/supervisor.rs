@@ -1194,6 +1194,19 @@ pub async fn start_all(frame: Arc<Frame>) {
         };
         let hello_limit = Duration::from_millis(cfg.hello_timeout_ms);
         tokio::spawn(ensure_running(frame.clone(), slot.clone(), target, Duration::ZERO));
+        if slot.category == crate::store::MEMORY {
+            // The frame's records come from the memory plugin's store: loaded before the plugins
+            // that use them start (and before the UI opens).
+            let load_frame = frame.clone();
+            let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui)| load_frame.state.load(projects, sessions, ui)) });
+            match tokio::time::timeout(Duration::from_secs(180), loaded).await {
+                Ok(Ok(Ok(()))) => tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store"),
+                Ok(Ok(Err(error))) => tracing::error!(%error.message, "the store's records could not be read"),
+                Ok(Err(error)) => tracing::error!(%error, "reading the store's records failed"),
+                Err(_) => tracing::error!("the memory plugin did not answer within 180 s: starting without its records"),
+            }
+            continue;
+        }
         // Wait until this plugin's process said hello (or failed) before starting the next one.
         let deadline = Instant::now() + hello_limit + Duration::from_secs(1);
         loop {
@@ -1213,7 +1226,16 @@ pub async fn start_all(frame: Arc<Frame>) {
 
 /// Stop every plugin in reverse start order (frame shutdown).
 pub async fn stop_all(frame: &Arc<Frame>) {
-    for slot in frame.sup.slots().iter().rev() {
+    stop_slots(frame, |_| true).await;
+}
+
+/// Stop every plugin but the one serving `category`, in reverse start order.
+pub async fn stop_all_except(frame: &Arc<Frame>, category: &str) {
+    stop_slots(frame, |slot| slot.category != category).await;
+}
+
+async fn stop_slots(frame: &Arc<Frame>, chosen: impl Fn(&Slot) -> bool) {
+    for slot in frame.sup.slots().iter().rev().filter(|slot| chosen(slot)) {
         let instances: Vec<Arc<Instance>> = {
             let inner = slot.lock();
             inner.current.iter().chain(inner.others.iter()).filter(|i| !i.has_exited()).cloned().collect()

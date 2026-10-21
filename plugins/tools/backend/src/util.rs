@@ -60,6 +60,26 @@ pub fn normalize(path: &Path) -> PathBuf {
 /// Resolve a path given by the model or the UI against a base directory.
 /// The workspace's scratch folder, `tmp/` at its root: its shells' `$TMPDIR`, where throwaway
 /// checks live (short relative paths, removed with the workspace). Git ignores it.
+/// Whether a path in a project is a test file by the usual layouts: inside a `test`, `tests`,
+/// `__tests__`, `spec`, `specs` or `testing` folder, or named like one (`test_x.py`, `x_test.py`,
+/// `x_test.go`, `x.test.ts`, `x.spec.js`, `XTest.java`, `XTests.cs`, `x_spec.rb`, `test.x`).
+pub fn is_test_path(relative: &Path) -> bool {
+    let folder = relative.parent().is_some_and(|parent| {
+        parent.components().any(|part| matches!(part.as_os_str().to_str(), Some("test" | "tests" | "__tests__" | "spec" | "specs" | "testing")))
+    });
+    let name = relative.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("");
+    folder
+        || stem == "test"
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+        || stem.ends_with("Test")
+        || stem.ends_with("Tests")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+}
+
 pub fn scratch_dir(workspace: &Path) -> PathBuf {
     workspace.join("tmp")
 }

@@ -62,7 +62,7 @@ Once installed, everything works offline.
 
 | Project | Holds |
 |---|---|
-| `main` | settings (`Settings -SECTION-> SettingsSection -HAS-> Setting`), global rules and style, the project registry (`ProjectEntry`), global notes |
+| `db` | the app's records (`src/app.rs`): `(:Project)-[:HAS_SESSION]->(:Session)`, `(:Session)-[:CHILD_OF]->(:Session)`, each session's journal as the stream `session.<id>`; settings, one `(:Settings {scope})` node per scope (`global`, or a project id linked by `HAS_SETTINGS`) holding all of that scope's settings; global rules and style, the code-graph registry (`ProjectEntry`), global notes. Never one of the app's projects. |
 | `cc_p_<hash(project id)>` | one per repository: the code graph, its work state and its notes |
 | `cc_w_<hash(project, path)>` | one per attached agent workspace (see below) |
 
@@ -210,7 +210,7 @@ runs in the background like any project's, and queries for its id wait for it (t
 opening lock). Without an id the project keeps the id already registered for that root, else the id
 the frame gives the root (`p_` + 16 hex of SHA-256), so opening it later as a session project reuses
 the index (and makes it a session project). Every project has a short unique name, its folder name
-(`A-Z a-z 0-9 . _ -`, `-2`, `-3`, ... on a clash; never a graph verb, `global` or `main`), stable
+(`A-Z a-z 0-9 . _ -`, `-2`, `-3`, ... on a clash; never a graph verb, `global`, `main` or `db`), stable
 once given; `memory.project.list` lists them (`project_id, name, root, reference, state`). A
 reference is never written to: its CORTEX.md is not imported as rules, and tasks, board posts,
 agents, runs, rules and style for it are refused; file-system refresh still applies.
@@ -234,7 +234,7 @@ re-opening it).
 quote, source url, title, date, topic; also `source`, `question`, `by`) in the KNOWLEDGE layer:
 `(:Note {id, name, topic, topic_key, claim, quote, url, title, date, source, question, by,
 project_id, created_ms})-[:CITES]->(:Source {url, name, title, date})` (`src/notes.rs`). Notes are
-global, in the `main` project, unless a `project_id` is given: then they live in that project's
+global, in the `db` project, unless a `project_id` is given: then they live in that project's
 IronGraph project (a registered project; a read-only reference refuses adds and removals, like
 other work state). Topics compare by key (lowercase letters and digits, other runs one `-`). The id
 is `n-` + 16 hex of SHA-256 of scope, topic key, url and quote, so adding a note again returns the
@@ -260,7 +260,7 @@ project, and removal (a source still cited stays, an uncited one goes).
 
 `memory.knowledge.upsert | get | list | search | link | unlink | withdraw | supersede | linked | brief`
 (docs/PROJECT-KNOWLEDGE-PLAN.md P0, `src/knowledge.rs`) keep knowledge items in the KNOWLEDGE layer of
-the project's IronGraph project (the global scope's in `main`): `(:Knowledge:<Kind> {id, name, text,
+the project's IronGraph project (the global scope's in `db`): `(:Knowledge:<Kind> {id, name, text,
 state, source, confidence, as_of, by, evidence, aliases, ...})`, kinds `Concept | Fact | Decision |
 Hypothesis | Question`, each with the states its kind allows (a hypothesis is `open | supported |
 refuted`, a question `open | answered`, the rest `asserted` / `accepted`; every kind can be

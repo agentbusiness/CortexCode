@@ -149,6 +149,26 @@ pub mod methods {
     /// [`super::KnowledgeCountParams`] -> [`super::KnowledgeItem`]: add to an item's `seen`,
     /// `helped` and `hurt` counters (how a lesson fared where it was shown).
     pub const KNOWLEDGE_COUNT: &str = "memory.knowledge.count";
+
+    /// The app's projects (the frame's records), from the main store: `{projects: [Project]}`.
+    pub const APP_PROJECTS: &str = "memory.app.projects";
+    /// Create or replace one project record: `{project: Project}`.
+    pub const APP_PROJECT_PUT: &str = "memory.app.project.put";
+    /// Delete one project record and its settings: `{id}`. Its sessions are deleted with
+    /// [`APP_SESSIONS_DELETE`] first.
+    pub const APP_PROJECT_DELETE: &str = "memory.app.project.delete";
+    /// The app's sessions (chats and agent runs), each linked to its project: `{sessions: [Session]}`.
+    pub const APP_SESSIONS: &str = "memory.app.sessions";
+    /// Create or replace one session record: `{session: Session}`.
+    pub const APP_SESSION_PUT: &str = "memory.app.session.put";
+    /// Delete session records and their journals: `{ids: [id]}`.
+    pub const APP_SESSIONS_DELETE: &str = "memory.app.sessions.delete";
+    /// Append a session's journal patches, in order, to its stream: `{session_id, patches:
+    /// [JournalPatch]}` -> `{next}` (the offset after the last one).
+    pub const JOURNAL_APPEND: &str = "memory.journal.append";
+    /// A session's journal patches from an offset: `{session_id, from, max}` -> `{patches, next,
+    /// end}` (`end`: nothing after `next`). A session without a journal reads as empty.
+    pub const JOURNAL_READ: &str = "memory.journal.read";
 }
 
 pub mod topics {
@@ -966,6 +986,9 @@ pub struct RunRecordParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SettingsGetParams {
     pub path: String,
+    /// `global` (absent or empty) or a project id: whose settings.
+    #[serde(default)]
+    pub scope: String,
 }
 
 /// One setting with its metadata.
@@ -987,6 +1010,9 @@ pub struct SettingValue {
 pub struct SettingsSetParams {
     pub path: String,
     pub value: Value,
+    /// `global` (absent or empty) or a project id: whose settings.
+    #[serde(default)]
+    pub scope: String,
     /// Who changed it (`user`, a plugin id, an agent name).
     #[serde(default)]
     pub by: String,
@@ -998,6 +1024,9 @@ pub struct SettingsSetParams {
 pub struct SettingsListParams {
     #[serde(default)]
     pub prefix: String,
+    /// `global` (absent or empty) or a project id: whose settings.
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1010,6 +1039,77 @@ pub struct SettingsListResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SettingsDeleteParams {
     pub path: String,
+    /// `global` (absent or empty) or a project id: whose settings.
+    #[serde(default)]
+    pub scope: String,
+}
+
+/// [`methods::APP_PROJECT_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppProjectPutParams {
+    pub project: crate::contracts::frame::Project,
+}
+
+/// [`methods::APP_PROJECTS`] result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AppProjectsResult {
+    pub projects: Vec<crate::contracts::frame::Project>,
+}
+
+/// [`methods::APP_PROJECT_DELETE`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppProjectDeleteParams {
+    pub id: String,
+}
+
+/// [`methods::APP_SESSION_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppSessionPutParams {
+    pub session: crate::contracts::frame::Session,
+}
+
+/// [`methods::APP_SESSIONS`] result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AppSessionsResult {
+    pub sessions: Vec<crate::contracts::frame::Session>,
+}
+
+/// [`methods::APP_SESSIONS_DELETE`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppSessionsDeleteParams {
+    pub ids: Vec<String>,
+}
+
+/// [`methods::JOURNAL_APPEND`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalAppendParams {
+    pub session_id: String,
+    pub patches: Vec<crate::contracts::frame::JournalPatch>,
+}
+
+/// [`methods::JOURNAL_APPEND`] result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalAppendResult {
+    pub next: u64,
+}
+
+/// [`methods::JOURNAL_READ`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalReadParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub from: u64,
+    /// At most this many patches (absent: the plugin's page size).
+    #[serde(default)]
+    pub max: Option<usize>,
+}
+
+/// [`methods::JOURNAL_READ`] result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalReadResult {
+    pub patches: Vec<crate::contracts::frame::JournalPatch>,
+    pub next: u64,
+    pub end: bool,
 }
 
 /// [`methods::NOTE_ADD`] parameters.

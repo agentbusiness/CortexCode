@@ -1,7 +1,8 @@
 //! The GitHub connection, through GitHub's REST API with the user's own sign-in: the device flow
 //! (a code the user approves in the browser) or a personal access token. The token lives only in
-//! the macOS Keychain; `settings.json` in the plugin's data directory keeps the account and the dev
-//! folder. Nothing here contacts GitHub unless a method asks for it.
+//! the macOS Keychain; the app's main store keeps the account and the dev folder (`vcs.github`; the
+//! `settings.json` it was kept in before is read once and removed). Nothing here contacts GitHub
+//! unless a method asks for it.
 
 use cc_protocol::contracts::vcs::{Credential, DeviceCode, GithubPr, GithubStatus, Repo, Repos};
 use cc_protocol::{RpcError, codes};
@@ -26,7 +27,7 @@ const REPO_PAGES: u32 = 5;
 const FORK_READY_TRIES: u32 = 30;
 const FORK_READY_STEP: Duration = Duration::from_secs(2);
 
-/// What is kept on disk: never the token.
+/// What is kept in the store: never the token.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
@@ -161,7 +162,7 @@ async fn keychain<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 pub struct Github {
     http: reqwest::Client,
     settings_path: PathBuf,
-    settings: Mutex<Settings>,
+    settings: cc_protocol::stored::Stored<Settings>,
     /// The GitHub app's client id for the device flow (`github_client_id`); empty: unavailable.
     client_id: Mutex<String>,
     device: Mutex<Option<Device>>,
@@ -181,15 +182,10 @@ impl Github {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| RpcError::internal(format!("HTTP client: {error}")))?;
-        let settings_path = data_dir.join("settings.json");
-        let settings = std::fs::read(&settings_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
         Ok(Self {
             http,
-            settings_path,
-            settings: Mutex::new(settings),
+            settings_path: data_dir.join("settings.json"),
+            settings: cc_protocol::stored::Stored::new("vcs.github"),
             client_id: Mutex::new(String::new()),
             device: Mutex::new(None),
             token: Mutex::new(None),
@@ -201,7 +197,7 @@ impl Github {
     }
 
     pub fn status(&self) -> GithubStatus {
-        let settings = lock(&self.settings).clone();
+        let settings = self.settings.get();
         let pending = lock(&self.device).as_ref().is_some_and(|device| Instant::now() < device.expires);
         GithubStatus {
             connected: settings.login.is_some(),
@@ -222,20 +218,17 @@ impl Github {
     }
 
     pub fn dev_folder(&self) -> Option<PathBuf> {
-        lock(&self.settings).dev_folder.as_ref().map(PathBuf::from)
+        self.settings.get().dev_folder.as_ref().map(PathBuf::from)
+    }
+
+    /// Read the account and dev folder from the store (or once from the file they were kept in).
+    pub async fn load(&self, ctx: &cc_protocol::Ctx) -> Result<(), RpcError> {
+        self.settings.load(ctx, Some(self.settings_path.clone())).await
     }
 
     fn update(&self, change: impl FnOnce(&mut Settings)) -> Result<(), RpcError> {
-        let mut settings = lock(&self.settings);
-        change(&mut settings);
-        let bytes = serde_json::to_vec_pretty(&*settings).map_err(|error| RpcError::internal(error.to_string()))?;
-        if let Some(dir) = self.settings_path.parent() {
-            std::fs::create_dir_all(dir).map_err(|error| RpcError::internal(format!("{}: {error}", dir.display())))?;
-        }
-        let partial = self.settings_path.with_extension("json.partial");
-        std::fs::write(&partial, bytes)
-            .and_then(|()| std::fs::rename(&partial, &self.settings_path))
-            .map_err(|error| RpcError::internal(format!("{}: {error}", self.settings_path.display())))
+        self.settings.update(change);
+        Ok(())
     }
 
     pub fn dev_folder_set(&self, path: &str) -> Result<GithubStatus, RpcError> {
@@ -253,7 +246,7 @@ impl Github {
     /// The saved token: from memory, else from the Keychain. A connection whose Keychain item is
     /// gone is forgotten.
     async fn token(&self) -> Result<String, RpcError> {
-        if lock(&self.settings).login.is_none() {
+        if self.settings.get().login.is_none() {
             return Err(not_connected());
         }
         if let Some(token) = lock(&self.token).clone() {
@@ -288,7 +281,7 @@ impl Github {
 
     pub async fn credential(&self) -> Result<Credential, RpcError> {
         let token = self.token().await?;
-        let login = lock(&self.settings).login.clone().ok_or_else(not_connected)?;
+        let login = self.settings.get().login.clone().ok_or_else(not_connected)?;
         Ok(Credential { login, token })
     }
 

@@ -19,10 +19,10 @@ use crate::repetition::{Detector, Verdict};
 use crate::schemas;
 use cc_protocol::contracts::chatflow::{
     KnowledgeAnswerParams,
-    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, DecisionAnswerParams, FlowState, PlanRefParams, PlanUpdateParams,
+    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, DecisionAnswerParams, FlowState, IdeationChooseParams, PlanCommentParams, PlanEditParams, PlanRefParams, PlanUpdateParams,
     PrewarmParams, PrewarmResult, SessionParams, SpecUpdateParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, methods, plan_status,
 };
-use crate::{plan, spec};
+use crate::{ideation, plan, spec};
 use cc_protocol::contracts::tools::topics as tools_topics;
 use cc_protocol::contracts::frame::{
     JournalEntry, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, topics as frame_topics,
@@ -54,6 +54,10 @@ pub fn hello() -> Hello {
         methods::SPEC_SAVE,
         methods::PLAN_UPDATE,
         methods::PLAN_IMPLEMENT,
+        methods::PLAN_EDIT,
+        methods::PLAN_COMMENT,
+        methods::PLAN_REVISE,
+        methods::IDEATION_CHOOSE,
         methods::DECISION_ANSWER,
         methods::KNOWLEDGE_ANSWER,
         methods::PREWARM,
@@ -111,11 +115,59 @@ struct Inner {
     skills_changed_ms: AtomicU64,
     /// Learns every finished run, one at a time at idle priority (started on activation).
     learner: std::sync::OnceLock<crate::learn::Learner>,
+    /// The sessions a replay is running in (`replay.rs`); a user's turn cancels them.
+    replaying: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
 pub struct Chatflow {
     inner: Arc<Inner>,
+}
+
+/// Replays' turns through this chat flow: a turn in a replay session, awaited to its end.
+struct FlowReplayer {
+    flow: Chatflow,
+    ctx: Ctx,
+}
+
+impl crate::replay::Replayer for FlowReplayer {
+    fn idle(&self) -> bool {
+        self.flow.lock_runs().values().all(|handle| handle.done.borrow().is_some())
+    }
+
+    fn turn(&self, session_id: String, text: String) -> BoxFuture<'static, Result<String, RpcError>> {
+        let flow = self.flow.clone();
+        let ctx = self.ctx.clone();
+        Box::pin(async move {
+            if let Ok(mut replaying) = flow.inner.replaying.lock() {
+                replaying.insert(session_id.clone());
+            }
+            let result = async {
+                let params = TurnParams { session_id: session_id.clone(), text, mode: "auto".to_owned(), attachments: Vec::new(), spec: false, mentions: Vec::new() };
+                let started = flow.turn(ctx.clone(), params).await?;
+                if let Some((.., mut done)) = flow.active(&session_id) {
+                    while done.borrow().is_none() {
+                        if done.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let entries = Host::new(ctx.clone()).journal_read(&session_id, 0).await?;
+                let state = entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "run_id") == started.run_id && str_field(&entry.data, "state") != "running")
+                    .map(|entry| str_field(&entry.data, "state").to_owned())
+                    .unwrap_or_else(|| "cancelled".to_owned());
+                Ok(state)
+            }
+            .await;
+            if let Ok(mut replaying) = flow.inner.replaying.lock() {
+                replaying.remove(&session_id);
+            }
+            result
+        })
+    }
 }
 
 impl Chatflow {
@@ -132,6 +184,7 @@ impl Chatflow {
                 warmed: Mutex::new(HashMap::new()),
                 skills_changed_ms: AtomicU64::new(0),
                 learner: std::sync::OnceLock::new(),
+                replaying: Mutex::new(HashSet::new()),
             }),
         })
     }
@@ -214,6 +267,23 @@ fn job_event_text(set: &crate::data::Dataset, data: &Value) -> String {
         text.push_str(&set.text(key, &[("artifact", artifact)]));
     }
     text
+}
+
+/// A turn a card starts with its route decided: the message text, extra fields of its
+/// `user_message` and `route` entries, and the stage the status starts at.
+struct CardTurn {
+    route: &'static str,
+    stage: &'static str,
+    text: String,
+    message: Value,
+    route_fields: Value,
+}
+
+/// `extra`'s fields set on `target` (both objects).
+fn merge_fields(target: &mut Value, extra: Value) {
+    if let (Some(target), Value::Object(extra)) = (target.as_object_mut(), extra) {
+        target.extend(extra);
+    }
 }
 
 fn new_run_id() -> String {
@@ -470,6 +540,18 @@ impl Chatflow {
 
     async fn turn(&self, ctx: Ctx, params: TurnParams) -> Result<TurnResult, RpcError> {
         let host = Host::new(ctx.clone());
+        // The user's work goes first: a replay running meanwhile is cancelled (it decides nothing
+        // and is tried again later).
+        let replay = self.inner.replaying.lock().map(|replaying| replaying.contains(&params.session_id)).unwrap_or(false);
+        if !replay {
+            let running: Vec<String> = self.inner.replaying.lock().map(|replaying| replaying.iter().cloned().collect()).unwrap_or_default();
+            for session in running {
+                if let Some((_, stops, ..)) = self.active(&session) {
+                    tracing::info!(%session, "a user's turn cancels a replay");
+                    stops.cancel.cancel();
+                }
+            }
+        }
         let attached = self.prepare_attachments(&host, params.attachments.clone()).await?;
         // Other repositories the message references: opened read-only, named to the run in a note.
         let referenced = references::resolve(&host, &self.inner.data.get(), &params.session_id, &params.mentions, &attached).await?;
@@ -520,6 +602,18 @@ impl Chatflow {
             .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "route", "mode": params.mode, "kind": "turn", "data_version": self.inner.data.get().version()}))
             .await?;
         let _ = host.session_status(&params.session_id, SessionStatus::Running).await;
+        // The run's starting point, for replaying a lesson learned from it later (`replay.rs`).
+        if !replay {
+            let snapshot_host = host.clone();
+            let paths = crate::replay::Paths::new(&data_dir(&ctx));
+            let (session_id, run) = (params.session_id.clone(), run_id.clone());
+            tokio::spawn(async move {
+                let Ok(session) = snapshot_host.session_get(&session_id).await else { return };
+                if let Err(reason) = crate::replay::snapshot(&paths, &session_id, &run, &session.workspace).await {
+                    tracing::debug!(%reason, session = %session_id, "no snapshot of the run's start");
+                }
+            });
+        }
         let this = self.clone();
         let session_id = params.session_id.clone();
         let mode = params.mode.clone();
@@ -727,38 +821,45 @@ impl Chatflow {
         let state = if params.accept { spec::ACCEPTED } else { spec::REJECTED };
         host.journal_set(&params.session_id, params.seq, "state", json!(state)).await?;
         if params.accept {
-            let mut journal = Journal::load(host.clone(), &params.session_id).await?;
-            if let Some((_, current)) = spec::current(&journal.entries_vec()) {
-                let decided = spec::Decided {
-                    decided: str_field(&entry.data, "decided").to_owned(),
-                    because: str_field(&entry.data, "because").to_owned(),
-                    rejected: str_field(&entry.data, "rejected").to_owned(),
-                    seq: Some(entry.seq),
-                };
-                let next = spec::with_decision(&self.inner.data.get(), &current, decided);
-                spec::append(&mut journal, &next, None).await?;
-            }
-            // The decision is project knowledge too (owner decision, docs/PROJECT-KNOWLEDGE-IDEAS.md
-            // §11): a `decision` item in the graph; the entry keeps its id. Memory being away never
-            // fails the answer.
-            let decided = str_field(&entry.data, "decided").trim().to_owned();
-            let because = str_field(&entry.data, "because").trim().to_owned();
-            let rejected = str_field(&entry.data, "rejected").trim().to_owned();
-            let mut text = decided.clone();
-            if !because.is_empty() {
-                text.push_str(&format!(" Because {}", because.trim_end_matches('.')));
-                text.push('.');
-            }
-            if !rejected.is_empty() {
-                text.push_str(&format!(" Rejected: {rejected}"));
-            }
-            let item = json!({
-                "kind": "decision", "name": knowledge_name(&decided), "text": text, "source": "user", "by": "user",
-                "evidence": [format!("journal://{}/{}", params.session_id, params.seq)]
-            });
-            self.remember(&host, &params.session_id, params.seq, item).await;
+            self.accepted_decision(&host, &params.session_id, params.seq, &entry.data).await?;
         }
         Ok(json!({"state": state, "changed": true}))
+    }
+
+    /// What an accepted decision does: it joins the spec (a new version) and is written to the
+    /// project's knowledge as a `decision` item; the entry keeps the item's id.
+    async fn accepted_decision(&self, host: &Host, session_id: &str, seq: u64, data: &Value) -> Result<(), RpcError> {
+        let mut journal = Journal::load(host.clone(), session_id).await?;
+        if let Some((_, current)) = spec::current(&journal.entries_vec()) {
+            let decided = spec::Decided {
+                decided: str_field(data, "decided").to_owned(),
+                because: str_field(data, "because").to_owned(),
+                rejected: str_field(data, "rejected").to_owned(),
+                seq: Some(seq),
+            };
+            let next = spec::with_decision(&self.inner.data.get(), &current, decided);
+            spec::append(&mut journal, &next, None).await?;
+        }
+        // The decision is project knowledge too (owner decision, docs/PROJECT-KNOWLEDGE-IDEAS.md
+        // §11): a `decision` item in the graph; the entry keeps its id. Memory being away never
+        // fails the answer.
+        let decided = str_field(data, "decided").trim().to_owned();
+        let because = str_field(data, "because").trim().to_owned();
+        let rejected = str_field(data, "rejected").trim().to_owned();
+        let mut text = decided.clone();
+        if !because.is_empty() {
+            text.push_str(&format!(" Because {}", because.trim_end_matches('.')));
+            text.push('.');
+        }
+        if !rejected.is_empty() {
+            text.push_str(&format!(" Rejected: {rejected}"));
+        }
+        let item = json!({
+            "kind": "decision", "name": knowledge_name(&decided), "text": text, "source": "user", "by": "user",
+            "evidence": [format!("journal://{session_id}/{seq}")]
+        });
+        self.remember(host, session_id, seq, item).await;
+        Ok(())
     }
 
     /// Accept (with the text as edited) or reject a knowledge item the model proposed; an accepted
@@ -852,40 +953,151 @@ impl Chatflow {
     /// The plan card's Implement: a turn whose route is IMPLEMENT (no router call), the plan named.
     async fn plan_implement(&self, ctx: Ctx, params: PlanRefParams) -> Result<TurnResult, RpcError> {
         let host = Host::new(ctx.clone());
-        let busy = || RpcError::new(codes::BUSY, "a run is going in this conversation; implement the plan when it ends");
-        if self.active(&params.session_id).is_some() {
-            return Err(busy());
-        }
-        let mut journal = Journal::load(host.clone(), &params.session_id).await?;
-        if running_status(&journal).is_some() {
-            return Err(busy());
-        }
+        let busy = "a run is going in this conversation; implement the plan when it ends";
+        let journal = self.idle_journal(&host, &params.session_id, busy).await?;
         let Some((_, current)) = plan::version_of(&journal.entries_vec(), &params.plan_id) else { return Err(RpcError::not_found("no such plan")) };
         if !current.is_open() {
             return Err(RpcError::invalid_params(format!("the plan is {}", current.status)));
         }
+        let text = self.inner.data.get().text("implement_request", &[]);
+        let card = CardTurn { route: "IMPLEMENT", stage: "implement", text, message: json!({"implement": params.plan_id}), route_fields: json!({"plan_id": params.plan_id}) };
+        self.start_card_turn(ctx, journal, &params.session_id, &params.mode, card, busy).await
+    }
+
+    /// The plan card's Revise: the plan's open comments as one change request, each under the part
+    /// it is about, in a turn whose route is PLAN (no router call), so PLAN_EDIT writes the next
+    /// version. The comments are marked sent with the run.
+    async fn plan_revise(&self, ctx: Ctx, params: PlanRefParams) -> Result<TurnResult, RpcError> {
+        let host = Host::new(ctx.clone());
+        let busy = "a run is going in this conversation; send the comments when it ends";
+        let journal = self.idle_journal(&host, &params.session_id, busy).await?;
+        let entries = journal.entries_vec();
+        let Some((_, current)) = plan::version_of(&entries, &params.plan_id) else { return Err(RpcError::not_found("no such plan")) };
+        if !current.is_open() {
+            return Err(RpcError::invalid_params(format!("the plan is {}", current.status)));
+        }
+        let comments = plan::open_comments(&entries, &params.plan_id);
+        if comments.is_empty() {
+            return Err(RpcError::invalid_params("the plan has no open comments"));
+        }
+        let text = plan::revise_request(&self.inner.data.get(), &current, &comments);
+        let card = CardTurn { route: "PLAN", stage: "plan", text, message: json!({"revise": params.plan_id}), route_fields: json!({"plan_id": params.plan_id}) };
+        let result = self.start_card_turn(ctx, journal, &params.session_id, &params.mode, card, busy).await?;
+        for comment in comments {
+            host.journal_set(&params.session_id, comment.seq, "state", json!("sent")).await?;
+            host.journal_set(&params.session_id, comment.seq, "run_id", json!(result.run_id)).await?;
+        }
+        Ok(result)
+    }
+
+    /// The session's journal when no run is going in it (else `busy` with `message`).
+    async fn idle_journal(&self, host: &Host, session_id: &str, message: &str) -> Result<Journal, RpcError> {
+        let busy = || RpcError::new(codes::BUSY, message.to_owned());
+        if self.active(session_id).is_some() {
+            return Err(busy());
+        }
+        let journal = Journal::load(host.clone(), session_id).await?;
+        if running_status(&journal).is_some() {
+            return Err(busy());
+        }
+        Ok(journal)
+    }
+
+    /// A turn a card started with its route decided (no router call): the message, the running
+    /// status and the route entry, then the foreground flow from there.
+    async fn start_card_turn(&self, ctx: Ctx, mut journal: Journal, session_id: &str, mode: &str, card: CardTurn, busy: &str) -> Result<TurnResult, RpcError> {
+        let host = Host::new(ctx.clone());
         let run_id = new_run_id();
-        let Some((stops, stage, sender)) = self.register(&params.session_id, &run_id) else { return Err(busy()) };
+        let Some((stops, stage, sender)) = self.register(session_id, &run_id) else { return Err(RpcError::new(codes::BUSY, busy.to_owned())) };
         let data = self.inner.data.get();
-        let text = data.text("implement_request", &[]);
-        journal.append(kinds::USER_MESSAGE, json!({"text": text, "run_id": run_id, "implement": params.plan_id})).await?;
+        let mut message = json!({"text": card.text, "run_id": run_id});
+        merge_fields(&mut message, card.message);
+        journal.append(kinds::USER_MESSAGE, message).await?;
         let status_seq = journal
-            .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "implement", "mode": params.mode, "kind": "turn", "data_version": data.version()}))
+            .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": card.stage, "mode": mode, "kind": "turn", "data_version": data.version()}))
             .await?;
-        let detail = json!({"work": text, "route": "IMPLEMENT", "effort": data.effort.default, "by": "user"});
-        journal
-            .append(kinds::ROUTE, json!({"route": "IMPLEMENT", "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "plan_id": params.plan_id, "spec_action": "none", "settles": false}))
-            .await?;
-        let _ = host.session_status(&params.session_id, SessionStatus::Running).await;
+        let detail = json!({"work": card.text, "route": card.route, "effort": data.effort.default, "by": "user"});
+        let mut route = json!({"route": card.route, "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false});
+        merge_fields(&mut route, card.route_fields);
+        journal.append(kinds::ROUTE, route).await?;
+        let _ = host.session_status(session_id, SessionStatus::Running).await;
         let this = self.clone();
-        let session_id = params.session_id.clone();
-        let mode = params.mode.clone();
+        let session_id = session_id.to_owned();
+        let mode = mode.to_owned();
         let run = run_id.clone();
         self.spawn(async move {
             let outcome = this.drive_foreground(ctx, &session_id, run, status_seq, mode, stops, stage).await;
             let _ = sender.send(Some(outcome.map(|_| empty_result("done"))));
         });
         Ok(TurnResult { run_id, queued_as_steer: false })
+    }
+
+    /// The user's own edit of an open plan: a new version `by: user`, back to draft (no model call).
+    async fn plan_edit(&self, ctx: Ctx, params: PlanEditParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let mut journal = Journal::load(host.clone(), &params.session_id).await?;
+        let entries = journal.entries_vec();
+        let Some((seq, current)) = plan::version_of(&entries, &params.plan_id) else { return Err(RpcError::not_found("no such plan")) };
+        if current.version != params.base_version {
+            return Err(RpcError::new(codes::CONFLICT, format!("the plan changed since version {}: it is version {} now, and this edit was not applied", params.base_version, current.version))
+                .with_data(json!({"version": current.version})));
+        }
+        let next = plan::user_edit(&current, &params).map_err(RpcError::invalid_params)?;
+        let run_id = entries.iter().find(|entry| entry.seq == seq).map(|entry| str_field(&entry.data, "run_id").to_owned()).unwrap_or_default();
+        let made = journal.append(chatflow_kinds::PLAN, next.entry(&run_id)).await?;
+        Ok(json!({"version": next.version, "seq": made}))
+    }
+
+    /// Add a comment to an open plan (on the plan, or on one of its tasks), or take one back.
+    async fn plan_comment(&self, ctx: Ctx, params: PlanCommentParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let journal = Journal::load(host.clone(), &params.session_id).await?;
+        if let Some(seq) = params.remove {
+            let entry = journal.get(seq).filter(|entry| entry.kind == chatflow_kinds::PLAN_COMMENT).ok_or_else(|| RpcError::not_found("no such comment"))?;
+            if str_field(&entry.data, "state") != "open" {
+                return Err(RpcError::invalid_params("the comment was sent already"));
+            }
+            host.journal_set(&params.session_id, seq, "state", json!("removed")).await?;
+            return Ok(json!({"seq": seq, "state": "removed"}));
+        }
+        let text = params.text.trim();
+        if text.is_empty() {
+            return Err(RpcError::invalid_params("a comment needs text"));
+        }
+        let Some((_, current)) = plan::version_of(&journal.entries_vec(), &params.plan_id) else { return Err(RpcError::not_found("no such plan")) };
+        if !current.is_open() {
+            return Err(RpcError::invalid_params(format!("the plan is {}", current.status)));
+        }
+        let mut data = json!({"plan_id": params.plan_id, "version": current.version, "text": text, "state": "open"});
+        if let Some(n) = params.task {
+            let task = current.tasks.iter().find(|task| task.n == n).ok_or_else(|| RpcError::invalid_params(format!("the plan has no task {n}")))?;
+            data["task"] = json!(n);
+            data["task_title"] = json!(task.title);
+        }
+        let seq = host.journal_append(&params.session_id, chatflow_kinds::PLAN_COMMENT, data).await?;
+        Ok(json!({"seq": seq, "state": "open"}))
+    }
+
+    /// Choose an option of an ideation: an accepted decision (it joins the spec or the decision
+    /// list and the project's knowledge), and the options entry keeps the choice.
+    async fn ideation_choose(&self, ctx: Ctx, params: IdeationChooseParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let journal = Journal::load(host.clone(), &params.session_id).await?;
+        let entry = journal.get(params.seq).cloned().ok_or_else(|| RpcError::not_found("no such journal entry"))?;
+        let options = ideation::options_at(&entry).ok_or_else(|| RpcError::invalid_params("that entry is not an ideation's options"))?;
+        if let (Some(chosen), Some(seq)) = (&options.chosen, options.decision_seq) {
+            return Ok(json!({"chosen": chosen, "seq": seq, "changed": false}));
+        }
+        let (decided, because, rejected) = ideation::chosen_decision(&options, &params.option).ok_or_else(|| RpcError::invalid_params(format!("no option {}", params.option)))?;
+        let mut accepted = spec::proposed_entry(&decided, &because, &rejected, str_field(&entry.data, "run_id"));
+        accepted["state"] = json!(spec::ACCEPTED);
+        accepted["ideation_seq"] = json!(params.seq);
+        let seq = host.journal_append(&params.session_id, chatflow_kinds::DECISION, accepted.clone()).await?;
+        let chosen = if params.option.eq_ignore_ascii_case("radical") { "radical".to_owned() } else { params.option.to_uppercase() };
+        host.journal_set(&params.session_id, params.seq, "chosen", json!(chosen)).await?;
+        host.journal_set(&params.session_id, params.seq, "decision_seq", json!(seq)).await?;
+        self.accepted_decision(&host, &params.session_id, seq, &accepted).await?;
+        Ok(json!({"chosen": chosen, "seq": seq, "changed": true}))
     }
 
     // ---- chatflow.steer / cancel / state ------------------------------------------------------
@@ -1427,6 +1639,10 @@ impl Plugin for Chatflow {
                 methods::PREWARM => to_value(&this.prewarm(ctx, parse_params(call.params.clone())?).await?),
                 methods::PLAN_UPDATE => this.plan_update(ctx, parse_params(call.params.clone())?).await,
                 methods::PLAN_IMPLEMENT => to_value(&this.plan_implement(ctx, parse_params(call.params.clone())?).await?),
+                methods::PLAN_REVISE => to_value(&this.plan_revise(ctx, parse_params(call.params.clone())?).await?),
+                methods::PLAN_EDIT => this.plan_edit(ctx, parse_params(call.params.clone())?).await,
+                methods::PLAN_COMMENT => this.plan_comment(ctx, parse_params(call.params.clone())?).await,
+                methods::IDEATION_CHOOSE => this.ideation_choose(ctx, parse_params(call.params.clone())?).await,
                 methods::AGENT_RUN => {
                     let params: AgentRunParams = parse_params(call.params.clone())?;
                     to_value(&this.agent_run(ctx, &call, params).await?)
@@ -1448,7 +1664,9 @@ impl Plugin for Chatflow {
         Box::pin(async move {
             this.start_data(&ctx);
             // Learning from finished runs, first the ones no instance learned yet.
-            let learner = this.inner.learner.get_or_init(|| crate::learn::Learner::start(Host::new(ctx.clone()), this.inner.data.clone(), this.inner.park.clone()));
+            let replayer: Arc<dyn crate::replay::Replayer> = Arc::new(FlowReplayer { flow: this.clone(), ctx: ctx.clone() });
+            let paths = crate::replay::Paths::new(&data_dir(&ctx));
+            let learner = this.inner.learner.get_or_init(|| crate::learn::Learner::start(Host::new(ctx.clone()), this.inner.data.clone(), this.inner.park.clone(), paths, replayer));
             learner.backlog();
             // Resume in the background: activation must not wait for a predecessor's lock.
             let task_ctx = ctx.clone();

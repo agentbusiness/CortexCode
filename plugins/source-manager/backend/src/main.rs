@@ -168,6 +168,9 @@ impl Plugin for SourcePlugin {
         let (service, stop) = (self.service.clone(), self.stop.clone());
         Box::pin(async move {
             tokio::spawn(async move {
+                if let Err(error) = service.load_stored(&ctx).await {
+                    tracing::error!(%error.message, "the settings and proposals could not be read from the store");
+                }
                 proposals::recover(&service, &ctx).await;
                 watch::update(&service, &ctx).await;
                 // The start-up merge is done: plugins that read live data from the code folder

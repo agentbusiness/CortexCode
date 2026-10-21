@@ -42,6 +42,21 @@ pub mod methods {
     /// project's knowledge (`memory.knowledge.upsert`, kind `decision`; the entry keeps the
     /// `knowledge_id`).
     pub const DECISION_ANSWER: &str = "chatflow.decision.answer";
+    /// The user's own edit of an open plan (the plan card's inline editor): [`super::PlanEditParams`]
+    /// -> `{version, seq}`. A new version `by: user`, back to draft, with its difference; no model
+    /// call. Refused with `conflict` when the plan moved on since `base_version`.
+    pub const PLAN_EDIT: &str = "chatflow.plan.edit";
+    /// Add a comment to an open plan, on the plan or on one task: [`super::PlanCommentParams`] ->
+    /// `{seq}` (a `plan_comment` entry), or take one back ([`super::PlanCommentParams::remove`]).
+    pub const PLAN_COMMENT: &str = "chatflow.plan.comment";
+    /// Send the plan's open comments as one change request: a turn whose route is PLAN (no router
+    /// call), its message the comments, each under the part it is about: [`super::PlanRefParams`]
+    /// -> [`super::TurnResult`]. The comments are marked sent with the run.
+    pub const PLAN_REVISE: &str = "chatflow.plan.revise";
+    /// Choose one option of an ideation (the options card): [`super::IdeationChooseParams`] ->
+    /// `{seq}` of the accepted `decision` entry it records (it joins the spec or the decision list
+    /// and the project's knowledge, as an accepted decision does).
+    pub const IDEATION_CHOOSE: &str = "chatflow.ideation.choose";
     /// Accept (with the text as edited), or reject, a knowledge item the model proposed from the
     /// user's message: [`super::KnowledgeAnswerParams`] -> `{state, changed, stored?}`. An
     /// accepted item is written to the project's knowledge (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
@@ -257,6 +272,16 @@ pub mod kinds {
     /// `{kind: concept|fact|hypothesis|question, name, text, item_state, binds: [code names], state:
     /// proposed|accepted|rejected, run_id, knowledge_id?}`, answered with `chatflow.knowledge.answer`.
     pub const KNOWLEDGE: &str = "knowledge";
+    /// An open design question worked through (route IDEATE), one entry per phase, sharing
+    /// `ideation_id`: `{phase: "ideas", question, constraints, criteria, ideas: [{n, principle,
+    /// name, mechanism, found: [{kind: code|note, ref, text}]}]}`, then `{phase: "options",
+    /// critique: [{idea, verdict, why}], options: [{letter, idea, name, mechanism, why, grounding,
+    /// prior_art, cost, risk, settle_by}], radical: {name, drops, buys, wins_if}, recommend (a
+    /// letter), because, would_change_if, chosen?, decision_seq?}`; both with `run_id`.
+    pub const IDEATION: &str = "ideation";
+    /// A comment on an open plan: `{plan_id, version, task?: n, task_title?, text, state:
+    /// open|sent|removed, run_id?}`; sent with `chatflow.plan.revise`.
+    pub const PLAN_COMMENT: &str = "plan_comment";
 }
 
 /// Statuses of a spec requirement.
@@ -310,6 +335,73 @@ pub struct PlanUpdateParams {
     pub plan_id: String,
     /// approved | draft
     pub status: String,
+}
+
+/// One task of a plan as the user edits it. `depends_on` holds positions in the edited list
+/// (1-based); a dependency on itself or a later task is dropped. `n` is the task's number before
+/// the edit (absent: a new task), so the difference names what changed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanTaskEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    pub title: String,
+    #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<u32>,
+    #[serde(default)]
+    pub touches: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
+    #[serde(default)]
+    pub covers: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
+/// `chatflow.plan.edit`: what is given replaces the plan's field; `tasks`, when given, is the
+/// whole new list (a task left out is removed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanEditParams {
+    pub session_id: String,
+    pub plan_id: String,
+    /// The version edited; a newer version refuses the edit with `conflict`.
+    pub base_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risks: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<PlanTaskEdit>>,
+}
+
+/// `chatflow.plan.comment`: a comment on the plan (`task` absent) or on task `task`; or, with
+/// `remove`, the comment entry at that seq taken back (`text` ignored).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanCommentParams {
+    pub session_id: String,
+    pub plan_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<u32>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove: Option<u64>,
+}
+
+/// `chatflow.ideation.choose`: the option (`A`, `B`, `C` or `radical`) of the `ideation` options
+/// entry at `seq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IdeationChooseParams {
+    pub session_id: String,
+    pub seq: u64,
+    pub option: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 pub struct Service {
+    /// The backup repository, shared pull requests and the last update's outcome; and the
+    /// proposals. Kept in the app's main store (see [`cc_protocol::stored`]).
+    pub stored_settings: cc_protocol::stored::Stored<Settings>,
+    pub stored_proposals: cc_protocol::stored::Stored<ProposalList>,
     pub data_dir: PathBuf,
     pub home: PathBuf,
     /// The code folder (`CORTEX_CODE`).
@@ -27,7 +31,16 @@ pub fn rpc(message: impl Into<String>) -> RpcError {
 
 impl Service {
     pub fn new(data_dir: PathBuf, home: PathBuf, code_dir: PathBuf) -> Self {
-        Self { data_dir, home, code_dir, config: RwLock::new(Value::Null), git: tokio::sync::Mutex::new(()), state: Mutex::new(()) }
+        Self {
+            stored_settings: cc_protocol::stored::Stored::new("source.settings"),
+            stored_proposals: cc_protocol::stored::Stored::new("source.proposals"),
+            data_dir,
+            home,
+            code_dir,
+            config: RwLock::new(Value::Null),
+            git: tokio::sync::Mutex::new(()),
+            state: Mutex::new(()),
+        }
     }
 
     /// The plugin's `[plugin.config]`: `shipped_source` (the source the app ships, a folder),
@@ -81,38 +94,46 @@ impl Service {
         tokio::task::spawn_blocking(move || work(&dir)).await.map_err(|error| rpc(format!("the git task failed: {error}")))?.map_err(rpc)
     }
 
+    /// Read the settings and proposals from the store (or once from the JSON files they were kept
+    /// in), when the plugin starts serving.
+    pub async fn load_stored(&self, ctx: &Ctx) -> Result<(), RpcError> {
+        self.stored_settings.load(ctx, Some(self.data_dir.join(settings::SETTINGS))).await?;
+        self.stored_proposals.load(ctx, Some(self.data_dir.join(settings::PROPOSALS))).await
+    }
+
     pub fn settings(&self) -> Result<Settings, RpcError> {
-        settings::load(&self.data_dir, settings::SETTINGS).map_err(rpc)
+        Ok(self.stored_settings.get())
     }
 
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, RpcError> {
         let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut settings: Settings = settings::load(&self.data_dir, settings::SETTINGS).map_err(rpc)?;
-        change(&mut settings);
-        settings::save(&self.data_dir, settings::SETTINGS, &settings).map_err(rpc)?;
-        Ok(settings)
+        Ok(self.stored_settings.update(|settings| {
+            change(settings);
+            settings.clone()
+        }))
     }
 
     pub fn proposals(&self) -> Result<ProposalList, RpcError> {
-        settings::load(&self.data_dir, settings::PROPOSALS).map_err(rpc)
+        Ok(self.stored_proposals.get())
     }
 
-    /// Change one proposal (or add it) and save the list.
+    /// Change one proposal and save the list.
     pub fn update_proposal(&self, id: &str, change: impl FnOnce(&mut Proposal)) -> Result<Proposal, RpcError> {
         let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut list: ProposalList = settings::load(&self.data_dir, settings::PROPOSALS).map_err(rpc)?;
-        let proposal = list.iter_mut().find(|p| p.id == id).ok_or_else(|| RpcError::invalid_params(format!("no proposal `{id}`")))?;
-        change(proposal);
-        let updated = proposal.clone();
-        settings::save(&self.data_dir, settings::PROPOSALS, &list).map_err(rpc)?;
-        Ok(updated)
+        if !self.stored_proposals.get().iter().any(|p| p.id == id) {
+            return Err(RpcError::invalid_params(format!("no proposal `{id}`")));
+        }
+        Ok(self.stored_proposals.update(|list| {
+            let proposal = list.iter_mut().find(|p| p.id == id).expect("checked above");
+            change(proposal);
+            proposal.clone()
+        }))
     }
 
     pub fn add_proposal(&self, proposal: Proposal) -> Result<(), RpcError> {
         let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut list: ProposalList = settings::load(&self.data_dir, settings::PROPOSALS).map_err(rpc)?;
-        list.push(proposal);
-        settings::save(&self.data_dir, settings::PROPOSALS, &list).map_err(rpc)
+        self.stored_proposals.update(|list| list.push(proposal));
+        Ok(())
     }
 
     /// Tell listeners (the settings panels, the card) to refetch.

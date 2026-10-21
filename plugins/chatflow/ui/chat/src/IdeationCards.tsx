@@ -3,9 +3,15 @@ import { Menu, type JournalEntry } from '@cortex/sdk';
 import {
   REQUIREMENT_STATUSES,
   diffLines,
+  ideationOf,
+  planComments,
   planOf,
   planProgress,
+  type ChoiceView,
   type Decided,
+  type FoundView,
+  type PlanCommentView,
+  type PlanTask,
   type PlanView,
   type Requirement,
   type SpecView,
@@ -28,6 +34,29 @@ export interface RequirementInput {
   status: string;
 }
 
+/** One task as the plan editor sends it: `depends_on` are positions (1-based) in the edited list. */
+export interface PlanTaskInput {
+  n?: number;
+  title: string;
+  brief: string;
+  rules: string[];
+  depends_on: number[];
+  touches: string[];
+  checks: string[];
+  covers: string[];
+  skills: string[];
+}
+
+export interface PlanEditInput {
+  plan_id: string;
+  base_version: number;
+  goal: string;
+  approach: string;
+  architecture: string;
+  risks: string[];
+  tasks: PlanTaskInput[];
+}
+
 export interface IdeationActions {
   /**
    * `chatflow.spec.update`: the fields given replace the spec's; `requirements` is the whole list;
@@ -43,8 +72,18 @@ export interface IdeationActions {
   setPlanStatus: (planId: string, status: 'approved' | 'draft') => Promise<void>;
   /** `chatflow.plan.implement`. */
   implementPlan: (planId: string) => Promise<void>;
-  /** Put the caret in the composer: the plan is edited by writing to the chat. */
-  editInChat: () => void;
+  /** `chatflow.plan.edit`: the user's own version of an open plan (a new version, back to draft). */
+  editPlan: (change: PlanEditInput) => Promise<void>;
+  /** `chatflow.plan.comment`: a comment on the plan (`task` null) or on one task. */
+  commentPlan: (planId: string, task: number | null, text: string) => Promise<void>;
+  /** `chatflow.plan.comment` with `remove`: takes an open comment back. */
+  removeComment: (planId: string, seq: number) => Promise<void>;
+  /** `chatflow.plan.revise`: the open comments go to the planner as one change request. */
+  revisePlan: (planId: string) => Promise<void>;
+  /** `chatflow.ideation.choose`: a letter or `radical`. */
+  chooseOption: (seq: number, option: string) => Promise<void>;
+  /** Send a message as a new turn (the options card's Plan it). */
+  sendMessage: (text: string) => Promise<void>;
   openSession: (sessionId: string) => void;
   openTask: (taskId: string) => void;
 }
@@ -213,15 +252,189 @@ export function DecisionCard({ entry, actions }: { entry: JournalEntry; actions:
   );
 }
 
+/** Lines of a textarea as a list (blank lines dropped). */
+function lines(text: string): string[] {
+  return text.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+/** Comma-separated items as a list. */
+function items(text: string): string[] {
+  return text.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+/** A task as the editor holds it: `key` stays with the task when tasks move, `after` names keys. */
+interface DraftTask {
+  key: string;
+  n?: number;
+  title: string;
+  brief: string;
+  rules: string;
+  touches: string;
+  after: string[];
+  keep: Pick<PlanTask, 'checks' | 'covers' | 'skills'>;
+}
+
+interface Draft {
+  goal: string;
+  approach: string;
+  architecture: string;
+  risks: string;
+  tasks: DraftTask[];
+}
+
+function draftOf(plan: PlanView): Draft {
+  const key = (n: number) => `t${n}`;
+  return {
+    goal: plan.goal,
+    approach: plan.approach,
+    architecture: plan.architecture,
+    risks: plan.risks.join('\n'),
+    tasks: plan.tasks.map((task) => ({
+      key: key(task.n), n: task.n, title: task.title, brief: task.brief, rules: task.rules.join('\n'), touches: task.touches.join(', '),
+      after: task.depends_on.map(key), keep: { checks: task.checks, covers: task.covers, skills: task.skills },
+    })),
+  };
+}
+
+/** The editor's draft as `chatflow.plan.edit` takes it: dependencies as positions of earlier tasks. */
+function editOf(plan: PlanView, draft: Draft): PlanEditInput {
+  const kept = draft.tasks.filter((task) => task.title.trim() !== '');
+  const position = new Map(kept.map((task, index) => [task.key, index + 1]));
+  return {
+    plan_id: plan.planId,
+    base_version: plan.version,
+    goal: draft.goal,
+    approach: draft.approach,
+    architecture: draft.architecture,
+    risks: lines(draft.risks),
+    tasks: kept.map((task, index) => ({
+      n: task.n,
+      title: task.title.trim(),
+      brief: task.brief.trim(),
+      rules: lines(task.rules),
+      depends_on: task.after.map((key) => position.get(key) ?? 0).filter((at) => at > 0 && at < index + 1),
+      touches: items(task.touches),
+      ...task.keep,
+    })),
+  };
+}
+
+/** The plan as a form: its document and every task (title, brief, rules, files, order, dependencies). */
+function PlanEditor({ plan, actions, onClose }: { plan: PlanView; actions: IdeationActions; onClose: () => void }) {
+  const [busy, error, act] = useAct();
+  const [draft, setDraft] = useState<Draft>(() => draftOf(plan));
+  const [fresh, setFresh] = useState(0);
+  const setTask = (index: number, patch: Partial<DraftTask>) => setDraft({ ...draft, tasks: draft.tasks.map((task, at) => (at === index ? { ...task, ...patch } : task)) });
+  const move = (index: number, by: number) => {
+    const tasks = [...draft.tasks];
+    const [task] = tasks.splice(index, 1);
+    tasks.splice(index + by, 0, task!);
+    setDraft({ ...draft, tasks });
+  };
+  const field = (label: string, value: string, change: (value: string) => void, rows = 2) => (
+    <label className="cx-spec-field"><span className="ap faint">{label}</span>
+      <textarea rows={rows} value={value} aria-label={label} onChange={(event) => change(event.target.value)} />
+    </label>
+  );
+  return (
+    <section className="notice commitment cx-plan" data-kind="plan" data-editing="true" aria-label="Edit the plan">
+      <span className="kindmark" />
+      <span className="ap lbl">Edit the plan · version {plan.version}</span>
+      {field('Goal', draft.goal, (goal) => setDraft({ ...draft, goal }))}
+      {field('Approach', draft.approach, (approach) => setDraft({ ...draft, approach }), 3)}
+      {field('Architecture', draft.architecture, (architecture) => setDraft({ ...draft, architecture }))}
+      {field('Risks, one per line', draft.risks, (risks) => setDraft({ ...draft, risks }), 3)}
+      <ol className="cx-plan-tasks cx-plan-edit-tasks" aria-label="Tasks">
+        {draft.tasks.map((task, index) => {
+          const earlier = draft.tasks.slice(0, index);
+          return (
+            <li key={task.key} data-task={index + 1}>
+              <div className="cx-plan-edit-head">
+                <span className="ap">{index + 1}</span>
+                <input type="text" value={task.title} placeholder="What this task makes happen" aria-label={`Title of task ${index + 1}`} onChange={(event) => setTask(index, { title: event.target.value })} />
+                <button type="button" className="detent" disabled={index === 0} aria-label={`Move task ${index + 1} up`} onClick={() => move(index, -1)}>↑</button>
+                <button type="button" className="detent" disabled={index === draft.tasks.length - 1} aria-label={`Move task ${index + 1} down`} onClick={() => move(index, 1)}>↓</button>
+                <button type="button" className="detent warn" aria-label={`Remove task ${index + 1}`}
+                  onClick={() => setDraft({ ...draft, tasks: draft.tasks.filter((_, at) => at !== index).map((other) => ({ ...other, after: other.after.filter((key) => key !== task.key) })) })}>Remove</button>
+              </div>
+              <textarea rows={3} value={task.brief} placeholder="What must be true when it is done, and the check that shows it" aria-label={`Brief of task ${index + 1}`} onChange={(event) => setTask(index, { brief: event.target.value })} />
+              <textarea rows={2} value={task.rules} placeholder="Rules it makes true, one per line" aria-label={`Rules of task ${index + 1}`} onChange={(event) => setTask(index, { rules: event.target.value })} />
+              <input type="text" value={task.touches} placeholder="Files or symbols it changes, comma-separated" aria-label={`Files of task ${index + 1}`} onChange={(event) => setTask(index, { touches: event.target.value })} />
+              {earlier.length > 0 && (
+                <div className="cx-plan-edit-after" role="group" aria-label={`Task ${index + 1} comes after`}>
+                  <span className="ap faint">after</span>
+                  {earlier.map((other, at) => {
+                    const on = task.after.includes(other.key);
+                    return (
+                      <button key={other.key} type="button" className="detent" aria-pressed={on} data-on={on ? 'true' : 'false'}
+                        onClick={() => setTask(index, { after: on ? task.after.filter((key) => key !== other.key) : [...task.after, other.key] })}>{at + 1}. {other.title || 'untitled'}</button>
+                    );
+                  })}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+      <div className="acts">
+        <button type="button" className="detent" onClick={() => {
+          setFresh(fresh + 1);
+          const previous = draft.tasks.at(-1);
+          setDraft({ ...draft, tasks: [...draft.tasks, { key: `new${fresh}`, title: '', brief: '', rules: '', touches: '', after: previous ? [previous.key] : [], keep: { checks: [], covers: [], skills: [] } }] });
+        }}>Add task</button>
+        <span className="grow" />
+        <button type="button" className="detent" data-action="cancel" onClick={onClose}>Cancel</button>
+        <button type="button" className="detent send" data-action="save" disabled={busy !== null}
+          onClick={() => void act('save', async () => { await actions.editPlan(editOf(plan, draft)); onClose(); })}>{busy === 'save' ? 'Saving…' : 'Save as new version'}</button>
+      </div>
+      {error && <p className="inline-error" role="alert">Not saved: {error}</p>}
+    </section>
+  );
+}
+
+/** A comment box: one line, sent with Enter or the button. */
+function CommentBox({ label, onSend, onClose }: { label: string; onSend: (text: string) => Promise<void>; onClose: () => void }) {
+  const [busy, error, act] = useAct();
+  const [text, setText] = useState('');
+  const send = () => void act('send', async () => { if (text.trim()) { await onSend(text.trim()); setText(''); onClose(); } });
+  return (
+    <div className="cx-plan-comment-box">
+      <input type="text" autoFocus value={text} placeholder={label} aria-label={label}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => { if (event.key === 'Enter') send(); if (event.key === 'Escape') onClose(); }} />
+      <button type="button" className="detent" disabled={busy !== null || !text.trim()} onClick={send}>{busy ? 'Adding…' : 'Add'}</button>
+      <button type="button" className="detent" onClick={onClose}>Cancel</button>
+      {error && <p className="inline-error" role="alert">{error}</p>}
+    </div>
+  );
+}
+
+function CommentList({ comments, onRemove }: { comments: PlanCommentView[]; onRemove: (seq: number) => void }) {
+  if (comments.length === 0) return null;
+  return (
+    <ul className="cx-plan-comments" aria-label="Comments">
+      {comments.map((comment) => (
+        <li key={comment.seq} data-seq={comment.seq}>
+          <span className="cx-plan-comment-text">{comment.text}</span>
+          <button type="button" className="detent" aria-label="Remove the comment" onClick={() => onRemove(comment.seq)}>Remove</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /**
  * A plan version. The newest version of a plan is the card: its document, the task graph with
- * dependencies, files, checks, requirement coverage and skills, what changed since the version before,
- * Approve / Back to draft, Edit in chat and Implement; once implementing, each task's agent and
- * verification. Older versions are one line.
+ * dependencies, files, checks, requirement coverage and skills, what changed since the version
+ * before, comments on the plan and its tasks, Approve / Back to draft, Edit (the plan as a form),
+ * Revise with the comments and Implement; once implementing, each task's agent and verification.
+ * Older versions are one line.
  */
 export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: IdeationActions }) {
   const { entries, running, newestPlans } = useContext(IdeationContext);
   const [busy, error, act] = useAct();
+  const [editing, setEditing] = useState(false);
+  const [commenting, setCommenting] = useState<number | 'plan' | null>(null);
   const plan: PlanView = planOf(entry);
   if (newestPlans.get(plan.planId) !== entry.seq) {
     return <p className="cx-note" data-seq={entry.seq} data-kind="plan" data-superseded="true">Plan v{plan.version}: replaced by a later version.</p>;
@@ -229,21 +442,26 @@ export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: Ide
   const progress = planProgress(plan, entries);
   const status = progress.status;
   const open = status === 'draft' || status === 'approved';
+  if (editing && open) return <PlanEditor plan={plan} actions={actions} onClose={() => setEditing(false)} />;
   const changes = diffLines(plan.diff);
   const titleOf = (n: number) => plan.tasks.find((task) => task.n === n)?.title ?? `#${n}`;
+  const comments = open ? planComments(entries, plan.planId).filter((comment) => comment.state === 'open') : [];
+  const onTask = (task: PlanTask) => comments.filter((comment) => comment.task === task.n || (comment.task !== null && comment.taskTitle === task.title && !plan.tasks.some((other) => other.n === comment.task)));
+  const onPlan = comments.filter((comment) => comment.task === null);
+  const remove = (seq: number) => void act(`remove:${seq}`, () => actions.removeComment(plan.planId, seq));
   return (
     <section className={`notice cx-plan ${open ? 'commitment' : 'context'}`} data-seq={entry.seq} data-kind="plan" data-status={status} aria-label="Plan">
       <span className="kindmark" />
-      <details className="cx-plan-details">
+      <details className="cx-plan-details" open={open && comments.length > 0 ? true : undefined}>
       <summary className="cx-plan-line">
-        <span className="ap lbl">Plan · {plan.tasks.length} task{plan.tasks.length === 1 ? '' : 's'}{status !== 'implementing' ? ` · ${status}` : ''}</span>
+        <span className="ap lbl">Plan · {plan.tasks.length} task{plan.tasks.length === 1 ? '' : 's'}{status !== 'implementing' ? ` · ${status}` : ''}{plan.by === 'user' ? ' · edited by you' : ''}{comments.length > 0 ? ` · ${comments.length} comment${comments.length === 1 ? '' : 's'}` : ''}</span>
         {plan.goal && <span className="cx-plan-goal">{plan.goal}</span>}
       </summary>
       {plan.goal && <p className="prose">{plan.goal}</p>}
       {plan.note && <p className="ap faint">{plan.note}</p>}
       {plan.analysis && <p className="prose"><span className="ap faint">Thought through </span>{plan.analysis}</p>}
       {plan.approach && <p className="prose"><span className="ap faint">Approach </span>{plan.approach}</p>}
-      {plan.steps.length > 0 && (
+      {plan.steps.length > 0 && plan.tasks.length === 0 && (
         <ol className="cx-plan-steps" aria-label="Steps">{plan.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
       )}
       {plan.architecture && <p className="prose"><span className="ap faint">Architecture </span>{plan.architecture}</p>}
@@ -264,10 +482,15 @@ export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: Ide
                 {done && done.summary && <span className="cx-plan-step-summary">{done.summary}</span>}
                 {task.depends_on.length > 0 && <span className="ap faint" data-depends> after {task.depends_on.map(titleOf).join(', ')}</span>}
                 {task.brief && <p className="cx-task-brief">{task.brief}</p>}
+                {task.rules.length > 0 && <ul className="cx-plan-rules" aria-label="Rules">{task.rules.map((rule, at) => <li key={at}>{rule}</li>)}</ul>}
                 {task.touches.length > 0 && <p className="ap faint">touches {task.touches.join(', ')}</p>}
                 {task.checks.length > 0 && <p className="ap faint">checks {task.checks.map((check) => `\`${check}\``).join(', ')}</p>}
                 {task.covers.length > 0 && <p className="ap faint">covers {task.covers.join(', ')}</p>}
                 {task.skills.length > 0 && <p className="ap faint">skills {task.skills.join(', ')}</p>}
+                <CommentList comments={onTask(task)} onRemove={remove} />
+                {open && (commenting === task.n
+                  ? <CommentBox label={`Comment on task ${task.n}`} onSend={(text) => actions.commentPlan(plan.planId, task.n, text)} onClose={() => setCommenting(null)} />
+                  : <button type="button" className="detent cx-plan-comment-add" data-action="comment-task" onClick={() => setCommenting(task.n)}>Comment</button>)}
                 {task.task_id && (
                   <div className="cx-task-progress">
                     <button type="button" className="stream-row" onClick={() => actions.openTask(task.task_id!)}>
@@ -286,21 +509,144 @@ export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: Ide
       </details>
       {changes.length > 0 && (
         <details className="cx-plan-diff" open>
-          <summary className="ap faint">Changed since v{plan.version - 1}</summary>
+          <summary className="ap faint">Changed since v{plan.version - 1}{plan.by === 'user' ? ' (your edit)' : ''}</summary>
           <ul>{changes.map((line, index) => <li key={index}>{line}</li>)}</ul>
         </details>
       )}
+      {open && <CommentList comments={onPlan} onRemove={remove} />}
+      {open && commenting === 'plan' && <CommentBox label="Comment on the plan" onSend={(text) => actions.commentPlan(plan.planId, null, text)} onClose={() => setCommenting(null)} />}
       {open && (
         <div className="acts">
           {status === 'draft'
             ? <button type="button" className="detent" data-action="approve" disabled={busy !== null} onClick={() => void act('approve', () => actions.setPlanStatus(plan.planId, 'approved'))}>Approve</button>
             : <button type="button" className="detent" data-action="draft" disabled={busy !== null} onClick={() => void act('draft', () => actions.setPlanStatus(plan.planId, 'draft'))}>Back to draft</button>}
-          <button type="button" className="detent" data-action="edit" onClick={actions.editInChat} title="Write the change to the chat: the plan gets a new version">Edit in chat</button>
+          <button type="button" className="detent" data-action="edit" onClick={() => setEditing(true)} title="Change the plan yourself: it gets a new version">Edit</button>
+          {commenting !== 'plan' && <button type="button" className="detent" data-action="comment" onClick={() => setCommenting('plan')} title="Comment on the plan as a whole; comment on a task under the task">Comment</button>}
+          {comments.length > 0 && (
+            <button type="button" className="detent" data-action="revise" disabled={busy !== null || running}
+              title={running ? 'Wait for the current run to end' : 'The planner writes the next version from your comments'}
+              onClick={() => void act('revise', () => actions.revisePlan(plan.planId))}>{busy === 'revise' ? 'Sending…' : `Revise with ${comments.length} comment${comments.length === 1 ? '' : 's'}`}</button>
+          )}
+          <span className="grow" />
           <button type="button" className="detent send" data-action="implement" disabled={busy !== null || running}
             title={running ? 'Wait for the current run to end' : 'Carry out the plan (approves it)'}
             onClick={() => void act('implement', () => actions.implementPlan(plan.planId))}>{busy === 'implement' ? 'Starting…' : 'Implement'}</button>
         </div>
       )}
+      {error && <p className="inline-error" role="alert">{error}</p>}
+    </section>
+  );
+}
+
+/** A finding as a short line: a source opens as a link, code and notes are text. */
+function Finding({ found }: { found: FoundView }) {
+  const where = found.kind === 'code' ? 'code' : found.kind === 'note' ? 'note' : 'elsewhere';
+  const linked = /^https?:\/\//.test(found.ref);
+  return (
+    <li data-kind={found.kind}>
+      <span className="ap faint">{where} </span>
+      {linked ? <a href={found.ref} target="_blank" rel="noreferrer">{found.text || found.ref}</a> : <code>{found.ref}</code>}
+      {!linked && found.text && <span className="ap faint"> {found.text}</span>}
+    </li>
+  );
+}
+
+/** The ideas an ideation weighed, with what the host found for each: one folded line. */
+export function IdeasCard({ entry }: { entry: JournalEntry }) {
+  const view = ideationOf(entry);
+  return (
+    <details className="cx-ideas" data-seq={entry.seq} data-kind="ideas">
+      <summary className="ap faint">Weighed {view.ideas.length} ideas{view.question ? ` for: ${view.question}` : ''}</summary>
+      {view.constraints.length > 0 && <p className="ap faint">Constraints: {view.constraints.join('; ')}</p>}
+      <ol className="cx-ideas-list">
+        {view.ideas.map((idea) => (
+          <li key={idea.n} data-idea={idea.n}>
+            <span className="cx-idea-name">{idea.name}</span> <span className="ap faint">({idea.principle})</span>
+            <p className="cx-idea-mechanism">{idea.mechanism}</p>
+            {idea.found.length > 0 ? <ul className="cx-findings">{idea.found.map((found, at) => <Finding key={at} found={found} />)}</ul> : <p className="ap faint">nothing found</p>}
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+function OptionBody({ choice }: { choice: ChoiceView }) {
+  return (
+    <>
+      <p className="cx-option-mechanism">{choice.mechanism}</p>
+      {choice.why && <p className="prose"><span className="ap faint">Why </span>{choice.why}</p>}
+      {choice.grounding.length > 0 && <ul className="cx-findings" aria-label="Builds on">{choice.grounding.map((found, at) => <Finding key={at} found={found} />)}</ul>}
+      {choice.priorArt && <p className="ap faint">Done before: {choice.priorArt}</p>}
+      {choice.cost && <p className="ap faint">Cost: {choice.cost}</p>}
+      {choice.risk && <p className="ap faint">Risk: {choice.risk}</p>}
+      {choice.settleBy && <p className="ap faint">Settle early by: {choice.settleBy}</p>}
+    </>
+  );
+}
+
+/**
+ * An ideation's options: the question and criteria, two or three options with their grounding,
+ * the radical one, the recommendation and what was set aside. Choose records the decision; once
+ * chosen, Plan it asks for a plan of that option.
+ */
+export function OptionsCard({ entry, actions }: { entry: JournalEntry; actions: IdeationActions }) {
+  const { running } = useContext(IdeationContext);
+  const [busy, error, act] = useAct();
+  const view = ideationOf(entry);
+  const chosen = view.chosen;
+  const dropped = view.critique.filter((item) => item.verdict === 'drop');
+  const choose = (option: string) => void act(`choose:${option}`, () => actions.chooseOption(entry.seq, option));
+  const planIt = (name: string, letter: string) => void act('plan', () => actions.sendMessage(letter === 'radical' ? `Plan the radical option: ${name}.` : `Plan option ${letter}: ${name}.`));
+  const chosenName = chosen === 'radical' ? view.radical?.name ?? '' : view.options.find((choice) => choice.letter === chosen)?.name ?? '';
+  return (
+    <section className={`notice cx-options ${chosen ? 'context' : 'commitment'}`} data-seq={entry.seq} data-kind="options" data-chosen={chosen ?? ''} aria-label="Options">
+      <span className="kindmark" />
+      <span className="ap lbl">Options{chosen ? ` · chose ${chosen === 'radical' ? 'the radical one' : chosen}` : ''}</span>
+      {view.question && <p className="cx-plan-goal">{view.question}</p>}
+      {view.criteria.length > 0 && <p className="ap faint">Compared by {view.criteria.join('; ')}</p>}
+      {view.options.length === 0 && <p className="prose">No idea held up; the reasons are below.</p>}
+      <ol className="cx-option-list">
+        {view.options.map((choice) => (
+          <li key={choice.letter} data-letter={choice.letter} data-recommended={view.recommend === choice.letter ? 'true' : 'false'} data-chosen={chosen === choice.letter ? 'true' : 'false'}>
+            <div className="cx-option-head">
+              <span className="ap">{choice.letter}</span>
+              <span className="cx-option-name">{choice.name}</span>
+              {view.recommend === choice.letter && <span className="ap cx-option-badge">recommended</span>}
+              {!chosen && <button type="button" className="detent" data-action="choose" disabled={busy !== null} onClick={() => choose(choice.letter)}>{busy === `choose:${choice.letter}` ? 'Choosing…' : 'Choose'}</button>}
+            </div>
+            <OptionBody choice={choice} />
+          </li>
+        ))}
+        {view.radical && (
+          <li data-letter="radical" data-chosen={chosen === 'radical' ? 'true' : 'false'}>
+            <div className="cx-option-head">
+              <span className="ap">Radical</span>
+              <span className="cx-option-name">{view.radical.name}</span>
+              {!chosen && <button type="button" className="detent" data-action="choose" disabled={busy !== null} onClick={() => choose('radical')}>{busy === 'choose:radical' ? 'Choosing…' : 'Choose'}</button>}
+            </div>
+            <p className="prose"><span className="ap faint">Drops </span>{view.radical.drops}</p>
+            <p className="prose"><span className="ap faint">Buys </span>{view.radical.buys}</p>
+            <p className="ap faint">Wins if {view.radical.wins_if}</p>
+          </li>
+        )}
+      </ol>
+      {view.recommend && (
+        <p className="prose"><span className="ap faint">Recommended {view.recommend} </span>because {view.because}{view.wouldChangeIf ? <span className="ap faint"> · would change if {view.wouldChangeIf}</span> : null}</p>
+      )}
+      {dropped.length > 0 && (
+        <details className="cx-plan-diff">
+          <summary className="ap faint">Set aside · {dropped.length}</summary>
+          <ul>{dropped.map((item) => <li key={item.idea}>Idea {item.idea}: {item.why}</li>)}</ul>
+        </details>
+      )}
+      {chosen && chosenName && (
+        <div className="acts">
+          <button type="button" className="detent send" data-action="plan" disabled={busy !== null || running} title={running ? 'Wait for the current run to end' : 'Ask for a plan of the chosen option'}
+            onClick={() => planIt(chosenName, chosen === 'radical' ? 'radical' : chosen)}>{busy === 'plan' ? 'Sending…' : 'Plan it'}</button>
+        </div>
+      )}
+      {!chosen && <p className="ap faint">Choose one, or write what to change.</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
     </section>
   );

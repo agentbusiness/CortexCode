@@ -228,33 +228,32 @@ pub struct Notifier {
     file: Arc<HistoryFile>,
 }
 
-/// The history file. Snapshots carry a version taken under the history lock; a write never
-/// replaces a newer version, so the background writer and a final flush cannot reorder.
+/// The history's place: the app's main store (`memory.settings` at `notify.history`). Snapshots
+/// carry a version taken under the history lock; a write never replaces a newer version, so the
+/// background writer and a final flush cannot reorder.
 struct HistoryFile {
+    /// The file the history was kept in before the store (read once, then removed).
     path: PathBuf,
     version: std::sync::atomic::AtomicU64,
     written: Mutex<u64>,
 }
 
+/// The history's settings path in the store.
+const HISTORY_PATH: &str = "notify.history";
+
 impl HistoryFile {
-    fn write(&self, version: u64, snapshot: &str) {
-        let mut written = lock(&self.written);
-        if version <= *written {
+    /// Write a snapshot to the store unless a newer one is there already.
+    async fn write(&self, bus: &Arc<dyn Bus>, version: u64, snapshot: &str) {
+        if version <= *lock(&self.written) {
             return;
         }
-        let temp = self.path.with_extension(format!("json.{version}.tmp"));
-        let outcome = self
-            .path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&temp, snapshot))
-            .and_then(|()| std::fs::rename(&temp, &self.path));
-        match outcome {
-            Ok(()) => *written = version,
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp);
-                tracing::warn!(%error, file = %self.path.display(), "notification history not saved");
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { return };
+        match bus.call(cc_protocol::contracts::memory::methods::SETTINGS_SET, json!({ "path": HISTORY_PATH, "value": value, "by": "notify" })).await {
+            Ok(_) => {
+                let mut written = lock(&self.written);
+                *written = (*written).max(version);
             }
+            Err(error) => tracing::warn!(error = %error.message, "notification history not saved"),
         }
     }
 }
@@ -297,12 +296,13 @@ impl Notifier {
             persist,
             file: file.clone(),
         });
-        // The history file is rewritten (atomically) with the latest snapshot after changes.
+        // The store gets the latest snapshot after changes (once the frame connection is there).
+        let writer = Arc::downgrade(&notifier);
         tokio::spawn(async move {
             while persisted.changed().await.is_ok() {
                 let Some((version, snapshot)) = persisted.borrow_and_update().clone() else { continue };
-                let file = file.clone();
-                let _ = tokio::task::spawn_blocking(move || file.write(version, &snapshot)).await;
+                let Some(bus) = writer.upgrade().and_then(|notifier| notifier.bus.get().cloned()) else { continue };
+                file.write(&bus, version, &snapshot).await;
             }
         });
         let weak = Arc::downgrade(&notifier);
@@ -319,9 +319,36 @@ impl Notifier {
         notifier
     }
 
-    /// Connect to the system (once).
-    pub fn attach(&self, bus: Arc<dyn Bus>) {
-        let _ = self.bus.set(bus);
+    /// Connect to the system (once), then read the history from the store: a history kept there
+    /// replaces the one read at start; none there takes the old file's history, which is removed.
+    pub fn attach(self: &Arc<Self>, bus: Arc<dyn Bus>) {
+        if self.bus.set(bus.clone()).is_err() {
+            return;
+        }
+        let notifier = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let stored = loop {
+                match bus.call(cc_protocol::contracts::memory::methods::SETTINGS_GET, json!({ "path": HISTORY_PATH })).await {
+                    Ok(setting) => break setting.get("value").cloned().and_then(|value| serde_json::from_value::<History>(value).ok()),
+                    Err(error) if error.code == codes::NOT_FOUND => break None,
+                    Err(error) if error.code == codes::UNAVAILABLE || error.code == codes::CONNECTION_CLOSED => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error.message, "notification history not read from the store");
+                        return;
+                    }
+                }
+            };
+            let Some(notifier) = notifier.upgrade() else { return };
+            match stored {
+                Some(history) => *lock(&notifier.history) = history,
+                None => {
+                    notifier.save();
+                    let _ = std::fs::remove_file(&notifier.file.path);
+                }
+            }
+        });
     }
 
     fn publish(&self, topic: &str, data: Value) {
@@ -1038,14 +1065,14 @@ impl Notifier {
     }
 
     /// Write the history now (the background writer may still hold the last change).
-    pub fn flush(&self) {
-        if let Some((version, snapshot)) = self.snapshot() {
-            self.file.write(version, &snapshot);
+    pub async fn flush(&self) {
+        if let (Some((version, snapshot)), Some(bus)) = (self.snapshot(), self.bus.get().cloned()) {
+            self.file.write(&bus, version, &snapshot).await;
         }
     }
 
     pub async fn shutdown(&self) {
-        self.flush();
+        self.flush().await;
         self.native.stop().await;
     }
 }

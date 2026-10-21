@@ -12,6 +12,7 @@ use crate::work::WorkStore;
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{
     ExtractProblem, LanguagePlugin, UncoveredFiles,
+    AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalReadParams, JournalReadResult,
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
@@ -29,9 +30,10 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 /// At most this many extraction problems are listed in a project's status (all are counted).
 const EXTRACT_PROBLEMS_SHOWN: usize = 100;
 
-/// The main IronGraph project: everything that belongs to no repository (settings, global rules
-/// and style, the project registry).
-pub const MAIN_PROJECT: &str = "main";
+/// The main IronGraph project: everything that belongs to no repository (the app's projects,
+/// sessions and their journals, settings, global rules and style, the project registry). It is
+/// never one of the app's projects, so it never shows in the project or session lists.
+pub const MAIN_PROJECT: &str = "db";
 
 pub struct Project {
     pub id: String,
@@ -50,6 +52,7 @@ pub struct Memory {
     graph: OnceCell<Arc<Graph>>,
     global: OnceCell<Arc<WorkStore>>,
     settings: OnceCell<Arc<Settings>>,
+    app: OnceCell<Arc<crate::app::AppStore>>,
     projects: RwLock<HashMap<String, Arc<Project>>>,
     /// Serialises opening of each project.
     opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -97,7 +100,7 @@ struct Entry {
 
 /// Names a project cannot take: graph URI verbs (`graph://<project>/search/...` must stay
 /// unambiguous) and the work-state scopes.
-const RESERVED_NAMES: &[&str] = &["search", "callers", "callees", "impact", "path", "global", "main"];
+const RESERVED_NAMES: &[&str] = &["search", "callers", "callees", "impact", "path", "global", "main", "db"];
 
 /// The id the frame gives a canonical root (`frame/src/state.rs`, `project_id`): a reference opened
 /// by path has the id the frame would give it, so opening it later as a session project reuses
@@ -168,6 +171,14 @@ pub const PROVIDES: &[&str] = &[
     methods::SETTINGS_LIST,
     methods::SETTINGS_DELETE,
     methods::ENGINE_STATUS,
+    methods::APP_PROJECTS,
+    methods::APP_PROJECT_PUT,
+    methods::APP_PROJECT_DELETE,
+    methods::APP_SESSIONS,
+    methods::APP_SESSION_PUT,
+    methods::APP_SESSIONS_DELETE,
+    methods::JOURNAL_APPEND,
+    methods::JOURNAL_READ,
     methods::NOTE_ADD,
     methods::NOTE_SEARCH,
     methods::NOTE_LIST,
@@ -211,6 +222,7 @@ impl Memory {
             graph: OnceCell::new(),
             global: OnceCell::new(),
             settings: OnceCell::new(),
+            app: OnceCell::new(),
             projects: RwLock::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             task_owner: Mutex::new(HashMap::new()),
@@ -381,6 +393,12 @@ impl Memory {
     async fn settings(&self) -> Result<Arc<Settings>, RpcError> {
         let global = self.global().await?;
         self.settings.get_or_try_init(|| async { Ok::<_, RpcError>(Arc::new(Settings::open(global.graph.clone(), global.ig_id.clone()).await?)) }).await.cloned()
+    }
+
+    /// The app's projects, sessions and journals (see [`crate::app`]).
+    async fn app(&self) -> Result<Arc<crate::app::AppStore>, RpcError> {
+        let global = self.global().await?;
+        self.app.get_or_try_init(|| async { Ok::<_, RpcError>(Arc::new(crate::app::AppStore::open(global.graph.clone(), global.ig_id.clone()).await?)) }).await.cloned()
     }
 
     /// Open the database and create the main project (with its settings root) on first start.
@@ -1178,20 +1196,51 @@ impl Memory {
             }
             methods::SETTINGS_GET => {
                 let p: SettingsGetParams = parse_params(params)?;
-                to_value(&self.settings().await?.get(&p.path).await?)
+                to_value(&self.settings().await?.get(&p.scope, &p.path).await?)
             }
             methods::SETTINGS_SET => {
                 let p: SettingsSetParams = parse_params(params)?;
-                let stored = self.settings().await?.set(&p.path, p.value, &p.by, p.description).await?;
-                self.publish(topics::SETTINGS_CHANGED, json!({"path": stored.path, "value": stored.value, "by": stored.updated_by}));
+                let stored = self.settings().await?.set(&p.scope, &p.path, p.value, &p.by, p.description).await?;
+                self.publish(topics::SETTINGS_CHANGED, json!({"scope": p.scope, "path": stored.path, "value": stored.value, "by": stored.updated_by}));
                 to_value(&stored)
             }
             methods::SETTINGS_LIST => {
                 let p: SettingsListParams = parse_params(params)?;
-                let settings = self.settings().await?.list(&p.prefix).await?;
+                let settings = self.settings().await?.list(&p.scope, &p.prefix).await?;
                 to_value(&SettingsListResult { prefix: p.prefix, settings })
             }
             methods::ENGINE_STATUS => to_value(&self.engine.status()),
+            methods::APP_PROJECTS => to_value(&AppProjectsResult { projects: self.app().await?.projects().await? }),
+            methods::APP_PROJECT_PUT => {
+                let p: AppProjectPutParams = parse_params(params)?;
+                self.app().await?.put_project(&p.project).await?;
+                Ok(json!({}))
+            }
+            methods::APP_PROJECT_DELETE => {
+                let p: AppProjectDeleteParams = parse_params(params)?;
+                self.app().await?.delete_project(&p.id).await?;
+                Ok(json!({}))
+            }
+            methods::APP_SESSIONS => to_value(&AppSessionsResult { sessions: self.app().await?.sessions().await? }),
+            methods::APP_SESSION_PUT => {
+                let p: AppSessionPutParams = parse_params(params)?;
+                self.app().await?.put_session(&p.session).await?;
+                Ok(json!({}))
+            }
+            methods::APP_SESSIONS_DELETE => {
+                let p: AppSessionsDeleteParams = parse_params(params)?;
+                self.app().await?.delete_sessions(&p.ids).await?;
+                Ok(json!({}))
+            }
+            methods::JOURNAL_APPEND => {
+                let p: JournalAppendParams = parse_params(params)?;
+                to_value(&JournalAppendResult { next: self.app().await?.journal_append(&p.session_id, &p.patches).await? })
+            }
+            methods::JOURNAL_READ => {
+                let p: JournalReadParams = parse_params(params)?;
+                let (patches, next, end) = self.app().await?.journal_read(&p.session_id, p.from, p.max).await?;
+                to_value(&JournalReadResult { patches, next, end })
+            }
             methods::NOTE_ADD => {
                 let p: NoteAddParams = parse_params(params)?;
                 let store = self.note_store(p.project_id.as_deref(), true).await?;
@@ -1276,9 +1325,9 @@ impl Memory {
             methods::SETTINGS_DELETE => {
                 let p: SettingsDeleteParams = parse_params(params.clone())?;
                 let by = params.get("by").and_then(|b| b.as_str()).unwrap_or("").to_owned();
-                let deleted = self.settings().await?.delete(&p.path).await?;
+                let deleted = self.settings().await?.delete(&p.scope, &p.path).await?;
                 for path in &deleted {
-                    self.publish(topics::SETTINGS_CHANGED, json!({"path": path, "value": null, "by": by}));
+                    self.publish(topics::SETTINGS_CHANGED, json!({"scope": p.scope, "path": path, "value": null, "by": by}));
                 }
                 Ok(json!({"deleted": deleted}))
             }

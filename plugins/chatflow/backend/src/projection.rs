@@ -534,7 +534,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             // A digested turn: its user message, plans and spec changes stay; everything else of
             // it becomes one host note and its final answer, where the turn ended.
             flush_host(&mut host_group, &mut messages);
-            if matches!(entry.kind.as_str(), kinds::USER_MESSAGE | chatflow_kinds::PLAN | chatflow_kinds::SPEC) {
+            if matches!(entry.kind.as_str(), kinds::USER_MESSAGE | chatflow_kinds::PLAN | chatflow_kinds::SPEC) || crate::ideation::is_answer(entry) {
                 emit_other(ds, entry, &mut messages, &emitted_results, &calls, &render_output, &mut host_group, image_input, &pins);
             } else if digest.end == entry.seq {
                 if !digest.calls.is_empty() {
@@ -709,6 +709,18 @@ fn emit_other(
         }
         chatflow_kinds::PLAN => {
             if let Some(text) = plan::in_place(ds, entry, &pins.newest_plans, pins.settled) {
+                messages.push(host_message(ds, &text));
+            }
+        }
+        // An open design question: the ideas with what the host found for each (host words), then
+        // the options, which are the turn's answer (the model's own words).
+        chatflow_kinds::IDEATION if crate::ideation::is_answer(entry) => {
+            if let Some(text) = crate::ideation::render_options(ds, data) {
+                messages.push(ChatMessage::new("assistant", text));
+            }
+        }
+        chatflow_kinds::IDEATION => {
+            if let Some(text) = crate::ideation::render_ideas(ds, data) {
                 messages.push(host_message(ds, &text));
             }
         }

@@ -9,6 +9,7 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 3. `route`, the kind of request. Pick the first that fits:
 - STATUS: a question about the background agents, their tasks or the project board.
 - IMPLEMENT: a plan is open (shown above) and the user says to carry it out.
+- IDEATE: the user asks for options or approaches to choose from on an open design question (an architecture, an API, an algorithm, a strategy). Not for a question with one answer: that is LOOKUP.
 - PLAN: the user asks for a plan to review before anything changes, or asks to change the open plan. Not for a plain request to build or fix: that is DO, and DO plans by itself.
 - DELEGATE: the user asks for the work to run in background agents. Not for one feature or one fix: that is DO.
 - DO: a change, a fix, new code or a command to run in this repository, now. Big or small.
@@ -21,4 +22,4 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 8. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
 9. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
 
-Examples: "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN.
+Examples: "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is IDEATE.

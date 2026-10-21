@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
-pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "PLAN", "IMPLEMENT"];
+pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "PLAN", "IDEATE", "IMPLEMENT"];
 pub const DECISIONS: &[&str] = &["MORE", "ANSWER", "DO", "DELEGATE", "PLAN"];
 
 /// The shape of a constrained output.
@@ -45,6 +45,11 @@ pub const REQUIREMENTS_PLACEHOLDER: &str = "@requirements";
 pub const READS_PLACEHOLDER: &str = "@reads";
 /// Placeholder of an enum of a plan's task numbers ("1" .. `limits.plan_max_tasks`).
 pub const TASKS_PLACEHOLDER: &str = "@tasks";
+/// Placeholder of an enum of the IDEAS stage's idea numbers ("1" .. the ideas written).
+pub const IDEAS_PLACEHOLDER: &str = "@ideas";
+/// Placeholder of a pick of what the host found for the ideas (code, notes, sources): an option's
+/// grounding can only name a finding, never one the model made up.
+pub const GROUNDING_PLACEHOLDER: &str = "@grounding";
 /// Placeholder of a pick of the project's own check commands (the language plugins' verifiers that
 /// apply to the project, filled at run time): a decision's `checks` can only be those, never a
 /// command the model writes, so no check carries an expected value the model worked out.
@@ -505,6 +510,9 @@ pub struct PlanTaskOutput {
     pub title: String,
     #[serde(default)]
     pub brief: String,
+    /// The request's rules this task makes true, one line each, in the request's words.
+    #[serde(default)]
+    pub rules: Vec<String>,
     /// Numbers of earlier tasks ("1" = the first written).
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -518,6 +526,125 @@ pub struct PlanTaskOutput {
     /// Skills the task's implementation reads (`skill://<plugin>/<name>`, from the catalog).
     #[serde(default)]
     pub skills: Vec<String>,
+}
+
+/// IDEAS: an open design question framed, and one idea per generating principle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct IdeasOutput {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    #[serde(default)]
+    pub ideas: IdeaFields,
+}
+
+/// One idea per principle; the field names are the principles the model generates from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct IdeaFields {
+    #[serde(default)]
+    pub first: IdeaOutput,
+    #[serde(default)]
+    pub two_choices_flipped: IdeaOutput,
+    #[serde(default)]
+    pub constraint_relaxed: IdeaOutput,
+    #[serde(default)]
+    pub inverted: IdeaOutput,
+    #[serde(default)]
+    pub component_removed: IdeaOutput,
+    #[serde(default)]
+    pub borrowed: IdeaOutput,
+    #[serde(default)]
+    pub prior_art: IdeaOutput,
+}
+
+impl IdeaFields {
+    /// `(principle, idea)` in the order written.
+    pub fn in_order(&self) -> [(&'static str, &IdeaOutput); 7] {
+        [
+            ("first", &self.first),
+            ("two_choices_flipped", &self.two_choices_flipped),
+            ("constraint_relaxed", &self.constraint_relaxed),
+            ("inverted", &self.inverted),
+            ("component_removed", &self.component_removed),
+            ("borrowed", &self.borrowed),
+            ("prior_art", &self.prior_art),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct IdeaOutput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mechanism: String,
+}
+
+/// OPTIONS: the ideas critiqued, the options chosen from them, a radical one, a recommendation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OptionsOutput {
+    #[serde(default)]
+    pub critique: Vec<CritiqueOutput>,
+    #[serde(default)]
+    pub options: Vec<OptionOutput>,
+    #[serde(default)]
+    pub radical: RadicalOutput,
+    /// The idea number of the recommended option.
+    #[serde(default)]
+    pub recommend: String,
+    #[serde(default)]
+    pub because: String,
+    #[serde(default)]
+    pub would_change_if: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CritiqueOutput {
+    #[serde(default)]
+    pub idea: String,
+    /// keep | drop
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OptionOutput {
+    #[serde(default)]
+    pub idea: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mechanism: String,
+    #[serde(default)]
+    pub why: String,
+    /// Picked from what the host found for the ideas (absent when it found nothing).
+    #[serde(default)]
+    pub grounding: Vec<String>,
+    #[serde(default)]
+    pub prior_art: String,
+    #[serde(default)]
+    pub cost: String,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub settle_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RadicalOutput {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub drops: String,
+    #[serde(default)]
+    pub buys: String,
+    #[serde(default)]
+    pub wins_if: String,
 }
 
 /// DECISIONS: what the latest exchange settled.

@@ -1,7 +1,8 @@
-//! Projects, sessions and the workbench's slot state, persisted as JSON under `<home>/state/`
-//! with atomic writes.
+//! Projects, sessions and the workbench's slot state. The memory plugin's main store keeps them
+//! (see [`crate::store`]): they are loaded from it when it first serves, held here while the frame
+//! runs, and every change is written through the store's outbox in the order it was made.
 
-use crate::home::write_atomic;
+use crate::store::{Op, Outbox};
 use cc_protocol::contracts::frame::{
     Project, Session, SessionCreateParams, SessionStatus, SessionUpdateParams, UiStateDocument,
 };
@@ -9,11 +10,10 @@ use cc_protocol::contracts::now_ms;
 use cc_protocol::RpcError;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub struct StateStore {
-    dir: PathBuf,
+    outbox: Outbox,
     inner: Mutex<Inner>,
     ui_state: Mutex<UiStateDocument>,
 }
@@ -24,26 +24,32 @@ struct Inner {
 }
 
 impl StateStore {
-    pub fn open(dir: PathBuf) -> std::io::Result<StateStore> {
-        std::fs::create_dir_all(&dir)?;
-        let projects: Vec<Project> = read_json(&dir.join("projects.json"))?;
-        let sessions: Vec<Session> = read_json(&dir.join("sessions.json"))?;
-        let ui_state = match std::fs::read(dir.join("ui_state.json")) {
-            Ok(bytes) => serde_json::from_slice::<UiStateDocument>(&bytes)
-                .map_err(|error| std::io::Error::other(format!("{} is corrupt: {error}", dir.join("ui_state.json").display())))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                UiStateDocument { document: serde_json::Value::Object(serde_json::Map::new()), rev: 0, updated_ms: 0 }
+    /// Empty until [`StateStore::load`] fills it from the store.
+    pub fn open(outbox: Outbox) -> StateStore {
+        StateStore {
+            outbox,
+            ui_state: Mutex::new(UiStateDocument { document: serde_json::Value::Object(serde_json::Map::new()), rev: 0, updated_ms: 0 }),
+            inner: Mutex::new(Inner { projects: BTreeMap::new(), sessions: BTreeMap::new() }),
+        }
+    }
+
+    /// The records the store holds, when it first serves. A record made before (none is, since the
+    /// UI starts after the store) is kept.
+    pub fn load(&self, projects: Vec<Project>, sessions: Vec<Session>, ui_state: Option<UiStateDocument>) {
+        let mut inner = self.lock();
+        for project in projects {
+            inner.projects.entry(project.id.clone()).or_insert(project);
+        }
+        for session in sessions {
+            inner.sessions.entry(session.id.clone()).or_insert(session);
+        }
+        drop(inner);
+        if let Some(document) = ui_state {
+            let mut state = self.ui_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.rev == 0 {
+                *state = document;
             }
-            Err(error) => return Err(error),
-        };
-        Ok(StateStore {
-            ui_state: Mutex::new(ui_state),
-            dir,
-            inner: Mutex::new(Inner {
-                projects: projects.into_iter().map(|p| (p.id.clone(), p)).collect(),
-                sessions: sessions.into_iter().map(|s| (s.id.clone(), s)).collect(),
-            }),
-        })
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -65,11 +71,8 @@ impl StateStore {
         }
         let name = canonical.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.clone());
         let project = Project { id: id.clone(), root, name, created_ms: now_ms() };
-        inner.projects.insert(id.clone(), project.clone());
-        if let Err(error) = self.persist_projects(&inner) {
-            inner.projects.remove(&id);
-            return Err(error);
-        }
+        inner.projects.insert(id, project.clone());
+        self.outbox.send(Op::PutProject(project.clone()));
         Ok((project, true))
     }
 
@@ -111,10 +114,7 @@ impl StateStore {
             model: None,
         };
         inner.sessions.insert(session.id.clone(), session.clone());
-        if let Err(error) = self.persist_sessions(&inner) {
-            inner.sessions.remove(&session.id);
-            return Err(error);
-        }
+        self.outbox.send(Op::PutSession(session.clone()));
         Ok(session)
     }
 
@@ -153,10 +153,7 @@ impl StateStore {
         }
         session.updated_ms = now_ms().max(previous.updated_ms);
         inner.sessions.insert(session.id.clone(), session.clone());
-        if let Err(error) = self.persist_sessions(&inner) {
-            inner.sessions.insert(previous.id.clone(), previous);
-            return Err(error);
-        }
+        self.outbox.send(Op::PutSession(session.clone()));
         Ok(session)
     }
 
@@ -168,12 +165,7 @@ impl StateStore {
         }
         let doomed = descendants(&inner.sessions, &[id.to_owned()]);
         let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
-        if let Err(error) = self.persist_sessions(&inner) {
-            for session in removed {
-                inner.sessions.insert(session.id.clone(), session);
-            }
-            return Err(error);
-        }
+        self.outbox.send(Op::DeleteSessions(removed.iter().map(|session| session.id.clone()).collect()));
         Ok(removed)
     }
 
@@ -187,13 +179,8 @@ impl StateStore {
         inner.projects.remove(id);
         // Sessions first: a project without its record but with sessions left would be worse than
         // the reverse, which the next delete finishes.
-        if let Err(error) = self.persist_sessions(&inner).and_then(|()| self.persist_projects(&inner)) {
-            for session in removed {
-                inner.sessions.insert(session.id.clone(), session);
-            }
-            inner.projects.insert(project.id.clone(), project);
-            return Err(error);
-        }
+        self.outbox.send(Op::DeleteSessions(removed.iter().map(|session| session.id.clone()).collect()));
+        self.outbox.send(Op::DeleteProject(project.id.clone()));
         Ok((project, removed))
     }
 
@@ -209,19 +196,9 @@ impl StateStore {
         }
         let mut state = self.ui_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let next = UiStateDocument { document, rev: state.rev + 1, updated_ms: now_ms() };
-        write_json(&self.dir.join("ui_state.json"), &next)?;
+        self.outbox.send(Op::UiState(next.clone()));
         *state = next;
         Ok(state.rev)
-    }
-
-    fn persist_projects(&self, inner: &Inner) -> Result<(), RpcError> {
-        let list: Vec<&Project> = inner.projects.values().collect();
-        write_json(&self.dir.join("projects.json"), &list)
-    }
-
-    fn persist_sessions(&self, inner: &Inner) -> Result<(), RpcError> {
-        let list: Vec<&Session> = inner.sessions.values().collect();
-        write_json(&self.dir.join("sessions.json"), &list)
     }
 }
 
@@ -252,16 +229,3 @@ pub fn project_id(canonical_root: &str) -> String {
     format!("p_{}", &hex::encode(digest)[..16])
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<Vec<T>> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::other(format!("{} is corrupt: {error}", path.display()))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error),
-    }
-}
-
-fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), RpcError> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|error| RpcError::internal(error.to_string()))?;
-    write_atomic(path, &bytes).map_err(|error| RpcError::internal(format!("cannot write {}: {error}", path.display())))
-}

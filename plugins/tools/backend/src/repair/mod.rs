@@ -922,22 +922,19 @@ fn normalize_op(args: &mut Args, value: Value) -> Result<String, RepairError> {
     }
 }
 
-/// Anchor value: `N:hh` (also from a copied `N:hh|text` line), `0`, or a bare line number.
+/// Anchor value: `N:hh` (also from a copied `N:hh|text` line), `0`, or a bare line number. A bare
+/// number goes through as a number: the edit uses it only while the file is exactly as the session
+/// last read it, and refuses it otherwise (seen: `at: 307` refused while the file had not changed).
 fn anchor_value(args: &mut Args, field: &str, value: Value) -> Result<Value, RepairError> {
-    let bare = |line: String| {
-        RepairError::new(
-            "bad_argument",
-            format!(
-                "`{field}` = {line} is a bare line number; use the line's anchor N:hh from read output (e.g. \"{line}:ab\"), which guards against editing a file that changed"
-            ),
-        )
-        .tool("edit")
-        .field(field)
+    let mut bare = |line: u64| {
+        args.note(format!("`{field}` = {line}: a bare line number, used while the file is as last read"));
+        Ok(Value::Number(line.into()))
     };
     match value {
         Value::Number(number) => match number.as_u64() {
             Some(0) => Ok(Value::String("0".to_owned())),
-            _ => Err(bare(number.to_string())),
+            Some(line) => bare(line),
+            None => Err(RepairError::new("bad_argument", format!("`{field}` = {number} is not a line; use the line's anchor N:hh from read output")).tool("edit").field(field)),
         },
         Value::String(text) => {
             let trimmed = text.trim();
@@ -951,8 +948,8 @@ fn anchor_value(args: &mut Args, field: &str, value: Value) -> Result<Value, Rep
             if trimmed == "0" || trimmed.starts_with("0:") {
                 return Ok(Value::String("0".to_owned()));
             }
-            if trimmed.parse::<u64>().is_ok() {
-                return Err(bare(trimmed.to_owned()));
+            if let Ok(line) = trimmed.parse::<u64>() {
+                return bare(line);
             }
             Err(RepairError::new(
                 "bad_argument",

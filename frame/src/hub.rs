@@ -98,6 +98,8 @@ pub struct Frame {
     pub machine: Machine,
     pub journal: Journal,
     pub state: StateStore,
+    /// The memory plugin that keeps the frame's records (see [`crate::store`]).
+    pub memory: Arc<crate::store::MemoryLink>,
     pub ui_plugins: UiPlugins,
     pub units: Units,
     pub power: KeepAwake,
@@ -129,6 +131,7 @@ pub struct FrameParts {
     pub machine: Machine,
     pub journal: Journal,
     pub state: StateStore,
+    pub memory: Arc<crate::store::MemoryLink>,
     pub units: Units,
     pub code: PathBuf,
     pub safe: bool,
@@ -136,7 +139,7 @@ pub struct FrameParts {
 
 impl Frame {
     pub fn new(parts: FrameParts) -> Arc<Frame> {
-        let FrameParts { config, home, token, socket, headless, machine, journal, state, units, code, safe } = parts;
+        let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, code, safe } = parts;
         let disabled = units.disabled();
         let ui_plugins = UiPlugins::new(units.ui_sources(), disabled.clone());
         let sup = Supervisor::new(&units.backends(), &disabled);
@@ -165,6 +168,7 @@ impl Frame {
             machine,
             journal,
             state,
+            memory,
             ui_plugins,
             sup,
             shell,
@@ -238,6 +242,9 @@ impl Frame {
     }
 
     pub fn set_route(&self, category: &str, route: Route) {
+        if category == crate::store::MEMORY {
+            self.memory.set(route.conn.clone());
+        }
         if let Ok(mut routes) = self.routes.write() {
             routes.insert(category.to_owned(), route);
         }
@@ -259,6 +266,9 @@ impl Frame {
         let Ok(mut routes) = self.routes.write() else { return false };
         if routes.get(category).is_some_and(|route| route.instance == instance) {
             routes.remove(category);
+            if category == crate::store::MEMORY {
+                self.memory.clear();
+            }
             return true;
         }
         false

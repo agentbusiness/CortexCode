@@ -467,6 +467,10 @@ enum Approval {
 /// Wait for the user's answer to an ask-mode call (an `approval` entry the UI answers through
 /// `chatflow.approve`), then run the call again with the approved classes.
 async fn await_approval(env: &RunEnv, journal: &mut Journal, call: &ToolCall, outcome: &ToolOutcome, existing: Option<u64>) -> Result<Approval, RpcError> {
+    // A replay (`replay.rs`) has nobody to ask: what needs approval is not run.
+    if crate::replay::arm(&journal.entries_vec()).is_some() {
+        return Ok(Approval::Answered(env.data.text("replay_denied", &[])));
+    }
     let classes: Vec<String> = outcome
         .display
         .pointer("/approval/classes")
@@ -574,6 +578,32 @@ async fn resolve_pending_approvals(env: &RunEnv, journal: &mut Journal) -> Resul
 
 /// Verify a task's contract: through `agents.verify` (which records the report and the task's
 /// status), or with the shared contract runner when no agents plugin serves.
+/// The note under a failure with `key`: the lessons and this project's facts learned from it
+/// before, each shown once in the run (`shown`), their ids kept on the note so learning after the
+/// run can tell whether the failure came again. Nothing when nothing was learned from it.
+async fn failure_note(env: &RunEnv, journal: &mut Journal, key: &str, shown: &mut HashSet<String>) -> Result<(), RpcError> {
+    let languages: Vec<String> = journal
+        .context_entry()
+        .and_then(|entry| entry.data.get("languages").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|language| language.as_str().map(str::to_owned))
+        .collect();
+    let found = crate::learn::at_failure(&env.host, &env.data, &env.scope.project_id, key, &languages, shown).await;
+    if found.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = found.iter().map(|(item, _)| env.data.text("list_item", &[("text", item.text.trim())])).collect();
+    let lessons: Vec<&str> = found.iter().filter(|(_, project)| !project).map(|(item, _)| item.id.as_str()).collect();
+    let facts: Vec<&str> = found.iter().filter(|(_, project)| *project).map(|(item, _)| item.id.as_str()).collect();
+    shown.extend(found.iter().map(|(item, _)| item.id.clone()));
+    let text = env.data.text("lessons_failure", &[("text", &lines.join("\n"))]);
+    journal
+        .append(kinds::NOTE, json!({"text": text, "purpose": "lesson", "run_id": env.run_id, "host_message": true, "key": key, "lessons": lessons, "facts": facts}))
+        .await
+        .map(|_| ())
+}
+
 pub async fn verify_task(host: &Host, journal: &mut Journal, task: &Task, workspace: &str, cancel: &CancellationToken) -> Result<VerifyReport, RpcError> {
     let via_agents = host
         .call_with(agents_methods::VERIFY, json!({"task_id": task.id, "workspace": workspace}), host::Effect::Idempotent, Some(cancel))
@@ -642,6 +672,18 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     let mut same_error: Option<(u64, u32, bool)> = None;
     let mut worked_since_run = false;
     let mut types_shown = false;
+    // What the run was shown under its failures already (`learn::at_failure`): each item once.
+    let mut failure_shown: HashSet<String> = of_run(&entries, &env.run_id)
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "lesson")
+        .flat_map(|entry| ["lessons", "facts"].into_iter().flat_map(|field| entry.data.get(field).and_then(Value::as_array).cloned().unwrap_or_default()))
+        .filter_map(|id| id.as_str().map(str::to_owned))
+        .collect();
+    // A replay without a lesson never shows it.
+    if let Some((arm, lesson, _)) = crate::replay::arm(&entries)
+        && arm == "without"
+    {
+        failure_shown.insert(lesson);
+    }
     let mut changed = changed_files_of(&entries, &env.run_id);
     let mut tracker = Tracker::default();
     let mut effort = spec.effort.clone();
@@ -660,6 +702,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // a jest run that found no tests, and the same failure handed back).
     let mut checked_nothing = false;
     let mut told_checked_nothing = false;
+    // A project file changed after the last passing test run: a "done" then rests on code no test
+    // ran, and is answered once with the run that checks it (seen: a fix edited after the green run
+    // and handed back failing).
+    let mut ran_tests = false;
+    let mut edited_after_pass = false;
+    let mut told_edited_after_pass = false;
+    // The last test command that passed after the last change, and how many tests it ran: at
+    // "done" the host runs it once on the code as it was before the turn; tests that pass there too
+    // do not check the change (seen: tests that passed on wrong code, the fix taken as done).
+    let mut last_pass: Option<(String, u64)> = None;
+    let mut baseline_checked = false;
     let (stage, live) = match &spec.kind {
         // With a spec, the closing summary states coverage per open requirement (the self-review).
         // No per-requirement review in the closing summary (it made the model narrate instead of
@@ -799,6 +852,26 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 told_checked_nothing = true;
                 journal.note(&env.run_id, "no_tests", &env.data.text("done_without_tests", &[]), true).await?;
                 continue;
+            }
+            if ran_tests && edited_after_pass && !told_edited_after_pass {
+                told_edited_after_pass = true;
+                journal.note(&env.run_id, "unchecked_edit", &env.data.text("done_after_edit", &[]), true).await?;
+                continue;
+            }
+            if let Some((command, ran)) = last_pass.clone().filter(|_| !baseline_checked && !edited_after_pass) {
+                baseline_checked = true;
+                env.set_stage("verify");
+                let params = json!({"session_id": env.session_id, "workspace": env.scope.workspace, "command": command});
+                let result = env.host.call_with(tools_methods::TESTS_BASELINE, params, crate::host::Effect::Effect, Some(&any)).await;
+                env.set_stage("act");
+                match result {
+                    Err(error) if error.code == codes::CANCELLED => continue,
+                    Ok(result) if baseline_passed(&result, ran) => {
+                        journal.note(&env.run_id, "baseline", &env.data.text("done_tests_pass_before", &[("command", &command)]), true).await?;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
@@ -993,6 +1066,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     // compile error: its note speaks of the test, not of a declaration.
                     let test_run = data.get("display").and_then(|display| display.get("tests")).is_some_and(|tests| !tests.is_null());
                     journal.append(kinds::TOOL_RESULT, data).await?;
+                    // A failure something was learned from before: what worked then, right under it,
+                    // where the next step is decided.
+                    let refusal = outcome.error_kind.as_deref().filter(|kind| !outcome.ok && !kind.is_empty() && *kind != "nonzero_exit");
+                    let failure = match (run_failed, refusal) {
+                        (_, Some(kind)) => crate::learn::failure_key(&outcome.tool, kind, ""),
+                        (Some(true), None) => crate::learn::failure_key("run", "", &outcome.output),
+                        _ => None,
+                    };
+                    if let Some(key) = failure {
+                        failure_note(env, journal, &key, &mut failure_shown).await?;
+                    }
                     if run_failed != Some(true) {
                         worked_since_run = true;
                     }
@@ -1049,6 +1133,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             *edited = true;
                         }
                     }
+                    // The model's own change of a project file (a one-off try in `tmp/` is none).
+                    if outcome.tool == "edit" && outcome.changed_files.iter().any(|path| !path.starts_with("tmp/") && !path.contains("/tmp/")) {
+                        edited_after_pass = true;
+                        baseline_checked = false;
+                    }
                     // A refused or unrun command (`run_failed == None`) is not a run: it counts for
                     // nothing here. A recognised test run (`display.tests`, see the tools plugin's
                     // test view) is what the counters watch: a green one resets them, a failing one
@@ -1065,6 +1154,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             checked_nothing = true;
                         } else if tests.is_some() {
                             checked_nothing = false;
+                            ran_tests = true;
+                            if run_failed == Some(false) {
+                                edited_after_pass = false;
+                                let ran = tests.and_then(|tests| tests.get("ran")).and_then(Value::as_u64).unwrap_or(0);
+                                last_pass = Some((command.to_owned(), ran));
+                            }
                         }
                         if tests.is_some() && run_failed == Some(false) {
                             stalled = 0;
@@ -1159,4 +1254,16 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             return Ok(outcome("stuck", summary, turns, tool_calls, &changed, None));
         }
     }
+}
+
+/// Whether the baseline run (the last passing test command on the code before the turn) passed as
+/// well: it ran at least as many tests as the passing run (a test inside a code file put back is
+/// gone there, so fewer tests decide nothing), none failed, and it finished in time.
+fn baseline_passed(result: &Value, ran: u64) -> bool {
+    let number = |field: &str| result.get(field).and_then(Value::as_u64);
+    result.get("checked").and_then(Value::as_bool) == Some(true)
+        && result.get("timed_out").and_then(Value::as_bool) != Some(true)
+        && ran > 0
+        && number("ran").is_some_and(|before| before >= ran)
+        && number("failed") == Some(0)
 }
