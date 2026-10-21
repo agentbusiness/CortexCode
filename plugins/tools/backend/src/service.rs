@@ -40,6 +40,7 @@ pub const PROVIDES: &[&str] = &[
     methods::APPROVE,
     methods::SKILLS_SHOWN,
     methods::CLEANUP,
+    methods::TESTS_REPORT,
 ];
 
 pub struct ToolsPlugin {
@@ -388,6 +389,11 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 .await
                 .map_err(|error| RpcError::internal(error.to_string()))?;
             Ok(json!({ "removed": removed }))
+        }
+        methods::TESTS_REPORT => {
+            let text = params.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let (report, notes) = tokio::task::spawn_blocking(move || crate::exec::tests_report(&text)).await.map_err(|error| RpcError::internal(error.to_string()))?;
+            Ok(json!({ "report": report, "notes": notes }))
         }
         other => Err(RpcError::unknown_method(other)),
     }

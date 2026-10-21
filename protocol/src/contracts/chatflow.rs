@@ -153,6 +153,15 @@ pub struct Attachment {
     pub lines: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Set by the chat flow when it journals a text attachment (ignored on input): when the text is
+    /// a test run's output too long to show whole, its compact report (the counts and one line per
+    /// failing test), shown to the model in place of the head/tail preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_report: Option<String>,
+    /// Set by the chat flow (ignored on input): for test output shown whole, what a failure in it
+    /// means where the runner's words hide it, and tests the runner could not reach; shown after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_notes: Option<String>,
 }
 
 /// `chatflow.attachment.put`: exactly one of `path` (a local file or folder the user picked or

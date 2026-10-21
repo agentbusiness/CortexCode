@@ -342,6 +342,8 @@ pub struct SyntaxIssue {
     /// 1-based line.
     pub line: usize,
     pub column: usize,
+    /// 1-based last line of the region the parser could not read (`line` for a named spot).
+    pub end_line: usize,
     /// `error` (unparseable text) or `missing` (the parser inserted an expected token).
     pub kind: &'static str,
     pub detail: String,
@@ -358,6 +360,7 @@ pub fn syntax_issues(lang: Lang, text: &str) -> Option<Vec<SyntaxIssue>> {
             issues.push(SyntaxIssue {
                 line: node.start_position().row + 1,
                 column: node.start_position().column + 1,
+                end_line: node.start_position().row + 1,
                 kind: "missing",
                 detail: format!("missing `{}`", node.kind()),
             });
@@ -368,11 +371,17 @@ pub fn syntax_issues(lang: Lang, text: &str) -> Option<Vec<SyntaxIssue>> {
             // only knows the region it could not read.
             let (start, end) = (node.start_position(), node.end_position());
             let issue = match bracket_fault(lang, text, (start.row + 1, start.column + 1), (end.row + 1, end.column + 1)) {
-                Some(fault) => SyntaxIssue { line: fault.line, column: fault.column, kind: "error", detail: fault.detail },
+                Some(fault) => SyntaxIssue { line: fault.line, column: fault.column, end_line: fault.line, kind: "error", detail: fault.detail },
                 None => {
                     let snippet: String = node.utf8_text(source).unwrap_or("").chars().take(40).collect();
                     let snippet = snippet.split('\n').next().unwrap_or("").to_owned();
-                    SyntaxIssue { line: start.row + 1, column: start.column + 1, kind: "error", detail: format!("cannot parse `{snippet}`") }
+                    SyntaxIssue {
+                        line: start.row + 1,
+                        column: start.column + 1,
+                        end_line: end.row + 1,
+                        kind: "error",
+                        detail: format!("cannot parse `{snippet}`"),
+                    }
                 }
             };
             issues.push(issue);
@@ -397,15 +406,12 @@ struct BracketFault {
     detail: String,
 }
 
-/// The first bracket fault inside the region `from`..`to` (1-based line and column) of `text`: a
-/// closing bracket that closes nothing, or one that closes another kind of bracket. The whole text
-/// up to the region's end is scanned, so brackets opened on earlier lines count. Strings and
-/// comments are skipped. Mechanical: brackets only, no grammar; None when it finds no fault there.
-fn bracket_fault(lang: Lang, text: &str, from: (usize, usize), to: (usize, usize)) -> Option<BracketFault> {
+/// Each bracket of `text` outside strings and comments, in order, with its 1-based line and column,
+/// up to the position `to`; `visit` returns true to stop. Mechanical: brackets only, no grammar.
+fn scan_brackets(lang: Lang, text: &str, to: (usize, usize), mut visit: impl FnMut(char, usize, usize) -> bool) {
     let hash_comments = matches!(lang, Lang::Python | Lang::Bash | Lang::Ruby | Lang::Toml | Lang::Yaml);
     let slash_comments = matches!(lang, Lang::Rust | Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Go | Lang::Java | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Css);
     let chars: Vec<char> = text.chars().collect();
-    let mut stack: Vec<(char, usize, usize)> = Vec::new();
     let (mut line, mut column) = (1usize, 1usize);
     let mut index = 0;
     // Advance over `count` characters, keeping the position.
@@ -458,35 +464,74 @@ fn bracket_fault(lang: Lang, text: &str, from: (usize, usize), to: (usize, usize
             }
             continue;
         }
-        let inside = (line, column) >= from;
-        match c {
-            '(' | '[' | '{' => stack.push((c, line, column)),
-            ')' | ']' | '}' => {
-                let opener = match c {
-                    ')' => '(',
-                    ']' => '[',
-                    _ => '{',
-                };
-                match stack.pop() {
-                    Some((open, ..)) if open == opener => {}
-                    Some((open, open_line, open_column)) if inside => {
-                        let at = if open_line == line { format!("column {open_column}") } else { format!("line {open_line}, column {open_column}") };
-                        let detail = format!("`{c}` at column {column} closes the `{open}` opened at {at}: one `{c}` too many, or a closing bracket missing before it");
-                        return Some(BracketFault { line, column, detail });
-                    }
-                    None if inside => {
-                        return Some(BracketFault { line, column, detail: format!("`{c}` at column {column} closes nothing: one `{c}` too many") });
-                    }
-                    // A fault before the region is not this error: take the closer as the stray one.
-                    Some(open) => stack.push(open),
-                    None => {}
-                }
-            }
-            _ => {}
+        if matches!(c, '(' | '[' | '{' | ')' | ']' | '}') && visit(c, line, column) {
+            return;
         }
         step(&mut index, &mut line, &mut column, 1);
     }
-    None
+}
+
+/// The opening bracket a closing bracket closes.
+fn opener_of(closer: char) -> char {
+    match closer {
+        ')' => '(',
+        ']' => '[',
+        _ => '{',
+    }
+}
+
+/// The first bracket fault inside the region `from`..`to` (1-based line and column) of `text`: a
+/// closing bracket that closes nothing, or one that closes another kind of bracket. The whole text
+/// up to the region's end is scanned, so brackets opened on earlier lines count. Strings and
+/// comments are skipped. Mechanical: brackets only, no grammar; None when it finds no fault there.
+fn bracket_fault(lang: Lang, text: &str, from: (usize, usize), to: (usize, usize)) -> Option<BracketFault> {
+    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+    let mut fault = None;
+    scan_brackets(lang, text, to, |c, line, column| {
+        let inside = (line, column) >= from;
+        match c {
+            '(' | '[' | '{' => stack.push((c, line, column)),
+            _ => match stack.pop() {
+                Some((open, ..)) if open == opener_of(c) => {}
+                Some((open, open_line, open_column)) if inside => {
+                    let at = if open_line == line { format!("column {open_column}") } else { format!("line {open_line}, column {open_column}") };
+                    let detail = format!("`{c}` at column {column} closes the `{open}` opened at {at}: one `{c}` too many, or a closing bracket missing before it");
+                    fault = Some(BracketFault { line, column, detail });
+                    return true;
+                }
+                None if inside => {
+                    fault = Some(BracketFault { line, column, detail: format!("`{c}` at column {column} closes nothing: one `{c}` too many") });
+                    return true;
+                }
+                // A fault before the region is not this error: take the closer as the stray one.
+                Some(open) => stack.push(open),
+                None => {}
+            },
+        }
+        false
+    });
+    fault
+}
+
+/// The line (1-based) of the bracket that the first closing bracket on line `line` of `text` closes,
+/// when that line has one and it closes a bracket of its kind.
+pub fn opening_line(lang: Lang, text: &str, line: usize) -> Option<usize> {
+    let mut stack: Vec<(char, usize)> = Vec::new();
+    let mut found = None;
+    scan_brackets(lang, text, (line, usize::MAX), |c, at, _| {
+        match c {
+            '(' | '[' | '{' => stack.push((c, at)),
+            _ => {
+                let open = stack.pop();
+                if at == line {
+                    found = open.filter(|(open, _)| *open == opener_of(c)).map(|(_, open_line)| open_line);
+                    return true;
+                }
+            }
+        }
+        false
+    });
+    found
 }
 
 /// Syntax issues present after an edit that were not present before, matched by
@@ -503,14 +548,29 @@ pub fn introduced_issues(lang: Lang, before: &str, after: &str) -> Option<Vec<Sy
     for issue in &old {
         *budget.entry(key(issue, &old_lines)).or_default() += 1;
     }
+    // A construct the grammar cannot read that the file already uses is the project's, not the
+    // edit's: a macro call that opens a block (`TEST_CASE("x") {`, `TEST(Suite, Name) {`) is a parse
+    // error on every such line (seen: each new Catch2 test case refused as "missing `;`" while the
+    // file held seven of them).
+    let shapes: std::collections::HashSet<(&'static str, String, String)> =
+        old.iter().filter_map(|issue| block_call(old_lines.get(issue.line - 1).copied().unwrap_or("")).map(|shape| (issue.kind, issue.detail.clone(), shape))).collect();
     let mut introduced = Vec::new();
     for issue in new {
         let entry = budget.entry(key(&issue, &new_lines)).or_default();
         if *entry > 0 {
             *entry -= 1;
+        } else if block_call(new_lines.get(issue.line - 1).copied().unwrap_or("")).is_some_and(|shape| shapes.contains(&(issue.kind, issue.detail.clone(), shape))) {
+            continue;
         } else {
             introduced.push(issue);
         }
     }
     Some(introduced)
+}
+
+/// The name of a call that opens a block on its line (`NAME(...) {`), the shape of a macro the
+/// grammar cannot read; None for any other line.
+fn block_call(line: &str) -> Option<String> {
+    static CALL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\(.*\)\s*\{\s*$").expect("valid"));
+    CALL.captures(line).map(|found| found[1].to_owned())
 }

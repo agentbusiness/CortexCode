@@ -459,6 +459,103 @@ struct Commit {
 
 /// Syntax errors introduced by the change (tree-sitter, structural): None when no grammar covers
 /// the file; with their record for the display.
+/// Syntax errors named where the edit is (seen: "line 1: cannot parse `// this module...`" and
+/// "line 341: missing `}`" for a brace the edit left out near line 109): a region the parser could
+/// not read that holds the edit, or a missing token past every changed line, is named at the edit's
+/// last line. Errors at the edit, and named spots (a bracket that closes nothing), stay as they are.
+/// `regions` are the edit's lines in the new file (1-based, first..=last); for an edit that only
+/// takes lines out, `removed` is true and each region is the line the removed ones stood before.
+fn at_the_edit(issues: Vec<lang::SyntaxIssue>, regions: &[(usize, usize)], removed: bool) -> Vec<lang::SyntaxIssue> {
+    if regions.is_empty() {
+        return issues;
+    }
+    let edit = |first: usize, last: usize| if removed { format!("the lines your edit took out, before line {first}") } else { format!("your edit (lines {first}-{last})") };
+    let near = |line: usize| regions.iter().any(|&(first, last)| line + SYNTAX_CONTEXT >= first && line <= last + SYNTAX_CONTEXT);
+    issues
+        .into_iter()
+        .map(|issue| {
+            if near(issue.line) {
+                return issue;
+            }
+            let moved = match issue.kind {
+                "missing" => regions.iter().rev().find(|&&(_, last)| last < issue.line).map(|&(_, last)| {
+                    (last, format!("{} (the parser only notices it at line {}): a block your edit opens is not closed, or the edit took out a closing line", issue.detail, issue.line))
+                }),
+                _ if issue.detail.starts_with("cannot parse") => regions.iter().find(|&&(first, last)| first >= issue.line && last <= issue.end_line).map(|&(first, last)| {
+                    (last, format!("the code from line {} to {} cannot be read, and {} is inside it: check where it opens and closes blocks", issue.line, issue.end_line, edit(first, last)))
+                }),
+                _ => None,
+            };
+            match moved {
+                Some((line, detail)) => lang::SyntaxIssue { line, column: 1, end_line: line, kind: issue.kind, detail },
+                None => issue,
+            }
+        })
+        .collect()
+}
+
+/// Where an edit is in the new file, 1-based first..=last: its changed regions, or, for an edit that
+/// only takes lines out, the line each run of removed lines stood before (`true`).
+fn edit_spots(changed: &[(usize, usize)], line_map: &[Option<usize>], new_len: usize) -> (Vec<(usize, usize)>, bool) {
+    let regions: Vec<(usize, usize)> = changed.iter().filter(|(start, end)| end > start).map(|&(start, end)| (start + 1, end)).collect();
+    if !regions.is_empty() {
+        return (regions, false);
+    }
+    let mut spots: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    while index < line_map.len() {
+        if line_map[index].is_some() {
+            index += 1;
+            continue;
+        }
+        while index < line_map.len() && line_map[index].is_none() {
+            index += 1;
+        }
+        // The first kept line after the run, in the new file; the last line when the run ends the file.
+        let before = line_map[index..].iter().flatten().next().map_or(new_len.max(1), |&new| new + 1);
+        if spots.last() != Some(&(before, before)) {
+            spots.push((before, before));
+        }
+    }
+    (spots, true)
+}
+
+/// For an edit that takes out more lone closing lines (`}`, `)`, `]`) than it writes: what each of
+/// the last of them closes, by the line that opens it in the file, so the missing closing line is
+/// looked for where it belongs (seen: a test file's last `}` deleted eight times while it closed a
+/// function that had swallowed the tests after it, its own `}` missing higher up).
+fn closing_notes(path: &Path, old: &str, line_map: &[Option<usize>], new: &str, changed: &[(usize, usize)]) -> Vec<String> {
+    let Some(lang) = Lang::detect(path, old) else { return Vec::new() };
+    let lone = |line: &str| {
+        let text = line.trim();
+        text.contains(['}', ')', ']']) && text.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
+    };
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    let removed: Vec<usize> = line_map.iter().enumerate().filter(|(index, new)| new.is_none() && old_lines.get(*index).is_some_and(|line| lone(line))).map(|(index, _)| index + 1).collect();
+    let written = changed.iter().flat_map(|&(start, end)| start..end).filter(|&index| new_lines.get(index).is_some_and(|line| lone(line))).count();
+    if removed.len() <= written {
+        return Vec::new();
+    }
+    let extra = (removed.len() - written).min(2);
+    removed[removed.len() - extra..]
+        .iter()
+        .filter_map(|&line| {
+            let open = lang::opening_line(lang, old, line)?;
+            if open + 1 >= line {
+                return None;
+            }
+            let header: String = old_lines[open - 1].trim().chars().take(80).collect();
+            let closer = old_lines[line - 1].trim();
+            Some(format!(
+                "Line {line}'s `{closer}` closes `{header}` from line {open}, so lines {}-{} are inside it. If code there should not be inside it, the closing line that is missing belongs higher up, where that code starts.",
+                open + 1,
+                line - 1
+            ))
+        })
+        .collect()
+}
+
 fn syntax_check(path: &Path, old: &str, new: &str) -> (Option<Vec<lang::SyntaxIssue>>, Value) {
     let Some(lang) = Lang::detect(path, new) else {
         return (None, Value::Null);
@@ -720,12 +817,18 @@ const WHOLE_AFTER_EDIT: usize = 300;
 /// Top-level definitions one edit may replace in an existing file.
 const MAX_DEFINITIONS_PER_EDIT: usize = 2;
 
-/// The one-line correction of a refused edit: each replace whose range ends one line before a
-/// closing line (`}`, `)`, `]`, `end`...) that its text also ends with gets `to` on that line. Only
-/// an edit that then passes every check (the definitions limit, the syntax check) is written, with
-/// a note naming the anchor used; None otherwise, and the refusal stands.
+/// The corrections of a refused edit whose range ends in the wrong place (seen: seven refusals of
+/// this kind in one run, each costing a step and often fixed the wrong way). Tried in order; the
+/// first that passes every check (the definitions limit, the syntax check) is written, with a note
+/// saying what moved; None otherwise, and the refusal stands.
+/// 1. The text already ends with the lines right after the range (a closing line, or several
+///    lines): the range grows over them. A replace without `to` is a range of one line.
+/// 2. The range's last line is a lone closing line (`}`, `end`...) the text does not end with: that
+///    line stays.
+/// 3. The text ends with a lone closing line and the line right after the range starts with the
+///    same one (`} else {`): the text's last line goes.
 #[allow(clippy::too_many_arguments)]
-fn retry_with_closing_line(
+fn retry_with_range_fix(
     core: &Core,
     host: &Arc<dyn Host>,
     session: &Session<'_>,
@@ -736,53 +839,113 @@ fn retry_with_closing_line(
     (absolute, display, old, notes): (PathBuf, String, Option<String>, Vec<String>),
 ) -> Option<Out> {
     let closing = |text: &str| !text.is_empty() && (text.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ',')) || text == "end");
-    let mut fixed: Vec<hashedit::EditOp> = ops.to_vec();
-    let mut moved: Vec<String> = Vec::new();
-    for op in fixed.iter_mut() {
-        let last = op.lines.iter().rev().map(|line| line.trim()).find(|line| !line.is_empty()).unwrap_or("");
-        if op.kind != hashedit::OpKind::Replace || !closing(last) {
-            continue;
-        }
-        let Some(hashedit::LineRef::Tagged(to)) = &op.to else { continue };
-        let next = to.line + 1;
-        if doc.lines.get(next - 1).map(|line| line.trim()) != Some(last) {
-            continue;
-        }
-        let tag = doc.tag(next - 1);
+    let line_of = |reference: &hashedit::LineRef| match reference {
+        hashedit::LineRef::Tagged(anchor) => Some(anchor.line),
+        hashedit::LineRef::Bare(line) => Some(*line),
+        hashedit::LineRef::Start => None,
+    };
+    // The file's line `line` (1-based), and its anchor.
+    let file = |line: usize| if line >= 1 { doc.lines.get(line - 1).map(String::as_str) } else { None };
+    let anchor = |line: usize| -> Option<hashedit::LineRef> {
+        file(line)?;
+        let tag = doc.tag(line - 1);
         let bytes = tag.as_bytes();
-        if bytes.len() != 2 {
+        (bytes.len() == 2).then(|| hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line, tag: [bytes[0], bytes[1]] }))
+    };
+    // Two lines are the same line when they differ only in trailing spaces, or are the same lone
+    // closing line at another indent.
+    let same = |a: &str, b: &str| a.trim_end() == b.trim_end() || (closing(a.trim()) && a.trim() == b.trim());
+    for fix in 1..=3 {
+        let mut fixed: Vec<hashedit::EditOp> = ops.to_vec();
+        let mut said: Vec<String> = Vec::new();
+        for (index, op) in fixed.iter_mut().enumerate() {
+            if op.kind != hashedit::OpKind::Replace {
+                continue;
+            }
+            let Some(start) = line_of(&op.at) else { continue };
+            let end = op.to.as_ref().and_then(line_of).unwrap_or(start);
+            let mut text: Vec<String> = op.lines.clone();
+            while text.last().is_some_and(|line| line.trim().is_empty()) {
+                text.pop();
+            }
+            let Some(last) = text.last().map(|line| line.trim().to_owned()) else { continue };
+            match fix {
+                1 => {
+                    let Some(k) = (1..text.len()).rev().find(|&k| {
+                        (1..=k).all(|i| file(end + i).is_some_and(|line| same(&text[text.len() - k + i - 1], line)))
+                    }) else {
+                        continue;
+                    };
+                    let Some(to) = anchor(end + k) else { continue };
+                    op.to = Some(to);
+                    let lines = if k == 1 { "line".to_owned() } else { format!("{k} lines") };
+                    said.push(format!("edit #{}: `to` is now line {}, because your text already ended with the {lines} after the range", index + 1, end + k));
+                }
+                2 => {
+                    let Some(closer) = file(end) else { continue };
+                    if end <= start || !closing(closer.trim()) || text.last().is_some_and(|line| line.trim_end() == closer.trim_end()) {
+                        continue;
+                    }
+                    let Some(to) = anchor(end - 1) else { continue };
+                    op.to = Some(to);
+                    said.push(format!(
+                        "edit #{}: line {end} (`{}`) stays, because it closes the code around your range and your text does not end with it",
+                        index + 1,
+                        closer.trim()
+                    ));
+                }
+                _ => {
+                    let Some(after) = file(end + 1).map(str::trim) else { continue };
+                    if !closing(&last) || after.len() <= last.len() || !after.starts_with(last.as_str()) {
+                        continue;
+                    }
+                    let kept = text.len() - 1;
+                    op.lines.truncate(kept);
+                    said.push(format!(
+                        "edit #{}: its last line `{last}` is left out, because line {} right after the range (`{after}`) already closes that block",
+                        index + 1,
+                        end + 1
+                    ));
+                }
+            }
+        }
+        if said.is_empty() {
             continue;
         }
-        op.to = Some(hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line: next, tag: [bytes[0], bytes[1]] }));
-        moved.push(format!("`{next}:{tag}`"));
+        let Ok(applied) = hashedit::apply(doc, view, &fixed) else { continue };
+        let written: Vec<(usize, usize)> = fixed
+            .iter()
+            .filter(|op| op.lines.len() > 2)
+            .filter_map(|op| {
+                let at = line_of(&op.at)?;
+                Some((at, op.to.as_ref().and_then(line_of).unwrap_or(at)))
+            })
+            .collect();
+        let text = old.clone().unwrap_or_default();
+        if !in_scratch
+            && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
+            && replaced.len() > MAX_DEFINITIONS_PER_EDIT
+        {
+            continue;
+        }
+        let new = applied.doc.to_text();
+        let commit_this = Commit {
+            absolute: absolute.clone(),
+            display: display.clone(),
+            old: old.clone(),
+            new,
+            line_map: Some(applied.line_map),
+            changed: applied.changed,
+            notes: notes.clone(),
+        };
+        let mut out = commit(core, host, session, commit_this);
+        if !out.ok {
+            continue;
+        }
+        out.output.insert_str(0, &format!("Applied with the range corrected: {}.\n", said.join("; ")));
+        return Some(out);
     }
-    if moved.is_empty() {
-        return None;
-    }
-    let applied = hashedit::apply(doc, view, &fixed).ok()?;
-    let written: Vec<(usize, usize)> = fixed
-        .iter()
-        .filter(|op| op.lines.len() > 2)
-        .filter_map(|op| match (&op.at, &op.to) {
-            (hashedit::LineRef::Tagged(at), Some(hashedit::LineRef::Tagged(to))) => Some((at.line, to.line)),
-            (hashedit::LineRef::Tagged(at), _) => Some((at.line, at.line)),
-            _ => None,
-        })
-        .collect();
-    let text = old.clone().unwrap_or_default();
-    if !in_scratch
-        && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
-        && replaced.len() > MAX_DEFINITIONS_PER_EDIT
-    {
-        return None;
-    }
-    let new = applied.doc.to_text();
-    let mut out = commit(core, host, session, Commit { absolute, display, old, new, line_map: Some(applied.line_map), changed: applied.changed, notes });
-    if !out.ok {
-        return None;
-    }
-    out.output.insert_str(0, &format!("Applied with `to` as {}: the range ended one line before the closing line its text ends with.\n", moved.join(", ")));
-    Some(out)
+    None
 }
 
 /// Lines of a definition's body that hold code: after its header, neither blank nor only closing
@@ -883,14 +1046,23 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     // An edit of an existing file that adds syntax errors is not written (SWE-agent's guard: a broken
     // edit cascades, the next edits pile onto it). The model gets the errors and what it proposed;
     // the file and its anchors stay as they were.
-    if let (Some(_), Some(_)) = (&old, &line_map) {
+    if let (Some(_), Some(map)) = (&old, &line_map) {
         let (introduced, _) = syntax_check(&absolute, &old_text, &new);
         if let Some(issues) = introduced.filter(|issues| !issues.is_empty()) {
             let proposed = Doc::parse(&new);
-            let (shown, _) = widen_to_definitions(&absolute, &new, &changed);
+            let (spots, removed) = edit_spots(&changed, map, proposed.len());
+            let issues = at_the_edit(issues, &spots, removed);
+            let (mut shown, _) = widen_to_definitions(&absolute, &new, &changed);
+            // An edit that only took lines out: the place they were, in view.
+            if removed {
+                shown.extend(spots.iter().map(|&(line, _)| (line.saturating_sub(1), line)));
+            }
             let mut text = format!("Nothing was written: this edit would add a syntax error to {display}.\n");
             for issue in issues.iter().take(5) {
                 let _ = writeln!(text, "- line {}: {}", issue.line, issue.detail);
+            }
+            for note in closing_notes(&absolute, &old_text, map, &new, &changed) {
+                let _ = writeln!(text, "{note}");
             }
             text.push_str("What the edit would make it (not in the file):\n");
             // The changed region, and every error line with the lines around it: an error just past
@@ -1172,10 +1344,25 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
     }
 
     if let Some(edits) = args.get("edits").and_then(Value::as_array) {
-        let (ops, mut notes) = match parse_ops(edits) {
+        let (mut ops, mut notes) = match parse_ops(edits) {
             Ok(parsed) => parsed,
             Err(message) => return Out::fail("bad_edit", message),
         };
+        // A delete whose `to` is the line right before its `at` names one line (seen: `at` 10 with
+        // `to` 9, refused and sent again as `at` 10 alone): that line is deleted, said in the result.
+        let mut reversed: Vec<String> = Vec::new();
+        for op in ops.iter_mut() {
+            let lines = match (&op.at, &op.to) {
+                (hashedit::LineRef::Tagged(at), Some(hashedit::LineRef::Tagged(to))) if op.kind == hashedit::OpKind::Delete && to.line + 1 == at.line => {
+                    Some((at.line, to.line))
+                }
+                _ => None,
+            };
+            if let Some((at, to)) = lines {
+                op.to = None;
+                reversed.push(format!("Deleted line {at} only: `to` (line {to}) was before `at`."));
+            }
+        }
         let text = match &current {
             Some(text) => text.clone(),
             None => {
@@ -1238,15 +1425,19 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                     session,
                     Commit { absolute, display, old, new, line_map: Some(applied.line_map), changed: applied.changed, notes },
                 );
-                // A range that ends one line before the closing line its text also ends with: the
-                // edit is written with `to` on that closing line when that is what makes it parse,
+                // A range that ends in the wrong place (short of lines its text already holds, past
+                // a closing line its text leaves out, or on a block the next line closes anyway):
+                // the edit is written with the range corrected when that is what makes it parse,
                 // said in a note (seen: the exact anchor named three times and the same range sent
                 // again each time). Any other refusal stays as it is.
                 if !out.ok
                     && out.error_kind.as_deref() == Some("syntax_error")
-                    && let Some(fixed) = retry_with_closing_line(core, host, session, &doc, view.as_ref(), &ops, in_scratch, retry)
+                    && let Some(fixed) = retry_with_range_fix(core, host, session, &doc, view.as_ref(), &ops, in_scratch, retry)
                 {
                     return fixed;
+                }
+                if out.ok && !reversed.is_empty() {
+                    out.output.insert_str(0, &format!("{}\n", reversed.join("\n")));
                 }
                 // Operations whose anchors no longer named their line: the rest was written.
                 if !applied.skipped.is_empty() {
@@ -1561,13 +1752,22 @@ const TEST_VIEW_BYTES: u64 = 1 << 20;
 /// for the rest. Any other output is `text` as given.
 fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
     let Some(whole) = whole else { return (text, artifact) };
+    // Tests the runner could not reach: said last, passing run or not, since a run without them
+    // reads as green (seen: the tests of the case being fixed never ran, and the fix was taken as done).
+    let unreachable = never_run_line(&whole);
     // A runner that found nothing to run: what that means, and the step after it (seen: `npm test`
     // run twice, then a search of the whole disk for the tests).
     if crate::testout::found_none(&whole) {
         let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-        return (format!("{text}{gap}[No tests ran: this command found none in the project. Add tests to the project, or check the change with a probe in `tmp/`.]\n"), artifact);
+        return (format!("{text}{gap}[No tests ran: this command found none in the project. Add tests to the project, or check the change with a probe in `tmp/`.]\n{unreachable}"), artifact);
     }
-    let Some(summary) = crate::testout::present(&whole) else { return (text, artifact) };
+    let Some(summary) = crate::testout::present(&whole) else {
+        if unreachable.is_empty() {
+            return (text, artifact);
+        }
+        let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+        return (format!("{text}{gap}{unreachable}"), artifact);
+    };
     let id = match artifact {
         Some(id) => id,
         None => match core.artifacts.store(whole.as_bytes()) {
@@ -1575,7 +1775,43 @@ fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<
             Err(_) => return (text, None),
         },
     };
-    (format!("{summary}\nEvery failure whole: read artifact://{id}\n"), Some(id))
+    (format!("{summary}\nEvery failure whole: read artifact://{id}\n{unreachable}"), Some(id))
+}
+
+/// A test run's output in its compact form (see [`crate::testout`]) for text that did not come from a
+/// command of this session (`tools.tests.report`: output the user pasted or attached): the report and
+/// the line naming tests that never ran (None when the text is not a runner's report with either),
+/// and the notes alone, for output shown whole (what a failure means, tests that never ran).
+pub fn tests_report(text: &str) -> (Option<String>, Option<String>) {
+    let summary = crate::testout::present(text);
+    let unreachable = never_run_line(text);
+    let mut notes: String = crate::testout::notes(text).iter().map(|note| format!("{note}\n")).collect();
+    notes.push_str(&unreachable);
+    let notes = (!notes.is_empty()).then_some(notes);
+    let report = match (summary, unreachable.is_empty()) {
+        (None, true) => None,
+        (None, false) => Some(unreachable),
+        (Some(summary), _) => Some(format!("{summary}{unreachable}")),
+    };
+    (report, notes)
+}
+
+/// The line that names tests the runner found but could not run (see [`crate::testout::never_run`]),
+/// ending with the step that makes them run; empty when there are none.
+fn never_run_line(output: &str) -> String {
+    let spots = crate::testout::never_run(output);
+    if spots.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = spots.iter().map(|spot| format!("`{spot}`")).collect();
+    let (count, verb) = if spots.len() == 1 { ("1 test".to_owned(), "is") } else { (format!("{} tests", spots.len()), "are") };
+    format!(
+        "[{count} never ran: {} {verb} inside another function, where the test runner cannot reach {}. A `}}` is missing above {}: close the function before {}.]\n",
+        named.join(", "),
+        if spots.len() == 1 { "it" } else { "them" },
+        if spots.len() == 1 { "it" } else { "each" },
+        if spots.len() == 1 { "it" } else { "each" },
+    )
 }
 
 /// The paths named on the lines of captured output that report a refused write
@@ -1939,6 +2175,8 @@ async fn run_in_container(
     let captured = Captured::Mem(output);
     let whole = captured.whole(TEST_VIEW_BYTES);
     let tests = whole.as_deref().and_then(crate::testout::summary);
+    // A test command that found no tests: the host's done check reads it (a check that ran nothing).
+    let no_tests = whole.as_deref().is_some_and(crate::testout::found_none);
     let (text, artifact, bytes) = present_output(core, captured, core.config.run_limits);
     let (mut text, artifact) = test_view(core, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
@@ -1959,7 +2197,7 @@ async fn run_in_container(
         }
     };
     let mut out = Out { ok, output: text, artifact: artifact.clone(), error_kind: kind.map(str::to_owned), code_hits, ..Out::default() };
-    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "artifact": artifact, "bytes": bytes, "tests": tests, "container": container.id });
+    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "artifact": artifact, "bytes": bytes, "tests": tests, "no_tests": no_tests, "container": container.id });
     out
 }
 
@@ -2183,6 +2421,8 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     };
     let whole = run.output.whole(TEST_VIEW_BYTES).map(|whole| util::relative_paths(&whole, &session.workspace));
     let tests = whole.as_deref().and_then(crate::testout::summary);
+    // A test command that found no tests: the host's done check reads it (a check that ran nothing).
+    let no_tests = whole.as_deref().is_some_and(crate::testout::found_none);
     let (text, artifact, bytes) = present_output(core, run.output, core.config.run_limits);
     let text = util::relative_paths(&text, &session.workspace);
     let (mut text, artifact) = test_view(core, whole, text, artifact);
@@ -2224,6 +2464,15 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         match run.exit_code {
             Some(code) => {
                 let _ = writeln!(text, "{}", exit_line(code, run.duration_ms));
+                // A pipe ends with its last command's status: a failure before a `| tail` is said
+                // (seen: `cargo test ... | tail -4` ended `[exit 0]` while the tests crashed).
+                // 141 is a command that stopped because `head` stopped reading: not a failure.
+                if code == 0
+                    && let Some((stage, failed)) = run.pipe_status.iter().enumerate().find(|&(_, &status)| status != 0 && status != 141)
+                {
+                    let which = if stage == 0 { "the command before the first `|`".to_owned() } else { format!("command {} of the pipe", stage + 1) };
+                    let _ = writeln!(text, "[{which} exited {failed}: the exit 0 above is only the pipe's last command]");
+                }
                 (code == 0, (code != 0).then_some("nonzero_exit"))
             }
             None => {
@@ -2241,6 +2490,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         "artifact": artifact,
         "bytes": bytes,
         "tests": tests,
+        "no_tests": no_tests,
         "sandbox": {
             "venv": venv_path,
             "venv_kind": runtime.venv.as_ref().map(|venv| if matches!(venv, PyEnv::Project(_)) { "project" } else { "auto" }),

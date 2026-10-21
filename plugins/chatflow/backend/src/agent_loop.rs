@@ -655,6 +655,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         .filter(|entry| matches!(entry.kind.as_str(), kinds::NOTE | kinds::TOOL_CALL))
         .last()
         .is_some_and(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "verify");
+    // The last test command found no tests (`display.no_tests`): a "done" after it is checked by
+    // nothing, and is answered once with the step that makes it a check (seen: a fix "verified" by
+    // a jest run that found no tests, and the same failure handed back).
+    let mut checked_nothing = false;
+    let mut told_checked_nothing = false;
     let (stage, live) = match &spec.kind {
         // With a spec, the closing summary states coverage per open requirement (the self-review).
         // No per-requirement review in the closing summary (it made the model narrate instead of
@@ -790,6 +795,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 continue;
             }
             let summary = result.content.trim().to_owned();
+            if checked_nothing && !told_checked_nothing {
+                told_checked_nothing = true;
+                journal.note(&env.run_id, "no_tests", &env.data.text("done_without_tests", &[]), true).await?;
+                continue;
+            }
             let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
             };
@@ -1051,6 +1061,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     {
                         let tests = outcome.display.get("tests").filter(|tests| tests.is_object());
                         let failed_tests = tests.and_then(|tests| tests.get("failed")).and_then(Value::as_u64);
+                        if outcome.display.get("no_tests").and_then(Value::as_bool) == Some(true) {
+                            checked_nothing = true;
+                        } else if tests.is_some() {
+                            checked_nothing = false;
+                        }
                         if tests.is_some() && run_failed == Some(false) {
                             stalled = 0;
                             refailed.clear();
