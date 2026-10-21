@@ -448,6 +448,8 @@ pub fn check(ds: &Dataset, attachments: Vec<Attachment>) -> Result<Vec<Attachmen
         attachment.described_by = None;
         attachment.lines = None;
         attachment.preview = None;
+        attachment.test_report = None;
+        attachment.test_notes = None;
         attachment.thumb = check_thumb(attachment.thumb.take())?;
         let path = PathBuf::from(&attachment.path);
         if !path.is_absolute() {
@@ -504,7 +506,36 @@ pub async fn prepare(host: &Host, ds: &Dataset, attachments: Vec<Attachment>) ->
             attachment.described_by = Some(by);
         }
     }
+    for attachment in checked.iter_mut().filter(|attachment| is_text(attachment)) {
+        let (report, notes) = test_report(host, attachment).await;
+        if attachment.pasted_text && attachment.bytes as usize <= WHOLE_CHARS {
+            // Shown whole: only what a failure in it means, after it.
+            attachment.test_notes = notes;
+        } else {
+            attachment.test_report = report;
+        }
+    }
     Ok(checked)
+}
+
+/// Pasted text, or an attached text file, within the attachment size limit. Test output among these
+/// is shown as its report when it is not shown whole (seen: an 82 KB test log whose head and tail
+/// held none of its seventeen failures), and with notes on what a failure means when it is (seen: a
+/// 2 KB output whose one failure read only "Maximum call stack size exceeded").
+fn is_text(attachment: &Attachment) -> bool {
+    let text_file = attachment.mime.starts_with("text/") || [".log", ".txt", ".out"].iter().any(|suffix| attachment.name.to_ascii_lowercase().ends_with(suffix));
+    attachment.kind == attachment_kinds::FILE && attachment.bytes <= limits::MAX_ATTACHMENT_BYTES && (attachment.pasted_text || text_file)
+}
+
+/// The compact report and the notes of a text attachment that is a test run's output, from the tools
+/// plugin (which reads every runner's format); None for any other text, or when the tools plugin
+/// cannot answer.
+async fn test_report(host: &Host, attachment: &Attachment) -> (Option<String>, Option<String>) {
+    let Ok(bytes) = std::fs::read(&attachment.path) else { return (None, None) };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let Ok(answer) = host.call(cc_protocol::contracts::tools::methods::TESTS_REPORT, json!({ "text": text })).await else { return (None, None) };
+    let field = |name: &str| answer.get(name).and_then(Value::as_str).map(str::to_owned).filter(|text| !text.trim().is_empty());
+    (field("report"), field("notes"))
 }
 
 /// The attachments of a journal entry (`data.attachments`), as journaled.
@@ -564,11 +595,19 @@ pub fn render(ds: &Dataset, attachments: &[Attachment], image_input: bool) -> St
                     };
                     ds.text("attachment_image", &[("name", &attachment.name), ("path", &attachment.path), ("size", &size), ("dims", &dims), ("seen", &seen)])
                 }
+                _ if attachment.test_report.is_some() => {
+                    let report = attachment.test_report.as_deref().unwrap_or("").lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n");
+                    ds.text("attachment_test_output", &[("name", &attachment.name), ("path", &attachment.path), ("size", &size), ("report", &report)])
+                }
                 _ if attachment.pasted_text => {
                     let lines = attachment.lines.unwrap_or(0).to_string();
                     let preview = attachment.preview.as_deref().unwrap_or("").lines().map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n");
                     let key = if attachment.bytes as usize <= WHOLE_CHARS { "attachment_pasted_whole" } else { "attachment_pasted" };
-                    ds.text(key, &[("name", &attachment.name), ("path", &attachment.path), ("size", &size), ("lines", &lines), ("preview", &preview)])
+                    let shown = ds.text(key, &[("name", &attachment.name), ("path", &attachment.path), ("size", &size), ("lines", &lines), ("preview", &preview)]);
+                    match attachment.test_notes.as_deref() {
+                        Some(notes) => format!("{shown}\n{}", ds.text("attachment_test_notes", &[("notes", notes.trim_end())])),
+                        None => shown,
+                    }
                 }
                 _ => ds.text("attachment_file", &[("name", &attachment.name), ("path", &attachment.path), ("size", &size)]),
             }

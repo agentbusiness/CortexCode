@@ -198,6 +198,9 @@ pub struct RunOutput {
     pub shell_exited: bool,
     pub output: Captured,
     pub duration_ms: u64,
+    /// Each stage's exit status of the command's last pipeline (one entry when it is no pipe;
+    /// empty when the shell did not get that far).
+    pub pipe_status: Vec<i32>,
 }
 
 pub struct Shells {
@@ -379,8 +382,16 @@ impl Shells {
         let state = self.state_dir(&identity.session_id);
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let command_file = state.join(format!("cmd-{nonce}.sh"));
-        std::fs::write(&command_file, request.command)?;
         let q = |path: &Path| util::shell_quote(&path.to_string_lossy());
+        // Each stage's exit status of the command's last pipeline, kept with the status the command
+        // ends with (a `| tail` returns its own 0 and hides the failure before it).
+        let pipe_file = state.join(format!("pipe-{nonce}"));
+        let script = format!(
+            "{}\n__cx_ps=\"${{PIPESTATUS[*]}}\" __cx_pr=$?; printf '%s' \"$__cx_ps\" >{} 2>/dev/null; (exit $__cx_pr)\n",
+            request.command,
+            q(&pipe_file)
+        );
+        std::fs::write(&command_file, &script)?;
         let mut prefix = String::new();
         for (key, value) in &request.env {
             if !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -409,7 +420,7 @@ impl Shells {
             // The shell died between commands; start a fresh one and retry once.
             terminate(&mut shell).await;
             shell = self.spawn(identity)?;
-            std::fs::write(&command_file, request.command)?;
+            std::fs::write(&command_file, &script)?;
             shell.stdin.write_all(line.as_bytes()).and_then(|_| shell.stdin.flush()).map_err(|_| error)?;
         }
 
@@ -491,6 +502,10 @@ impl Shells {
             shell.last_used = Instant::now();
             *guard = Some(shell);
         }
+        let pipe_status = std::fs::read_to_string(&pipe_file)
+            .map(|text| text.split_whitespace().filter_map(|code| code.parse().ok()).collect())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&pipe_file);
         Ok(RunOutput {
             exit_code,
             timed_out,
@@ -498,6 +513,7 @@ impl Shells {
             shell_exited,
             output: capture.finish(),
             duration_ms: started.elapsed().as_millis() as u64,
+            pipe_status,
         })
     }
 

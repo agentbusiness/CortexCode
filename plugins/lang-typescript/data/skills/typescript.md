@@ -143,5 +143,6 @@ throw new RangeError("width must be positive");
 | `ERR_REQUIRE_ESM` | `await import("pkg")`, or make the file ESM |
 | `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` | run with `npx --no -- tsx` |
 | `Cannot read properties of undefined (reading 'x')`, `x is not a function` | missing `await`, a failed `find`, default vs named import, lost `this` |
+| `Maximum call stack size exceeded` at `toEqual` / `toStrictEqual` | the values differ and Jest could not print them (a getter returns a new object of its class): compare the fields one by one with `Object.is`, which also tells `-0` from `0` |
 
 Never silence a type error with `any`, `as unknown as T`, `// @ts-ignore` or a looser tsconfig.

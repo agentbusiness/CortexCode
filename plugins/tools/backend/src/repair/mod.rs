@@ -294,7 +294,18 @@ impl Args {
     fn array(&mut self, field: &str, value: Value) -> Result<Vec<Value>, RepairError> {
         match value {
             Value::Array(items) => Ok(items),
-            Value::String(text) => match json::parse_lenient(&text) {
+            // Escaped one level too deep in part (seen: `[{"op": \"replace\", ...}]`): read again
+            // with that level taken off, only when it does not parse as sent.
+            Value::String(text) => match json::parse_lenient(&text).or_else(|problem| {
+                let unescaped = unescape_once(&text);
+                if unescaped == text {
+                    return Err(problem);
+                }
+                json::parse_lenient(&unescaped).map(|(value, mut notes)| {
+                    notes.push("took off one level of escaping".to_owned());
+                    (value, notes)
+                })
+            }) {
                 Ok((Value::Array(items), notes)) => {
                     self.note(format!("parsed stringified `{field}`"));
                     for note in notes {
@@ -1733,4 +1744,22 @@ fn map_run(payload: Payload, raw_name: &str, notes: Vec<String>) -> Result<Canon
         }
     }
     args.finish(out, intent)
+}
+
+/// `\"` and `\\` read as the character they escape; every other character as it is.
+fn unescape_once(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && (next == '"' || next == '\\')
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }

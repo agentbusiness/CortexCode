@@ -2,8 +2,9 @@
 //! test with its error, and the first failure whole. A runner prints every failure as a traceback
 //! (seen: twelve tracebacks, 160 lines, four runs in a row; the model cut them with `| tail`, lost
 //! the rest and doubted the file on disk), while a line per case was what it fixed from. Recognised
-//! by the runner's own format: unittest, pytest, cargo test, go test, jest or vitest, and TAP
-//! (node:test). Any other output, and a passing run, is shown as it is.
+//! by the runner's own format: unittest, pytest, cargo test, go test, jest or vitest, TAP
+//! (node:test), and JUnit as Gradle and Maven print it. Any other output, and a passing run, is
+//! shown as it is.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -18,11 +19,13 @@ struct Failure {
     error: String,
 }
 
-/// What a runner reported: the failing tests, its own count line, and the first failure's block.
+/// What a runner reported: the failing tests, its own count line, the first failure's block, and
+/// what a failure means when the runner's own words hide it (see [`notes`]).
 struct Report {
     failures: Vec<Failure>,
     counts: String,
     first: String,
+    notes: Vec<String>,
 }
 
 /// What a recognised test run reported, passing or failing: the runner, how many tests ran, how
@@ -34,6 +37,9 @@ pub struct Tests {
     pub ran: usize,
     pub failed: usize,
     pub names: Vec<String>,
+    /// Tests the runner found but could not run, as `path:line` (see [`never_run`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub never_run: Vec<String>,
 }
 
 /// The counts of a test run from its summary line, per runner. `None` when `text` is not a test
@@ -49,6 +55,8 @@ pub fn summary(text: &str) -> Option<Tests> {
     static GO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(ok|FAIL)\s+\S+\s+(?:[\d.]+s|\(cached\))").expect("valid"));
     static GO_FAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*--- FAIL: (\S+)").expect("valid"));
     static GO_PASS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*--- PASS: ").expect("valid"));
+    // A package that passed and had tests (`[no tests to run]` marks one whose filter matched none).
+    static GO_OK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^ok\s+\S+\s+(?:[\d.]+s|\(cached\))(?:\s+coverage:[^\[\n]*)?\s*$").expect("valid"));
     static JEST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*Tests:\s+(.*)$").expect("valid"));
     static JEST_N: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) (failed|passed|total|skipped|todo)").expect("valid"));
     static TAP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^# (tests|pass|fail) (\d+)$").expect("valid"));
@@ -57,7 +65,7 @@ pub fn summary(text: &str) -> Option<Tests> {
     if let Some(found) = UNITTEST.captures(text) {
         let ran = num(&found[1]);
         let failed: usize = found.get(3).map(|counts| COUNT.captures_iter(counts.as_str()).map(|c| num(&c[2])).sum()).unwrap_or(0);
-        return Some(Tests { runner: "unittest", ran, failed, names: names(unittest(text)) });
+        return Some(Tests { runner: "unittest", ran, failed, names: names(unittest(text)), never_run: Vec::new() });
     }
     if let Some(found) = PYTEST.captures(text) {
         let mut ran = 0;
@@ -69,14 +77,16 @@ pub fn summary(text: &str) -> Option<Tests> {
                 failed += n;
             }
         }
-        return Some(Tests { runner: "pytest", ran, failed, names: names(pytest(text)) });
+        return Some(Tests { runner: "pytest", ran, failed, names: names(pytest(text)), never_run: Vec::new() });
     }
     // cargo prints one `test result:` per test target (unit tests, each tests/ file, doc-tests):
     // the run is their sum, not the first (seen: an empty unit-test target read as "0 of 0 failed"
     // while a tests/ file failed).
-    if CARGO.is_match(text) {
+    // A test program that died (a signal) reports no line at all: it counts as a failure.
+    let crashed = cargo_crashes(text).len();
+    if CARGO.is_match(text) || crashed > 0 {
         let (passed, failed) = CARGO.captures_iter(text).fold((0, 0), |(passed, failed), found| (passed + num(&found[1]), failed + num(&found[2])));
-        return Some(Tests { runner: "cargo", ran: passed + failed, failed, names: names(cargo(text)) });
+        return Some(Tests { runner: "cargo", ran: passed + failed + crashed, failed: failed + crashed, names: names(cargo(text)), never_run: never_run(text) });
     }
     if let Some(found) = JEST.captures(text) {
         let mut total = 0;
@@ -88,7 +98,7 @@ pub fn summary(text: &str) -> Option<Tests> {
                 _ => {}
             }
         }
-        return Some(Tests { runner: "jest", ran: total, failed, names: names(jest(text)) });
+        return Some(Tests { runner: "jest", ran: total, failed, names: names(jest(text)), never_run: Vec::new() });
     }
     if TAP.is_match(text) {
         let mut ran = 0;
@@ -100,14 +110,32 @@ pub fn summary(text: &str) -> Option<Tests> {
                 _ => {}
             }
         }
-        return Some(Tests { runner: "tap", ran, failed, names: names(tap(text)) });
+        return Some(Tests { runner: "tap", ran, failed, names: names(tap(text)), never_run: Vec::new() });
     }
     if GO.is_match(text) || GO_FAIL.is_match(text) {
         let failed = GO_FAIL.captures_iter(text).count();
         let passed = GO_PASS.find_iter(text).count();
-        return Some(Tests { runner: "go", ran: passed + failed, failed, names: names(gotest(text)) });
+        // Without -v a passing package prints only `ok  pkg  0.3s`: its tests ran, uncounted. Each
+        // such package counts as one (seen: a green run read as "no tests ran").
+        let quiet = if passed + failed == 0 { GO_OK.find_iter(text).count() } else { 0 };
+        return Some(Tests { runner: "go", ran: passed + failed + quiet, failed, names: names(gotest(text)), never_run: Vec::new() });
+    }
+    if let Some((ran, failed)) = junit_counts(text) {
+        return Some(Tests { runner: "junit", ran, failed, names: names(junit(text)), never_run: Vec::new() });
     }
     None
+}
+
+/// Tests the runner found but cannot run, as `path:line`: cargo's `#[test]` functions inside another
+/// function (`warning: cannot test inner items`, a `}` missing above them). A run with these passes
+/// without them (seen: two tests of the case being fixed never ran, the run read "0 of 8 failed" and
+/// the fix was taken as done).
+pub fn never_run(text: &str) -> Vec<String> {
+    static INNER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^warning: cannot test inner items\s*\n\s*--> (\S+?):(\d+):\d+").expect("valid"));
+    let mut spots: Vec<String> = INNER.captures_iter(text).map(|found| format!("{}:{}", &found[1], &found[2])).collect();
+    spots.sort();
+    spots.dedup();
+    spots
 }
 
 /// Whether a runner reported that it found no tests to run (jest, vitest, pytest, unittest,
@@ -124,7 +152,7 @@ pub fn found_none(text: &str) -> bool {
 /// The compact form of a failing test run, or `None` when `text` is not a recognised runner's
 /// report with failures.
 pub fn present(text: &str) -> Option<String> {
-    let report = unittest(text).or_else(|| pytest(text)).or_else(|| cargo(text)).or_else(|| gotest(text)).or_else(|| jest(text)).or_else(|| tap(text))?;
+    let report = unittest(text).or_else(|| pytest(text)).or_else(|| cargo(text)).or_else(|| gotest(text)).or_else(|| jest(text)).or_else(|| tap(text)).or_else(|| junit(text))?;
     if report.failures.is_empty() {
         return None;
     }
@@ -137,11 +165,25 @@ pub fn present(text: &str) -> Option<String> {
     if report.failures.len() > LISTED {
         out.push_str(&format!("and {} more\n", report.failures.len() - LISTED));
     }
-    out.push_str("\nThe first failure, whole:\n");
+    for note in &report.notes {
+        out.push_str(note);
+        out.push('\n');
+    }
     // A runner's rule line (`====`) that opens the next block is not part of this one.
-    out.push_str(report.first.trim_end().trim_end_matches(['=', '-']).trim_end());
-    out.push('\n');
+    let first = report.first.trim_end().trim_end_matches(['=', '-']).trim_end();
+    // No block to show (a crashed test program prints none): no heading over nothing.
+    if !first.trim().is_empty() {
+        out.push_str("\nThe first failure, whole:\n");
+        out.push_str(first);
+        out.push('\n');
+    }
     Some(out)
+}
+
+/// What a failure means where the runner's own words hide it, one line each, for any runner's output
+/// (also output shown whole, which gets no compact form).
+pub fn notes(text: &str) -> Vec<String> {
+    jest(text).map(|report| report.notes).unwrap_or_default()
 }
 
 /// The lines of `text` from `start` up to the first later line matching `end` (exclusive).
@@ -180,7 +222,7 @@ fn unittest(text: &str) -> Option<Report> {
         failures.push(Failure { name: found[2].to_owned(), status, error: last_error(&body[1..]) });
     }
     let result = RESULT.captures(text).map(|found| found[1].to_owned()).unwrap_or_default();
-    Some(Report { failures, counts: format!("Ran {} tests: {}", &ran[1], result), first })
+    Some(Report { failures, counts: format!("Ran {} tests: {}", &ran[1], result), first, notes: Vec::new() })
 }
 
 /// pytest: `FAILED path::name - Error` summary lines, `____ name ____` blocks with `E   ` lines,
@@ -217,7 +259,7 @@ fn pytest(text: &str) -> Option<Report> {
         }
     }
     let first = blocks.first().map(|(_, body)| body.join("\n")).unwrap_or_default();
-    Some(Report { failures, counts: summary[1].to_owned(), first })
+    Some(Report { failures, counts: summary[1].to_owned(), first, notes: Vec::new() })
 }
 
 /// cargo test: `test name ... FAILED` lines, `---- name stdout ----` blocks with the panic message,
@@ -227,7 +269,11 @@ fn cargo(text: &str) -> Option<Report> {
     static FAILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^test (\S+) \.\.\. FAILED$").expect("valid"));
     static BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^---- (\S+) stdout ----$").expect("valid"));
     static END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^---- \S+ stdout ----$|^failures:$|^test result:").expect("valid"));
-    let result = RESULT.captures(text)?;
+    let result = RESULT.captures(text);
+    let crashes = cargo_crashes(text);
+    if result.is_none() && crashes.is_empty() {
+        return None;
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -255,6 +301,8 @@ fn cargo(text: &str) -> Option<Report> {
     if failures.is_empty() {
         failures = blocks.iter().map(|(name, body)| Failure { name: name.clone(), status: "FAIL", error: message(body) }).collect();
     }
+    let crashed = crashes.len();
+    failures.extend(crashes);
     let first = blocks.first().map(|(_, body)| body.join("\n")).unwrap_or_default();
     // Every target's counts summed (cargo prints one `test result:` per target).
     static COUNTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) (passed|failed|ignored)").expect("valid"));
@@ -265,14 +313,40 @@ fn cargo(text: &str) -> Option<Report> {
             sums[index] += found[1].parse::<usize>().unwrap_or(0);
         }
     }
-    let verdict = if sums[1] > 0 { "FAILED" } else { &result[1] };
-    Some(Report { failures, counts: format!("test result: {verdict}. {} passed; {} failed; {} ignored", sums[0], sums[1], sums[2]), first })
+    let verdict = if sums[1] > 0 || crashed > 0 { "FAILED" } else { result.as_ref().map_or("ok", |found| found.get(1).map_or("ok", |m| m.as_str())) };
+    let mut counts = format!("test result: {verdict}. {} passed; {} failed; {} ignored", sums[0], sums[1], sums[2]);
+    if crashed > 0 {
+        counts.push_str(&format!("; {crashed} test program{} crashed", if crashed == 1 { "" } else { "s" }));
+    }
+    Some(Report { failures, counts, first, notes: Vec::new() })
 }
 
-/// go test: `--- FAIL: TestName (0.00s)` with its indented `file.go:12: message` lines, `--- PASS`
-/// lines with -v, and the package's `FAIL`/`ok` line.
+/// cargo's test programs that died before reporting (a signal: a trap, an abort, a segfault): no
+/// `test result:` line counts their tests (seen: a SIGTRAP read as "0 of 0 failed" because the
+/// library's empty target reported `ok`). One failure per program, named after it.
+fn cargo_crashes(text: &str) -> Vec<Failure> {
+    static DIED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"process didn't exit successfully: `([^`]+)` \(signal: \d+, (SIG\w+)").expect("valid"));
+    static HASH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-[0-9a-f]{16}$").expect("valid"));
+    DIED.captures_iter(text)
+        .map(|found| {
+            let program = found[1].split_whitespace().next().unwrap_or("");
+            let program = program.rsplit('/').next().unwrap_or(program);
+            Failure {
+                name: HASH.replace(program, "").into_owned(),
+                status: "CRASH",
+                error: format!("the test program died ({}) before it reported its tests; run it alone with `-- --test-threads=1 --nocapture` to see which test was running", &found[2]),
+            }
+        })
+        .collect()
+}
+
+/// go test: `--- FAIL: TestName (0.00s)` with its `file.go:12: message` lines, `--- PASS` lines with
+/// -v, and the package's `FAIL`/`ok` line. With -v a test's own lines come between its `=== RUN`
+/// line and its `--- FAIL` line; without it (and for subtests) they follow the FAIL line, indented
+/// (seen: with -v every failure shown without its reason, and the same tests run again).
 fn gotest(text: &str) -> Option<Report> {
     static FAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*--- FAIL: (\S+)").expect("valid"));
+    static RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*=== RUN\s+(\S+)\s*$").expect("valid"));
     static END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(---|===) |^(FAIL|ok|PASS)\b").expect("valid"));
     static MESSAGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+\S+\.go:\d+: (.*)$").expect("valid"));
     let lines: Vec<&str> = text.lines().collect();
@@ -280,19 +354,27 @@ fn gotest(text: &str) -> Option<Report> {
     let mut first = String::new();
     for (index, line) in lines.iter().enumerate() {
         let Some(found) = FAIL.captures(line) else { continue };
-        let body = block(&lines, index, &END);
+        let name = &found[1];
+        // The test's own lines before its FAIL line (-v): from its `=== RUN` line, without the
+        // runner's lines of other tests (`=== RUN`, `=== PAUSE`, `--- PASS` of subtests).
+        let run = lines[..index].iter().rposition(|line| RUN.captures(line).is_some_and(|found| &found[1] == name));
+        let before: Vec<&str> = run.map(|run| lines[run + 1..index].iter().filter(|line| !END.is_match(line)).copied().collect()).unwrap_or_default();
+        let after = block(&lines, index, &END);
+        let mut body: Vec<&str> = vec![after[0]];
+        body.extend(before);
+        body.extend(after.iter().skip(1));
         if first.is_empty() {
             first = body.join("\n");
         }
-        let error = body.iter().find_map(|line| MESSAGE.captures(line).map(|found| found[1].to_owned())).unwrap_or_else(|| last_error(&body));
-        failures.push(Failure { name: found[1].to_owned(), status: "FAIL", error });
+        let error = body.iter().find_map(|line| MESSAGE.captures(line).map(|found| found[1].to_owned())).unwrap_or_else(|| last_error(&body[1..]));
+        failures.push(Failure { name: name.to_owned(), status: "FAIL", error });
     }
     if failures.is_empty() {
         return None;
     }
     let passed = lines.iter().filter(|line| line.trim_start().starts_with("--- PASS:")).count();
     let counts = if passed > 0 { format!("{} failed, {} passed", failures.len(), passed) } else { format!("{} failed", failures.len()) };
-    Some(Report { failures, counts, first })
+    Some(Report { failures, counts, first, notes: Vec::new() })
 }
 
 /// jest or vitest: `✕ name` lines, `● Suite › name` blocks, and `Tests: 2 failed, 10 passed, 12 total`.
@@ -323,7 +405,8 @@ fn jest(text: &str) -> Option<Report> {
         }
     }
     let first = blocks.first().map(|(_, body)| body.join("\n")).unwrap_or_default();
-    Some(Report { failures, counts: format!("Tests: {}", &tests[1]), first })
+    let notes = jest_notes(&blocks);
+    Some(Report { failures, counts: format!("Tests: {}", &tests[1]), first, notes })
 }
 
 /// TAP (node:test): `not ok N - name` with its YAML diagnostics, and the `# tests`/`# pass`/
@@ -349,5 +432,106 @@ fn tap(text: &str) -> Option<Report> {
         failures.push(Failure { name: found[1].to_owned(), status: "FAIL", error });
     }
     let counts = COUNT.captures_iter(text).map(|found| format!("{} {}", &found[2], &found[1])).collect::<Vec<_>>().join(", ");
-    Some(Report { failures, counts, first })
+    Some(Report { failures, counts, first, notes: Vec::new() })
+}
+
+/// The counts of a JUnit run: Gradle's `17 tests completed, 2 failed` (or, with test events logged,
+/// its `Class > test() PASSED|FAILED|SKIPPED` lines), and Maven Surefire's closing `Tests run: 17,
+/// Failures: 1, Errors: 1, Skipped: 0` (failures and errors both count as failed).
+fn junit_counts(text: &str) -> Option<(usize, usize)> {
+    static GRADLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(\d+) tests? completed(?:, (\d+) failed)?").expect("valid"));
+    static EVENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\S.*? > .+? (PASSED|FAILED|SKIPPED)\s*$").expect("valid"));
+    static MAVEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(?:\[\w+\] )?Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: \d+\s*$").expect("valid"));
+    let num = |s: &str| s.parse::<usize>().unwrap_or(0);
+    if let Some(found) = GRADLE.captures(text) {
+        return Some((num(&found[1]), found.get(2).map_or(0, |m| num(m.as_str()))));
+    }
+    // Maven prints one line per test class (with `Time elapsed`) and the total last, without it.
+    if let Some(found) = MAVEN.captures_iter(text).last() {
+        return Some((num(&found[1]), num(&found[2]) + num(&found[3])));
+    }
+    let events: Vec<String> = EVENT.captures_iter(text).map(|found| found[1].to_owned()).collect();
+    if events.is_empty() {
+        return None;
+    }
+    let ran = events.iter().filter(|event| *event != "SKIPPED").count();
+    Some((ran, events.iter().filter(|event| *event == "FAILED").count()))
+}
+
+/// JUnit as Gradle prints it: `Class > test() FAILED`, then the exception and its message, indented,
+/// then the stack frames; and as Maven Surefire prints it: `[ERROR]   Class.test:95 message` under
+/// `[ERROR] Failures:` and `[ERROR] Errors:`. One line per failure: the message, and the first frame
+/// of the code under test when there is no message (seen: the expected texts buried in an 82 KB log
+/// of stack frames, two of them missed).
+fn junit(text: &str) -> Option<Report> {
+    static HEAD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\S.*? > .+?) FAILED\s*$").expect("valid"));
+    static FRAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at \S").expect("valid"));
+    static SECTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[ERROR\] (Failures|Errors):\s*$").expect("valid"));
+    static ITEM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[ERROR\]\s{2,}(\S+?)(?::\d+)?\s+(\S.*)$").expect("valid"));
+    let (ran, failed) = junit_counts(text)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut failures = Vec::new();
+    let mut first = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(found) = HEAD.captures(line) {
+            // The block: the indented lines after the head (blank lines inside it included).
+            let end = lines.iter().enumerate().skip(index + 1).find(|(_, line)| !line.is_empty() && !line.starts_with(char::is_whitespace)).map_or(lines.len(), |(end, _)| end);
+            let body = &lines[index + 1..end];
+            // The message: the lines before the stack frames, without the assertion library's
+            // "Throwable that failed the check:" tail.
+            let message: Vec<&str> = body
+                .iter()
+                .take_while(|line| !FRAME.is_match(line) && !line.trim_start().starts_with("Throwable that failed the check"))
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect();
+            let frame = body.iter().find(|line| FRAME.is_match(line)).map(|line| line.trim().to_owned());
+            let error = match (message.len(), &frame) {
+                (0 | 1, Some(frame)) => format!("{} ({frame})", message.join(" ")),
+                _ => message.join(" "),
+            };
+            if first.is_empty() {
+                // The head, the message and the first few frames: the rest is the test framework's.
+                let frames = body.iter().filter(|line| FRAME.is_match(line)).take(3);
+                let mut kept: Vec<&str> = vec![line];
+                kept.extend(body.iter().take_while(|line| !FRAME.is_match(line)).copied());
+                kept.extend(frames.copied());
+                first = kept.join("\n");
+            }
+            failures.push(Failure { name: found[1].to_owned(), status: "FAIL", error: error.trim().to_owned() });
+        }
+    }
+    if failures.is_empty() {
+        let mut status = None;
+        for line in &lines {
+            if let Some(found) = SECTION.captures(line) {
+                status = Some(if &found[1] == "Failures" { "FAIL" } else { "ERROR" });
+                continue;
+            }
+            match (status, ITEM.captures(line)) {
+                (Some(status), Some(found)) => failures.push(Failure { name: found[1].to_owned(), status, error: found[2].trim().to_owned() }),
+                (Some(_), None) if !line.starts_with("[ERROR]   ") => status = None,
+                _ => {}
+            }
+        }
+        if let Some(failure) = failures.first() {
+            first = format!("{} {}: {}", failure.status, failure.name, failure.error);
+        }
+    }
+    Some(Report { failures, counts: format!("{ran} tests, {failed} failed"), first, notes: Vec::new() })
+}
+
+/// Jest's own words that hide what failed: a deep equality that overflowed the stack while printing
+/// its difference (seen: `-0` against `0` in an object whose getter returns a new object of its
+/// class, reported only as "Maximum call stack size exceeded", and taken for recursion in the code).
+fn jest_notes(blocks: &[(String, Vec<&str>)]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter(|(_, body)| body.iter().any(|line| line.contains("Maximum call stack size exceeded")) && body.iter().any(|line| line.contains("toEqual") || line.contains("toStrictEqual")))
+        .map(|(name, _)| {
+            format!(
+                "{name}: the two values differ and Jest could not print them (an object whose getter returns a new object of its class makes the printing recurse). Compare the fields one by one with `Object.is`, which also tells `-0` from `0`."
+            )
+        })
+        .collect()
 }

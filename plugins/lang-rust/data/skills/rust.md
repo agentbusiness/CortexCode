@@ -43,6 +43,7 @@ cargo clippy --all-targets -- -D warnings        # lint
 ```
 
 - Cargo flags (`-p`, `--lib`, `--test`, `--features`) go before `--`; test flags (`--exact`, `--nocapture`) after.
+- An optional feature stays off by default: test it with `cargo test --features name`, never by adding it to `default` in `Cargo.toml`.
 - A filter matching nothing passes (`0 passed; 5 filtered out`). Real names: `cargo test -- --list`.
 - Prefer the crates already in `Cargo.toml` and the standard library. A new crate is a new dependency of the user's project: ask before adding it. `cargo update` only when the user asks.
 - `[workspace]`: pick a member with `-p name`.
@@ -58,6 +59,7 @@ cargo clippy --all-targets -- -D warnings        # lint
 6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
 7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
 8. A one-off try (call a function, print a value) goes in `tmp/`; git ignores `tmp/`.
+9. Code that frees memory itself (`unsafe`, `Box::from_raw`, a `Drop` impl) gets a test with an element that counts its drops, `struct Counted<'a>(&'a Cell<usize>)` whose `Drop` adds 1: after each remove, pop and drop of the whole, the count equals the elements that left, so a leak or a double free fails the test.
 
 ## 3. Code that runs
 

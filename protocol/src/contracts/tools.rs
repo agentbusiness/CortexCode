@@ -42,6 +42,12 @@ pub mod methods {
     /// nobody's work (the scratch folder `tmp/`, new untracked files commands made); returns
     /// `{removed: [path]}`.
     pub const CLEANUP: &str = "tools.cleanup";
+    /// `{text}`: when the text is a test runner's report with failures, or with tests the runner
+    /// could not reach, `{report}` holds its compact form (the counts, one line per failing test with
+    /// its error, the first failure whole), else null; `{notes}` holds only what a failure means
+    /// where the runner's words hide it and the tests it could not reach (for output shown whole),
+    /// else null.
+    pub const TESTS_REPORT: &str = "tools.tests.report";
 }
 
 /// Approval classes beyond the ask-mode action classes.
