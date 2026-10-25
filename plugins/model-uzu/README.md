@@ -6,7 +6,7 @@ speculator) embedded **in-process** as a library: `backend/vendor/uzu` holds the
 `391abc29abb26f18aa812f6f02e8b023aed11364` (release 0.6.7, see `backend/vendor/uzu/REVISION`) with the
 patches in `backend/vendor/uzu/PATCHES.md`. There is no HTTP server inside and no subprocess. Swap policy:
 drain first. The plugin is one self-contained folder (`plugin.toml`; the Rust
-workspace in `backend/`, the card and settings panels in `ui/`, verification in `verify/`); its only
+workspace in `backend/`, the card and settings panels in `ui/`); its only
 outside dependencies are `cc-protocol` (`../../../protocol` from `backend/`) and `@cortex/sdk`.
 
 ## Building
@@ -54,8 +54,7 @@ Mirai ships it only as its own prebuilt server binary.
 | `models_dir` | `$CORTEX_HOME/models` | where variants live |
 | `speculative` | `auto` | `auto` (draft with the model's speculator when it has one) or `off` |
 | `slots` | none | operator cap on resident conversations; by default as many are resident as the shared pool holds |
-| `endpoint_port` | any free | port of the OpenAI-compatible endpoint |
-| `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total`, `prefill_chunk` (1024) | measured | operator limits and benchmark overrides |
+| `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total`, `prefill_chunk` (1024) | measured | operator limits and overrides |
 | `vision` | `auto` | `auto`: image input with the variant's vision tower when installed (`model.select` installs it); `off`: text only, the tower is never installed or loaded |
 | `idle_spill_s` | 30 | seconds a conversation stays resident after its last request before it is spilled to disk (0: kept until the pool needs the room) |
 | `hibernate_limit_bytes` | 32 GiB | disk bound of the spilled conversations; the oldest beyond it are deleted (that conversation starts cold) |
@@ -168,10 +167,6 @@ Mirai ships it only as its own prebuilt server binary.
   them, so conversations survive a plugin upgrade.
 - **Repetition guard** (`backend/src/repeat.rs`): a stream whose tail is one block written 8+ times (512+
   bytes) ends with `finish_reason: "repeated"`; there is no output cap.
-- **Endpoint** (`backend/src/endpoint.rs`): `model.endpoint` starts `http://127.0.0.1:<port>/v1`
-  (`/models`, `/chat/completions` with streaming, tools, `reasoning_content` and `response_format`)
-  in the plugin process on the same engine and scheduler. Headers `X-Cortex-Priority` and
-  `X-Cortex-Cache-Key` are optional.
 
 ## Images (vendor patch P7)
 
@@ -230,38 +225,7 @@ tower and feeds its output to the Mirai M language model.
   that no longer matches its digest is refused.
 - **MRoPE**: positions are planned per input by uzu (P7), including images cut by the
   1024-token prefill steps; the state's rope delta travels with checkpoints and snapshots.
-- **Endpoint**: OpenAI `image_url` parts with `data:` URLs (stored by SHA-256 under the plugin's
-  data directory, `images/`) or local file paths; remote URLs are refused.
-
-Verified (`backend/tests/vision*.rs`, fixtures and their generator in
-`backend/tests/fixtures/vision/`, reference: transformers 5.5 / torch 2.10 on the CPU):
-
-| check | result |
-|---|---|
-| encoder vs transformers' Qwen3.5 vision model, real tower, 8×12 patches → 24×5120 (mean \|ref\| 0.311) | vs float32: max abs 1.076, mean abs 0.00406, min row cosine 0.999953; torch's own bf16 run vs float32: 1.576, 0.00515, 0.999895 |
-| preprocessing vs transformers' Qwen2VL processor (200×136 → 224×320, 7,051 sampled values) | grid identical (14×20); 99.97% of values equal, all within one 8-bit level |
-| MRoPE cos/sin vs `Qwen3_5TextRotaryEmbedding` (5 positions up to 4059) | max abs difference 6e-8; text rows equal the 1-D tables bit for bit |
-| text-only greedy output on the 4B test model (21- and 4,072-token prompts, one stream and 1024-token steps) | bit-identical to the output before P7 |
-| 7 one-token "images" carrying the replaced tokens' own embeddings (rows 5 … 4000, at the 1024/2048 step edges) | output identical to the text-only output; the bare pad tokens change it |
-| a 6×8 image straddling the first 1024-token step | one stream = 1024-token steps; rope delta −40, kept through a checkpoint rollback and a written/read snapshot |
-| the engine worker with a small synthetic tower on the 4B (prefill steps of 5 tokens) | encoded on demand; the same picture reused by digest (cached = prompt − 1, same answer); another picture with the same pad tokens not reused; hibernation keeps the identity; tower loaded and unloaded per encode at idle 0; a file not matching its digest refused |
-| memory (`tests/vision_memory.rs`, 4B + synthetic tower) | budget one byte short of tower + scratch: one idle 4,000-token conversation hibernated (230.7 MiB freed), then the image ran; no idle conversation left and no room: refused with "not enough memory to load vision now", tower not loaded, text unaffected |
-| plan with the tower installed (`fit.rs`) | identical to the plan of the same model directory without `vision/` |
-| concurrency (`tests/vision_concurrency.rs`, 512-wide 12-block synthetic tower, 1920×1080 picture) | the encode took 1.4 s; a text conversation sent after the image request produced 7 of its 24 tokens before the encode finished |
-| device memory of the real tower (`tests/vision_encoder.rs`) | 1.143 GB loaded (estimate 1.156), +0.364 GB scratch after a 68×120-patch encode (estimate 0.449) |
 
 Still to verify on the 27B (needs the model run): answers on real screenshots against
 Qwen3.8-27B UD-Q4_K_M + mmproj (the 4-bit Mirai M was distilled on text only), DFlash acceptance
 after images, and prefill/encode latency end to end.
-
-## Verification
-
-`verify/*.mjs` drive the real `cortex-frame` (`CORTEX_FRAME_BIN`, else `../../frame/target/release`)
-on a temporary `CORTEX_HOME`:
-`conformance.mjs` (G3),
-`hibernate.mjs` (G4), `endpoint.mjs` (G5, with aider and mini-swe-agent from the eval harness's
-virtualenvs), `bench.mjs` (G6, on the engine bake-off's corpus) and `engine_swap.mjs` (G7). They run at once;
-nothing waits for the machine.
-`CC_VERIFY_VARIANT=qwen3.5-4b-m` runs a script on the test model (the gates run on the default
-27B). Results:
-`verify/results/`, `bench/qwen38-27b.json`.

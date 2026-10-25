@@ -7,7 +7,7 @@
  */
 
 import { useState } from 'react';
-import { bytes, definePlugin, duration, errorMessage, plural, useClient, useModelState, useNow, useQuery, ServiceProblem } from '@cortex/sdk';
+import { bytes, definePlugin, duration, errorMessage, installLine, plural, useClient, useModelState, useNow, useQuery, ServiceProblem } from '@cortex/sdk';
 import { EngineChoice } from './engine';
 import './model.css';
 
@@ -47,8 +47,14 @@ function ModelPanel() {
           Test instance: {state.variant} is loaded, not the configured {state.configuredVariant}. Answers and speeds here are not the real setup's.
         </p>
       )}
-      {(state.phase === 'loading' || state.phase === 'starting') && <p className="hint" data-model-phase={state.phase}>The model is loading: fitting {state.variant ?? 'it'} into memory.</p>}
-      {state.phase === 'failed' && <p className="inline-error">The model failed to load: {state.reason}</p>}
+      {installLine(state.install) && state.install && (
+        <div className="cx-model-install" data-install-phase={state.install.phase}>
+          <progress max={state.install.total || 1} value={state.install.bytes} />
+          <p className="hint">{installLine(state.install)}{state.install.file ? ` · ${state.install.file}` : ''}</p>
+        </div>
+      )}
+      {(state.phase === 'loading' || state.phase === 'starting') && !state.install && <p className="hint" data-model-phase={state.phase}>The model is loading: fitting {state.variant ?? 'it'} into memory.</p>}
+      {state.phase === 'failed' && !state.install && <p className="inline-error">The model failed to load: {state.reason}</p>}
       {m && (
         <table className="tbl">
           <tbody>
@@ -84,9 +90,9 @@ function ModelPanel() {
                   {variant.verified === true && <span className="ap origin">verified</span>}
                   {variant.mtp === true && <span className="ap faint">MTP draft head</span>}
                   <span className="grow" />
-                  <button className="detent" type="button" data-action="select-variant" disabled={variant.active || !variant.installed || switching !== null} onClick={() => void select(variant.id)}
-                    title={variant.installed ? `Load ${variant.label} (reloads the weights)` : 'Not installed on this Mac'}>
-                    {switching?.id === variant.id ? `Loading… ${duration(now - switching.started)}` : 'Select'}
+                  <button className="detent" type="button" data-action={variant.installed ? 'select-variant' : 'download-variant'} disabled={variant.active || switching !== null || state.install !== null} onClick={() => void select(variant.id)}
+                    title={variant.installed ? `Load ${variant.label} (reloads the weights)` : `Download ${variant.label}${variant.bytes ? ` (${bytes(variant.bytes)})` : ''}, then load it`}>
+                    {switching?.id === variant.id ? (state.install ? 'Downloading…' : `Loading… ${duration(now - switching.started)}`) : variant.installed ? 'Select' : 'Download'}
                   </button>
                 </div>
                 {variant.notes && <p className="cx-settings-line">{variant.notes}</p>}

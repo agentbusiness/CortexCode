@@ -43,6 +43,11 @@ pub async fn diff_files(
     path: Option<&str>,
     base: Option<&str>,
 ) -> Result<Vec<ParsedFile>, RpcError> {
+    // Diff reads may run repository clean/process filters even with external diff and textconv
+    // disabled. Every caller, including automatic editor diffs and hunk previews, uses this bound.
+    std::fs::create_dir_all(scratch).map_err(|error| RpcError::internal(format!("cannot create Git inspection scratch: {error}")))?;
+    let confined = git.confined(scratch);
+    let git = &confined;
     let mut args: Vec<OsString> = vec!["diff".into(), "-p".into(), "--find-renames".into()];
     args.extend(PATCH_FLAGS.iter().map(OsString::from));
     let mut index = None;
@@ -98,10 +103,10 @@ pub async fn diff_files(
         args.push("--".into());
         args.push(rel_path(repo, path)?.into());
     }
-    let mut cmd = git.cmd(&repo.top).args(args);
-    if let Some(index) = &index {
-        cmd = cmd.env("GIT_INDEX_FILE", &index.path);
-    }
+    let cmd = match &index {
+        Some(index) => index.command(git, repo),
+        None => git.cmd(&repo.top),
+    }.args(args);
     let out = cmd.ok().await?;
     let mut files = parse_patch(&out);
     if !untracked_set.is_empty() {

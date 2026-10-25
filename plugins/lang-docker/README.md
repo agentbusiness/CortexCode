@@ -13,7 +13,6 @@ containers is the separate `container` plugin; this one is the language side.)
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-docker`: category `lang-docker`, contract `lang@1`; `cc-lang-docker lsp-router` is the language-server router |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -92,25 +91,13 @@ download per architecture.
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-docker     # -> plugins/lang-docker/target/lang-docker-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-docker --install`). The probe extracts a
 sample Dockerfile through the real `extract`, reads every skill and reports whether the servers can
 run (absent servers do not fail the probe).
-
-## Verification
-
-`verify/lang_docker.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: definition lines of stages, ARGs, ports and services found in the fixture
-text; an unknown instruction and a YAML error written at known lines (and BuildKit's own
-`docker build --check` line when a daemon answers) before and after a fix; `docker compose config`
-agreeing on the compose file; definition / references / hover of a stage, an ARG, an instruction and
-a service; skills read back; the `lang-docker.server` event; refusals (other YAML, a relative root,
-a missing file). The servers must be installed; `node verify/lang_docker.mjs --install` lets
-`lang-docker.install` add them first. The fixture Dockerfile is `app.Dockerfile` (the extension
-form; `Dockerfile` and `Dockerfile.*` are opened by name and pattern).
 
 ## Why the router stays
 

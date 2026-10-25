@@ -8,8 +8,6 @@ Rules it keeps: CortexCode works offline, so research is optional and online onl
 |---|---|
 | `plugin.toml` | identity, build command and output, provides / publishes / uses, config defaults, source location, verify commands |
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binary `cc-research`: category `research`, contract `research@1` |
-| `backend/tests/fixtures/` | recorded answers of every source, an article, an arXiv abstract page, an arXiv PDF |
-| `verify/` | `network.mjs`: the real frame against the real network |
 
 ## Methods
 
@@ -39,7 +37,7 @@ Events: `research.progress` (`{job_id, project_id, topic, phase, round, done, to
 
 ## Fetch
 
-HTTP through one client (rustls, HTTP/2, the macOS system proxy, gzip/brotli), a descriptive User-Agent, a download limit (`max_download_bytes`; a larger PDF is refused with that name), up to 8 redirects. URLs a user or the model gives are refused when they point at loopback, private, link-local or `.local` addresses (also when a public name resolves to one; a redirect to such an address literal is refused too) unless `allow_private_hosts`. Extraction runs on a blocking thread:
+HTTP uses rustls, HTTP/2, gzip/brotli, a descriptive User-Agent, a download limit (`max_download_bytes`; a larger PDF is refused with that name), and up to 8 redirects. User/model fetch URLs and every redirect hop resolve once; private, loopback, link-local and local-name destinations are refused, and the connection uses only those checked DNS addresses. Guarded requests connect directly because a system proxy can resolve the destination independently; deployments requiring a trusted proxy can explicitly enable `allow_private_hosts`, which also allows local destinations. Configured source API endpoints retain system-proxy support on their first hop. Cross-origin redirects never receive the source API credentials. Extraction runs on a blocking thread:
 
 - HTML: `dom_smoothie` (a maintained Rust port of Mozilla's Readability.js) in its formatted text mode; dates from the article metadata or the usual meta tags (Open Graph, Highwire `citation_*` as on arXiv and journals, Dublin Core, schema.org, `<time datetime>`), authors from `citation_author` or the byline; a page that is only a `<meta http-equiv="refresh">` is followed (two hops); a page Readability cannot score falls back to its body blocks without scripts, styles and page chrome.
 - PDF: `pdf-extract` (on `lopdf`), page by page, under `catch_unwind`. Text comes in content-stream order, which for LaTeX output (arXiv) is reading order, one column after the other (the two-column fixture checks the order); a PDF whose stream order differs from its visual order can come out interleaved. Cleaned: ligatures expanded, hyphenated line ends joined, paragraph lines joined, bare page numbers dropped. Title from the Title entry when meaningful, else the first substantial line; date from CreationDate. Scanned PDFs have no text (no OCR) and say so. Chosen over `pdf_oxide` (pre-1.0; its layout pass scrambled the fixture's author line) and MuPDF bindings (AGPL, a C build).
@@ -75,19 +73,3 @@ The tools plugin's `read` takes `research://search/<query>?sources=arxiv,github&
 ## Configuration (`[backend.config]`)
 
 `timeout_ms`, `max_download_bytes`, `max_text_chars`, `cache_ttl_hours`, `allow_private_hosts`, `web_search` (auto | http | browser), `github` (auto | gh | rest), `gh`, `arxiv_interval_ms`, `max_retry_wait_ms`, `deep_depth`, `deep_sources_per_round`, `deep_results_per_query`, `chunk_chars`, `max_chunks_per_source`, `synth_chars`, `model_max_tokens`, `model_priority`, `user_agent`, and the endpoints `arxiv_api`, `semantic_scholar_api`, `github_api`, `reddit`, `hackernews_api`, `duckduckgo_html` (mirrors, tests).
-
-## Tests and verification
-
-```sh
-cd backend && cargo test --release && cargo clippy --release --all-targets -- -D warnings
-node verify/network.mjs                    # the real network (with the memory plugin); CC_VERIFY_DEEP=1 adds a deep job with the local model
-```
-
-- Unit tests: each source's request building and parsing on its recorded answer, error and block pages, dates, quotes, readability on the Rust blog article and arXiv's abstract page, the two-column arXiv PDF (order, de-hyphenation, ligatures), chunking, source picking, synthesis grounding, the report.
-- `tests/notes.rs`: what goes to `memory.note.*` (global unless a project is named, normalized fields), memory unavailable as a plain error with no local file, and the JSON-lines import: skipped while memory is away, then once (a torn line skipped, the same note of two projects one global note, renamed files never read again, also after a restart). The memory side (ranking by meaning) is tested in the memory plugin; here a stand-in (`tests/common`, `FakeMemory`) answers `memory.note.*`.
-- `tests/search.rs`: every source over HTTP against a local server (parameters, User-Agent, Reddit's RSS fallback, 429 retries, keys only when configured, GitHub through a fake `gh`, the browser fallback with a fake browser, offline).
-- `tests/fetch.rs`: HTML, PDF, cache hits without the network, refresh, a stale copy offline, paging, limits, private addresses, meta refresh.
-- `tests/deep.rs`: the job with fake sources, a fake model and the memory stand-in: two rounds to a report, invented quotes dropped, notes written global, events, a cancel and a resume after a restart, offline failing plainly, memory unavailable failing plainly before any model call.
-- `tests/plugin.rs`: the binary over CPP/1 with an in-test frame that also answers `model.chat`, `frame.project.get` and `memory.note.*`: probe, search, fetch, notes (and memory away), a deep job to its report.
-
-Fixtures (recorded 2026-10-15): `arxiv_search.xml`, `hn_search.json`, `github_repos.json`, `github_issues.json`, `github_code.json` (through `gh api`), `reddit_search.rss`, `ddg_search.html`, `article_rust_blog.html`, `meta_refresh.html` (blog.rust-lang.org's redirect page), `arxiv_abs.html` and `arxiv_2211.17192.pdf` (Leviathan, Kalman, Matias, "Fast Inference from Transformers via Speculative Decoding", CC BY 4.0, two-column, 575 KB). `s2_rate_limited.json` is Semantic Scholar's real 429 answer. Two are written by hand in the documented shape, because the services refused this network while recording: `s2_search.json` (the shared pool answered 429 for 40 minutes) and the Reddit Listing JSON inside `reddit.rs`'s test (403 to every JSON path); `verify/network.mjs` exercises both live.

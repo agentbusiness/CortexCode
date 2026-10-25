@@ -94,11 +94,18 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
   const [depth, setDepth] = useState({ undo: 0, redo: 0 });
   const [stale, setStale] = useState(false);
   const [confirmRevert, setConfirmRevert] = useState(false);
+  const [confirmReload, setConfirmReload] = useState(false);
   const [busy, setBusy] = useState(false);
   const [reloads, setReloads] = useState(0);
   const element = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const savedText = useRef('');
+  const documentVersion = useRef(0);
+  const savePending = useRef(false);
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  const [documentText, setDocumentText] = useState('');
+  const wrapping = useRef(new Compartment());
   const themeCompartment = useRef(new Compartment());
   const language = useRef(new Compartment());
   const root = open.root;
@@ -112,23 +119,30 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
   // ─── the file on disk ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
+    const version = documentVersion.current;
     setError(null);
     client
       .call<ReadResult>('tools.read', { workspace: root, target: path })
       .then((result) => {
         if (cancelled) return;
+        if (documentVersion.current !== version) { setStale(true); return; }
         const read = decodeRead(result, path);
-        setLoaded({ text: read.text, editable: read.editable, note: read.editable ? '' : `Read-only: ${read.reason}` });
+        savedText.current = read.text;
+        setDocumentText(read.text);
+        saveRef.current = 'saved';
+        setSave('saved');
+        setLoaded((current) => {
+          if (view.current?.state.doc.toString() === read.text && current?.editable === read.editable) return current;
+          return { text: read.text, editable: read.editable, note: read.editable ? '' : `Read-only: ${read.reason}` };
+        });
         setStale(false);
       })
       .catch((cause) => {
         if (cancelled) return;
+        if (documentVersion.current !== version) { setStale(true); return; }
         const message = errorMessage(cause);
-        if (/not.?found|no such file/i.test(message)) setLoaded({ text: '', editable: false, note: 'This file no longer exists on disk.' });
-        else {
-          setLoaded(null);
-          setError(`Could not open ${path}: ${message}`);
-        }
+        if (/not.?found|no such file/i.test(message) && !loaded) setLoaded({ text: '', editable: false, note: 'This file no longer exists on disk.' });
+        else setError(`Could not open ${path}: ${message}`);
       });
     return () => {
       cancelled = true;
@@ -136,8 +150,6 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
   }, [client, root, path, reloads]);
 
   // Disk or git changed under the open file: take the new text, unless there are unsaved edits.
-  const saveRef = useRef(save);
-  saveRef.current = save;
   useEffect(() => {
     const offs = ['tools.files_changed', 'vcs.changed'].map((topic) => client.on(topic, (_t, data) => {
       const record = (data ?? {}) as { root?: string; workspace?: string; paths?: string[] };
@@ -207,27 +219,35 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
 
   const doSave = useCallback(async () => {
     const editor = view.current;
-    if (!editor) return;
+    if (!editor || savePending.current) return;
+    savePending.current = true;
     const content = editor.state.doc.toString();
+    saveRef.current = 'saving';
     setSave('saving');
     try {
       await client.call('tools.save', { workspace: root, path, content });
       savedText.current = content;
-      setSave('saved');
+      const current = view.current?.state.doc.toString() ?? documentText;
+      saveRef.current = current === content ? 'saved' : 'dirty';
+      setSave(saveRef.current);
+      setStale(false);
       setError(null);
     } catch (cause) {
+      saveRef.current = 'error';
       setSave('error');
       setError(`Not saved: ${errorMessage(cause)}`);
+    } finally {
+      savePending.current = false;
     }
-  }, [client, root, path]);
+  }, [client, root, path, documentText]);
 
   // ─── the editor ───────────────────────────────────────────────────────────────────────
   const markedRef = useRef(marked);
   markedRef.current = marked;
   useEffect(() => {
     const parent = element.current;
-    if (!parent || !loaded || rendered) return;
-    savedText.current = loaded.text;
+    if (!parent || !loaded) return;
+    let disposed = false;
     const hover = hoverTooltip(async (editorView, pos) => {
       if (!projectId) return null;
       const word = editorView.state.wordAt(pos);
@@ -272,7 +292,13 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
       const undoCount = undoDepth(state);
       const redoCount = redoDepth(state);
       setDepth((current) => (current.undo === undoCount && current.redo === redoCount ? current : { undo: undoCount, redo: redoCount }));
-      if (update.docChanged) setSave(state.doc.toString() === savedText.current ? 'saved' : 'dirty');
+      if (update.docChanged) {
+        documentVersion.current++;
+        const text = state.doc.toString();
+        setDocumentText(text);
+        saveRef.current = savePending.current ? 'saving' : text === savedText.current ? 'saved' : 'dirty';
+        setSave(saveRef.current);
+      }
     });
     const scroll = EditorView.domEventHandlers({
       scroll: (_event, editorView) => {
@@ -290,30 +316,40 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
       scroll,
       EditorState.readOnly.of(!loaded.editable),
       EditorView.editable.of(loaded.editable),
-      ...(options.wrap ? [EditorView.lineWrapping] : []),
+      wrapping.current.of(options.wrap ? EditorView.lineWrapping : []),
     ];
     const editor = new EditorView({ parent, state: EditorState.create({ doc: loaded.text, extensions }) });
     view.current = editor;
     editor.dispatch({ effects: setChanged.of(markedRef.current) });
-    setSave('saved');
+    setDepth({ undo: undoDepth(editor.state), redo: redoDepth(editor.state) });
     const description = LanguageDescription.matchFilename(languages, basename(path));
-    if (description) void description.load().then((support) => editor.dispatch({ effects: language.current.reconfigure(support) })).catch(() => undefined);
+    if (description) void description.load().then((support) => { if (!disposed) editor.dispatch({ effects: language.current.reconfigure(support) }); }).catch(() => undefined);
     const offTheme = subscribeTheme(() => editor.dispatch({ effects: themeCompartment.current.reconfigure(themeExtensions(activeTheme())) }));
     // Where the reader was, unless the file was opened at a line (handled below).
     requestAnimationFrame(() => {
+      if (disposed) return;
       if (!open.line && scrolls[key]) editor.scrollDOM.scrollTo({ top: scrolls[key] });
     });
     const observer = new ResizeObserver(() => editor.requestMeasure());
     observer.observe(parent);
     return () => {
+      disposed = true;
       observer.disconnect();
       offTheme();
       editor.destroy();
       view.current = null;
     };
-    // Rebuilt for new text or another way of showing it.
+    // Display switches keep this view, including its document, selection and undo history.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, rendered, options.wrap]);
+  }, [loaded]);
+
+  useEffect(() => {
+    view.current?.dispatch({ effects: wrapping.current.reconfigure(options.wrap ? EditorView.lineWrapping : []) });
+  }, [loaded, options.wrap]);
+
+  useEffect(() => {
+    if (!rendered) view.current?.requestMeasure();
+  }, [rendered]);
 
   // The changed lines follow the diff.
   useEffect(() => {
@@ -382,12 +418,23 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
             { key: 'stage', label: 'Stage the whole file', disabled: busy || hunks.length === 0, onSelect: () => void act('vcs.stage', { paths: [path] }, `Staged ${path}`) },
             { key: 'revert', label: 'Discard this file’s changes…', disabled: busy || hunks.length === 0, onSelect: () => setConfirmRevert(true) },
             { key: 'wrap', label: options.wrap ? 'Scroll long lines sideways' : 'Wrap long lines', onSelect: () => setOptions({ wrap: !options.wrap }) },
-            { key: 'reload', label: 'Reload from disk', onSelect: () => setReloads((n) => n + 1) },
+            { key: 'reload', label: 'Reload from disk', disabled: save === 'saving', onSelect: () => { if (saveRef.current !== 'saved') setConfirmReload(true); else setReloads((n) => n + 1); } },
             { key: 'copy', label: 'Copy the path', note: path, onSelect: () => void navigator.clipboard?.writeText(path) },
             ...(host.shell ? [{ key: 'reveal', label: 'Show in Finder', onSelect: () => void host.shell!.reveal(`${root}/${path}`).then((problem) => problem && host.notify(problem)) }] : []),
           ]}
         />
       </div>
+      {confirmReload && (
+        <div className="notice contradiction cx-file-notice">
+          <span className="kindmark" />
+          <span className="ap lbl">Reload from disk</span>
+          <p>Discard your unsaved edits to {path} and load its disk version?</p>
+          <div className="acts">
+            <button className="detent warn" type="button" onClick={() => { setConfirmReload(false); setReloads((n) => n + 1); }}>Discard edits and reload</button>
+            <button className="detent" type="button" onClick={() => setConfirmReload(false)}>Keep editing</button>
+          </div>
+        </div>
+      )}
       {confirmRevert && (
         <div className="notice contradiction cx-file-notice">
           <span className="kindmark" />
@@ -438,11 +485,10 @@ export function FileEditor({ open, active }: { open: CodeOpen; active: boolean }
       {error && <p className="inline-error cx-file-notice" role="alert">{error}</p>}
       {rendered && loaded ? (
         <div className="cx-file-md">
-          <article className="prose cx-md-doc"><Markdown remarkPlugins={[remarkGfm]} components={mdLinks(root, path)}>{loaded.text}</Markdown></article>
+          <article className="prose cx-md-doc"><Markdown remarkPlugins={[remarkGfm]} components={mdLinks(root, path)}>{documentText}</Markdown></article>
         </div>
-      ) : (
-        <div className="cx-file-host" ref={element} hidden={!loaded} />
-      )}
+      ) : null}
+      <div className="cx-file-host" ref={element} hidden={!loaded || rendered} />
       {!loaded && !error && <p className="empty-line cx-file-notice">Reading {path}…</p>}
     </div>
   );

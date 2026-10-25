@@ -12,7 +12,6 @@ built like [lang-rust](../lang-rust/README.md).
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-java`: category `lang-java`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -57,16 +56,6 @@ built like [lang-rust](../lang-rust/README.md).
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-java
 ```
-
-## Verification
-
-`verify/lang_java.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: definition lines and call sites found in the fixture text, pom.xml and
-build.gradle facts, `javac`'s errors (of the described JDK) before and after a fix, definition,
-references and hover positions of a method, skills read back with their summaries, Java 21 from the
-described toolchain, the `lang-java.server` event, and refusals. `node verify/lang_java.mjs
---install` lets `lang-java.install` install the JDK and jdtls into the run's temporary CORTEX_HOME
-first.

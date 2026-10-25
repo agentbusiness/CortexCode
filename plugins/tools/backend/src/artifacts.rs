@@ -5,10 +5,14 @@
 use crate::read::parse_range;
 use crate::util;
 use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
 
 #[derive(Debug, Clone)]
 pub struct Artifacts {
     dir: PathBuf,
+    home: PathBuf,
 }
 
 /// Limits for inline output (bytes). Output above `inline` is offloaded; the inline view then
@@ -32,7 +36,8 @@ pub fn valid_id(id: &str) -> bool {
 
 impl Artifacts {
     pub fn new(home: &Path) -> Self {
-        Self { dir: home.join("artifacts") }
+        let home = util::canonical_lenient(home);
+        Self { dir: home.join("artifacts"), home }
     }
 
     pub fn dir(&self) -> &Path {
@@ -58,10 +63,33 @@ impl Artifacts {
         Ok(id)
     }
 
-    pub fn read(&self, id: &str) -> std::io::Result<Vec<u8>> {
+    pub fn open(&self, id: &str) -> std::io::Result<std::fs::File> {
         let path =
             self.path(id).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("`{id}` is not an artifact id")))?;
-        std::fs::read(path)
+        let resolved = std::fs::canonicalize(&path)?;
+        if !resolved.starts_with(&self.dir) || crate::sandbox::control_read_path(&self.home, &resolved) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "artifact aliases may not read app control files or leave the artifact directory"));
+        }
+        // Check the opened object too: a command can replace an artifact while it is being read.
+        let directory = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&self.dir)?;
+        let name = std::ffi::CString::new(id).expect("validated ASCII artifact id");
+        // SAFETY: the directory descriptor stays alive, the validated name is NUL-terminated,
+        // and the returned descriptor is owned by the File exactly once.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+        if fd == -1 { return Err(std::io::Error::last_os_error()); }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "artifact must be a regular file without aliases"));
+        }
+        Ok(file)
+    }
+
+    pub fn read(&self, id: &str) -> std::io::Result<Vec<u8>> {
+        let mut file = self.open(id)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 }
 

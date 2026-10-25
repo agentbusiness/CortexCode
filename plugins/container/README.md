@@ -6,13 +6,12 @@ Projects whose commands run inside Docker while their files stay on the Mac. A p
 - **a Docker Compose project** (`docker compose`, the v2 plugin): the compose files define the services and their bind mounts; commands and terminals run in one `service`;
 - **a devcontainer with `features`**: built, created and started by the official Dev Containers CLI (`@devcontainers/cli`).
 
-The code graph, edits, language servers and the editor work on the files as on any project, while commands (the tools plugin's `run`, terminals, benchmark verifiers such as SWE-bench Verified and Terminal-Bench) run in the container's installed environment. Contract: `container@1` (`protocol/src/contracts/container.rs`), built on the `docker` command-line tool (Docker Desktop on macOS).
+The code graph, edits, language servers and the editor work on the files as on any project, while commands (the tools plugin's `run`, terminals) run in the container's installed environment. Contract: `container@1` (`protocol/src/contracts/container.rs`), built on the `docker` command-line tool (Docker Desktop on macOS).
 
 | Path | What |
 |---|---|
-| `plugin.toml` | identity, build command and output, config defaults, source location, verify commands |
+| `plugin.toml` | identity, build command and output, config defaults, source location |
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binary `cc-container`: category `container`, contract `container@1` |
-| `verify/` | `docker.mjs`: the real frame, the real docker daemon, small public images |
 
 ## Methods
 
@@ -113,12 +112,8 @@ Plugin config (`[plugin.config]`): `docker` (CLI path), `max_output_bytes`, `sto
 
 Notes: `bash -l` reads the image's login profile; on Debian-based images `/etc/profile` resets `PATH` (images that only extend `PATH` through `ENV` lose those entries in login shells unless their profile adds them back; SWE-bench images activate their environment from `~/.bashrc`, which Debian's `~/.profile` sources). Bind mounts need their sources under a directory Docker Desktop shares (`/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` by default). `platform` is not tracked for Compose services (`null`; the compose file decides it).
 
-## Build and verify
+## Build
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
-node verify/docker.mjs        # needs Docker Desktop running, network and node; pulls alpine:3.20, debian:12-slim (also linux/amd64), postgres:16-alpine; installs @devcontainers/cli into the frame's temporary CORTEX_HOME
-cortex-pack build plugins/container
+cortex-pack build plugins/container --install
 ```
-
-The unit and integration tests need no Docker: `backend/tests/fake_docker.sh` is a fake docker CLI put on a temporary PATH (it runs exec'd commands on the host, so streaming, timeouts and kills are real processes; its `compose` subcommand creates the services of a fixture, reading labels and ports from the plugin's JSON override with `plutil`), `fake_devcontainer.sh` is a fake Dev Containers CLI that creates and reuses containers through the fake docker by their id labels, and `fake_npm.sh` (with a fake `node`) "installs" it into the toolchains directory. The in-container kill script is run under dash against a fabricated `/proc`. The frame runs it once installed: `cortex-pack build plugins/container --install`.

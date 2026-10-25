@@ -9,6 +9,15 @@ use serde_json::Value;
 
 /// Methods the frame serves. Each line names the params and result types.
 pub mod methods {
+    /// Trusted tools backend requests the restricted API credential for a command session.
+    /// [`super::CommandAccessParams`] -> [`super::CommandAccessResult`].
+    pub const COMMAND_ACCESS: &str = "frame.command_access";
+    /// Atomically activate an already-built set, restoring previous versions on failure.
+    /// [`super::InstallManyParams`] -> [`super::InstallManyResult`].
+    pub const PLUGINS_INSTALL_MANY: &str = "frame.plugins.install_many";
+    /// Wait for a previously submitted installation, including across a caller hot swap.
+    /// [`super::InstallWaitParams`] -> [`super::InstallManyResult`].
+    pub const PLUGINS_INSTALL_WAIT: &str = "frame.plugins.install_wait";
     /// [`super::super::lifecycle::Hello`] -> [`super::super::lifecycle::HelloAck`]. Plugins send it
     /// first; a WebSocket client sends it to serve a category (the Electron shell serves `browser`).
     pub const HELLO: &str = "frame.hello";
@@ -103,6 +112,42 @@ pub mod methods {
     /// Start the Electron shell again after the user closed it (no-op while it runs).
     /// `{}` -> [`super::UiOpenResult`].
     pub const UI_OPEN: &str = "frame.ui.open";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandAccessParams {
+    pub session_id: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandAccessResult {
+    pub url: String,
+    pub token: String,
+    pub socket: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstallManyParams {
+    pub id: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstallWaitParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstallManyResult {
+    pub id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub swaps: Vec<PackageSwapResult>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub recovery_errors: Vec<String>,
 }
 
 /// Event topics the frame publishes.
@@ -816,9 +861,6 @@ pub mod package {
         pub license: String,
         #[serde(default)]
         pub platforms: Vec<String>,
-        /// Test-only code (never packed or configured for real use).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        pub test_only: bool,
         /// The plugin's icon (a file in the folder: .svg, .png or .icns); in a package, `icon.<ext>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub icon: Option<String>,
@@ -901,9 +943,6 @@ pub mod package {
         /// Build command, run in `dir`; builds every package's `dist/`.
         #[serde(default)]
         pub build: Vec<String>,
-        /// Test command, run in `dir`.
-        #[serde(default)]
-        pub test: Vec<String>,
         #[serde(default)]
         pub package: Vec<UiPackageSpec>,
     }
@@ -1006,23 +1045,21 @@ pub mod package {
                         return Err(format!("[backend] asset `{asset}` must be a relative path inside the plugin"));
                     }
                 }
-                if !meta.test_only {
-                    let category = backend.category.as_deref().unwrap_or("");
-                    if category.is_empty() {
-                        return Err("[backend] category is required".into());
-                    }
-                    let contract = backend.contract.as_deref().unwrap_or("");
-                    // A family member (`lang-go`) speaks its family's contract (`lang@1`).
-                    let expected = crate::contracts::family_of(category).unwrap_or(category);
-                    match contract.split_once('@') {
-                        Some((c, major)) if c == expected && !major.is_empty() => {}
-                        _ => return Err(format!("[backend] contract `{contract}` must be `{expected}@<major>`")),
-                    }
-                    match backend.exec.as_deref() {
-                        Some(exec) if safe_relative(exec) => {}
-                        Some(exec) => return Err(format!("[backend] exec `{exec}` must be a relative path inside the plugin")),
-                        None => return Err("[backend] exec is required".into()),
-                    }
+                let category = backend.category.as_deref().unwrap_or("");
+                if category.is_empty() {
+                    return Err("[backend] category is required".into());
+                }
+                let contract = backend.contract.as_deref().unwrap_or("");
+                // A family member (`lang-go`) speaks its family's contract (`lang@1`).
+                let expected = crate::contracts::family_of(category).unwrap_or(category);
+                match contract.split_once('@') {
+                    Some((c, major)) if c == expected && !major.is_empty() => {}
+                    _ => return Err(format!("[backend] contract `{contract}` must be `{expected}@<major>`")),
+                }
+                match backend.exec.as_deref() {
+                    Some(exec) if safe_relative(exec) => {}
+                    Some(exec) => return Err(format!("[backend] exec `{exec}` must be a relative path inside the plugin")),
+                    None => return Err("[backend] exec is required".into()),
                 }
             }
             let mut ids: Vec<&str> = Vec::new();

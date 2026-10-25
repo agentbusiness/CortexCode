@@ -2,7 +2,7 @@
 
 use crate::core::{Config, Core};
 use crate::exec::{self, Session};
-use crate::host::{CtxHost, Host, NoHost};
+use crate::host::{CtxHost, Host};
 use crate::schemas::{self, EditFormat};
 use crate::shell::RunRequest;
 use crate::util;
@@ -121,8 +121,13 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
     let Call { method, params, items, cancel } = call;
     match method.as_str() {
         methods::SCHEMAS => {
-            let params: SchemasParams = if params.is_null() { SchemasParams { edit_format: None } } else { parse_params(params)? };
-            to_value(&schemas::schemas(EditFormat::parse(params.edit_format.as_deref())))
+            let params: SchemasParams = if params.is_null() { SchemasParams { edit_format: None, workspace: None } } else { parse_params(params)? };
+            let offline = params
+                .workspace
+                .as_deref()
+                .filter(|workspace| !workspace.is_empty())
+                .is_some_and(|workspace| util::canonical_lenient(&util::expand_home(workspace)).join(crate::sandbox::OFFLINE_MARKER).exists());
+            to_value(&schemas::schemas(EditFormat::parse(params.edit_format.as_deref()), offline))
         }
         methods::EXECUTE => {
             let params: ExecuteParams = parse_params(params)?;
@@ -163,8 +168,14 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let for_session = params.session_id.is_some();
             if !for_session && !crate::uris::is_uri(&params.target) {
                 let absolute = util::resolve(&session.workspace, &params.target);
+                if core.sandbox.control_read_denied(&absolute) {
+                    return Err(RpcError::new(
+                        codes::CONTRACT_VIOLATION,
+                        "frame credentials are private to the app; use cx for command access",
+                    ));
+                }
                 if absolute.is_file()
-                    && let Ok(bytes) = std::fs::read(&absolute)
+                    && let Ok(bytes) = crate::util::read_host_file(&absolute)
                     && !crate::read::is_binary(&bytes)
                 {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -201,7 +212,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let session =
                 Session { workspace: util::canonical_lenient(&util::expand_home(&params.workspace)), context: &context, python_env: true };
             let runtime = core
-                .runtime(&context.session_id, &session.workspace, true)
+                .runtime(host.as_ref(), &context.session_id, &session.workspace, true)
                 .await
                 .map_err(|message| RpcError::new(codes::UNAVAILABLE, message))?;
             let venv = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
@@ -212,6 +223,8 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 .as_object()
                 .map(|map| map.iter().filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned()))).collect())
                 .unwrap_or_default();
+            env.push(("CORTEX_COMMAND_URL".to_owned(), runtime.command_access.url.clone()));
+            env.push(("CORTEX_COMMAND_TOKEN".to_owned(), runtime.command_access.token.clone()));
             let mut one_off = params.session_id.is_none();
             // A caller confining a command further (`sandbox-exec -p <profile> <command...>`, e.g. a
             // check run without network): a sandboxed shell cannot apply a second sandbox, so the
@@ -261,6 +274,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                     duration_ms: 0,
                     timed_out: false,
                     job_id: Some(meta.job_id),
+                    tests: None,
                 });
             }
             let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(core.config.default_timeout_ms));
@@ -278,14 +292,22 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 core.shells.drop_session(&identity.session_id).await;
             }
             let run = result.map_err(|error| RpcError::internal(format!("could not run: {error}")))?;
+            let tests = run.output.whole(exec::TEST_VIEW_BYTES).as_deref().and_then(crate::testout::summary).map(|tests| cc_protocol::contracts::tools::TestCounts {
+                runner: tests.runner.to_owned(),
+                ran: tests.ran,
+                failed: tests.failed,
+                names: tests.names,
+            });
             let (output, _, _) = exec::present_output(&core, run.output, core.config.run_limits);
-            to_value(&RunResult { exit_code: run.exit_code, output, duration_ms: run.duration_ms, timed_out: run.timed_out, job_id: None })
+            to_value(&RunResult { exit_code: run.exit_code, output, duration_ms: run.duration_ms, timed_out: run.timed_out, job_id: None, tests })
         }
         methods::JOB_STATUS => {
+            check_command_job(&core, &params)?;
             let params: JobParams = parse_params(params)?;
             to_value(&job_status(&core, &params.job_id)?)
         }
         methods::JOB_KILL => {
+            check_command_job(&core, &params)?;
             let params: JobParams = parse_params(params)?;
             core.jobs.kill(&params.job_id).await.ok_or_else(|| RpcError::not_found(format!("no job `{}`", params.job_id)))?;
             to_value(&job_status(&core, &params.job_id)?)
@@ -394,7 +416,16 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         methods::TESTS_BASELINE => {
             let field = |name: &str| params.get(name).and_then(Value::as_str).unwrap_or_default().to_owned();
             let timeout_ms = params.get("timeout_ms").and_then(Value::as_u64);
-            crate::baseline::check(&core, &field("session_id"), &field("workspace"), &field("command"), timeout_ms, cancel.clone()).await
+            crate::baseline::check(
+                &core,
+                host.as_ref(),
+                &field("session_id"),
+                &field("workspace"),
+                &field("command"),
+                timeout_ms,
+                cancel.clone(),
+            )
+            .await
         }
         methods::TESTS_REPORT => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -403,6 +434,16 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         other => Err(RpcError::unknown_method(other)),
     }
+}
+
+fn check_command_job(core: &Core, params: &Value) -> Result<(), RpcError> {
+    if let Some(session) = params.get("_command_session").and_then(Value::as_str) {
+        let id = params.get("job_id").and_then(Value::as_str).unwrap_or_default();
+        if !core.jobs.list(Some(session)).iter().any(|job| job.job_id == id) {
+            return Err(RpcError::not_found("no background job in this command's session"));
+        }
+    }
+    Ok(())
 }
 
 /// The exact text of the given lines (terminators included).
@@ -476,11 +517,10 @@ fn save(core: &Core, params: &SaveParams) -> Result<SaveResult, RpcError> {
     if target == root || target.is_dir() {
         return Err(RpcError::invalid_params(format!("{} is a directory", params.path)));
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| RpcError::internal(error.to_string()))?;
+    if core.sandbox.protected(&target) || core.sandbox.git_control_write_denied(&root, &target) {
+        return Err(RpcError::new(codes::CONTRACT_VIOLATION, "app control files and Git worktree pointers are managed by the app; save a project file instead"));
     }
-    util::atomic_write(&target, params.content.as_bytes()).map_err(|error| RpcError::internal(format!("{}: {error}", target.display())))?;
-    let _ = core;
+    util::atomic_write_checked(&target, params.content.as_bytes(), |path| util::is_inside(path, &root) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&root, path)).map_err(|error| RpcError::internal(format!("{}: {error}", target.display())))?;
     Ok(SaveResult {
         path: util::display_rel(&target, &root),
         bytes: params.content.len() as u64,
@@ -490,11 +530,10 @@ fn save(core: &Core, params: &SaveParams) -> Result<SaveResult, RpcError> {
 
 /// The probe exercises the real tools in a scratch directory: hashline read, anchored edit with
 /// stale rejection, a shell round trip, output offload with byte-exact read-back, and a parse.
-pub async fn probe(core: &Arc<Core>) -> ProbeReport {
+pub async fn probe(core: &Arc<Core>, host: Arc<dyn Host>) -> ProbeReport {
     let mut checks = Vec::new();
     let scratch = std::env::temp_dir().join(format!("cc-tools-probe-{}", uuid::Uuid::new_v4().simple()));
     let _ = std::fs::create_dir_all(&scratch);
-    let host: Arc<dyn Host> = Arc::new(NoHost);
     let context = ExecContext {
         project_id: "probe".into(),
         session_id: format!("probe-{}", uuid::Uuid::new_v4().simple()),
@@ -542,7 +581,7 @@ pub async fn probe(core: &Arc<Core>) -> ProbeReport {
         false,
     )
     .await;
-    let written = std::fs::read_to_string(scratch.join("p.rs")).unwrap_or_default();
+    let written = crate::util::read_host_text(scratch.join("p.rs")).unwrap_or_default();
     check(
         "edit_anchor",
         started,
@@ -563,7 +602,7 @@ pub async fn probe(core: &Arc<Core>) -> ProbeReport {
         false,
     )
     .await;
-    let unchanged = std::fs::read_to_string(scratch.join("p.rs")).unwrap_or_default() == written;
+    let unchanged = crate::util::read_host_text(scratch.join("p.rs")).unwrap_or_default() == written;
     check(
         "edit_stale_rejected",
         started,
@@ -671,7 +710,8 @@ impl Plugin for ToolsPlugin {
 
     fn probe(&self, ctx: Ctx) -> BoxFuture<'static, Result<ProbeReport, RpcError>> {
         let core = self.core(&ctx);
-        Box::pin(async move { Ok(probe(&core.await).await) })
+        let host: Arc<dyn Host> = Arc::new(CtxHost(ctx));
+        Box::pin(async move { Ok(probe(&core.await, host).await) })
     }
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {

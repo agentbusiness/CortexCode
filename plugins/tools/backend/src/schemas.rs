@@ -40,10 +40,21 @@ Find code by meaning: graph://search/<words>.\n\
 One function or class, by its name: symbol://<name> (its code, what it takes and returns), graph://used-by/<name> (every place that uses it), graph://uses/<name> (everything it uses), graph://impact/<name> (what a change to it reaches), graph://path/<name>/<name> (how two relate), outline://<path> (what a file contains).\n\
 Language server, at path:line:col: definition://<path:line:col>, references://<path:line:col> (every use), hover://<path:line:col> (type and docs), diagnostics://<path> (errors; diagnostics:// for every file).\n\
 Host: artifact://<id> (a saved long output; may end in :range), task://<id> and agent://<name> (background agents and their tasks), board:// (messages between agents), rule:// (project rules), skill://<plugin>/<name> (a how-to).\n\
-Online, when a network exists: research://search/<words>, research://fetch/<url> (a page or PDF as text), research://notes/<topic>.\n\
+{online}\n\
 Another repository, read-only (<project>: its name or path): <project>:<path>, graph://<project>/search/<words>, symbol://<project>/<name>, outline://<project>/<path>.";
 
-pub fn read_spec() -> ToolSpec {
+/// The online reads, or (offline) only the local notes: an offline project is not shown a fetch it
+/// cannot use (seen: a model trying a PR's URL three ways in a workspace without network).
+fn read_path(offline: bool) -> String {
+    let online = if offline {
+        "Research notes (local): research://notes/<topic>."
+    } else {
+        "Online: research://search/<words>, research://fetch/<url> (a page or PDF as text), research://notes/<topic>."
+    };
+    READ_PATH.replace("{online}", online)
+}
+
+pub fn read_spec(offline: bool) -> ToolSpec {
     ToolSpec {
         name: "read".to_owned(),
         description: "See a file or folder, or find code by meaning or name. For exact text, use run with grep -rn.".to_owned(),
@@ -51,7 +62,7 @@ pub fn read_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "intent": intent(),
-                "path": {"type": "string", "description": READ_PATH},
+                "path": {"type": "string", "description": read_path(offline)},
                 "range": {"type": "string", "description": "Lines to read: 50 (from line 50 on), 50-120, 50+30 (30 lines from line 50), or 5-16,40-52. Without a range a long file comes back as an outline of its definitions."}
             },
             "required": ["intent", "path"]
@@ -150,7 +161,7 @@ pub fn run_spec() -> ToolSpec {
                 "wake": {
                     "type": "object",
                     "description": "Background jobs: also wake you when output matches `pattern` (regex) or after `silence_s` seconds without output.",
-                    "properties": {"pattern": {"type": "string"}, "silence_s": {"type": "number"}}
+                    "properties": {"pattern": {"type": "string", "description": "Regex in rolling 64 KiB output windows; full output stays in the artifact."}, "silence_s": {"type": "number"}}
                 },
                 "cwd": {"type": "string", "description": "Run this one command in another directory."},
                 "permission": {"type": "string", "description": "Only for an install, another write outside the workspace, or a program the sandbox cannot start: why this command needs it, e.g. \"install the image library the thumbnails need\". Commands may write only in the workspace, temp dirs, package caches and your Python venv (python and pip use it, so `pip install` needs no flags). An install changes the user's machine, so the user is asked; once approved the command runs with writes anywhere. Never for what commands may do already."}
@@ -162,7 +173,7 @@ pub fn run_spec() -> ToolSpec {
 
 /// What spans the tools: which tool for what, and how each result reads; each tool's own
 /// mechanics are in its description (said once, there).
-pub fn guide(format: EditFormat) -> String {
+pub fn guide(format: EditFormat, offline: bool) -> String {
     let anchors = match format {
         EditFormat::Hashline => {
             "  N:hh (the line number and a short hash of the line) is the line's anchor: edit names lines by anchor, never by bare line number, and an anchor stops matching once its line changes."
@@ -172,6 +183,13 @@ pub fn guide(format: EditFormat) -> String {
     let change = match format {
         EditFormat::Hashline => "each function it changed, whole, as it is now (other code: the changed lines and 2 around them), with new anchors; then any lines it removed",
         EditFormat::Replace | EditFormat::Whole => "each function it changed, whole, as it is now (other code: the changed lines and 2 around them); then any lines it removed",
+    };
+    // Local first: the project answers most questions, and the network is used only when it cannot
+    // (seen: a request naming a pull request sent the model to the network before the code).
+    let network = if offline {
+        "This project has no network: commands cannot reach the internet, research://search and research://fetch do not answer, and nothing can be installed or downloaded. To find out how something works, use the project's files."
+    } else {
+        "To find out how something works (the code, an API, a tool), look in the project first: its files, docs and tests, graph://search. Go online (research://search, research://fetch, documentation) only when the project cannot answer."
     };
     let (how, fresh) = match format {
         EditFormat::Hashline => ("by anchors", ", with new anchors"),
@@ -183,7 +201,8 @@ pub fn guide(format: EditFormat) -> String {
 2. edit: to change or write a file (below).\n\
 3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Checks of your work are tests in the project (a project without tests gets them), run whole: no `| tail` or `| grep`, the result shows each failure; a one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
-5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through. Everything else is yours to use, the network included: search, read documentation, look for how others solved it.\n\
+5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through.\n\
+6. {network}\n\
 Give every call a short `intent` first.\n\
 \n\
 Working with files:\n\
@@ -211,10 +230,11 @@ Find code:\n\
     )
 }
 
-pub fn schemas(format: EditFormat) -> SchemasResult {
+/// The tool specs and guide for a workspace (`offline`: it holds the offline marker).
+pub fn schemas(format: EditFormat, offline: bool) -> SchemasResult {
     SchemasResult {
-        tools: vec![read_spec(), edit_spec(format), run_spec(), terminal_spec()],
+        tools: vec![read_spec(offline), edit_spec(format), run_spec(), terminal_spec()],
         versions: json!({"read": "read@1", "edit": format!("edit-{}@1", format.name()), "run": "run@1", "terminal": "terminal@1"}),
-        guide: guide(format),
+        guide: guide(format, offline),
     }
 }

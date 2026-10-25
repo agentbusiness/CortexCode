@@ -53,6 +53,7 @@ interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: RpcError) => void;
   onItem?: (item: unknown) => void;
+  cleanup?: () => void;
 }
 
 /** Minimal surface of the WebSocket the client needs (lets tests drive it without a socket). */
@@ -80,7 +81,7 @@ export class Client {
   private socket: SocketLike | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
-  private readonly outbox: string[] = [];
+  private readonly outbox = new Map<number, Extract<Envelope, { t: 'req' }>>();
   private readonly handlers = new Map<string, Set<EventHandler>>();
   private readonly stateListeners = new Set<(state: ConnectionState) => void>();
   private readonly reconnectListeners = new Set<() => void>();
@@ -101,21 +102,24 @@ export class Client {
   call<T = unknown>(method: string, params: unknown = {}, options: CallOptions = {}): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      if (options.signal?.aborted) {
-        reject(new RpcError('cancelled', 'request cancelled'));
+      if (this.stopped || options.signal?.aborted) {
+        reject(new RpcError(this.stopped ? 'connection_closed' : 'cancelled', this.stopped ? 'client closed' : 'request cancelled'));
         return;
       }
+      const abort = () => {
+        const queued = this.outbox.has(id);
+        const entry = this.takePending(id);
+        if (!entry) return;
+        if (!queued) this.send({ t: 'cancel', id });
+        entry.reject(new RpcError('cancelled', 'request cancelled'));
+      };
       this.pending.set(id, {
         resolve: resolve as (value: unknown) => void,
         reject,
         onItem: options.onItem,
+        cleanup: () => options.signal?.removeEventListener('abort', abort),
       });
-      options.signal?.addEventListener('abort', () => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        this.send({ t: 'cancel', id });
-        reject(new RpcError('cancelled', 'request cancelled'));
-      }, { once: true });
+      options.signal?.addEventListener('abort', abort, { once: true });
       this.send({ t: 'req', id, method, params });
     });
   }
@@ -170,6 +174,7 @@ export class Client {
     const socket = this.makeSocket(this.url);
     this.socket = socket;
     socket.onopen = () => {
+      if (this.stopped || this.socket !== socket) return;
       const reconnect = this.everOpened;
       this.everOpened = true;
       this.retryMs = 250;
@@ -177,7 +182,10 @@ export class Client {
       // The frame forgets a client's subscriptions with its socket: renew all of them first.
       this.subscribedTopics = '';
       this.syncSubscriptions();
-      for (const frame of this.outbox.splice(0)) socket.send(frame);
+      for (const [id, frame] of [...this.outbox]) {
+        this.outbox.delete(id);
+        if (this.pending.has(id)) this.send(frame);
+      }
       if (reconnect) for (const listener of this.reconnectListeners) listener();
     };
     socket.onmessage = (event) => this.receive(event.data);
@@ -207,15 +215,28 @@ export class Client {
   private fail(error: RpcError): void {
     const pending = [...this.pending.values()];
     this.pending.clear();
-    for (const entry of pending) entry.reject(error);
+    this.outbox.clear();
+    for (const entry of pending) { entry.cleanup?.(); entry.reject(error); }
+  }
+
+  private takePending(id: number): Pending | undefined {
+    const entry = this.pending.get(id);
+    this.pending.delete(id);
+    this.outbox.delete(id);
+    entry?.cleanup?.();
+    return entry;
   }
 
   private send(envelope: Envelope): void {
     const text = JSON.stringify(envelope);
-    if (this.socket && this.socket.readyState === OPEN) this.socket.send(text);
-    else if (envelope.t === 'req') this.outbox.push(text);
-    // A cancel for a request that never left is moot: the request is still in the outbox only if
-    // the socket never opened, and then it was rejected locally already.
+    if (this.stopped) return;
+    if (this.socket && this.socket.readyState === OPEN) {
+      try { this.socket.send(text); }
+      catch {
+        this.fail(new RpcError('connection_closed', 'could not send to the frame', true));
+        this.socket.close();
+      }
+    } else if (envelope.t === 'req' && this.pending.has(envelope.id)) this.outbox.set(envelope.id, envelope);
   }
 
   private syncSubscriptions(): void {
@@ -242,9 +263,8 @@ export class Client {
     }
     switch (envelope.t) {
       case 'res': {
-        const entry = this.pending.get(envelope.id);
+        const entry = this.takePending(envelope.id);
         if (!entry) return;
-        this.pending.delete(envelope.id);
         if (envelope.ok) entry.resolve(envelope.result ?? null);
         else entry.reject(RpcError.from(envelope.error ?? { code: 'internal', message: 'error without detail' }));
         return;

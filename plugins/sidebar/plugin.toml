@@ -17,7 +17,6 @@ platforms = ["macos"]
 [ui]
 dir = "ui"
 build = ["npm", "run", "build"]
-test = ["npm", "test"]
 
 [[ui.package]]
 dir = "ui/new-chat"

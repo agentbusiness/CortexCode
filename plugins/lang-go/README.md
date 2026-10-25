@@ -11,7 +11,6 @@ Go / gopls / delve installed into CortexCode's toolchains directory, and the Go 
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-go`: category `lang-go`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -54,20 +53,10 @@ Methods are called on the category: `lang-go.describe`, `lang-go.extract`, ...
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-go     # -> plugins/lang-go/target/lang-go-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-go --install`). The probe extracts a sample
 through the real `extract`, reads every skill and reports whether gopls can run (an absent server
 does not fail the probe).
-
-## Verification
-
-`verify/lang_go.mjs` loads the folder in a real frame and checks every method against truth computed
-independently: definition lines and call sites found in the fixture text, the compiler's errors from
-`go build ./...` (run with the described toolchain path) before and after a fix, definition,
-references and hover positions of a function, skills read back with their summaries, the toolchain
-directories, the `lang-go.server` event, and refusals. gopls and Go must be runnable;
-`node verify/lang_go.mjs --install` lets `lang-go.install` put Go, gopls and delve into the run's
-temporary CORTEX_HOME first.

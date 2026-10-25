@@ -18,7 +18,3 @@ cortex-pack build plugins/browser                  # -> plugins/browser/target/b
 ```
 
 `cortex-pack build plugins/browser --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the UI package and shell module together; Settings > Plugins disables and enables the whole plugin.
-
-## Verification
-
-ui/verify/browser.mjs (gate 1.7 G5) drives it through the frame in the real app.

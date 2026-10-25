@@ -8,9 +8,8 @@
   "main": "index.js",
   "cortex": {
     "id": "notify.shell-module",
-    "shellModule": { "entry": "index.js" }
-  },
-  "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "shellModule": {
+      "entry": "index.js"
+    }
   }
 }

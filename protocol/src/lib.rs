@@ -5,11 +5,13 @@
 //! responses, events and cancellations. Category contracts live in [`contracts`]; the shared
 //! hashline anchor definition lives in [`hashline`].
 
+pub mod checks;
 pub mod codec;
 pub mod conn;
 pub mod contracts;
 pub mod envelope;
 pub mod hashline;
+pub mod host;
 pub mod plugin;
 pub mod sha256;
 pub mod stored;

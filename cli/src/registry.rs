@@ -316,20 +316,30 @@ fn format_snapshot(value: &Value) -> String {
     format!("{}  {}\n{}\n", s(value, "url"), s(value, "title"), s(value, "tree").trim_end())
 }
 
+fn history_note(value: &Value) -> String {
+    let omitted = value.get("omitted").and_then(Value::as_u64).unwrap_or(0);
+    let clipped = value.get("clipped").and_then(Value::as_u64).unwrap_or(0);
+    if omitted == 0 && clipped == 0 {
+        String::new()
+    } else {
+        format!("[live history: {omitted} older entries omitted; {clipped} fields clipped]\n")
+    }
+}
+
 fn format_console(value: &Value) -> String {
     let messages = value.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     if messages.is_empty() {
-        return "no console messages\n".to_owned();
+        return history_note(value) + "no console messages\n";
     }
-    messages.iter().map(|m| format!("[{}] {}\n", s(m, "level"), s(m, "text"))).collect()
+    history_note(value) + &messages.iter().map(|m| format!("[{}] {}\n", s(m, "level"), s(m, "text"))).collect::<String>()
 }
 
 fn format_network(value: &Value) -> String {
     let entries = value.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
     if entries.is_empty() {
-        return "no requests\n".to_owned();
+        return history_note(value) + "no requests\n";
     }
-    entries
+    let text: String = entries
         .iter()
         .map(|e| {
             let status = e
@@ -340,7 +350,8 @@ fn format_network(value: &Value) -> String {
                 .unwrap_or_default();
             format!("{} {} {}\n", s(e, "method"), status, s(e, "url"))
         })
-        .collect()
+        .collect();
+    history_note(value) + &text
 }
 
 fn format_screenshot(value: &Value) -> String {

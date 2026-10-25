@@ -2,11 +2,8 @@
  * Journal materialization: a session's state is the fold of its patches (`JournalPatch`).
  *
  * A view subscribes to `journal.<session_id>` before it reads the journal, so nothing written in
- * between is lost. Patches that arrive while the read is in flight are held back: a `create` newer
- * than the read is applied, while `append`/`set` on an entry the read already returned are dropped,
- * because the read may already contain them and an `append` applied twice would duplicate text.
- * Whatever such a drop could lose is repaired when the entry finishes streaming (`streaming` set to
- * false): the view re-reads that entry and takes the frame's final copy.
+ * between is lost. The read's revision identifies exactly which buffered patches it includes;
+ * only newer patches are replayed, so text is neither duplicated nor dropped while loading.
  */
 
 import type { Client } from './rpc';
@@ -34,19 +31,38 @@ export function applyPatch(entries: readonly JournalEntry[], patch: JournalPatch
       const index = findIndex(entries, patch.seq);
       if (index < 0) return entries;
       const entry = entries[index]!;
-      const current = entry.data[patch.field];
-      const text = (typeof current === 'string' ? current : '') + patch.text;
-      return replaceAt(entries, index, { ...entry, data: { ...entry.data, [patch.field]: text } });
+      const data = patchField(entry.data, patch.field, (current) => {
+        if (current !== null && current !== undefined && typeof current !== 'string') return undefined;
+        return (current ?? '') + patch.text;
+      });
+      return data ? replaceAt(entries, index, { ...entry, data }) : entries;
     }
     case 'set': {
       const index = findIndex(entries, patch.seq);
       if (index < 0) return entries;
       const entry = entries[index]!;
-      return replaceAt(entries, index, { ...entry, data: { ...entry.data, [patch.field]: patch.value } });
+      const data = patchField(entry.data, patch.field, () => patch.value);
+      return data ? replaceAt(entries, index, { ...entry, data }) : entries;
     }
     default:
       return entries;
   }
+}
+
+/** The frame creates missing objects and refuses traversal into scalars or arrays. */
+function patchField(data: JournalEntry['data'], field: string, change: (value: Json | undefined) => Json | undefined): JournalEntry['data'] | null {
+  const parts = field.split('.');
+  if (parts.some((part) => !part)) return null;
+  const descend = (value: Json | undefined, at: number): Json | undefined => {
+    if (at === parts.length) return change(value);
+    if (value !== null && value !== undefined && (typeof value !== 'object' || Array.isArray(value))) return undefined;
+    const object = (value ?? {}) as JournalEntry['data'];
+    const part = parts[at]!;
+    const current = Object.prototype.hasOwnProperty.call(object, part) ? object[part] : undefined;
+    const next = descend(current, at + 1);
+    return next === undefined ? undefined : { ...object, [part]: next };
+  };
+  return descend(data, 0) as JournalEntry['data'] | undefined ?? null;
 }
 
 function replaceAt(entries: readonly JournalEntry[], index: number, entry: JournalEntry): readonly JournalEntry[] {
@@ -76,14 +92,14 @@ function patchSeq(patch: JournalPatch): number {
 
 /**
  * Merge the patches that arrived while a read was in flight into the read's result.
- * Mechanical rule (see the module comment): creates newer than the read are applied; edits to
- * entries the read returned are dropped; edits to entries created after the read are applied.
+ * Revisions prevent replaying edits already in the snapshot. The sequence fallback supports
+ * older frames; their buffered completion events are reconciled by JournalView.load.
  */
-export function mergeBuffered(read: readonly JournalEntry[], buffered: readonly JournalPatch[]): readonly JournalEntry[] {
+export function mergeBuffered(read: readonly JournalEntry[], buffered: readonly JournalPatch[], revision?: number): readonly JournalEntry[] {
   const readMax = read.length ? read[read.length - 1]!.seq : 0;
   let entries = read;
   for (const patch of buffered) {
-    if (patchSeq(patch) <= readMax) continue;
+    if (revision !== undefined && patch.rev !== undefined ? patch.rev <= revision : patchSeq(patch) <= readMax) continue;
     entries = applyPatch(entries, patch);
   }
   return entries;
@@ -110,6 +126,7 @@ export class JournalView {
   private stopReconnect: (() => void) | null = null;
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
   private readGeneration = 0;
+  private revision = 0;
   refs = 0;
 
   constructor(client: Client, sessionId: string) {
@@ -128,6 +145,8 @@ export class JournalView {
   }
 
   stop(): void {
+    this.readGeneration++;
+    this.buffer = null;
     this.unsubscribe?.();
     this.stopReconnect?.();
     if (this.notifyTimer) clearTimeout(this.notifyTimer);
@@ -148,20 +167,30 @@ export class JournalView {
     const generation = ++this.readGeneration;
     this.buffer = [];
     try {
-      const result = await this.client.call<{ entries: JournalEntry[] }>('frame.journal.read', {
+      const result = await this.client.call<{ entries: JournalEntry[]; rev?: number }>('frame.journal.read', {
         session_id: this.sessionId,
       });
       if (generation !== this.readGeneration) return;
       const read = [...result.entries].sort((a, b) => a.seq - b.seq);
-      const merged = mergeBuffered(read, this.buffer ?? []);
+      const buffered = this.buffer ?? [];
+      const merged = mergeBuffered(read, buffered, result.rev);
+      this.revision = buffered.reduce((revision, patch) => Math.max(revision, patch.rev ?? 0), result.rev ?? 0);
       this.buffer = null;
       this.set({ status: 'ready', entries: merged }, true);
+      // Older frames lack revisions: refresh any completion they may have buffered.
+      for (const patch of buffered) {
+        if ((result.rev === undefined || patch.rev === undefined) && patch.op === 'set' && patch.field === 'streaming' && patch.value === false) void this.refreshEntry(patch.seq);
+      }
     } catch (error) {
       if (generation !== this.readGeneration) return;
       const buffered = this.buffer ?? [];
       this.buffer = null;
       let entries = this.snapshot.entries;
-      for (const patch of buffered) entries = applyPatch(entries, patch);
+      for (const patch of buffered) {
+        if (patch.rev !== undefined && patch.rev <= this.revision) continue;
+        entries = applyPatch(entries, patch);
+        this.revision = Math.max(this.revision, patch.rev ?? 0);
+      }
       this.set({ status: 'error', entries, error: error instanceof Error ? error.message : String(error) }, true);
     }
   }
@@ -172,21 +201,26 @@ export class JournalView {
       this.buffer.push(patch);
       return;
     }
+    if (patch.rev !== undefined && patch.rev <= this.revision) return;
     const entries = applyPatch(this.snapshot.entries, patch);
+    this.revision = Math.max(this.revision, patch.rev ?? 0);
     if (entries !== this.snapshot.entries) this.set({ ...this.snapshot, entries }, false);
-    if (patch.op === 'set' && patch.field === 'streaming' && patch.value === false) {
+    if (patch.rev === undefined && patch.op === 'set' && patch.field === 'streaming' && patch.value === false) {
       void this.refreshEntry(patch.seq);
     }
   }
 
   /** Take the frame's copy of a finished entry (repairs an edit dropped during a read). */
   private async refreshEntry(seq: number): Promise<void> {
+    const generation = this.readGeneration;
+    const revision = this.revision;
     try {
       const result = await this.client.call<{ entries: JournalEntry[] }>('frame.journal.read', {
         session_id: this.sessionId,
         from: seq,
       });
       const fresh = result.entries.find((entry) => entry.seq === seq);
+      if (generation !== this.readGeneration || revision !== this.revision) return;
       if (!fresh || fresh.data.streaming === true) return;
       const index = findIndex(this.snapshot.entries, seq);
       if (index < 0) return;

@@ -1,0 +1,38 @@
+# CortexCode's configuration inside the app bundle (`Contents/Resources/cortex.toml`), read by the
+# frame (`Contents/MacOS/CortexCode`). The same file runs the macOS app and the development start
+# (`./cortexcode` builds the same app into build/). Relative paths resolve against this file, and the
+# plugins run with this folder as their working directory.
+#
+# Schema (the frame rejects unknown keys):
+#   [frame]
+#   home = "~/.cortexcode"   # CORTEX_HOME unless the env var overrides it
+#   port = 0                 # 0 = pick a free port (written to <home>/run/frame.json)
+#   ui = true                # spawn the Electron shell after plugins are active
+#   ui_dir = "ui"            # the Electron shell, renderer and Electron itself
+#   packages = "packages"    # the app's prebuilt plugins (<id>@<version>.ccplugin), installed at start
+#   code = "~/.cortexcode/code"  # the code folder (default <home>/code; `--safe` ignores it)
+#
+#   [plugin.<id>]            # optional overrides of what plugin <id>'s package declares
+#   args = []
+#   hello_timeout_ms = 60000
+#   probe_timeout_ms = 120000
+#   [plugin.<id>.config]     # merged over the package's [backend.config]
+
+[frame]
+home = "~/.cortexcode"
+port = 0
+ui = true
+ui_dir = "ui"
+packages = "packages"
+
+# cx and cortex-pack, copied into <home>/bin for the model's shells (plugins are built and installed
+# from the code folder with them).
+[plugin.tools.config]
+cx_path = "bin/cx"
+pack_path = "bin/cortex-pack"
+
+# The code folder (<home>/code) is created from the source the app carries and updated from it at
+# every start; approved code changes are built with this packer.
+[plugin.source-manager.config]
+shipped_source = "source"
+packer = "bin/cortex-pack"

@@ -126,6 +126,10 @@ pub struct CheckResult {
     /// failure the worker can fix either.
     #[serde(default)]
     pub indeterminate: bool,
+    /// A failed check whose output is a test report naming every failing test: those names (None
+    /// otherwise). The work is compared by them with the run before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tests: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

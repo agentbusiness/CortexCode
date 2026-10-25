@@ -129,7 +129,7 @@ pub fn shebang_interpreter(line: &str) -> Option<String> {
 /// The language plugin for a workspace file (its category).
 pub async fn plugin_for(host: &dyn Host, absolute: &Path) -> Option<String> {
     let plugins = plugins(host).await;
-    let first_line = std::fs::read(absolute).ok().and_then(|bytes| {
+    let first_line = crate::util::read_host_file(absolute).ok().and_then(|bytes| {
         let end = bytes.iter().position(|b| *b == b'\n').unwrap_or(bytes.len()).min(256);
         String::from_utf8(bytes[..end].to_vec()).ok()
     });

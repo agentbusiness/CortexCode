@@ -57,7 +57,7 @@ checks instant. Nothing is downloaded at startup for a variant that is not insta
 |---|---|---|
 | `variant` | `bonsai2-27b-pq2` | catalog id |
 | `models_dir` | `$CORTEX_HOME/models` | where variants live |
-| `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total` | measured | operator limits and benchmark overrides |
+| `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total` | measured | operator limits and overrides |
 
 ## Memory fit (`backend/src/fit.rs`)
 

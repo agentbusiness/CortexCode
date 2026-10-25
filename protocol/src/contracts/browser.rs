@@ -122,6 +122,12 @@ pub struct ConsoleMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsoleResult {
     pub messages: Vec<ConsoleMessage>,
+    /// Older entries omitted by the bounded live history.
+    #[serde(default)]
+    pub omitted: u64,
+    /// Page-controlled fields clipped to the per-field retention limit.
+    #[serde(default)]
+    pub clipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +147,12 @@ pub struct NetworkEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetworkResult {
     pub entries: Vec<NetworkEntry>,
+    /// Older entries omitted by the bounded live history.
+    #[serde(default)]
+    pub omitted: u64,
+    /// Page-controlled fields clipped to the per-field retention limit.
+    #[serde(default)]
+    pub clipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

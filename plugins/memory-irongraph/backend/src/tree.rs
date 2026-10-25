@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
@@ -82,8 +82,10 @@ pub struct CodeTree {
     pub model: RwLock<Model>,
     pub lines: LineStore,
     pub status: Mutex<TreeStatus>,
-    /// Serialises syncs of this tree.
+    /// Serialises indexing preparation and writes of this tree.
     sync_lock: Mutex<()>,
+    /// A write that failed or was cancelled must be reconciled before content can be skipped.
+    sync_pending: AtomicBool,
     /// Outgoing-edge hash per file as stored in the graph (`File.edge_hash`).
     edge_hashes: Mutex<HashMap<String, String>>,
     /// Directory structure hash as stored (`Repo.structure_hash`).
@@ -343,15 +345,27 @@ fn probe_text(props: &Map<String, Value>) -> Option<String> {
 impl CodeTree {
     pub async fn open(root: PathBuf, ig_name: String, graph: Arc<Graph>, lines_dir: PathBuf, langs: Arc<Languages>) -> Result<Arc<Self>, RpcError> {
         let ig_id = graph.ensure_project(&ig_name).await?;
+        let lines = LineStore::new(lines_dir);
+        // This tree is not exposed yet: collect old sessions' entries without an indexing or
+        // model lock. Ordinary saves never walk the line store.
+        let rows = graph.run(&ig_id, &format!("{} MATCH (f:File) RETURN f.content_hash", layer::OBSERVED_READ), Map::new()).await?;
+        let live: HashSet<String> = rows.column(0).filter_map(Value::as_str).map(str::to_owned).collect();
+        let cleanup = lines.clone();
+        match tokio::task::spawn_blocking(move || cleanup.retain(&live)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "line store cleanup failed"),
+            Err(error) => tracing::warn!(%error, "line store cleanup task failed"),
+        }
         Ok(Arc::new(Self {
             model: RwLock::new(Model::new(root.clone())),
             root,
             ig_name,
             ig_id,
             graph,
-            lines: LineStore::new(lines_dir),
+            lines,
             status: Mutex::new(TreeStatus { state: "indexing".into(), externals_state: "pending".into(), ..TreeStatus::default() }),
             sync_lock: Mutex::new(()),
+            sync_pending: AtomicBool::new(false),
             edge_hashes: Mutex::new(HashMap::new()),
             structure_hash: Mutex::new(String::new()),
             indexes_created: Mutex::new(false),
@@ -375,6 +389,13 @@ impl CodeTree {
     /// graph in line with the tree (only differences are written when the graph already holds an
     /// earlier index of it).
     pub async fn full_index(&self) -> Result<SyncReport, RpcError> {
+        let _guard = self.sync_lock.lock().await;
+        self.full_index_owned().await
+    }
+
+    /// The existing sync gate owns preparation as well as persistence, so concurrent refreshes
+    /// cannot compare against an older model and then publish out of order.
+    async fn full_index_owned(&self) -> Result<SyncReport, RpcError> {
         let started = Instant::now();
         let snapshot = self.langs.snapshot().await;
         self.note_plugins(&snapshot).await;
@@ -389,48 +410,41 @@ impl CodeTree {
         let parse_ms = started.elapsed().as_millis() as u64;
         // What the graph already holds.
         let existing = self
-            .run(&format!("{} MATCH (f:File) RETURN f.path, f.content_hash, f.edge_hash, f.language, f.extractor, f.extractor_version", layer::OBSERVED_READ), Map::new())
+            .run(&format!("{} MATCH (f:File) RETURN f.path, f.content_hash, f.language, f.extractor, f.extractor_version", layer::OBSERVED_READ), Map::new())
             .await?;
         let mut stored: HashMap<String, StoredFile> = HashMap::new();
-        {
-            let mut hashes = self.edge_hashes.lock().await;
-            hashes.clear();
-            for row in &existing.rows {
-                let text = |i: usize| row.get(i).and_then(|v| v.as_str()).map(str::to_owned);
-                if let (Some(path), Some(content_hash)) = (text(0), text(1)) {
-                    if let Some(edge_hash) = text(2) {
-                        hashes.insert(path.clone(), edge_hash);
-                    }
-                    stored.insert(path, StoredFile { content_hash, language: text(3).unwrap_or_default(), extractor: text(4), extractor_version: text(5) });
-                }
+        for row in &existing.rows {
+            let text = |i: usize| row.get(i).and_then(|v| v.as_str()).map(str::to_owned);
+            if let (Some(path), Some(content_hash)) = (text(0), text(1)) {
+                stored.insert(path, StoredFile { content_hash, language: text(2).unwrap_or_default(), extractor: text(3), extractor_version: text(4) });
             }
         }
-        if !existing.rows.is_empty() {
-            *self.indexes_created.lock().await = true;
-            let repo = self.run(&format!("{} MATCH (r:Repo) RETURN r.structure_hash", layer::OBSERVED_READ), Map::new()).await?;
-            *self.structure_hash.lock().await = repo.rows.first().and_then(|r| r.first()).and_then(|v| v.as_str()).unwrap_or("").to_owned();
-        }
+        // Rebuild outgoing edges on reconciliation/cold passes, including a previous process
+        // that stopped after writing File metadata but before writing its edges.
+        let repairing = self.sync_pending.load(Ordering::Acquire);
+        self.invalidate_write_caches().await;
+        self.sync_pending.store(true, Ordering::Release);
         let on_disk: HashSet<String> = parsed.iter().map(|(f, _)| f.path.clone()).collect();
-        let deleted: Vec<String> = stored.keys().filter(|p| !on_disk.contains(*p)).cloned().collect();
+        let mut model = self.model.read().await.clone();
+        let deleted: Vec<String> = stored.keys().chain(model.files.keys()).filter(|p| !on_disk.contains(*p)).cloned().collect::<BTreeSet<_>>().into_iter().collect();
         let mut changed: Vec<(FileFacts, String)> = Vec::new();
         {
-            let mut model = self.model.write().await;
             model.files.clear();
             for (facts, text) in parsed {
                 let previous = stored.get(&facts.path);
                 let facts = keep_extracted(facts, previous);
-                let unchanged = matches!(facts.origin, Origin::Kept { .. }) || previous.is_some_and(|p| p.same_as(&facts));
+                let unchanged = matches!(facts.origin, Origin::Kept { .. }) || (!repairing && previous.is_some_and(|p| p.same_as(&facts)));
                 // The line store may have been cleaned independently; keep it complete.
                 if unchanged {
-                    let _ = self.lines.put(&facts.content_hash, &text);
+                    self.lines.put(&facts.content_hash, &text).map_err(|e| RpcError::internal(format!("line store: {e}")))?;
                     model.files.insert(facts.path.clone(), Arc::new(facts));
                 } else {
                     changed.push((facts, text));
                 }
             }
         }
-        self.load_history().await;
-        let mut report = self.sync(changed, deleted).await?;
+        (model.commits, model.history) = self.read_history().await;
+        let mut report = self.sync_prepared(changed, deleted, model).await?;
         if let Err(error) = self.drop_code().await {
             tracing::warn!(%error, "removing stored definition code failed");
         }
@@ -447,6 +461,10 @@ impl CodeTree {
     /// When the language plugins changed since the files were matched, the files whose plugin
     /// changed come along ([`CodeTree::recover`]).
     pub async fn refresh_paths(&self, paths: &[String]) -> Result<SyncReport, RpcError> {
+        let _guard = self.sync_lock.lock().await;
+        if self.sync_pending.load(Ordering::Acquire) || paths.iter().any(|path| crate::watch::changes_membership(&self.root, &self.root.join(path))) {
+            return self.full_index_owned().await;
+        }
         let snapshot = self.langs.snapshot().await;
         let coverage = if self.coverage_key.lock().await.as_deref() == Some(snapshot.key.as_str()) { Vec::new() } else { self.coverage_changes(&snapshot).await };
         self.reindex(&snapshot, paths, coverage).await
@@ -456,6 +474,10 @@ impl CodeTree {
     /// (text, failed, kept) and one covers now, and files whose plugin is another one or another
     /// version, are extracted again. Nothing to do when the plugins did not change.
     pub async fn recover(&self) -> Result<SyncReport, RpcError> {
+        let _guard = self.sync_lock.lock().await;
+        if self.sync_pending.load(Ordering::Acquire) {
+            return self.full_index_owned().await;
+        }
         let snapshot = self.langs.snapshot().await;
         if self.coverage_key.lock().await.as_deref() == Some(snapshot.key.as_str()) {
             return Ok(SyncReport::default());
@@ -512,10 +534,8 @@ impl CodeTree {
             let mut present = Vec::new();
             let mut deleted = Vec::new();
             for rel in wanted {
-                if root.join(&rel).is_file() {
-                    if indexed_name(&rel) && included(&root, &rel) {
-                        present.push(rel);
-                    }
+                if root.join(&rel).is_file() && indexed_name(&rel) && included(&root, &rel) {
+                    present.push(rel);
                 } else {
                     deleted.push(rel);
                 }
@@ -541,13 +561,15 @@ impl CodeTree {
             let deleted: Vec<String> = deleted.into_iter().filter(|p| model.files.contains_key(p)).collect();
             (changed, deleted)
         };
-        // Every file whose plugin changed is in this pass: the tree is matched to `snapshot` now.
-        *self.coverage_key.lock().await = Some(snapshot.key.clone());
         if changed.is_empty() && deleted.is_empty() {
+            *self.coverage_key.lock().await = Some(snapshot.key.clone());
             return Ok(SyncReport { total_ms: started.elapsed().as_millis() as u64, ..SyncReport::default() });
         }
         let parse_ms = started.elapsed().as_millis() as u64;
-        let mut report = self.sync(changed, deleted).await?;
+        let model = self.model.read().await.clone();
+        let mut report = self.sync_prepared(changed, deleted, model).await?;
+        // Coverage advances only after the corresponding facts reach the graph.
+        *self.coverage_key.lock().await = Some(snapshot.key.clone());
         report.parse_ms = parse_ms;
         report.total_ms = started.elapsed().as_millis() as u64;
         Ok(report)
@@ -556,6 +578,35 @@ impl CodeTree {
     /// Apply parsed changes and deletions to the model and the graph.
     pub async fn sync(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>) -> Result<SyncReport, RpcError> {
         let _guard = self.sync_lock.lock().await;
+        if self.sync_pending.load(Ordering::Acquire) {
+            return self.full_index_owned().await;
+        }
+        let model = self.model.read().await.clone();
+        self.sync_prepared(changed, deleted, model).await
+    }
+
+    async fn invalidate_write_caches(&self) {
+        self.edge_hashes.lock().await.clear();
+        self.shared_hashes.lock().await.clear();
+        self.structure_hash.lock().await.clear();
+        *self.summary_hashes.lock().await = None;
+        self.summary_reach.lock().await.clear();
+        *self.coverage_key.lock().await = None;
+    }
+
+    async fn sync_prepared(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>, model: Model) -> Result<SyncReport, RpcError> {
+        // Leave this set on error or cancellation: the next refresh reconciles all persisted work.
+        self.sync_pending.store(true, Ordering::Release);
+        let result = self.write_sync(changed, deleted, model).await;
+        if result.is_ok() {
+            self.sync_pending.store(false, Ordering::Release);
+        } else {
+            self.invalidate_write_caches().await;
+        }
+        result
+    }
+
+    async fn write_sync(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>, mut model: Model) -> Result<SyncReport, RpcError> {
         let started = Instant::now();
         let mut report = SyncReport { files_changed: changed.len(), files_deleted: deleted.len(), ..SyncReport::default() };
         report.changed_paths = changed.iter().map(|(f, _)| f.path.clone()).chain(deleted.iter().cloned()).collect();
@@ -566,14 +617,13 @@ impl CodeTree {
         // 1. Model update and full re-resolution (cheap, parallel); only differing edge sets are written.
         let resolve_started = Instant::now();
         let (new_nodes, shared_nodes, all_edges, structure, kept, packages) = {
-            let mut model = self.model.write().await;
             for path in &deleted {
                 model.files.remove(path);
             }
             for (facts, _) in changed {
                 model.files.insert(facts.path.clone(), Arc::new(facts));
             }
-            let model = &*model;
+            let model = &model;
             let index = Index::build(model);
             let all_edges: Vec<(String, Vec<EdgeRow>, String)> = model
                 .files
@@ -604,7 +654,6 @@ impl CodeTree {
             let kept: HashSet<String> = model.files.values().filter(|f| matches!(f.origin, Origin::Kept { .. })).map(|f| f.path.clone()).collect();
             (new_nodes, shared.into_values().collect::<Vec<_>>(), all_edges, structure, kept, index.packages())
         };
-        self.status.lock().await.packages = packages;
         report.resolve_ms = resolve_started.elapsed().as_millis() as u64;
         let write_started = Instant::now();
         let mut statements = 0usize;
@@ -690,7 +739,6 @@ impl CodeTree {
         // Source sids of dirty files that already exist in the graph (new nodes have no edges yet).
         let mut dirty_sources: Vec<String> = Vec::new();
         {
-            let model = self.model.read().await;
             for (path, _, _) in &dirty {
                 if let Some(facts) = model.files.get(path) {
                     for row in model::file_nodes(facts) {
@@ -710,7 +758,7 @@ impl CodeTree {
         // 6b. Summaries (src/summary.rs), recomposed only for definitions whose words may have
         // changed: those of changed files, and those the words of re-resolved files reach (now or
         // before). Written only when the text differs from the stored one.
-        let mut pending = self.summaries(&all_edges, &changed_paths, &dirty, &deleted).await?;
+        let mut pending = self.summaries(&model, &all_edges, &changed_paths, &dirty, &deleted).await?;
         let mut summary_updates: Vec<(u64, u64)> = Vec::with_capacity(pending.len());
 
         // 7. Upsert nodes whose properties changed. Symbols first: IronGraph embeds in write order,
@@ -865,15 +913,10 @@ impl CodeTree {
         report.write_ms = write_started.elapsed().as_millis() as u64;
         report.total_ms = started.elapsed().as_millis() as u64;
         *self.edge_total.lock().await = all_edges.iter().map(|(_, e, _)| e.len() as u64).sum::<u64>() + dir_edge_count;
+        // Publish facts only after every fallible graph write has succeeded.
+        *self.model.write().await = model;
+        self.status.lock().await.packages = packages;
         self.update_status(report.total_ms).await;
-        // Line store entries no file references any more.
-        {
-            let model = self.model.read().await;
-            if !deleted.is_empty() || !changed_paths.is_empty() {
-                let live: HashSet<String> = model.files.values().map(|f| f.content_hash.clone()).collect();
-                let _ = self.lines.retain(&live);
-            }
-        }
         Ok(report)
     }
 
@@ -881,6 +924,7 @@ impl CodeTree {
     /// The first sync of a tree loads the stored hashes and considers every definition.
     async fn summaries(
         &self,
+        model: &Model,
         all_edges: &[(String, Vec<EdgeRow>, String)],
         changed_paths: &[String],
         dirty: &[&(String, Vec<EdgeRow>, String)],
@@ -892,8 +936,7 @@ impl CodeTree {
             *stored_guard = Some(self.stored_summary_hashes().await?);
         }
         let Some(stored) = stored_guard.as_ref() else { return Ok(HashMap::new()) };
-        let model = self.model.read().await;
-        let (heard, reach) = summary::heard(&model, all_edges);
+        let (heard, reach) = summary::heard(model, all_edges);
         let mut pending: HashMap<String, (Option<String>, u64)> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut consider = |sid: String, symbol: &crate::facts::SymbolFact| {
@@ -932,7 +975,7 @@ impl CodeTree {
             reached.extend(reach.iter().map(|(path, sids)| (path.to_string(), sids.iter().map(|sid| sid.to_string()).collect())));
         }
         for sid in targets {
-            if let Some(symbol) = summary::lookup(&model, &sid) {
+            if let Some(symbol) = summary::lookup(model, &sid) {
                 consider(sid, symbol);
             }
         }
@@ -1091,31 +1134,25 @@ impl CodeTree {
 impl CodeTree {
     /// Read the git history of the tree (read-only `git log`; nothing is written to the repository).
     /// Each indexed file gets MODIFIED_IN edges to the commits that changed it.
-    pub async fn load_history(&self) {
+    async fn read_history(&self) -> History {
         let root = self.root.clone();
-        let parsed = tokio::task::spawn_blocking(move || read_history(&root)).await.ok().flatten();
-        let mut model = self.model.write().await;
-        match parsed {
-            Some((commits, history)) => {
-                model.commits = commits;
-                model.history = history;
-            }
-            None => {
-                model.commits.clear();
-                model.history.clear();
-            }
-        }
+        tokio::task::spawn_blocking(move || read_history(&root)).await.ok().flatten().unwrap_or_default()
     }
 
     /// Reload history after the repository's HEAD moved, and write the new edges.
     pub async fn refresh_history(&self) -> Result<SyncReport, RpcError> {
-        let before = self.model.read().await.commits.first().map(|c| c.sha.clone());
-        self.load_history().await;
-        let after = self.model.read().await.commits.first().map(|c| c.sha.clone());
-        if before == after {
+        let _guard = self.sync_lock.lock().await;
+        if self.sync_pending.load(Ordering::Acquire) {
+            return self.full_index_owned().await;
+        }
+        let mut model = self.model.read().await.clone();
+        let (commits, history) = self.read_history().await;
+        if model.commits.first().map(|c| &c.sha) == commits.first().map(|c| &c.sha) {
             return Ok(SyncReport::default());
         }
-        self.sync(Vec::new(), Vec::new()).await
+        model.commits = commits;
+        model.history = history;
+        self.sync_prepared(Vec::new(), Vec::new(), model).await
     }
 }
 
@@ -1165,17 +1202,52 @@ pub fn included(root: &Path, rel: &str) -> bool {
             return false;
         }
     }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    // Every .gitignore from the root down to the file's directory, plus the repo exclude file.
+    let absolute = root.join(rel);
+    let mut directories = vec![root.to_path_buf()];
     let mut dir = root.to_path_buf();
-    let _ = builder.add(root.join(".git").join("info").join("exclude"));
-    let _ = builder.add(dir.join(".gitignore"));
     for seg in &segments[..segments.len().saturating_sub(1)] {
         dir.push(seg);
-        let _ = builder.add(dir.join(".gitignore"));
+        directories.push(dir.clone());
     }
-    let Ok(matcher) = builder.build() else { return true };
-    !matcher.matched_path_or_any_parents(root.join(rel), false).is_ignore()
+    let load = |dir: &Path, name: &str| {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+        let _ = builder.add(dir.join(name));
+        builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+    };
+    // Each matcher has its own base, so a nested /pattern is relative to that directory.
+    let rules: Vec<_> = [".ignore", ".gitignore"].iter().map(|name| directories.iter().map(|dir| load(dir, name)).collect::<Vec<_>>()).collect();
+    let exclude = load(root, ".git/info/exclude");
+    let (global, _) = ignore::gitignore::GitignoreBuilder::new(root).build_global();
+    let mut path = root.to_path_buf();
+    // Check parents before their descendants: a whitelist inside an ignored directory must
+    // not make it searchable when the full scan cannot enter that directory.
+    for (depth, segment) in segments.iter().enumerate() {
+        path.push(segment);
+        let is_dir = depth + 1 < segments.len() || absolute.is_dir();
+        let mut matched = ignore::Match::None;
+        // .ignore takes precedence over gitignore, then deeper files over shallower ones.
+        for matchers in &rules {
+            for matcher in matchers[..=depth.min(matchers.len() - 1)].iter().rev() {
+                matched = matcher.matched(&path, is_dir);
+                if !matched.is_none() {
+                    break;
+                }
+            }
+            if !matched.is_none() {
+                break;
+            }
+        }
+        if matched.is_none() {
+            matched = exclude.matched(&path, is_dir);
+        }
+        if matched.is_none() {
+            matched = global.matched(&path, is_dir);
+        }
+        if matched.is_ignore() {
+            return false;
+        }
+    }
+    true
 }
 
 /// A summary's hash as stored: hex, or null when there is no summary.

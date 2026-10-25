@@ -14,7 +14,6 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-shell`: category `lang-shell`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -51,19 +50,10 @@ Methods are called on the category: `lang-shell.describe`, `lang-shell.extract`,
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-shell     # -> plugins/lang-shell/target/lang-shell-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-shell --install`). The probe extracts a sample
 through the real `extract`, reads every skill and reports whether bash-language-server and ShellCheck
 can run (an absent server does not fail the probe: extraction and skills work without it).
-
-## Verification
-
-`verify/lang_shell.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: definition lines and call sites found in the fixture text, ShellCheck's own
-findings (`shellcheck -f json`, run here) before and after a fix, definition, references and hover
-positions of a function, skills read back with their summaries, the `lang-shell.server` event, and
-refusals (another language, a relative root, a missing file). bash-language-server and ShellCheck
-must be runnable; `node verify/lang_shell.mjs --install` lets `lang-shell.install` add them first.

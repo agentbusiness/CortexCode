@@ -480,11 +480,14 @@ impl Worker {
 
     fn run(&mut self) {
         let mut stalled = false;
+        // A quiet deadline wakes admission once; a request that still cannot start then waits
+        // for a state-changing command instead of polling the expired deadline.
+        let mut idle_room_checked = None;
         loop {
             // Block for a command only when nothing runs and nothing waiting can start.
             let idle = self.active.is_empty() && (self.waiting.is_empty() || stalled);
             // An idle-only generation waiting for the quiet period wakes the worker when it ends.
-            let wake = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER);
+            let wake = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER).filter(|at| Some(*at) != idle_room_checked);
             let command = if idle && !self.shutting_down {
                 let received = match wake {
                     Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
@@ -522,7 +525,12 @@ impl Worker {
                 self.stop_all();
                 break;
             }
+            let admission_at = Instant::now();
             self.admit();
+            let quiet_at = self.last_work + IDLE_ROOM_AFTER;
+            if admission_at >= quiet_at {
+                idle_room_checked = Some(quiet_at);
+            }
             stalled = self.active.is_empty() && !self.waiting.is_empty();
             if !self.active.is_empty() {
                 self.step();
@@ -764,9 +772,10 @@ impl Worker {
         }
     }
 
+    /// Queued idle-only generations yield in admission order; running generations still block.
     fn serving_other(&self, key: &str) -> bool {
         let real = |request: &Request| request.key != key && !matches!(request.work, Work::Prewarm);
-        self.active.iter().any(|active| real(&active.request)) || self.waiting.iter().any(|request| real(request))
+        self.active.iter().any(|active| real(&active.request)) || self.waiting.iter().any(|request| real(request) && !idle_generation(request))
     }
 
     fn stop_idle_prewarms(&mut self, key: &str) {

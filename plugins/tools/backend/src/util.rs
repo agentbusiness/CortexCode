@@ -1,7 +1,9 @@
 //! Small shared helpers: ids, content hashes, path resolution and atomic file writes.
 
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 /// A short random id with a prefix, e.g. `a-3f9c0d1e2b4a`.
@@ -212,6 +214,105 @@ pub fn display_rel(path: &Path, base: &Path) -> String {
             }
         }
     }
+}
+
+/// Resolve the opened object, rather than a path a command can replace after validation.
+fn descriptor_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes to this live descriptor's buffer.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = buffer.iter().position(|byte| *byte == 0).ok_or_else(|| std::io::Error::other("opened path is not terminated"))?;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "host file access needs macOS descriptor path verification"))
+    }
+}
+
+pub fn open_host_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    let actual = descriptor_path(&file)?;
+    if crate::sandbox::host_control_read_denied(&actual) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "app control files are private; use cx for command access"));
+    }
+    Ok(file)
+}
+
+pub fn read_host_file(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    let mut file = open_host_read(path.as_ref())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub fn read_host_text(path: impl AsRef<Path>) -> std::io::Result<String> {
+    let mut file = open_host_read(path.as_ref())?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Open a parent directory by descriptor, checking every newly created path before mutating it.
+fn checked_parent(path: &Path, create: bool, allowed: &impl Fn(&Path) -> bool) -> std::io::Result<(std::fs::File, std::ffi::CString)> {
+    let target = normalize(&if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) });
+    let parent = target.parent().ok_or_else(|| std::io::Error::other("file has no parent"))?;
+    let name = target.file_name().ok_or_else(|| std::io::Error::other("file has no name"))?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| std::io::Error::other("file name contains NUL"))?;
+    let mut directory = std::fs::File::open("/")?;
+    for component in parent.components() {
+        let Component::Normal(component) = component else { continue };
+        let next_path = descriptor_path(&directory)?.join(component);
+        let component = std::ffi::CString::new(component.as_bytes()).map_err(|_| std::io::Error::other("directory name contains NUL"))?;
+        // SAFETY: directory and CString remain alive throughout each descriptor-relative call.
+        let mut fd = unsafe { libc::openat(directory.as_raw_fd(), component.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if create && fd == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            if !allowed(&next_path) { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "app control paths are managed by the app")); }
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o755) } == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(error); }
+            }
+            fd = unsafe { libc::openat(directory.as_raw_fd(), component.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        }
+        if fd == -1 { return Err(std::io::Error::last_os_error()); }
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let actual = descriptor_path(&directory)?.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+    if !allowed(&actual) { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "app control paths are managed by the app")); }
+    Ok((directory, name))
+}
+
+/// Native model/editor writes cannot cross into app control paths through a replaced symlink.
+pub fn atomic_write_checked(path: &Path, bytes: &[u8], allowed: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+    let target = canonical_lenient(path);
+    let permissions = std::fs::metadata(&target).ok().map(|metadata| metadata.permissions());
+    let (directory, name) = checked_parent(&target, true, &allowed)?;
+    let temporary = std::ffi::CString::new(format!(".cortex-{}", uuid::Uuid::new_v4().simple())).expect("ASCII temporary name");
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), temporary.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o666) };
+    if fd == -1 { return Err(std::io::Error::last_os_error()); }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let result = (|| {
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions { file.set_permissions(permissions)?; }
+        file.sync_all()?;
+        let actual = descriptor_path(&directory)?.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        if !allowed(&actual) { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "app control paths are managed by the app")); }
+        if unsafe { libc::renameat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), name.as_ptr()) } == -1 { return Err(std::io::Error::last_os_error()); }
+        Ok(())
+    })();
+    if result.is_err() { unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0); } }
+    result
+}
+
+pub fn remove_file_checked(path: &Path, allowed: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+    let (directory, name) = checked_parent(path, false, &allowed)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == -1 { return Err(std::io::Error::last_os_error()); }
+    Ok(())
 }
 
 /// Write a file atomically (temp file in the same directory, then rename), keeping the

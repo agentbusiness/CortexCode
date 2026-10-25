@@ -25,8 +25,6 @@ pub mod methods {
     pub const HOLD: &str = "model.hold";
     /// Warm a cache key's prefix (prefill without generating), e.g. the shared system block.
     pub const PREWARM: &str = "model.prewarm";
-    /// Local OpenAI-compatible HTTP endpoint serving the same weights (used by baseline harnesses).
-    pub const ENDPOINT: &str = "model.endpoint";
     /// Available model variants and the active one (e.g. stock vs. uncensored).
     pub const VARIANTS: &str = "model.variants";
     /// Switch the active variant (reloads weights).
@@ -522,13 +520,6 @@ pub struct PrewarmParams {
     /// must never slow work under way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub idle_only: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EndpointResult {
-    /// e.g. `http://127.0.0.1:18081/v1`
-    pub base_url: String,
-    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

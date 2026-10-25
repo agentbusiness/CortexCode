@@ -16,7 +16,7 @@ const APP_PARTS: &[(&str, &str)] =
     &[("frame/", "frame"), ("ui/shell/", "shell"), ("ui/renderer/", "shell"), ("packer/", "packer"), ("cli/", "cli")];
 
 /// Shared libraries: a change rebuilds every plugin that uses them.
-pub const SHARED: &[&str] = &["protocol/", "lang-kit/", "ui/sdk/"];
+pub const SHARED: &[&str] = &["protocol/", "lang-kit/", "model-kit/", "ui/sdk/"];
 
 /// The plugin a path belongs to (`plugins/<id>/...`).
 pub fn plugin_of(path: &str) -> Option<&str> {
@@ -57,9 +57,7 @@ pub fn plugin_manifests(code: &Path) -> BTreeMap<String, PluginToml> {
     for entry in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path().join("plugin.toml")) else { continue };
         let Ok(manifest) = toml::from_str::<PluginToml>(&text) else { continue };
-        if !manifest.plugin.test_only {
-            out.insert(manifest.plugin.id.clone(), manifest);
-        }
+        out.insert(manifest.plugin.id.clone(), manifest);
     }
     out
 }
@@ -98,7 +96,7 @@ pub fn affected(code: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
     (plugins, parts)
 }
 
-/// Whether plugin `id` builds against `library` (`protocol/`, `lang-kit/`, `ui/sdk/`): its backend's
+/// Whether plugin `id` builds against a shared library: its backend's
 /// Cargo.toml or one of its UI package.json files names the library's folder.
 fn uses_library(code: &Path, id: &str, manifest: &PluginToml, library: &str) -> bool {
     let dir = code.join("plugins").join(id);

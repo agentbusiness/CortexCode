@@ -299,18 +299,6 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
       // (a skill's text, referenced projects) are one line, opened on demand. A task's start is
       // the header of its section (TurnView), not a note.
       if (!str(data.text) || str(data.purpose) === 'task_start') return null;
-      // A benchmark verdict the harness wrote after the hidden tests ran: the outcome, plainly.
-      if (str(data.purpose) === 'verdict') {
-        const passed = data.passed === true;
-        const tests = typeof data.tests_passed === 'number' && typeof data.tests_total === 'number' ? `${data.tests_passed}/${data.tests_total} tests` : '';
-        return (
-          <div className="cx-verdict" data-passed={passed ? 'true' : 'false'} data-seq={entry.seq}>
-            <span className="cx-verdict-mark">{passed ? '✓' : '✗'}</span>
-            <span className="cx-verdict-text">Benchmark {passed ? 'passed' : 'failed'}</span>
-            <span className="cx-verdict-facts">{[`attempt ${String(data.attempt ?? 1)}`, tests, data.final === false ? 'next attempt follows' : ''].filter(Boolean).join(' · ')}</span>
-          </div>
-        );
-      }
       return <p className="cx-note" data-seq={entry.seq}>{str(data.text)}</p>;
     case SPEC:
       return <SpecChange entry={entry} />;

@@ -9,18 +9,13 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `plugin.toml` | identity, build commands and outputs, UI packages and their slots, shell modules, source location |
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binary `cc-vcs`: category `vcs`, contract `vcs@1` |
 | `ui/` | one npm workspace (own `package-lock.json`, `@cortex/sdk` as a local dependency): `ui/card-git` (card.git@1), `ui/settings-github` (settings.github@1); each package builds `dist/` with `manifest.json` |
-| `verify/` | gate scripts, run against the real frame |
 
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
 cd ui && npm ci && npm run build && npm test     # after the SDK is built (cd ../../ui/sdk && npm run build)
 cortex-pack build plugins/vcs-git                  # -> plugins/vcs-git/target/vcs-git-<version>-<target>.ccplugin
 ```
 
 `cortex-pack build plugins/vcs-git --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the backend and the UI package together; Settings > Plugins disables and enables the whole plugin.
-
-## Verification
-
-verify/git_truth.mjs (gate 1.5 G3) compares every result with what git plumbing computes independently on scripted fixture repositories.

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Between two attempts to write a value the store did not take.
 const RETRY: Duration = Duration::from_secs(1);
@@ -21,7 +21,12 @@ const RETRY: Duration = Duration::from_secs(1);
 pub struct Stored<T> {
     path: &'static str,
     value: Mutex<T>,
-    writes: Mutex<Option<mpsc::UnboundedSender<Value>>>,
+    writes: Mutex<Option<mpsc::UnboundedSender<Write>>>,
+}
+
+enum Write {
+    Value(Value),
+    Flush(oneshot::Sender<()>),
 }
 
 impl<T: Serialize + DeserializeOwned + Default + Clone + Send + 'static> Stored<T> {
@@ -44,7 +49,10 @@ impl<T: Serialize + DeserializeOwned + Default + Clone + Send + 'static> Stored<
         // The store's plugin may start after this one: its answer is waited for.
         let stored = loop {
             match ctx.call(methods::SETTINGS_GET, json!({ "path": self.path })).await {
-                Ok(setting) => break setting.get("value").cloned().and_then(|value| serde_json::from_value::<T>(value).ok()),
+                Ok(setting) => {
+                    let value = setting.get("value").cloned().ok_or_else(|| RpcError::internal(format!("{} has no stored value", self.path)))?;
+                    break Some(serde_json::from_value::<T>(value).map_err(|error| RpcError::internal(format!("{} cannot be decoded: {error}", self.path)))?);
+                }
                 Err(error) if error.code == codes::NOT_FOUND => break None,
                 Err(error) if matches!(error.code.as_str(), codes::UNAVAILABLE | codes::CONNECTION_CLOSED | codes::DRAINING) => {
                     tokio::time::sleep(RETRY).await;
@@ -56,19 +64,26 @@ impl<T: Serialize + DeserializeOwned + Default + Clone + Send + 'static> Stored<
             (None, Some(file)) => read_legacy::<T>(file),
             _ => None,
         };
-        *self.lock() = stored.or_else(|| imported.clone()).unwrap_or_default();
-        let (tx, rx) = mpsc::unbounded_channel();
-        spawn_writer(ctx.clone(), self.path, rx);
-        if let Ok(mut writes) = self.writes.lock() {
-            *writes = Some(tx);
-        }
+        let value = stored.or_else(|| imported.clone()).unwrap_or_default();
         if imported.is_some() {
-            self.write(&self.get());
+            // The legacy file remains the recovery copy until the store confirms the exact value.
+            let encoded = serde_json::to_value(&value).map_err(|error| RpcError::internal(error.to_string()))?;
+            ctx.call(methods::SETTINGS_SET, json!({ "path": self.path, "value": encoded, "by": "plugin" })).await?;
+            let readback = ctx.call(methods::SETTINGS_GET, json!({ "path": self.path })).await?;
+            if readback.get("value") != Some(&encoded) {
+                return Err(RpcError::internal(format!("{} migration was not confirmed; the legacy file was kept", self.path)));
+            }
             if let Some(file) = legacy
                 && let Err(error) = std::fs::remove_file(&file)
             {
                 tracing::warn!(file = %file.display(), %error, "cannot remove the imported record file");
             }
+        }
+        *self.lock() = value;
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_writer(ctx.clone(), self.path, rx);
+        if let Ok(mut writes) = self.writes.lock() {
+            *writes = Some(tx);
         }
         Ok(())
     }
@@ -78,13 +93,20 @@ impl<T: Serialize + DeserializeOwned + Default + Clone + Send + 'static> Stored<
         self.lock().clone()
     }
 
+    /// Wait for changes already queued, before handing this record to a replacement process.
+    pub async fn flush(&self) -> Result<(), RpcError> {
+        let writer = self.writes.lock().ok().and_then(|writes| writes.clone())
+            .ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "the record writer has not started"))?;
+        let (tx, rx) = oneshot::channel();
+        writer.send(Write::Flush(tx)).map_err(|_| RpcError::new(codes::UNAVAILABLE, "the record writer stopped"))?;
+        rx.await.map_err(|_| RpcError::new(codes::UNAVAILABLE, "the record writer stopped before changes were durable"))
+    }
+
     /// Change the record and write it through; returns what `change` returns.
     pub fn update<R>(&self, change: impl FnOnce(&mut T) -> R) -> R {
-        let (result, value) = {
-            let mut value = self.lock();
-            let result = change(&mut value);
-            (result, value.clone())
-        };
+        // Mutation and publication share one order; a later snapshot cannot enqueue first.
+        let mut value = self.lock();
+        let result = change(&mut value);
         self.write(&value);
         result
     }
@@ -93,7 +115,7 @@ impl<T: Serialize + DeserializeOwned + Default + Clone + Send + 'static> Stored<
         let Ok(json) = serde_json::to_value(value) else { return };
         match self.writes.lock().ok().and_then(|writes| writes.clone()) {
             Some(writes) => {
-                let _ = writes.send(json);
+                let _ = writes.send(Write::Value(json));
             }
             None => tracing::warn!(path = self.path, "a record changed before it was loaded from the store: not written"),
         }
@@ -112,12 +134,21 @@ fn read_legacy<T: DeserializeOwned>(file: &Path) -> Option<T> {
 }
 
 /// Write the latest value through, in order; a value the store does not take is tried again.
-fn spawn_writer(ctx: Ctx, path: &'static str, mut rx: mpsc::UnboundedReceiver<Value>) {
+fn spawn_writer(ctx: Ctx, path: &'static str, mut rx: mpsc::UnboundedReceiver<Write>) {
     tokio::spawn(async move {
-        while let Some(mut value) = rx.recv().await {
+        let mut carried = None;
+        loop {
+            let Some(write) = (match carried.take() { Some(write) => Some(write), None => rx.recv().await }) else { return };
+            let mut value = match write {
+                Write::Value(value) => value,
+                Write::Flush(done) => { let _ = done.send(()); continue; }
+            };
             // Only the latest of several queued values matters.
-            while let Ok(newer) = rx.try_recv() {
-                value = newer;
+            while let Ok(next) = rx.try_recv() {
+                match next {
+                    Write::Value(newer) => value = newer,
+                    barrier => { carried = Some(barrier); break; }
+                }
             }
             loop {
                 match ctx.call(methods::SETTINGS_SET, json!({ "path": path, "value": value, "by": "plugin" })).await {
@@ -125,9 +156,6 @@ fn spawn_writer(ctx: Ctx, path: &'static str, mut rx: mpsc::UnboundedReceiver<Va
                     Err(error) => {
                         tracing::warn!(path, %error.message, "the store did not take a record; trying again");
                         tokio::time::sleep(RETRY).await;
-                        if let Ok(newer) = rx.try_recv() {
-                            value = newer;
-                        }
                     }
                 }
             }

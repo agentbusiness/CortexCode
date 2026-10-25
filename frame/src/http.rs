@@ -56,7 +56,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Token from `?token=`, `Authorization: Bearer`, `X-Cortex-Token` or the `cortex_token` cookie.
-fn authorized(frame: &Frame, query: &HashMap<String, String>, headers: &HeaderMap) -> bool {
+fn authorized(
+    frame: &Frame,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Option<Option<Arc<crate::access::CommandScope>>> {
     let mut candidates: Vec<String> = Vec::new();
     if let Some(token) = query.get("token") {
         candidates.push(token.clone());
@@ -76,7 +80,17 @@ fn authorized(frame: &Frame, query: &HashMap<String, String>, headers: &HeaderMa
             }
         }
     }
-    candidates.iter().any(|candidate| constant_time_eq(candidate.as_bytes(), frame.token.as_bytes()))
+    if candidates
+        .iter()
+        .any(|candidate| constant_time_eq(candidate.as_bytes(), frame.token.as_bytes()))
+    {
+        Some(None)
+    } else {
+        candidates
+            .iter()
+            .find_map(|candidate| frame.command_access.find(candidate))
+            .map(Some)
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -98,9 +112,9 @@ async fn ws_upgrade(
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     // The token is checked before the upgrade request itself is validated.
-    if !authorized(&state.frame, &query, &headers) {
+    let Some(scope) = authorized(&state.frame, &query, &headers) else {
         return unauthorized();
-    }
+    };
     let upgrade = match upgrade {
         Ok(upgrade) => upgrade,
         Err(rejection) => return rejection.into_response(),
@@ -109,15 +123,19 @@ async fn ws_upgrade(
     upgrade
         .max_message_size(cc_protocol::codec::MAX_FRAME_BYTES)
         .max_frame_size(cc_protocol::codec::MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| serve_ws(frame, socket))
+        .on_upgrade(move |socket| serve_ws(frame, socket, scope))
 }
 
 /// Bridge a WebSocket to a frame peer: text messages are envelopes; internally they travel over an
 /// in-memory duplex stream with the protocol's framing, so WebSocket clients get exactly the
 /// connection semantics plugins get (ids, stream items, cancellation, events).
-async fn serve_ws(frame: Arc<Frame>, socket: WebSocket) {
+async fn serve_ws(
+    frame: Arc<Frame>,
+    socket: WebSocket,
+    scope: Option<Arc<crate::access::CommandScope>>,
+) {
     let (frame_side, adapter) = tokio::io::duplex(1 << 20);
-    let peer = frame.attach(frame_side, PeerKind::Client);
+    let peer = frame.attach_scoped(frame_side, PeerKind::Client, scope);
     tracing::debug!(peer = peer.id, "websocket client connected");
     let (mut adapter_read, mut adapter_write) = tokio::io::split(adapter);
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -209,9 +227,9 @@ async fn api_rpc(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !authorized(&state.frame, &query, &headers) {
+    let Some(scope) = authorized(&state.frame, &query, &headers) else {
         return unauthorized();
-    }
+    };
     let request: RpcBody = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -220,7 +238,9 @@ async fn api_rpc(
         }
     };
     let (frame_side, client_side) = tokio::io::duplex(1 << 20);
-    let _peer = state.frame.attach(frame_side, PeerKind::Client);
+    let _peer = state
+        .frame
+        .attach_scoped(frame_side, PeerKind::Client, scope);
     let client = Connection::spawn(client_side, Arc::new(NoHandler));
     let mut stream = match client.call_stream(&request.method, request.params) {
         Ok(stream) => stream,

@@ -5,7 +5,7 @@
 
 use crate::shell::kill_group;
 use crate::util;
-use regex::Regex;
+use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -16,9 +16,12 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+const OUTPUT_CHUNK: u64 = 64 * 1024;
+const MATCH_WINDOW: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Wake {
-    /// Regex matched against each output line; fires once.
+    /// Regex matched within rolling 64 KiB output windows; fires once. Full output is retained.
     #[serde(default)]
     pub pattern: Option<String>,
     /// Fire when the job has printed nothing for this many seconds (re-arms after new output).
@@ -55,6 +58,7 @@ pub trait Publisher: Send + Sync {
 pub struct Jobs {
     jobs_dir: PathBuf,
     artifacts_dir: PathBuf,
+    artifacts: crate::artifacts::Artifacts,
     /// Holds the `cx` link; kept on every job's PATH.
     bin_dir: PathBuf,
     bash: PathBuf,
@@ -80,15 +84,15 @@ pub struct StartRequest<'a> {
     pub venv: Option<&'a Path>,
 }
 
-fn tail_of(path: &Path, bytes: u64) -> String {
-    let Ok(mut file) = std::fs::File::open(path) else { return String::new() };
+fn tail_of(artifacts: &crate::artifacts::Artifacts, id: &str, bytes: u64) -> String {
+    let Ok(mut file) = artifacts.open(id) else { return String::new() };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let start = len.saturating_sub(bytes);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return String::new();
     }
     let mut buffer = Vec::new();
-    let _ = file.read_to_end(&mut buffer);
+    let _ = file.take(len - start).read_to_end(&mut buffer);
     let text = String::from_utf8_lossy(&buffer).into_owned();
     if start > 0 {
         // Start at a line boundary.
@@ -106,6 +110,7 @@ impl Jobs {
         Arc::new(Self {
             jobs_dir: home.join("jobs"),
             artifacts_dir: home.join("artifacts"),
+            artifacts: crate::artifacts::Artifacts::new(home),
             bin_dir: home.join("bin"),
             bash,
             publisher: Mutex::new(None),
@@ -200,6 +205,7 @@ impl Jobs {
             .env_remove("VIRTUAL_ENV")
             .env_remove("PYTHONHOME")
             .env_remove("CORTEX_VENV")
+            .env_remove("CORTEX_FRAME_TOKEN")
             .arg("--noprofile")
             .arg("--norc")
             .arg(dir.join("runner.sh"))
@@ -271,42 +277,58 @@ impl Jobs {
         let silence = meta.wake.silence_s.filter(|seconds| *seconds > 0.0).map(Duration::from_secs_f64);
         let mut matched = dir.join("wake-match").exists();
         let mut offset: u64 = 0;
-        let mut partial = String::new();
+        let mut partial = Vec::new();
         let mut last_output = tokio::time::Instant::now();
         let mut silence_fired = false;
-        let mut final_pass = false;
         loop {
             // New output.
             let len = std::fs::metadata(&output_path).map(|meta| meta.len()).unwrap_or(offset);
+            let mut progressed = false;
             if len > offset
-                && let Ok(mut file) = std::fs::File::open(&output_path)
+                && let Ok(mut file) = self.artifacts.open(&meta.artifact)
                 && file.seek(SeekFrom::Start(offset)).is_ok()
             {
-                let mut buffer = Vec::with_capacity((len - offset) as usize);
-                let _ = (&mut file).take(len - offset).read_to_end(&mut buffer);
+                let available = (len - offset).min(OUTPUT_CHUNK);
+                let mut buffer = Vec::with_capacity(available as usize);
+                let _ = (&mut file).take(available).read_to_end(&mut buffer);
                 offset += buffer.len() as u64;
                 if !buffer.is_empty() {
+                    progressed = true;
                     last_output = tokio::time::Instant::now();
                     silence_fired = false;
                 }
                 if let Some(regex) = &pattern
                     && !matched
                 {
-                    partial.push_str(&String::from_utf8_lossy(&buffer));
-                    let complete_upto = partial.rfind('\n').map(|index| index + 1).unwrap_or(0);
+                    // Keep bytes between reads so a UTF-8 character split by a chunk is intact.
+                    partial.extend_from_slice(&buffer);
+                    // Every scan is bounded, including output with no newline. Overlap keeps
+                    // matches crossing a chunk boundary; output itself stays byte-exact on disk.
                     let mut hit = None;
-                    for line in partial[..complete_upto].lines() {
-                        if regex.is_match(line) {
-                            hit = Some(line.to_owned());
+                    while partial.len() > MATCH_WINDOW {
+                        if regex.is_match(&partial[..MATCH_WINDOW]) {
+                            hit = Some(String::from_utf8_lossy(&partial[..MATCH_WINDOW]).into_owned());
                             break;
+                        }
+                        partial.drain(..MATCH_WINDOW / 2);
+                    }
+                    let complete_upto = partial.iter().rposition(|byte| *byte == b'\n').map(|index| index + 1).unwrap_or(0);
+                    if hit.is_none() {
+                        for line in partial[..complete_upto].split(|byte| *byte == b'\n') {
+                            let line = line.strip_suffix(b"\r").unwrap_or(line);
+                            if regex.is_match(line) {
+                                hit = Some(String::from_utf8_lossy(line).into_owned());
+                                break;
+                            }
                         }
                     }
                     partial.drain(..complete_upto);
                     if hit.is_none() && regex.is_match(&partial) {
-                        hit = Some(partial.clone());
+                        hit = Some(String::from_utf8_lossy(&partial).into_owned());
                     }
                     if let Some(line) = hit {
                         matched = true;
+                        partial.clear();
                         // Exclusive marker: only one instance publishes this wake.
                         if std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("wake-match")).is_ok() {
                             self.publish(json!({
@@ -317,10 +339,14 @@ impl Jobs {
                                 "reason": "match",
                                 "matched": line,
                                 "artifact": meta.artifact,
-                                "output_tail": tail_of(&output_path, 2048),
+                                "output_tail": tail_of(&self.artifacts, &meta.artifact, 2048),
                             }));
                         }
                     }
+                }
+                if !buffer.is_empty() && offset < len {
+                    tokio::task::yield_now().await;
+                    continue;
                 }
             }
             // Exit.
@@ -328,9 +354,11 @@ impl Jobs {
             let own_child_done = self.reap(&meta.job_id);
             let alive = exited.is_none() && !own_child_done && process_group_alive(meta.pid);
             if exited.is_some() || !alive {
-                // One more pass over the output written just before the exit, then report.
-                if !final_pass && std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(offset) > offset {
-                    final_pass = true;
+                // The job can write its final bytes after the size sample above. Drain them
+                // in bounded chunks, but do not loop forever when the artifact cannot be read.
+                let final_len = std::fs::metadata(&output_path).map(|meta| meta.len()).unwrap_or(offset);
+                if final_len > offset && (len <= offset || progressed) {
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 let current = self.meta(&meta.job_id).unwrap_or(meta.clone());
@@ -353,7 +381,7 @@ impl Jobs {
                         "exit_code": meta.exit_code,
                         "reason": "exit",
                         "artifact": meta.artifact,
-                        "output_tail": tail_of(&output_path, 4096),
+                        "output_tail": tail_of(&self.artifacts, &meta.artifact, 4096),
                     }));
                 }
                 if let Ok(mut monitored) = self.monitored.lock() {
@@ -375,7 +403,7 @@ impl Jobs {
                     "reason": "silence",
                     "silent_s": limit.as_secs_f64(),
                     "artifact": meta.artifact,
-                    "output_tail": tail_of(&output_path, 2048),
+                    "output_tail": tail_of(&self.artifacts, &meta.artifact, 2048),
                 }));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -401,7 +429,7 @@ impl Jobs {
 
     pub fn status(&self, job_id: &str) -> Option<(JobMeta, String)> {
         let meta = self.meta(job_id)?;
-        let tail = tail_of(&self.output_path(&meta), 4096);
+        let tail = tail_of(&self.artifacts, &meta.artifact, 4096);
         Some((meta, tail))
     }
 

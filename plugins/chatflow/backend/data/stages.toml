@@ -101,10 +101,6 @@ check_rounds = 4
 # Identical call with identical output this many times = a repetition (the second time: the model
 # re-ran the same command and got the same failure, so it is told so at once).
 repeat_at = 2
-# Repository map in the prefix: a share of one conversation's context, within bounds (tokens).
-repo_map_share = 12
-repo_map_min = 1024
-repo_map_max = 6144
 # Focused map read for a decision's `focus` (tokens) and semantic search hits per query.
 focus_map_tokens = 1024
 search_limit = 5

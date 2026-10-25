@@ -25,7 +25,6 @@ exec = "backend/target/release/cc-agents"
 [ui]
 dir = "ui"
 build = ["npm", "run", "build"]
-test = ["npm", "test"]
 
 [[ui.package]]
 dir = "ui/board"

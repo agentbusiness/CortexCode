@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -104,23 +104,14 @@ pub struct Net {
 
 impl Net {
     pub fn new(config: Config) -> Self {
-        let allow_private = config.allow_private_hosts;
-        let client = reqwest::Client::builder()
-            .user_agent(config.user_agent.clone())
-            .timeout(Duration::from_millis(config.timeout_ms.max(1_000)))
-            .connect_timeout(Duration::from_millis(config.timeout_ms.clamp(1_000, 10_000)))
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 8 {
-                    attempt.error("more than 8 redirects")
-                } else if !allow_private && attempt.url().host_str().is_some_and(literal_private) {
-                    attempt.error("redirect to a private address")
-                } else {
-                    attempt.follow()
-                }
-            }))
+        let client = client_builder(&config)
             .build()
-            .unwrap_or_default();
-        Self { client, config, next_slot: Mutex::new(HashMap::new()) }
+            .expect("valid research HTTP configuration");
+        Self {
+            client,
+            config,
+            next_slot: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -141,7 +132,9 @@ impl Net {
         }
         let host = url.host_str().unwrap_or_default().to_owned();
         let wait = {
-            let Ok(mut slots) = self.next_slot.lock() else { return };
+            let Ok(mut slots) = self.next_slot.lock() else {
+                return;
+            };
             let now = Instant::now();
             let start = slots.get(&host).copied().filter(|slot| *slot > now).unwrap_or(now);
             slots.insert(host, start + Duration::from_millis(interval));
@@ -153,22 +146,64 @@ impl Net {
     }
 
     pub async fn get(&self, request: Request) -> Result<Response, NetError> {
-        let url = url::Url::parse(&request.url).map_err(|error| NetError::Refused(format!("`{}` is not a URL ({error})", request.url)))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(NetError::Refused(format!("only http and https URLs are fetched, not {}:", url.scheme())));
-        }
-        if request.guard && !self.config.allow_private_hosts {
-            guard_host(&url).await?;
-        }
+        let mut url = url::Url::parse(&request.url).map_err(|error| {
+            NetError::Refused(format!("`{}` is not a URL ({error})", request.url))
+        })?;
+        let original_origin = url.origin();
+        let mut redirects = 0;
         let mut attempt = 0;
         loop {
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(NetError::Refused(format!(
+                    "only http and https URLs are fetched, not {}:",
+                    url.scheme()
+                )));
+            }
+            // Configured source endpoints are trusted for their first hop. Every fetch and every
+            // redirect is resolved once, checked, then connected to exactly those addresses.
+            let guarded = (request.guard || redirects > 0) && !self.config.allow_private_hosts;
+            let client = if guarded {
+                let addresses = public_addresses(&url).await?;
+                client_builder(&self.config)
+                    // A proxy may resolve the target itself, bypassing our checked DNS answers.
+                    .no_proxy()
+                    .resolve_to_addrs(url.host_str().unwrap_or_default(), &addresses)
+                    .build()
+                    .map_err(|error| {
+                        NetError::Other(format!("cannot create the guarded HTTP client: {error}"))
+                    })?
+            } else {
+                self.client.clone()
+            };
             attempt += 1;
             self.space(&url).await;
-            let mut builder = self.client.get(url.clone());
-            for (name, value) in &request.headers {
-                builder = builder.header(name.as_str(), value.as_str());
+            let mut builder = client.get(url.clone());
+            // A source credential belongs to its original origin, never a redirect's new host.
+            if url.origin() == original_origin {
+                for (name, value) in &request.headers {
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
             }
-            let response = builder.send().await.map_err(|error| classify(&error, &url))?;
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| classify(&error, &url))?;
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+                && let Some(location) = response.headers().get(reqwest::header::LOCATION)
+            {
+                if redirects >= 8 {
+                    return Err(NetError::Refused("more than 8 redirects".into()));
+                }
+                let location = location.to_str().map_err(|_| {
+                    NetError::Refused("redirect has an invalid Location header".into())
+                })?;
+                url = url
+                    .join(location)
+                    .map_err(|error| NetError::Refused(format!("invalid redirect: {error}")))?;
+                redirects += 1;
+                attempt = 0;
+                continue;
+            }
             let status = response.status().as_u16();
             let headers: HashMap<String, String> = response
                 .headers()
@@ -195,7 +230,20 @@ impl Net {
     }
 }
 
-async fn read_limited(mut response: reqwest::Response, limit: u64) -> Result<(Vec<u8>, bool), reqwest::Error> {
+fn client_builder(config: &Config) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(config.user_agent.clone())
+        .timeout(Duration::from_millis(config.timeout_ms.max(1_000)))
+        .connect_timeout(Duration::from_millis(
+            config.timeout_ms.clamp(1_000, 10_000),
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+async fn read_limited(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         let room = (limit as usize).saturating_sub(body.len());
@@ -294,22 +342,29 @@ pub fn private_address(address: &IpAddr) -> bool {
     }
 }
 
-async fn guard_host(url: &url::Url) -> Result<(), NetError> {
+async fn public_addresses(url: &url::Url) -> Result<Vec<SocketAddr>, NetError> {
     let host = url.host_str().unwrap_or_default();
     if literal_private(host) {
         return Err(NetError::Refused(format!("{host} is a local or private address (set allow_private_hosts to fetch it)")));
     }
     let port = url.port_or_known_default().unwrap_or(443);
-    // A public name that resolves to a private address is refused too. A failed lookup is left to
-    // the request itself (it reports the host as unreachable).
-    if let Ok(addresses) = tokio::net::lookup_host((host, port)).await {
-        for address in addresses {
-            if private_address(&address.ip()) {
-                return Err(NetError::Refused(format!("{host} resolves to the private address {}", address.ip())));
-            }
-        }
+    let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+        .await
+        .map_err(|error| NetError::Unreachable(format!("cannot resolve {host}: {error}")))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(NetError::Unreachable(format!("{host} has no addresses")));
     }
-    Ok(())
+    if let Some(address) = addresses
+        .iter()
+        .find(|address| private_address(&address.ip()))
+    {
+        return Err(NetError::Refused(format!(
+            "{host} resolves to the private address {}",
+            address.ip()
+        )));
+    }
+    Ok(addresses)
 }
 
 /// Decode a body as text: the charset of the Content-Type, else a `<meta charset>` in the first

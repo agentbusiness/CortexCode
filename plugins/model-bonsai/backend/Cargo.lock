@@ -131,13 +131,12 @@ dependencies = [
 name = "cc-model-bonsai"
 version = "0.1.0"
 dependencies = [
+ "cc-model-kit",
  "cc-protocol",
  "cmake",
  "futures-util",
  "libc",
  "llguidance",
- "minijinja",
- "minijinja-contrib",
  "reqwest",
  "serde",
  "serde_json",
@@ -149,6 +148,19 @@ dependencies = [
  "toktrie_hf_tokenizers",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "cc-model-kit"
+version = "0.1.0"
+dependencies = [
+ "cc-protocol",
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
  "uuid",
 ]
 

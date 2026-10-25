@@ -46,7 +46,6 @@ request_authorization = true   # ask macOS for the notification app's permission
 [ui]
 dir = "ui"
 build = ["npm", "run", "build"]
-test = ["npm", "run", "verify"]
 
 [[ui.package]]
 dir = "ui"

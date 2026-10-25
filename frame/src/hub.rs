@@ -53,6 +53,7 @@ pub struct Peer {
     /// The category this client serves after its hello.
     serves: Mutex<Option<String>>,
     pub connected_ms: u64,
+    pub command_scope: Option<Arc<crate::access::CommandScope>>,
 }
 
 impl Peer {
@@ -65,7 +66,9 @@ impl Peer {
     }
 
     pub fn add_subscriptions(&self, prefixes: &[String]) -> Vec<String> {
-        let Ok(mut subs) = self.subs.lock() else { return Vec::new() };
+        let Ok(mut subs) = self.subs.lock() else {
+            return Vec::new();
+        };
         for prefix in prefixes {
             if !subs.contains(prefix) {
                 subs.push(prefix.clone());
@@ -88,6 +91,7 @@ pub struct Frame {
     pub config: Config,
     pub home: Home,
     pub token: String,
+    pub command_access: crate::access::CommandAccess,
     pub socket: PathBuf,
     pub port: AtomicU16,
     pub headless: bool,
@@ -161,6 +165,7 @@ impl Frame {
             config,
             home,
             token,
+            command_access: crate::access::CommandAccess::default(),
             socket,
             headless,
             code,
@@ -184,6 +189,18 @@ impl Frame {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
+        self.attach_scoped(stream, kind, None)
+    }
+
+    pub fn attach_scoped<S>(
+        self: &Arc<Self>,
+        stream: S,
+        kind: PeerKind,
+        command_scope: Option<Arc<crate::access::CommandScope>>,
+    ) -> Arc<Peer>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
         let peer = Arc::new(Peer {
             id: self.next_peer.fetch_add(1, Ordering::Relaxed),
             kind,
@@ -193,6 +210,7 @@ impl Frame {
             subs: Mutex::new(Vec::new()),
             serves: Mutex::new(None),
             connected_ms: now_ms(),
+            command_scope,
         });
         if let Ok(mut peers) = self.peers.write() {
             peers.insert(peer.id, peer.clone());
@@ -253,8 +271,13 @@ impl Frame {
     /// Stop routing `category` to the WebSocket client that serves it (a disabled plugin's shell
     /// module, until the shell unloads it). Returns whether a route was removed.
     pub fn unroute_ws(&self, category: &str) -> bool {
-        let Ok(mut routes) = self.routes.write() else { return false };
-        if routes.get(category).is_some_and(|route| route.instance.starts_with("ws-")) {
+        let Ok(mut routes) = self.routes.write() else {
+            return false;
+        };
+        if routes
+            .get(category)
+            .is_some_and(|route| route.instance.starts_with("ws-"))
+        {
             routes.remove(category);
             return true;
         }
@@ -263,8 +286,13 @@ impl Frame {
 
     /// Remove the route of `category` if it still points at `instance`.
     pub fn clear_route(&self, category: &str, instance: &str) -> bool {
-        let Ok(mut routes) = self.routes.write() else { return false };
-        if routes.get(category).is_some_and(|route| route.instance == instance) {
+        let Ok(mut routes) = self.routes.write() else {
+            return false;
+        };
+        if routes
+            .get(category)
+            .is_some_and(|route| route.instance == instance)
+        {
             routes.remove(category);
             if category == crate::store::MEMORY {
                 self.memory.clear();
@@ -372,8 +400,12 @@ impl Frame {
     }
 
     fn watch_ui_sources(&self) {
-        let Some(tx) = self.ui_changed.lock().ok().and_then(|slot| slot.clone()) else { return };
-        let Ok(mut watches) = self.ui_watches.lock() else { return };
+        let Some(tx) = self.ui_changed.lock().ok().and_then(|slot| slot.clone()) else {
+            return;
+        };
+        let Ok(mut watches) = self.ui_watches.lock() else {
+            return;
+        };
         let renderer = self.config.ui_dir.join("renderer/dist");
         if !renderer.is_dir() || watches.contains_key(&renderer) {
             return;
@@ -426,7 +458,9 @@ impl Frame {
         let Ok(peers) = self.peers.read() else { return };
         for peer in peers.values() {
             if peer.kind == PeerKind::Plugin {
-                let Some(instance) = peer.instance.get() else { continue };
+                let Some(instance) = peer.instance.get() else {
+                    continue;
+                };
                 if !active.contains(&instance.id) {
                     continue;
                 }
@@ -479,7 +513,9 @@ impl Frame {
 
     fn ws_unserve(self: &Arc<Self>, category: &str, peer_id: u64) {
         let (removed, next) = {
-            let Ok(mut servers) = self.ws_servers.lock() else { return };
+            let Ok(mut servers) = self.ws_servers.lock() else {
+                return;
+            };
             let list = servers.entry(category.to_owned()).or_default();
             let removed = list.iter().position(|(id, _)| *id == peer_id).map(|index| list.remove(index));
             (removed, list.last().cloned())
@@ -548,6 +584,25 @@ impl Frame {
                     PeerKind::Client => self.ws_hello(peer, hello),
                 };
                 to_value(&ack)
+            }
+            methods::COMMAND_ACCESS => {
+                if peer.kind != PeerKind::Plugin
+                    || !peer
+                        .hello
+                        .get()
+                        .is_some_and(|hello| hello.category == "tools")
+                {
+                    return Err(RpcError::new(
+                        codes::CONTRACT_VIOLATION,
+                        "command credentials are issued only to the active tools backend",
+                    ));
+                }
+                let params = parse_params(params)?;
+                to_value(&self.command_access.issue(
+                    params,
+                    self.port.load(Ordering::SeqCst),
+                    &self.socket,
+                )?)
             }
             methods::PROJECT_OPEN => {
                 let params: ProjectOpenParams = parse_params(params)?;
@@ -648,6 +703,8 @@ impl Frame {
                 | methods::PLUGINS_DISABLE
                 | methods::PLUGINS_ENABLE
                 | methods::PLUGINS_INSTALL
+                | methods::PLUGINS_INSTALL_MANY
+                | methods::PLUGINS_INSTALL_WAIT
                 | methods::PLUGINS_SWITCH
         )
     }
@@ -663,7 +720,11 @@ impl Frame {
                 let params: RollbackParams = parse_params(params)?;
                 let plugin = match params.plugin.filter(|p| !p.is_empty()) {
                     Some(plugin) => plugin,
-                    None if params.category.is_empty() => return Err(RpcError::invalid_params("give `plugin` (a plugin id) or `category` (its backend's category)")),
+                    None if params.category.is_empty() => {
+                        return Err(RpcError::invalid_params(
+                            "give `plugin` (a plugin id) or `category` (its backend's category)",
+                        ));
+                    }
                     None => self
                         .units
                         .of_category(&params.category)
@@ -677,7 +738,22 @@ impl Frame {
                 if self.is_shutting_down() {
                     return Err(RpcError::new(codes::UNAVAILABLE, "the frame is shutting down"));
                 }
-                to_value(&crate::units::set_enabled(&self, &params.plugin, method == methods::PLUGINS_ENABLE).await?)
+                to_value(
+                    &crate::units::set_enabled(
+                        &self,
+                        &params.plugin,
+                        method == methods::PLUGINS_ENABLE,
+                    )
+                    .await?,
+                )
+            }
+            methods::PLUGINS_INSTALL_MANY => {
+                to_value(&crate::units::install_many(&self, parse_params(params)?).await?)
+            }
+            methods::PLUGINS_INSTALL_WAIT => {
+                let params: cc_protocol::contracts::frame::InstallWaitParams =
+                    parse_params(params)?;
+                to_value(&crate::units::install_wait(&self, &params.id).await?)
             }
             methods::PLUGINS_INSTALL => {
                 let params: InstallParams = parse_params(params)?;
@@ -728,6 +804,7 @@ impl Frame {
     fn forget_sessions(&self, removed: Vec<cc_protocol::contracts::frame::Session>) -> Vec<String> {
         let mut ids = Vec::with_capacity(removed.len());
         for session in removed {
+            self.command_access.forget_session(&session.id);
             if let Err(error) = self.journal.remove(&session.id) {
                 tracing::warn!(session = %session.id, %error, "deleting a session's journal failed");
             }
@@ -754,10 +831,17 @@ struct PeerHandler {
 }
 
 impl Handler for PeerHandler {
-    fn handle(&self, request: IncomingRequest) -> BoxFuture<'static, ()> {
+    fn handle(&self, mut request: IncomingRequest) -> BoxFuture<'static, ()> {
         let frame = self.frame.clone();
         let peer = self.peer.clone();
         let method = request.method.clone();
+        if let Some(scope) = &peer.command_scope {
+            if let Err(error) = scope.authorize(&method, &mut request.params) {
+                return Box::pin(async move {
+                    request.responder.err(error);
+                });
+            }
+        }
         if method != methods::HELLO && peer.kind == PeerKind::Plugin && peer.hello.get().is_none() {
             return Box::pin(async move {
                 request.responder.err(RpcError::new(codes::CONTRACT_VIOLATION, "send frame.hello first"));
@@ -790,7 +874,27 @@ impl Handler for PeerHandler {
         if method.starts_with("frame.") {
             let IncomingRequest { method, params, responder, .. } = request;
             let outcome = frame.serve_now(&peer, &method, params);
-            let rejected = method == methods::HELLO && outcome.as_ref().is_ok_and(|ack| ack.get("accepted") == Some(&Value::Bool(false)));
+            let rejected = method == methods::HELLO
+                && outcome
+                    .as_ref()
+                    .is_ok_and(|ack| ack.get("accepted") == Some(&Value::Bool(false)));
+            let persist = matches!(
+                method.as_str(),
+                methods::PROJECT_OPEN
+                    | methods::PROJECT_DELETE
+                    | methods::SESSION_CREATE
+                    | methods::SESSION_UPDATE
+                    | methods::SESSION_DELETE
+                    | methods::UI_STATE_PUT
+            );
+            if persist && outcome.is_ok() {
+                return Box::pin(async move {
+                    match frame.state.flush().await {
+                        Ok(()) => responder.respond(outcome),
+                        Err(error) => responder.err(error),
+                    }
+                });
+            }
             responder.respond(outcome);
             if rejected
                 && peer.kind == PeerKind::Plugin
@@ -813,6 +917,9 @@ impl Handler for PeerHandler {
     }
 
     fn event(&self, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        if self.peer.command_scope.is_some() {
+            return Box::pin(async {});
+        }
         if self.peer.kind == PeerKind::Plugin && self.peer.hello.get().is_none() {
             tracing::warn!(peer = self.peer.id, %topic, "event before hello dropped");
         } else {

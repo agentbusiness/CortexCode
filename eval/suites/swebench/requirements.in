@@ -1,3 +1,0 @@
-swebench==4.1.0
-# swebench 5.x pins ghapi<2 (ghapi 2 broke the collect module that swebench/__init__ imports)
-ghapi<2

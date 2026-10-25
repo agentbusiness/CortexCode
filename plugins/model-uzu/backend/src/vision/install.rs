@@ -251,7 +251,7 @@ async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn 
     let data_end = 8 + length + selection.data.1;
     let part = dir.join(format!("{WEIGHTS}.part"));
     // A part file is valid only when it starts with this exact header.
-    let existing = std::fs::read(&part).ok().map(|bytes| bytes.len() as u64);
+    let existing = std::fs::metadata(&part).ok().map(|metadata| metadata.len());
     let reusable = existing.is_some_and(|len| len >= selection.prefix.len() as u64)
         && std::fs::File::open(&part).ok().is_some_and(|mut file| {
             let mut head = vec![0u8; selection.prefix.len()];
@@ -293,6 +293,9 @@ async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn 
             }
             out.flush().map_err(|error| format!("cannot write {}: {error}", part.display()))?;
             report(written, String::new());
+            if written != wanted {
+                return Err(format!("download ended at {written} of {wanted} bytes"));
+            }
             Ok(())
         }
         .await;

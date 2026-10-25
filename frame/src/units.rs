@@ -32,7 +32,7 @@ use crate::hub::Frame;
 use crate::package::{INCOMING, Installed};
 use crate::supervisor::{self, ExecSpec};
 use cc_protocol::contracts::frame::{
-    PackageSwapResult, PluginToggleResult, PluginUnit, ProviderInfo, ProvidersResult, SwapStep, SwitchResult, UiPlugin, topics,
+    InstallManyParams, InstallManyResult, PackageSwapResult, PluginToggleResult, PluginUnit, ProviderInfo, ProvidersResult, SwapStep, SwitchResult, UiPlugin, topics,
 };
 use cc_protocol::contracts::{CATEGORIES, FAMILIES};
 use cc_protocol::{RpcError, to_value};
@@ -183,6 +183,7 @@ pub struct Units {
     /// `<home>/plugins`.
     pub root: PathBuf,
     overrides: BTreeMap<String, PluginOverride>,
+    batch_dir: PathBuf,
     /// Serializes enable, disable, install, rollback and switch.
     pub op: tokio::sync::Mutex<()>,
     /// The person's choice per category with alternatives (persisted).
@@ -198,11 +199,13 @@ impl Units {
     /// not serving yet, so a newer version simply becomes current).
     pub fn load(root: &Path, state_dir: &Path, overrides: BTreeMap<String, PluginOverride>, memory_bytes: u64) -> Result<Units, String> {
         let legacy = state_dir.join("plugins.json");
-        let saved: PluginsFile = match std::fs::read(&legacy) {
+        let mut saved: PluginsFile = match std::fs::read(&legacy) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", legacy.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => read_records(root),
             Err(error) => return Err(format!("cannot read {}: {error}", legacy.display())),
         };
+        let batch_dir = state_dir.join("plugin-installs");
+        recover_batches(root, &batch_dir, &mut saved)?;
         let resolve = |id: &str, version: &str| match crate::package::load(root, id, version) {
             Ok(installed) => Some(Arc::new(installed)),
             Err(error) => {
@@ -226,6 +229,7 @@ impl Units {
             list: RwLock::new(list),
             root: root.to_path_buf(),
             overrides,
+            batch_dir,
             op: tokio::sync::Mutex::new(()),
             providers: Mutex::new(saved.providers.clone()),
             serving: Mutex::new(BTreeMap::new()),
@@ -698,6 +702,198 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
     Ok(PluginToggleResult { plugin: info, changed: true, steps, ui: ui_ids })
 }
 
+/// The baseline is written before the first activation. A frame restart restores it before any
+/// plugin starts; a source-manager replacement can wait for the final result without owning it.
+#[derive(Serialize, Deserialize)]
+struct InstallBatch {
+    id: String,
+    previous: BTreeMap<String, InstalledRecord>,
+    targets: BTreeMap<String, String>,
+    result: Option<InstallManyResult>,
+}
+
+fn batch_path(dir: &Path, id: &str) -> Result<PathBuf, RpcError> {
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+        return Err(RpcError::invalid_params("the install id must contain only letters, digits or hyphens"));
+    }
+    Ok(dir.join(format!("{id}.json")))
+}
+
+fn save_batch(dir: &Path, batch: &InstallBatch) -> Result<(), RpcError> {
+    std::fs::create_dir_all(dir).map_err(|e| RpcError::internal(format!("cannot create {}: {e}", dir.display())))?;
+    let path = batch_path(dir, &batch.id)?;
+    let bytes = serde_json::to_vec(batch).map_err(|e| RpcError::internal(e.to_string()))?;
+    write_atomic(&path, &bytes).map_err(|e| RpcError::internal(format!("cannot record install {}: {e}", batch.id)))
+}
+
+fn read_batch(dir: &Path, id: &str) -> Result<InstallBatch, RpcError> {
+    let path = batch_path(dir, id)?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound { RpcError::not_found(format!("no install `{id}`")) }
+        else { RpcError::internal(format!("cannot read {}: {e}", path.display())) }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| RpcError::internal(format!("{} is corrupt: {e}", path.display())))
+}
+
+fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+        let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let mut batch: InstallBatch = serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", path.display()))?;
+        if batch.result.is_some() { continue; }
+        let mut errors = Vec::new();
+        for (id, previous) in &batch.previous {
+            if let Err(error) = crate::package::load(root, id, &previous.current) {
+                errors.push(format!("{id}: {error}"));
+                continue;
+            }
+            let plugin_dir = root.join(id);
+            let restored = write_record(&plugin_dir, CURRENT, Some(&previous.current))
+                .and_then(|()| write_record(&plugin_dir, PREVIOUS, previous.previous.as_deref()))
+                .and_then(|()| write_record(&plugin_dir, KNOWN_GOOD, previous.known_good.as_deref()));
+            match restored {
+                Ok(()) => { saved.installed.insert(id.clone(), InstalledRecord {
+                    current: previous.current.clone(), previous: previous.previous.clone(), known_good: previous.known_good.clone(),
+                }); }
+                Err(error) => errors.push(error),
+            }
+        }
+        batch.result = Some(InstallManyResult { id: batch.id.clone(), ok: false, swaps: Vec::new(),
+            error: Some("The frame stopped during installation; restoration of the previous versions was attempted before startup.".into()), recovery_errors: errors });
+        save_batch(dir, &batch).map_err(|e| e.message)?;
+    }
+    Ok(())
+}
+
+/// Install a prebuilt set under the existing package operation gate. The frame owns this future,
+/// so replacing the requesting source plugin cannot interrupt the remaining swaps or rollbacks.
+pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Result<InstallManyResult, RpcError> {
+    let _op = frame.units.op.lock().await;
+    let path = batch_path(&frame.units.batch_dir, &params.id)?;
+    if path.exists() {
+        return read_batch(&frame.units.batch_dir, &params.id)?.result.ok_or_else(|| RpcError::internal("the previous install has no final result; restart the frame to recover it"));
+    }
+    if params.paths.is_empty() { return Err(RpcError::invalid_params("give the built plugin packages")); }
+    let mut prepared = Vec::new();
+    let mut previous = BTreeMap::new();
+    let mut targets = BTreeMap::new();
+    // Validate and unpack everything before replacing any running version.
+    for path in params.paths {
+        let archive = PathBuf::from(path);
+        if !archive.is_absolute() { return Err(RpcError::invalid_params("package paths must be absolute")); }
+        let copy = frame.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            crate::package::install_archive(&copy.units.root, &archive, &|id, version| copy.units.in_use(id, version))
+        }).await.map_err(|e| RpcError::internal(e.to_string()))?.map_err(RpcError::invalid_params)?;
+        let id = installed.id().to_owned();
+        if targets.contains_key(&id) { return Err(RpcError::invalid_params(format!("duplicate plugin `{id}` in install"))); }
+        let unit = frame.units.get(&id).ok_or_else(|| RpcError::invalid_params(format!("{id} has no installed version to restore; install this new plugin separately")))?;
+        check_same_category(&unit, &installed).map_err(RpcError::invalid_params)?;
+        let state = unit.lock();
+        previous.insert(id.clone(), InstalledRecord { current: state.current.version().to_owned(), previous: state.previous.as_ref().map(|p| p.version().to_owned()), known_good: state.known_good.clone() });
+        targets.insert(id, installed.version().to_owned());
+        drop(state);
+        prepared.push(Arc::new(installed));
+    }
+    // The successor can wait for this operation after activation; no work remains in its parent.
+    prepared.sort_by_key(|installed| installed.manifest.backend.as_ref().is_some_and(|b| b.category == "source"));
+    let mut batch = InstallBatch { id: params.id.clone(), previous, targets, result: None };
+    save_batch(&frame.units.batch_dir, &batch)?;
+    let mut result = InstallManyResult { id: params.id, ok: true, swaps: Vec::new(), error: None, recovery_errors: Vec::new() };
+    let mut attempted = Vec::new();
+    for installed in &prepared {
+        let Some(unit) = frame.units.get(installed.id()) else {
+            result.ok = false;
+            result.error = Some(format!("{} disappeared during installation", installed.id()));
+            break;
+        };
+        attempted.push(installed.id().to_owned());
+        let from_version = unit.current().version().to_owned();
+        let mut steps = Vec::new();
+        let outcome = switch(frame, &unit, installed.clone(), "install", &mut steps).await;
+        match finish(frame, &unit, from_version, steps, outcome) {
+            Ok(swapped) => {
+                let persistence_error = swapped.steps.iter().find(|step| step.step == "persist" && !step.ok).map(|step| step.detail.clone());
+                let failed = !swapped.ok || persistence_error.is_some();
+                if failed { result.ok = false; result.error = persistence_error.or_else(|| swapped.error.clone()); }
+                result.swaps.push(swapped);
+            }
+            Err(error) => { result.ok = false; result.error = Some(error.message); }
+        }
+        if !result.ok { break; }
+    }
+    if result.ok && let Err(error) = frame.units.persist() {
+        result.ok = false;
+        result.error = Some(format!("The installed versions could not be recorded: {error}"));
+    }
+    if !result.ok {
+        result.recovery_errors = restore_batch(frame, &batch, &attempted, &result.swaps).await;
+    }
+    batch.result = Some(result.clone());
+    if let Err(error) = save_batch(&frame.units.batch_dir, &batch) {
+        if result.ok {
+            result.ok = false;
+            result.error = Some(error.message.clone());
+            result.recovery_errors = restore_batch(frame, &batch, &attempted, &result.swaps).await;
+            batch.result = Some(result.clone());
+        }
+        if let Err(record) = save_batch(&frame.units.batch_dir, &batch) {
+            return Err(RpcError::internal(format!("{}; recovery details: {}", record.message, result.recovery_errors.join("; ")))
+                .with_data(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)));
+        }
+    }
+    Ok(result)
+}
+
+async fn restore_batch(frame: &Arc<Frame>, batch: &InstallBatch, attempted: &[String], swaps: &[PackageSwapResult]) -> Vec<String> {
+    let mut errors = Vec::new();
+    // Include the failing plugin: a backend may also have failed its own automatic restore.
+    for id in attempted.iter().rev() {
+        let Some(unit) = frame.units.get(id) else { errors.push(format!("{id} disappeared during rollback")); continue; };
+        let baseline = &batch.previous[id];
+        let already_restored = unit.current().version() == baseline.current
+            && swaps.iter().find(|swap| swap.plugin == *id).is_some_and(|swap| swap.ok || swap.rolled_back);
+        if !already_restored {
+            let prior = match crate::package::load(&frame.units.root, id, &baseline.current) {
+                Ok(prior) => Arc::new(prior),
+                Err(error) => { errors.push(error); continue; }
+            };
+            let mut steps = Vec::new();
+            let from = unit.current().version().to_owned();
+            let outcome = switch(frame, &unit, prior, "batch rollback", &mut steps).await;
+            match finish(frame, &unit, from, steps, outcome) {
+                Ok(restored) if restored.ok => {},
+                Ok(restored) => { errors.push(format!("{id}: {}", restored.error.unwrap_or_else(|| "the previous version did not start".into()))); continue; }
+                Err(error) => { errors.push(format!("{id}: {}", error.message)); continue; }
+            }
+        }
+        // Preserve the baseline's rollback and known-good pointers, not the rejected package.
+        let previous = match baseline.previous.as_deref().map(|version| crate::package::load(&frame.units.root, id, version)).transpose() {
+            Ok(previous) => previous.map(Arc::new),
+            Err(error) => { errors.push(error); continue; }
+        };
+        let mut state = unit.lock();
+        state.previous = previous;
+        state.known_good = baseline.known_good.clone();
+    }
+    if let Err(error) = frame.units.persist() {
+        errors.push(format!("The previous plugin versions could not be recorded: {error}"));
+    }
+    errors
+}
+
+/// A successor source plugin waits on the existing operation gate, then reads the durable result.
+pub async fn install_wait(frame: &Arc<Frame>, id: &str) -> Result<InstallManyResult, RpcError> {
+    let _op = frame.units.op.lock().await;
+    read_batch(&frame.units.batch_dir, id)?.result.ok_or_else(|| RpcError::internal("the install has no final result; restart the frame to recover it"))
+}
+
 /// `frame.plugins.install`.
 pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult, RpcError> {
     let archive = PathBuf::from(path);
@@ -1013,4 +1209,47 @@ pub fn watch_incoming(frame: &Arc<Frame>) {
             while let Ok(Some(())) = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {}
         }
     });
+}
+
+/// The record of the app version a plugin was last installed from (`<root>/<id>/.bundled`).
+const BUNDLED: &str = ".bundled";
+
+/// Queue the app's prebuilt packages (`<packages>/<id>@<version>.ccplugin`) in `.incoming/` when
+/// this home has not installed that version from the app yet. A plugin the user rebuilt from the
+/// code folder keeps its own version until the app brings a new one. Returns what was queued.
+pub fn queue_bundled(root: &Path, packages: &Path) -> Vec<(String, String)> {
+    let mut queued = Vec::new();
+    let Ok(entries) = std::fs::read_dir(packages) else {
+        tracing::warn!(dir = %packages.display(), "the app's plugin packages are missing");
+        return queued;
+    };
+    let incoming = root.join(crate::package::INCOMING);
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((id, version)) = name.strip_suffix(".ccplugin").and_then(|stem| stem.split_once('@')) else { continue };
+        if !cc_protocol::contracts::frame::package::valid_id(id) || !crate::package::valid_version(version) {
+            continue;
+        }
+        let taken = std::fs::read_to_string(root.join(id).join(BUNDLED)).map(|text| text.trim() == version).unwrap_or(false);
+        if taken {
+            continue;
+        }
+        if let Err(error) = std::fs::create_dir_all(&incoming).and_then(|()| std::fs::copy(entry.path(), incoming.join(&name)).map(|_| ())) {
+            tracing::error!(package = %name, %error, "cannot queue the app's plugin package");
+            continue;
+        }
+        queued.push((id.to_owned(), version.to_owned()));
+    }
+    queued
+}
+
+/// Record the app versions that installed (a failed install is queued again at the next start).
+pub fn mark_bundled(root: &Path, queued: &[(String, String)]) {
+    for (id, version) in queued {
+        if crate::package::versions(root, id).iter().any(|installed| installed == version)
+            && let Err(error) = write_record(&root.join(id), BUNDLED, Some(version))
+        {
+            tracing::warn!(plugin = %id, %error, "cannot record the app version installed");
+        }
+    }
 }

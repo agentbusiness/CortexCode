@@ -731,6 +731,9 @@ impl<B: Backend> Worker<B> {
         // Nothing waiting could be admitted on the last pass (with nothing running, only a waiting
         // request of a higher class can hold one back): block for the next command.
         let mut stalled = false;
+        // A quiet deadline wakes admission once; a request that still cannot start then waits
+        // for a state-changing command instead of polling the expired deadline.
+        let mut idle_room_checked = None;
         loop {
             // Commands: block only when nothing is running and nothing waiting can start. A request
             // queued behind one that just finished or was cancelled (its conversation's slot was
@@ -751,7 +754,7 @@ impl<B: Backend> Worker<B> {
             self.spill_idle();
             // An idle worker also wakes when the next resident conversation is due to be spilled.
             // ... and when an idle-only generation's wait for the quiet period ends.
-            let idle_room = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER);
+            let idle_room = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER).filter(|at| Some(*at) != idle_room_checked);
             let wake = [unload_at.filter(|_| self.vision.is_some()), self.next_spill(), idle_room].into_iter().flatten().min();
             let command = if idle && !self.shutting_down {
                 let received = match wake {
@@ -796,7 +799,12 @@ impl<B: Backend> Worker<B> {
                 }
                 break;
             }
+            let admission_at = Instant::now();
             self.admit();
+            let quiet_at = self.last_work + IDLE_ROOM_AFTER;
+            if admission_at >= quiet_at {
+                idle_room_checked = Some(quiet_at);
+            }
             stalled = self.active.is_empty() && !self.waiting.is_empty();
             self.run_pending_hibernations();
             self.run_pending_forgets();
@@ -1116,10 +1124,11 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    /// Whether a request that is not a prewarm, for a conversation other than `key`, runs or waits.
+    /// Whether another conversation runs a generation or waits for non-idle work.
+    /// Queued idle-only generations yield to each other in admission order instead of deadlocking.
     fn serving_other(&self, key: &str) -> bool {
         let real = |request: &Request| request.key != key && !matches!(request.work, Work::Prewarm);
-        self.active.iter().any(|active| real(&active.request)) || self.waiting.iter().any(|request| real(request))
+        self.active.iter().any(|active| real(&active.request)) || self.waiting.iter().any(|request| real(request) && !idle_generation(request))
     }
 
     /// Stop the running idle-only prewarms of conversations other than `key` (at their next step;

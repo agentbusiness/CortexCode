@@ -1,0 +1,1103 @@
+{
+  "classes": [
+    {
+      "id": "web-auth",
+      "name": "HTTP, sessions and authentication",
+      "applies": {
+        "imports": [
+          "flask",
+          "django",
+          "fastapi",
+          "starlette",
+          "tornado",
+          "aiohttp",
+          "bottle",
+          "express",
+          "koa",
+          "fastify",
+          "hono",
+          "next",
+          "@nestjs/core",
+          "hapi",
+          "gin-gonic",
+          "echo",
+          "chi",
+          "fiber",
+          "net/http",
+          "actix-web",
+          "axum",
+          "rocket",
+          "warp",
+          "spring",
+          "javalin",
+          "rails",
+          "sinatra",
+          "laravel",
+          "symfony",
+          "Microsoft.AspNetCore"
+        ],
+        "content": [
+          "(?i)\\b(set_cookie|setCookie|res\\.cookie|session\\[|SESSION_COOKIE|csrf|jwt|oauth|openid|saml|passport|password_reset|reset_token|X-Forwarded|request\\.host)\\b"
+        ]
+      },
+      "invariant": "The server knows which principal, session and request each credential belongs to, and no header, cookie, redirect or token the client controls can confuse that.",
+      "look": [
+        "Cookie-authenticated state changes: a CSRF token or SameSite that covers this cookie, this method and this content type; JSON endpoints with cookie auth and no token.",
+        "Session fixation: is the session id rotated at login, privilege change and logout; are old sessions, refresh tokens and reset tokens invalidated on password change?",
+        "JWT: signature verified with a server-pinned algorithm and key; exp, aud, iss checked; kid or jku never used to pick an attacker key; decode-without-verify paths.",
+        "OAuth and OIDC: redirect_uri exactly matched, state bound to the session, PKCE where applicable, id_token nonce and audience checked.",
+        "Password reset and recovery: token random, bound to the user, single use, expiring; the reset link built from a trusted host, not from the Host or X-Forwarded-Host header.",
+        "Host and forwarded headers used for URLs, tenant routing or the client IP in rate limits; open redirects from next, return_to, redirect, url parameters.",
+        "CORS: a reflected Origin with credentials; a regex or suffix match on the origin.",
+        "Cookie attributes for a session cookie: HttpOnly, Secure, SameSite, Domain and Path not wider than needed (only a hardening note without a reachable path)."
+      ],
+      "counts": "A cross-site request changes state with the victim's cookie, a token is accepted for another principal or service, a reset link goes to an attacker host, a redirect lands on an attacker page after login.",
+      "hardening": "A missing cookie flag or header where another layer already stops the attack; a framework default you verified protects the route.",
+      "patterns": [
+        {
+          "name": "CSRF protection off",
+          "langs": [
+            "any"
+          ],
+          "needle": "csrf",
+          "regex": "(?i)(csrf_exempt|WTF_CSRF_ENABLED\\s*=\\s*False|CSRF_ENABLED\\s*=\\s*False|csrf\\s*:\\s*false|protect_from_forgery\\s*:?\\s*false|skip_before_action\\s*:verify_authenticity_token|csrf\\(\\)\\.disable|\\.csrf\\(\\)\\.disable|ignoreAntiforgeryToken|VerifyCsrfToken)"
+        },
+        {
+          "name": "cookie set without HttpOnly or Secure",
+          "langs": [
+            "any"
+          ],
+          "needle": "ooki",
+          "regex": "(?i)(set_cookie|setcookie|res\\.cookie|cookies\\.set|http\\.SetCookie|new\\s+Cookie|Set-Cookie)\\s*\\(?[^\\n]*(session|auth|token|sid|jwt)(?![^\\n]*(httponly|HttpOnly))"
+        },
+        {
+          "name": "URL built from the Host header",
+          "langs": [
+            "any"
+          ],
+          "needle": "ost",
+          "regex": "(?i)(request\\.host\\b|request\\.host_url|req\\.headers\\.host|req\\.hostname|req\\.get\\s*\\(\\s*[\"']host[\"']\\)|r\\.Host\\b|X-Forwarded-Host|HTTP_HOST|getServerName\\(\\)|request\\.base_url|url_for\\s*\\([^)]*_external\\s*=\\s*True)"
+        },
+        {
+          "name": "redirect to a request value",
+          "langs": [
+            "any"
+          ],
+          "needle": "edirect",
+          "regex": "(?i)\\b(redirect|res\\.redirect|http\\.Redirect|redirect_to|RedirectResponse|sendRedirect|Redirect)\\s*\\(?[^\\n]*(req(uest)?\\.(args|query|params|form|body|GET|POST)|params\\[|r\\.(URL|Form|FormValue)|c\\.Query|\\$_(GET|POST|REQUEST)|getParameter)\\s*[\\[(.]?\\s*[\"']?(next|return|return_to|returnTo|redirect|redirect_uri|redirectUrl|url|goto|continue|target|dest|back)\\b"
+        },
+        {
+          "name": "CORS reflects the origin or allows all with credentials",
+          "langs": [
+            "any"
+          ],
+          "needle": "rigin",
+          "regex": "(?i)(Access-Control-Allow-Origin[\"']?\\s*[,:=]\\s*(req(uest)?\\.headers|request\\.headers\\.get\\s*\\(\\s*[\"']origin|r\\.Header\\.Get\\s*\\(\\s*\"Origin)|cors\\w*\\s*\\(\\s*\\{[^}]*origin\\s*:\\s*(true|[\"']\\*[\"'])|AllowAllOrigins\\s*[:=]\\s*true|allow_origins\\s*=\\s*\\[\\s*[\"']\\*[\"']\\s*\\][^\\n]*allow_credentials\\s*=\\s*True|CORS_ORIGIN_ALLOW_ALL\\s*=\\s*True|AllowAnyOrigin\\(\\)[^\\n]*AllowCredentials|\\.allowedOrigins\\s*\\(\\s*\"\\*\"\\s*\\)|allow_origin\\s*\\(\\s*Any\\s*\\)[^\\n]*allow_credentials\\s*\\(\\s*true)"
+        },
+        {
+          "name": "JWT decoded or verified loosely",
+          "langs": [
+            "any"
+          ],
+          "needle": "jwt",
+          "regex": "(?i)(jwt\\.decode\\s*\\((?![^\\n]*verify)|jwt\\.decode\\s*\\([^\\n]*(verify\\s*=\\s*False|verify_signature[\"']?\\s*:\\s*False)|algorithms?\\s*[:=]\\s*\\[?\\s*[\"']none[\"']|jwt\\.Parse\\s*\\(|ParseUnverified|jwt\\.decode\\s*\\(\\s*token\\s*\\)|\\.verify\\s*\\([^)]*,\\s*(null|undefined|\"\"|'')\\s*[,)]|decodeJwt\\s*\\()"
+        },
+        {
+          "name": "login or reset without rate limiting signs",
+          "langs": [
+            "any"
+          ],
+          "needle": "/",
+          "regex": "(?i)[\"'`](/[\\w/-]*)?/(login|signin|sign-in|auth/token|token|reset|forgot|forgot-password|password/reset|verify|otp|2fa|mfa)[\"'`/]"
+        },
+        {
+          "name": "session cookie settings",
+          "langs": [
+            "any"
+          ],
+          "needle": "SESSION",
+          "regex": "(?i)(SESSION_COOKIE_(HTTPONLY|SECURE|SAMESITE)\\s*=\\s*(False|[\"']None[\"'])|cookie\\s*:\\s*\\{[^}]*(secure\\s*:\\s*false|httpOnly\\s*:\\s*false|sameSite\\s*:\\s*[\"']?none)|SameSite=None|secure\\s*=\\s*False)"
+        },
+        {
+          "name": "password or token compared loosely",
+          "langs": [
+            "any"
+          ],
+          "needle": "==",
+          "regex": "(?i)\\b(password|passwd|pwd|reset_token|otp|api_key|apikey)\\b\\s*(==|===)\\s*\\w|\\w\\s*(==|===)\\s*\\b(password|passwd|pwd|reset_token|otp|api_key|apikey)\\b"
+        }
+      ]
+    },
+    {
+      "id": "client-side",
+      "name": "Client-side and browser",
+      "applies": {
+        "langs": [
+          "html"
+        ],
+        "imports": [
+          "react",
+          "react-dom",
+          "preact",
+          "vue",
+          "svelte",
+          "@angular/core",
+          "solid-js",
+          "jquery",
+          "next",
+          "nuxt",
+          "lit"
+        ],
+        "files": [
+          "manifest.json",
+          "*.jsx",
+          "*.tsx",
+          "*.vue",
+          "*.svelte",
+          "service-worker.js",
+          "sw.js"
+        ]
+      },
+      "invariant": "Attacker-influenced data (URL, fragment, message, storage, API response) never reaches a DOM, navigation or evaluation sink unencoded, and cross-window messages are checked by exact origin.",
+      "look": [
+        "DOM sinks: innerHTML, outerHTML, insertAdjacentHTML, document.write, dangerouslySetInnerHTML, v-html, {@html}, bypassSecurityTrust*, jQuery .html()/.append() with data; what feeds them (location, hash, search params, postMessage, API text, user content)?",
+        "Navigation sinks: location.href / window.open / a.href from a parameter; javascript: and data: URLs.",
+        "postMessage handlers without an exact event.origin comparison (startsWith, includes, indexOf and regexes are not checks); postMessage(data, '*') carrying secrets.",
+        "Prototype pollution: a deep merge, extend or path-set over user keys (__proto__, constructor.prototype) followed by a gadget that reads the polluted property.",
+        "Tokens in localStorage or sessionStorage readable by any script on the origin; service worker caches of personalized responses across logout.",
+        "Browser extensions: content scripts trusting page messages; manifest permissions and web_accessible_resources wider than needed.",
+        "Framework escape hatches and markdown renderers with raw HTML allowed; sanitizer configured to allow dangerous tags or attributes."
+      ],
+      "counts": "A victim's session runs attacker script or data, another origin reads protected state, or a message from an untrusted origin triggers a sensitive action.",
+      "hardening": "A sink fed only by trusted literals or sanitized by a library you read; a missing CSP or frame protection where no sensitive action is framed.",
+      "patterns": [
+        {
+          "name": "DOM HTML sink",
+          "langs": [
+            "js",
+            "html"
+          ],
+          "needle": "HTML",
+          "regex": "\\.(innerHTML|outerHTML)\\s*=|insertAdjacentHTML\\s*\\(|dangerouslySetInnerHTML|document\\.write(ln)?\\s*\\(|\\.html\\s*\\(\\s*[^\"')]|bypassSecurityTrust\\w+\\s*\\(|\\bv-html\\b|\\{@html\\b"
+        },
+        {
+          "name": "navigation from a parameter",
+          "langs": [
+            "js"
+          ],
+          "needle": "location",
+          "regex": "(location\\.(href|assign|replace)|window\\.open)\\s*[(=]\\s*[^\"'`\\s)][^\\n]*(location\\.|params|searchParams|query|hash|get\\s*\\()"
+        },
+        {
+          "name": "URL data into a sink",
+          "langs": [
+            "js"
+          ],
+          "needle": "location",
+          "regex": "(location\\.(hash|search|href)|URLSearchParams|searchParams\\.get|document\\.referrer|window\\.name)\\b[^\\n]*(innerHTML|\\.html\\(|eval|href\\s*=|src\\s*=|write\\()"
+        },
+        {
+          "name": "message handler",
+          "langs": [
+            "js"
+          ],
+          "needle": "message",
+          "regex": "addEventListener\\s*\\(\\s*[\"']message[\"']|window\\.onmessage\\s*=|\\.on\\s*\\(\\s*[\"']message[\"']"
+        },
+        {
+          "name": "postMessage to any origin",
+          "langs": [
+            "js"
+          ],
+          "needle": "postMessage",
+          "regex": "postMessage\\s*\\([^)]*,\\s*[\"']\\*[\"']\\s*\\)"
+        },
+        {
+          "name": "weak origin check",
+          "langs": [
+            "js"
+          ],
+          "needle": "origin",
+          "regex": "\\.origin\\s*\\.\\s*(startsWith|includes|indexOf|endsWith|match|search)\\s*\\(|\\.origin\\s*\\)\\s*\\)|/\\^?https?:\\\\?/\\\\?/[^/]*\\.test\\s*\\(\\s*\\w*\\.origin"
+        },
+        {
+          "name": "deep merge or path set over user keys",
+          "langs": [
+            "js"
+          ],
+          "needle": "(",
+          "regex": "\\b(deepMerge|merge|extend|defaultsDeep|mergeWith|set|setWith|assign|unflatten)\\s*\\([^)]*(req\\.body|req\\.query|params|JSON\\.parse|data|payload|input|options)\\b|\\[\\s*key\\s*\\]\\s*=\\s*[^\\n]*\\[\\s*key\\s*\\]"
+        },
+        {
+          "name": "token in web storage",
+          "langs": [
+            "js"
+          ],
+          "needle": "Storage",
+          "regex": "(localStorage|sessionStorage)\\.setItem\\s*\\(\\s*[\"'][^\"']*(token|jwt|auth|session|secret|key)[^\"']*[\"']"
+        },
+        {
+          "name": "javascript: or data: URL",
+          "langs": [
+            "js",
+            "html"
+          ],
+          "needle": ":",
+          "regex": "[\"'`](javascript|data):[^\"'`]*\\$\\{|href\\s*=\\s*\\{?\\s*[a-zA-Z_$][\\w.$]*\\s*\\}?(?![\"'])"
+        },
+        {
+          "name": "window.open without noopener",
+          "langs": [
+            "js",
+            "html"
+          ],
+          "needle": "_blank",
+          "regex": "target\\s*=\\s*[\"']_blank[\"'](?![^>\\n]*rel\\s*=\\s*[\"'][^\"']*noopener)|window\\.open\\s*\\([^)]*\\)(?![^\\n]*opener)"
+        },
+        {
+          "name": "extension permissions",
+          "langs": [
+            "json"
+          ],
+          "needle": "permissions",
+          "regex": "\"(permissions|host_permissions|web_accessible_resources|content_security_policy)\"\\s*:"
+        }
+      ]
+    },
+    {
+      "id": "supply-chain-ci",
+      "name": "Supply chain, CI and release",
+      "applies": {
+        "files": [
+          ".github/workflows/*.yml",
+          ".github/workflows/*.yaml",
+          ".gitlab-ci.yml",
+          "Jenkinsfile",
+          ".circleci/config.yml",
+          "azure-pipelines.yml",
+          "bitbucket-pipelines.yml",
+          ".travis.yml",
+          "Dockerfile",
+          "Dockerfile.*",
+          "*.dockerfile",
+          "install.sh",
+          "setup.sh",
+          "release.sh",
+          "publish.sh",
+          "Makefile",
+          ".pre-commit-config.yaml",
+          ".goreleaser.yml",
+          ".goreleaser.yaml"
+        ]
+      },
+      "invariant": "Nothing a contributor, a dependency author or a registry controls can run with the project's secrets, change what is released, or change what users install.",
+      "look": [
+        "Workflows triggered by pull_request_target, issue_comment, workflow_run or fork events that check out the PR head and run its code or scripts, with secrets or a write token.",
+        "Expression injection: ${{ github.event.issue.title }}, .pull_request.title, .head_ref, .comment.body, .commits[*].message inside run: or a shell step.",
+        "Actions, images, tools and scripts pinned to a mutable tag (@v3, :latest, main) rather than a digest or exact version; curl | sh installers.",
+        "GITHUB_TOKEN permissions: write-all or contents: write where the job only needs to read; secrets passed to steps that print or upload the environment.",
+        "Caches and artifacts a low-trust job writes and a release job restores and executes.",
+        "Lockfiles: present, used by the install command (npm ci, pip install -r with hashes, cargo --locked), not ignored; install hooks (postinstall, build.rs, setup.py) of dependencies.",
+        "Release and publish steps: which branch, who approves, how the artifact is signed and how the installer verifies it."
+      ],
+      "counts": "A pull request or a dependency can run code with repository secrets or alter a release or an installer, with the full path shown.",
+      "hardening": "An unpinned action in a job without secrets and without write permissions; a missing lockfile with exact versions in the manifest.",
+      "patterns": [
+        {
+          "name": "privileged trigger",
+          "langs": [
+            "yml"
+          ],
+          "needle": ":",
+          "regex": "^\\s*(pull_request_target|issue_comment|workflow_run|discussion_comment|pull_request_review(_comment)?)\\s*:"
+        },
+        {
+          "name": "checkout of the PR head",
+          "langs": [
+            "yml"
+          ],
+          "needle": "ref",
+          "regex": "ref\\s*:\\s*\\$\\{\\{\\s*github\\.event\\.pull_request\\.head\\.(sha|ref)|ref\\s*:\\s*refs/pull/\\$\\{\\{"
+        },
+        {
+          "name": "expression injection in a run step",
+          "langs": [
+            "yml"
+          ],
+          "needle": "${{",
+          "regex": "\\$\\{\\{\\s*(github\\.event\\.(issue|pull_request|comment|review|discussion|commits|head_commit|inputs|workflow_run)\\.[\\w.\\[\\]*]*(title|body|message|ref|label|name|email|login|default_branch)|github\\.head_ref|github\\.event\\.inputs\\.\\w+|inputs\\.\\w+)\\s*\\}\\}"
+        },
+        {
+          "name": "action pinned to a mutable tag",
+          "langs": [
+            "yml"
+          ],
+          "needle": "uses:",
+          "regex": "uses\\s*:\\s*[\\w.-]+/[\\w./-]+@(v?\\d+(\\.\\d+)?|main|master|latest|dev)\\s*$"
+        },
+        {
+          "name": "write-all or broad permissions",
+          "langs": [
+            "yml"
+          ],
+          "needle": "permissions",
+          "regex": "permissions\\s*:\\s*write-all|(contents|packages|id-token|actions|deployments|pull-requests)\\s*:\\s*write"
+        },
+        {
+          "name": "curl piped to a shell",
+          "langs": [
+            "any"
+          ],
+          "needle": "|",
+          "regex": "(curl|wget)\\b[^|\\n]*\\|\\s*(sudo\\s+)?(ba)?sh\\b"
+        },
+        {
+          "name": "image pinned to latest or unpinned",
+          "langs": [
+            "docker",
+            "yml"
+          ],
+          "needle": "image",
+          "regex": "^\\s*FROM\\s+[\\w./-]+(:latest)?\\s*$|^\\s*FROM\\s+[\\w./-]+:latest|image\\s*:\\s*[\"']?[\\w./-]+(:latest)?[\"']?\\s*$"
+        },
+        {
+          "name": "secret echoed or dumped",
+          "langs": [
+            "yml",
+            "sh"
+          ],
+          "needle": "secrets",
+          "regex": "(echo|printenv|env\\b|set\\s*$|cat)[^\\n]*\\$\\{\\{\\s*secrets\\.|toJSON\\s*\\(\\s*secrets\\s*\\)"
+        },
+        {
+          "name": "install without the lockfile",
+          "langs": [
+            "yml",
+            "docker",
+            "sh"
+          ],
+          "needle": "install",
+          "regex": "\\b(npm\\s+install|npm\\s+i|yarn\\s+install(?!\\s+--frozen-lockfile)|pnpm\\s+install(?!\\s+--frozen-lockfile)|pip\\s+install\\s+(?!-r|--require-hashes)[a-zA-Z]|cargo\\s+(build|install)(?!.*--locked))\\b"
+        },
+        {
+          "name": "install hook",
+          "langs": [
+            "json"
+          ],
+          "needle": "install",
+          "regex": "\"(pre|post)install\"\\s*:|\"prepare\"\\s*:"
+        },
+        {
+          "name": "sudo or root in a build",
+          "langs": [
+            "docker",
+            "sh",
+            "yml"
+          ],
+          "needle": "sudo",
+          "regex": "\\bsudo\\s+(chmod|chown|rm|curl|wget|sh|bash)"
+        }
+      ],
+      "files": [
+        {
+          "name": "manifest without a lockfile",
+          "glob": [],
+          "note": ""
+        }
+      ]
+    },
+    {
+      "id": "cloud-deploy",
+      "name": "Cloud, containers and deployment",
+      "applies": {
+        "files": [
+          "Dockerfile",
+          "Dockerfile.*",
+          "docker-compose*.yml",
+          "docker-compose*.yaml",
+          "compose*.yml",
+          "compose*.yaml",
+          "*.tf",
+          "*.tfvars",
+          "Chart.yaml",
+          "values*.yaml",
+          "serverless.yml",
+          "wrangler.toml",
+          "fly.toml",
+          "app.yaml",
+          "k8s/*.yaml",
+          "kubernetes/*.yaml",
+          "deploy/*.yaml",
+          "manifests/*.yaml",
+          "Procfile",
+          "vercel.json",
+          "netlify.toml",
+          "cloudbuild.yaml",
+          "template.yaml",
+          "samconfig.toml",
+          "cdk.json",
+          "Pulumi.yaml"
+        ]
+      },
+      "invariant": "Each workload runs with the least identity, network reach and privilege it needs, and the configuration shipped is the configuration meant for production.",
+      "look": [
+        "Containers: privileged, hostNetwork, hostPID, host path mounts, the Docker socket mounted, running as root (no USER in the Dockerfile), capabilities added.",
+        "Listeners bound to 0.0.0.0 for admin, debug, metrics or database ports; debug ports (--inspect, 5005, 5678) in a production command; ports published in compose for internal services.",
+        "IAM and policies with Action * or Resource *, public buckets or ACLs, security groups open to 0.0.0.0/0 on sensitive ports, wildcard CORS on storage.",
+        "Secrets in environment blocks, ConfigMaps, compose files, Dockerfile ENV or ARG, terraform variables with defaults, committed tfstate.",
+        "Development values that reach production: DEBUG, dev mode, disabled TLS, default passwords, an overlay that turns authentication off.",
+        "Serverless and edge: function URLs without auth, event sources trusted by body fields, broad execution roles."
+      ],
+      "counts": "An active configuration that exposes a sensitive service or credential to a lower-trust network, or lets a workload act beyond its role, with the consuming environment identified.",
+      "hardening": "A manifest for a local or test environment only; a missing restriction whose effect depends on a network or account policy you cannot read (needs_validation).",
+      "patterns": [
+        {
+          "name": "privileged or host access",
+          "langs": [
+            "yml"
+          ],
+          "needle": ":",
+          "regex": "privileged\\s*:\\s*true|hostNetwork\\s*:\\s*true|hostPID\\s*:\\s*true|hostIPC\\s*:\\s*true|runAsUser\\s*:\\s*0\\b|allowPrivilegeEscalation\\s*:\\s*true|/var/run/docker\\.sock|network_mode\\s*:\\s*[\"']?host|cap_add|capabilities:\\s*$|add:\\s*\\[?\\s*(SYS_ADMIN|ALL|NET_ADMIN)"
+        },
+        {
+          "name": "no USER in the Dockerfile",
+          "langs": [
+            "docker"
+          ],
+          "needle": "FROM",
+          "regex": "^\\s*FROM\\s+(?!scratch)[\\w./:@-]+(\\s+AS\\s+\\w+)?\\s*$"
+        },
+        {
+          "name": "secret in an environment block",
+          "langs": [
+            "yml",
+            "docker",
+            "toml"
+          ],
+          "needle": "=",
+          "regex": "(?i)^\\s*(-\\s*)?(ENV\\s+|ARG\\s+)?[\"']?\\w*(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|ACCESS_KEY)\\w*[\"']?\\s*[:=]\\s*[\"']?[^\\s\"'$][^\\n]{3,}"
+        },
+        {
+          "name": "bound to all interfaces or a debug port",
+          "langs": [
+            "any"
+          ],
+          "needle": "0",
+          "regex": "0\\.0\\.0\\.0:(22|2375|2376|3306|5432|5984|6379|9200|27017|11211|8080|9090|5005|5678|9229)\\b|--inspect(-brk)?(=|\\s)|\\b(5005|5678|9229):\\d+"
+        },
+        {
+          "name": "wildcard IAM action or resource",
+          "langs": [
+            "json",
+            "yml",
+            "tf"
+          ],
+          "needle": "*",
+          "regex": "[\"']?(Action|actions)[\"']?\\s*[:=]\\s*\\[?\\s*[\"']\\*[\"']|[\"']?(Resource|resources)[\"']?\\s*[:=]\\s*\\[?\\s*[\"']\\*[\"']|\"Principal\"\\s*:\\s*\"\\*\"|principals?\\s*=\\s*\\[\\s*\"\\*\""
+        },
+        {
+          "name": "open to the world",
+          "langs": [
+            "tf",
+            "yml",
+            "json"
+          ],
+          "needle": "0.0.0.0/0",
+          "regex": "0\\.0\\.0\\.0/0|::/0"
+        },
+        {
+          "name": "public storage",
+          "langs": [
+            "tf",
+            "yml",
+            "json"
+          ],
+          "needle": "public",
+          "regex": "(?i)acl\\s*=\\s*\"public-read(-write)?\"|\"public-read\"|publicAccessBlock\\w*\\s*[:=]\\s*false|block_public_(acls|policy)\\s*=\\s*false|allUsers|allAuthenticatedUsers|uniform_bucket_level_access\\s*=\\s*false"
+        },
+        {
+          "name": "TLS or auth disabled",
+          "langs": [
+            "yml",
+            "tf",
+            "toml",
+            "json"
+          ],
+          "needle": "false",
+          "regex": "(?i)(tls|ssl|https|verify|authentication|auth_enabled|require_auth|enable_auth|insecure_skip_verify|insecure)\\w*\\s*[:=]\\s*(false|true|disabled?|\"none\")(?![\\w-])"
+        },
+        {
+          "name": "published database or admin port",
+          "langs": [
+            "yml"
+          ],
+          "needle": "ports",
+          "regex": "^\\s*-\\s*[\"']?(\\d+\\.){3}\\d+:?(3306|5432|6379|27017|9200|5984|11211|8080|15672):|^\\s*-\\s*[\"']?(3306|5432|6379|27017|9200|5984|11211|15672):\\d+"
+        }
+      ]
+    },
+    {
+      "id": "ai-llm-agent",
+      "name": "LLM, agent and tool use",
+      "applies": {
+        "imports": [
+          "openai",
+          "anthropic",
+          "@anthropic-ai/sdk",
+          "langchain",
+          "@langchain/core",
+          "langchain_core",
+          "llama_index",
+          "llamaindex",
+          "ai",
+          "@ai-sdk/openai",
+          "mcp",
+          "@modelcontextprotocol/sdk",
+          "ollama",
+          "litellm",
+          "google.generativeai",
+          "@google/generative-ai",
+          "cohere",
+          "mistralai",
+          "transformers",
+          "vllm",
+          "autogen",
+          "crewai",
+          "semantic_kernel",
+          "instructor",
+          "dspy",
+          "haystack"
+        ],
+        "content": [
+          "(?i)\\b(system_prompt|systemPrompt|tool_calls?|function_call|toolChoice|chat\\.completions|messages\\.create|prompt_template|PromptTemplate|retriever|embedding|vector_store|mcp\\.server|McpServer)\\b"
+        ]
+      },
+      "invariant": "Model output, retrieved content, memory and tool descriptions are untrusted input; every tool call is authorized for the requesting user on the named resource and bound to what the user asked for.",
+      "look": [
+        "Where untrusted text enters the prompt (documents, web pages, emails, issues, tool results, other users' content) and which tools with side effects the same loop can call: a code-level check stands between them, or only the prompt?",
+        "Tool handlers: do they validate arguments as request input (paths, URLs, SQL, shell, ids) and re-check the requesting user's permission on the resource, or run with a service identity?",
+        "Confirmation flows: is the approved action bound to the exact tool name and arguments, or can a later turn, retry or changed argument run under the approval?",
+        "Memory and RAG writes: who can write what another user's session later reads; tenant filters in the retrieval query itself and in cache keys.",
+        "Model output rendered as HTML or Markdown with raw HTML, used as a URL, a command or a code path.",
+        "Secrets, other users' data or policy in the assembled context; MCP servers trusted by name or by tool description rather than by connection."
+      ],
+      "counts": "Attacker-controlled content causes a tool action, a disclosure or a write under another user's authority, or model output reaches a sink a user could not reach directly.",
+      "hardening": "A guardrail prompt that is weak but stands behind a deterministic check; an injection with no capability behind it.",
+      "patterns": [
+        {
+          "name": "model output into a sink",
+          "langs": [
+            "py",
+            "js"
+          ],
+          "needle": "e",
+          "regex": "(?i)\\b(completion|response|reply|answer|output|result|content|message)\\w*\\.(choices|content|text|message)\\b[^\\n]*(exec|eval|subprocess|os\\.system|innerHTML|dangerouslySetInnerHTML|execute\\(|query\\(|open\\(|fetch\\(|requests\\.)|\\b(exec|eval|subprocess\\.run|os\\.system|execute|query)\\s*\\([^\\n]*(completion|llm_output|model_output|response\\.choices|tool_args|arguments)"
+        },
+        {
+          "name": "tool arguments parsed from the model",
+          "langs": [
+            "py",
+            "js"
+          ],
+          "needle": "argument",
+          "regex": "(?i)(json\\.loads|JSON\\.parse)\\s*\\([^\\n]*(arguments|tool_call|function_call|tool_input)|\\.function\\.arguments\\b|tool_call\\.args\\b|toolCall\\.args\\b|input\\[[\"']\\w+[\"']\\]"
+        },
+        {
+          "name": "prompt built from outside text",
+          "langs": [
+            "py",
+            "js"
+          ],
+          "needle": "prompt",
+          "regex": "(?i)(prompt|system|messages?|context|instructions?)\\w*\\s*(\\+=|=|\\.append\\(|\\.push\\(|\\.format\\()[^\\n]*(f[\"']|`|\\+|\\{\\{|\\.format|\\$\\{)[^\\n]*(user_input|user_message|document|page|content|email|issue|comment|retrieved|chunk|results?|tool_result|memory|history)\\b"
+        },
+        {
+          "name": "tool or function registered",
+          "langs": [
+            "py",
+            "js"
+          ],
+          "needle": "tool",
+          "regex": "(?i)(@tool\\b|@mcp\\.tool|server\\.tool\\s*\\(|\\.setRequestHandler\\s*\\(|tools?\\s*[:=]\\s*\\[|\"type\"\\s*:\\s*\"function\"|StructuredTool|FunctionTool|defineTool|tool\\s*\\(\\s*\\{|addTool\\s*\\()"
+        },
+        {
+          "name": "markdown or HTML rendered from model output",
+          "langs": [
+            "js",
+            "py"
+          ],
+          "needle": "ark",
+          "regex": "(?i)(marked|markdown|remark|rehype|showdown|markdown-it|mistune|bleach|DOMPurify)\\w*[^\\n]*(sanitize\\s*:\\s*false|allowDangerousHtml\\s*:\\s*true|html\\s*:\\s*true|escape\\s*=\\s*False|rehypeRaw|unsafe|dangerously)"
+        },
+        {
+          "name": "secret in the prompt or context",
+          "langs": [
+            "py",
+            "js"
+          ],
+          "needle": "prompt",
+          "regex": "(?i)(prompt|system|messages|context)\\w*[^\\n]*\\b(api_key|apikey|secret|password|token|credential)\\b"
+        }
+      ]
+    },
+    {
+      "id": "protocols-messaging",
+      "name": "RPC, messaging and webhooks",
+      "applies": {
+        "imports": [
+          "grpc",
+          "@grpc/grpc-js",
+          "google.golang.org/grpc",
+          "tonic",
+          "graphql",
+          "apollo-server",
+          "@apollo/server",
+          "strawberry",
+          "graphene",
+          "ariadne",
+          "gqlgen",
+          "async-graphql",
+          "kafka",
+          "kafkajs",
+          "confluent_kafka",
+          "pika",
+          "amqplib",
+          "aio_pika",
+          "nats",
+          "bullmq",
+          "celery",
+          "rq",
+          "sidekiq",
+          "ws",
+          "websockets",
+          "socket.io",
+          "tokio-tungstenite",
+          "gorilla/websocket",
+          "protobuf",
+          "capnp",
+          "thrift"
+        ],
+        "content": [
+          "(?i)(webhook|X-Hub-Signature|Stripe-Signature|x-signature|graphql|introspection|WebSocket|amqp|kafka|nats\\.connect|CheckOrigin)"
+        ]
+      },
+      "invariant": "Every message is bound to an authenticated producer and the right principal, handled once, and authorized per item even in streams and batches.",
+      "look": [
+        "Webhooks: signature or HMAC verified with a constant-time compare, over the raw body, with a timestamp window; the secret per sender; unverified handlers that change state.",
+        "GraphQL: introspection in production, no depth or complexity limit, batching, field-level authorization missing (a resolver that returns another user's node), mutations without auth.",
+        "gRPC and RPC: interceptors applied to unary but not streaming methods, health or reflection services, per-message authorization in a stream after the first message.",
+        "WebSockets: Origin checked at upgrade, authentication of the socket, per-message authorization, message size limits.",
+        "Queues and topics: can a producer choose another tenant's topic, routing key or reply queue; are message bodies trusted as control events (admin, provider callback); idempotency on redelivery; stale or out-of-order messages overwriting newer state.",
+        "Serialization: unknown fields, duplicate keys, default values and enum fallbacks read differently by two components."
+      ],
+      "counts": "A forged or replayed message is accepted as authentic, a stream or batch item escapes authorization, or a producer reaches another tenant's channel, with the effect shown.",
+      "hardening": "Introspection enabled without sensitive schema, a missing limit without a concrete amplification path.",
+      "patterns": [
+        {
+          "name": "webhook handler",
+          "langs": [
+            "any"
+          ],
+          "needle": "webhook",
+          "regex": "(?i)[\"'`/](webhook|webhooks|hook|hooks|callback|callbacks|events|notify)[\"'`/]|def\\s+\\w*webhook\\w*|function\\s+\\w*webhook\\w*"
+        },
+        {
+          "name": "signature header read",
+          "langs": [
+            "any"
+          ],
+          "needle": "ignature",
+          "regex": "(?i)(x-hub-signature|stripe-signature|x-signature|x-slack-signature|x-twilio-signature|x-github-event|svix-signature|headers\\s*(\\[|\\.get\\s*\\()\\s*[\"'][\\w-]*signature|header\\s*\\(\\s*[\"'][\\w-]*signature)"
+        },
+        {
+          "name": "introspection or limits",
+          "langs": [
+            "any"
+          ],
+          "needle": "ntrospection",
+          "regex": "(?i)introspection\\s*[:=]\\s*(true|True)|allowIntrospection|disable_introspection\\s*=\\s*False|depthLimit|max_depth|complexity"
+        },
+        {
+          "name": "WebSocket upgrade handler",
+          "langs": [
+            "any"
+          ],
+          "needle": "ocket",
+          "regex": "(?i)(new\\s+WebSocket\\.Server|WebSocketServer\\s*\\(|upgrader\\.Upgrade|CheckOrigin\\s*:|@app\\.websocket|@router\\.websocket|websocket_connect|io\\.on\\s*\\(\\s*[\"']connection|ws\\.on\\s*\\(\\s*[\"']message)"
+        },
+        {
+          "name": "check origin disabled",
+          "langs": [
+            "go"
+          ],
+          "needle": "CheckOrigin",
+          "regex": "CheckOrigin\\s*:\\s*func\\s*\\([^)]*\\)\\s*bool\\s*\\{\\s*return\\s+true"
+        },
+        {
+          "name": "consumer or subscriber handler",
+          "langs": [
+            "any"
+          ],
+          "needle": "e",
+          "regex": "(?i)\\b(@app\\.task|@celery\\.task|@shared_task|consumer\\.(subscribe|poll|run)|channel\\.(consume|basic_consume)|\\.subscribe\\s*\\(\\s*[\"']|Worker\\s*\\(\\s*[\"']|@KafkaListener|@RabbitListener|@SqsListener|nc\\.Subscribe|js\\.Subscribe)"
+        }
+      ]
+    },
+    {
+      "id": "memory-safety",
+      "name": "Memory safety, unsafe code and FFI",
+      "applies": {
+        "langs": [
+          "c"
+        ],
+        "content": [
+          "\\bunsafe\\s*\\{",
+          "\\bunsafe\\s+(fn|impl)\\b",
+          "import\\s+\"C\"",
+          "\\bextern\\s+\"C\"",
+          "ctypes\\.",
+          "\\bcffi\\b",
+          "\\bffi\\b",
+          "JNIEXPORT",
+          "Marshal\\.(Copy|PtrTo|AllocHGlobal)",
+          "\\bfixed\\s*\\("
+        ]
+      },
+      "invariant": "Every length, index, lifetime and type assumption is derived from the worst accepted input, on both sides of every FFI boundary.",
+      "look": [
+        "Fixed buffers and copies: strcpy, strcat, sprintf, gets, memcpy and read with a length computed from input; arithmetic before malloc (count * size, a - b) that can overflow or go negative; signed to unsigned conversions; off-by-one on terminators.",
+        "Lifetimes: pointers kept in callbacks, timers, caches or iterators after the owner is freed; realloc paths; error and cancel paths that free twice.",
+        "Rust unsafe: from_raw_parts, get_unchecked, transmute, set_len, raw pointer arithmetic; which invariant each block relies on and who checks it.",
+        "FFI: who allocates and frees, bytes versus elements, null and zero length, struct layout and repr, panics crossing the boundary.",
+        "Parsers of untrusted formats (images, archives, network frames): offsets and counts trusted before range checks; existing fuzz targets and sanitizer builds to run.",
+        "Concurrency: check-then-use on shared state without a lock, lock order, signal handlers."
+      ],
+      "counts": "A realistic untrusted input reaches an out-of-bounds read or write, a use after free, a type confusion or an unchecked unsafe assumption, shown by a harness, a sanitizer run or an unmistakable path.",
+      "hardening": "A pattern on data only the program itself produces; a panic (safe termination) in a non-shared process.",
+      "patterns": [
+        {
+          "name": "unsafe string or buffer function",
+          "langs": [
+            "c"
+          ],
+          "needle": "(",
+          "regex": "\\b(strcpy|strcat|sprintf|vsprintf|gets|scanf|sscanf|strncpy|strncat|memcpy|memmove|alloca|realpath|getwd|tmpnam|mktemp)\\s*\\("
+        },
+        {
+          "name": "arithmetic before allocation",
+          "langs": [
+            "c"
+          ],
+          "needle": "alloc",
+          "regex": "\\b(malloc|calloc|realloc|alloca|new\\s+\\w+)\\s*[\\[(][^;]*[*+-][^;]*[\\])]"
+        },
+        {
+          "name": "format string from a variable",
+          "langs": [
+            "c"
+          ],
+          "needle": "printf",
+          "regex": "\\b(printf|fprintf|sprintf|snprintf|syslog|vprintf)\\s*\\(\\s*([a-zA-Z_]\\w*\\s*,\\s*)?[a-zA-Z_]\\w*\\s*\\)"
+        },
+        {
+          "name": "unsafe block or function",
+          "langs": [
+            "rs"
+          ],
+          "needle": "unsafe",
+          "regex": "\\bunsafe\\s*(\\{|fn|impl)"
+        },
+        {
+          "name": "unchecked operation",
+          "langs": [
+            "rs"
+          ],
+          "needle": "_",
+          "regex": "\\b(from_raw_parts(_mut)?|get_unchecked(_mut)?|transmute|set_len|from_utf8_unchecked|assume_init|unwrap_unchecked)\\s*\\("
+        },
+        {
+          "name": "cgo or FFI boundary",
+          "langs": [
+            "go",
+            "py",
+            "java",
+            "cs"
+          ],
+          "needle": "C",
+          "regex": "import\\s+\"C\"|unsafe\\.Pointer|ctypes\\.(CDLL|cdll|c_char_p|POINTER|cast)|\\bnative\\s+\\w+\\s*\\(|\\[DllImport|Marshal\\.(Copy|PtrToStructure|AllocHGlobal)"
+        }
+      ]
+    },
+    {
+      "id": "desktop-ipc",
+      "name": "Desktop, mobile and local IPC",
+      "applies": {
+        "imports": [
+          "electron",
+          "@tauri-apps/api",
+          "tauri",
+          "wails",
+          "nw",
+          "@capacitor/core",
+          "react-native"
+        ],
+        "files": [
+          "AndroidManifest.xml",
+          "Info.plist",
+          "*.entitlements",
+          "tauri.conf.json",
+          "electron-builder.yml",
+          "*.xcodeproj",
+          "Podfile",
+          "build.gradle",
+          "*.sock"
+        ],
+        "content": [
+          "(?i)\\b(ipcMain|ipcRenderer|contextBridge|nodeIntegration|webSecurity|shell\\.openExternal|setAsDefaultProtocolClient|addJavascriptInterface|WKScriptMessageHandler|NSXPCConnection|AF_UNIX|UnixListener|net\\.Listen\\(\"unix|D-Bus|dbus|exported=\"true\"|intent-filter)\\b"
+        ]
+      },
+      "invariant": "Only the intended principal can reach each local channel, bridge or deep link, and every privileged operation re-checks the normalized arguments.",
+      "look": [
+        "Electron: nodeIntegration true or contextIsolation false with remote content; webSecurity false; ipcMain handlers that act on sender data without validating event.senderFrame or the arguments; shell.openExternal or openPath with a URL or path from content; custom protocol handlers; will-navigate and window-open guards.",
+        "Deep links and custom schemes: a URL from another app completes login, imports data or selects an account without binding to the current session; duplicate query parameters; replay.",
+        "Webview bridges (addJavascriptInterface, WKScriptMessageHandler, postMessage bridges): origin checked after every navigation, not only at load; bridge methods allowlisted and arguments validated.",
+        "Local sockets, named pipes, XPC, D-Bus, loopback servers: peer authenticated (uid, code signature, token), socket path permissions, world-writable directories, predictable paths.",
+        "Privileged helpers and installers: a low-privilege caller selects the command, path or user; symlinks and TOCTOU on files the helper writes.",
+        "Android: exported components without permissions, intent extras trusted, content providers with path traversal; iOS: URL schemes, keychain access groups, ATS exceptions."
+      ],
+      "counts": "Another app, another OS user, a sandboxed process or remote content reaches an operation meant for the app itself, with the operation shown.",
+      "hardening": "A setting that would matter only with remote content the app never loads; a channel reachable only by the same user with the same authority.",
+      "patterns": [
+        {
+          "name": "Electron insecure web preferences",
+          "langs": [
+            "js"
+          ],
+          "needle": "e",
+          "regex": "nodeIntegration\\s*:\\s*true|contextIsolation\\s*:\\s*false|webSecurity\\s*:\\s*false|allowRunningInsecureContent\\s*:\\s*true|enableRemoteModule\\s*:\\s*true|sandbox\\s*:\\s*false|nodeIntegrationInWorker\\s*:\\s*true"
+        },
+        {
+          "name": "shell open or IPC handler",
+          "langs": [
+            "js"
+          ],
+          "needle": "e",
+          "regex": "shell\\.(openExternal|openPath|showItemInFolder)\\s*\\(|ipcMain\\.(on|handle)\\s*\\(|setAsDefaultProtocolClient\\s*\\(|protocol\\.(registerFileProtocol|handle)\\s*\\(|loadURL\\s*\\(\\s*[^\"'`]"
+        },
+        {
+          "name": "exported Android component",
+          "langs": [
+            "any"
+          ],
+          "needle": "exported",
+          "regex": "android:exported\\s*=\\s*\"true\"|<intent-filter"
+        },
+        {
+          "name": "JavaScript bridge",
+          "langs": [
+            "java",
+            "swift",
+            "js"
+          ],
+          "needle": "a",
+          "regex": "addJavascriptInterface\\s*\\(|setJavaScriptEnabled\\s*\\(\\s*true|setAllowFileAccess(FromFileURLs|UniversalAccessFromFileURLs)?\\s*\\(\\s*true|WKScriptMessageHandler|allowFileAccessFromFileURLs|allowUniversalAccessFromFileURLs"
+        },
+        {
+          "name": "local socket or pipe listener",
+          "langs": [
+            "any"
+          ],
+          "needle": "i",
+          "regex": "(?i)(AF_UNIX|UnixListener::bind|net\\.Listen\\s*\\(\\s*\"unix|NSXPCListener|\\\\\\\\\\.\\\\pipe\\\\|net\\.createServer\\s*\\([^)]*\\)\\.listen\\s*\\(\\s*[\"'][^\"']*\\.sock|chmod\\s*\\(\\s*[^,]+,\\s*0o?777|0o?666\\b|localhost:\\d+|127\\.0\\.0\\.1:\\d+)"
+        },
+        {
+          "name": "URL scheme or deep link handler",
+          "langs": [
+            "any"
+          ],
+          "needle": "ur",
+          "regex": "(?i)(CFBundleURLSchemes|open-url|openURL\\s*\\(|application\\s*\\(\\s*_\\s*app[^)]*open\\s+url|onNewIntent|getIntent\\(\\)\\.getData|handleOpenURL|deep[-_]?link)"
+        }
+      ]
+    },
+    {
+      "id": "availability",
+      "name": "Resource exhaustion and availability",
+      "applies": {
+        "imports": [
+          "flask",
+          "django",
+          "fastapi",
+          "express",
+          "koa",
+          "fastify",
+          "hono",
+          "net/http",
+          "gin-gonic",
+          "echo",
+          "actix-web",
+          "axum",
+          "rocket",
+          "spring",
+          "rails",
+          "tokio",
+          "asyncio",
+          "grpc"
+        ],
+        "content": [
+          "(?i)\\b(listen\\(|HttpServer|app\\.run\\(|serve\\(|uvicorn|gunicorn|ListenAndServe)\\b"
+        ]
+      },
+      "invariant": "Untrusted work is bounded in size, depth, time and count before it costs the service anything shared.",
+      "look": [
+        "Request bodies, uploads, JSON depth, array lengths, page sizes and query results without a limit; decompression of request data without a size cap.",
+        "Regular expressions built from or applied to user text with nested quantifiers or overlapping alternations (ReDoS); backtracking engines.",
+        "Outbound calls without a timeout (requests.get without timeout=, fetch without a signal, http.Client without Timeout); retries without a ceiling or jitter.",
+        "Work before authentication: expensive hashing, parsing, lookups or external calls on unauthenticated routes; missing rate limits on login, reset and signup.",
+        "Panics, unwraps, asserts and unhandled exceptions on input in a shared process; infinite loops on malformed input; recursive parsers.",
+        "Leaks: handles, temp files, subprocesses or connections not closed on the error path; detached work after a client disconnects."
+      ],
+      "counts": "One bounded request makes a shared service unavailable or costs far more than it should, with the amplification shown in code or a bounded local measurement.",
+      "hardening": "A missing limit with no shared resource behind it, a slow path reachable only by an authenticated operator.",
+      "patterns": [
+        {
+          "name": "request without a timeout",
+          "langs": [
+            "py"
+          ],
+          "needle": "requests.",
+          "regex": "requests\\.(get|post|put|delete|head|patch|request)\\s*\\((?![^\\n]*timeout)"
+        },
+        {
+          "name": "regex on user text",
+          "langs": [
+            "any"
+          ],
+          "needle": "re",
+          "regex": "(?i)\\b(re\\.(compile|match|search|findall|sub)|new\\s+RegExp|regexp\\.(Compile|MustCompile|MatchString)|Regex::new|Pattern\\.compile|preg_match)\\s*\\(\\s*(req|request|params|input|user|query|pattern|data|body|c\\.|r\\.)"
+        },
+        {
+          "name": "nested quantifier",
+          "langs": [
+            "any"
+          ],
+          "needle": "+",
+          "regex": "\\([^()]*[+*]\\)[+*]|\\([^()]*\\|[^()]*\\)[+*]\\s*[$)]"
+        },
+        {
+          "name": "unwrap or expect in a handler",
+          "langs": [
+            "rs"
+          ],
+          "needle": "unwrap",
+          "regex": "\\b(req|request|body|payload|params|query|headers|form)\\w*(\\.\\w+\\s*\\([^()]*\\))?\\.(unwrap|expect)\\s*\\("
+        },
+        {
+          "name": "unbounded query or collection",
+          "langs": [
+            "py",
+            "js",
+            "go",
+            "java",
+            "rb",
+            "php",
+            "cs"
+          ],
+          "needle": "a",
+          "regex": "(?i)\\.(objects\\.all|all|fetchall|findAll|find_all|findMany|Find|scan|list_all|listAll)\\s*\\(\\s*(\\)|\\{\\s*\\}|&)(?![^\\n]*(limit|take|page|first|LIMIT|\\[:))|\\.limit\\s*\\(\\s*(req|params|query|c\\.Query|r\\.Form|int\\(request)"
+        },
+        {
+          "name": "decompression of request data",
+          "langs": [
+            "any"
+          ],
+          "needle": "z",
+          "regex": "(?i)\\b(zlib\\.decompress|gzip\\.(open|decompress|GzipFile)|zipfile\\.ZipFile|tarfile\\.open|gunzip(Sync)?|inflate(Sync)?|createGunzip|gzip\\.NewReader|zip\\.NewReader|GzDecoder|ZipArchive)\\s*\\("
+        },
+        {
+          "name": "client without a timeout",
+          "langs": [
+            "go",
+            "java",
+            "js"
+          ],
+          "needle": "Client",
+          "regex": "&?http\\.Client\\s*\\{\\s*\\}|http\\.DefaultClient|HttpClient\\.newHttpClient\\(\\)|new\\s+OkHttpClient\\s*\\(\\s*\\)|axios\\.create\\s*\\(\\s*\\{(?![^}]*timeout)"
+        },
+        {
+          "name": "body size unlimited",
+          "langs": [
+            "js",
+            "py"
+          ],
+          "needle": "limit",
+          "regex": "(json|urlencoded|raw|text)\\s*\\(\\s*\\{[^}]*limit\\s*:\\s*[\"']?(\\d{3,}mb|\\d+gb|Infinity)|MAX_CONTENT_LENGTH\\s*=\\s*None|DATA_UPLOAD_MAX_MEMORY_SIZE\\s*=\\s*None"
+        }
+      ]
+    },
+    {
+      "id": "data-lifecycle",
+      "name": "Data lifecycle, deletion and migration",
+      "applies": {
+        "files": [
+          "alembic.ini",
+          "*/migrations/*",
+          "migrations/*",
+          "db/migrate/*",
+          "*/db/migrate/*",
+          "prisma/migrations/*",
+          "flyway.conf",
+          "liquibase.properties",
+          "*/alembic/versions/*"
+        ],
+        "content": [
+          "(?i)\\b(deleted_at|is_deleted|isDeleted|soft_delete|softDelete|paranoid|acts_as_paranoid|withTrashed|knex\\.schema|revoke_token|revokeToken|invalidate_sessions)\\b"
+        ]
+      },
+      "invariant": "Deleted, revoked and migrated data stays deleted, revoked and consistent in every copy: primary store, caches, indexes, exports, queues and backups.",
+      "look": [
+        "Soft delete: direct lookups, relations, search, object links and background jobs that ignore deleted_at; re-registration of a deleted identifier while references remain.",
+        "Revocation: removed membership, changed role, rotated secret or withdrawn consent not reaching sessions, caches, subscriptions, queued jobs or materialized views.",
+        "Migrations: old rows without tenant or ACL fields, defaults applied differently by old and new readers, dual-write windows, rollback paths restoring removed permissions.",
+        "Retention and deletion promises: queued work, exports, analytics, logs and backups that recreate or keep data after deletion.",
+        "Restore and undo: re-authorized with current policy, or restoring memberships, credentials and permissions as they were."
+      ],
+      "counts": "A deleted or revoked record, membership or credential still authorizes or is still readable through a path you traced.",
+      "hardening": "A copy that lags briefly by design with no authorization consequence.",
+      "patterns": [
+        {
+          "name": "soft-delete marker",
+          "langs": [
+            "any"
+          ],
+          "needle": "delete",
+          "regex": "(?i)\\b(deleted_at|is_deleted|isDeleted|soft_delete|softDelete|paranoid|with_deleted|withTrashed|only_deleted|unscoped)\\b"
+        },
+        {
+          "name": "cache key without a tenant",
+          "langs": [
+            "any"
+          ],
+          "needle": "cache",
+          "regex": "(?i)cache\\w*\\.(get|set|put|fetch|remember|add|delete)\\s*\\(\\s*(f?[\"'`][^\"'`]*[\"'`]\\s*(%|\\+|\\.format)|[a-zA-Z_]\\w*\\s*[,)])"
+        },
+        {
+          "name": "revocation or role change",
+          "langs": [
+            "any"
+          ],
+          "needle": "e",
+          "regex": "(?i)\\b(revoke|revoked|invalidate_sessions|logout_all|remove_member|removeMember|change_role|changeRole|set_role|disable_user|deactivate|rotate_secret|rotateKey)\\w*\\s*\\("
+        },
+        {
+          "name": "migration file",
+          "langs": [
+            "any"
+          ],
+          "needle": "igrat",
+          "regex": "(?i)(def\\s+upgrade\\s*\\(|def\\s+downgrade\\s*\\(|exports\\.(up|down)\\s*=|class\\s+Migration\\b|AddColumn|add_column|alter\\s+table|ALTER\\s+TABLE)"
+        }
+      ]
+    }
+  ]
+}

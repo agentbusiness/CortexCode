@@ -8,7 +8,7 @@
  */
 
 import { useState } from 'react';
-import { definePlugin, useEvent, useJournal, useModelState, useQuery, useSelection, ServiceProblem } from '@cortex/sdk';
+import { definePlugin, installLine, ServiceProblem, useEvent, useJournal, useModelState, useQuery, useSelection } from '@cortex/sdk';
 import './model.css';
 
 /** One `model.progress` event, as far as the card reads it. */
@@ -48,23 +48,31 @@ function ModelSection() {
   const list = slots.data?.slots ?? [];
   const busy = list.filter((slot) => slot.busy).length;
   const loading = state.phase === 'loading' || state.phase === 'starting';
+  const downloading = installLine(state.install);
   const detail = info.data ? [`${info.data.variant} · ${info.data.quant}`, info.data.speculative ? `speculative: ${info.data.speculative}` : '', speed !== null ? 'speed of the last model call in this conversation' : ''].filter(Boolean).join('\n') : undefined;
   return (
     <section className="cx-cs" data-section="model" data-build={__CORTEX_BUILD__}>
       <div className="cx-cs-l"><span className="ap">Model</span></div>
       <div className="cx-cs-b">
-        {info.error && !info.data && !loading && <ServiceProblem service="model" state={info} className="hint" />}
+        {info.error && !info.data && !loading && !downloading && <ServiceProblem service="model" state={info} className="hint" />}
         <div className="cx-cs-row" title={detail}>
           {(info.data || state.variant) && <span className="ap cx-model-name">{info.data?.variant ?? state.variant}</span>}
           {state.testVariant && <span className="ap live" data-test-variant={state.variant ?? ''} title="Not the configured model: a test instance">test</span>}
           <span className="grow" />
-          {loading && <span className="ap hot" data-model-phase={state.phase}>loading</span>}
+          {loading && !downloading && <span className="ap hot" data-model-phase={state.phase}>loading</span>}
           {info.data && slots.data && <span className="ap faint" data-busy={busy}><span className="num cx-model-num">{busy}/{list.length || info.data.slots}</span> busy</span>}
           {slots.data && slots.data.queued > 0 && <span className="ap hot"><span className="num">{slots.data.queued}</span> queued</span>}
           {live !== null
             ? <span className="ap live" data-writing={rates.size}><span className="num cx-model-num">{live.toFixed(1)}</span> tok/s</span>
             : speed !== null && <span className="ap faint"><span className="num cx-model-num">{speed.toFixed(1)}</span> tok/s</span>}
         </div>
+        {downloading && state.install && (
+          <div className="cx-model-install" data-install-phase={state.install.phase}>
+            <progress max={state.install.total || 1} value={state.install.bytes} />
+            <span className="ap hot">{downloading}</span>
+          </div>
+        )}
+        {state.phase === 'failed' && !downloading && <p className="hint" data-model-phase="failed">{state.reason}</p>}
       </div>
     </section>
   );

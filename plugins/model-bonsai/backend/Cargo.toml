@@ -22,9 +22,8 @@ path = "src/lib.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol" }
+cc-model-kit = { path = "../../../model-kit" }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-minijinja = { version = "2.17.0", features = ["json", "preserve_order", "loop_controls"] }
-minijinja-contrib = { version = "2.17.0", features = ["pycompat"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.53", features = ["full"] }

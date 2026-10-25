@@ -8,7 +8,6 @@
 // keeps the modules the workbench shares through its import map external (React, ReactDOM, the
 // JSX runtime and @cortex/sdk), and writes dist/manifest.json — {id, version, slot, entry, css, label?, order?,
 // build} — from the package's `cortex` field. The frame serves a plugin from that directory.
-// Tests (vitest) run in jsdom with the same definitions.
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -92,7 +91,7 @@ export async function pluginConfig(dir) {
   return {
     root: dir,
     plugins: [react(), manifestPlugin(dir, identity, stamp)],
-    define: { ...define, 'process.env.NODE_ENV': JSON.stringify(process.env.VITEST ? 'test' : 'production') },
+    define: { ...define, 'process.env.NODE_ENV': JSON.stringify('production') },
     build: {
       outDir: path.join(dir, 'dist'),
       emptyOutDir: true,
@@ -103,6 +102,5 @@ export async function pluginConfig(dir) {
       lib: { entry: path.join(dir, 'src/index.tsx'), formats: ['es'], fileName: () => 'index.js', cssFileName: 'style' },
       rolldownOptions: { external: SHARED_MODULES, output: { chunkFileNames: 'chunks/[name]-[hash].js' } },
     },
-    test: { include: ['test/**/*.test.{ts,tsx}'], environment: 'jsdom' },
   };
 }

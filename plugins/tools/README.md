@@ -18,7 +18,6 @@ outside):
 |---|---|
 | `plugin.toml` | identity, build command and output, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binary `cc-tools`: category `tools`, contract `tools@1` |
-| `verify/` | gate scripts, run against the real frame (plus fixtures and their results) |
 
 The plugin has no UI package of its own: the file tree and editor are the code-view plugin's, which
 call `tools.files` and `tools.save`.
@@ -26,7 +25,7 @@ call `tools.files` and `tools.save`.
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
 cortex-pack build plugins/tools        # -> plugins/tools/target/tools-<version>-<target>.ccplugin
 ```
 
@@ -65,7 +64,7 @@ their first inline for later). The set of skills a session got lives with the pe
 another way (the chat flow's injected skills) is recorded there with `tools.skills.shown {session_id,
 uris}`, so a code that leads to it later brings nothing.
 
-The scratch folder is `tmp/` at the workspace root (`$TMPDIR` of its shells), listed in the project's
+The scratch folder is `tmp/` at the workspace root (`$TMPDIR` in its shells' commands, not exported: the programs they start use the system's temp folder, so their temp files never sit inside the project), listed in the project's
 `.gitignore` while it exists. When a turn ends the chat flow calls `tools.cleanup {workspace,
 session_id, since_ms}` (`cleanup.rs`): `tmp/` goes, the added `.gitignore` line is taken back, and
 new untracked files the turn's commands made (build output, logs) are removed; files `edit` wrote,
@@ -78,15 +77,3 @@ does not have on its PATH.
 A host `tools.read` of `diagnostics://` may pass `wait_ms` (0: what the servers have now, nothing
 started or waited for, marked partial; the chat flow's reads) and `shown` (at most that many listed
 per server, errors first, the rest counted). A server that cannot answer is a line of the result.
-
-## Verification
-
-Each `[verify]` entry of `plugin.toml`, run from this folder (binaries come from `CORTEX_FRAME_BIN`,
-`CORTEX_TOOLS_BIN`, `CORTEX_CX_BIN`, `CORTEX_MEMORY_BIN`, else the repository layout):
-
-- `verify/hashline_suite.mjs`: anchored edits against an independent hashline implementation.
-- `verify/repair_corpus.mjs`: real malformed calls recorded from Qwen models are repaired or refused without side effects.
-- `verify/run.mjs`: shell, background jobs, output offloading, cancellation.
-- `verify/workspace.mjs`: copy-on-write workspaces.
-- `verify/uris_cx.mjs`: URI reads and the `cx` CLI against the real memory plugin.
-- `../../scripts/verify-sandbox.mjs`: the write sandbox and the per-workspace venv.

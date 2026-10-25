@@ -24,7 +24,6 @@ pub const PROVIDES: &[&str] = &[
     methods::HIBERNATE,
     methods::HOLD,
     methods::PREWARM,
-    methods::ENDPOINT,
     methods::VARIANTS,
     methods::SELECT,
 ];
@@ -129,7 +128,7 @@ async fn dispatch(runtime: Arc<Runtime>, call: Call) -> Result<Value, RpcError> 
             let params: SelectParams = parse_params(params)?;
             to_value(&runtime.select(&params.variant).await?)
         }
-        methods::HIBERNATE | methods::ENDPOINT => Err(not_yet(&method)),
+        methods::HIBERNATE => Err(not_yet(&method)),
         other => Err(RpcError::unknown_method(other)),
     }
 }

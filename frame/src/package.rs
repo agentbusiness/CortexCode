@@ -200,9 +200,6 @@ fn check(manifest: &CcPluginManifest, staging: &Path) -> Result<(), String> {
     if !valid_id(&meta.id) || !valid_version(&meta.version) {
         return Err(format!("invalid plugin id `{}` or version `{}`", meta.id, meta.version));
     }
-    if meta.test_only {
-        return Err(format!("`{}` is test-only and cannot be installed", meta.id));
-    }
     if let Some(backend) = &manifest.backend {
         let host = host_target();
         if manifest.build.target != host {

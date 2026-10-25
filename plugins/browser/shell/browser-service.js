@@ -30,6 +30,9 @@ export class RpcError extends Error {
 export const PARTITION = 'persist:cortex-browser';
 
 /** Size a tab lays out at before the pane has ever been shown. */
+const HISTORY_LIMIT = 1000;
+const FIELD_LIMIT = 4096;
+
 const DEFAULT_BOUNDS = { x: 0, y: 0, width: 1280, height: 800 };
 
 /**
@@ -56,6 +59,10 @@ class Tab {
     this.requests = new Map();
     /** @type {NetworkEntry[]} */
     this.network = [];
+    this.consoleOmitted = 0;
+    this.consoleClipped = 0;
+    this.networkOmitted = 0;
+    this.networkClipped = 0;
     /** @type {Map<number, number>} */
     this.refs = new Map();
     this.loadError = /** @type {string | null} */ (null);
@@ -81,6 +88,26 @@ class Tab {
     };
   }
 
+  /** Bound page-controlled strings before retaining them in the main process. */
+  field(/** @type {unknown} */ value, /** @type {'console' | 'network'} */ kind) {
+    const text = String(value ?? '');
+    if (text.length <= FIELD_LIMIT) return text;
+    if (kind === 'console') this.consoleClipped += 1;
+    else this.networkClipped += 1;
+    return text.slice(0, FIELD_LIMIT) + '… [clipped]';
+  }
+
+  appendConsole(/** @type {ConsoleMessage} */ entry) {
+    entry.text = this.field(entry.text, 'console');
+    entry.level = this.field(entry.level, 'console');
+    if (entry.source) entry.source = this.field(entry.source, 'console');
+    this.console.push(entry);
+    if (this.console.length > HISTORY_LIMIT) {
+      this.console.shift();
+      this.consoleOmitted += 1;
+    }
+  }
+
   /**
    * One CDP event.
    * @param {string} method
@@ -89,19 +116,21 @@ class Tab {
   onEvent(method, params) {
     switch (method) {
       case 'Runtime.consoleAPICalled': {
-        const text = (params.args ?? []).map(remoteText).join(' ');
-        this.console.push({ level: consoleLevel(params.type), text, ts_ms: Date.now(), source: 'console-api' });
+        const args = params.args ?? [];
+        if (args.length > 64) this.consoleClipped += 1;
+        const text = args.slice(0, 64).map((arg) => this.field(remoteText(arg), 'console')).join(' ');
+        this.appendConsole({ level: consoleLevel(params.type), text, ts_ms: Date.now(), source: 'console-api' });
         return;
       }
       case 'Runtime.exceptionThrown': {
         const details = params.exceptionDetails ?? {};
         const text = details.exception?.description ?? details.text ?? 'uncaught exception';
-        this.console.push({ level: 'error', text, ts_ms: Date.now(), source: 'exception' });
+        this.appendConsole({ level: 'error', text, ts_ms: Date.now(), source: 'exception' });
         return;
       }
       case 'Log.entryAdded': {
         const entry = params.entry ?? {};
-        this.console.push({ level: entry.level ?? 'info', text: entry.text ?? '', ts_ms: Date.now(), source: entry.source ?? 'log' });
+        this.appendConsole({ level: entry.level ?? 'info', text: entry.text ?? '', ts_ms: Date.now(), source: entry.source ?? 'log' });
         return;
       }
       case 'Network.requestWillBeSent': {
@@ -109,31 +138,38 @@ class Tab {
         if (previous && params.redirectResponse) {
           // A redirect ends the previous hop under the same request id.
           previous.status = params.redirectResponse.status;
-          previous.mime = params.redirectResponse.mimeType ?? null;
+          previous.mime = this.field(params.redirectResponse.mimeType ?? '', 'network');
           previous.duration_ms = previous.started !== undefined ? round((params.timestamp - previous.started) * 1000) : null;
         }
         /** @type {NetworkEntry} */
-        const entry = { url: params.request?.url ?? '', method: params.request?.method ?? 'GET', status: null, mime: null, duration_ms: null, failed: null, started: params.timestamp, ts_ms: Date.now() };
+        const entry = { url: this.field(params.request?.url ?? '', 'network'), method: this.field(params.request?.method ?? 'GET', 'network'), status: null, mime: null, duration_ms: null, failed: null, started: params.timestamp, ts_ms: Date.now() };
         this.requests.set(params.requestId, entry);
+        if (this.requests.size > HISTORY_LIMIT) this.requests.delete(this.requests.keys().next().value);
         this.network.push(entry);
+        if (this.network.length > HISTORY_LIMIT) {
+          this.network.shift();
+          this.networkOmitted += 1;
+        }
         return;
       }
       case 'Network.responseReceived': {
         const entry = this.requests.get(params.requestId);
         if (!entry) return;
         entry.status = params.response?.status ?? null;
-        entry.mime = params.response?.mimeType ?? null;
+        entry.mime = this.field(params.response?.mimeType ?? '', 'network');
         return;
       }
       case 'Network.loadingFinished': {
         const entry = this.requests.get(params.requestId);
+        this.requests.delete(params.requestId);
         if (entry && entry.started !== undefined) entry.duration_ms = round((params.timestamp - entry.started) * 1000);
         return;
       }
       case 'Network.loadingFailed': {
         const entry = this.requests.get(params.requestId);
+        this.requests.delete(params.requestId);
         if (!entry) return;
-        entry.failed = params.errorText ?? 'failed';
+        entry.failed = this.field(params.errorText ?? 'failed', 'network');
         if (entry.started !== undefined) entry.duration_ms = round((params.timestamp - entry.started) * 1000);
         return;
       }
@@ -242,7 +278,8 @@ export class BrowserService {
         return tab.info();
       }
       case 'browser.tabs':
-        return { tabs: this.visibleTabs().map((tab) => tab.info()), active: this.activeId };
+        return { tabs: this.visibleTabs().filter((tab) => !params._command_session || tab.sessionId === params._command_session).map((tab) => tab.info()),
+          active: params._command_session && this.tabs.get(this.activeId ?? '')?.sessionId !== params._command_session ? null : this.activeId };
       case 'browser.select': {
         const tab = this.tab(params);
         this.activeId = tab.id;
@@ -287,11 +324,12 @@ export class BrowserService {
       case 'browser.console': {
         const tab = this.tab(params);
         const since = typeof params.since_ms === 'number' ? params.since_ms : 0;
-        return { messages: tab.console.filter((message) => message.ts_ms >= since) };
+        return { messages: tab.console.filter((message) => message.ts_ms >= since), omitted: tab.consoleOmitted, clipped: tab.consoleClipped };
       }
       case 'browser.network': {
         const tab = this.tab(params);
         return {
+          omitted: tab.networkOmitted, clipped: tab.networkClipped,
           entries: tab.network.map((entry) => ({
             url: entry.url, method: entry.method, status: entry.status ?? null, mime: entry.mime ?? null,
             duration_ms: entry.duration_ms ?? null, failed: entry.failed ?? null,
@@ -435,7 +473,7 @@ export class BrowserService {
   tab(params) {
     const id = requireString(params, 'tab_id');
     const tab = this.tabs.get(id);
-    if (!tab || tab.wc.isDestroyed()) throw new RpcError('not_found', `no browser tab ${id}`);
+    if (!tab || (params._command_session && tab.sessionId !== params._command_session) || tab.wc.isDestroyed()) throw new RpcError('not_found', `no browser tab ${id}`);
     return tab;
   }
 

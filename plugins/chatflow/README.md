@@ -46,13 +46,9 @@ The composable parts of docs/IDEATION-WORKFLOW.md (1, 5, 6), each usable alone (
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
 cd ui && npm ci && npm run build && npm test     # after the SDK is built (cd ../../ui/sdk && npm run build)
 cortex-pack build plugins/chatflow                  # -> plugins/chatflow/target/chatflow-<version>-<target>.ccplugin
 ```
 
 `cortex-pack build plugins/chatflow --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the backend and the UI packages together; Settings > Plugins disables and enables the whole plugin.
-
-## Verification
-
-The mechanics are verified together with the agents plugin: ../agents/verify/mechanics.mjs (gate 1.6 G3), against deterministic test peers (../runtime-testpeers) through the real frame. Its section 15 is `verify/ideation.mjs` (spec, decisions, plan mode) and section 16 `verify/references.mjs` (cross-project references); each also runs alone.

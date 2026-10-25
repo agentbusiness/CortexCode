@@ -62,9 +62,6 @@ impl MemoryLink {
             match conn.call_timeout(method, params.clone(), CALL_LIMIT).await {
                 Err(error) if gone(&error) => {
                     tracing::warn!(method, %error.message, "the memory plugin went away during a call; waiting for it");
-                    if conn.is_closed() {
-                        self.clear();
-                    }
                     serving.await;
                 }
                 outcome => return outcome,
@@ -75,7 +72,7 @@ impl MemoryLink {
 
 /// A call that did not reach a serving memory plugin.
 fn gone(error: &RpcError) -> bool {
-    matches!(error.code.as_str(), codes::CONNECTION_CLOSED | codes::UNAVAILABLE | codes::DRAINING)
+    matches!(error.code.as_str(), codes::CONNECTION_CLOSED | codes::DRAINING)
 }
 
 /// One change to write through.
@@ -100,18 +97,15 @@ impl Outbox {
         (Outbox(tx), rx)
     }
 
-    pub fn send(&self, op: Op) {
-        if self.0.send(op).is_err() {
-            tracing::error!("the store writer stopped: a change was not written");
-        }
+    pub fn send(&self, op: Op) -> Result<(), RpcError> {
+        self.0.send(op).map_err(|_| RpcError::new(codes::UNAVAILABLE, "the store writer stopped: the change was not queued"))
     }
 
     /// Wait until everything sent so far is written.
-    pub async fn flush(&self) {
+    pub async fn flush(&self) -> Result<(), RpcError> {
         let (tx, rx) = oneshot::channel();
-        if self.0.send(Op::Flush(tx)).is_ok() {
-            let _ = rx.await;
-        }
+        self.send(Op::Flush(tx))?;
+        rx.await.map_err(|_| RpcError::new(codes::UNAVAILABLE, "the store writer stopped before changes were durable"))
     }
 }
 
@@ -145,13 +139,9 @@ pub fn spawn_writer(link: Arc<MemoryLink>, mut rx: mpsc::UnboundedReceiver<Op>) 
                             Err(_) => break,
                         }
                     }
-                    let outcome = link.call(methods::JOURNAL_APPEND, json!({"session_id": session_id, "patches": patches})).await;
-                    let outcome = outcome.map(|_| ()).map_err(|error| {
-                        tracing::error!(session = %session_id, %error.message, "writing journal patches failed");
-                        error.message
-                    });
+                    write(&link, methods::JOURNAL_APPEND, json!({"session_id": session_id, "patches": patches})).await;
                     for ack in acks {
-                        let _ = ack.send(outcome.clone());
+                        let _ = ack.send(Ok(()));
                     }
                 }
                 Op::Flush(done) => {
@@ -159,13 +149,27 @@ pub fn spawn_writer(link: Arc<MemoryLink>, mut rx: mpsc::UnboundedReceiver<Op>) 
                 }
                 other => {
                     let (method, params) = request(other);
-                    if let Err(error) = link.call(method, params).await {
-                        tracing::error!(method, %error.message, "writing a record to the store failed");
-                    }
+                    write(&link, method, params).await;
                 }
             }
         }
     });
+}
+
+/// Never move past an unacknowledged write: upserts/deletes are idempotent, and journal
+/// revisions make an append retried after an ambiguous timeout harmless during replay.
+async fn write(link: &MemoryLink, method: &str, params: Value) {
+    let mut retry = Duration::from_millis(250);
+    loop {
+        match link.call(method, params.clone()).await {
+            Ok(_) => return,
+            Err(error) => {
+                tracing::error!(method, %error.message, retry_ms = retry.as_millis(), "store write not acknowledged; retaining it and retrying in order");
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 /// The memory call that writes a record change.

@@ -8,7 +8,7 @@ use crate::paths;
 use crate::proc;
 use crate::service::{Service, rpc};
 use crate::{capability, code, summary};
-use cc_protocol::contracts::frame::{JournalAppendResult, PackageSwapResult, Project, SessionKind, SessionListResult, methods as frame_methods};
+use cc_protocol::contracts::frame::{InstallManyResult, JournalAppendResult, Project, SessionKind, SessionListResult, methods as frame_methods};
 use cc_protocol::contracts::source::{CHANGE_ENTRY, DecideParams, Progress, Proposal, ProposeParams, topics};
 use cc_protocol::{Ctx, RpcError};
 use git2::Oid;
@@ -25,7 +25,7 @@ fn now_ms() -> u64 {
 
 /// Code files changed in the work tree that no open proposal holds yet.
 pub async fn unproposed(service: &Service) -> Result<Vec<String>, RpcError> {
-    let open: Vec<Proposal> = service.proposals()?.into_iter().filter(|p| matches!(p.state.as_str(), "pending" | "building")).collect();
+    let open: Vec<Proposal> = service.proposals()?.into_iter().filter(|p| matches!(p.state.as_str(), "pending" | "building" | "installing")).collect();
     service
         .git(move |repo| {
             let changed: Vec<String> = code::changed_paths(repo)?.into_iter().filter(|file| !paths::is_data(file)).collect();
@@ -91,8 +91,8 @@ pub async fn propose(service: &Arc<Service>, ctx: &Ctx, params: ProposeParams) -
     };
     // The draft again, now with the message the history will show once it is approved.
     let text = code::message(&card.summary, &[("Origin", "approved".into()), ("Plugins", plugins.join(", "))]);
-    let (draft_files, draft_id) = (files.clone(), id.clone());
-    let draft = service.git(move |repo| code::draft(repo, &draft_id, &draft_files, &text)).await?;
+    let draft_id = id.clone();
+    let draft = service.git(move |repo| code::describe_draft(repo, &draft_id, draft, &text)).await?;
     let session_id = match params.session_id {
         Some(session) => Some(session),
         None => session_for(ctx, &service.code_dir).await,
@@ -137,10 +137,9 @@ async fn set_state(service: &Service, ctx: &Ctx, id: &str, state: &str, outcome:
     let proposal = service.update_proposal(id, |p| {
         p.state = state.to_owned();
         p.outcome = outcome;
-        if commit.is_some() {
-            p.commit = commit;
-        }
+        p.commit = commit;
     })?;
+    service.stored_proposals.flush().await?;
     show(ctx, &proposal).await;
     service.changed(ctx);
     Ok(proposal)
@@ -161,67 +160,129 @@ pub async fn decide(service: &Arc<Service>, ctx: &Ctx, params: DecideParams) -> 
             .await?;
         return set_state(service, ctx, &proposal.id, "declined", "Kept as a draft; nothing was built.".into(), None).await;
     }
-    let proposal = set_state(service, ctx, &proposal.id, "building", String::new(), None).await?;
+    let (proposal, started) = service.start_build(&proposal.id)?;
+    if !started { return Ok(proposal); }
+    if let Err(error) = service.stored_proposals.flush().await {
+        service.update_proposal(&proposal.id, |p| p.state = "pending".into())?;
+        return Err(error);
+    }
+    show(ctx, &proposal).await;
+    service.changed(ctx);
     let (service, ctx, building) = (service.clone(), ctx.clone(), proposal.clone());
     tokio::spawn(async move {
         let (state, outcome, commit) = build(&service, &ctx, &building, draft).await;
-        let _ = set_state(&service, &ctx, &building.id, state, outcome, commit).await;
+        if let Err(error) = set_state(&service, &ctx, &building.id, state, outcome, commit).await {
+            tracing::error!(%error.message, proposal = %building.id, "cannot record the approved build outcome");
+        }
         crate::backup::after_change(&service, &ctx).await;
     });
     Ok(proposal)
 }
 
-/// Put the change on the branch, then build and install what it affects. Returns the final state,
-/// the outcome in plain words and the commit (when it stays on the branch).
+/// Build only the approved commit's complete source tree. Finish every artifact before the frame
+/// owns activation and recovery; a source-manager hot swap must not kill its own coordinator.
 async fn build(service: &Arc<Service>, ctx: &Ctx, proposal: &Proposal, draft: Oid) -> (&'static str, String, Option<String>) {
-    let tools = capability::detect().await;
-    let manifests = paths::plugin_manifests(&service.code_dir);
-    let (plugins, parts) = paths::affected(&service.code_dir, &proposal.files);
-    for plugin in &plugins {
-        if let Some(manifest) = manifests.get(plugin) {
-            let missing = capability::missing(manifest, &tools);
-            if !missing.is_empty() {
-                return ("failed", format!("This Mac cannot build {plugin}: it needs {}.", missing.join(", ")), None);
-            }
-        }
-    }
     let commit = match service.git(move |repo| code::apply_draft(repo, draft)).await {
         Ok(oid) => oid,
         Err(error) => return ("failed", error.message, None),
     };
-    // Recorded at once: a restart during the build finds the change on the branch ([`recover`]).
-    let _ = service.update_proposal(&proposal.id, |p| p.commit = Some(commit.to_string()));
-    let mut done: Vec<String> = Vec::new();
+    if let Err(error) = set_state(service, ctx, &proposal.id, "building", String::new(), Some(commit.to_string())).await {
+        return failed_build(service, commit, format!("The approved commit could not be recorded: {}", error.message)).await;
+    }
+    let snapshot = service.data_dir.join(format!("build-{}", uuid::Uuid::new_v4().simple()));
+    let destination = snapshot.clone();
+    if let Err(error) = service.git(move |repo| code::export_commit(repo, commit, &destination)).await {
+        let _ = std::fs::remove_dir_all(&snapshot);
+        return failed_build(service, commit, error.message).await;
+    }
+    let tools = capability::detect().await;
+    let manifests = paths::plugin_manifests(&snapshot);
+    let (plugins, parts) = paths::affected(&snapshot, &proposal.files);
+    let mut packages = Vec::new();
     for plugin in &plugins {
-        progress(ctx, &proposal.id, plugin, "started", format!("building {plugin}"));
-        match build_and_install(service, ctx, &proposal.id, plugin).await {
-            Ok(note) => {
-                progress(ctx, &proposal.id, plugin, "done", note);
-                done.push(plugin.clone());
+        let failure = match manifests.get(plugin) {
+            Some(manifest) => {
+                let missing = capability::missing(manifest, &tools);
+                if missing.is_empty() { None } else { Some(format!("This Mac cannot build {plugin}: it needs {}.", missing.join(", "))) }
             }
-            Err((state, failure)) => {
+            None => Some(format!("The approved source has no manifest for {plugin}.")),
+        };
+        if let Some(failure) = failure {
+            remove_packages(&packages);
+            let _ = std::fs::remove_dir_all(&snapshot);
+            return failed_build(service, commit, failure).await;
+        }
+        progress(ctx, &proposal.id, plugin, "started", format!("building {plugin}"));
+        match build_package(service, ctx, &proposal.id, plugin, &snapshot).await {
+            Ok(package) => packages.push(package),
+            Err((_, failure)) => {
                 progress(ctx, &proposal.id, plugin, "failed", failure.clone());
-                // The branch goes back to what runs; the draft keeps the change.
-                let reverted = service.git(move |repo| code::revert(repo, &commit.to_string()).map(|_| ())).await;
-                let _ = service.update_proposal(&proposal.id, |p| p.commit = None);
-                let back = match reverted {
-                    Ok(()) => "The change was taken back off the code folder; it stays as a draft.",
-                    Err(_) => "The change is still in the code folder; revert it in History.",
-                };
-                let installed = if done.is_empty() { String::new() } else { format!(" Already installed: {}.", done.join(", ")) };
-                return (state, format!("{failure}{installed} {back}"), None);
+                remove_packages(&packages);
+                let _ = std::fs::remove_dir_all(&snapshot);
+                return failed_build(service, commit, failure).await;
             }
         }
     }
+    let _ = std::fs::remove_dir_all(&snapshot);
     let mut outcome = if plugins.is_empty() { String::new() } else { format!("Built and swapped: {}.", names(service, &plugins).join(", ")) };
     if !parts.is_empty() {
-        outcome.push_str(&format!(
-            " {} {} part of the app itself: the change is kept and reaches the app with its next update.",
-            parts.join(", "),
-            if parts.len() == 1 { "is" } else { "are" }
-        ));
+        outcome.push_str(&format!(" {} {} part of the app itself: the change is kept and reaches the app with its next update.", parts.join(", "), if parts.len() == 1 { "is" } else { "are" }));
     }
-    ("done", outcome.trim().to_owned(), Some(commit.to_string()))
+    if packages.is_empty() { return ("done", outcome.trim().to_owned(), Some(commit.to_string())); }
+    // The completion message and commit are durable before dispatch. The successor waits on the
+    // frame's own operation and finishes this card using its durable batch result.
+    if let Err(error) = set_state(service, ctx, &proposal.id, "installing", outcome.trim().to_owned(), Some(commit.to_string())).await {
+        remove_packages(&packages);
+        return failed_build(service, commit, format!("Installation was not started: {}", error.message)).await;
+    }
+    let answer = ctx.call(frame_methods::PLUGINS_INSTALL_MANY, json!({"id": proposal.id, "paths": packages.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() })).await;
+    let result = match answer.and_then(|value| serde_json::from_value::<InstallManyResult>(value).map_err(|e| rpc(format!("unexpected installation answer: {e}")))) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            // A disconnect or malformed response is not evidence that nothing was installed.
+            match wait_install(ctx, &proposal.id).await {
+                Ok(result) => Ok(result),
+                Err(wait) if wait.code == cc_protocol::codes::NOT_FOUND => {
+                    remove_packages(&packages);
+                    return failed_build(service, commit, format!("Installation did not start: {}", error.message)).await;
+                }
+                Err(wait) => Err(format!("Installation outcome is unknown: {}. Recovery could not read its result: {}. The approved source and packages are retained.", error.message, wait.message)),
+            }
+        }
+    };
+    match result {
+        Ok(result) => {
+            if result.recovery_errors.is_empty() { remove_packages(&packages); }
+            finish_install(service, commit, &outcome, result).await
+        }
+        Err(error) => ("failed", error, Some(commit.to_string())),
+    }
+}
+
+fn remove_packages(packages: &[PathBuf]) {
+    for package in packages { let _ = std::fs::remove_file(package); }
+}
+
+async fn failed_build(service: &Service, commit: Oid, failure: String) -> (&'static str, String, Option<String>) {
+    match service.git(move |repo| code::revert(repo, &commit.to_string()).map(|_| ())).await {
+        Ok(()) => ("failed", format!("{failure} The change was taken back off the code folder; it stays as a draft."), None),
+        Err(error) => ("failed", format!("{failure} The source could not be restored: {}. The approved commit remains in History; your edits were kept.", error.message), Some(commit.to_string())),
+    }
+}
+
+async fn wait_install(ctx: &Ctx, id: &str) -> Result<InstallManyResult, RpcError> {
+    let value = ctx.call(frame_methods::PLUGINS_INSTALL_WAIT, json!({"id": id})).await?;
+    serde_json::from_value(value).map_err(|e| rpc(format!("unexpected installation result: {e}")))
+}
+
+async fn finish_install(service: &Service, commit: Oid, outcome: &str, result: InstallManyResult) -> (&'static str, String, Option<String>) {
+    if result.ok { return ("done", outcome.trim().to_owned(), Some(commit.to_string())); }
+    let failure = result.error.unwrap_or_else(|| "Installation failed.".into());
+    if !result.recovery_errors.is_empty() {
+        return ("failed", format!("{failure} Previous plugin versions could not all be restored: {}. The approved source is retained for recovery.", result.recovery_errors.join("; ")), Some(commit.to_string()));
+    }
+    let (_, outcome, retained) = failed_build(service, commit, format!("{failure} Previous plugin versions were restored.")).await;
+    (if retained.is_none() { "rolled_back" } else { "failed" }, outcome, retained)
 }
 
 fn progress(ctx: &Ctx, proposal: &str, plugin: &str, state: &str, detail: String) {
@@ -234,15 +295,13 @@ pub fn packer(service: &Service) -> Option<PathBuf> {
     service.config_path("packer").filter(|path| path.is_file()).or_else(|| proc::which("cortex-pack"))
 }
 
-/// Build and pack one plugin from the code folder and install it into the running frame. A failure
-/// is `(state, plain outcome)`: `failed` for a build that did not finish, `rolled_back` when the
-/// frame put the previous version back.
-pub async fn build_and_install(service: &Service, ctx: &Ctx, proposal: &str, plugin: &str) -> Result<String, (&'static str, String)> {
+/// Build and pack one plugin, without changing the running app.
+async fn build_package(service: &Service, ctx: &Ctx, proposal: &str, plugin: &str, source: &Path) -> Result<PathBuf, (&'static str, String)> {
     let packer = packer(service).ok_or(("failed", "cortex-pack was not found, so nothing could be built.".to_owned()))?;
     let packages = service.data_dir.join("packages");
     std::fs::create_dir_all(&packages).map_err(|e| ("failed", format!("cannot create {}: {e}", packages.display())))?;
-    let package = packages.join(format!("{plugin}-{}.ccplugin", now_ms()));
-    let folder = service.code_dir.join("plugins").join(plugin);
+    let package = packages.join(format!("{proposal}-{plugin}-{}.ccplugin", uuid::Uuid::new_v4().simple()));
+    let folder = source.join("plugins").join(plugin);
     let mut cmd = proc::command(&packer, &folder);
     cmd.arg("build").arg(&folder).arg("-o").arg(&package);
     let mut tail: Vec<String> = Vec::new();
@@ -258,41 +317,47 @@ pub async fn build_and_install(service: &Service, ctx: &Ctx, proposal: &str, plu
     .await
     .map_err(|e| ("failed", format!("cortex-pack could not start: {e}")))?;
     if !status.success() {
+        let _ = std::fs::remove_file(&package);
         return Err(("failed", format!("Building {plugin} failed:\n{}", tail.join("\n"))));
     }
-    let value = ctx
-        .call(frame_methods::PLUGINS_INSTALL, json!({"path": package.display().to_string()}))
-        .await
-        .map_err(|e| ("failed", format!("Installing {plugin} failed: {}", e.message)))?;
-    let _ = std::fs::remove_file(&package);
-    let result: PackageSwapResult = serde_json::from_value(value).map_err(|e| ("failed", format!("Installing {plugin}: unexpected answer ({e})")))?;
-    if result.ok {
-        Ok(format!("{plugin} {} is running", result.to_version))
-    } else if result.rolled_back {
-        Err(("rolled_back", format!("{plugin} did not start properly, so the previous version was put back: {}", result.error.unwrap_or_default())))
-    } else {
-        Err(("failed", format!("Installing {plugin} failed: {}", result.error.unwrap_or_default())))
-    }
+    Ok(package)
 }
 
-/// After a start: a proposal still `building` was cut off by a restart. Its change is taken back off
-/// the branch (the draft stays) and the card says so.
+/// A successor of the source plugin waits for the frame-owned batch; a frame restart has already
+/// restored interrupted batches before plugins start. A build interrupted before activation is safe
+/// to take back because no package was activated.
 pub async fn recover(service: &Arc<Service>, ctx: &Ctx) {
     let Ok(list) = service.proposals() else { return };
-    for proposal in list.into_iter().filter(|p| p.state == "building") {
-        let mut outcome = "The app stopped while this change was being built.".to_owned();
-        if let Some(commit) = proposal.commit.clone() {
-            match service.git(move |repo| code::revert(repo, &commit).map(|_| ())).await {
-                Ok(()) => outcome.push_str(" It was taken back off the code folder; it stays as a draft."),
-                Err(error) => outcome.push_str(&format!(" It is still in the code folder ({}); revert it in History.", error.message)),
+    for proposal in list.into_iter().filter(|p| matches!(p.state.as_str(), "building" | "installing")) {
+        let commit = proposal.commit.as_deref().and_then(|id| Oid::from_str(id).ok());
+        let (state, outcome, retained) = if proposal.state == "installing" {
+            match wait_install(ctx, &proposal.id).await {
+                Ok(result) => match commit {
+                    Some(commit) => finish_install(service, commit, &proposal.outcome, result).await,
+                    None => ("failed", "The installation result was found, but its source commit is missing; inspect History before changing the source.".into(), None),
+                },
+                Err(error) if error.code == cc_protocol::codes::NOT_FOUND => match commit {
+                    Some(commit) => failed_build(service, commit, "The app stopped before installation started.".into()).await,
+                    None => ("failed", "The app stopped before installation started.".into(), None),
+                },
+                Err(error) => ("failed", format!("The installation outcome could not be recovered: {}. The approved source is retained; inspect installed versions before reverting it.", error.message), proposal.commit.clone()),
+            }
+        } else {
+            match commit {
+                Some(commit) => failed_build(service, commit, "The app stopped while this change was being built; no plugins were activated.".into()).await,
+                None => ("failed", "The app stopped before the approved build started.".into(), None),
+            }
+        };
+        if matches!(state, "done" | "rolled_back") || (state == "failed" && retained.is_none()) {
+            if let Ok(packages) = std::fs::read_dir(service.data_dir.join("packages")) {
+                let prefix = format!("{}-", proposal.id);
+                for package in packages.flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)) {
+                    let _ = std::fs::remove_file(package.path());
+                }
             }
         }
-        if let Ok(updated) = service.update_proposal(&proposal.id, |p| {
-            p.state = "failed".into();
-            p.outcome = outcome;
-            p.commit = None;
-        }) {
-            show(ctx, &updated).await;
+        if let Err(error) = set_state(service, ctx, &proposal.id, state, outcome, retained).await {
+            tracing::error!(%error.message, proposal = %proposal.id, "cannot record installation recovery");
         }
     }
     service.changed(ctx);
@@ -301,19 +366,35 @@ pub async fn recover(service: &Arc<Service>, ctx: &Ctx) {
 /// Build and install `plugins` from the code folder without a card (after an update or a restore
 /// carried the user's own code onto a new base). Returns the plugins installed and the failures.
 pub async fn rebuild(service: &Service, ctx: &Ctx, plugins: &[String]) -> (Vec<String>, Vec<String>) {
+    if plugins.is_empty() { return (Vec::new(), Vec::new()); }
     let tools = capability::detect().await;
     let manifests = paths::plugin_manifests(&service.code_dir);
-    let (mut built, mut failed) = (Vec::new(), Vec::new());
+    if plugins.iter().any(|plugin| !manifests.get(plugin).is_some_and(|manifest| capability::missing(manifest, &tools).is_empty())) {
+        return (Vec::new(), plugins.to_vec());
+    }
+    let mut packages = Vec::new();
+    let id = uuid::Uuid::new_v4().simple().to_string();
     for plugin in plugins {
-        let buildable = manifests.get(plugin).is_some_and(|manifest| capability::missing(manifest, &tools).is_empty());
-        if !buildable {
-            failed.push(plugin.clone());
-            continue;
-        }
-        match build_and_install(service, ctx, "rebuild", plugin).await {
-            Ok(_) => built.push(plugin.clone()),
-            Err(_) => failed.push(plugin.clone()),
+        match build_package(service, ctx, &id, plugin, &service.code_dir).await {
+            Ok(package) => packages.push(package),
+            Err((_, error)) => {
+                tracing::error!(%error, "rebuilding the restored source failed; no plugins were activated");
+                remove_packages(&packages);
+                return (Vec::new(), plugins.to_vec());
+            }
         }
     }
-    (built, failed)
+    let result = ctx.call(frame_methods::PLUGINS_INSTALL_MANY, json!({"id": id, "paths": packages.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() })).await;
+    remove_packages(&packages);
+    match result.and_then(|value| serde_json::from_value::<InstallManyResult>(value).map_err(|e| rpc(e.to_string()))) {
+        Ok(result) if result.ok => (plugins.to_vec(), Vec::new()),
+        Ok(result) => {
+            tracing::error!(error = ?result.error, recovery_errors = ?result.recovery_errors, "the rebuilt plugins could not all be activated");
+            (Vec::new(), plugins.to_vec())
+        }
+        Err(error) => {
+            tracing::error!(%error.message, "the rebuild installation outcome could not be read");
+            (Vec::new(), plugins.to_vec())
+        }
+    }
 }

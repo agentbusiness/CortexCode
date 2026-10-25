@@ -42,9 +42,9 @@ export interface JournalEntry {
 }
 
 export type JournalPatch =
-  | { op: 'create'; entry: JournalEntry }
-  | { op: 'append'; session_id: string; seq: number; field: string; text: string }
-  | { op: 'set'; session_id: string; seq: number; field: string; value: Json };
+  | { op: 'create'; entry: JournalEntry; rev?: number }
+  | { op: 'append'; session_id: string; seq: number; field: string; text: string; rev?: number }
+  | { op: 'set'; session_id: string; seq: number; field: string; value: Json; rev?: number };
 
 export interface UiPlugin {
   id: string;
@@ -264,7 +264,7 @@ export interface SourceProposal {
   files: string[];
   session_id?: string | null;
   entry_seq?: number | null;
-  /** pending | building | done | failed | rolled_back | declined */
+  /** pending | building | installing | done | failed | rolled_back | declined */
   state: string;
   outcome?: string;
   draft: string;

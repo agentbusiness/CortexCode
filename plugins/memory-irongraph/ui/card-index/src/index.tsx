@@ -8,6 +8,7 @@ import { useState } from 'react';
 import { definePlugin, duration, errorMessage, ServiceProblem, useClient, useHost, useQuery, useSelection } from '@cortex/sdk';
 import './index.css';
 
+interface EngineStatus { state: string; bytes_done: number; bytes_total: number; error?: string | null }
 interface ProjectStatus { project_id: string; root: string; state: string; files: number; symbols: number; edges: number; described: number; last_index_ms: number; languages?: string[]; error?: string | null }
 
 function IndexSection() {
@@ -28,8 +29,17 @@ function IndexSection() {
       setBusy(false);
     }
   };
+  // The embedding model memory searches with: downloaded on a first start, before any project.
+  const engine = useQuery<EngineStatus>('memory.engine.status', (c) => c.call<EngineStatus>('memory.engine.status', {}), { topics: ['memory.engine'] });
+  const preparing = engine.data && (engine.data.state === 'installing' || engine.data.state === 'loading') ? engine.data : null;
   const data = status.data;
-  if (!projectId) return null;
+  if (!projectId && !preparing) return null;
+  const mb = (value: number) => (value / 1e6).toFixed(0);
+  const engineLine = preparing
+    ? preparing.state === 'installing'
+      ? `Downloading the search model · ${preparing.bytes_total > 0 ? Math.floor((preparing.bytes_done / preparing.bytes_total) * 100) : 0} % · ${mb(preparing.bytes_done)} of ${mb(preparing.bytes_total)} MB`
+      : 'Loading the search model'
+    : null;
   const detail = data ? [
     `${data.edges.toLocaleString()} edges · ${data.described.toLocaleString()} described`,
     data.last_index_ms > 0 ? `last pass ${duration(data.last_index_ms)}` : '',
@@ -39,7 +49,13 @@ function IndexSection() {
     <section className="cx-cs" data-section="index" data-build={__CORTEX_BUILD__}>
       <div className="cx-cs-l"><span className="ap">Index</span></div>
       <div className="cx-cs-b">
-        <div className="cx-cs-row" title={detail}>
+        {engineLine && preparing && (
+          <div className="cx-index-engine" data-engine-state={preparing.state}>
+            {preparing.state === 'installing' && <progress max={preparing.bytes_total || 1} value={preparing.bytes_done} />}
+            <span className="ap hot">{engineLine}</span>
+          </div>
+        )}
+        {projectId && <div className="cx-cs-row" title={detail}>
           {data ? (
             <>
               <span className={`ap ${data.state === 'ready' ? 'origin' : data.state === 'error' ? 'live' : 'hot'}`} data-state={data.state} title={data.error ?? undefined}>{data.state}</span>
@@ -61,7 +77,7 @@ function IndexSection() {
           ) : (
             <button className="detent tiny" type="button" disabled={busy || !project} onClick={() => void run('memory.project.open', { root: project!.root, project_id: projectId }, `Indexing ${project!.name}`)}>Index</button>
           )}
-        </div>
+        </div>}
       </div>
     </section>
   );

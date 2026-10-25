@@ -34,6 +34,7 @@ use cc_protocol::{ItemSink, RpcError, codes, parse_params, to_value};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1466,7 +1467,7 @@ impl Containers {
         Ok(())
     }
 
-    /// Copy the image's workdir to the (empty) root. A root that was seeded from the same image
+    /// Stage the image's workdir, then publish it into the empty root. A root seeded from that image
     /// before keeps its files (they may have been edited since).
     async fn seed(
         &self,
@@ -1487,7 +1488,12 @@ impl Containers {
                 .and_then(|t| serde_json::from_str(&t).ok());
             if seeded
                 .as_ref()
-                .is_some_and(|s| s["root"] == root && s["image_id"] == image_id)
+                .is_some_and(|s| {
+                    s["root"] == root && s["image_id"] == image_id
+                        && (s.get("device").is_none() || std::fs::metadata(root).is_ok_and(|meta| {
+                            s["device"].as_u64() == Some(meta.dev()) && s["inode"].as_u64() == Some(meta.ino())
+                        }))
+                })
             {
                 return Ok(());
             }
@@ -1496,6 +1502,11 @@ impl Containers {
                 spec.image
             )));
         }
+        // A sibling keeps publication on one filesystem. Dropping it removes only our private
+        // partial copy; the user's root is untouched until Docker has finished successfully.
+        let parent = Path::new(root).parent().ok_or_else(|| invalid("cannot seed a filesystem root"))?;
+        let stage = tempfile::Builder::new().prefix(".cortex-seed-").tempdir_in(parent)
+            .map_err(|e| RpcError::internal(format!("staging {root}: {e}")))?;
         let name = format!(
             "cortex-seed-{}-{}",
             config::root_hash(root),
@@ -1518,19 +1529,27 @@ impl Containers {
                 &[
                     "cp".to_owned(),
                     format!("{name}:{}/.", spec.workdir),
-                    root.to_owned(),
+                    stage.path().to_string_lossy().into_owned(),
                 ],
             )
             .await;
         let _ = docker.run(&["rm", "-f", name.as_str()]).await;
         copied?;
+        let permissions = std::fs::metadata(root).map_err(|e| RpcError::internal(e.to_string()))?.permissions();
+        std::fs::set_permissions(stage.path(), permissions).map_err(|e| RpcError::internal(e.to_string()))?;
         std::fs::create_dir_all(&marker_dir).map_err(|e| RpcError::internal(e.to_string()))?;
+        let meta = std::fs::metadata(stage.path()).map_err(|e| RpcError::internal(e.to_string()))?;
+        let marker_tmp = marker_dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(
-            &marker,
-            serde_json::json!({"root": root, "image_id": image_id, "image": spec.image})
+            &marker_tmp,
+            serde_json::json!({"root": root, "image_id": image_id, "image": spec.image, "device": meta.dev(), "inode": meta.ino()})
                 .to_string(),
         )
         .map_err(|e| RpcError::internal(e.to_string()))?;
+        std::fs::rename(&marker_tmp, &marker).map_err(|e| RpcError::internal(e.to_string()))?;
+        // Rename replaces an empty directory atomically and fails if user files appeared there.
+        // The prepared marker recognizes the published inode even after a crash before return.
+        std::fs::rename(stage.path(), root).map_err(|e| RpcError::internal(format!("publishing seed into {root}: {e}")))?;
         Ok(())
     }
 
