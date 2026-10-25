@@ -22,6 +22,7 @@ use cc_protocol::contracts::model::{ChatMessage, ModelInfo, ToolSpec, methods as
 use std::path::Path;
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::tools::{SchemasResult, methods as tools_methods};
+use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -40,6 +41,9 @@ pub struct Prefix {
     pub skills: Vec<String>,
     /// The catalog's lines (`skill://<plugin>/<name>  <summary>`), as the choosing stages show it.
     pub skill_lines: Vec<String>,
+    /// `skill://<plugin>/<name>` -> the command that says whether that skill's work is finished
+    /// (`SkillInfo::done`): a turn whose work it says is open goes on instead of ending on a reply.
+    pub skill_done: BTreeMap<String, String>,
 }
 
 impl Prefix {
@@ -74,6 +78,7 @@ impl Prefix {
             // `ctx_slot`: journals written before the window was the whole pool.
             ctx_window: data.get("ctx_window").or_else(|| data.get("ctx_slot")).and_then(Value::as_u64).unwrap_or(0) as u32,
             skills: strings("skills"),
+            skill_done: data.get("skill_done").and_then(Value::as_object).map(|map| map.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default(),
             skill_lines: strings("skill_lines"),
         })
     }
@@ -169,12 +174,15 @@ impl ProjectFacts {
 struct ProjectSkills {
     lines: Vec<String>,
     always: Vec<(String, String)>,
+    /// `skill://<plugin>/<name>` -> the command that says whether that skill's work is finished.
+    done: BTreeMap<String, String>,
 }
 
 async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFacts) -> ProjectSkills {
     let Ok(listed) = host.get::<Value>("frame.plugins.list", json!({})).await else { return ProjectSkills::default() };
     let mut lines = Vec::new();
     let mut always = Vec::new();
+    let mut done = BTreeMap::new();
     for entry in listed.get("plugins").and_then(Value::as_array).cloned().unwrap_or_default() {
         let field = |name: &str| entry.get(name).and_then(Value::as_str).unwrap_or("").to_owned();
         let contract = field("contract");
@@ -201,6 +209,9 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
             if !project.offers(host, project_id, &skill.applies).await {
                 continue;
             }
+            if let Some(command) = &skill.done {
+                done.insert(format!("skill://{category}/{}", skill.name), command.clone());
+            }
             if skill.applies.always {
                 always.push((category.clone(), skill.name));
             } else {
@@ -210,7 +221,7 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
     }
     lines.sort();
     always.sort();
-    ProjectSkills { lines, always }
+    ProjectSkills { lines, always, done }
 }
 
 /// A skill file's guide: the body after line 1 (the catalog summary) and the blank line.
@@ -285,6 +296,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
                 "settled_through": settled_through,
                 "skills": prefix.skills,
                 "skill_lines": prefix.skill_lines,
+                "skill_done": prefix.skill_done,
                 "role": role,
                 "languages": languages,
             }),
@@ -444,7 +456,7 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
     } else {
         host.get::<KnowledgeBriefResult>(memory_methods::KNOWLEDGE_BRIEF, json!({"project_id": project_id, "budget_tokens": data.limits.brief_tokens})).await.unwrap_or_default()
     };
-    let ProjectSkills { lines: skills, always } = project_skills(host, project_id, &mut project).await;
+    let ProjectSkills { lines: skills, always, done: skill_done } = project_skills(host, project_id, &mut project).await;
     let mut system = system_prompt(data, role, &PrefixParts { project_root: &root, tools_guide: &schemas.guide, rules: &rules, style: &style, brief: &brief.text, contract: &contract, repo_map: &map_text });
     // The project's language guides: every session in the project (chat and agents) works with
     // them, so they sit in the byte-stable, cached system message, not in a choice.
@@ -453,7 +465,7 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
         system = format!("{system}\n\n{guides}");
     }
     let catalog: Vec<String> = skills.iter().filter_map(|line| line.split_whitespace().next()).map(str::to_owned).collect();
-    let prefix = Prefix { role: role.to_owned(), system, tools: schemas.tools, ctx_window, skills: catalog, skill_lines: skills };
+    let prefix = Prefix { role: role.to_owned(), system, tools: schemas.tools, ctx_window, skills: catalog, skill_lines: skills, skill_done };
     let facts = BuiltFacts { versions: json!(schemas.versions), repo_map_files: map_files, rules: rules.len(), style: style.len(), brief_items: brief.ids.len() };
     Ok((prefix, facts))
 }

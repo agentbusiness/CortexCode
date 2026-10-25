@@ -173,6 +173,13 @@ pub struct SkillInfo {
     /// project that matches one of the conditions ([`Applies::matches`]).
     #[serde(default, skip_serializing_if = "Applies::is_unset")]
     pub applies: Applies,
+    /// A command, run in the project root, whose exit status says whether the skill's work is
+    /// finished: 0 finished; otherwise its output says what is left and ends with the next step.
+    /// Declared by the plugin that owns the skill (`done` in `data/skills/applies.toml`), for skills
+    /// that drive a procedure through a tool (an audit, a migration): the chat flow does not let a
+    /// turn end on a reply while the command says the work is open. Not meant for the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<String>,
 }
 
 /// Structural facts a project must show (any one) for a skill to apply to it. Every list is

@@ -161,11 +161,12 @@ async fn run(cli: Cli, config: Config, home: Home) -> ExitCode {
 
 async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
-    // The frame's records live in the memory plugin's store, written through one ordered outbox.
+    // The frame's records live in the memory plugin's store, written through one ordered outbox;
+    // the session journals are the frame's own files under the home.
     let memory = store::MemoryLink::new();
     let (outbox, outgoing) = store::Outbox::new();
     store::spawn_writer(memory.clone(), outgoing);
-    let journal = journal::Journal::open(outbox.clone(), memory.clone());
+    let journal = journal::Journal::open(home.journal()).map_err(|e| format!("journal: {e}"))?;
     let state = state::StateStore::open(outbox);
     // The app's prebuilt plugins: a version this home has not taken from the app yet is installed.
     let bundled = config.packages.as_deref().map(|packages| units::queue_bundled(&home.plugins(), packages)).unwrap_or_default();

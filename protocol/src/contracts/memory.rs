@@ -164,11 +164,16 @@ pub mod methods {
     /// Delete session records and their journals: `{ids: [id]}`.
     pub const APP_SESSIONS_DELETE: &str = "memory.app.sessions.delete";
     /// Append a session's journal patches, in order, to its stream: `{session_id, patches:
-    /// [JournalPatch]}` -> `{next}` (the offset after the last one).
+    /// [JournalPatch]}` -> `{next}` (the offset after the last one). Frames before the move of
+    /// journals into files wrote here; the frame no longer calls it.
     pub const JOURNAL_APPEND: &str = "memory.journal.append";
     /// A session's journal patches from an offset: `{session_id, from, max}` -> `{patches, next,
-    /// end}` (`end`: nothing after `next`). A session without a journal reads as empty.
+    /// end}` (`end`: nothing after `next`). A session without a journal reads as empty. The frame
+    /// reads a stream once, to move it into the session's journal file.
     pub const JOURNAL_READ: &str = "memory.journal.read";
+    /// Drop a session's journal stream (after its file is written): `{session_id}` -> `{}`. A
+    /// session without a stream is fine.
+    pub const JOURNAL_DROP: &str = "memory.journal.drop";
 }
 
 pub mod topics {
@@ -1110,6 +1115,12 @@ pub struct JournalReadResult {
     pub patches: Vec<crate::contracts::frame::JournalPatch>,
     pub next: u64,
     pub end: bool,
+}
+
+/// [`methods::JOURNAL_DROP`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalDropParams {
+    pub session_id: String,
 }
 
 /// [`methods::NOTE_ADD`] parameters.

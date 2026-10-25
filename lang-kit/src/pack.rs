@@ -355,7 +355,7 @@ impl<P: LanguagePack> LangPlugin<P> {
             .and_then(|dir| skills::load(dir).or_else(|_| skills::list(dir)).ok())
             .unwrap_or_default()
             .into_iter()
-            .map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies })
+            .map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done })
             .collect();
         let toolchain = {
             let shared = self.shared.clone();

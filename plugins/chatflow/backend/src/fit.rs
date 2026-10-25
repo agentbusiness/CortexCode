@@ -109,6 +109,25 @@ pub async fn settle(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
     Ok(true)
 }
 
+/// Fold the running turn's steps so far into their one note (layer 2 through the newest entry) and
+/// settle the conversation there. For a procedure a tool drives piece by piece (an audit of many
+/// units), each piece then starts from a short history: the pieces done are one note, the tool's
+/// state is on disk, and the engine reads the new piece's steps only, instead of compacting and
+/// re-reading the whole past every few pieces. True when the mark moved.
+pub async fn fold_steps(journal: &mut Journal) -> Result<bool, RpcError> {
+    let Some((context_seq, current)) = journal.context_entry().map(|entry| (entry.seq, Marks::of(entry))) else { return Ok(false) };
+    let newest = journal.last_seq();
+    if newest <= current.steps_through {
+        return Ok(false);
+    }
+    journal.set(context_seq, "steps_through", json!(newest)).await?;
+    let settled_before = journal.context_entry().and_then(|entry| entry.data.get(SETTLED).and_then(Value::as_u64)).unwrap_or(0);
+    if newest > settled_before {
+        journal.set(context_seq, SETTLED, json!(newest)).await?;
+    }
+    Ok(true)
+}
+
 /// Compact to the target now (the model ran out of room while answering). False when nothing is
 /// left to compact.
 pub async fn compact_now(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[JournalEntry]) -> Vec<ChatMessage>) -> Result<bool, RpcError> {

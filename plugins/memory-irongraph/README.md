@@ -61,7 +61,7 @@ Once installed, everything works offline.
 
 | Project | Holds |
 |---|---|
-| `db` | the app's records (`src/app.rs`): `(:Project)-[:HAS_SESSION]->(:Session)`, `(:Session)-[:CHILD_OF]->(:Session)`, each session's journal as the stream `session.<id>`; settings, one `(:Settings {scope})` node per scope (`global`, or a project id linked by `HAS_SETTINGS`) holding all of that scope's settings; global rules and style, the code-graph registry (`ProjectEntry`), global notes. Never one of the app's projects. |
+| `db` | the app's records (`src/app.rs`): `(:Project)-[:HAS_SESSION]->(:Session)`, `(:Session)-[:CHILD_OF]->(:Session)`, the journal streams `session.<id>` that frames before the move to journal files wrote (read once by the frame to move them into `<home>/journal/<id>.jsonl`, then dropped); settings, one `(:Settings {scope})` node per scope (`global`, or a project id linked by `HAS_SETTINGS`) holding all of that scope's settings; global rules and style, the code-graph registry (`ProjectEntry`), global notes. Never one of the app's projects. |
 | `cc_p_<hash(project id)>` | one per repository: the code graph, its work state and its notes |
 | `cc_w_<hash(project, path)>` | one per attached agent workspace (see below) |
 
