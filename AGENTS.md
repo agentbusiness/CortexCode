@@ -76,20 +76,15 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   (`plugins/memory-irongraph/data/skills/irongraph-queries.md`, `skill://memory/...`), never of a
   skills plugin, so it leaves with the store.
 
-## Testing and benchmarks
+## Checking a change
 
-- No tests unless the owner names one: no unit tests (`#[cfg(test)]`, `*.test.*`), no `tests/`
-  folders, no verify scripts, no `[verify]` sections. Check a change by running the real app.
+- No tests, test harnesses or benchmarks in this repository: no unit tests (`#[cfg(test)]`,
+  `*.test.*`), no `tests/` folders, no verify or check scripts, no eval or bench folders. Check a
+  change by using the real app on a real project.
 - The frame runs plugins only from installed packages (`~/.cortexcode/plugins/<id>/<version>/`),
   never from a plugin folder: a cargo or npm build alone does not reach the app. Deliver a changed
   plugin with `packer/target/release/cortex-pack build plugins/<name> --install` (a dev build; the
   running app swaps to it live, backend and UI together); `cx plugin rollback <name>` undoes it.
-
-- Benchmarks run through the real app window so they can be watched (`eval/`, see `eval/README.md`).
-- Tests start on a clean slate (no learned skills or rules); that reset belongs to the test harness
-  only, never to the product.
-- Benchmark tests stay hidden from the model and benchmark workspaces are offline for it; giving the
-  model the tests or the reference is cheating.
-- After a run, read each task's steps (the journal) before changing anything: the fix goes to the
-  mechanism (stage, schema, cue), not to wording.
-- No locks or quiet waits in code or tests.
+- When the model does the wrong thing, read its steps (the session's journal) before changing
+  anything: the fix goes to the mechanism (stage, schema, cue), not to wording.
+- No locks or quiet waits in code.

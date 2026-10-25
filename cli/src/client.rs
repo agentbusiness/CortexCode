@@ -29,6 +29,15 @@ pub fn home_dir(explicit: Option<&str>) -> PathBuf {
 }
 
 pub fn read_frame_info(home: &Path) -> Result<FrameInfo, String> {
+    if let Ok(token) = std::env::var("CORTEX_COMMAND_TOKEN") {
+        let url = std::env::var("CORTEX_COMMAND_URL").map_err(|_| "command access has no frame URL".to_owned())?;
+        let port = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .ok_or_else(|| "command access has an invalid frame URL".to_owned())?;
+        return Ok(FrameInfo { port, token, pid: 0 });
+    }
     let path = home.join("run/frame.json");
     let text = std::fs::read_to_string(&path).map_err(|error| format!("the frame is not running ({}: {error})", path.display()))?;
     serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))

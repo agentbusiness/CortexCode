@@ -57,7 +57,7 @@ pub struct Config {
     /// Minimum context one conversation needs (default 32768); a machine whose pool cannot give one is a load error.
     #[serde(default)]
     pub min_context_per_slot: Option<u64>,
-    /// Benchmark override of the fitted pool (tokens).
+    /// An operator override of the fitted pool (tokens).
     #[serde(default)]
     pub ctx_total: Option<u64>,
     /// An operator cap on resident conversations (default: the fit's).
@@ -299,7 +299,15 @@ impl Runtime {
             if let Some(runtime) = runtime.upgrade() {
                 runtime.publish("model.install", serde_json::to_value(&progress).unwrap_or(Value::Null));
                 if progress.phase == "download" || progress.phase == "verify" {
-                    runtime.phase.send_replace(Phase::Installing(progress));
+                    // Downloads before a switch (and optional vision installs) leave the
+                    // current engine serving. Progress has its own `model.install` event.
+                    runtime.phase.send_if_modified(|phase| {
+                        if matches!(phase, Phase::Ready(_)) {
+                            return false;
+                        }
+                        *phase = Phase::Installing(progress);
+                        true
+                    });
                 }
             }
         }

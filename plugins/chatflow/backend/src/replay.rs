@@ -28,9 +28,12 @@ use cc_protocol::BoxFuture;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 /// Snapshots kept (the newest runs').
 const KEPT: usize = 40;
+/// Older snapshots may have silently lost files or flattened links and cannot be trusted.
+const SNAPSHOT_VERSION: u64 = 2;
 /// A snapshot whose untracked files are larger than this is not taken (a build output git does
 /// not ignore, a dataset).
 const UNTRACKED_BYTES: u64 = 64 * 1024 * 1024;
@@ -65,7 +68,10 @@ impl Paths {
     }
 
     pub fn has_snapshot(&self, session_id: &str, run_id: &str) -> bool {
-        self.snapshot(session_id, run_id).join("meta.json").is_file()
+        std::fs::read(self.snapshot(session_id, run_id).join("meta.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|meta| meta.get("version").and_then(Value::as_u64) == Some(SNAPSHOT_VERSION))
     }
 
     pub fn results(&self) -> PathBuf {
@@ -87,6 +93,34 @@ async fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// Copy an untracked entry without following symlinks, including dangling links.
+fn copy_entry(from: &Path, to: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(from).map_err(|error| format!("{}: {error}", from.display()))?;
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(from).map_err(|error| format!("{}: {error}", from.display()))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, to).map_err(|error| format!("{}: {error}", to.display()))?;
+        #[cfg(not(unix))]
+        return Err(format!("cannot preserve symlink {} on this platform", from.display()));
+    } else if meta.is_file() {
+        std::fs::copy(from, to).map_err(|error| format!("{}: {error}", from.display()))?;
+    } else {
+        return Err(format!("unsupported snapshot entry: {}", from.display()));
+    }
+    Ok(())
+}
+
+fn remove_tree(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
 /// Keep the run's starting point (see the module's doc). A workspace that is not in a git
 /// repository with a commit is not snapshotted.
 pub async fn snapshot(paths: &Paths, session_id: &str, run_id: &str, workspace: &str) -> Result<(), String> {
@@ -96,28 +130,27 @@ pub async fn snapshot(paths: &Paths, session_id: &str, run_id: &str, workspace: 
     let head = String::from_utf8_lossy(&git(&root, &["rev-parse", "HEAD"]).await?).trim().to_owned();
     let diff = git(&root, &["diff", "HEAD", "--binary"]).await?;
     let listed = git(&root, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
-    let untracked: Vec<String> = listed.split(|byte| *byte == 0).filter(|name| !name.is_empty()).map(|name| String::from_utf8_lossy(name).into_owned()).collect();
+    let untracked: Vec<String> = listed.split(|byte| *byte == 0).filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8(name.to_vec()).map_err(|_| "snapshot contains a non-UTF-8 path".to_owned()))
+        .collect::<Result<_, _>>()?;
     let mut bytes = 0u64;
     for name in &untracked {
-        bytes += std::fs::metadata(root.join(name)).map(|meta| meta.len()).unwrap_or(0);
+        let meta = std::fs::symlink_metadata(root.join(name)).map_err(|error| format!("{name}: {error}"))?;
+        bytes = bytes.checked_add(meta.len()).ok_or_else(|| "snapshot size overflow".to_owned())?;
         if bytes > UNTRACKED_BYTES {
             return Err(format!("untracked files over {} MB", UNTRACKED_BYTES / (1024 * 1024)));
         }
     }
     let dir = paths.snapshot(session_id, run_id);
-    let _ = std::fs::remove_dir_all(&dir);
+    remove_tree(&dir)?;
     std::fs::create_dir_all(dir.join("untracked")).map_err(|error| error.to_string())?;
     std::fs::write(dir.join("diff.patch"), &diff).map_err(|error| error.to_string())?;
     for name in &untracked {
-        let to = dir.join("untracked").join(name);
-        if let Some(parent) = to.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(root.join(name), &to);
+        copy_entry(&root.join(name), &dir.join("untracked").join(name))?;
     }
     let subdir = workspace.strip_prefix(&root).map(|rest| rest.to_string_lossy().into_owned()).unwrap_or_default();
-    let meta = json!({"root": root, "head": head, "subdir": subdir, "untracked": untracked, "session_id": session_id, "run_id": run_id});
-    std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta).unwrap_or_default()).map_err(|error| error.to_string())?;
+    let meta = json!({"version": SNAPSHOT_VERSION, "root": root, "head": head, "subdir": subdir, "untracked": untracked, "session_id": session_id, "run_id": run_id});
+    std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
     prune(paths);
     Ok(())
 }
@@ -141,9 +174,12 @@ fn prune(paths: &Paths) {
 async fn materialize(paths: &Paths, session_id: &str, run_id: &str, dest: &Path) -> Result<PathBuf, String> {
     let dir = paths.snapshot(session_id, run_id);
     let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    if meta.get("version").and_then(Value::as_u64) != Some(SNAPSHOT_VERSION) {
+        return Err("snapshot predates complete file and symlink capture".to_owned());
+    }
     let root = PathBuf::from(str_field(&meta, "root"));
     let head = str_field(&meta, "head");
-    let _ = std::fs::remove_dir_all(dest);
+    remove_tree(dest)?;
     std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
     let tar = dest.join(".snapshot.tar");
     git(&root, &["archive", "--format=tar", "-o", &tar.to_string_lossy(), head]).await?;
@@ -153,18 +189,19 @@ async fn materialize(paths: &Paths, session_id: &str, run_id: &str, dest: &Path)
         return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     let patch = dir.join("diff.patch");
-    if std::fs::metadata(&patch).map(|meta| meta.len()).unwrap_or(0) > 0 {
+    if std::fs::metadata(&patch).map_err(|error| format!("{}: {error}", patch.display()))?.len() > 0 {
         let out = Command::new("git").arg("apply").arg("--binary").arg(&patch).current_dir(dest).output().await.map_err(|error| format!("git apply: {error}"))?;
         if !out.status.success() {
             return Err(format!("git apply: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
     }
-    for name in meta.get("untracked").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-        let to = dest.join(name);
-        if let Some(parent) = to.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let untracked = meta.get("untracked").and_then(Value::as_array).ok_or_else(|| "snapshot has no untracked-file manifest".to_owned())?;
+    for entry in untracked {
+        let name = entry.as_str().ok_or_else(|| "snapshot has an invalid untracked path".to_owned())?;
+        if name.is_empty() || Path::new(name).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            return Err(format!("invalid untracked snapshot path: {name}"));
         }
-        let _ = std::fs::copy(dir.join("untracked").join(name), &to);
+        copy_entry(&dir.join("untracked").join(name), &dest.join(name))?;
     }
     // A repository of its own, so the run sees what it changed as it would at home.
     for args in [&["init", "-q"][..], &["add", "-A"][..], &["-c", "user.name=replay", "-c", "user.email=replay@localhost", "commit", "-q", "--no-verify", "-m", "snapshot"][..]] {
@@ -181,11 +218,32 @@ pub fn arm(entries: &[JournalEntry]) -> Option<(String, String, String)> {
         .map(|entry| (str_field(&entry.data, "arm").to_owned(), str_field(&entry.data, "lesson").to_owned(), str_field(&entry.data, "lesson_text").to_owned()))
 }
 
-/// What runs a replay's turns: whether no run is going, and one turn of a session to its end
-/// (its final state).
+/// Owns a complete replay, including preparation and both arms.
+pub struct ReplayGuard {
+    pub cancel: CancellationToken,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl ReplayGuard {
+    pub fn new(cancel: CancellationToken, release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self { cancel, release: Some(Box::new(release)) }
+    }
+}
+
+impl Drop for ReplayGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+/// What runs a replay's turns: exclusive idle ownership and a turn awaited to its final state.
 pub trait Replayer: Send + Sync {
     fn idle(&self) -> bool;
-    fn turn(&self, session_id: String, text: String) -> BoxFuture<'static, Result<String, RpcError>>;
+    fn begin(&self) -> Option<ReplayGuard>;
+    fn turn(&self, session_id: String, text: String, cancel: CancellationToken) -> BoxFuture<'static, Result<String, RpcError>>;
 }
 
 /// A lesson to replay and the run it was learned from.
@@ -234,32 +292,44 @@ async fn candidate(host: &Host, paths: &Paths, last_dom: Option<bool>) -> Option
 }
 
 /// One arm: a fresh copy, a session on it marked with the arm, the run's message sent; its end.
-async fn run_arm(host: &Host, paths: &Paths, replayer: &dyn Replayer, c: &Candidate, arm: &str, stamp: &str) -> Result<(String, String), String> {
+async fn run_arm(host: &Host, paths: &Paths, replayer: &dyn Replayer, c: &Candidate, arm: &str, stamp: &str, cancel: &CancellationToken) -> Result<(String, String), String> {
+    let check = || if cancel.is_cancelled() { Err("cancelled".to_owned()) } else { Ok(()) };
+    check()?;
     let dest = paths.replays.join(format!("{stamp}-{arm}"));
     let workspace = materialize(paths, &c.session_id, &c.run_id, &dest).await?;
+    check()?;
     let project = host.call(frame_methods::PROJECT_OPEN, json!({"root": workspace})).await.map_err(|error| error.message)?;
+    check()?;
     let project_id = str_field(&project, "id").to_owned();
     let head: String = c.item.name.chars().take(60).collect();
     let session = host
         .session_create(&SessionCreateParams { project_id, kind: SessionKind::Chat, title: format!("Replay {arm}: {head}"), agent: None, parent: None, workspace: None, task_id: None })
         .await
         .map_err(|error| error.message)?;
+    check()?;
     host.journal_append(&session.id, kinds::NOTE, json!({"text": "", "purpose": NOTE_PURPOSE, "host_message": false, "arm": arm, "lesson": c.item.id, "lesson_text": c.item.text, "of": format!("journal://{}/{}", c.session_id, c.run_id)}))
         .await
         .map_err(|error| error.message)?;
-    let state = replayer.turn(session.id.clone(), c.message.clone()).await.map_err(|error| error.message)?;
+    check()?;
+    let state = replayer.turn(session.id.clone(), c.message.clone(), cancel.clone()).await.map_err(|error| error.message)?;
+    check()?;
     Ok((session.id, state))
 }
 
 /// Replay one candidate (see the module's doc). Returns whether one was replayed to a decision,
 /// and the kind it was (for taking turns).
 pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, last_dom: Option<bool>) -> Option<bool> {
-    let c = candidate(host, paths, last_dom).await?;
+    let guard = replayer.begin()?;
+    let c = tokio::select! {
+        biased;
+        _ = guard.cancel.cancelled() => return None,
+        candidate = candidate(host, paths, last_dom) => candidate?,
+    };
     let stamp = format!("{}-{}", now_ms(), safe(&c.item.id));
     tracing::info!(lesson = %c.item.name, "replaying a lesson with and without it");
-    let with = run_arm(host, paths, replayer, &c, "with", &stamp).await;
+    let with = run_arm(host, paths, replayer, &c, "with", &stamp, &guard.cancel).await;
     let without = match &with {
-        Ok((_, state)) if state != "cancelled" => run_arm(host, paths, replayer, &c, "without", &stamp).await,
+        Ok((_, state)) if state != "cancelled" && !guard.cancel.is_cancelled() => run_arm(host, paths, replayer, &c, "without", &stamp, &guard.cancel).await,
         Ok(_) => Err("cancelled".to_owned()),
         Err(error) => Err(error.clone()),
     };
@@ -273,6 +343,9 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
             return None;
         }
     };
+    if guard.cancel.is_cancelled() {
+        return None;
+    }
     let verdict = match (with_state == "done", without_state == "done") {
         (true, false) => "helped",
         (false, true) => "hurt",

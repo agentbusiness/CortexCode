@@ -1,6 +1,7 @@
 //! `cortex-frame`: the CortexCode frame.
 //!
-//! `cortex-frame --config <cortex.dev.toml> [--headless] [--home <dir>]`
+//! `cortex-frame [--config <cortex.toml>] [--headless] [--home <dir>]` (without `--config`: the app
+//! bundle's `Contents/Resources/cortex.toml`)
 
 // The frame relays requests with their JSON key order intact (serde_json `preserve_order`, see
 // Cargo.toml), which makes `serde_json::Value` and so `RpcError` 136 bytes, just over clippy's
@@ -8,6 +9,7 @@
 // the error at each of them would cost an allocation per error for no measurable gain.
 #![allow(clippy::result_large_err)]
 
+mod access;
 mod config;
 mod fswatch;
 mod home;
@@ -41,9 +43,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[derive(Parser, Debug)]
 #[command(name = "cortex-frame", version, about = "CortexCode frame: plugin supervisor, router and journal owner")]
 struct Cli {
-    /// Frame configuration file (e.g. cortex.dev.toml).
+    /// Frame configuration file (default: `Resources/cortex.toml` of the app bundle this binary is in).
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     /// Do not start the Electron shell.
     #[arg(long)]
     headless: bool,
@@ -58,7 +60,12 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = match Config::load(&cli.config) {
+    // The app bundle's own config: `Contents/MacOS/CortexCode` reads `Contents/Resources/cortex.toml`.
+    let Some(config_path) = cli.config.clone().or_else(bundle_config) else {
+        eprintln!("cortex-frame: no --config given and no Resources/cortex.toml beside this binary's app bundle");
+        return ExitCode::FAILURE;
+    };
+    let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("cortex-frame: {error}");
@@ -160,7 +167,10 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     store::spawn_writer(memory.clone(), outgoing);
     let journal = journal::Journal::open(outbox.clone(), memory.clone());
     let state = state::StateStore::open(outbox);
+    // The app's prebuilt plugins: a version this home has not taken from the app yet is installed.
+    let bundled = config.packages.as_deref().map(|packages| units::queue_bundled(&home.plugins(), packages)).unwrap_or_default();
     let units = units::Units::load(&home.plugins(), &home.state(), config.overrides.clone(), machine.memory_bytes).map_err(|e| format!("plugins: {e}"))?;
+    units::mark_bundled(&home.plugins(), &bundled);
     let token = home::random_token(32).map_err(|e| format!("token: {e}"))?;
 
     // Plugin socket. We hold the home lock, so an existing socket file is stale.
@@ -245,7 +255,6 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
         tracing::warn!("second signal: forcing exit");
         force_frame.shutting_down.store(true, Ordering::SeqCst);
         supervisor::kill_remaining(&force_frame).await;
-        force_frame.journal.flush().await;
         let _ = std::fs::remove_file(force_json);
         std::process::exit(130);
     });
@@ -282,8 +291,10 @@ async fn shutdown(frame: &Arc<Frame>) {
     // Every plugin but the memory plugin first; then the records still in the outbox go to its
     // store, and it stops last.
     supervisor::stop_all_except(frame, store::MEMORY).await;
-    if tokio::time::timeout(Duration::from_secs(30), frame.journal.close()).await.is_err() {
-        tracing::error!("the store did not take the last changes within 30 s");
+    match tokio::time::timeout(Duration::from_secs(30), frame.journal.close()).await {
+        Ok(Ok(())) => {},
+        Ok(Err(error)) => tracing::error!(%error, "the store writer stopped before shutdown completed"),
+        Err(_) => tracing::error!("the store did not take the last changes within 30 s"),
     }
     supervisor::stop_all(frame).await;
     supervisor::kill_remaining(frame).await;
@@ -291,3 +302,9 @@ async fn shutdown(frame: &Arc<Frame>) {
     frame.power.release_all();
 }
 
+/// `Contents/Resources/cortex.toml` of the app bundle this binary runs from, when there is one.
+fn bundle_config() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let config = exe.parent()?.parent()?.join("Resources").join("cortex.toml");
+    config.is_file().then_some(config)
+}

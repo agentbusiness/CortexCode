@@ -115,8 +115,25 @@ struct Inner {
     skills_changed_ms: AtomicU64,
     /// Learns every finished run, one at a time at idle priority (started on activation).
     learner: std::sync::OnceLock<crate::learn::Learner>,
-    /// The sessions a replay is running in (`replay.rs`); a user's turn cancels them.
-    replaying: Mutex<HashSet<String>>,
+    /// Owns the whole replay, including preparation and the gap between its arms.
+    replay: Mutex<ReplayState>,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    active: bool,
+    cancel: CancellationToken,
+    foreground: usize,
+}
+
+/// A foreground request owns its preparation until it has registered its run.
+struct ForegroundTurn(Arc<Inner>);
+
+impl Drop for ForegroundTurn {
+    fn drop(&mut self) {
+        let mut replay = self.0.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        replay.foreground -= 1;
+    }
 }
 
 #[derive(Clone)]
@@ -135,37 +152,41 @@ impl crate::replay::Replayer for FlowReplayer {
         self.flow.lock_runs().values().all(|handle| handle.done.borrow().is_some())
     }
 
-    fn turn(&self, session_id: String, text: String) -> BoxFuture<'static, Result<String, RpcError>> {
+    fn begin(&self) -> Option<crate::replay::ReplayGuard> {
+        let mut replay = self.flow.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if replay.active || replay.foreground > 0 || !self.idle() || self.flow.inner.park.is_cancelled() {
+            return None;
+        }
+        replay.active = true;
+        replay.cancel = self.flow.inner.park.child_token();
+        let cancel = replay.cancel.clone();
+        let inner = self.flow.inner.clone();
+        Some(crate::replay::ReplayGuard::new(cancel, move || {
+            inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).active = false;
+        }))
+    }
+
+    fn turn(&self, session_id: String, text: String, cancel: CancellationToken) -> BoxFuture<'static, Result<String, RpcError>> {
         let flow = self.flow.clone();
         let ctx = self.ctx.clone();
         Box::pin(async move {
-            if let Ok(mut replaying) = flow.inner.replaying.lock() {
-                replaying.insert(session_id.clone());
-            }
-            let result = async {
-                let params = TurnParams { session_id: session_id.clone(), text, mode: "auto".to_owned(), attachments: Vec::new(), spec: false, mentions: Vec::new() };
-                let started = flow.turn(ctx.clone(), params).await?;
-                if let Some((.., mut done)) = flow.active(&session_id) {
-                    while done.borrow().is_none() {
-                        if done.changed().await.is_err() {
-                            break;
-                        }
+            let params = TurnParams { session_id: session_id.clone(), text, mode: "auto".to_owned(), attachments: Vec::new(), spec: false, mentions: Vec::new() };
+            let started = flow.turn_inner(ctx.clone(), params, Some(cancel)).await?;
+            if let Some((.., mut done)) = flow.active(&session_id) {
+                while done.borrow().is_none() {
+                    if done.changed().await.is_err() {
+                        break;
                     }
                 }
-                let entries = Host::new(ctx.clone()).journal_read(&session_id, 0).await?;
-                let state = entries
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "run_id") == started.run_id && str_field(&entry.data, "state") != "running")
-                    .map(|entry| str_field(&entry.data, "state").to_owned())
-                    .unwrap_or_else(|| "cancelled".to_owned());
-                Ok(state)
             }
-            .await;
-            if let Ok(mut replaying) = flow.inner.replaying.lock() {
-                replaying.remove(&session_id);
-            }
-            result
+            let entries = Host::new(ctx.clone()).journal_read(&session_id, 0).await?;
+            let state = entries
+                .iter()
+                .rev()
+                .find(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "run_id") == started.run_id && str_field(&entry.data, "state") != "running")
+                .map(|entry| str_field(&entry.data, "state").to_owned())
+                .unwrap_or_else(|| "cancelled".to_owned());
+            Ok(state)
         })
     }
 }
@@ -184,7 +205,7 @@ impl Chatflow {
                 warmed: Mutex::new(HashMap::new()),
                 skills_changed_ms: AtomicU64::new(0),
                 learner: std::sync::OnceLock::new(),
-                replaying: Mutex::new(HashSet::new()),
+                replay: Mutex::new(ReplayState::default()),
             }),
         })
     }
@@ -309,11 +330,18 @@ impl Chatflow {
 
     /// Register a run for `session_id` unless one is active. Returns the stops and the sender.
     fn register(&self, session_id: &str, run_id: &str) -> Option<Registered> {
+        // Non-replay entrances (plans, agent runs and resumed runs) also yield background work.
+        let replay = self.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        replay.cancel.cancel();
+        self.register_with_cancel(session_id, run_id, None)
+    }
+
+    fn register_with_cancel(&self, session_id: &str, run_id: &str, cancel: Option<CancellationToken>) -> Option<Registered> {
         let mut runs = self.lock_runs();
         if runs.get(session_id).is_some_and(|handle| handle.done.borrow().is_none()) {
             return None;
         }
-        let stops = Stops { cancel: CancellationToken::new(), park: self.inner.park.child_token() };
+        let stops = Stops { cancel: cancel.map(|token| token.child_token()).unwrap_or_default(), park: self.inner.park.child_token() };
         let stage = Arc::new(Mutex::new("starting".to_owned()));
         let (sender, done) = watch::channel(None);
         runs.insert(session_id.to_owned(), RunHandle { run_id: run_id.to_owned(), stops: stops.clone(), stage: stage.clone(), done });
@@ -373,12 +401,18 @@ impl Chatflow {
         stops: Stops,
         stage: Arc<Mutex<String>>,
     ) -> Result<RunEnv, RpcError> {
-        // The run's first wait is the code graph (opening the project, the repository map): say so.
+        if stops.cancel.is_cancelled() || stops.park.is_cancelled() {
+            return Err(RpcError::cancelled());
+        }
+        // The run's first wait is opening the project's code graph: say so.
         if let Ok(mut current) = stage.lock() {
             *current = "context".into();
         }
         let project = host.project_get(&session.project_id).await?;
         self.ensure_project_open(host, &project.id, &project.root).await;
+        if stops.cancel.is_cancelled() || stops.park.is_cancelled() {
+            return Err(RpcError::cancelled());
+        }
         let data = self.inner.data.get();
         // A background agent's system prompt carries its task loop's rules only.
         let role = if matches!(priority, Priority::Agent) { crate::data::ROLE_AGENT } else { crate::data::ROLE_CHAT };
@@ -539,18 +573,22 @@ impl Chatflow {
     // ---- chatflow.turn ------------------------------------------------------------------------
 
     async fn turn(&self, ctx: Ctx, params: TurnParams) -> Result<TurnResult, RpcError> {
+        self.turn_inner(ctx, params, None).await
+    }
+
+    async fn turn_inner(&self, ctx: Ctx, params: TurnParams, replay_cancel: Option<CancellationToken>) -> Result<TurnResult, RpcError> {
         let host = Host::new(ctx.clone());
-        // The user's work goes first: a replay running meanwhile is cancelled (it decides nothing
-        // and is tried again later).
-        let replay = self.inner.replaying.lock().map(|replaying| replaying.contains(&params.session_id)).unwrap_or(false);
-        if !replay {
-            let running: Vec<String> = self.inner.replaying.lock().map(|replaying| replaying.iter().cloned().collect()).unwrap_or_default();
-            for session in running {
-                if let Some((_, stops, ..)) = self.active(&session) {
-                    tracing::info!(%session, "a user's turn cancels a replay");
-                    stops.cancel.cancel();
-                }
-            }
+        let replay = replay_cancel.is_some();
+        let _foreground = if replay {
+            None
+        } else {
+            let mut state = self.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.foreground += 1;
+            state.cancel.cancel();
+            Some(ForegroundTurn(self.inner.clone()))
+        };
+        if replay_cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(RpcError::new(codes::CANCELLED, "replay cancelled"));
         }
         let attached = self.prepare_attachments(&host, params.attachments.clone()).await?;
         // Other repositories the message references: opened read-only, named to the run in a note.
@@ -578,7 +616,10 @@ impl Chatflow {
             return Ok(TurnResult { run_id, queued_as_steer: true });
         }
         let run_id = new_run_id();
-        let Some((stops, stage, sender)) = self.register(&params.session_id, &run_id) else {
+        if replay_cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(RpcError::new(codes::CANCELLED, "replay cancelled"));
+        }
+        let Some((stops, stage, sender)) = self.register_with_cancel(&params.session_id, &run_id, replay_cancel) else {
             journal.append(kinds::STEER, steer).await?;
             let run_id = self.active(&params.session_id).map(|active| active.0).unwrap_or_default();
             if let Some(note) = note(&run_id) {

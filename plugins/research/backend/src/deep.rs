@@ -96,7 +96,7 @@ pub struct JobState {
     /// The current round's sub-questions (to search), empty once searched.
     pub pending: Vec<Planned>,
     pub candidates: Vec<Candidate>,
-    /// URL keys read or given up on (all rounds).
+    /// URL keys whose extraction completed successfully (all rounds).
     pub visited: Vec<String>,
     pub unread: Vec<Unread>,
     pub queries_run: Vec<String>,
@@ -106,13 +106,29 @@ pub struct JobState {
     pub dropped_quotes: u32,
 }
 
+/// Reading a source can fail before extraction starts, or while extracting/storing evidence.
+/// Keep this origin explicit: an HTTP error code can also come from the model or memory.
+enum ReadFailure {
+    Source(RpcError),
+    Extraction(RpcError),
+}
+
+impl From<RpcError> for ReadFailure {
+    fn from(error: RpcError) -> Self { Self::Extraction(error) }
+}
+
+struct Worker {
+    generation: uuid::Uuid,
+    cancel: CancellationToken,
+}
+
 pub struct Jobs {
     dir: PathBuf,
     tools: Arc<dyn Tools>,
     notes: Arc<Notes>,
     config: Config,
     publish: Publish,
-    running: Mutex<HashMap<String, CancellationToken>>,
+    running: Mutex<HashMap<String, Worker>>,
     /// Set while handing running jobs to a successor (a hot swap): they stop as `interrupted`.
     handing_off: std::sync::atomic::AtomicBool,
 }
@@ -170,9 +186,9 @@ impl Jobs {
     /// Jobs saved as running by a previous process are interrupted (call `research.deep` again on
     /// the topic to resume, or a successor resumes them after a hot swap).
     pub fn mark_interrupted(&self) {
-        let running: HashSet<String> = self.running.lock().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+        let Ok(running) = self.running.lock() else { return };
         for mut state in self.all() {
-            if state.job.state == states::RUNNING && !running.contains(&state.job.job_id) {
+            if state.job.state == states::RUNNING && !running.contains_key(&state.job.job_id) {
                 state.job.state = states::INTERRUPTED.into();
                 state.job.updated_ms = now_ms();
                 self.save(&state);
@@ -190,8 +206,8 @@ impl Jobs {
         let ids = self.running_ids();
         self.handing_off.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(running) = self.running.lock() {
-            for token in running.values() {
-                token.cancel();
+            for worker in running.values() {
+                worker.cancel.cancel();
             }
         }
         let deadline = tokio::time::Instant::now() + limit;
@@ -210,10 +226,11 @@ impl Jobs {
     }
 
     pub fn cancel(&self, job_id: &str) -> Result<Job, RpcError> {
-        let token = self.running.lock().ok().and_then(|running| running.get(job_id).cloned());
+        // The same ownership guard serializes cancellation with spawn and worker checkpoints.
+        let running = self.running.lock().map_err(|_| RpcError::internal("research job ownership unavailable"))?;
         let mut state = self.load(job_id).ok_or_else(|| RpcError::not_found(format!("no research job {job_id}")))?;
-        if let Some(token) = token {
-            token.cancel();
+        if let Some(worker) = running.get(job_id) {
+            worker.cancel.cancel();
         }
         if state.job.state == states::RUNNING || state.job.state == states::INTERRUPTED {
             state.job.state = states::CANCELLED.into();
@@ -273,8 +290,7 @@ impl Jobs {
                 }
             }
         };
-        self.save(&state);
-        Ok(self.spawn(state))
+        self.spawn(state)
     }
 
     /// Resume a job by id (after a hot swap).
@@ -285,23 +301,47 @@ impl Jobs {
         }
         state.job.state = states::RUNNING.into();
         state.job.resumed += 1;
-        self.save(&state);
-        Some(self.spawn(state))
+        self.spawn(state).ok()
     }
 
-    fn spawn(self: &Arc<Self>, state: JobState) -> Job {
+    fn spawn(self: &Arc<Self>, mut state: JobState) -> Result<Job, RpcError> {
         let token = CancellationToken::new();
-        if let Ok(mut running) = self.running.lock() {
-            running.insert(state.job.job_id.clone(), token.clone());
+        let generation = uuid::Uuid::new_v4();
+        let job;
+        {
+            let mut running = self.running.lock().map_err(|_| RpcError::internal("research job ownership unavailable"))?;
+            if let Some(previous) = running.get(&state.job.job_id)
+                && !previous.cancel.is_cancelled() {
+                return self.status(&state.job.job_id);
+            }
+            // Refresh after taking ownership: another worker may have checkpointed since the
+            // caller read the saved job. Preserve the caller's new session and resume intent.
+            if let Some(mut saved) = self.load(&state.job.job_id) {
+                saved.job.resumed = saved.job.resumed.max(state.job.resumed);
+                saved.job.session_id = state.job.session_id.clone();
+                saved.job.state = states::RUNNING.into();
+                saved.job.error = None;
+                saved.job.updated_ms = now_ms();
+                state = saved;
+            }
+            job = state.job.clone();
+            // Superseding a cancelled generation never lets its late completion touch this one.
+            if let Some(previous) = running.insert(job.job_id.clone(), Worker { generation, cancel: token.clone() }) {
+                previous.cancel.cancel();
+            }
+            self.save(&state);
+            (self.publish)(topics::JOB, json!(job));
         }
-        let job = state.job.clone();
-        (self.publish)(topics::JOB, json!(job));
         let jobs = self.clone();
         tokio::spawn(async move {
             let id = state.job.job_id.clone();
-            let mut run = Run { jobs: jobs.clone(), state, cancel: token.clone() };
+            let mut run = Run { jobs: jobs.clone(), state, cancel: token.clone(), generation };
             let outcome = run.drive().await;
             let mut state = run.state;
+            let Ok(mut running) = jobs.running.lock() else { return };
+            if !running.get(&id).is_some_and(|worker| worker.generation == generation) {
+                return;
+            }
             // A cancel may have been saved meanwhile; it wins over whatever the run reached.
             let cancelled = token.is_cancelled() || jobs.load(&id).is_some_and(|saved| saved.job.state == states::CANCELLED);
             let handed_off = jobs.handing_off.load(std::sync::atomic::Ordering::SeqCst);
@@ -320,12 +360,10 @@ impl Jobs {
             }
             state.job.updated_ms = now_ms();
             jobs.save(&state);
-            if let Ok(mut running) = jobs.running.lock() {
-                running.remove(&id);
-            }
+            running.remove(&id);
             (jobs.publish)(topics::JOB, json!(state.job));
         });
-        job
+        Ok(job)
     }
 }
 
@@ -349,6 +387,7 @@ struct Run {
     jobs: Arc<Jobs>,
     state: JobState,
     cancel: CancellationToken,
+    generation: uuid::Uuid,
 }
 
 impl Run {
@@ -357,13 +396,19 @@ impl Run {
     }
 
     fn progress(&self, phase: &str, done: u32, total: u32, detail: impl Into<String>) {
-        run_progress(&self.jobs, &self.state, phase, done, total, &detail.into());
+        if let Ok(running) = self.jobs.running.lock()
+            && running.get(&self.state.job.job_id).is_some_and(|worker| worker.generation == self.generation && !worker.cancel.is_cancelled()) {
+            run_progress(&self.jobs, &self.state, phase, done, total, &detail.into());
+        }
     }
 
     fn checkpoint(&mut self, phase: &str) {
         self.state.job.phase = phase.into();
         self.state.job.updated_ms = now_ms();
-        self.jobs.save(&self.state);
+        if let Ok(running) = self.jobs.running.lock()
+            && running.get(&self.state.job.job_id).is_some_and(|worker| worker.generation == self.generation && !worker.cancel.is_cancelled()) {
+            self.jobs.save(&self.state);
+        }
     }
 
     fn check(&self) -> Result<(), RpcError> {
@@ -417,6 +462,7 @@ impl Run {
     // ----- model -----
 
     async fn ask(&self, system: &str, user: String, schema: Value) -> Result<Value, RpcError> {
+        self.check()?;
         let priority = match self.config().model_priority.as_str() {
             "foreground" => Priority::Foreground,
             "background" => Priority::Background,
@@ -443,6 +489,7 @@ impl Run {
                 RpcError::new(&error.code, format!("the model: {}", error.message))
             }
         })?;
+        self.check()?;
         parse_json_answer(&result.content).ok_or_else(|| RpcError::internal(format!("the model's answer is not JSON: {}", crate::text::clip(&result.content, 200))))
     }
 
@@ -575,6 +622,7 @@ impl Run {
     async fn read(&mut self) -> Result<(), RpcError> {
         let candidates = self.state.candidates.clone();
         let total = candidates.len() as u32;
+        let mut failure = None;
         for (index, candidate) in candidates.iter().enumerate() {
             self.check()?;
             let key = url_key(&candidate.read_url);
@@ -585,35 +633,49 @@ impl Run {
             self.progress("read", position - 1, total, format!("reading {} ({})", candidate.hit.title, candidate.read_url));
             match self.read_one(candidate).await {
                 Ok((added, dropped)) => {
+                    self.state.visited.push(key.clone());
+                    self.state.unread.retain(|source| url_key(&source.url) != key);
                     self.state.job.sources_read += 1;
                     self.state.dropped_quotes += dropped;
                     let dropped_text = if dropped > 0 { format!("; {dropped} dropped (quote not found in the source)") } else { String::new() };
                     self.progress("read", position, total, format!("{}: {added} note(s){dropped_text}", candidate.hit.title));
                 }
-                Err(error) if error.code == codes::CANCELLED => return Err(error),
-                Err(error) => {
+                Err(ReadFailure::Extraction(error) | ReadFailure::Source(error)) if error.code == codes::CANCELLED => return Err(error),
+                Err(failed) => {
+                    let error = match failed {
+                        ReadFailure::Source(error) => error,
+                        ReadFailure::Extraction(error) => {
+                            failure = Some(error.clone());
+                            error
+                        }
+                    };
                     self.state.job.sources_failed += 1;
+                    self.state.unread.retain(|source| url_key(&source.url) != key);
                     self.state.unread.push(Unread { title: candidate.hit.title.clone(), url: candidate.read_url.clone(), why: error.message.clone() });
                     self.progress("read", position, total, format!("{}: not read ({})", candidate.hit.title, error.message));
                 }
             }
-            self.state.visited.push(key);
             self.state.job.notes = self.topic_notes().await?.len() as u32;
             self.checkpoint("read");
         }
+        // Stay in read on extraction failure. Unavailable sources remain listed as unread,
+        // while accessible sources can still support a report. Resume retries unvisited sources, even
+        // when earlier chunks already added notes; extraction failure is not irrelevant text.
+        if let Some(error) = failure { return Err(error); }
         Ok(())
     }
 
-    async fn read_one(&self, candidate: &Candidate) -> Result<(u32, u32), RpcError> {
+    async fn read_one(&self, candidate: &Candidate) -> Result<(u32, u32), ReadFailure> {
         let budget = self.config().chunk_chars * u64::from(self.config().max_chunks_per_source);
         let mut fetched = self.jobs.tools.fetch(FetchParams { url: candidate.read_url.clone(), max_chars: Some(budget), ..FetchParams::default() }).await;
         // A paper's PDF that cannot be read: its landing page still has the abstract.
         if fetched.is_err() && candidate.read_url != candidate.hit.url {
             fetched = self.jobs.tools.fetch(FetchParams { url: candidate.hit.url.clone(), max_chars: Some(budget), ..FetchParams::default() }).await;
         }
-        let fetched = fetched?;
+        let fetched = fetched.map_err(ReadFailure::Source)?;
+        self.check()?;
         if fetched.text.trim().chars().count() < 200 {
-            return Err(RpcError::new(codes::NOT_FOUND, "no readable text"));
+            return Err(ReadFailure::Source(RpcError::new(codes::NOT_FOUND, "no readable text")));
         }
         let chunks = chunk(&fetched.text, self.config().chunk_chars as usize, self.config().max_chunks_per_source as usize);
         let questions = self.questions_block();
@@ -629,16 +691,13 @@ impl Run {
                 part + 1,
                 chunks.len()
             );
-            let answer = match self.ask(MAP_SYSTEM, user, map_schema(self.state.job.questions.len())).await {
-                Ok(answer) => answer,
-                Err(error) if error.code == codes::CANCELLED => return Err(error),
-                Err(error) => {
-                    tracing::warn!("research: extracting notes from {}: {}", fetched.url, error.message);
-                    continue;
-                }
-            };
+            let answer = self.ask(MAP_SYSTEM, user, map_schema(self.state.job.questions.len())).await?;
+            self.check()?;
+            let notes = answer.get("notes").and_then(Value::as_array).ok_or_else(|| {
+                RpcError::internal(format!("the model returned no notes list for {} (part {})", fetched.url, part + 1))
+            })?;
             let form = match_form(text);
-            for item in answer.get("notes").and_then(Value::as_array).cloned().unwrap_or_default() {
+            for item in notes {
                 let claim = item.get("claim").and_then(Value::as_str).map(squash).unwrap_or_default();
                 let quote = item.get("quote").and_then(Value::as_str).map(|q| q.trim().to_owned()).unwrap_or_default();
                 if claim.is_empty() || !quote_in(&quote, &form) {
@@ -651,6 +710,7 @@ impl Run {
                     .and_then(|n| self.state.job.questions.get((n as usize).saturating_sub(1)))
                     .or_else(|| candidate.questions.first().and_then(|i| self.state.job.questions.get(*i)))
                     .cloned();
+                self.check()?;
                 self.jobs
                     .notes
                     .add(NoteAddParams {
@@ -678,9 +738,18 @@ impl Run {
         let notes = self.topic_notes().await?;
         self.state.job.notes = notes.len() as u32;
         if notes.is_empty() {
-            self.progress("synthesize", 0, 0, "no notes to synthesize (no source had relevant, quotable text)");
+            let summary = if self.state.job.sources_read == 0 && self.state.unread.is_empty() {
+                "No readable source text was obtained."
+            } else if self.state.job.sources_read == 0 {
+                "No readable source text was obtained. Sources that could not be read are listed below."
+            } else if self.state.unread.is_empty() {
+                "No source that was read had relevant text that could be quoted."
+            } else {
+                "The sources that were read had no relevant text that could be quoted. Some sources could not be read and are listed below."
+            };
+            self.progress("synthesize", 0, 0, summary);
             self.state.synthesis = Some(Synthesis {
-                summary: "No source that was read had relevant text that could be quoted.".into(),
+                summary: summary.into(),
                 findings: Vec::new(),
                 open_questions: self.state.job.questions.clone(),
             });
@@ -791,11 +860,18 @@ impl Run {
         };
         let notes = self.topic_notes().await?;
         let text = crate::report::render(&self.state, &notes, &chrono::Utc::now().date_naive().to_string());
-        let dir = PathBuf::from(&root).join("docs").join("research");
-        std::fs::create_dir_all(&dir).map_err(|e| RpcError::internal(format!("{}: {e}", dir.display())))?;
-        let path = dir.join(format!("{}.md", crate::text::slug(&self.state.job.topic)));
-        std::fs::write(&path, text).map_err(|e| RpcError::internal(format!("{}: {e}", path.display())))?;
-        let path = path.to_string_lossy().into_owned();
+        let path = {
+            let running = self.jobs.running.lock().map_err(|_| RpcError::internal("research job ownership unavailable"))?;
+            self.check()?;
+            if !running.get(&self.state.job.job_id).is_some_and(|worker| worker.generation == self.generation) {
+                return Err(RpcError::cancelled());
+            }
+            let dir = PathBuf::from(&root).join("docs").join("research");
+            std::fs::create_dir_all(&dir).map_err(|e| RpcError::internal(format!("{}: {e}", dir.display())))?;
+            let path = dir.join(format!("{}.md", crate::text::slug(&self.state.job.topic)));
+            std::fs::write(&path, text).map_err(|e| RpcError::internal(format!("{}: {e}", path.display())))?;
+            path.to_string_lossy().into_owned()
+        };
         self.state.job.report_path = Some(path.clone());
         let proposed = self.propose_knowledge(&notes).await;
         self.progress("done", 1, 1, if proposed > 0 { format!("report written: {path}; {proposed} knowledge item(s) proposed") } else { format!("report written: {path}") });
@@ -830,6 +906,7 @@ impl Run {
         };
         let mut written = 0;
         for finding in synthesis.findings.iter().filter(|f| matches!(f.confidence.as_str(), "high" | "medium")) {
+            if self.check().is_err() { return written; }
             let statement = finding.statement.trim();
             if statement.is_empty() {
                 continue;
@@ -860,6 +937,7 @@ impl Run {
             }
         }
         for question in synthesis.open_questions.iter().map(|q| q.trim()).filter(|q| !q.is_empty()) {
+            if self.check().is_err() { return written; }
             let params = cc_protocol::contracts::memory::KnowledgeUpsertParams {
                 project_id: Some(project_id.to_owned()),
                 kind: "question".into(),

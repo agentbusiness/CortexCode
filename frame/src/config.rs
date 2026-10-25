@@ -1,5 +1,5 @@
-//! Frame configuration (`cortex.dev.toml`). The schema is documented in the header of the repo's
-//! `cortex.dev.toml`; unknown keys are rejected. Relative paths resolve against the config file.
+//! Frame configuration (the app bundle's `Contents/Resources/cortex.toml`, from
+//! `scripts/app/cortex.toml`, whose header documents the schema); unknown keys are rejected. Relative paths resolve against the config file.
 //!
 //! The frame runs only installed packages (`<home>/plugins/<id>/<version>/`); the config holds the
 //! frame's own settings and, per plugin id, overrides of what its package declares: `args`,
@@ -34,6 +34,8 @@ struct RawFrame {
     /// The code folder: CortexCode's own source, where plugins read their live data
     /// (default `<home>/code`).
     code: Option<String>,
+    /// The app's prebuilt plugin packages (`<id>@<version>.ccplugin`), installed at start.
+    packages: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +78,8 @@ pub struct Config {
     pub ui_dir: PathBuf,
     /// `[frame] code`, resolved against the config's directory (`None` = `<home>/code`).
     pub code: Option<PathBuf>,
+    /// `[frame] packages`: the app's prebuilt plugin packages, resolved against the config's directory.
+    pub packages: Option<PathBuf>,
     /// Overrides by plugin id.
     pub overrides: BTreeMap<String, PluginOverride>,
 }
@@ -117,6 +121,7 @@ impl Config {
             ui: raw.frame.ui,
             ui_dir: resolve(&base, raw.frame.ui_dir.as_deref().unwrap_or("ui")),
             code: raw.frame.code.as_deref().map(|code| resolve(&base, code)),
+            packages: raw.frame.packages.as_deref().map(|packages| resolve(&base, packages)),
             overrides,
             base,
         })

@@ -146,6 +146,7 @@ name = "cc-lang-rust"
 version = "0.1.0"
 dependencies = [
  "cc-lang-kit",
+ "semver",
  "serde_json",
  "tempfile",
  "tokio",

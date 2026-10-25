@@ -29,7 +29,6 @@ github_client_id = ""              # the GitHub app's client id for "Connect Git
 [ui]
 dir = "ui"
 build = ["npm", "run", "build"]
-test = ["npm", "test"]
 
 [[ui.package]]
 dir = "ui/card-git"

@@ -106,9 +106,6 @@ plugin while it runs. A swap that fails rolls back on its own.
 plugin talks to the rest only through a typed contract, so any part can be swapped for another that
 speaks the same contract.
 
-**Measured, not guessed.** A benchmark harness drives the real app window on well-known coding
-benchmarks, so every change to the flow is measured on the model it ships with.
-
 ## Who it is for
 
 - Developers who want a capable coding agent that is **private, offline and free to run**.

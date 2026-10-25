@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// Contents of `<home>/run/frame.json`, read by the UI, `cx` and the eval harness.
+/// Contents of `<home>/run/frame.json`, read by the UI and `cx`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FrameInfo {
     pub pid: u32,

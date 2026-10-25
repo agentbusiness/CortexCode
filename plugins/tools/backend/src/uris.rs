@@ -87,7 +87,9 @@ fn abs(scope: &Scope, path: &str) -> PathBuf {
 
 /// One line of a file as plain text (no anchor): result lines already say `path:line`.
 fn source_line(scope: &Scope, path: &str, line: u32) -> Option<String> {
-    let text = std::fs::read_to_string(abs(scope, path)).ok()?;
+    let path = abs(scope, path);
+    if crate::sandbox::host_control_read_denied(&path) { return None; }
+    let text = crate::util::read_host_text(path).ok()?;
     text.lines().nth((line as usize).checked_sub(1)?).map(|line| line.trim_end().to_owned())
 }
 
@@ -111,10 +113,10 @@ const HEADER_LINES: usize = 4;
 /// Read lines `start_line..=end_line` (1-based) of a symbol's file.
 fn read_definition(scope: &Scope, symbol: &SymbolRef) -> Definition {
     let path = abs(scope, &symbol.path);
-    if !path.is_file() {
+    if crate::sandbox::host_control_read_denied(&path) || !path.is_file() {
         return Definition::Gone;
     }
-    let Ok(text) = std::fs::read_to_string(&path) else { return Definition::NotText };
+    let Ok(text) = crate::util::read_host_text(&path) else { return Definition::NotText };
     let doc = crate::doc::Doc::parse(&text);
     let (start, end) = (symbol.start_line as usize, symbol.end_line.max(symbol.start_line) as usize);
     if start == 0 || start > doc.len() {
@@ -530,7 +532,8 @@ async fn outline(host: &dyn Host, scope: &Scope<'_>, path: &str) -> Result<Strin
         Err(error) if matches!(error.code.as_str(), cc_protocol::codes::UNAVAILABLE | cc_protocol::codes::UNKNOWN_METHOD) => {
             // The structural outline does not need the graph.
             let file = abs(scope, path);
-            let text = std::fs::read_to_string(&file).map_err(|e| UriError::new("not_found", format!("{path}: {e}")))?;
+            if crate::sandbox::host_control_read_denied(&file) { return Err(UriError::new("denied", "app control files are private; use cx for command access")); }
+            let text = crate::util::read_host_text(&file).map_err(|e| UriError::new("not_found", format!("{path}: {e}")))?;
             let doc = crate::doc::Doc::parse(&text);
             Ok(crate::read::render_outline(&file, path, &text, &doc, true))
         }

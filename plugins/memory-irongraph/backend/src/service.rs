@@ -780,7 +780,7 @@ impl Memory {
         let workspace = if root == project.root { None } else { Some(root.to_string_lossy().into_owned()) };
         let watch_root = root.clone();
         let work = project.work.clone();
-        let result = watch::watch(&root, move |paths: Vec<PathBuf>| {
+        let result = watch::watch(&root, move |batch: watch::Batch| {
             let me = me.clone();
             let tree = tree.clone();
             let project_id = project_id.clone();
@@ -792,26 +792,29 @@ impl Memory {
                 if me.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
+                let paths = batch.paths;
+                let reconcile = batch.reconcile || paths.iter().any(|p| watch::changes_membership(&root, p));
                 // HEAD or a ref moved: new commits for MODIFIED_IN.
                 let git_moved = paths.iter().any(|p| {
                     let s = p.to_string_lossy();
                     s.contains("/.git/") && (s.ends_with("/HEAD") || s.contains("/.git/refs/") || s.ends_with("ORIG_HEAD"))
                 });
-                if git_moved && let Err(error) = tree.refresh_history().await {
+                if !reconcile && git_moved && let Err(error) = tree.refresh_history().await {
                     tracing::warn!(%error, "history refresh failed");
                 }
                 let paths: Vec<PathBuf> = paths.into_iter().filter(|p| !p.to_string_lossy().contains("/.git/")).collect();
-                let rels = expand_paths(&root, &paths, &tree).await;
-                if workspace.is_none() && paths.iter().any(|p| p.file_name().is_some_and(|n| n == "CORTEX.md")) {
+                let rels = if reconcile { Vec::new() } else { expand_paths(&root, &paths, &tree).await };
+                if workspace.is_none() && (reconcile || paths.iter().any(|p| p.file_name().is_some_and(|n| n == "CORTEX.md"))) {
                     let text = std::fs::read_to_string(root.join("CORTEX.md")).unwrap_or_default();
                     if let Err(error) = work.import_cortex_md(&text).await {
                         tracing::warn!(%error, "CORTEX.md import failed");
                     }
                 }
-                if rels.is_empty() {
+                if !reconcile && rels.is_empty() {
                     return;
                 }
-                match tree.refresh_paths(&rels).await {
+                let result = if reconcile { tree.full_index().await } else { tree.refresh_paths(&rels).await };
+                match result {
                     Ok(report) if report.files_changed + report.files_deleted > 0 => {
                         me.publish(topics::INDEXED, indexed_payload(&project_id, workspace.as_deref(), &report));
                     }

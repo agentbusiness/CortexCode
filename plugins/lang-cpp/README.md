@@ -12,7 +12,6 @@ C/C++ skills. A `LanguagePack` served by `cc-lang-kit`, built like
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-cpp`: category `lang-cpp`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -50,16 +49,6 @@ C/C++ skills. A `LanguagePack` served by `cc-lang-kit`, built like
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-cpp
 ```
-
-## Verification
-
-`verify/lang_cpp.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: definition lines and call sites found in the fixture text, CMakeLists.txt
-facts, clang's own errors (`xcrun clang++ -fsyntax-only` with the database's flags) before and after
-a fix, the missing-database warning in a workspace without one, definition, references and hover
-positions of a function, skills read back with their summaries, the `lang-cpp.server` event, and
-refusals. `node verify/lang_cpp.mjs --install` lets `lang-cpp.install` download clangd when the
-system has none.

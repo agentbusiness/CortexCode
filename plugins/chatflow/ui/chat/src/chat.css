@@ -209,12 +209,6 @@
 #cc .cx-test-failed{color:var(--rubric);}
 #cc .cx-test-passed summary{cursor:pointer;margin-top:6px;}
 
-#cc .cx-verdict{display:flex;gap:12px;align-items:baseline;margin:14px 0;padding:10px 14px;border:1px solid var(--counter);border-left-width:3px;}
-#cc .cx-verdict[data-passed="false"]{border-color:var(--rubric);}
-#cc .cx-verdict-mark{font-size:1.3em;font-weight:700;color:var(--counter);}
-#cc .cx-verdict[data-passed="false"] .cx-verdict-mark,#cc .cx-verdict[data-passed="false"] .cx-verdict-text{color:var(--rubric);}
-#cc .cx-verdict-text{font-weight:600;color:var(--counter);}
-#cc .cx-verdict-facts{font-variant-numeric:tabular-nums;opacity:.8;}
 
 /* Plan editing and comments (the plan card's Edit and Comment). */
 #cc .cx-chat .cx-plan-edit-tasks li{display:flex;flex-direction:column;gap:6px;}

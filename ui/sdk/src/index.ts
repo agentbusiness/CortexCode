@@ -67,5 +67,5 @@ export { publishTheme, activeTheme, subscribeTheme, useThemeData, currentGround,
 export type { ThemeData, Ground, XtermPalette, HighlightRule } from './theme';
 export { byOrder, contributions, pluginLabel, slotName } from './contrib';
 export type { Contribution } from './contrib';
-export { DEFAULT_MODEL_VARIANT, plural, useModelState } from './model';
-export type { ModelInfoData, ModelPhase, ModelSlotsData, ModelState } from './model';
+export { DEFAULT_MODEL_VARIANT, installLine, plural, useModelState } from './model';
+export type { InstallProgress, ModelInfoData, ModelPhase, ModelSlotsData, ModelState } from './model';

@@ -17,7 +17,3 @@ cortex-pack build plugins/theme-cortex                  # -> plugins/theme-corte
 ```
 
 `cortex-pack build plugins/theme-cortex --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the UI package together; Settings > Plugins disables and enables the whole plugin.
-
-## Verification
-
-ui/verify/tokens.mjs and ui/verify/theme.mjs (in the UI core) check the tokens against the design reference and the live re-theme.

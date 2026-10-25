@@ -19,20 +19,22 @@ use tokio_util::sync::CancellationToken;
 const OUTPUT_BYTES: u64 = 1 << 20;
 
 /// Code files put back as they were before the turn; dropping it restores them as they are now.
-struct Swapped {
+struct Swapped<'a> {
+    core: &'a Core,
+    workspace: &'a Path,
     /// Each file and its content now (None: it does not exist now).
     now: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
-impl Swapped {
+impl<'a> Swapped<'a> {
     /// Put each file back as `before` says (None: the turn created it, so it is taken away).
-    fn apply(before: &[(PathBuf, Option<String>)]) -> std::io::Result<Swapped> {
-        let mut swapped = Swapped { now: Vec::with_capacity(before.len()) };
+    fn apply(core: &'a Core, workspace: &'a Path, before: &[(PathBuf, Option<String>)]) -> std::io::Result<Swapped<'a>> {
+        let mut swapped = Swapped { core, workspace, now: Vec::with_capacity(before.len()) };
         for (path, original) in before {
-            swapped.now.push((path.clone(), std::fs::read(path).ok()));
+            swapped.now.push((path.clone(), util::read_host_file(path).ok()));
             match original {
-                Some(text) => util::atomic_write(path, text.as_bytes())?,
-                None => match std::fs::remove_file(path) {
+                Some(text) => util::atomic_write_checked(path, text.as_bytes(), |path| util::is_inside(path, workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(workspace, path))?,
+                None => match util::remove_file_checked(path, |path| util::is_inside(path, workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(workspace, path)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
@@ -43,12 +45,12 @@ impl Swapped {
     }
 }
 
-impl Drop for Swapped {
+impl Drop for Swapped<'_> {
     fn drop(&mut self) {
         for (path, now) in &self.now {
             let restored = match now {
-                Some(bytes) => util::atomic_write(path, bytes),
-                None => std::fs::remove_file(path).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }),
+                Some(bytes) => util::atomic_write_checked(path, bytes, |path| util::is_inside(path, self.workspace) && !self.core.sandbox.protected(path) && !self.core.sandbox.git_control_write_denied(self.workspace, path)),
+                None => util::remove_file_checked(path, |path| util::is_inside(path, self.workspace) && !self.core.sandbox.protected(path) && !self.core.sandbox.git_control_write_denied(self.workspace, path)).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) }),
             };
             if let Err(error) = restored {
                 tracing::error!(path = %path.display(), %error, "restoring a file after the baseline check failed");
@@ -73,7 +75,15 @@ fn changed_code(core: &Core, session_id: &str, workspace: &Path) -> Vec<(PathBuf
 }
 
 /// `tools.tests.baseline`.
-pub async fn check(core: &Arc<Core>, session_id: &str, workspace: &str, command: &str, timeout_ms: Option<u64>, cancel: CancellationToken) -> Result<Value, RpcError> {
+pub async fn check(
+    core: &Arc<Core>,
+    host: &dyn crate::host::Host,
+    session_id: &str,
+    workspace: &str,
+    command: &str,
+    timeout_ms: Option<u64>,
+    cancel: CancellationToken,
+) -> Result<Value, RpcError> {
     if session_id.is_empty() || workspace.is_empty() || command.trim().is_empty() {
         return Err(RpcError::invalid_params("tools.tests.baseline needs session_id, workspace and command"));
     }
@@ -84,7 +94,8 @@ pub async fn check(core: &Arc<Core>, session_id: &str, workspace: &str, command:
     }
     let context = crate::service::host_context(workspace, None, Some(session_id));
     let session = crate::exec::Session { workspace: root.clone(), context: &context, python_env: true };
-    let runtime = core.runtime(session_id, &root, true).await.map_err(|message| RpcError::new(cc_protocol::codes::UNAVAILABLE, message))?;
+    let runtime =
+        core.runtime(host, session_id, &root, true).await.map_err(|message| RpcError::new(cc_protocol::codes::UNAVAILABLE, message))?;
     let mut identity = crate::exec::identity(core, &session, Some(&runtime));
     // A one-off shell that starts where the session's shell is (its directory and environment).
     let temporary = format!("{session_id}-baseline-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -92,7 +103,7 @@ pub async fn check(core: &Arc<Core>, session_id: &str, workspace: &str, command:
     identity.session_id = temporary.clone();
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(core.config.default_timeout_ms));
     let run = {
-        let _swapped = Swapped::apply(&before).map_err(|error| RpcError::internal(format!("cannot put the code back as it was: {error}")))?;
+        let _swapped = Swapped::apply(core, &root, &before).map_err(|error| RpcError::internal(format!("cannot put the code back as it was: {error}")))?;
         core.shells
             .run(&identity, RunRequest { command, cwd: None, env: Vec::new(), toolchain: crate::shell::Toolchain::default(), timeout }, cancel, |_: &[u8]| {})
             .await

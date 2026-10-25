@@ -1,0 +1,986 @@
+{
+  "classes": [
+    {
+      "id": "obvious",
+      "name": "Obvious exposures",
+      "applies": {
+        "always": true
+      },
+      "invariant": "No secret, debug switch or dangerous dynamic evaluation is reachable from the repository as shipped.",
+      "look": [
+        "A hit for a secret pattern: is the value real (not a placeholder, a test fixture or a public key id)? Where is it used, and who can read the repository or the built artifact?",
+        "A committed secret file (.env, *.pem, *.key, credentials.json, id_rsa): is it in git history even if deleted now? `git log --all --diff-filter=D --name-only -- <path>`.",
+        "A debug or dev switch (DEBUG=True, dev mode, verbose errors): can a request, header or environment variable turn it on in production?",
+        "eval/exec/Function/vm with a value that is not a literal: where does the string come from?",
+        "A TODO or FIXME about auth, validation or permissions: is the gap it describes still open?",
+        "Manifests without a lockfile, or a lockfile that is not used by the install command: what version is installed in CI?"
+      ],
+      "counts": "A real credential or token readable by anyone with the repository or the artifact, a debug switch reachable from a request, or an eval of outside data.",
+      "hardening": "An example value, a placeholder, a public identifier, a missing lockfile with pinned ranges and no exposure.",
+      "patterns": [
+        {
+          "name": "private key block",
+          "langs": [
+            "any"
+          ],
+          "needle": "PRIVATE KEY",
+          "regex": "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+        },
+        {
+          "name": "AWS access key id",
+          "langs": [
+            "any"
+          ],
+          "needle": "AKIA",
+          "regex": "\\bAKIA[0-9A-Z]{16}\\b"
+        },
+        {
+          "name": "GitHub token",
+          "langs": [
+            "any"
+          ],
+          "needle": "gh",
+          "regex": "\\bgh[pousr]_[A-Za-z0-9]{36,}\\b"
+        },
+        {
+          "name": "Slack token",
+          "langs": [
+            "any"
+          ],
+          "needle": "xox",
+          "regex": "\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b"
+        },
+        {
+          "name": "Stripe live key",
+          "langs": [
+            "any"
+          ],
+          "needle": "sk_live_",
+          "regex": "\\bsk_live_[A-Za-z0-9]{16,}\\b"
+        },
+        {
+          "name": "Google API key",
+          "langs": [
+            "any"
+          ],
+          "needle": "AIza",
+          "regex": "\\bAIza[0-9A-Za-z_-]{35}\\b"
+        },
+        {
+          "name": "JWT literal",
+          "langs": [
+            "any"
+          ],
+          "needle": "eyJ",
+          "regex": "\\beyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+        },
+        {
+          "name": "password or secret assigned a literal",
+          "langs": [
+            "any"
+          ],
+          "needle": "=",
+          "regex": "(?i)\\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\\b\\s*[:=]\\s*[\"'][^\"'\\s]{8,}[\"']"
+        },
+        {
+          "name": "connection string with password",
+          "langs": [
+            "any"
+          ],
+          "needle": "://",
+          "regex": "(?i)\\b(postgres|postgresql|mysql|mongodb|redis|amqp)://[^:\\s/]+:[^@\\s]{4,}@"
+        },
+        {
+          "name": "debug switched on",
+          "langs": [
+            "any"
+          ],
+          "needle": "DEBUG",
+          "regex": "\\bDEBUG\\s*[:=]\\s*(True|true|1|\"true\"|'true'|\"1\")"
+        },
+        {
+          "name": "eval or exec of a non-literal",
+          "langs": [
+            "py"
+          ],
+          "needle": "e",
+          "regex": "\\b(eval|exec)\\s*\\(\\s*[^\"'\\s)]"
+        },
+        {
+          "name": "eval, Function or vm of a non-literal",
+          "langs": [
+            "js"
+          ],
+          "needle": "(",
+          "regex": "\\b(eval|new\\s+Function|vm\\.runIn\\w+)\\s*\\(\\s*[^\"'\\s)(]"
+        },
+        {
+          "name": "security TODO",
+          "langs": [
+            "any"
+          ],
+          "needle": "O",
+          "regex": "(?i)\\b(TODO|FIXME|HACK|XXX)\\b.*\\b(auth|authz|authn|permission|validate|validation|sanitize|escape|csrf|security|insecure|secret|password)"
+        }
+      ],
+      "files": [
+        {
+          "name": "secret file committed",
+          "glob": [
+            ".env",
+            ".env.*",
+            "*.pem",
+            "*.key",
+            "*.p12",
+            "*.pfx",
+            "*.jks",
+            "*.keystore",
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            "credentials.json",
+            "service-account*.json",
+            "*.tfstate",
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            "*.ovpn"
+          ],
+          "note": "A credential file in the repository: check its content and its history."
+        }
+      ]
+    },
+    {
+      "id": "dependencies",
+      "name": "Known vulnerable dependencies",
+      "live": "osv",
+      "applies": {
+        "files": [
+          "package-lock.json",
+          "yarn.lock",
+          "pnpm-lock.yaml",
+          "requirements*.txt",
+          "poetry.lock",
+          "Pipfile.lock",
+          "uv.lock",
+          "pdm.lock",
+          "Cargo.lock",
+          "go.mod",
+          "Gemfile.lock",
+          "composer.lock",
+          "packages.lock.json",
+          "pom.xml"
+        ]
+      },
+      "invariant": "No dependency the project ships at its pinned version has a known vulnerability that this project's use of it can reach.",
+      "look": [
+        "For each advisory: which function or feature of the package is affected (the advisory says), and does this project call it? `grep -rn \"<package>\"` for the import, then read graph://used-by/<function> for the call sites.",
+        "Does outside data reach that call (a request field, a file, a message)? A vulnerable parser fed only with the project's own constants is not reachable.",
+        "Is the fixed version a drop-in (same major) or a breaking upgrade? Name it either way.",
+        "A transitive dependency: which direct dependency pulls it in (`npm ls <pkg>`, `pipdeptree`, `cargo tree -i <pkg>`, `go mod why <pkg>`)."
+      ],
+      "counts": "An advisory whose affected code this project reaches with outside data, at the pinned version.",
+      "hardening": "An advisory in a package the project does not call that way: note the upgrade to the fixed version.",
+      "patterns": []
+    },
+    {
+      "id": "injection",
+      "name": "Injection",
+      "applies": {
+        "langs": [
+          "py",
+          "js",
+          "go",
+          "rs",
+          "java",
+          "rb",
+          "php",
+          "c",
+          "cs",
+          "swift",
+          "sh"
+        ]
+      },
+      "invariant": "Data from outside never changes the structure of a command, query, template, path or expression; it is only ever a value.",
+      "look": [
+        "Shell: a command string built with a variable (shell=True, os.system, exec/execSync with a template string, sh -c, Runtime.exec with a string, system()). The fix is an argument list.",
+        "SQL and other queries: a query string built with +, f-string, format, template literal or sprintf and run with execute/query/raw. The fix is a placeholder.",
+        "Templates and HTML: a template built from a string, |safe or Markup(), autoescape off, render_template_string, innerHTML, v-html.",
+        "Deserialization of outside bytes: pickle, yaml.load without SafeLoader, ObjectInputStream, unserialize, Marshal.load, BinaryFormatter.",
+        "Expressions: eval, exec, Function, template engines evaluating user text, regex built from user text (ReDoS, injection), LDAP or XPath strings.",
+        "Second-order: data stored safely and used later in another sink (a stored name becomes a file path, a slug becomes a query, a header becomes a log line)."
+      ],
+      "counts": "A value a lower-trust party controls reaches the sink unparameterized, with a result: another user's data, a file outside the intended folder, a command, a script in another user's page.",
+      "hardening": "A sink fed only by literals, configuration the operator writes, or a value validated against an allowlist you read.",
+      "patterns": [
+        {
+          "name": "shell=True",
+          "langs": [
+            "py"
+          ],
+          "needle": "shell=True",
+          "regex": "shell\\s*=\\s*True"
+        },
+        {
+          "name": "os.system or os.popen",
+          "langs": [
+            "py"
+          ],
+          "needle": "os.",
+          "regex": "\\bos\\.(system|popen)\\s*\\("
+        },
+        {
+          "name": "query built from a string",
+          "langs": [
+            "py"
+          ],
+          "needle": "execute",
+          "regex": "\\.(execute|executemany|executescript|raw|extra)\\s*\\(\\s*(f[\"']|[\"'][^\"']*[\"']\\s*(%|\\+)|.*\\.format\\()"
+        },
+        {
+          "name": "query string with %, + or f-string",
+          "langs": [
+            "py"
+          ],
+          "needle": "SELECT",
+          "regex": "(?i)(f[\"'][^\"']*\\b(select|insert|update|delete)\\b|\\b(select|insert|update|delete)\\b[^\"']*[\"']\\s*(%|\\+)\\s*\\w)"
+        },
+        {
+          "name": "unsafe deserialization",
+          "langs": [
+            "py"
+          ],
+          "needle": "load",
+          "regex": "\\b(pickle|cPickle|dill|shelve|marshal)\\.loads?\\s*\\(|yaml\\.(load|load_all|unsafe_load)\\s*\\([^)]*\\)(?![^\\n]*SafeLoader)|yaml\\.load\\s*\\([^)]*Loader\\s*=\\s*yaml\\.(Loader|UnsafeLoader|FullLoader)"
+        },
+        {
+          "name": "template from a string or markup",
+          "langs": [
+            "py"
+          ],
+          "needle": "a",
+          "regex": "\\b(render_template_string|Markup)\\s*\\(|\\|\\s*safe\\b|autoescape\\s*=\\s*False"
+        },
+        {
+          "name": "child_process exec with a template",
+          "langs": [
+            "js"
+          ],
+          "needle": "exec",
+          "regex": "(?<![.\\w/)\\]])(exec|execSync|spawn|spawnSync)\\s*\\(\\s*(`[^`]*\\$\\{|[^\"'`)\\s][^)]*shell\\s*:\\s*true|[a-zA-Z_$][\\w.$]*\\s*[,)])|child_process\\.(exec|execSync|spawn|spawnSync)\\s*\\(\\s*[^\"'`)\\s]"
+        },
+        {
+          "name": "query built with a template literal",
+          "langs": [
+            "js"
+          ],
+          "needle": "`",
+          "regex": "\\.(query|execute|raw|unsafe)\\s*\\(\\s*`[^`]*\\$\\{"
+        },
+        {
+          "name": "query built by concatenation",
+          "langs": [
+            "js"
+          ],
+          "needle": "+",
+          "regex": "(?i)[\"']\\s*(select|insert|update|delete|where)\\b[^\"']*[\"']\\s*\\+\\s*\\w"
+        },
+        {
+          "name": "HTML sink",
+          "langs": [
+            "js",
+            "html"
+          ],
+          "needle": "HTML",
+          "regex": "\\.(innerHTML|outerHTML)\\s*=|insertAdjacentHTML\\s*\\(|dangerouslySetInnerHTML|document\\.write(ln)?\\s*\\("
+        },
+        {
+          "name": "v-html or {@html}",
+          "langs": [
+            "js",
+            "html"
+          ],
+          "needle": "html",
+          "regex": "\\bv-html\\s*=|\\{@html\\b"
+        },
+        {
+          "name": "sh -c with a variable",
+          "langs": [
+            "go"
+          ],
+          "needle": "exec.Command",
+          "regex": "exec\\.Command(Context)?\\s*\\(\\s*(\"(sh|bash|/bin/sh|/bin/bash|cmd)\"|[a-zA-Z_][\\w.]*\\s*[,)])"
+        },
+        {
+          "name": "query built with Sprintf or +",
+          "langs": [
+            "go"
+          ],
+          "needle": "Query",
+          "regex": "\\.(Query|QueryRow|Exec|QueryContext|ExecContext|Raw)\\s*\\((ctx,\\s*)?(fmt\\.Sprintf|[\"'][^\"']*[\"']\\s*\\+|\\w+\\s*\\+)"
+        },
+        {
+          "name": "template.HTML or JS cast",
+          "langs": [
+            "go"
+          ],
+          "needle": "template.",
+          "regex": "template\\.(HTML|JS|URL|HTMLAttr)\\s*\\("
+        },
+        {
+          "name": "sh -c or a shell command string",
+          "langs": [
+            "rs"
+          ],
+          "needle": "Command::new",
+          "regex": "Command::new\\s*\\(\\s*\"(sh|bash|/bin/sh|cmd)\"|\\.arg\\s*\\(\\s*\"-c\"\\s*\\)"
+        },
+        {
+          "name": "query built with format!",
+          "langs": [
+            "rs"
+          ],
+          "needle": "format!",
+          "regex": "(query|execute|prepare|sql)\\w*\\s*\\(\\s*&?\\s*format!\\s*\\("
+        },
+        {
+          "name": "Runtime.exec or ProcessBuilder with a string",
+          "langs": [
+            "java"
+          ],
+          "needle": "exec",
+          "regex": "Runtime\\.getRuntime\\(\\)\\.exec\\s*\\(\\s*[^\"\\s)]|new\\s+ProcessBuilder\\s*\\(\\s*\"(sh|bash|cmd)"
+        },
+        {
+          "name": "query built with + or format",
+          "langs": [
+            "java"
+          ],
+          "needle": "Statement",
+          "regex": "(?i)(createStatement\\s*\\(|createQuery\\s*\\(\\s*\"[^\"]*\"\\s*\\+|execute(Query|Update)?\\s*\\(\\s*\"[^\"]*\"\\s*\\+|String\\.format\\s*\\(\\s*\"(select|insert|update|delete))"
+        },
+        {
+          "name": "ObjectInputStream or XMLDecoder",
+          "langs": [
+            "java"
+          ],
+          "needle": "new ",
+          "regex": "new\\s+(ObjectInputStream|XMLDecoder)\\s*\\("
+        },
+        {
+          "name": "shell with interpolation",
+          "langs": [
+            "rb"
+          ],
+          "needle": "#{",
+          "regex": "(`[^`]*#\\{|\\b(system|exec|spawn|popen)\\s*\\(?\\s*\"[^\"]*#\\{|IO\\.popen\\s*\\(?\\s*\"[^\"]*#\\{)"
+        },
+        {
+          "name": "query with interpolation",
+          "langs": [
+            "rb"
+          ],
+          "needle": "#{",
+          "regex": "\\.(where|find_by_sql|execute|select_all|order|group|having|joins)\\s*\\(?\\s*\"[^\"]*#\\{"
+        },
+        {
+          "name": "unsafe deserialization",
+          "langs": [
+            "rb"
+          ],
+          "needle": "load",
+          "regex": "\\b(Marshal\\.load|YAML\\.load(?!_file\\(.*safe)|Oj\\.load)\\s*\\("
+        },
+        {
+          "name": "shell or eval",
+          "langs": [
+            "php"
+          ],
+          "needle": "(",
+          "regex": "\\b(exec|shell_exec|system|passthru|popen|proc_open|eval)\\s*\\(\\s*\\$"
+        },
+        {
+          "name": "query with a variable",
+          "langs": [
+            "php"
+          ],
+          "needle": "$",
+          "regex": "(?i)\\b(mysqli?_query|->query|->exec|pg_query)\\s*\\(.*\\$\\w+|\"(select|insert|update|delete)\\b[^\"]*\\$\\w+"
+        },
+        {
+          "name": "unserialize",
+          "langs": [
+            "php"
+          ],
+          "needle": "unserialize",
+          "regex": "\\bunserialize\\s*\\("
+        },
+        {
+          "name": "system or popen with a built string",
+          "langs": [
+            "c"
+          ],
+          "needle": "(",
+          "regex": "\\b(system|popen|execl|execlp)\\s*\\(\\s*[a-zA-Z_]\\w*\\s*[,)]"
+        },
+        {
+          "name": "query built with sprintf or +",
+          "langs": [
+            "c"
+          ],
+          "needle": "(",
+          "regex": "(?i)(sprintf|snprintf|strcat|strcpy)\\s*\\([^;]*\\b(select|insert|update|delete)\\b"
+        },
+        {
+          "name": "Process.Start or SqlCommand with a built string",
+          "langs": [
+            "cs"
+          ],
+          "needle": "(",
+          "regex": "Process\\.Start\\s*\\(\\s*\"(cmd|sh|bash)|new\\s+SqlCommand\\s*\\(\\s*(\\$\"|\"[^\"]*\"\\s*\\+|string\\.Format)|FromSqlRaw\\s*\\(\\s*\\$\"|ExecuteSqlRaw\\s*\\(\\s*\\$\""
+        },
+        {
+          "name": "BinaryFormatter or unsafe serializer",
+          "langs": [
+            "cs"
+          ],
+          "needle": "new ",
+          "regex": "new\\s+(BinaryFormatter|NetDataContractSerializer|SoapFormatter|LosFormatter|ObjectStateFormatter)\\s*\\("
+        },
+        {
+          "name": "eval of a variable",
+          "langs": [
+            "sh"
+          ],
+          "needle": "eval",
+          "regex": "\\beval\\s+.*\\$"
+        }
+      ]
+    },
+    {
+      "id": "access-control",
+      "name": "Access control",
+      "applies": {
+        "content": [
+          "(?i)\\b(login_required|authenticate|authorize|authorization|permission|is_admin|isAdmin|require_role|requireAuth|ensureAuth|passport\\.|jwt\\.|bearer|api[_-]?key|current_user|request\\.user|session\\[)"
+        ]
+      },
+      "invariant": "Every handler that reads or changes a resource checks that this caller may act on this resource, through the same mechanism as its siblings.",
+      "look": [
+        "The handler list below: for each handler that changes state, where is the authorization check, and does it check the resource (this user owns record 42), not only that a session exists?",
+        "Two paths to the same state change (UI route and API route, single and bulk, import and create): do both check the same thing?",
+        "Fields copied from the request body into a record: can the caller set owner_id, role, is_admin, price, tenant?",
+        "Identifiers from the request (ids, slugs, paths): is the lookup scoped to the caller (WHERE owner = current user), or global?",
+        "Middleware order: does the auth middleware run before every route, including ones registered later, under another prefix, or on another server instance?",
+        "Health, metrics, debug, admin, internal and export routes: who may reach them?"
+      ],
+      "counts": "A caller reaches an action or a record outside their authority: another user's data, an admin action, a field only the server should set.",
+      "hardening": "A check that exists but is written differently from its siblings, a missing rate limit, an internal route that only operators can reach by deployment facts you cannot read (needs_validation).",
+      "patterns": [
+        {
+          "name": "route handler",
+          "langs": [
+            "py"
+          ],
+          "needle": "@",
+          "regex": "@\\w+\\.(route|get|post|put|patch|delete|api_route|websocket)\\s*\\(|^\\s*(path|re_path|url)\\s*\\(\\s*[\"']"
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "js"
+          ],
+          "needle": ".",
+          "regex": "\\b(app|router|server|fastify|api)\\.(get|post|put|patch|delete|all|use)\\s*\\(\\s*[\"'`/]|export\\s+(async\\s+)?function\\s+(GET|POST|PUT|PATCH|DELETE)\\b|@(Get|Post|Put|Patch|Delete)\\s*\\("
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "go"
+          ],
+          "needle": "(",
+          "regex": "\\.(HandleFunc|Handle|GET|POST|PUT|PATCH|DELETE|Any|Group)\\s*\\(\\s*\"|http\\.HandleFunc\\s*\\("
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "rs"
+          ],
+          "needle": "route",
+          "regex": "\\.route\\s*\\(\\s*\"|#\\[(get|post|put|patch|delete|route)\\s*\\(|\\.service\\s*\\(|web::(get|post|put|patch|delete)\\s*\\(\\)"
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "java"
+          ],
+          "needle": "Mapping",
+          "regex": "@(Get|Post|Put|Patch|Delete|Request)Mapping\\b|@Path\\s*\\("
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "rb"
+          ],
+          "needle": " ",
+          "regex": "^\\s*(get|post|put|patch|delete|resources?|match)\\s+[\"':]"
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "php"
+          ],
+          "needle": "Route",
+          "regex": "Route::(get|post|put|patch|delete|any|match|resource)\\s*\\("
+        },
+        {
+          "name": "route handler",
+          "langs": [
+            "cs"
+          ],
+          "needle": "[Http",
+          "regex": "\\[Http(Get|Post|Put|Patch|Delete)\\b|\\.Map(Get|Post|Put|Patch|Delete)\\s*\\("
+        },
+        {
+          "name": "mass assignment from the request",
+          "langs": [
+            "py"
+          ],
+          "needle": "request",
+          "regex": "\\*\\*\\s*(request\\.(json|form|data|args|POST|GET)|data|payload|body)\\b|\\.update\\s*\\(\\s*request\\.(json|form|data|POST)"
+        },
+        {
+          "name": "mass assignment from the request",
+          "langs": [
+            "js"
+          ],
+          "needle": "req.",
+          "regex": "(\\.\\.\\.req\\.(body|query|params)|Object\\.assign\\s*\\([^,]+,\\s*req\\.(body|query)|\\.(create|update|insertMany|updateOne|findOneAndUpdate)\\s*\\(\\s*req\\.body)"
+        },
+        {
+          "name": "role or admin from the request",
+          "langs": [
+            "any"
+          ],
+          "needle": "r",
+          "regex": "(?i)(req(uest)?\\.(body|query|params|json|form|args|data)\\s*(\\[|\\.|\\.get\\()\\s*[\"']?(role|is_admin|isAdmin|admin|owner_id|user_id|tenant_id|org_id|price|amount|balance)\\b)"
+        },
+        {
+          "name": "authorization turned off",
+          "langs": [
+            "any"
+          ],
+          "needle": "=",
+          "regex": "(?i)\\b(permission_classes|authentication_classes)\\s*=\\s*(\\[\\s*\\]|\\(\\s*\\)|\\[\\s*AllowAny)|@csrf_exempt|\\bskip_authorization\\b|\\bauth\\s*[:=]\\s*(false|False|None|null)"
+        }
+      ]
+    },
+    {
+      "id": "files-resources",
+      "name": "Files, paths, archives and outbound requests",
+      "applies": {
+        "langs": [
+          "py",
+          "js",
+          "go",
+          "rs",
+          "java",
+          "rb",
+          "php",
+          "c",
+          "cs",
+          "swift",
+          "sh"
+        ]
+      },
+      "invariant": "A path or URL from outside stays inside the intended folder or host set; archives are checked member by member; temporary files are private.",
+      "look": [
+        "A path built from a request value, a file name or an argument: is it resolved and checked to stay under the base folder (resolve then is_relative_to / Rel without ..)? Is the client's file name used as the stored name?",
+        "Archive extraction: members with .. or absolute paths, symlinks, size limits (zip bomb).",
+        "An outbound request to a URL from outside (webhook, callback, fetch, import by URL): allowlisted scheme and host, no loopback or private addresses, redirects not followed into them (SSRF).",
+        "Downloads and sendFile with a user path; static file servers with a root above the intended folder.",
+        "Temporary files with fixed names in /tmp, or created then opened by path (TOCTOU); world-readable modes.",
+        "Uploads: size limit, content type checked by content not by name, stored outside the web root, under a generated name."
+      ],
+      "counts": "A lower-trust party reads or writes a file outside the intended folder, or makes the server fetch an internal address, with a concrete result.",
+      "hardening": "A check that exists in another form (containment by chroot or a sandbox you read), a missing limit without a reachable effect.",
+      "patterns": [
+        {
+          "name": "path built from a request value",
+          "langs": [
+            "py"
+          ],
+          "needle": "request",
+          "regex": "(os\\.path\\.join|open|Path|send_file|send_from_directory)\\s*\\([^)]*request\\.(args|form|json|files|values|data|path|view_args)|\\.filename\\b"
+        },
+        {
+          "name": "archive extracted without a check",
+          "langs": [
+            "py"
+          ],
+          "needle": "extract",
+          "regex": "\\.extractall\\s*\\((?![^)]*filter)|(zip|tar|archive|zf|tf|z|t|bundle)\\w*\\.extract\\s*\\("
+        },
+        {
+          "name": "outbound request to a variable URL",
+          "langs": [
+            "py"
+          ],
+          "needle": "(",
+          "regex": "\\b(requests\\.(get|post|put|delete|head|request)|urlopen|httpx\\.(get|post)|aiohttp\\.ClientSession\\(\\)\\.get)\\s*\\(\\s*[a-zA-Z_f][\\w.\\[\\]\"']*\\s*[,)]"
+        },
+        {
+          "name": "verify disabled",
+          "langs": [
+            "py"
+          ],
+          "needle": "verify",
+          "regex": "verify\\s*=\\s*False"
+        },
+        {
+          "name": "path built from a request value",
+          "langs": [
+            "js"
+          ],
+          "needle": "req.",
+          "regex": "(path\\.(join|resolve)|readFile(Sync)?|writeFile(Sync)?|createReadStream|sendFile|download|unlink(Sync)?)\\s*\\([^)]*req\\.(params|query|body|path|url)"
+        },
+        {
+          "name": "outbound request to a variable URL",
+          "langs": [
+            "js"
+          ],
+          "needle": "(",
+          "regex": "\\b(fetch|axios(\\.(get|post|put|delete))?|got|request|http\\.get|https\\.get|needle|superagent\\.get)\\s*\\(\\s*(req\\.|[a-zA-Z_$][\\w.$]*(url|Url|URL|href|target|callback|webhook)\\w*\\s*[,)])"
+        },
+        {
+          "name": "TLS verification disabled",
+          "langs": [
+            "js"
+          ],
+          "needle": "reject",
+          "regex": "rejectUnauthorized\\s*:\\s*false|NODE_TLS_REJECT_UNAUTHORIZED\\W*0"
+        },
+        {
+          "name": "path built from a request value",
+          "langs": [
+            "go"
+          ],
+          "needle": "(",
+          "regex": "(filepath\\.Join|os\\.(Open|ReadFile|Create|Remove)|http\\.ServeFile|ioutil\\.ReadFile)\\s*\\([^)]*(r\\.(URL|Form|FormValue|PathValue|Header)|c\\.(Param|Query|PostForm)|mux\\.Vars|chi\\.URLParam|vars\\[)"
+        },
+        {
+          "name": "outbound request to a variable URL",
+          "langs": [
+            "go"
+          ],
+          "needle": "http.",
+          "regex": "http\\.(Get|Post|Head|NewRequest(WithContext)?)\\s*\\(\\s*([a-zA-Z_][\\w.]*\\s*[,)]|ctx,\\s*[\"']\\w+[\"'],\\s*[a-zA-Z_][\\w.]*\\s*,)"
+        },
+        {
+          "name": "TLS verification disabled",
+          "langs": [
+            "go"
+          ],
+          "needle": "Insecure",
+          "regex": "InsecureSkipVerify\\s*:\\s*true"
+        },
+        {
+          "name": "path joined with request data",
+          "langs": [
+            "rs"
+          ],
+          "needle": "join",
+          "regex": "\\.join\\s*\\(\\s*&?\\s*(req|request|params|query|form|body|payload|user|input|upload|filename|file_name|client)(_\\w+)?\\b"
+        },
+        {
+          "name": "TLS verification disabled",
+          "langs": [
+            "rs"
+          ],
+          "needle": "danger",
+          "regex": "\\.join\\s*\\(\\s*&?\\s*(req|request|params|query|form|body|payload|user|input|upload|filename|file_name|client)(_\\w+)?\\b"
+        },
+        {
+          "name": "path from a request parameter",
+          "langs": [
+            "java"
+          ],
+          "needle": "new File",
+          "regex": "new\\s+File\\s*\\([^)]*(request\\.getParameter|@PathVariable|@RequestParam|getHeader)|Paths\\.get\\s*\\([^)]*request\\.getParameter"
+        },
+        {
+          "name": "TLS verification disabled",
+          "langs": [
+            "java"
+          ],
+          "needle": "Trust",
+          "regex": "TrustAllCerts|ALLOW_ALL_HOSTNAME_VERIFIER|checkServerTrusted\\s*\\([^)]*\\)\\s*\\{\\s*\\}"
+        },
+        {
+          "name": "path or URL from params",
+          "langs": [
+            "rb"
+          ],
+          "needle": "params",
+          "regex": "(File\\.(open|read|write|join|delete)|send_file|open|URI\\.open|Net::HTTP\\.get)\\s*\\(?[^)]*params\\["
+        },
+        {
+          "name": "path or URL from a request value",
+          "langs": [
+            "php"
+          ],
+          "needle": "$_",
+          "regex": "(include|require|include_once|require_once|file_get_contents|fopen|readfile|unlink|move_uploaded_file|curl_setopt)\\s*\\(?[^;]*\\$_(GET|POST|REQUEST|FILES)"
+        },
+        {
+          "name": "fixed temp file name",
+          "langs": [
+            "any"
+          ],
+          "needle": "/tmp/",
+          "regex": "[\"']/tmp/[\\w.-]+[\"']"
+        }
+      ]
+    },
+    {
+      "id": "crypto-secrets",
+      "name": "Cryptography, randomness and secret handling",
+      "applies": {
+        "content": [
+          "(?i)\\b(hashlib|bcrypt|argon2|scrypt|pbkdf2|hmac|crypto\\.|Cipher|AES|RSA|jwt|jsonwebtoken|jose|md5|sha1|random\\.|Math\\.random|rand\\.|SecureRandom|secrets\\.|token_hex|randomBytes)\\b"
+        ]
+      },
+      "invariant": "Security values come from a cryptographic random source, passwords are hashed with a slow hash, secrets are compared in constant time, and failures never fall back to no protection.",
+      "look": [
+        "Tokens, session ids, reset codes, nonces, IVs made with random/Math.random/rand.Intn instead of secrets/crypto.randomBytes/crypto/rand/SecureRandom.",
+        "Passwords hashed with md5, sha1 or sha256 (fast hashes) or stored plain; API keys compared with == instead of a constant-time compare.",
+        "AES in ECB mode, a static or reused IV or nonce, encryption without authentication (no GCM/HMAC), a key derived from a password without a KDF.",
+        "A secret read from code or a default value when the environment variable is missing (SECRET_KEY = os.environ.get('SECRET_KEY', 'dev')).",
+        "What happens when a crypto operation fails: does the error path skip verification or return success?",
+        "Secrets in logs, error messages, URLs (query strings), responses, or client bundles."
+      ],
+      "counts": "A token or key a lower-trust party can predict, forge or read; a password store a leaked database would reveal; a verification an attacker can skip.",
+      "hardening": "A fast hash of a non-secret, a weak random for a non-security value (a display id, a shuffle), a default secret used only in tests you read.",
+      "patterns": [
+        {
+          "name": "weak random for a token",
+          "langs": [
+            "py"
+          ],
+          "needle": "random",
+          "regex": "\\brandom\\.(random|randint|choice|choices|getrandbits|randrange|shuffle)\\s*\\([^\\n]*(token|secret|key|nonce|salt|session|password|otp|code|csrf|reset)|(token|secret|nonce|salt|session|otp|reset)\\w*\\s*=\\s*[^\\n]*\\brandom\\.(random|randint|choice|choices|getrandbits|randrange)"
+        },
+        {
+          "name": "fast hash of a password",
+          "langs": [
+            "py"
+          ],
+          "needle": "hashlib",
+          "regex": "hashlib\\.(md5|sha1|sha224|sha256|sha512)\\s*\\([^\\n]*(password|passwd|pwd)"
+        },
+        {
+          "name": "default secret value",
+          "langs": [
+            "py"
+          ],
+          "needle": "SECRET",
+          "regex": "(?i)(secret_key|secret|jwt_secret|signing_key|api_key)\\w*\\s*=\\s*os\\.(environ\\.get|getenv)\\s*\\([^,)]+,\\s*[\"'][^\"']+[\"']\\s*\\)"
+        },
+        {
+          "name": "ECB mode or a static IV",
+          "langs": [
+            "any"
+          ],
+          "needle": "ECB",
+          "regex": "(?i)\\b(MODE_ECB|AES/ECB|aes-\\d+-ecb|ECBMode|cipher\\.MODE_ECB|modes\\.ECB)\\b"
+        },
+        {
+          "name": "Math.random for a token",
+          "langs": [
+            "js"
+          ],
+          "needle": "Math.random",
+          "regex": "(token|secret|nonce|salt|session|otp|code|reset|key|id)\\w*\\s*[:=][^\\n]*Math\\.random\\s*\\(|Math\\.random\\s*\\(\\)[^\\n]*(toString\\(36\\)|token|secret|nonce)"
+        },
+        {
+          "name": "fast hash of a password",
+          "langs": [
+            "js"
+          ],
+          "needle": "createHash",
+          "regex": "createHash\\s*\\(\\s*[\"'](md5|sha1|sha256|sha512)[\"']\\s*\\)[^\\n]*(password|passwd|pwd)"
+        },
+        {
+          "name": "JWT without verification",
+          "langs": [
+            "js"
+          ],
+          "needle": "jwt",
+          "regex": "jwt\\.decode\\s*\\(|algorithms?\\s*:\\s*\\[?\\s*[\"']none[\"']|ignoreExpiration\\s*:\\s*true|jwt\\.verify\\s*\\([^)]*,\\s*(null|undefined|\"\"|'')\\s*[,)]"
+        },
+        {
+          "name": "JWT without verification",
+          "langs": [
+            "py"
+          ],
+          "needle": "jwt",
+          "regex": "jwt\\.decode\\s*\\([^)]*(verify\\s*=\\s*False|verify_signature[\"']?\\s*:\\s*False|options\\s*=\\s*\\{[^}]*False)|algorithms\\s*=\\s*\\[[^\\]]*[\"']none[\"']"
+        },
+        {
+          "name": "math/rand for a token",
+          "langs": [
+            "go"
+          ],
+          "needle": "rand.",
+          "regex": "\\brand\\.(Int|Intn|Int63|Read|Perm|Seed)\\s*\\([^\\n]*(token|secret|key|nonce|salt|session|otp|code)|(token|secret|nonce|salt|session|otp|key)\\w*\\s*:?=\\s*[^\\n]*\\brand\\.(Int|Intn|Int63|Read)\\b"
+        },
+        {
+          "name": "non-constant-time compare of a secret",
+          "langs": [
+            "any"
+          ],
+          "needle": "==",
+          "regex": "(?i)\\b(token|hmac|secret|api_key|apikey|password_hash|otp)\\w*\\s*(==|!=|===|!==)\\s*[a-zA-Z_(]|[a-zA-Z_)]\\s*(==|!=|===|!==)\\s*(expected_?|provided_?|given_?)?(token|hmac|secret|api_key|apikey|otp)\\b"
+        },
+        {
+          "name": "java.util.Random for a token",
+          "langs": [
+            "java"
+          ],
+          "needle": "Random",
+          "regex": "new\\s+Random\\s*\\(\\s*\\)[^\\n]*(token|secret|key|nonce|salt|session|otp|code)|(token|secret|nonce|salt|otp)\\w*\\s*=\\s*[^\\n]*new\\s+Random\\s*\\("
+        },
+        {
+          "name": "MD5 or SHA-1 for a password",
+          "langs": [
+            "java",
+            "cs",
+            "php",
+            "rb",
+            "c"
+          ],
+          "needle": "D5",
+          "regex": "(?i)(MessageDigest\\.getInstance\\s*\\(\\s*\"(MD5|SHA-?1)\"|MD5\\.Create|SHA1\\.Create|\\bmd5\\s*\\(|Digest::MD5|Digest::SHA1|MD5_Init|SHA1_Init)[^\\n]*(password|passwd|pwd)|(password|passwd|pwd)[^\\n]*(MessageDigest\\.getInstance\\s*\\(\\s*\"(MD5|SHA-?1)\"|\\bmd5\\s*\\(|Digest::MD5|Digest::SHA1)"
+        },
+        {
+          "name": "secret written to a log or URL",
+          "langs": [
+            "any"
+          ],
+          "needle": "o",
+          "regex": "(?i)\\b(log(ger)?\\.(info|debug|warn|warning|error)|console\\.log|print|println|printf|fmt\\.Print\\w*)\\s*\\([^\\n]*(\\.|\\[[\"']|\\b)(password|passwd|secret_key|secret|token|api_key|apikey|access_token|authorization)\\w*\\s*[,)}\\]]"
+        }
+      ]
+    },
+    {
+      "id": "business-logic",
+      "name": "Business logic, state and quantities",
+      "applies": {
+        "content": [
+          "(?i)\\b(price|amount|quantity|qty|balance|credits?|coupon|discount|invoice|payment|checkout|refund|transfer|approve|approval|subscription|wallet)\\b"
+        ]
+      },
+      "invariant": "Every state transition, quantity and price is decided by the server from trusted data, in one atomic step, and cannot be replayed, skipped or reversed outside the intended flow.",
+      "look": [
+        "Numbers from the request (quantity, amount, price, discount, page size): negative, zero, huge, fractional, string typed; where are they bounded, and where is the total computed?",
+        "State machines (order, approval, subscription, verification): can a step be skipped by calling a later endpoint, repeated (replay of a completed flow), or reversed (cancel after shipping)?",
+        "Check-then-act without a transaction or lock (balance check then debit; coupon valid then redeem): two concurrent requests.",
+        "Expiry and time: comparisons against now, clock source, time zones, exact boundary; tokens or coupons after expiry.",
+        "Defaults when configuration, a flag or a dependency is missing: which way does it fail (open or closed)?",
+        "Data trusted because it was validated on the way in: another code path (import, admin, migration, plugin) writes the same record."
+      ],
+      "counts": "A caller changes an amount, skips a step, repeats a one-time action or reaches an invalid state with a concrete gain or a loss for someone else.",
+      "hardening": "A missing upper bound with no effect beyond the caller's own data; a race you cannot make concrete in code.",
+      "patterns": [
+        {
+          "name": "quantity or amount read from the request",
+          "langs": [
+            "any"
+          ],
+          "needle": "r",
+          "regex": "(?i)(req(uest)?\\.(body|query|params|json|form|args|data|POST|GET)\\s*(\\[|\\.|\\.get\\()\\s*[\"']?(quantity|qty|amount|price|total|discount|percent|credits?|balance|count|limit|page_size|per_page)\\b|params\\[:(quantity|amount|price|total|discount)\\])"
+        },
+        {
+          "name": "parsed number without a bound",
+          "langs": [
+            "any"
+          ],
+          "needle": "(",
+          "regex": "(?i)\\b(int|float|parseInt|parseFloat|Number|strconv\\.Atoi|strconv\\.ParseInt|Integer\\.parseInt|Double\\.parseDouble|to_i|to_f|intval|floatval)\\s*\\(\\s*(req(uest)?\\.|params\\[|r\\.(Form|URL)|c\\.(Query|Param|PostForm)|\\$_(GET|POST|REQUEST))"
+        },
+        {
+          "name": "status set from the request",
+          "langs": [
+            "any"
+          ],
+          "needle": "status",
+          "regex": "(?i)\\.(status|state)\\s*=\\s*(req(uest)?\\.|params\\[|data\\[|body\\[|payload\\[)|[\"'](status|state)[\"']\\s*:\\s*req(uest)?\\."
+        }
+      ]
+    },
+    {
+      "id": "data-exposure",
+      "name": "Data exposure, isolation and feature abuse",
+      "applies": {
+        "content": [
+          "(?i)\\b(tenant_id|tenantId|org_id|orgId|organization_id|account_id|owner_id|user_id|userId|to_dict|model_to_dict|as_dict|jsonify|toJSON|res\\.json|c\\.JSON)\\b"
+        ]
+      },
+      "invariant": "Every read, list, search, export and derived copy is scoped to the caller's tenant and ownership, and returns only the fields the caller may see.",
+      "look": [
+        "Queries that look a record up by id without the tenant or owner in the WHERE clause; list and count endpoints without a scope; raw or unscoped query clients.",
+        "Serializers that return whole records (to_dict, model_to_dict, jsonify(user), select *): password hashes, tokens, internal flags, other users' fields.",
+        "Export, backup, report and bulk download: do they apply per-item authorization after selection? Deleted, draft or private items included?",
+        "Import and restore: can they overwrite records, set owner fields, create records in another tenant?",
+        "Search, filter, sort and error messages as oracles: do they reveal existence or values of items the caller cannot read (different message, count or ordering)?",
+        "Caches, indexes, thumbnails, feeds and logs: keyed without the tenant, or not invalidated when access changes."
+      ],
+      "counts": "A caller reads or infers another tenant's or user's data, or a field they may not see, through any of these paths.",
+      "hardening": "A field that is not sensitive, an oracle that only reveals public existence, a scope enforced in a layer you read (row-level security, a default scope).",
+      "patterns": [
+        {
+          "name": "whole record serialized",
+          "langs": [
+            "any"
+          ],
+          "needle": "(",
+          "regex": "(?i)\\b(to_dict|model_to_dict|as_dict|jsonify|json\\.dumps|serialize|to_json|toJSON|res\\.json|c\\.JSON|JSON\\.stringify)\\s*\\(\\s*(user|users|account|accounts|member|members|customer|customers|profile|profiles|row|rows|record|records)\\w*\\s*[,)]"
+        },
+        {
+          "name": "lookup by id alone",
+          "langs": [
+            "any"
+          ],
+          "needle": "id",
+          "regex": "(?i)\\b(find_by_id|findById|findOne|find_one|get_object_or_404|objects\\.get|first\\(\\)|First\\(|find\\(|get\\()\\s*\\(?[^\\n]*\\b(id|pk|_id)\\s*[=:]\\s*(req|params|request|args|body|query|c\\.Param|mux\\.Vars|r\\.URL)"
+        },
+        {
+          "name": "select star",
+          "langs": [
+            "any"
+          ],
+          "needle": "*",
+          "regex": "(?i)[\"']\\s*select\\s+\\*\\s+from\\s+\\w*(user|account|member|customer|credential|secret|token|key)\\w*"
+        },
+        {
+          "name": "unscoped query client",
+          "langs": [
+            "any"
+          ],
+          "needle": "(",
+          "regex": "\\b(unscoped|withoutGlobalScope|withoutGlobalScopes|ignoreQueryFilters|IgnoreQueryFilters|raw_sql|\\.raw\\(|allowUnsafeQuery)\\b"
+        },
+        {
+          "name": "export, backup or restore route",
+          "langs": [
+            "any"
+          ],
+          "needle": "/",
+          "regex": "(?i)[\"'`](/[\\w/:{}-]*)?/(export|backup|dump|restore|import|download|bulk|report)s?[\"'`/]"
+        }
+      ]
+    }
+  ]
+}

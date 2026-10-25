@@ -64,6 +64,7 @@ pub struct Cmd {
     /// Run in a new session without a controlling terminal, so ssh/credential helpers can never
     /// open `/dev/tty` and block waiting for a password.
     detach: bool,
+    read_sandbox: Option<PathBuf>,
 }
 
 impl Cmd {
@@ -76,6 +77,7 @@ impl Cmd {
             stdin: None,
             timeout: None,
             detach: false,
+            read_sandbox: None,
         }
     }
 
@@ -123,7 +125,54 @@ impl Cmd {
     /// exit status is not (callers decide).
     pub async fn output(self) -> Result<Output, RpcError> {
         let display = self.display();
-        let mut command = Command::new(&self.program);
+        let mut command = if let Some(scratch) = &self.read_sandbox {
+            let resolved = std::fs::canonicalize(scratch).map_err(|error| RpcError::internal(format!("cannot resolve Git inspection scratch: {error}")))?;
+            if &resolved != scratch {
+                return Err(RpcError::new(codes::CONTRACT_VIOLATION, "Git inspection scratch was redirected; restore the plugin data directory in the app"));
+            }
+            if !Path::new("/usr/bin/sandbox-exec").is_file() {
+                return Err(RpcError::new(
+                    codes::UNAVAILABLE,
+                    "Git inspection needs the macOS sandbox; open this repository in the app on macOS",
+                ));
+            }
+            let quote = |path: &Path| -> Result<String, RpcError> {
+                let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                let text = path
+                    .to_str()
+                    .ok_or_else(|| RpcError::invalid_params("Git sandbox path is not UTF-8"))?;
+                if text.chars().any(char::is_control) {
+                    return Err(RpcError::invalid_params(
+                        "Git sandbox path contains control characters",
+                    ));
+                }
+                Ok(format!(
+                    "\"{}\"",
+                    text.replace('\\', "\\\\").replace('"', "\\\"")
+                ))
+            };
+            let home = std::env::var_os("CORTEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_default()
+                        .join(".cortexcode")
+                });
+            let home = home.canonicalize().unwrap_or(home);
+            let profile = format!(
+                "(version 1)(allow default)\n(deny network*)\n(deny process-info*)\n(allow process-info* (target self))\n(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n(deny file-read* (subpath {}) (subpath {}))\n(deny file-write* (require-not (require-any (subpath {}) (subpath \"/dev\"))))\n",
+                quote(&home.join("run"))?,
+                quote(&home.join("plugins-data/ui/electron"))?,
+                quote(scratch)?
+            );
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command.env("TMPDIR", scratch).env("TMP", scratch).env("TEMP", scratch);
+            command.args(["-p", &profile]).arg(&self.program);
+            command
+        } else {
+            Command::new(&self.program)
+        };
         command.args(&self.args).current_dir(&self.cwd);
         for var in LOCATION_VARS {
             command.env_remove(var);
@@ -218,16 +267,39 @@ pub fn command_error(display: &str, output: &Output) -> RpcError {
 #[derive(Debug, Clone)]
 pub struct Git {
     pub exe: PathBuf,
+    read_sandbox: Option<PathBuf>,
 }
 
 impl Git {
     pub fn new(exe: PathBuf) -> Self {
-        Self { exe }
+        Self {
+            exe,
+            read_sandbox: None,
+        }
     }
 
     /// A git command running in `cwd` with our configuration overrides.
     pub fn cmd(&self, cwd: &Path) -> Cmd {
-        Cmd::new(&self.exe, cwd).args(["-c", "core.quotePath=false", "-c", "color.ui=false", "-c", "core.pager=cat"])
+        let mut command = Cmd::new(&self.exe, cwd).args([
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+        command.read_sandbox = self.read_sandbox.clone();
+        command
+    }
+
+    /// Read-side Git may invoke repository-configured clean/process filters for its scratch index.
+    pub fn confined(&self, scratch: &Path) -> Self {
+        Self {
+            exe: self.exe.clone(),
+            read_sandbox: Some(scratch.to_path_buf()),
+        }
     }
 
     /// Run `git <args>` in `cwd`, requiring success.

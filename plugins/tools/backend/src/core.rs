@@ -126,6 +126,7 @@ pub struct Core {
 /// How a session's commands run: its sandbox, its Python environment and the writes approved for it.
 pub struct Runtime {
     pub sandbox: crate::sandbox::Sandbox,
+    pub command_access: cc_protocol::contracts::frame::CommandAccessResult,
     pub venv: Option<crate::pyenv::PyEnv>,
     pub grants: Vec<PathBuf>,
     /// Why there is no Python environment (creation failed), for the tool output.
@@ -161,17 +162,23 @@ fn find_program(name: &str, configured: Option<&str>, env: &str) -> Option<PathB
     beside.is_file().then_some(beside)
 }
 
-/// Put `target` on the shells' PATH as `<bin_dir>/<name>` (a symlink, created beside and renamed
-/// over, so it is never missing for a running shell).
+/// Put `target` on the shells' PATH as `<bin_dir>/<name>`: a copy, so it keeps working when the
+/// app bundle it came from moves or a build folder is cleaned (written beside and renamed over, so
+/// it is never missing for a running shell). An identical copy is left as it is.
 fn link_program(bin_dir: &Path, name: &str, target: &Path) {
     let _ = std::fs::create_dir_all(bin_dir);
-    let link = bin_dir.join(name);
-    if std::fs::read_link(&link).ok().as_deref() == Some(target) {
+    let place = bin_dir.join(name);
+    let Ok(wanted) = std::fs::read(target) else { return };
+    if std::fs::symlink_metadata(&place).is_ok_and(|meta| meta.is_file()) && std::fs::read(&place).is_ok_and(|have| have == wanted) {
         return;
     }
     let temp = bin_dir.join(format!(".{name}-{}", std::process::id()));
     let _ = std::fs::remove_file(&temp);
-    if std::os::unix::fs::symlink(target, &temp).is_ok() && std::fs::rename(&temp, &link).is_err() {
+    let written = std::fs::write(&temp, &wanted).and_then(|()| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+    });
+    if written.is_err() || std::fs::rename(&temp, &place).is_err() {
         let _ = std::fs::remove_file(&temp);
     }
 }
@@ -245,7 +252,13 @@ impl Core {
 
     /// The sandbox and Python environment for commands of `session` in `workspace`. With
     /// `python_env`, the project's venv is used, or the automatic one is created on first use.
-    pub async fn runtime(&self, session: &str, workspace: &Path, python_env: bool) -> Result<Runtime, String> {
+    pub async fn runtime(
+        &self,
+        host: &dyn crate::host::Host,
+        session: &str,
+        workspace: &Path,
+        python_env: bool,
+    ) -> Result<Runtime, String> {
         if !self.sandbox.available() {
             return Err(format!(
                 "commands are not run: the write sandbox needs {}, which this system does not have. Work with read and edit.",
@@ -269,12 +282,22 @@ impl Core {
                 }
             }
         };
+        let access = host
+            .call(
+                cc_protocol::contracts::frame::methods::COMMAND_ACCESS,
+                serde_json::json!({"session_id": session, "workspace": workspace}),
+            )
+            .await
+            .map_err(|error| format!("cannot obtain command access: {}", error.message))?;
+        let command_access: cc_protocol::contracts::frame::CommandAccessResult =
+            serde_json::from_value(access).map_err(|error| format!("invalid command access: {error}"))?;
+        self.sandbox.set_socket(Path::new(&command_access.socket));
         let grants = crate::sandbox::grants(&self.approved(session));
         let sandbox = self
             .sandbox
             .sandbox(workspace, venv.as_ref().map(|venv| venv.path()), &grants)
             .ok_or_else(|| "the write sandbox is unavailable".to_owned())?;
-        Ok(Runtime { sandbox, venv, grants, venv_error })
+        Ok(Runtime { sandbox, command_access, venv, grants, venv_error })
     }
 
     /// A deleted session: its shell, background jobs, approvals and, when it worked in a workspace

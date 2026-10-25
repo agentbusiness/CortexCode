@@ -2,8 +2,7 @@
 //! Mac (bind-mounted into the container), so the code graph, edits, language servers and the editor
 //! work on them as on any project; commands (the `run` tool, terminals, verifiers) run inside the
 //! container, with its installed environment. A project gets a container from its
-//! `.cortex/container.toml`, its `.devcontainer/devcontainer.json`, or an explicit `attach`
-//! (benchmarks: SWE-bench, Terminal-Bench). A project may be one container (`docker run`), a Docker
+//! `.cortex/container.toml`, its `.devcontainer/devcontainer.json`, or an explicit `attach`. A project may be one container (`docker run`), a Docker
 //! Compose project (commands run in one of its services), or a devcontainer with features (created
 //! by the Dev Containers CLI).
 //!
@@ -69,7 +68,7 @@ pub mod kinds {
 pub struct AttachParams {
     /// The project root on the Mac.
     pub root: String,
-    /// Image to run (`swebench/sweb.eval.x86_64.django__django-11099:latest`). With `build`, the tag
+    /// Image to run (`postgres:16-alpine`). With `build`, the tag
     /// the built image gets.
     #[serde(default)]
     pub image: Option<String>,
@@ -80,8 +79,8 @@ pub struct AttachParams {
     /// the root is mounted in `service`).
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Copy the image's own `workdir` content out to `root` before mounting (the repository a
-    /// benchmark image ships), so the files on the Mac are exactly the image's.
+    /// Copy the image's own `workdir` content out to `root` before mounting (the repository an
+    /// image ships), so the files on the Mac are exactly the image's.
     #[serde(default)]
     pub seed_from_image: bool,
     /// `linux/amd64` | `linux/arm64`; default: the image's own.

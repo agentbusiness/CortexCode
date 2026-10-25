@@ -1,0 +1,19 @@
+[package]
+name = "cc-model-kit"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "Engine-neutral model parsing, repetition, progress and chat templating."
+
+[workspace]
+
+[dependencies]
+cc-protocol = { path = "../protocol" }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+minijinja = { version = "2.17.0", features = ["json", "preserve_order", "loop_controls"] }
+minijinja-contrib = { version = "2.17.0", features = ["pycompat"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+uuid = { version = "1.23", features = ["v4"] }

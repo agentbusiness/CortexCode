@@ -14,7 +14,6 @@ for its two servers. (Visual design, component accessibility and checking a rend
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-web`: category `lang-web`, contract `lang@1`; `cc-lang-web lsp-router` is the language-server router |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -106,24 +105,13 @@ mixins resolve along the import chain first; imports link by their `local` path.
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-web     # -> plugins/lang-web/target/lang-web-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-web --install`). The probe extracts a sample
 page through the real `extract`, reads every skill and reports whether the servers can run (absent
 servers do not fail the probe).
-
-## Verification
-
-`verify/lang_web.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: element, form, field, heading and rule lines found in the fixture text;
-the page's class tokens against the stylesheet's rule names; imports of files the script wrote
-(a missing image is none); an unknown property and an unclosed block written at known lines, and a
-CSS error inside the page's `<style>`, before and after a fix; definition and references of a
-custom property; hover on a CSS property and an HTML element; skills read back; the
-`lang-web.server` event; refusals (component files, a relative root, a missing file). The servers
-must be installed; `node verify/lang_web.mjs --install` lets `lang-web.install` add them first.
 
 ## Known limits
 

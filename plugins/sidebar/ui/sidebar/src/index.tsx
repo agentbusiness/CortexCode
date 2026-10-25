@@ -470,7 +470,7 @@ function SessionRow({ session, selected, onSelect, onDelete, now, notice }: {
     <li className={['cx-row', selected ? 'sel' : '', needsYou(session.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ')}
       data-session={session.id} data-status={session.status} data-notice={notice?.kind}>
       <button type="button" onClick={onSelect} aria-current={selected ? 'true' : undefined} title={notice ? notice.title : undefined}>
-        <div className="t"><VerdictTitle title={title} /></div>
+        <div className="t">{title}</div>
         <div className="r">
           <StatePip status={session.status} />
           <span className={`ap${statusTone(session.status)}`}>{STATUS_LABEL[session.status] ?? session.status}</span>
@@ -607,16 +607,3 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
 }
 
 export default definePlugin({ slot: 'workbench.sidebar@1', component: Sidebar });
-
-/** A title whose last part is a benchmark verdict the harness set (` ✓ …` passed, ` ✗ …` failed):
- * the verdict in green or red after the name. */
-function VerdictTitle({ title }: { title: string }) {
-  const match = /^(.*?)\s+([✓✗])(.*)$/.exec(title);
-  if (!match) return <>{title}</>;
-  const passed = match[2] === '✓';
-  return (
-    <>
-      {match[1]} <span className={passed ? 'cx-verdict-pass' : 'cx-verdict-fail'}>{match[2]}{match[3]}</span>
-    </>
-  );
-}

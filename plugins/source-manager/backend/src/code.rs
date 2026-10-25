@@ -364,6 +364,47 @@ pub fn draft(repo: &Repository, id: &str, files: &[String], text: &str) -> Resul
     Ok(oid)
 }
 
+/// Give the reviewed draft its final message without sampling the mutable work tree again.
+pub fn describe_draft(repo: &Repository, id: &str, draft: Oid, text: &str) -> Result<Oid> {
+    let draft = repo.find_commit(draft).map_err(err)?;
+    let oid = draft.amend(None, None, None, None, Some(text), None).map_err(err)?;
+    repo.reference(&format!("{DRAFTS}{id}"), oid, true, "draft description").map_err(err)?;
+    Ok(oid)
+}
+
+/// Materialize every file of one commit, including shared path dependencies, into a new folder.
+/// No work-tree paths or symlinks are reused, so edits made during a build cannot change it.
+pub fn export_commit(repo: &Repository, commit: Oid, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn export(repo: &Repository, tree: &Tree<'_>, dir: &Path) -> Result<()> {
+        for entry in tree {
+            let name = entry.name().map_err(err)?;
+            if name == "." || name == ".." || name.contains('/') || name == ".git" {
+                return Err(format!("unsupported approved source path: {name}"));
+            }
+            let path = dir.join(name);
+            match entry.filemode() {
+                0o040000 => {
+                    std::fs::create_dir(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+                    export(repo, &repo.find_tree(entry.id()).map_err(err)?, &path)?;
+                }
+                mode @ (0o100644 | 0o100755) => {
+                    let blob = repo.find_blob(entry.id()).map_err(err)?;
+                    std::fs::write(&path, blob.content()).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 }))
+                        .map_err(|e| format!("cannot set permissions on {}: {e}", path.display()))?;
+                }
+                _ => return Err(format!("{} is a symlink or submodule; approved builds require self-contained source", path.display())),
+            }
+        }
+        Ok(())
+    }
+    // create_dir deliberately refuses an existing directory instead of trusting its contents.
+    std::fs::create_dir(destination).map_err(|e| format!("cannot create {}: {e}", destination.display()))?;
+    let tree = repo.find_commit(commit).and_then(|commit| commit.tree()).map_err(err)?;
+    export(repo, &tree, destination)
+}
+
 fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     let executable = std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0);

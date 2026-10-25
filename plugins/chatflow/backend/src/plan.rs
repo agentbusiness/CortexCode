@@ -264,7 +264,8 @@ pub struct Known<'a> {
 /// written; at most `max_tasks`; `covers` keeps known requirement ids, `skills` catalog skills.
 /// Tasks that touch exactly the same files and symbols are one part of the work, not several
 /// (a split is for parts the request names, and those touch different code): each later such task
-/// joins the first one (its brief, checks, requirements and skills), and the rest are renumbered.
+/// joins the first one when its prerequisites can still run first (its brief, dependencies,
+/// checks, requirements and skills are kept), and the rest are renumbered.
 /// A task that touches nothing joins the task before it.
 pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     let key = |task: &PlanTask| {
@@ -280,11 +281,17 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
         // A task that touches nothing changes no code (only runs or reviews): it joins the task
         // before it, whose own checks run its cases.
         let target = if touches.is_empty() { merged.len().checked_sub(1) } else { merged.iter().position(|kept| key(kept) == touches) };
+        // Moving this task into an earlier one must not move its work before a prerequisite.
+        // A dependency already folded into the target is satisfied inside the combined task.
+        let target = target.filter(|index| task.depends_on.iter().all(|dependency| {
+            renumber.get(dependency).is_some_and(|n| *n <= merged[*index].n)
+        }));
         if let Some(first) = target.and_then(|index| merged.get_mut(index)) {
             renumber.insert(task.n, first.n);
             if !task.brief.trim().is_empty() {
                 first.brief = format!("{}\n{}", first.brief.trim_end(), task.brief.trim());
             }
+            first.depends_on.extend(task.depends_on);
             for (into, from) in [(&mut first.rules, task.rules), (&mut first.checks, task.checks), (&mut first.covers, task.covers), (&mut first.skills, task.skills)] {
                 for item in from {
                     if !into.contains(&item) {
@@ -300,6 +307,7 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     }
     for task in &mut merged {
         let mut depends: Vec<u32> = task.depends_on.iter().filter_map(|d| renumber.get(d).copied()).filter(|d| *d < task.n).collect();
+        depends.sort_unstable();
         depends.dedup();
         task.depends_on = depends;
     }

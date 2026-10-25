@@ -168,6 +168,12 @@ fn window_json(window: &Window) -> Value {
     })
 }
 
+/// The controller never resumes after Stop; a later explicit operation owns a separate scope.
+struct AgentCancellations {
+    controller: CancellationToken,
+    manual: Vec<CancellationToken>,
+}
+
 struct Inner {
     /// Prompts, texts and tunables (reloaded on change).
     data: Arc<Data>,
@@ -184,8 +190,8 @@ struct Inner {
     opened: Mutex<std::collections::HashSet<String>>,
     /// Effort per task chosen by the planner (used when an agent's run starts).
     efforts: Mutex<HashMap<String, String>>,
-    /// Runs this instance started, by agent.
-    running: Mutex<HashMap<AgentKey, CancellationToken>>,
+    /// Stop scopes, shared by an agent's controller and explicit merge/verify calls.
+    cancellations: Mutex<HashMap<AgentKey, AgentCancellations>>,
     /// One merge into a project at a time.
     merge: tokio::sync::Mutex<()>,
     tasks: tokio_util::task::TaskTracker,
@@ -213,7 +219,7 @@ impl Agents {
                 adjustments: Mutex::new(VecDeque::new()),
                 opened: Mutex::new(std::collections::HashSet::new()),
                 efforts: Mutex::new(HashMap::new()),
-                running: Mutex::new(HashMap::new()),
+                cancellations: Mutex::new(HashMap::new()),
                 merge: tokio::sync::Mutex::new(()),
                 tasks: tokio_util::task::TaskTracker::new(),
                 park: CancellationToken::new(),
@@ -693,17 +699,50 @@ impl Agents {
         }
     }
 
-    fn start(&self, ctx: Ctx, key: AgentKey) {
+    fn cancellation(&self, key: &AgentKey) -> CancellationToken {
+        lock(&self.inner.cancellations)
+            .entry(key.clone())
+            .or_insert_with(|| AgentCancellations { controller: self.inner.park.child_token(), manual: Vec::new() })
+            .controller.clone()
+    }
+
+    /// Explicit Verify/Merge requests can recover stopped work without reviving its controller.
+    fn manual_cancellation(&self, key: &AgentKey) -> CancellationToken {
+        let mut scopes = lock(&self.inner.cancellations);
+        let scope = scopes.entry(key.clone()).or_insert_with(|| AgentCancellations {
+            controller: self.inner.park.child_token(), manual: Vec::new(),
+        });
+        scope.manual.retain(|token| !token.is_cancelled());
         let token = self.inner.park.child_token();
-        lock(&self.inner.running).insert(key.clone(), token.clone());
+        scope.manual.push(token.clone());
+        token
+    }
+
+    fn cancel_agent(&self, key: &AgentKey) {
+        let mut scopes = lock(&self.inner.cancellations);
+        let scope = scopes.entry(key.clone()).or_insert_with(|| AgentCancellations {
+            controller: self.inner.park.child_token(), manual: Vec::new(),
+        });
+        scope.controller.cancel();
+        for token in scope.manual.drain(..) {
+            token.cancel();
+        }
+    }
+
+    fn start(&self, ctx: Ctx, key: AgentKey) {
+        let token = self.cancellation(&key);
         let this = self.clone();
         self.inner.tasks.spawn(async move {
             let parked = token.clone();
             tokio::select! {
-                outcome = this.run_agent(ctx.clone(), key.clone()) => {
-                    if let Err(error) = outcome {
+                biased;
+                _ = parked.cancelled() => {},
+                outcome = this.run_agent(ctx.clone(), key.clone(), token.clone()) => {
+                    if let Err(error) = outcome
+                        && error.code != codes::CANCELLED
+                    {
                         tracing::warn!(agent = %key.name, %error, "agent run ended with an error");
-                        let host = Host::new(ctx.clone());
+                        let host = Host::with_cancel(ctx.clone(), token.clone());
                         if let Ok(mut record) = agent(&host, &key.project_id, &key.name).await
                             && record.status == "working"
                         {
@@ -719,19 +758,20 @@ impl Agents {
                         }
                     }
                 }
-                _ = parked.cancelled() => return,
             }
-            lock(&this.inner.running).remove(&key);
+            // Stopping frees the scheduler slot too; only plugin parking prevents new starts.
             let next = lock(&this.inner.scheduler).finished(&key);
-            for key in next {
-                this.start(ctx.clone(), key);
+            if !this.inner.park.is_cancelled() {
+                for key in next {
+                    this.start(ctx.clone(), key);
+                }
             }
         });
     }
 
     /// Drive one agent: its run, the merge steward, conflict hand-backs, then dependents.
-    async fn run_agent(&self, ctx: Ctx, key: AgentKey) -> Result<(), RpcError> {
-        let host = Host::new(ctx.clone());
+    async fn run_agent(&self, ctx: Ctx, key: AgentKey, cancel: CancellationToken) -> Result<(), RpcError> {
+        let host = Host::with_cancel(ctx.clone(), cancel.clone());
         loop {
             let record = agent(&host, &key.project_id, &key.name).await?;
             if record.status != "working" {
@@ -741,10 +781,10 @@ impl Agents {
                 return Err(RpcError::internal(format!("agent {} has no session or task", key.name)));
             };
             let effort = lock(&self.inner.efforts).get(&task_id).cloned().unwrap_or_else(|| "medium".into());
-            let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode).await?;
+            let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await?;
             let task = task(&host, &task_id).await?;
             match result.outcome.as_str() {
-                "done" => match self.steward(&ctx, &host, &record, &task, &result).await? {
+                "done" => match self.steward(&ctx, &host, &record, &task, &result, false).await? {
                     Stewarded::Merged => {
                         self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
                         return Ok(());
@@ -772,14 +812,25 @@ impl Agents {
 
     // ---- merge steward ----------------------------------------------------------------------
 
-    async fn steward(&self, ctx: &Ctx, host: &Host, record: &AgentRecord, task: &Task, result: &AgentRunResult) -> Result<Stewarded, RpcError> {
-        let _merging = self.inner.merge.lock().await;
+    async fn steward(&self, ctx: &Ctx, host: &Host, record: &AgentRecord, task: &Task, result: &AgentRunResult, allow_stopped: bool) -> Result<Stewarded, RpcError> {
+        let _merging = tokio::select! {
+            biased;
+            _ = host.cancelled() => return Err(RpcError::cancelled()),
+            merging = self.inner.merge.lock() => merging,
+        };
+        host.check_cancelled()?;
+        // The run's record may predate a stop while it waited for the merge steward.
+        let fresh = agent(host, &record.project_id, &record.name).await?;
+        if fresh.status == "stopped" && !allow_stopped {
+            return Err(RpcError::cancelled());
+        }
         let project = host.project_get(&record.project_id).await?;
         let Some(workspace) = record.workspace.clone() else {
             return Err(RpcError::internal(format!("agent {} has no workspace", record.name)));
         };
         let branch = workspace_branch(host, &project.id, &workspace, &record.name).await;
         let session_id = record.session_id.clone().unwrap_or_default();
+        host.check_cancelled()?;
         let outcome = merge_branch(host, &project, &workspace, &branch, &format!("{} (agent {})", task.title, record.name)).await?;
         if !outcome.ok && !outcome.blocked_by_local.is_empty() {
             // Not the agent's to resolve: the user's uncommitted edits are in the way. Nothing
@@ -831,7 +882,12 @@ impl Agents {
         if let Some(parent) = &parent {
             let _ = host.journal_append(parent, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "merged": outcome.sha, "agent": record.name})).await;
         }
-        let mut updated = record.clone();
+        host.check_cancelled()?;
+        let fresh = agent(host, &record.project_id, &record.name).await?;
+        if fresh.status == "stopped" && !allow_stopped {
+            return Err(RpcError::cancelled());
+        }
+        let mut updated = fresh;
         if report.ok {
             update_task(host, json!({"id": task.id, "status": "done", "result": format!("merged {} and verified in the project: {}", outcome.sha.clone().unwrap_or_default(), result.summary)})).await?;
             updated.status = "done".into();
@@ -872,23 +928,28 @@ impl Agents {
             let ready = task.status == "pending"
                 && task.assignee.is_none()
                 && task.depends_on.iter().all(|dependency| status.get(dependency).map(String::as_str) == Some("done"));
+            if host.check_cancelled().is_err() {
+                return;
+            }
             if ready {
-                let spawned = self
-                    .spawn(ctx.clone(), SpawnParams {
+                let spawned = tokio::select! {
+                    biased;
+                    _ = host.cancelled() => return,
+                    spawned = self.spawn(ctx.clone(), SpawnParams {
                         project_id: task.project_id.clone(),
                         task_id: task.id.clone(),
                         name: None,
                         role: None,
                         from_session: from.clone(),
                         mode: mode.to_owned(),
-                    })
-                    .await;
+                    }) => spawned,
+                };
                 if let Err(error) = spawned {
                     tracing::warn!(%error, task = %task.id, "could not start a dependent task");
                 }
             }
         }
-        if all_done {
+        if all_done && host.check_cancelled().is_ok() {
             let _ = update_task(host, json!({"id": parent_id, "status": "done", "result": "every subtask merged and verified"})).await;
             if let Some(from) = &from {
                 let _ = host.journal_append(from, kinds::NOTE, json!({"text": "Every delegated task is merged and verified.", "purpose": "delegation_done", "task_id": parent_id})).await;
@@ -902,6 +963,15 @@ impl Agents {
         let host = Host::new(ctx);
         let task = task(&host, &params.task_id).await?;
         let project = host.project_get(&task.project_id).await?;
+        let cancel = task.assignee.as_ref().map(|name| self.manual_cancellation(&AgentKey {
+            project_id: project.id.clone(), name: name.clone(),
+        }));
+        // Finishing an explicit operation releases its scope; Stop also reaches it while active.
+        let _operation = cancel.clone().map(CancellationToken::drop_guard);
+        let host = match cancel {
+            Some(cancel) => Host::with_cancel(host.ctx().clone(), cancel),
+            None => host,
+        };
         let workspace = match params.workspace.clone() {
             Some(workspace) => workspace,
             None => match &task.assignee {
@@ -933,10 +1003,13 @@ impl Agents {
     async fn merge(&self, ctx: Ctx, params: MergeParams) -> Result<MergeOutcome, RpcError> {
         let host = Host::new(ctx.clone());
         let record = agent(&host, &params.project_id, &params.agent).await?;
+        let cancel = self.manual_cancellation(&AgentKey { project_id: params.project_id.clone(), name: params.agent.clone() });
+        let _operation = cancel.clone().drop_guard();
+        let host = Host::with_cancel(ctx.clone(), cancel);
         let task_id = record.task_id.clone().ok_or_else(|| RpcError::invalid_params("the agent has no task"))?;
         let task = task(&host, &task_id).await?;
         let result = AgentRunResult { outcome: "done".into(), summary: String::new(), turns: 0, tool_calls: 0, changed_files: vec![], usage: Value::Null };
-        let outcome = self.steward(&ctx, &host, &record, &task, &result).await?;
+        let outcome = self.steward(&ctx, &host, &record, &task, &result, true).await?;
         Ok(match outcome {
             Stewarded::Merged => {
                 // A merge that waited (blocked by local edits) releases the tasks that depend on it.
@@ -965,16 +1038,17 @@ impl Agents {
 
     async fn stop(&self, ctx: Ctx, params: AgentRefParams) -> Result<Value, RpcError> {
         let host = Host::new(ctx.clone());
-        let mut record = agent(&host, &params.project_id, &params.agent).await?;
         let key = AgentKey { project_id: params.project_id.clone(), name: params.agent.clone() };
+        let mut record = agent(&host, &params.project_id, &params.agent).await?;
+        self.cancel_agent(&key);
         let was_queued = lock(&self.inner.scheduler).dequeue(&key);
         record.status = "stopped".into();
         let record = upsert(&ctx, &host, record).await?;
-        if let Some(session_id) = &record.session_id {
-            host.call(chatflow_methods::CANCEL, json!({"session_id": session_id})).await?;
-        }
         if let Some(task_id) = &record.task_id {
             update_task(&host, json!({"id": task_id, "status": "cancelled"})).await?;
+        }
+        if let Some(session_id) = &record.session_id {
+            host.call(chatflow_methods::CANCEL, json!({"session_id": session_id})).await?;
         }
         Ok(json!({"stopped": true, "was_queued": was_queued}))
     }
@@ -1177,15 +1251,26 @@ fn pick_name(taken: &BTreeSet<&str>) -> String {
 
 /// `chatflow.agent_run`, retried while the chat flow restarts (the call resumes from the journal,
 /// so repeating it is safe).
-async fn call_agent_run(host: &Host, session_id: &str, task_id: &str, effort: &str, mode: &str) -> Result<AgentRunResult, RpcError> {
+async fn call_agent_run(host: &Host, session_id: &str, task_id: &str, effort: &str, mode: &str, cancel: &CancellationToken) -> Result<AgentRunResult, RpcError> {
     let params = json!({"session_id": session_id, "task_id": task_id, "mode": mode, "options": {"effort": effort}});
     let mut delay = Duration::from_millis(250);
     loop {
-        match host.ctx().call(chatflow_methods::AGENT_RUN, params.clone()).await {
+        host.check_cancelled()?;
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(RpcError::cancelled()),
+            outcome = host.call_with(chatflow_methods::AGENT_RUN, params.clone(), host::Effect::Idempotent, Some(cancel)) => outcome,
+        };
+        match outcome {
             Ok(value) => return parse_params(value),
-            Err(error) if error.retryable || host::refused(&error) || host::interrupted(&error) || error.code == codes::CANCELLED => {
+            Err(error) if error.code == codes::CANCELLED => return Err(error),
+            Err(error) if error.retryable || host::refused(&error) || host::interrupted(&error) => {
                 tracing::info!(%error, session_id, "agent run interrupted; calling again");
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(RpcError::cancelled()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
             Err(error) => return Err(error),

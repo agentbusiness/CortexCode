@@ -13,7 +13,7 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 - PLAN: the user asks for a plan to review before anything changes, or asks to change the open plan. Not for a plain request to build or fix: that is DO, and DO plans by itself.
 - DELEGATE: the user asks for the work to run in background agents. Not for one feature or one fix: that is DO.
 - DO: a change, a fix, new code or a command to run in this repository, now. Big or small.
-- LOOKUP: a question about this repository, answered by reading it. Nothing is changed.
+- LOOKUP: a question about this repository, answered by reading it, or a review or security audit of its code. Nothing is changed.
 - ANSWER: a general question or conversation that needs nothing from this repository.
 4. `skills`: skills from the Skills list whose summary matches the work in `work`. Usually none: sharing only the language or the topic is not a match. A skill used in the previous turn applies again when the user continues that work.
 5. `effort`: how hard the work is to think through: none, low, medium, high or xhigh.

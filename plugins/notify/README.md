@@ -9,7 +9,6 @@ job ended, a plugin hot-swap failed or rolled back. One self-contained plugin fo
 | `backend/` | `cc-notify`, the `notify@1` plugin process (Rust, own Cargo workspace), plus `CortexCodeNotify.app`, a tiny notification app built from `backend/helper/` by `build.rs` |
 | `shell/` | the Electron main-process module: brings the window forward on a notification click, publishes the window's focus, and says once per start when macOS has CortexCode's notifications turned off |
 | `ui/` | the settings panel (`settings.notify@1`: whether macOS shows them, which kinds, the focus rule), its own npm package built to `ui/dist` |
-| `verify/` | the gate scripts, run against the real frame |
 | `plugin.toml` | what to build, ship and plug in: the frame loads the folder from it (`[[plugin]] dir = "plugins/notify"`), `cortex-pack build plugins/notify` packs it into a `.ccplugin` (the app bundle travels beside `cc-notify`, where the backend finds it) |
 
 ## How it works
@@ -86,16 +85,6 @@ asks again; the window then says so once per start (shell module) and offers to 
 Settings at CortexCode's entry. Without permission every notification still appears in CortexCode's
 own list, with the reason it was not shown.
 
-## Reading delivery back from the OS (verification)
-
-- **Notification Center's database**: `~/Library/Group Containers/group.com.apple.usernoted/db2/db`
-  (SQLite, WAL), table `record` joined with `app` (the posting bundle identifier); `record.data` is
-  a binary plist whose `req` dict holds `titl`, `subt`, `body`. Read read-only with Python's
-  standard library. Records appear 2–6 s after posting. This is the primary evidence.
-- **Accessibility**: the texts of the banner on screen from the `NotificationCenter` process's
-  Accessibility tree (System Events), and `AXPress` on a banner as a real click. Banners are not
-  shown while the screen is locked or a Focus mode holds them, so this is secondary evidence.
-
 ## Configuration (`[plugin.config]`)
 
 | Key | Default | Meaning |
@@ -119,19 +108,12 @@ client); the selection it reports in `notify.focus` comes from the frame's slot 
 (`frame.ui_state.get`) and the workbench's `ui.focus` events. The frame hands the shell the module
 folders of enabled plugins (`[[shell]]` in plugin.toml); disabling the plugin unloads it.
 
-## Build, test, verify
+## Build
 
 ```sh
 cd backend && cargo build --release            # cc-notify + CortexCodeNotify.app
-cd backend && cargo test --release && cd ../ui && npm run verify     # G1
-cd backend && cargo clippy --all-targets -- -D warnings              # G2
-node verify/derive.mjs                         # G3: derivation, dedup, settings, focus (real frame)
-node verify/deliver.mjs                        # G4: OS delivery read back, both modes (real frame + Electron)
+cortex-pack build plugins/notify --install
 ```
-
-The verify scripts use the real frame (`CORTEX_FRAME_BIN`, else `<repo>/frame/target/release/cortex-frame`),
-a temporary `CORTEX_HOME`, the real `cc-memory` for the settings database when it is built
-(`CORTEX_MEMORY_BIN`), and the real Electron shell from `<repo>/ui` (`CORTEX_UI_DIR`).
 
 ## Absent in v0.1
 

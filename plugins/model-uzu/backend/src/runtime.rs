@@ -60,14 +60,11 @@ pub struct Config {
     /// `auto` (draft with the model's speculator when it has one, default) | `off`.
     #[serde(default)]
     pub speculative: Option<String>,
-    /// Port of the OpenAI-compatible endpoint (default: any free port).
-    #[serde(default)]
-    pub endpoint_port: Option<u16>,
     /// An operator cap on resident conversations. Default: none; as many are resident as the
     /// shared pool holds with their contexts (idle ones are spilled to disk when it is full).
     #[serde(default)]
     pub slots: Option<u32>,
-    /// Benchmark override of the fitted pool (tokens).
+    /// An operator override of the fitted pool (tokens).
     #[serde(default)]
     pub ctx_total: Option<u64>,
     /// Prompt tokens per prefill step (default 1024).
@@ -302,7 +299,6 @@ pub struct Runtime {
     publisher: Publisher,
     phase: watch::Sender<Phase>,
     switch: tokio::sync::Mutex<()>,
-    pub endpoint: tokio::sync::Mutex<Option<crate::endpoint::Endpoint>>,
     /// Conversations a predecessor hibernated, adopted once the model is loaded.
     adopted: std::sync::Mutex<Vec<Hibernated>>,
 }
@@ -379,7 +375,6 @@ impl Runtime {
             publisher,
             phase,
             switch: tokio::sync::Mutex::new(()),
-            endpoint: tokio::sync::Mutex::new(None),
             adopted: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -396,7 +391,9 @@ impl Runtime {
             Phase::Ready(loaded) => json!({"state": "ready", "variant": loaded.variant}),
             Phase::Failed(error) => json!({"state": "failed", "error": error}),
         };
-        if !matches!(phase, Phase::Installing(_)) {
+        // Every progress tick is a `model.install` event; the state changes only on entering it.
+        let entering = !matches!(phase, Phase::Installing(_)) || !matches!(&*self.phase.borrow(), Phase::Installing(_));
+        if entering {
             self.publish("model.state", state);
         }
         self.phase.send_replace(phase);
@@ -406,7 +403,10 @@ impl Runtime {
     pub async fn start(self: &Arc<Self>) {
         let _switch = self.switch.lock().await;
         let variant = self.config.variant.clone().unwrap_or_else(|| variants::DEFAULT_VARIANT.to_owned());
-        match self.load(&variant, false).await {
+        // A first start has no model on this Mac: it is downloaded now, its progress shown as
+        // `model.install` events (the card and the model settings show them), instead of a load
+        // that fails and leaves the app without a model.
+        match self.load(&variant, true).await {
             Ok(loaded) => self.set_phase(Phase::Ready(loaded)),
             Err(error) => {
                 tracing::error!(%error, "model load failed");
@@ -430,6 +430,22 @@ impl Runtime {
         }
     }
 
+    /// The download under way, if the model is being installed (no model to serve yet).
+    pub async fn installing_or_ready(&self) -> Result<Result<Arc<Loaded>, Progress>, RpcError> {
+        let mut rx = self.phase.subscribe();
+        loop {
+            match &*rx.borrow_and_update() {
+                Phase::Ready(loaded) => return Ok(Ok(loaded.clone())),
+                Phase::Installing(progress) => return Ok(Err(progress.clone())),
+                Phase::Failed(error) => return Err(unavailable(format!("the model failed to load: {error}"))),
+                _ => {}
+            }
+            if rx.changed().await.is_err() {
+                return Err(unavailable("the model runtime stopped"));
+            }
+        }
+    }
+
     pub fn current(&self) -> Option<Arc<Loaded>> {
         match &*self.phase.borrow() {
             Phase::Ready(loaded) => Some(loaded.clone()),
@@ -443,7 +459,19 @@ impl Runtime {
             if let Some(runtime) = runtime.upgrade() {
                 runtime.publish("model.install", serde_json::to_value(&progress).unwrap_or(Value::Null));
                 if progress.phase == "download" || progress.phase == "verify" {
-                    runtime.phase.send_replace(Phase::Installing(progress));
+                    // Downloads before a switch (and optional vision installs) leave the
+                    // current engine serving. Progress has its own `model.install` event.
+                    let entered = runtime.phase.send_if_modified(|phase| {
+                        if matches!(phase, Phase::Ready(_)) {
+                            return false;
+                        }
+                        let entering = !matches!(phase, Phase::Installing(_));
+                        *phase = Phase::Installing(progress.clone());
+                        entering
+                    });
+                    if entered {
+                        runtime.publish("model.state", json!({"state": "installing", "variant": progress.variant}));
+                    }
                 }
             }
         }
@@ -807,7 +835,7 @@ impl Runtime {
         self.chat_with(params, &mut sink, cancel).await
     }
 
-    /// `model.chat` with pieces delivered to `sink` (the endpoint streams the same pieces).
+    /// `model.chat` with pieces delivered to `sink`.
     pub async fn chat_with(
         &self,
         params: ChatParams,
@@ -1077,7 +1105,22 @@ impl Runtime {
     /// (downloading it on demand when not installed).
     pub async fn select(self: &Arc<Self>, variant: &str) -> Result<SelectResult, RpcError> {
         let _switch = self.switch.lock().await;
-        let previous = self.ready().await?;
+        let Some(previous) = self.current() else {
+            // No model is loaded (none was installed, or it failed): download and load this one.
+            let started = Instant::now();
+            return match self.load(variant, true).await {
+                Ok(loaded) => {
+                    let info = self.info(&loaded);
+                    self.set_phase(Phase::Ready(loaded));
+                    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    Ok(SelectResult { variant: variant.to_owned(), previous: String::new(), changed: true, reload_ms: load_ms, unload_ms: 0.0, load_ms, info })
+                }
+                Err(error) => {
+                    self.set_phase(Phase::Failed(error.clone()));
+                    Err(RpcError::internal(format!("cannot load `{variant}`: {error}")))
+                }
+            };
+        };
         // The variant's vision tower is installed with it (its own small download). A failure (e.g.
         // offline) leaves the model text-only and does not stop the switch; `model.info` says why.
         if let Some(spec) = variants::find(variant)

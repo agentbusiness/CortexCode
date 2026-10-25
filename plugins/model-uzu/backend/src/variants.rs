@@ -481,6 +481,9 @@ pub(crate) async fn download(
             let mut last = Instant::now();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| format!("download interrupted: {error}"))?;
+                if chunk.len() as u64 > file.bytes.saturating_sub(written) {
+                    return Err("the server sent more than the expected file size".into());
+                }
                 out.write_all(&chunk).map_err(|error| format!("cannot write {}: {error}", part.display()))?;
                 written += chunk.len() as u64;
                 if last.elapsed() >= Duration::from_secs(1) {
@@ -490,6 +493,9 @@ pub(crate) async fn download(
             }
             out.flush().map_err(|error| format!("cannot write {}: {error}", part.display()))?;
             report("download", written, String::new());
+            if written != file.bytes {
+                return Err(format!("download ended at {written} of {} bytes", file.bytes));
+            }
             Ok(())
         }
         .await;

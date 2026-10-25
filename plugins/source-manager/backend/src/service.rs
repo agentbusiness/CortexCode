@@ -130,6 +130,26 @@ impl Service {
         }))
     }
 
+    /// Claim one approval using the existing state gate; two decisions must not build/revert
+    /// overlapping source commits while the first change is still being activated.
+    pub fn start_build(&self, id: &str) -> Result<(Proposal, bool), RpcError> {
+        let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let proposals = self.stored_proposals.get();
+        let proposal = proposals.iter().find(|p| p.id == id).ok_or_else(|| RpcError::invalid_params(format!("no proposal `{id}`")))?;
+        if proposal.state != "pending" { return Ok((proposal.clone(), false)); }
+        if proposals.iter().any(|p| matches!(p.state.as_str(), "building" | "installing")) {
+            return Err(RpcError::invalid_params("Another approved change is still building or installing. Finish it before approving this change."));
+        }
+        let proposal = self.stored_proposals.update(|proposals| {
+            let proposal = proposals.iter_mut().find(|p| p.id == id).expect("checked above");
+            proposal.state = "building".into();
+            proposal.outcome.clear();
+            proposal.commit = None;
+            proposal.clone()
+        });
+        Ok((proposal, true))
+    }
+
     pub fn add_proposal(&self, proposal: Proposal) -> Result<(), RpcError> {
         let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stored_proposals.update(|list| list.push(proposal));

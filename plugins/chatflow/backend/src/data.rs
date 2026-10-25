@@ -183,9 +183,13 @@ pub struct Limits {
     pub read_rounds: usize,
     pub check_rounds: usize,
     pub repeat_at: u32,
-    pub repo_map_share: u32,
-    pub repo_map_min: u32,
-    pub repo_map_max: u32,
+    // Legacy config keys remain accepted; prefixes no longer contain repository maps.
+    #[serde(default, rename = "repo_map_share")]
+    _repo_map_share: Option<u32>,
+    #[serde(default, rename = "repo_map_min")]
+    _repo_map_min: Option<u32>,
+    #[serde(default, rename = "repo_map_max")]
+    _repo_map_max: Option<u32>,
     pub focus_map_tokens: u32,
     pub search_limit: u32,
     pub hibernate_after_ms: u64,
@@ -602,7 +606,7 @@ impl Dataset {
             }
         }
         let limits = &raw.limits;
-        if limits.read_rounds == 0 || limits.check_rounds == 0 || limits.repeat_at < 2 || limits.repo_map_share == 0 || limits.repo_map_min > limits.repo_map_max || limits.reads_per_round == 0 || limits.answer_reserve_tokens == 0 || limits.plan_max_tasks == 0 || limits.spec_max_chars == 0 {
+        if limits.read_rounds == 0 || limits.check_rounds == 0 || limits.repeat_at < 2 || limits.reads_per_round == 0 || limits.answer_reserve_tokens == 0 || limits.plan_max_tasks == 0 || limits.spec_max_chars == 0 {
             return Err("stages.toml: a limit is out of range".into());
         }
 

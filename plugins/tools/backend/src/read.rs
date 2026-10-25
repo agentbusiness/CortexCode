@@ -151,7 +151,7 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
         }
         return list_dir(path, display);
     }
-    let bytes = std::fs::read(path).map_err(|error| ReadError::new("io_error", format!("{display}: {error}")))?;
+    let bytes = crate::util::read_host_file(path).map_err(|error| ReadError::new("io_error", format!("{display}: {error}")))?;
     if is_binary(&bytes) {
         let what = describe_binary(&bytes);
         return Ok(FileView {

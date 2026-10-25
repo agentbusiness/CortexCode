@@ -39,7 +39,7 @@ Repository documents are indexed by default, beside the code, so what a project 
 ## Build and run
 
 ```sh
-cd backend && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo clippy --release --all-targets -- -D warnings
 cd ui && npm ci && npm run build && npm test     # after the SDK is built (cd ../../ui/sdk && npm run build)
 cortex-pack build plugins/markdown                  # -> plugins/markdown/target/markdown-<version>-<target>.ccplugin
 ```

@@ -91,10 +91,10 @@ pub fn conversation_window(ctx_total: u32, ctx_native: u32, cap: u32) -> u32 {
     if cap == 0 { window } else { window.min(cap) }
 }
 
-/// Repository map budget: a share of one conversation's context (shapes the prefix, not output).
-pub fn repo_map_budget(data: &Dataset, ctx_window: u32) -> u32 {
-    let limits = &data.limits;
-    if ctx_window == 0 { limits.repo_map_min.max(2048).min(limits.repo_map_max) } else { (ctx_window / limits.repo_map_share).clamp(limits.repo_map_min, limits.repo_map_max) }
+/// Retained for callers compiled against older chatflow versions; prefixes contain no map.
+#[deprecated(note = "repository maps are excluded from prefixes; the budget is always zero")]
+pub fn repo_map_budget(_data: &Dataset, _ctx_window: u32) -> u32 {
+    0
 }
 
 /// Make sure the memory plugin has the project open (idempotent on its side).
@@ -263,6 +263,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
     // stays as compact as it was.
     let mark = |field: &str| journal.context_entry().and_then(|entry| entry.data.get(field).and_then(Value::as_u64));
     let (folded_through, digested_through) = (mark("folded_through"), mark("digested_through"));
+    let (steps_through, settled_through) = (mark("steps_through"), mark(crate::fit::SETTLED));
     let host = journal.host().clone();
     let (prefix, facts) = build_with(&host, project_id, data, role, project).await?;
     journal
@@ -280,6 +281,8 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
                 "data_version": data.version(),
                 "folded_through": folded_through,
                 "digested_through": digested_through,
+                "steps_through": steps_through,
+                "settled_through": settled_through,
                 "skills": prefix.skills,
                 "skill_lines": prefix.skill_lines,
                 "role": role,
@@ -406,7 +409,9 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
 }
 
 async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, mut project: ProjectFacts) -> Result<(Prefix, BuiltFacts), RpcError> {
-    let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({})).await?;
+    let root = host.project_get(project_id).await.map(|project| project.root).unwrap_or_default();
+    // The project's folder: an offline one gets a tools guide that says so before any call.
+    let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({"workspace": root})).await?;
     let info = model_info(host).await;
     let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native, data.limits.context_tokens)).unwrap_or(0);
 
@@ -426,7 +431,6 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
     // misleading cue. The prompt carries what the software is (the description, in the brief) and
     // the project's own contract; code is found per task by searching for its topic.
     let (map_text, map_files) = (String::new(), 0);
-    let root = host.project_get(project_id).await.map(|project| project.root).unwrap_or_default();
     let contract = if root.is_empty() { String::new() } else { contract_section(data, Path::new(&root)) };
     if !root.is_empty() && data.limits.brief_tokens > 0 {
         ensure_description(host, data, project_id, Path::new(&root), &project.languages).await;

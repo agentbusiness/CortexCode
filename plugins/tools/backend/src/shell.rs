@@ -13,6 +13,7 @@ use crate::util;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ pub struct Identity {
     pub sandbox: Option<crate::sandbox::Sandbox>,
     /// The Python venv the shell activates before each command.
     pub venv: Option<PathBuf>,
+    pub command_access: Option<cc_protocol::contracts::frame::CommandAccessResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +82,13 @@ impl Captured {
     pub fn whole(&self, limit: u64) -> Option<String> {
         match self {
             Captured::Mem(bytes) => (bytes.len() as u64 <= limit).then(|| String::from_utf8_lossy(bytes).into_owned()),
-            Captured::File { path, total, .. } => (*total <= limit).then(|| std::fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())).flatten(),
+            Captured::File { path, total, .. } => {
+                (*total <= limit).then(|| std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).ok().and_then(|mut file| {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).ok()?;
+                    Some(String::from_utf8_lossy(&bytes).into_owned())
+                })).flatten()
+            }
         }
     }
 }
@@ -118,7 +126,7 @@ impl Capture {
         self.mem.extend_from_slice(bytes);
         if self.mem.len() > self.spill_at && std::fs::create_dir_all(&self.spill_dir).is_ok() {
             let path = self.spill_dir.join(format!(".spool-{}", util::new_id("o")));
-            if let Ok(mut file) = std::fs::File::create(&path)
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&path)
                 && file.write_all(&self.mem).is_ok()
             {
                 self.head = self.mem[..self.keep.min(self.mem.len())].to_vec();
@@ -269,6 +277,7 @@ impl Shells {
             .env_remove("VIRTUAL_ENV")
             .env_remove("PYTHONHOME")
             .env_remove("CORTEX_VENV")
+            .env_remove("CORTEX_FRAME_TOKEN")
             .stdin(Stdio::piped())
             .stdout(writer)
             .stderr(writer_err)
@@ -277,8 +286,6 @@ impl Shells {
             .env("CORTEX_PROJECT_ID", &identity.project_id)
             .env("CORTEX_HOME", &identity.home)
             .env("CORTEX_WORKSPACE", &identity.workspace)
-            // The session's own scratch folder (throwaway checks; `edit` writes there too).
-            .env("TMPDIR", &scratch)
             // A check written in the scratch folder imports the project's code as usual: Python
             // looks next to the script and Node resolves packages from the script's folder.
             .env("PYTHONPATH", &identity.workspace)
@@ -342,6 +349,19 @@ impl Shells {
             q(&identity.home),
             q(&identity.workspace)
         ));
+        // `$TMPDIR` in the session's commands is its scratch folder (throwaway checks; `edit` writes
+        // there too), but the programs they start do not get it: a temp folder inside the project
+        // puts their temp files under its own config and git root (seen: tests that make a temp
+        // folder and expect no justfile above it found the project's and failed). They use the
+        // system's temp folder.
+        init.push_str(&format!("TMPDIR={}; export -n TMPDIR\n", q(&scratch)));
+        if let Some(access) = &identity.command_access {
+            init.push_str(&format!(
+                "export CORTEX_COMMAND_URL={} CORTEX_COMMAND_TOKEN={}\n",
+                util::shell_quote(&access.url),
+                util::shell_quote(&access.token)
+            ));
+        }
         if let Some(bin) = &self.config.bin_dir {
             let bin = q(bin);
             init.push_str(&format!("case \":$PATH:\" in *:{bin}:*) ;; *) export PATH={bin}:\"$PATH\" ;; esac\n"));

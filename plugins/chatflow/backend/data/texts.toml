@@ -127,6 +127,8 @@ checks_none = "No check command can show this work; the host will not verify it 
 checks_accepted = "The planner accepted your revision of the checks: {reason}"
 checks_refused = "Your revision of the checks was not accepted: {reason}\nThe checks stand as they are; make the work pass them."
 checks_no_reviewer = "no one but the task's worker could accept it (the planner is not available)"
+checks_failed_before = "These tests fail, but they failed before this change too, so they are not this work's: {tests}."
+checks_partly_failed_before = "\nOf the failing tests, these failed before the change too and are not this work's: {tests}. Fix the others."
 checks_indeterminate = "The machine-checkable checks pass, but the host cannot decide these itself, so a person must judge them:{checks}"
 
 # ---- agent tasks ----------------------------------------------------------------------------------

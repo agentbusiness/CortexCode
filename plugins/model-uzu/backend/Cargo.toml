@@ -28,20 +28,15 @@ cpu = ["uzu-engine/cpu"]
 
 [dependencies]
 cc-protocol = { path = "../../../protocol" }
+cc-model-kit = { path = "../../../model-kit" }
 uzu-engine = { path = "vendor/uzu/crates/uzu-engine", default-features = false, features = ["grammar"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-minijinja = { version = "2.17.0", features = ["json", "preserve_order", "loop_controls"] }
-minijinja-contrib = { version = "2.17.0", features = ["pycompat"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-hyper = { version = "1.8", features = ["server", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
-http-body-util = "0.1"
-bytes = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 sha2 = "0.10.9"
@@ -53,7 +48,6 @@ metal = { package = "mtl-rs", version = "0.2.2" }
 # Image understanding (vendor patch P7): decoding PNG/JPEG/WebP/GIF/BMP and resizing on the CPU.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 half = { version = "2.7", features = ["bytemuck"] }
-base64 = "0.22"
 
 [dev-dependencies]
 xgrammar = { package = "xgrammar-rs", version = "0.2.8", features = ["tokenizers"] }

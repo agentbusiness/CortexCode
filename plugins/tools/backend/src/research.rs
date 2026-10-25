@@ -57,7 +57,7 @@ pub async fn read(host: &dyn Host, uri: &str, offline: bool) -> Result<String, U
     let rest = uri.strip_prefix("research://").ok_or_else(|| error("bad_uri", HELP))?;
     let (verb, rest) = rest.split_once('/').unwrap_or((rest, ""));
     if offline && matches!(verb, "search" | "fetch") {
-        return Err(error("unavailable", "offline: this workspace has no network access. Work from the files in the workspace."));
+        return Err(error("unavailable", "offline: this project has no network, and no route reaches the internet here: not research://search or research://fetch, not curl or git, not a download or an install. Work from the project's files."));
     }
     match verb {
         "search" => search(host, rest).await,

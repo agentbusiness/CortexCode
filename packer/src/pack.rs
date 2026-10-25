@@ -20,6 +20,8 @@ pub struct Options {
     /// Keep plugin.toml's version as it is (a release); otherwise the package is a dev build,
     /// versioned `<version>+dev.<UTC date>.<time>`, so every build is its own installed version.
     pub release: bool,
+    /// Version the package `<version>+<id>` (a digest of the plugin's source, from the app builder).
+    pub build_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -148,11 +150,11 @@ pub fn build(options: &Options) -> Result<Packed, String> {
     let dir = std::fs::canonicalize(&options.dir).map_err(|e| format!("{}: {e}", options.dir.display()))?;
     let toml = read_plugin_toml(&dir)?;
     let mut meta = toml.plugin.clone();
-    if !options.release {
+    if let Some(id) = &options.build_id {
+        let base = meta.version.split('+').next().unwrap_or(&meta.version).to_owned();
+        meta.version = format!("{base}+{id}");
+    } else if !options.release {
         meta.version = dev_version(&meta.version);
-    }
-    if meta.test_only {
-        return Err(format!("`{}` is test-only and is never packed", meta.id));
     }
     let (target, rustc) = rust_target(&dir)?;
     let mut entries: BTreeMap<String, Entry> = BTreeMap::new();

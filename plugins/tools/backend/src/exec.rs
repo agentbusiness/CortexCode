@@ -322,13 +322,15 @@ pub async fn read_target(
     // one definition at a time instead of whole.
     let by_name;
     let target = match target.split_once('#') {
-        Some((file, name)) if !target.contains("://") && !file.is_empty() && !name.trim().is_empty() => match definition_range(session, file, name.trim()) {
-            Ok(lines) => {
-                by_name = format!("{file}:{lines}");
-                by_name.as_str()
+        Some((file, name)) if !target.contains("://") && !file.is_empty() && !name.trim().is_empty() => {
+            match definition_range(session, file, name.trim()) {
+                Ok(lines) => {
+                    by_name = format!("{file}:{lines}");
+                    by_name.as_str()
+                }
+                Err(message) => return Out::fail("not_found", message),
             }
-            Err(message) => return Out::fail("not_found", message),
-        },
+        }
         _ => target,
     };
     // `$TMPDIR/...` is the scratch folder `tmp/` (the same folder its shells see).
@@ -344,7 +346,7 @@ pub async fn read_target(
         }
     }
     let display = session.display(&absolute);
-    if crate::sandbox::read_denied(&session.workspace, &absolute) {
+    if core.sandbox.control_read_denied(&absolute) {
         return Out::fail("denied", format!("{display}: not readable from this workspace. Work from the files in the workspace."));
     }
     match read::read_file(&absolute, &display, range.as_deref(), &core.config.read) {
@@ -435,7 +437,7 @@ async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
 // ---------------------------------------------------------------------------------------------
 // edit
 
-fn resolve_in_workspace(session: &Session<'_>, path: &str) -> Result<PathBuf, Box<Out>> {
+fn resolve_in_workspace(core: &Core, session: &Session<'_>, path: &str) -> Result<PathBuf, Box<Out>> {
     // The workspace, its scratch folder `tmp/` included (throwaway checks, also as `$TMPDIR/...`).
     let scratch = util::scratch_dir(&session.workspace);
     let absolute = util::resolve(&session.workspace, &util::expand_scratch(path, &scratch));
@@ -448,6 +450,9 @@ fn resolve_in_workspace(session: &Session<'_>, path: &str) -> Result<PathBuf, Bo
     if util::is_inside(&absolute, &scratch) {
         util::ensure_scratch(&session.workspace);
     }
+    if core.sandbox.protected(&absolute) || core.sandbox.git_control_write_denied(&session.workspace, &absolute) {
+        return Err(Box::new(Out::fail("protected_path", "App control files and Git worktree pointers are managed by the app; edit project files instead.".to_owned())));
+    }
     if absolute.is_dir() {
         return Err(Box::new(Out::fail("is_directory", format!("{path} is a directory"))));
     }
@@ -456,7 +461,7 @@ fn resolve_in_workspace(session: &Session<'_>, path: &str) -> Result<PathBuf, Bo
 
 /// Current text of a file: Ok(None) when it does not exist.
 fn current_text(absolute: &Path, display: &str) -> Result<Option<String>, Box<Out>> {
-    match std::fs::read(absolute) {
+    match crate::util::read_host_file(absolute) {
         Ok(bytes) => {
             if read::is_binary(&bytes) {
                 return Err(Box::new(Out::fail("not_text", format!("{display} is not a UTF-8 text file; it cannot be edited as text"))));
@@ -724,7 +729,9 @@ fn render_removed(old: &str, map: &[Option<usize>], doc: &Doc, changed: &[(usize
 /// that definition has at most 80 lines; true when any was widened.
 fn widen_to_definitions(path: &Path, text: &str, changed: &[(usize, usize)]) -> (Vec<(usize, usize)>, bool) {
     const MAX: usize = 80;
-    let Some(items) = crate::lang::Lang::detect(path, text).and_then(|lang| crate::lang::outline(lang, text)) else { return (changed.to_vec(), false) };
+    let Some(items) = crate::lang::Lang::detect(path, text).and_then(|lang| crate::lang::outline(lang, text)) else {
+        return (changed.to_vec(), false);
+    };
     fn innermost(items: &[crate::lang::Item], first: usize, last: usize) -> Option<(usize, usize)> {
         items.iter().find(|item| item.start <= first && item.end >= last).map(|item| {
             innermost(&item.children, first, last).unwrap_or((item.start, item.end))
@@ -791,7 +798,7 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
 /// unknown or names several.
 fn definition_range(session: &Session<'_>, file: &str, name: &str) -> Result<String, String> {
     let absolute = util::resolve(&session.workspace, &util::expand_scratch(file, &util::scratch_dir(&session.workspace)));
-    let text = std::fs::read_to_string(&absolute).map_err(|_| format!("{file}: no such file."))?;
+    let text = crate::util::read_host_text(&absolute).map_err(|_| format!("{file}: no such file."))?;
     let lines: Vec<&str> = text.lines().collect();
     let items = crate::lang::Lang::detect(&absolute, &text).and_then(|lang| crate::lang::outline(lang, &text)).ok_or_else(|| format!("{file}: its definitions cannot be listed; read a line range instead, e.g. {file}:1-100."))?;
     let parts: Vec<&str> = name.split(|c: char| c == ':' || c == '.').filter(|part| !part.is_empty()).collect();
@@ -1165,7 +1172,7 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     {
         originals.entry(session.context.session_id.clone()).or_default().entry(absolute.clone()).or_insert_with(|| old.clone());
     }
-    if let Err(error) = util::atomic_write(&absolute, new.as_bytes()) {
+    if let Err(error) = util::atomic_write_checked(&absolute, new.as_bytes(), |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path)) {
         return Out::fail("io_error", format!("{display}: {error}"));
     }
     let new_hash = util::content_hash(new.as_bytes());
@@ -1315,7 +1322,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return Out::fail("call_missing_argument", "edit needs `path`".to_owned());
     };
-    let absolute = match resolve_in_workspace(session, path) {
+    let absolute = match resolve_in_workspace(core, session, path) {
         Ok(path) => path,
         Err(out) => return *out,
     };
@@ -1637,12 +1644,12 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
         let path = match op {
             FileOp::Add { path, .. } | FileOp::Delete { path } | FileOp::Update { path, .. } => path,
         };
-        targets.push(match resolve_in_workspace(session, path) {
+        targets.push(match resolve_in_workspace(core, session, path) {
             Ok(path) => path,
             Err(out) => return *out,
         });
         if let FileOp::Update { move_to: Some(target), .. } = op {
-            match resolve_in_workspace(session, target) {
+            match resolve_in_workspace(core, session, target) {
                 Ok(path) => targets.push(path),
                 Err(out) => return *out,
             }
@@ -1661,7 +1668,7 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
         let path = match op {
             FileOp::Add { path, .. } | FileOp::Delete { path } | FileOp::Update { path, .. } => path,
         };
-        let absolute = match resolve_in_workspace(session, path) {
+        let absolute = match resolve_in_workspace(core, session, path) {
             Ok(path) => path,
             Err(out) => return *out,
         };
@@ -1713,7 +1720,7 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
                 };
                 match move_to {
                     Some(target) => {
-                        let target_abs = match resolve_in_workspace(session, target) {
+                        let target_abs = match resolve_in_workspace(core, session, target) {
                             Ok(path) => path,
                             Err(out) => return *out,
                         };
@@ -1757,7 +1764,7 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
                 }
                 displays.push(out.display);
             }
-            Planned::Remove { absolute, display } => match std::fs::remove_file(&absolute) {
+            Planned::Remove { absolute, display } => match util::remove_file_checked(&absolute, |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path)) {
                 Ok(()) => {
                     let _ = writeln!(combined.output, "Deleted {display}.");
                     combined.changed_files.push(display.clone());
@@ -1787,6 +1794,7 @@ pub fn identity(core: &Core, session: &Session<'_>, runtime: Option<&Runtime>) -
         workspace: session.workspace.clone(),
         home: core.home.clone(),
         sandbox: runtime.map(|runtime| runtime.sandbox.clone()),
+        command_access: runtime.map(|runtime| runtime.command_access.clone()),
         venv: runtime.and_then(|runtime| runtime.venv.as_ref()).map(|venv| venv.path().to_path_buf()),
     }
 }
@@ -1821,7 +1829,7 @@ pub fn present_output(core: &Core, captured: Captured, limits: InlineLimits) -> 
 }
 
 /// Bytes of output a test run may have for its compact view (see [`crate::testout`]).
-const TEST_VIEW_BYTES: u64 = 1 << 20;
+pub const TEST_VIEW_BYTES: u64 = 1 << 20;
 
 /// A failing test run shown in the form the model acts on (see [`crate::testout`]): its counts,
 /// one line per failing test, the first failure whole, and the whole output kept as an artifact
@@ -2021,8 +2029,13 @@ async fn exec_terminal(host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<S
             let container = match host.call("container.status", json!({"root": workspace})).await {
                 Ok(Value::Object(info)) if info.get("state").and_then(Value::as_str) == Some("running") => {
                     match host.call("container.shell_command", json!({"root": workspace})).await {
-                        Ok(value) => value.get("argv").and_then(Value::as_array).map(|argv| argv.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()),
-                        Err(error) => return Out::fail("unavailable", format!("the project's container gives no shell: {}", error.message)),
+                        Ok(value) => value
+                            .get("argv")
+                            .and_then(Value::as_array)
+                            .map(|argv| argv.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()),
+                        Err(error) => {
+                            return Out::fail("unavailable", format!("the project's container gives no shell: {}", error.message));
+                        }
                     }
                 }
                 _ => None,
@@ -2241,7 +2254,9 @@ async fn run_in_container(
     };
     let result = match result {
         Ok(result) => result,
-        Err(error) => return Out::fail("container_error", format!("could not run the command in the project's container: {}", error.message)),
+        Err(error) => {
+            return Out::fail("container_error", format!("could not run the command in the project's container: {}", error.message));
+        }
     };
     let output = result.get("output").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec();
     let code_hits = verifier_hits(host, command, &output[..]).await;
@@ -2304,14 +2319,14 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     // read (seen: `cat bowling.py` three times in one task; the next edit had no anchors and the
     // reads stayed whole in the history).
     if let Some((file, range)) = crate::approval::terminal_read(command)
-        && let Ok(absolute) = resolve_in_workspace(session, &file)
+        && let Ok(absolute) = resolve_in_workspace(core, session, &file)
         && absolute.is_file()
     {
         let mut read_args = Map::new();
         let path = match &range {
             Some(range) if range.starts_with('-') => {
                 // `tail -N`: the last N lines of the file.
-                let total = std::fs::read_to_string(&absolute).map(|text| text.lines().count()).unwrap_or(0);
+                let total = crate::util::read_host_text(&absolute).map(|text| text.lines().count()).unwrap_or(0);
                 let last: usize = range[1..].parse().unwrap_or(10);
                 format!("{file}:{}-{total}", total.saturating_sub(last) + 1)
             }
@@ -2343,7 +2358,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             format!("Not run: `/` and the home folder hold the whole machine, and searching them takes minutes. Search the project ({}) or a folder you know, e.g. `grep -rn <text> .`.", session.workspace.display()),
         );
     }
-    let runtime = match core.runtime(&session.context.session_id, &session.workspace, session.python_env).await {
+    let runtime = match core.runtime(host.as_ref(), &session.context.session_id, &session.workspace, session.python_env).await {
         Ok(runtime) => runtime,
         Err(message) => return Out::fail("sandbox_unavailable", message),
     };
@@ -2442,6 +2457,8 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             ("CORTEX_PROJECT_ID".to_owned(), identity.project_id.clone()),
             ("CORTEX_HOME".to_owned(), core.home.to_string_lossy().into_owned()),
             ("CORTEX_WORKSPACE".to_owned(), session.workspace.to_string_lossy().into_owned()),
+            ("CORTEX_COMMAND_URL".to_owned(), runtime.command_access.url.clone()),
+            ("CORTEX_COMMAND_TOKEN".to_owned(), runtime.command_access.token.clone()),
         ];
         return match core.jobs.start(StartRequest {
             session_id: &identity.session_id,
@@ -2490,7 +2507,10 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let eperm = refused.iter().any(|path| !writable(path.as_path()) && !is_program(path.as_path()));
     let code_hits = match &run.output {
         Captured::Mem(bytes) => verifier_hits(host, command, &bytes[..]).await,
-        Captured::File { path, .. } => match std::fs::File::open(path) {
+        Captured::File { path, .. } => match {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
+        } {
             Ok(file) => verifier_hits(host, command, std::io::BufReader::new(file)).await,
             Err(_) => Vec::new(),
         },

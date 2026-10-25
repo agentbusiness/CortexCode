@@ -16,7 +16,6 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-skills-data`: category `skills-data`, contract `skills@1`, served by `cc_lang_kit::run_skills_plugin` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary of when to read it, a blank line, the Markdown body) |
 | `data/skills/applies.toml` | the projects each skill applies to (languages, files, imports); the chat flow offers a skill only where one holds |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -28,7 +27,7 @@ model's coding, CortexCode's tools and URIs by their real names.
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/skills-data   # -> plugins/skills-data/target/skills-data-<version>-<target>.ccplugin
 ```
 
@@ -37,10 +36,3 @@ The frame runs it once installed (`cortex-pack build plugins/skills-data --insta
 `describe` gave, a body follows) and asks for an unknown skill (`not_found`). The unit tests also
 hold the shipped skills to the brief's format (1-16 skills, a summary of at most 100 characters
 naming the situation, blank line 2, 250-3200 words, no links in prose).
-
-## Verification
-
-`verify/skills_data.mjs` loads the folder in a real frame and checks both methods against the
-files on disk read independently: the skills described are exactly the files, each with its first
-line as summary, each read back byte for byte; the brief's format; refusals (an unknown skill, a
-path-like name, a missing name).

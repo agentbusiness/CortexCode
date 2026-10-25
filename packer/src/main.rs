@@ -13,7 +13,7 @@
 //! (`source/`, the files git tracks or would track in the folder) for self-rewrite.
 //!
 //! A build is a dev build, versioned `<version>+dev.<UTC date>.<time>`, unless `--release` keeps
-//! plugin.toml's version. `--install` hands the package to the frame (`CORTEX_HOME`, default
+//! plugin.toml's version or `--build-id <id>` versions it `<version>+<id>`. `--install` hands the package to the frame (`CORTEX_HOME`, default
 //! `~/.cortexcode`): a running frame hot-swaps to it and this command prints the outcome; a stopped
 //! frame installs it at its next start. `info` prints the validated plugin.toml as JSON.
 
@@ -47,6 +47,10 @@ enum Command {
         /// <dir>/target/<id>-<version>-<target>.ccplugin).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Version the package `<version>+<id>` (the app builder passes a digest of the plugin's
+        /// source, so an unchanged plugin keeps its version and is not installed again).
+        #[arg(long)]
+        build_id: Option<String>,
         /// Leave the plugin's source out of the package (it is included by default, for self-rewrite).
         #[arg(long)]
         no_source: bool,
@@ -61,8 +65,8 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
-        Command::Build { dir, install, release, out, no_source, no_build } => {
-            pack::build(&pack::Options { dir, out, source: !no_source, run_build: !no_build, release }).and_then(|packed| {
+        Command::Build { dir, install, release, out, build_id, no_source, no_build } => {
+            pack::build(&pack::Options { dir, out, source: !no_source, run_build: !no_build, release, build_id }).and_then(|packed| {
                 println!("packed {} {} ({} bytes) -> {}", packed.manifest.plugin.id, packed.manifest.plugin.version, packed.bytes, packed.path.display());
                 if install { install::install(&packed.path, &install::home()) } else { Ok(()) }
             })

@@ -56,6 +56,7 @@ export class SlotEngine {
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private loading: string | null = null;
   private disposed = false;
+  private loadGeneration = 0;
   onRecord: ((record: SwapRecord) => void) | null = null;
 
   constructor(slot: string, load: Loader, loadStyle: StyleLoader) {
@@ -73,6 +74,12 @@ export class SlotEngine {
   desire(plugin: UiPlugin | undefined): void {
     if (!plugin || this.disposed) return;
     this.desired = plugin;
+    if (this.staging && this.staging.plugin.hash !== plugin.hash) {
+      this.clearTimer();
+      this.staging.dropStyle();
+      this.staging = null;
+      this.emit();
+    }
     if (plugin.hash === this.active?.plugin.hash && !this.broken) return;
     if (plugin.hash === this.staging?.plugin.hash) return;
     if (plugin.hash === this.loading) return;
@@ -83,7 +90,7 @@ export class SlotEngine {
   /** The staged instance rendered without error. */
   ready(key: string): void {
     const staged = this.staging;
-    if (!staged || staged.key !== key) return;
+    if (!staged || staged.key !== key || this.desired?.hash !== staged.plugin.hash) return;
     this.clearTimer();
     const previous = this.active;
     this.active = staged;
@@ -123,8 +130,9 @@ export class SlotEngine {
     this.record({ from: active.plugin.hash, to: active.plugin.hash, outcome: 'rejected', reason });
     const fallback = [...this.good].reverse().find((entry) => !this.rejected.has(entry.plugin.hash));
     if (fallback) {
+      this.desired = fallback.plugin;
       this.rollingBack = fallback.plugin.hash;
-      void this.stageLoaded(fallback.plugin, fallback.component);
+      void this.stageLoaded(fallback.plugin, fallback.component, ++this.loadGeneration);
     } else {
       this.broken = { instance: active, reason };
     }
@@ -155,6 +163,8 @@ export class SlotEngine {
    * unmount what runs. What the plugin kept in the workbench's store stays for when it returns.
    */
   release(): void {
+    this.loadGeneration++;
+    this.loading = null;
     this.desired = null;
     if (!this.active && !this.staging && !this.broken) return;
     this.clearTimer();
@@ -167,6 +177,7 @@ export class SlotEngine {
   }
 
   dispose(): void {
+    this.loadGeneration++;
     this.disposed = true;
     this.clearTimer();
     this.active?.dropStyle();
@@ -177,6 +188,7 @@ export class SlotEngine {
   private rollingBack: string | null = null;
 
   private async stage(plugin: UiPlugin): Promise<void> {
+    const generation = ++this.loadGeneration;
     this.loading = plugin.hash;
     let definition: UiPluginDefinition;
     try {
@@ -188,6 +200,7 @@ export class SlotEngine {
         throw new Error(`the module fills ${definition.slot}, not ${this.slot}`);
       }
     } catch (error) {
+      if (generation !== this.loadGeneration) return;
       this.loading = null;
       if (this.disposed) return;
       this.rejected.add(plugin.hash);
@@ -200,6 +213,7 @@ export class SlotEngine {
       this.emit();
       return;
     }
+    if (generation !== this.loadGeneration) return;
     this.loading = null;
     if (this.disposed) return;
     // Released while it loaded (the frame stopped serving the plugin): nothing to stage.
@@ -209,22 +223,22 @@ export class SlotEngine {
       void this.stage(this.desired);
       return;
     }
-    await this.stageLoaded(plugin, definition.component);
+    await this.stageLoaded(plugin, definition.component, generation);
   }
 
-  private async stageLoaded(plugin: UiPlugin, component: ComponentType<SlotProps>): Promise<void> {
+  private async stageLoaded(plugin: UiPlugin, component: ComponentType<SlotProps>, generation: number): Promise<void> {
     const key = `${plugin.hash.slice(0, 12)}-${++this.counter}`;
     let dropStyle: () => void = () => undefined;
     try {
       dropStyle = await this.loadStyle(plugin, key);
     } catch (error) {
-      if (this.disposed) return;
+      if (this.disposed || generation !== this.loadGeneration || this.desired?.hash !== plugin.hash) return;
       this.rejected.add(plugin.hash);
       this.record({ from: this.active?.plugin.hash ?? null, to: plugin.hash, outcome: 'rejected', reason: `stylesheet: ${error instanceof Error ? error.message : String(error)}` });
       this.emit();
       return;
     }
-    if (this.disposed) {
+    if (this.disposed || generation !== this.loadGeneration || this.desired?.hash !== plugin.hash) {
       dropStyle();
       return;
     }

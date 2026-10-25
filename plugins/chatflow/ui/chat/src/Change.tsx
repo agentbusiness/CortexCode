@@ -5,6 +5,7 @@ import { str } from './transcript';
 const LABEL: Record<string, string> = {
   pending: 'Needs you',
   building: 'Building…',
+  installing: 'Installing…',
   done: 'Built and swapped',
   failed: 'Build failed',
   rolled_back: 'Rolled back',
@@ -14,6 +15,7 @@ const LABEL: Record<string, string> = {
 const TONE: Record<string, string> = {
   pending: 'commitment',
   building: 'context',
+  installing: 'context',
   done: 'context',
   failed: 'contradiction',
   rolled_back: 'overdue',
@@ -49,6 +51,7 @@ export function ChangeCard({ entry, onDecide }: { entry: JournalEntry; onDecide:
   const data = entry.data;
   const id = str(data.id);
   const state = str(data.state) || 'pending';
+  const running = state === 'building' || state === 'installing';
   const name = usePluginNames();
   const plugins = Array.isArray(data.plugins) ? data.plugins.filter((plugin): plugin is string => typeof plugin === 'string') : [];
   const [busy, setBusy] = useState<'approve' | 'decline' | null>(null);
@@ -56,7 +59,7 @@ export function ChangeCard({ entry, onDecide }: { entry: JournalEntry; onDecide:
   const [showing, setShowing] = useState(false);
   const [progress, setProgress] = useState('');
   const diff = useQuery<FileDiff[]>(showing && id ? `source.diff:proposal:${id}` : null, async (c) => diffFiles((await c.call<{ files: SourceFileDiff[] }>('source.diff', { proposal: id }))?.files ?? []));
-  useEvent(state === 'building' ? 'source.progress' : null, (_topic, payload) => {
+  useEvent(running ? 'source.progress' : null, (_topic, payload) => {
     const step = payload as SourceProgress;
     if (step?.proposal !== id) return;
     const what = step.plugin ? name(step.plugin) : 'the change';
@@ -83,8 +86,8 @@ export function ChangeCard({ entry, onDecide }: { entry: JournalEntry; onDecide:
       {str(data.summary) && <p>{str(data.summary)}</p>}
       {str(data.why) && <p className="cx-change-line">Why: {str(data.why)}</p>}
       {str(data.risk) && <p className="cx-change-line">Risk: {str(data.risk)}</p>}
-      {state === 'building' && <p className="cx-change-progress">{progress || 'Starting the build…'}</p>}
-      {!pending && state !== 'building' && outcome && <p className="cx-change-outcome">{outcome}</p>}
+      {running && <p className="cx-change-progress">{state === 'installing' ? 'Installing plugins…' : progress || 'Starting the build…'}</p>}
+      {!pending && !running && outcome && <p className="cx-change-outcome">{outcome}</p>}
       <div className="acts">
         {pending && <button className="detent" type="button" data-action="approve" disabled={busy !== null} onClick={() => void answer(true)}>{busy === 'approve' ? 'Approving…' : 'Approve'}</button>}
         {pending && <button className="detent warn" type="button" data-action="decline" disabled={busy !== null} onClick={() => void answer(false)}>{busy === 'decline' ? 'Declining…' : 'Decline'}</button>}

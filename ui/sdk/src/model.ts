@@ -53,7 +53,47 @@ export interface ModelState {
   /** Requests waiting for a slot (read only while `watchSlots`). */
   queued: number | null;
   busy: number | null;
+  /** A model download or check under way (the model plugin's `model.install` events), else null. */
+  install: InstallProgress | null;
   info: QueryResult<ModelInfoData>;
+}
+
+/** One `model.install` event: a variant's files being downloaded or checked. */
+export interface InstallProgress {
+  variant: string;
+  /** download | verify | done | failed */
+  phase: string;
+  file: string;
+  /** Bytes done of the whole variant. */
+  bytes: number;
+  total: number;
+  detail?: string;
+  /** Bytes per second over the last events of the same phase, when known. */
+  rate: number | null;
+  at: number;
+}
+
+function nextInstall(previous: InstallProgress | null, data: unknown): InstallProgress | null {
+  const event = data as Partial<InstallProgress> | null;
+  if (!event || typeof event.variant !== 'string' || typeof event.phase !== 'string') return previous;
+  const at = Date.now();
+  const bytes = typeof event.bytes === 'number' ? event.bytes : 0;
+  let rate: number | null = null;
+  if (previous && previous.variant === event.variant && previous.phase === event.phase && at > previous.at && bytes >= previous.bytes) {
+    const now = (bytes - previous.bytes) / ((at - previous.at) / 1000);
+    rate = previous.rate === null ? now : previous.rate * 0.7 + now * 0.3;
+  }
+  return { variant: event.variant, phase: event.phase, file: event.file ?? '', bytes, total: typeof event.total === 'number' ? event.total : 0, detail: event.detail, rate, at };
+}
+
+/** `Downloading qwen3.8-27b-m · 42 % · 6.1 of 14.7 GB · 38 MB/s`; null when nothing installs. */
+export function installLine(install: InstallProgress | null): string | null {
+  if (!install || (install.phase !== 'download' && install.phase !== 'verify')) return null;
+  const gb = (value: number) => (value / 1e9).toFixed(1);
+  const percent = install.total > 0 ? Math.floor((install.bytes / install.total) * 100) : 0;
+  const what = install.phase === 'download' ? 'Downloading' : 'Checking';
+  const rate = install.rate !== null && install.rate > 0 ? ` · ${(install.rate / 1e6).toFixed(0)} MB/s` : '';
+  return `${what} ${install.variant} · ${percent} % · ${gb(install.bytes)} of ${gb(install.total)} GB${rate}`;
 }
 
 /**
@@ -64,6 +104,8 @@ export function useModelState({ watchSlots = false }: { watchSlots?: boolean } =
   const info = useQuery<ModelInfoData>('model.info', (c) => c.call<ModelInfoData>('model.info', {}), { topics: ['model.state', 'plugin.swapped'] });
   const [event, setEvent] = useState<{ state: string; variant?: string; reason?: string; error?: string } | null>(null);
   useEvent('model.state', (_topic, data) => setEvent(data as { state: string }));
+  const [install, setInstall] = useState<InstallProgress | null>(null);
+  useEvent('model.install', (_topic, data) => setInstall((previous) => nextInstall(previous, data)));
   const slots = useQuery<ModelSlotsData>(watchSlots ? 'model.slots' : null, (c) => c.call<ModelSlotsData>('model.slots', {}));
   useEffect(() => {
     if (!watchSlots) return;
@@ -77,6 +119,7 @@ export function useModelState({ watchSlots = false }: { watchSlots?: boolean } =
   let phase: ModelPhase = 'unknown';
   if (info.errorCode === 'unavailable') phase = 'unavailable';
   else if (event && ['starting', 'installing', 'loading', 'failed'].includes(event.state)) phase = event.state as ModelPhase;
+  else if (!data && install && (install.phase === 'download' || install.phase === 'verify')) phase = 'installing';
   else if (data) phase = 'ready';
   const variant = data?.variant ?? event?.variant ?? null;
   const configured: string = data?.extra?.configured_variant ?? DEFAULT_MODEL_VARIANT;
@@ -92,6 +135,7 @@ export function useModelState({ watchSlots = false }: { watchSlots?: boolean } =
     slots: data?.slots ?? null,
     queued: slots.data?.queued ?? null,
     busy: slots.data ? slots.data.busy ?? slots.data.slots.filter((slot) => slot.busy).length : null,
+    install: install && (install.phase === 'download' || install.phase === 'verify') ? install : null,
     info,
   };
 }

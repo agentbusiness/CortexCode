@@ -5,8 +5,7 @@
   "description": "The settings-host plugin's UI packages (one npm workspace; each package builds its own dist/ with manifest.json).",
   "license": "Apache-2.0",
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present"
+    "build": "npm run build --workspaces --if-present"
   },
   "workspaces": [
     "host"

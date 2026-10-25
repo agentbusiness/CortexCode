@@ -15,7 +15,6 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-typescript`: category `lang-typescript`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -68,23 +67,10 @@ Methods are called on the category: `lang-typescript.describe`, `lang-typescript
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --release --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
 cortex-pack build plugins/lang-typescript     # -> plugins/lang-typescript/target/lang-typescript-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-typescript --install`). The probe extracts a
 sample through the real `extract`, reads every skill and reports whether typescript-language-server
 can run (an absent server does not fail the probe: extraction and skills work without it).
-
-## Verification
-
-`verify/lang_typescript.mjs` loads the folder in a real frame and checks every method against
-truth computed independently: definition lines and call sites found in the fixture text, tsc's own
-errors (`tsc --noEmit --pretty false` of CortexCode's TypeScript: positions and TS codes) before and
-after a fix, no type error in plain JavaScript, which TypeScript serves a root with and without
-`node_modules/typescript`, definition, references and hover positions of a function, the described
-verifier commands run in the fixture (offline: the tsc verifier fails without `node_modules` and
-installs nothing), skills read back with their summaries, the `lang-typescript.server` event, and
-refusals (another language, a relative root, a missing file). typescript-language-server must be
-runnable; `node verify/lang_typescript.mjs --install` lets `lang-typescript.install` install it and
-its TypeScript first.

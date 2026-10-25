@@ -15,7 +15,7 @@
 //! - /dev (terminals, /dev/null, /dev/fd; device nodes are guarded by their own permissions).
 //!
 //! A workspace holding a `.cortex-offline` file is offline: its commands get no outbound network
-//! but localhost and unix sockets (a benchmark workspace, or a project its owner keeps offline).
+//! but localhost and unix sockets (a project its owner keeps offline).
 //!
 //! A command the user let past the sandbox (`lift:<command>` approvals, asked for by the model with
 //! `run`'s `permission`) runs without it: macOS refuses a sandbox inside a sandbox, and installers
@@ -31,8 +31,9 @@
 //! fixed `strerror(EPERM)` text (a mechanical rule, not a judgement) so the model can be told why.
 
 use crate::util;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Approval classes that widen the sandbox for a session: `write_outside:<absolute dir>`.
@@ -49,37 +50,13 @@ pub fn lift_class(command: &str) -> String {
 /// The file whose presence makes a workspace offline (see the module doc).
 pub const OFFLINE_MARKER: &str = ".cortex-offline";
 
-/// Folders an offline workspace's commands and reads may not see: the marker's lines that are
-/// absolute paths (a benchmark lists its hidden tests and reference solutions there).
-pub fn denied_reads(workspace: &Path) -> Vec<PathBuf> {
-    std::fs::read_to_string(workspace.join(OFFLINE_MARKER))
-        .map(|text| text.lines().map(str::trim).filter(|line| line.starts_with('/')).map(|line| real(Path::new(line))).collect())
-        .unwrap_or_default()
-}
-
-/// Whether `path` lies under a folder the workspace's marker denies.
-pub fn read_denied(workspace: &Path, path: &Path) -> bool {
-    let denied = denied_reads(workspace);
-    !denied.is_empty() && {
-        let path = real(path);
-        denied.iter().any(|folder| path.starts_with(folder))
-    }
-}
-
 /// The rules of an offline workspace (none otherwise): no outbound network but localhost (the
-/// frame, language servers, local services) and unix sockets, and no reads of the folders its
-/// marker lists.
+/// frame, language servers, local services) and unix sockets.
 pub fn network_rules(workspace: &Path) -> String {
     if !workspace.join(OFFLINE_MARKER).exists() {
         return String::new();
     }
-    let mut rules = "(deny network-outbound)\n(allow network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote unix-socket))\n".to_owned();
-    for folder in denied_reads(workspace) {
-        if let Some(text) = sbpl_string(&folder) {
-            rules.push_str(&format!("(deny file-read* (subpath {text}))\n"));
-        }
-    }
-    rules
+    "(deny network-outbound)\n(allow network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote unix-socket))\n".to_owned()
 }
 
 /// How one shell or job is confined: `sandbox-exec [-D key=value]... -p <profile> <program>`.
@@ -127,12 +104,32 @@ pub struct Policy {
     pub protected_literals: Vec<PathBuf>,
     /// Regex rules (already escaped) for protected files with variable names.
     pub protected_regexes: Vec<String>,
+    control_read_paths: Vec<PathBuf>,
+    socket: Arc<Mutex<Option<PathBuf>>>,
+    /// Resolved once before the session runs code; workspace-controlled pointer files never widen it.
+    git_dirs: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>,
 }
 
 /// Real path of `path` (through symlinks of its existing ancestors): the sandbox matches the
 /// resolved path, so every rule names the resolved form.
 fn real(path: &Path) -> PathBuf {
     util::canonical_lenient(&util::normalize(path))
+}
+
+/// Every on-disk copy of the privileged frame credential that command tools must not expose.
+pub fn control_paths(home: &Path) -> Vec<PathBuf> {
+    let home = real(home);
+    vec![home.join("run"), home.join("plugins-data/ui/electron")]
+}
+
+pub fn control_read_path(home: &Path, path: &Path) -> bool {
+    let path = real(path);
+    control_paths(home).iter().any(|root| path.starts_with(root))
+}
+
+pub fn host_control_read_denied(path: &Path) -> bool {
+    let home = env_path("CORTEX_HOME").or_else(|| user_home().map(|home| home.join(".cortexcode")));
+    home.is_some_and(|home| control_read_path(&home, path))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -243,13 +240,52 @@ impl Policy {
         let data = real(data_dir);
         // The main store (projects, conversations, settings, approvals) is the app's, never a
         // command's to write.
-        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph")];
+        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph"), home.join("plugins-data/cc-source")];
         let mut protected_literals = vec![home.clone(), home.join("plugins-data"), data.clone(), home.join("jobs")];
         protected_literals.extend(protected_subpaths.iter().cloned());
         let protected_regexes = regex_escape(&home.join("jobs"))
             .map(|jobs| vec![format!("^{jobs}/[^/]+/(meta\\.json|cmd\\.sh|runner\\.sh)$")])
             .unwrap_or_default();
-        Policy { exec, roots, files, protected_subpaths, protected_literals: dedup(protected_literals), protected_regexes }
+        Policy {
+            exec,
+            roots,
+            files,
+            protected_subpaths,
+            protected_literals: dedup(protected_literals),
+            protected_regexes,
+            control_read_paths: control_paths(&home),
+            socket: Arc::new(Mutex::new(None)),
+            git_dirs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn set_socket(&self, socket: &Path) {
+        if let Ok(mut path) = self.socket.lock() {
+            *path = Some(real(socket));
+        }
+    }
+
+    pub fn control_read_denied(&self, path: &Path) -> bool {
+        self.control_read_paths.iter().any(|root| real(path).starts_with(root))
+    }
+
+    fn linked_dirs(&self, workspace: &Path) -> Vec<PathBuf> {
+        let workspace = real(workspace);
+        let Ok(mut pinned) = self.git_dirs.lock() else { return Vec::new() };
+        pinned.entry(workspace.clone()).or_insert_with(|| linked_git_dirs(&workspace)).clone()
+    }
+
+    fn git_controls(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut controls = vec![real(workspace)];
+        if workspace.join(".git").exists() { controls.push(real(&workspace.join(".git"))); }
+        for dir in self.linked_dirs(workspace) {
+            controls.extend([dir.clone(), dir.join("commondir"), dir.join("gitdir")]);
+            // A linked record's parent can otherwise be renamed as a way to replace its pointers.
+            if dir.parent().is_some_and(|parent| parent.file_name().is_some_and(|name| name == "worktrees")) {
+                controls.push(dir.parent().unwrap().to_path_buf());
+            }
+        }
+        controls
     }
 
     pub fn available(&self) -> bool {
@@ -259,7 +295,7 @@ impl Policy {
     /// Writable roots of one session: the base roots plus its workspace, git dirs, venv and grants.
     pub fn session_roots(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Vec<PathBuf> {
         let mut roots = vec![real(workspace)];
-        roots.extend(linked_git_dirs(workspace));
+        roots.extend(self.linked_dirs(workspace));
         if let Some(venv) = venv {
             roots.push(real(venv));
         }
@@ -271,7 +307,7 @@ impl Policy {
     /// Whether `path` is one of the paths that stay read-only for commands whatever is approved.
     pub fn protected(&self, path: &Path) -> bool {
         let path = real(path);
-        self.protected_subpaths.iter().any(|protected| path.starts_with(protected))
+        self.control_read_denied(&path) || self.protected_subpaths.iter().any(|protected| path.starts_with(protected))
             || self.protected_literals.contains(&path)
             || self
                 .protected_regexes
@@ -279,9 +315,13 @@ impl Policy {
                 .any(|pattern| regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(&path.to_string_lossy())))
     }
 
+    pub fn git_control_write_denied(&self, workspace: &Path, path: &Path) -> bool {
+        self.git_controls(workspace).contains(&real(path))
+    }
+
     /// Whether the sandbox of this session lets commands write `path` (protected paths excluded).
     pub fn writable(&self, path: &Path, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> bool {
-        if self.protected(path) {
+        if self.protected(path) || self.git_controls(workspace).contains(&real(path)) {
             return false;
         }
         let path = real(path);
@@ -307,7 +347,9 @@ impl Policy {
                 protected.push_str(&format!("  (subpath {text})\n"));
             }
         }
-        for path in &self.protected_literals {
+        let mut literals = self.protected_literals.clone();
+        literals.extend(self.git_controls(workspace));
+        for path in &literals {
             if let Some(text) = sbpl_string(path) {
                 protected.push_str(&format!("  (literal {text})\n"));
             }
@@ -315,7 +357,17 @@ impl Policy {
         for regex in &self.protected_regexes {
             protected.push_str(&format!("  (regex #\"{regex}\")\n"));
         }
-        format!("(deny file-write*\n  (require-not\n    (require-any\n{allowed}    )))\n(deny file-write*\n{protected})\n")
+        let mut control = String::from("(deny process-info*)\n(allow process-info* (target self))\n(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n");
+        for root in &self.control_read_paths {
+            let root = sbpl_string(root).unwrap_or_else(|| "\"/\"".to_owned());
+            control.push_str(&format!("(deny file-read* file-write* (subpath {root}))\n"));
+        }
+        if let Some(socket) = self.socket.lock().ok().and_then(|socket| socket.clone()) {
+            if let Some(socket) = sbpl_string(&socket) {
+                control.push_str(&format!("(deny network-outbound (remote unix-socket (path-literal {socket})))\n"));
+            }
+        }
+        format!("(deny file-write*\n  (require-not\n    (require-any\n{allowed}    )))\n(deny file-write*\n{protected})\n{control}")
     }
 
     /// The complete profile for a session's shell or job.
@@ -351,13 +403,30 @@ fn linked_git_dirs(workspace: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
     let Ok(text) = std::fs::read_to_string(&dot_git) else { return Vec::new() };
-    let Some(gitdir) = text.lines().find_map(|line| line.strip_prefix("gitdir:")).map(str::trim) else { return Vec::new() };
-    let gitdir = util::resolve(workspace, gitdir);
-    let mut dirs = vec![real(&gitdir)];
-    if let Ok(common) = std::fs::read_to_string(gitdir.join("commondir")) {
-        dirs.push(real(&util::resolve(&gitdir, common.trim())));
+    let Some(pointer) = text.trim().strip_prefix("gitdir:").map(str::trim).filter(|text| !text.is_empty() && !text.contains('\n')) else {
+        return Vec::new();
+    };
+    let gitdir = real(&util::resolve(workspace, pointer));
+    let Some(records) = gitdir.parent().filter(|parent| parent.file_name().is_some_and(|name| name == "worktrees")) else {
+        return Vec::new();
+    };
+    let Some(common) = records.parent().map(real) else { return Vec::new() };
+    let Ok(common_pointer) = std::fs::read_to_string(gitdir.join("commondir")) else { return Vec::new() };
+    if real(&util::resolve(&gitdir, common_pointer.trim())) != common {
+        return Vec::new();
     }
-    dirs
+    let Ok(backlink) = std::fs::read_to_string(gitdir.join("gitdir")) else { return Vec::new() };
+    if real(&util::resolve(&gitdir, backlink.trim())) != real(&dot_git) {
+        return Vec::new();
+    }
+    if !gitdir.join("HEAD").is_file()
+        || !common.join("objects").is_dir()
+        || !common.join("HEAD").is_file()
+        || !(common.join("refs").is_dir() || common.join("packed-refs").is_file())
+    {
+        return Vec::new();
+    }
+    vec![gitdir, common]
 }
 
 /// Paths granted by `write_outside:<dir>` approvals.

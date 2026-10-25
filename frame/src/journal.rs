@@ -70,7 +70,14 @@ impl Journal {
         let entry = JournalEntry { seq, ts_ms: now_ms(), session_id: session_id.to_owned(), kind: kind.to_owned(), data };
         let patch = JournalPatch::Create { entry, rev: log.rev + 1 };
         apply(log, &patch).map_err(RpcError::invalid_params)?;
-        let durable = self.enqueue(session_id, &patch);
+        let durable = match self.enqueue(session_id, &patch) {
+            Ok(durable) => durable,
+            Err(error) => {
+                log.entries.pop();
+                log.rev -= 1;
+                return Err(error);
+            }
+        };
         publish(&patch);
         Ok((seq, durable))
     }
@@ -99,8 +106,16 @@ impl Journal {
         let mut sessions = self.lock();
         let log = self.loaded(&mut sessions, session_id)?;
         patch.set_rev(log.rev + 1);
+        let previous = entry_mut(log, seq).map_err(RpcError::invalid_params)?.clone();
         apply(log, &patch).map_err(RpcError::invalid_params)?;
-        let durable = self.enqueue(session_id, &patch);
+        let durable = match self.enqueue(session_id, &patch) {
+            Ok(durable) => durable,
+            Err(error) => {
+                *entry_mut(log, seq).map_err(RpcError::invalid_params)? = previous;
+                log.rev -= 1;
+                return Err(error);
+            }
+        };
         publish(&patch);
         Ok(durable)
     }
@@ -128,19 +143,19 @@ impl Journal {
     }
 
     /// Wait until everything enqueued so far is in the store.
-    pub async fn flush(&self) {
-        self.outbox.flush().await;
+    pub async fn flush(&self) -> Result<(), RpcError> {
+        self.outbox.flush().await
     }
 
     /// Flush (the store writer stops with the frame).
-    pub async fn close(&self) {
-        self.flush().await;
+    pub async fn close(&self) -> Result<(), RpcError> {
+        self.flush().await
     }
 
-    fn enqueue(&self, session_id: &str, patch: &JournalPatch) -> Durable {
+    fn enqueue(&self, session_id: &str, patch: &JournalPatch) -> Result<Durable, RpcError> {
         let (ack, rx) = oneshot::channel();
-        self.outbox.send(Op::Patch { session_id: session_id.to_owned(), patch: patch.clone(), ack });
-        Durable(rx)
+        self.outbox.send(Op::Patch { session_id: session_id.to_owned(), patch: patch.clone(), ack })?;
+        Ok(Durable(rx))
     }
 
     /// Read a session's journal from its stream the first time it is needed. Callers order their

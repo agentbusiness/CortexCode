@@ -1,0 +1,18 @@
+[package]
+name = "cc-skills-security"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode skills@1 plugin: security skills for the model (codebase audit, review of a change, triage of a reported vulnerability) with the bundled secaudit tool."
+
+# Own workspace: every plugin directory builds independently.
+[workspace]
+
+[[bin]]
+name = "cc-skills-security"
+path = "src/main.rs"
+
+[dependencies]
+cc-lang-kit = { path = "../../../lang-kit" }

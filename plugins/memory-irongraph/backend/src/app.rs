@@ -39,8 +39,6 @@ fn doc<T: serde::Serialize>(record: &T) -> Result<String, RpcError> {
 
 impl AppStore {
     pub async fn open(graph: Arc<Graph>, ig_id: String) -> Result<Self, RpcError> {
-        graph.ensure_index(&ig_id, "app_project_id", "Project", "id").await?;
-        graph.ensure_index(&ig_id, "app_session_id", "Session", "id").await?;
         Ok(Self { graph, ig_id })
     }
 
@@ -71,6 +69,7 @@ impl AppStore {
             params! { "id" => project.id, "root" => project.root, "name" => project.name, "created" => project.created_ms, "doc" => doc(project)? },
         )
         .await?;
+        self.graph.ensure_index(&self.ig_id, "app_project_id", "Project", "id").await?;
         // Its settings node, when it has one, belongs to it.
         self.run(
             &format!("{} MATCH (p:Project {{id: $id}}), (s:Settings {{scope: $id}}) MERGE (p)-[:HAS_SETTINGS]->(s)", layer::WORKSPACE_WRITE),
@@ -108,6 +107,7 @@ impl AppStore {
             },
         )
         .await?;
+        self.graph.ensure_index(&self.ig_id, "app_session_id", "Session", "id").await?;
         self.run(
             &format!("{} MATCH (p:Project {{id: $project}}), (s:Session {{id: $id}}) MERGE (p)-[:HAS_SESSION]->(s)", layer::WORKSPACE_WRITE),
             params! { "id" => session.id, "project" => session.project_id },

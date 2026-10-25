@@ -4,7 +4,7 @@ use crate::engine::Hibernated;
 use crate::runtime::{Config, Paths, Publisher, Runtime, expand_home};
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::{
-    CacheKeyParams, ChatMessage, ChatParams, CompleteParams, EndpointResult, HoldParams, PrewarmParams, Priority, Sampling,
+    CacheKeyParams, ChatMessage, ChatParams, CompleteParams, HoldParams, PrewarmParams, Priority, Sampling,
     SelectParams, Thinking, TokenizeParams, methods,
 };
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, parse_params, to_value};
@@ -23,7 +23,6 @@ pub const PROVIDES: &[&str] = &[
     methods::HIBERNATE,
     methods::HOLD,
     methods::PREWARM,
-    methods::ENDPOINT,
     methods::VARIANTS,
     methods::SELECT,
 ];
@@ -127,16 +126,6 @@ async fn dispatch(runtime: Arc<Runtime>, call: Call) -> Result<Value, RpcError> 
             let params: PrewarmParams = parse_params(params)?;
             runtime.prewarm(params, cancel).await
         }
-        methods::ENDPOINT => {
-            let loaded = runtime.ready().await?;
-            let mut endpoint = runtime.endpoint.lock().await;
-            if endpoint.is_none() {
-                let port = runtime.config.endpoint_port.unwrap_or(0);
-                *endpoint = Some(crate::endpoint::start(runtime.clone(), port).await.map_err(RpcError::internal)?);
-            }
-            let base_url = endpoint.as_ref().map(crate::endpoint::Endpoint::base_url).unwrap_or_default();
-            to_value(&EndpointResult { base_url, model: loaded.variant.clone() })
-        }
         methods::VARIANTS => {
             let runtime = runtime.clone();
             let result = tokio::task::spawn_blocking(move || runtime.variants())
@@ -164,6 +153,16 @@ fn check(name: &str, started: Instant, outcome: Result<String, String>) -> Probe
 async fn probe(runtime: Arc<Runtime>) -> ProbeReport {
     let mut checks = Vec::new();
     let started = Instant::now();
+    // A model being downloaded (a first start) is the plugin working, not failing: the check says
+    // how far it is, and the generation check follows once it has loaded.
+    match runtime.installing_or_ready().await {
+        Ok(Err(progress)) => {
+            let gb = |bytes: u64| bytes as f64 / 1e9;
+            checks.push(check("model downloading", started, Ok(format!("{}: {:.1} of {:.1} GB", progress.variant, gb(progress.bytes), gb(progress.total)))));
+            return ProbeReport::from_checks(checks);
+        }
+        Ok(Ok(_)) | Err(_) => {}
+    }
     let loaded = runtime.ready().await;
     checks.push(check(
         "model loaded",

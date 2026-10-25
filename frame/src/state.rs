@@ -71,8 +71,8 @@ impl StateStore {
         }
         let name = canonical.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.clone());
         let project = Project { id: id.clone(), root, name, created_ms: now_ms() };
+        self.outbox.send(Op::PutProject(project.clone()))?;
         inner.projects.insert(id, project.clone());
-        self.outbox.send(Op::PutProject(project.clone()));
         Ok((project, true))
     }
 
@@ -113,8 +113,8 @@ impl StateStore {
             updated_ms: now,
             model: None,
         };
+        self.outbox.send(Op::PutSession(session.clone()))?;
         inner.sessions.insert(session.id.clone(), session.clone());
-        self.outbox.send(Op::PutSession(session.clone()));
         Ok(session)
     }
 
@@ -152,8 +152,8 @@ impl StateStore {
             session.model = Some(model);
         }
         session.updated_ms = now_ms().max(previous.updated_ms);
+        self.outbox.send(Op::PutSession(session.clone()))?;
         inner.sessions.insert(session.id.clone(), session.clone());
-        self.outbox.send(Op::PutSession(session.clone()));
         Ok(session)
     }
 
@@ -164,8 +164,8 @@ impl StateStore {
             return Err(RpcError::not_found(format!("no session `{id}`")));
         }
         let doomed = descendants(&inner.sessions, &[id.to_owned()]);
+        self.outbox.send(Op::DeleteSessions(doomed.clone()))?;
         let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
-        self.outbox.send(Op::DeleteSessions(removed.iter().map(|session| session.id.clone()).collect()));
         Ok(removed)
     }
 
@@ -175,12 +175,12 @@ impl StateStore {
         let project = inner.projects.get(id).cloned().ok_or_else(|| RpcError::not_found(format!("no project `{id}`")))?;
         let own: Vec<String> = inner.sessions.values().filter(|session| session.project_id == id).map(|session| session.id.clone()).collect();
         let doomed = descendants(&inner.sessions, &own);
-        let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
-        inner.projects.remove(id);
         // Sessions first: a project without its record but with sessions left would be worse than
         // the reverse, which the next delete finishes.
-        self.outbox.send(Op::DeleteSessions(removed.iter().map(|session| session.id.clone()).collect()));
-        self.outbox.send(Op::DeleteProject(project.id.clone()));
+        self.outbox.send(Op::DeleteSessions(doomed.clone()))?;
+        self.outbox.send(Op::DeleteProject(project.id.clone()))?;
+        let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
+        inner.projects.remove(id);
         Ok((project, removed))
     }
 
@@ -196,9 +196,14 @@ impl StateStore {
         }
         let mut state = self.ui_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let next = UiStateDocument { document, rev: state.rev + 1, updated_ms: now_ms() };
-        self.outbox.send(Op::UiState(next.clone()));
+        self.outbox.send(Op::UiState(next.clone()))?;
         *state = next;
         Ok(state.rev)
+    }
+
+    /// Mutating frame calls acknowledge only after the ordered store outbox is durable.
+    pub async fn flush(&self) -> Result<(), RpcError> {
+        self.outbox.flush().await
     }
 }
 

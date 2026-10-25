@@ -150,6 +150,7 @@ pub async fn refine(env: &RunEnv, journal: &mut Journal, proposed: &Contract) ->
                     "host_message": true,
                     "passed": report.checks.iter().filter(|check| check.ok).count(),
                     "checks": report.checks.len(),
+                    "failed_tests": failed_tests_by_command(&report),
                 }),
             )
             .await?;
@@ -193,6 +194,53 @@ pub async fn propose_after_failure(env: &RunEnv, journal: &mut Journal, current:
         return Ok(None);
     }
     Ok(Some((revised, live)))
+}
+
+/// Each failed check's failing tests by its command (only checks whose report names them all).
+fn failed_tests_by_command(report: &VerifyReport) -> Value {
+    let mut map = serde_json::Map::new();
+    for check in report.checks.iter().filter(|check| !check.ok) {
+        if let (Some(names), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) {
+            map.insert(spec.spec.clone(), json!(names));
+        }
+    }
+    Value::Object(map)
+}
+
+/// The tests a check failed before the work too, out of the ones failing now.
+pub struct FailedBefore {
+    /// Checks that pass now except for tests that failed before the work too: counted as passed.
+    pub settled: Vec<String>,
+    /// Failing tests that failed before the work too, in checks that still fail for other tests.
+    pub also_before: Vec<String>,
+}
+
+/// Compare the failed checks with the run before the work (the latest baseline of this run): a
+/// check whose failing tests all failed before the work too is the project's state, not this
+/// work's, so it counts as passed (seen: a project's temp-folder tests failing in the sandbox sent
+/// the model to rewrite the project's test helper). A check without the names on both sides stays
+/// failed.
+pub fn failed_before(journal: &Journal, run_id: &str, report: &mut VerifyReport) -> FailedBefore {
+    let mut outcome = FailedBefore { settled: Vec::new(), also_before: Vec::new() };
+    let Some(before) = run_notes(journal, run_id, "baseline").last().and_then(|note| note.data.get("failed_tests")).and_then(Value::as_object).cloned() else {
+        return outcome;
+    };
+    let specs: Vec<(String, String)> = report.contract.checks.iter().map(|spec| (spec.name.clone(), spec.spec.clone())).collect();
+    for check in report.checks.iter_mut().filter(|check| !check.ok && !check.indeterminate) {
+        let Some(now) = &check.failed_tests else { continue };
+        let Some(spec) = specs.iter().find(|(name, _)| *name == check.name).map(|(_, spec)| spec) else { continue };
+        let Some(earlier) = before.get(spec).and_then(Value::as_array) else { continue };
+        let earlier: Vec<&str> = earlier.iter().filter_map(Value::as_str).collect();
+        let (old, new): (Vec<&String>, Vec<&String>) = now.iter().partition(|name| earlier.contains(&name.as_str()));
+        if new.is_empty() {
+            check.ok = true;
+            outcome.settled.extend(old.into_iter().cloned());
+        } else {
+            outcome.also_before.extend(old.into_iter().cloned());
+        }
+    }
+    report.ok = report.checks.iter().all(|check| check.ok);
+    outcome
 }
 
 /// The baseline output a proposal made before the work rests on.

@@ -62,9 +62,9 @@ fn setting(path: &str, entry: &Value) -> SettingValue {
 
 impl Settings {
     pub async fn open(graph: Arc<Graph>, ig_id: String) -> Result<Self, RpcError> {
-        graph.ensure_index(&ig_id, "settings_scope", "Settings", "scope").await?;
         let settings = Self { graph, ig_id, write: Mutex::new(()) };
         settings.run(&format!("{} MERGE (s:Settings {{scope: $scope}})", layer::WORKSPACE_WRITE), params! { "scope" => GLOBAL }).await?;
+        settings.graph.ensure_index(&settings.ig_id, "settings_scope", "Settings", "scope").await?;
         Ok(settings)
     }
 

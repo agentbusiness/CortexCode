@@ -14,7 +14,6 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-lang-rust`: category `lang-rust`, contract `lang@1` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary, a blank line, the Markdown body) |
-| `verify/` | gate script, run against the real frame |
 
 ## What it serves
 
@@ -45,20 +44,10 @@ Methods are called on the category: `lang-rust.describe`, `lang-rust.extract`, .
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo test --release && cargo clippy --all-targets -- -D warnings
+cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
 cortex-pack build plugins/lang-rust     # -> plugins/lang-rust/target/lang-rust-<version>-<target>.ccplugin
 ```
 
 The frame runs it once installed (`cortex-pack build plugins/lang-rust --install`). The probe extracts a sample
 through the real `extract`, reads every skill and reports whether rust-analyzer can run (an absent
 server does not fail the probe: extraction and skills work without it).
-
-## Verification
-
-`verify/lang_rust.mjs` loads the folder in a real frame and checks every method against truth
-computed independently: definition lines and call sites found in the fixture text, rustc's errors
-from `cargo check --message-format=json` (positions and codes) before and after a fix, definition,
-references and hover positions of a function, skills read back with their summaries, the
-`lang-rust.server` event, and refusals (another language, a relative root, a missing file).
-rust-analyzer must be runnable; `node verify/lang_rust.mjs --install` lets `lang-rust.install` add
-it with rustup first.

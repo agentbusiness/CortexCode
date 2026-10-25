@@ -23,6 +23,7 @@ cc-lang-kit = { path = "../../../lang-kit" }
 tree-sitter-rust = "0.24"
 toml = "0.9"
 serde_json = "1.0.149"
+semver = "1"
 
 [dev-dependencies]
 tempfile = "3.27"

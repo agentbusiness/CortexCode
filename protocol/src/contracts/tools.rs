@@ -81,6 +81,10 @@ pub struct SchemasParams {
     /// Edit format to expose: hashline (default) | replace | whole
     #[serde(default)]
     pub edit_format: Option<String>,
+    /// The session's workspace: an offline one (its `.cortex-offline` marker) gets specs and a guide
+    /// that say so up front.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,6 +218,21 @@ pub struct RunResult {
     pub timed_out: bool,
     #[serde(default)]
     pub job_id: Option<String>,
+    /// When the output is a test runner's report: its counts and the failing tests' names, read
+    /// from the whole output (`output` may be shortened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<TestCounts>,
+}
+
+/// A test run's counts, read from its runner's report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TestCounts {
+    pub runner: String,
+    pub ran: usize,
+    pub failed: usize,
+    /// The failing tests' names (as many as the report names; it may name fewer than `failed`).
+    #[serde(default)]
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -37,12 +37,16 @@ impl Shell {
         }
     }
 
+    /// Electron's own executable, as its package names it (`node_modules/electron/path.txt`, relative
+    /// to `dist/`): started directly, so a Mac without Node runs the app bundle's UI.
     pub fn electron(&self) -> PathBuf {
-        self.ui_dir.join("node_modules/.bin/electron")
+        let package = self.ui_dir.join("node_modules/electron");
+        let relative = std::fs::read_to_string(package.join("path.txt")).map(|text| text.trim().to_owned()).unwrap_or_default();
+        package.join("dist").join(relative)
     }
 
     pub fn available(&self) -> bool {
-        self.electron().exists()
+        self.electron().is_file()
     }
 
     pub fn pid(&self) -> u32 {
@@ -68,7 +72,7 @@ impl Shell {
         if !self.available() {
             return Err(RpcError::new(
                 codes::NOT_FOUND,
-                format!("Electron is not installed at {} (run npm install in the ui directory)", self.electron().display()),
+                format!("Electron is not installed at {}", self.electron().display()),
             ));
         }
         self.launch(frame);

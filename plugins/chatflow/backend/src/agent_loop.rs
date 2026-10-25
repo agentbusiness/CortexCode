@@ -46,9 +46,26 @@ pub struct Stops {
     pub park: CancellationToken,
 }
 
+/// Cancels the forwarding task when its caller finishes, including error exits.
+pub struct CombinedStop(CancellationToken);
+
+impl std::ops::Deref for CombinedStop {
+    type Target = CancellationToken;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for CombinedStop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl Stops {
     /// Fires on either signal (for calls that must stop promptly either way).
-    pub fn any(&self) -> CancellationToken {
+    pub fn any(&self) -> CombinedStop {
         let token = CancellationToken::new();
         let (cancel, park, out) = (self.cancel.clone(), self.park.clone(), token.clone());
         tokio::spawn(async move {
@@ -58,7 +75,7 @@ impl Stops {
                 _ = out.cancelled() => {}
             }
         });
-        token
+        CombinedStop(token)
     }
 }
 
@@ -867,7 +884,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 match result {
                     Err(error) if error.code == codes::CANCELLED => continue,
                     Ok(result) if baseline_passed(&result, ran) => {
-                        journal.note(&env.run_id, "baseline", &env.data.text("done_tests_pass_before", &[("command", &command)]), true).await?;
+                        journal.note(&env.run_id, "tests_pass_before", &env.data.text("done_tests_pass_before", &[("command", &command)]), true).await?;
                         continue;
                     }
                     _ => {}
@@ -886,6 +903,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 Err(error) if error.code == codes::CANCELLED => continue,
                 Err(error) => return Err(error),
             };
+            let mut before = crate::checks::failed_before(journal, &env.run_id, &mut report);
             let fixable = |report: &VerifyReport| report.checks.iter().any(|check| !check.ok && !check.indeterminate);
             if fixable(&report) {
                 // A check can turn out to be broken in itself only now. The worker may only propose
@@ -913,6 +931,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             Err(error) if error.code == codes::CANCELLED => continue,
                             Err(error) => return Err(error),
                         };
+                        before = crate::checks::failed_before(journal, &env.run_id, &mut report);
                     }
                 }
             }
@@ -930,9 +949,19 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             env.set_stage("act");
             if report.ok {
+                let mut summary = summary;
+                if !before.settled.is_empty() {
+                    let note = env.data.text("checks_failed_before", &[("tests", &before.settled.join(", "))]);
+                    journal.note(&env.run_id, "failed_before", &note, false).await?;
+                    let _ = env.host.call(memory_methods::TASK_UPDATE, json!({"id": task.id, "status": "done"})).await;
+                    summary = format!("{summary}\n\n{note}");
+                }
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
             }
-            let failures = report_text(&env.data, &report);
+            let mut failures = report_text(&env.data, &report);
+            if !before.also_before.is_empty() {
+                failures.push_str(&env.data.text("checks_partly_failed_before", &[("tests", &before.also_before.join(", "))]));
+            }
             match detector.observe("contract", &failures) {
                 Verdict::Stop(_) => {
                     let summary = format!("The contract kept failing the same way after a corrective replan:{failures}");

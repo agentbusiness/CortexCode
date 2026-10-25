@@ -8,9 +8,8 @@ embedding model lives in `<CORTEX_HOME>/irongraph-models` and its rebuildable ve
 in 0.1.8). Nothing is read from or written to `~/.irongraph`.
 
 One self-contained plugin folder (`plugin.toml`): `backend/` (the Cargo workspace: `src/`,
-`tests/`, `examples/`), `ui/card-index/` (the card's Index section, `card.index@1`, an npm package
-in the `ui/` workspace), `fixtures/` (shared by the tests and the verify scripts), `verify/` and
-`bench/` (measurements). The frame loads it with `[[plugin]] dir = "plugins/memory-irongraph"`;
+`examples/`) and `ui/card-index/` (the card's Index section, `card.index@1`, an npm package in the
+`ui/` workspace). The frame loads it with `[[plugin]] dir = "plugins/memory-irongraph"`;
 `cortex-pack build plugins/memory-irongraph` packs it into a `.ccplugin`.
 
 ## The contract boundary
@@ -20,7 +19,7 @@ Other plugins reach this one only through the named `memory@1` methods
 (`memory.callers {sid}` -> call sites, `memory.files` -> paths). IronGraph, Cypher and the node
 schema stay inside this folder, so another store can replace the plugin by implementing the same
 contract. `memory.query` (read-only Cypher, `src/queries.rs`) is this plugin's own inspection
-method for its tests, verify scripts and `cx call`; it is not part of `memory@1`, and no other
+method for `cx call`; it is not part of `memory@1`, and no other
 plugin calls it. A caller that needs something new gets a new named method here.
 
 What the model needs to know about the store ships with it: `data/skills/irongraph-queries.md`
@@ -127,9 +126,7 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   `$x`, `@x` and keyframes names read in CSS resolve in the file and that chain, else project-wide
   (nearest by directory); a page attribute's id (`for`, `href="#x"`) is the page's own element;
   mixin calls resolve like variables. Element rules (`button {}`) are never linked. Their imports
-  are linked by `local` path (stylesheets, scripts, images, pages). `tests/extract_resolve.rs`
-  covers it on `fixtures/web` (with negative controls: an unimported stylesheet's `.btn`, a class
-  two unimported files define, element names in text and attributes).
+  are linked by `local` path (stylesheets, scripts, images, pages).
 - Resolution is structural: imports (JS/TS relative paths and tsconfig aliases, Python modules,
   Rust module paths and workspace crates, Go import paths by the root `go.mod` module or the
   package directory, Java packages and static imports, C/C++ `#include` by the including directory
@@ -192,14 +189,14 @@ Results show `description` when one was written (`memory.describe`), else `summa
 ## Workspaces (BRAINSTORM §4.3)
 
 `memory.workspace.attach` indexes an agent's copy-on-write clone as **its own IronGraph project**
-(option b). Measured with `verify/workspace_bench.mjs` (`bench/workspace.json`, frame crate, 15 files):
+(option b). Measured on the frame crate (15 files):
 attaching the clone (a full cold index) took 358 ms and IronGraph had embedded it 7.5 s later
 (identical texts re-use its embedding cache); the delta an overlay would ingest (3 changed files)
 took 60 ms. The overlay is cheaper to ingest but every query would have to merge two graphs and mask
 the files the workspace shadows, which IronGraph's graph procedures (`graph.shortestpath`,
 `graph.pagerank`) cannot do across projects, so paths, repo maps and centrality would be wrong in a
 workspace. A per-workspace project keeps every query exact; its cost is one cold index of the
-clone (for a mid-sized application repository, the cold index measured in `bench/index.json`).
+clone.
 Queries with `workspace` set read that project; work state stays in the repository's project.
 
 ## Reference projects (docs/IDEATION-WORKFLOW.md part 2)
@@ -278,22 +275,3 @@ decisions, facts with the user's first, concepts by how much code they bind, ope
 line each, the longest prefix within `budget_tokens` as the model counts them, bytes without a
 model). `memory.knowledge.changed` is published after every write. `tests/knowledge.rs` covers it
 on the real engine.
-
-## Verification
-
-`verify/*.mjs` run against the real frame (`CORTEX_FRAME_BIN`, else `../../frame/target/release/cortex-frame`,
-built when needed) on a temporary `CORTEX_HOME`:
-`fixture_truth.mjs` (G3), `real_repos.mjs` (G4), `incremental.mjs` (G5), `semantic.mjs` (G6),
-`workstate.mjs` (G7), `settings.mjs` (G8), `upgrade_018.mjs` (G9), `workspace_bench.mjs` (measurement).
-Results go to `bench/`. Every verification home is fresh, so `verify/lib.mjs` keeps one verified
-model copy in `$TMPDIR/cc-memory-model-cache` and clones it into each new home (the plugin
-re-verifies it); `tests/embedded.rs` does the same. The scripts' frame loads the language plugins'
-folders beside the memory plugin (`verify/lib.mjs`, `LANG_PLUGINS`) and waits for them to be active.
-
-The Rust tests that need code facts run the real language plugins: `tests/common` is an in-test
-frame peer that answers `frame.plugins.list` and routes `lang-*` methods to the plugins' crates
-(dev-dependencies, served in-process by the kit's `LangPlugin`, the object `run_pack` serves).
-`tests/extract_resolve.rs` checks facts and resolution, `tests/plugin_ids.rs` compares the graph
-rows from the plugins' facts with `fixtures/ids-before-plugins.json` (the in-process extractors'
-rows, recorded before they were removed), and `tests/embedded.rs` covers plugins that start late,
-stop, fail and come back.

@@ -142,6 +142,17 @@ fn status_word(code: u8) -> &'static str {
 /// computes them (attributes, binary detection) without touching the user's index.
 pub struct IntentIndex {
     pub path: PathBuf,
+    objects: PathBuf,
+    alternates: String,
+}
+
+impl IntentIndex {
+    pub fn command(&self, git: &Git, repo: &Repo) -> crate::git::Cmd {
+        git.cmd(&repo.top)
+            .env("GIT_INDEX_FILE", &self.path)
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &self.alternates)
+    }
 }
 
 impl Drop for IntentIndex {
@@ -150,13 +161,20 @@ impl Drop for IntentIndex {
         let mut lock = self.path.clone().into_os_string();
         lock.push(".lock");
         let _ = std::fs::remove_file(PathBuf::from(lock));
+        let _ = std::fs::remove_dir_all(&self.objects);
     }
 }
 
 pub async fn intent_index(git: &Git, repo: &Repo, scratch: &Path, untracked: &[Vec<u8>]) -> Result<IntentIndex, RpcError> {
     std::fs::create_dir_all(scratch)
         .map_err(|error| RpcError::internal(format!("cannot create {}: {error}", scratch.display())))?;
-    let index = IntentIndex { path: scratch.join(format!("index-{}", uuid::Uuid::new_v4().simple())) };
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let objects = scratch.join(format!("objects-{id}"));
+    std::fs::create_dir_all(&objects).map_err(|error| RpcError::internal(format!("cannot create scratch objects: {error}")))?;
+    // Git's C-quoted alternate syntax preserves spaces, colons and backslashes in repository paths.
+    let alternates = serde_json::to_string(&repo.common_dir.join("objects").to_string_lossy())
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    let index = IntentIndex { path: scratch.join(format!("index-{id}")), objects, alternates };
     let source = repo.git_dir.join("index");
     if source.exists() {
         std::fs::copy(&source, &index.path)
@@ -168,8 +186,7 @@ pub async fn intent_index(git: &Git, repo: &Repo, scratch: &Path, untracked: &[V
             list.extend_from_slice(path);
             list.push(0);
         }
-        git.cmd(&repo.top)
-            .env("GIT_INDEX_FILE", &index.path)
+        index.command(&git.confined(scratch), repo)
             .args(["add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"])
             .stdin(list)
             .ok()
@@ -196,7 +213,16 @@ pub async fn status(git: &Git, scratch: &Path, root: &str) -> Result<Status, Rpc
 }
 
 /// Status plus the repository it was computed for (`None` outside a working tree).
-pub async fn status_with_repo(git: &Git, scratch: &Path, root: &str) -> Result<(Status, Option<Repo>), RpcError> {
+pub async fn status_with_repo(
+    git: &Git,
+    scratch: &Path,
+    root: &str,
+) -> Result<(Status, Option<Repo>), RpcError> {
+    std::fs::create_dir_all(scratch).map_err(|error| {
+        RpcError::internal(format!("cannot create Git inspection scratch: {error}"))
+    })?;
+    let confined = git.confined(scratch);
+    let git = &confined;
     let canonical = canonical_root(root)?;
     let Some(repo) = discover(git, &canonical).await? else {
         return Ok((Status {
@@ -236,7 +262,7 @@ pub async fn status_with_repo(git: &Git, scratch: &Path, root: &str) -> Result<(
         // Untracked files enter a scratch copy of the index as intent-to-add entries, so they are
         // counted exactly like git counts a new file (attributes, binary detection).
         let index = intent_index(git, &repo, scratch, &untracked).await?;
-        parse_numstat(&git.cmd(&repo.top).env("GIT_INDEX_FILE", &index.path).args(worktree_args).ok().await?)
+        parse_numstat(&index.command(git, &repo).args(worktree_args).ok().await?)
     };
     // A conflicted file is counted against HEAD (its index entries are the unmerged stages).
     let unmerged: Vec<Vec<u8>> = entries
