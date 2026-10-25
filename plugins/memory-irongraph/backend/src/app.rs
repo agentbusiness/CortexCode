@@ -138,6 +138,11 @@ impl AppStore {
         self.graph.stream_append(&self.ig_id, &topic(session_id), records).await
     }
 
+    /// Drop a session's journal stream: the frame moved it into its own file.
+    pub async fn journal_drop(&self, session_id: &str) -> Result<(), RpcError> {
+        self.graph.drop_topic(&self.ig_id, &topic(session_id)).await
+    }
+
     /// A session's journal patches from `from`: the patches, the offset after them, and whether
     /// nothing follows.
     pub async fn journal_read(&self, session_id: &str, from: u64, max: Option<usize>) -> Result<(Vec<JournalPatch>, u64, bool), RpcError> {

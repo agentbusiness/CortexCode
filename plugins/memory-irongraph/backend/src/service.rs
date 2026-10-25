@@ -12,7 +12,7 @@ use crate::work::WorkStore;
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{
     ExtractProblem, LanguagePlugin, UncoveredFiles,
-    AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalReadParams, JournalReadResult,
+    AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalDropParams, JournalReadParams, JournalReadResult,
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
@@ -179,6 +179,7 @@ pub const PROVIDES: &[&str] = &[
     methods::APP_SESSIONS_DELETE,
     methods::JOURNAL_APPEND,
     methods::JOURNAL_READ,
+    methods::JOURNAL_DROP,
     methods::NOTE_ADD,
     methods::NOTE_SEARCH,
     methods::NOTE_LIST,
@@ -1243,6 +1244,11 @@ impl Memory {
                 let p: JournalReadParams = parse_params(params)?;
                 let (patches, next, end) = self.app().await?.journal_read(&p.session_id, p.from, p.max).await?;
                 to_value(&JournalReadResult { patches, next, end })
+            }
+            methods::JOURNAL_DROP => {
+                let p: JournalDropParams = parse_params(params)?;
+                self.app().await?.journal_drop(&p.session_id).await?;
+                Ok(json!({}))
             }
             methods::NOTE_ADD => {
                 let p: NoteAddParams = parse_params(params)?;

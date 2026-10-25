@@ -1,9 +1,9 @@
-//! Where the frame's records live: the memory plugin keeps them in its main store (`memory.app.*`
-//! for projects and sessions, `memory.journal.*` for each session's journal stream,
-//! `memory.settings.*` at `ui.state` for the workbench's slot state). The frame holds them in
-//! memory while it runs and writes every change through one outbox, in the order it was made: a
-//! journal patch is acknowledged when the store has it. While no memory plugin serves (starting,
-//! swapping, disabled), changes wait in the outbox and go out when one serves again.
+//! Where the frame's records live: the memory plugin keeps projects and sessions (`memory.app.*`)
+//! and the workbench's slot state (`memory.settings.*` at `ui.state`) in its main store. The frame
+//! holds them in memory while it runs and writes every change through one outbox, in the order it
+//! was made. While no memory plugin serves (starting, swapping, disabled), changes wait in the
+//! outbox and go out when one serves again. Session journals are the frame's own files
+//! ([`crate::journal`]); the store's journal streams are read here only to move them into files.
 
 use cc_protocol::contracts::frame::{JournalPatch, Project, Session, UiStateDocument};
 use cc_protocol::contracts::memory::{methods, AppProjectsResult, AppSessionsResult, JournalReadResult};
@@ -15,10 +15,8 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 /// The memory plugin's category.
 pub const MEMORY: &str = "memory";
-/// One call to the store at most this long (a journal page, a batch of patches).
+/// One call to the store at most this long (a journal page, a record).
 const CALL_LIMIT: Duration = Duration::from_secs(60);
-/// Journal patches of one session sent in one call at most.
-const BATCH: usize = 256;
 /// The settings path of the workbench's slot state.
 const UI_STATE: &str = "ui.state";
 
@@ -81,7 +79,6 @@ pub enum Op {
     DeleteProject(String),
     PutSession(Session),
     DeleteSessions(Vec<String>),
-    Patch { session_id: String, patch: JournalPatch, ack: oneshot::Sender<Result<(), String>> },
     UiState(UiStateDocument),
     /// Answered once everything sent before it is written.
     Flush(oneshot::Sender<()>),
@@ -109,41 +106,11 @@ impl Outbox {
     }
 }
 
-/// Write the outbox through, in order, for as long as the frame runs: consecutive patches of one
-/// session go in one call.
+/// Write the outbox through, in order, for as long as the frame runs.
 pub fn spawn_writer(link: Arc<MemoryLink>, mut rx: mpsc::UnboundedReceiver<Op>) {
     tokio::spawn(async move {
-        let mut carried: Option<Op> = None;
-        loop {
-            let op = match carried.take() {
-                Some(op) => op,
-                None => match rx.recv().await {
-                    Some(op) => op,
-                    None => return,
-                },
-            };
+        while let Some(op) = rx.recv().await {
             match op {
-                Op::Patch { session_id, patch, ack } => {
-                    let mut patches = vec![patch];
-                    let mut acks = vec![ack];
-                    while patches.len() < BATCH {
-                        match rx.try_recv() {
-                            Ok(Op::Patch { session_id: next, patch, ack }) if next == session_id => {
-                                patches.push(patch);
-                                acks.push(ack);
-                            }
-                            Ok(other) => {
-                                carried = Some(other);
-                                break;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    write(&link, methods::JOURNAL_APPEND, json!({"session_id": session_id, "patches": patches})).await;
-                    for ack in acks {
-                        let _ = ack.send(Ok(()));
-                    }
-                }
                 Op::Flush(done) => {
                     let _ = done.send(());
                 }
@@ -156,8 +123,8 @@ pub fn spawn_writer(link: Arc<MemoryLink>, mut rx: mpsc::UnboundedReceiver<Op>) 
     });
 }
 
-/// Never move past an unacknowledged write: upserts/deletes are idempotent, and journal
-/// revisions make an append retried after an ambiguous timeout harmless during replay.
+/// Never move past an unacknowledged write: upserts and deletes are idempotent, so a write
+/// retried after an ambiguous timeout is harmless.
 async fn write(link: &MemoryLink, method: &str, params: Value) {
     let mut retry = Duration::from_millis(250);
     loop {
@@ -180,7 +147,7 @@ fn request(op: Op) -> (&'static str, Value) {
         Op::PutSession(session) => (methods::APP_SESSION_PUT, json!({ "session": session })),
         Op::DeleteSessions(ids) => (methods::APP_SESSIONS_DELETE, json!({ "ids": ids })),
         Op::UiState(document) => (methods::SETTINGS_SET, json!({ "path": UI_STATE, "value": document, "by": "frame" })),
-        Op::Patch { .. } | Op::Flush(_) => unreachable!("written by the writer loop"),
+        Op::Flush(_) => unreachable!("answered by the writer loop"),
     }
 }
 
@@ -196,7 +163,8 @@ pub async fn load(link: &MemoryLink) -> Result<(Vec<Project>, Vec<Session>, Opti
     Ok((projects.projects, sessions.sessions, ui_state))
 }
 
-/// A session's whole journal, in order (empty when it has none).
+/// A session's whole journal as the store's stream holds it, in order (empty when it has none).
+/// Earlier versions wrote journals there; [`crate::journal::Journal::migrate_streams`] moves them.
 pub async fn read_journal(link: &MemoryLink, session_id: &str) -> Result<Vec<JournalPatch>, RpcError> {
     let mut patches = Vec::new();
     let mut from = 0u64;
@@ -210,4 +178,9 @@ pub async fn read_journal(link: &MemoryLink, session_id: &str) -> Result<Vec<Jou
             return Ok(patches);
         }
     }
+}
+
+/// Drop a session's journal stream once its file is written.
+pub async fn drop_journal(link: &MemoryLink, session_id: &str) -> Result<(), RpcError> {
+    link.call(methods::JOURNAL_DROP, json!({ "session_id": session_id })).await.map(|_| ())
 }

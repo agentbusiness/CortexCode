@@ -28,7 +28,7 @@ pub fn describe(env: &PluginEnv) -> Result<Description, RpcError> {
     Ok(Description {
         id: "memory".into(),
         name: "Memory (IronGraph)".into(),
-        skills: listed.into_iter().map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies }).collect(),
+        skills: listed.into_iter().map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done }).collect(),
     })
 }
 

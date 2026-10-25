@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """secaudit: the mechanical half of a source-code security audit, for CortexCode's model.
 
+    python3 secaudit.py next                       the one driving command: maps the project on the first call, then the next lines to judge, then the report
+    python3 secaudit.py settle <id>... safe|hardening|lead|finding|blocked ["note"]
     python3 secaudit.py recon [--scope <path>...] [--out <dir>]
     python3 secaudit.py hunt <unit>
     python3 secaudit.py cover <unit> covered|candidate|blocked ["<note>"]
@@ -261,11 +263,25 @@ def load_catalog(directory):
     return classes
 
 
+PREVIOUS_CLASS = {
+    "id": "previous", "name": "Issues of the previous audit", "applies": {}, "patterns": [],
+    "invariant": "Every issue the previous audit reported is either fixed in the current code or still open and carried into this report.",
+    "look": [
+        "A confirmed finding or lead: read the flagged line and its callers again; the pre-check says whether the line is unchanged, moved or gone, which is a hint, not a verdict.",
+        "A hardening note: is the change made (an upgrade, a moved secret, a tightened check)?",
+        "A dependency note: the pre-check compares the pinned version with the previous one and OSV's current answer."
+    ],
+    "counts": "A previous finding whose path still exists unchanged is still a finding: settle it as still. A previous issue that the code no longer has is fixed.",
+    "hardening": "A previous hardening note not acted on stays a hardening note (still).",
+}
+
+
 class Catalog:
     def __init__(self, directory=None):
         self.directory = directory or str(HERE)
         self.classes = load_catalog(self.directory)
         self.by_id = {cls["id"]: cls for cls in self.classes}
+        self.by_id["previous"] = PREVIOUS_CLASS
 
     def patterns_for(self, lang):
         """(class id, pattern) pairs that apply to files of `lang`."""
@@ -528,9 +544,9 @@ def deps_lines(rows, packages, more, shown=DEPS_SHOWN):
             ids = row["id"] + (" " + row["aliases"][0] if row["aliases"] else "")
             lines.append("    %s %s: %s" % (ids, row["severity"], row["summary"]))
         if len(group) > 3:
-            lines.append("    ... %d more in deps.json" % (len(group) - 3))
+            lines.append("    ... %d more advisories in tmp/secaudit/deps.json" % (len(group) - 3))
     if len(ordered) > shown:
-        lines.append("  ... %d more packages: the dependencies unit lists them" % (len(ordered) - shown))
+        lines.append("  ... %d more packages (all of them in tmp/secaudit/deps.json; the dependencies unit shows each as a line to judge)" % (len(ordered) - shown))
     return lines
 
 
@@ -798,8 +814,10 @@ class State:
 
     def __init__(self, root, out):
         self.root = root
-        self.out = os.path.join(root, out)
-        self.out_rel = out
+        self.out = out if os.path.isabs(out) else os.path.join(root, out)
+        self.out_rel = out if os.path.isabs(out) else out
+        self.drafts = os.path.join(root, drafts_dir())
+        self.drafts_rel = drafts_dir()
 
     def path(self, name):
         return os.path.join(self.out, name)
@@ -849,6 +867,18 @@ def tool():
 
 
 def default_out():
+    """Where the audit's state and report live: under the app's home (commands may write there and
+    nothing cleans it; the project's `tmp/` is wiped when a turn ends), one folder per project."""
+    home = os.environ.get("CORTEX_HOME")
+    if not home:
+        return OUT_DEFAULT
+    root = os.getcwd()
+    return os.path.join(home, "audits", "%s-%s" % (os.path.basename(root) or "project", hashlib.sha1(root.encode("utf-8")).hexdigest()[:8]))
+
+
+def drafts_dir():
+    """Where record templates are written for the model to fill with `edit` (which writes only inside
+    the workspace): the project's scratch folder."""
     return OUT_DEFAULT
 
 
@@ -889,9 +919,12 @@ def cmd_recon(args):
         fail("no files to audit under %s%s" % (root, (" within " + ", ".join(scope)) if scope else ""), "run from the repository root, or name existing paths after --scope")
     git_head = (git(["rev-parse", "--short", "HEAD"], root) or "").strip()
     dirty = bool((git(["status", "--porcelain"], root) or "").strip())
+    earlier_run = archive_previous(state)
     facts, texts = collect(root, files)
     hits = scan_texts(catalog, texts)
     units = []
+    if earlier_run and earlier_run["issues"]:
+        units.append({"id": "U0", "class": "previous", "name": "Issues of the previous audit", "reason": "%d issues reported on %s" % (len(earlier_run["issues"]), earlier_run["archived"][:8]), "status": "planned", "hits": len(earlier_run["issues"]), "files": len({i.get("file") for i in earlier_run["issues"] if i.get("file")}), "note": ""})
     for cls in catalog.classes:
         ok, reason = applies_to(cls, facts, texts)
         if not ok:
@@ -955,6 +988,10 @@ def cmd_recon(args):
         print("Tests: none found (local checks will be small scripts in tmp/)")
     for line in live_deps(state, root, files, shown=RECON_DEPS_SHOWN):
         print(line)
+    if earlier_run and earlier_run["issues"]:
+        recheck_previous(state, earlier_run, list(project_packages(root, files)))
+        print("")
+        print("A previous audit of this project (%s) reported %d issues; they are U0, re-checked first. Its report is kept at %s." % (earlier_run["archived"][:8], len(earlier_run["issues"]), state.path(earlier_run["report"])))
     print("")
     print("Units (the audit's checklist; each is one attack class that applies here):")
     for unit in units:
@@ -963,8 +1000,8 @@ def cmd_recon(args):
             line += "; last audit: %s" % unit["previous"]["status"]
         print(line)
     print("")
-    print("Written to %s/ (coverage.json, recon.json, hits/). %.1fs." % (out, time.time() - started))
-    print("Next: %s hunt %s" % (tool(), units[0]["id"] if units else "U1"))
+    print("State kept in %s (survives the turn; the project itself is not written). %.1fs." % (state.out, time.time() - started))
+    print("Next: %s next" % tool())
 
 
 # ----------------------------------------------------------------------------- hunt, cover, status
@@ -1050,11 +1087,11 @@ def cmd_hunt(args):
             if len(rows) > HITS_PER_PATTERN:
                 print("    ... %d more" % (len(rows) - HITS_PER_PATTERN))
         if shown < len(hits):
-            listing = os.path.join(state.out_rel, "hits", unit["id"] + ".txt")
-            with open(os.path.join(state.root, listing), "w", encoding="utf-8") as handle:
+            listing = state.path(os.path.join("hits", unit["id"] + ".txt"))
+            with open(listing, "w", encoding="utf-8") as handle:
                 for rel, number, name, text in hits:
                     handle.write("%s:%d  [%s]  %s\n" % (rel, number, name, text))
-            print("All %d lines: read %s" % (len(hits), listing))
+            print("All %d lines: run `cat %s`" % (len(hits), listing))
     print("")
     print("For each line: find where its value comes from (read graph://used-by/<function>, read <path>:<from>-<to>), decide whether a lower-trust party controls it and whether a check you read stops it; then record (%s new <verdict>) or move on." % tool())
     print("Next, when every line is settled: %s cover %s covered|candidate|blocked \"<what settled it>\"" % (tool(), unit["id"]))
@@ -1089,22 +1126,33 @@ def cmd_status(args):
     state = State(os.getcwd(), default_out())
     coverage = state.coverage()
     findings = state.findings()
+    sync_units(state, coverage)
+    states = hit_states(state)
+    open_units = []
     for unit in coverage["units"]:
-        print("  %-4s %-20s %-12s %s" % (unit["id"], unit["class"], unit["status"], unit.get("note", "")[:80]))
-    counts = {v: sum(1 for f in findings if f.get("verdict") == v) for v in VERDICTS}
-    print("Records: %d confirmed, %d needs_validation, %d rejected" % (counts["confirmed"], counts["needs_validation"], counts["rejected"]))
-    drafts = sorted(p for p in os.listdir(state.out) if re.match(r"finding-\d+\.json$", p)) if os.path.isdir(state.out) else []
-    fingerprints = {f.get("fingerprint") for f in findings}
-    pending = [d for d in drafts if (state.load(d, {}) or {}).get("fingerprint") not in fingerprints]
-    if pending:
-        print("Drafts not recorded yet: " + ", ".join(os.path.join(state.out_rel, d) for d in pending))
-    left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress")]
-    if pending:
-        print("Next: %s finding %s" % (tool(), os.path.join(state.out_rel, pending[0])))
-    elif left:
-        print("Next: %s hunt %s" % (tool(), left[0]["id"]))
+        rows = hit_rows(state, unit)
+        left = sum(1 for r in rows if r[0] not in states)
+        if left:
+            open_units.append("%s %s (%d of %d lines open)" % (unit["id"], unit["class"], left, len(rows)))
+    settled = [u for u in coverage["units"] if u["status"] in ("covered", "candidate", "blocked")]
+    if open_units:
+        print("Open: " + "; ".join(open_units[:4]) + ("; and %d more units" % (len(open_units) - 4) if len(open_units) > 4 else "") + ".")
+        for unit in coverage["units"]:
+            if unit.get("error"):
+                print("Failed: %s %s: %s (still open)." % (unit["id"], unit["class"], unit["error"]))
     else:
-        print("Next: %s report" % tool())
+        print("Settled: %s." % (", ".join("%s %s" % (u["id"], u["status"]) for u in settled) or "nothing yet"))
+    counts = {v: sum(1 for f in findings if f.get("verdict") == v) for v in VERDICTS}
+    if findings or not open_units:
+        print("Records: %d confirmed, %d needs_validation, %d rejected" % (counts["confirmed"], counts["needs_validation"], counts["rejected"]))
+    pending = [name for name, _ in pending_records(state)]
+    if pending:
+        print("Drafts not recorded yet: " + ", ".join(os.path.join(state.drafts_rel, d) for d in pending))
+    left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress")]
+    if pending or left or not os.path.isfile(state.path("REPORT.md")):
+        print("Next: %s next" % tool())
+        sys.exit(1)
+    print("The audit is complete; the report is %s." % state.path("REPORT.md"))
 
 
 # ----------------------------------------------------------------------------- findings
@@ -1174,13 +1222,14 @@ def cmd_new(args):
     if not args or args[0] not in TEMPLATES:
         fail("usage: new confirmed|needs_validation|rejected", "%s new confirmed" % tool())
     state = State(os.getcwd(), default_out())
-    os.makedirs(state.out, exist_ok=True)
+    os.makedirs(state.drafts, exist_ok=True)
     n = 1
-    while os.path.exists(state.path("finding-%d.json" % n)):
+    while os.path.exists(os.path.join(state.drafts, "finding-%d.json" % n)):
         n += 1
     name = "finding-%d.json" % n
-    state.save(name, TEMPLATES[args[0]])
-    rel = os.path.join(state.out_rel, name)
+    with open(os.path.join(state.drafts, name), "w", encoding="utf-8") as handle:
+        json.dump(TEMPLATES[args[0]], handle, indent=1)
+    rel = os.path.join(state.drafts_rel, name)
     print("Wrote %s. Replace every value that starts with '? ' using edit; keep the field names." % rel)
     if args[0] == "confirmed":
         print("Severity comes from the demonstrated result, never from the class name; overall never exceeds impact:")
@@ -1223,6 +1272,9 @@ def validate(record, root, catalog):
     for key in FORBIDDEN[verdict]:
         if key in record:
             problems.append("%s does not belong in a %s record: remove it" % (key, verdict))
+    for key in ("unit", "hit"):
+        if key in record and not isinstance(record[key], str):
+            problems.append(key + " must be a string")
     for path in placeholders(record):
         problems.append("%s still holds the template's '? ...' placeholder" % path)
     fp = record.get("fingerprint", "")
@@ -1319,9 +1371,22 @@ def cmd_finding(args):
     replaced = [f for f in findings if f.get("fingerprint") == record["fingerprint"]]
     findings = [f for f in findings if f.get("fingerprint") != record["fingerprint"]]
     record["recorded"] = time.strftime("%Y-%m-%d %H:%M")
+    record["draft"] = path
+    for step in record.get("trace", []):
+        content = read_text(os.path.join(root, step["file"])) or ""
+        lines = content.split("\n")
+        if 0 < step.get("line", 0) <= len(lines):
+            step["text"] = lines[step["line"] - 1].strip()
     findings.append(record)
     findings.sort(key=lambda f: (VERDICTS.index(f["verdict"]), -(SEVERITY.index(f["severity"]["overall"]) if f.get("severity") else -1), f["fingerprint"]))
     state.save("findings.json", findings)
+    if record.get("hit"):
+        states = hit_states(state)
+        states[record["hit"]] = {"status": "finding" if record["verdict"] == "confirmed" else "lead" if record["verdict"] == "needs_validation" else "safe", "note": record["title"], "record": os.path.basename(path)}
+        state.save("hits-state.json", states)
+        coverage = state.load("coverage.json", None)
+        if coverage:
+            sync_units(state, coverage)
     print("Recorded %s as %s%s." % (record["fingerprint"], record["verdict"], " (replaced the earlier record)" if replaced else ""))
     coverage = state.load("coverage.json", None)
     unit = None
@@ -1330,10 +1395,7 @@ def cmd_finding(args):
             if u["class"] == record["class"] or u["id"] == record.get("unit"):
                 unit = u
                 break
-    if unit and unit["status"] in ("planned", "in_progress", "covered"):
-        print("Next: finish %s's other lines, then %s cover %s candidate \"<note>\"" % (unit["id"], tool(), unit["id"]))
-    else:
-        print("Next: %s status" % tool())
+    print("Next: %s next" % tool())
 
 
 # ----------------------------------------------------------------------------- report
@@ -1374,6 +1436,10 @@ def cmd_report(args):
     summary = ", ".join("%d %s" % (counts[level], level) for level in reversed(SEVERITY) if counts[level])
     summary_line = "%d confirmed finding%s%s; %d lead%s needing validation; %d claim%s checked and rejected. %d of %d units covered%s." % (len(confirmed), "" if len(confirmed) == 1 else "s", " (%s)" % summary if summary else "", len(leads), "" if len(leads) == 1 else "s", len(rejected), "" if len(rejected) == 1 else "s", sum(1 for u in coverage["units"] if u["status"] in ("covered", "candidate")), len(coverage["units"]), "; %d blocked" % len(blocked) if blocked else "")
     add(summary_line)
+    add("")
+    judged_all = hit_states(state)
+    if judged_all:
+        add("The reviewer traced %d flagged lines to their source and their effect; each verdict and its reasoning is in the unit reports below." % len(judged_all))
     add("This is one pass by one reviewer: a class marked covered means its suspicious lines were traced, not that it holds no defect.")
     add("")
     add("## Confirmed findings")
@@ -1402,6 +1468,22 @@ def cmd_report(args):
             add("- Impact: " + f["impact"])
             add("- Severity: likelihood %s, impact %s, overall %s" % (f["severity"]["likelihood"], f["severity"]["impact"], f["severity"]["overall"]))
             add("- Fix: in %s, %s. Test: %s" % (f["fix"]["where"], f["fix"]["change"], f["fix"]["test"]))
+    previous = state.load(PREVIOUS_FILE, None)
+    if previous and previous.get("issues"):
+        judged_prev = hit_states(state)
+        add("")
+        add("## Previous audit (%s)" % previous["archived"][:8])
+        add("")
+        fixed = sum(1 for i, issue in enumerate(previous["issues"], 1) if (judged_prev.get("U0.%d" % i) or {}).get("status") == "fixed")
+        still = sum(1 for i, issue in enumerate(previous["issues"], 1) if (judged_prev.get("U0.%d" % i) or {}).get("status") in ("finding", "lead", "hardening"))
+        add("The previous audit reported %d issues; %d are fixed, %d are still open, %d were not re-checked. Its report is kept at %s." % (len(previous["issues"]), fixed, still, len(previous["issues"]) - fixed - still, previous["report"]))
+        add("")
+        add("| Issue | Was | Where | Code now | Verdict |")
+        add("|---|---|---|---|---|")
+        for i, issue in enumerate(previous["issues"], 1):
+            st = judged_prev.get("U0.%d" % i) or {}
+            where = ("%s:%d" % (issue["file"], issue["line"])) if issue.get("file") and issue.get("line") else (issue.get("file") or "")
+            add("| %s | %s | %s | %s | %s |" % (md_escape(issue["title"][:90]), issue["kind"] + ((" " + issue["severity"]) if issue.get("severity") else ""), where, md_escape(issue.get("now", "")), md_escape(VERDICT_WORDS.get(st.get("status"), st.get("status") or "not re-checked") + ((": " + st["note"]) if st.get("note") else ""))))
     deps = state.load("deps.json", {}) or {}
     if deps.get("rows"):
         add("")
@@ -1435,13 +1517,45 @@ def cmd_report(args):
     else:
         for cls, note in hardening:
             add("- %s: %s" % (cls, note))
+    judged = hit_states(state)
+    if judged:
+        add("")
+        add("## Lines judged")
+        add("")
+        add("Every line the tool showed and how the reviewer settled it. `safe` names the check or fact; `hardening` a change worth making without a reachable attack; `blocked` what could not be read or run.")
+        for u in coverage["units"]:
+            rows = [(hid, rel, number, shape, text) for hid, rel, number, shape, text in hit_rows(state, u) if hid in judged]
+            if not rows:
+                continue
+            add("")
+            add("### %s %s" % (u["id"], u["class"]))
+            add("")
+            add("| Line | Where | Shape | Verdict | Reason |")
+            add("|---|---|---|---|---|")
+            for hid, rel, number, shape, text in rows:
+                st = judged[hid]
+                where = ("%s:%d" % (rel, number)) if number else (rel or "")
+                add("| %s | %s | %s | %s | %s |" % (hid, where, md_escape(shape), st["status"], md_escape(st.get("note", ""))))
+    catalog_for_units = Catalog()
+    unit_files = []
+    for u in coverage["units"]:
+        if u["status"] in ("covered", "candidate", "blocked", "in_progress"):
+            unit_files.append((u, unit_report(state, coverage, u, catalog_for_units)))
+    if unit_files:
+        add("")
+        add("## Unit reports")
+        add("")
+        add("One file per attack class, with every reviewed line, its verdict and the reviewer's reasoning:")
+        add("")
+        for u, name in unit_files:
+            add("- [%s %s](units/%s): %s" % (u["id"], u["class"], name, u["status"].replace("_", " ")))
     add("")
     add("## Coverage")
     add("")
     add("| Unit | Class | Why it applies | Lines reviewed | Status | Note |")
     add("|---|---|---|---|---|---|")
     for u in coverage["units"]:
-        add("| %s | %s | %s | %d | %s | %s |" % (u["id"], u["class"], md_escape(u["reason"]), u["hits"], u["status"], md_escape(u.get("note", ""))))
+        add("| %s | %s | %s | %d | %s | %s |" % (u["id"], u["class"], md_escape(u["reason"]), u["hits"], u["status"], md_escape(unit_note(u))))
     if rejected:
         add("")
         add("## Rejected claims")
@@ -1454,7 +1568,7 @@ def cmd_report(args):
     os.makedirs(state.out, exist_ok=True)
     with open(state.path("REPORT.md"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
-    rel = os.path.join(state.out_rel, "REPORT.md")
+    rel = state.path("REPORT.md")
     print("Wrote %s." % rel)
     print(summary_line)
     for f in confirmed:
@@ -1465,7 +1579,7 @@ def cmd_report(args):
         print("  needs validation: %s (%s:%d); missing: %s" % (f["title"], sink["file"], sink["line"], f["blocker"]))
     for u in blocked + left:
         print("  not covered: %s %s%s" % (u["id"], u["class"], (": " + u["note"]) if u.get("note") else ""))
-    print("Next: reply to the user with these findings, the leads, what was not covered, and the report's path (%s)." % rel)
+    print("The report is at %s." % rel)
 
 
 # ----------------------------------------------------------------------------- scan
@@ -1532,9 +1646,650 @@ def cmd_scan(args):
     print("For each line: where does the value come from (read graph://used-by/<function>, read <path>:<from>-<to>), who controls it, which check stops it. A hit is a question, not a finding.")
 
 
+# ----------------------------------------------------------------------------- next and settle: the script drives
+
+HIT_STATUSES = ("safe", "hardening", "lead", "finding", "blocked", "fixed", "still")
+HITS_PER_STEP = 30
+DEPS_PER_STEP = 60
+
+
+def hit_rows(state, unit):
+    """The unit's hits as the model settles them: [(id, file, line, shape, text)]. The dependencies
+    unit's hits are its vulnerable packages; the previous-issues unit's are the last audit's issues;
+    a unit without shape hits has one hit, the unit itself."""
+    if unit["class"] == "previous":
+        return previous_rows(state, unit) or [("%s.0" % unit["id"], "", 0, "the unit", "the previous audit left no issue to re-check; settle the unit")]
+    if unit["class"] == "dependencies":
+        rows = (state.load("deps.json", {}) or {}).get("rows") or []
+        groups = {}
+        for row in rows:
+            groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
+        ordered = sorted(groups.items(), key=lambda kv: (min(SEVERITY_RANK.get(r["severity"], 5) for r in kv[1]), kv[0][1]))
+        out = []
+        for index, ((eco, name, version, lockfile), group) in enumerate(ordered, 1):
+            fix = covering_fix(group)
+            text = "%s %s %s: %d advisor%s, worst %s; %s; %s" % (eco, name, version, len(group), "y" if len(group) == 1 else "ies", group[0]["severity"], ("upgrade to %s" % fix) if fix else "no fixed version", "; ".join("%s %s" % (r["id"], r["summary"][:70]) for r in group[:2]))
+            out.append(("%s.%d" % (unit["id"], index), lockfile, 0, "vulnerable package", text))
+        if out:
+            return out
+        return [("%s.0" % unit["id"], "", 0, "the unit", "no pinned dependency has a known vulnerability (OSV, live); settle the unit")]
+    try:
+        hits = state.load(os.path.join("hits", unit["id"] + ".json"), [])
+        rows = [("%s.%d" % (unit["id"], index), rel, number, name, text) for index, (rel, number, name, text) in enumerate(hits, 1)]
+    except (OSError, ValueError, TypeError) as error:
+        # A damaged hits file never hides the unit: it stays one open line the model settles.
+        return [("%s.0" % unit["id"], "", 0, "the unit", "the unit's lines could not be read (%s): settle the unit blocked with that reason, or run recon again" % error)]
+    if not rows:
+        return [("%s.0" % unit["id"], "", 0, "the unit", "no code shape of this class matched: read its 'look for' items against the entry points and handlers, then settle the unit")]
+    return rows
+
+
+def unit_note(unit):
+    """A unit's note for the reports: what the model noted, and the tool's own failure when it had one."""
+    parts = [unit.get("note", "")]
+    if unit.get("error"):
+        parts.append("the tool failed on this unit: %s" % unit["error"])
+    return "; ".join(p for p in parts if p)
+
+
+LOCATION = re.compile(r"((?:[\w.-]+/)*[\w.-]+\.?[\w-]*):(\d+)")
+
+
+def cited_location(state, note, targets):
+    """The place the note cites for a judgment of several lines: a `path:line` that exists in the
+    project, or, for the dependencies unit, one of the packages or lockfiles judged. None when the
+    note cites nothing that can be checked."""
+    units = {u["id"]: u for u, _ in targets}
+    if any(u["class"] == "dependencies" for u in units.values()):
+        words = set(re.findall(r"[\w@./-]+", note.lower()))
+        for _, (hid, rel, number, shape, text) in targets:
+            head = text.split(":")[0]
+            package = head.split(" ")[1] if " " in head else head
+            for candidate in (package.lower(), package.split("/")[-1].lower(), (rel or "").lower()):
+                if candidate and candidate in words:
+                    return candidate
+        return None
+    for match in LOCATION.finditer(note):
+        rel, number = match.group(1).rstrip("."), int(match.group(2))
+        full = os.path.join(state.root, rel)
+        if not os.path.isfile(full):
+            continue
+        text = read_text(full)
+        if text is not None and 1 <= number <= max(1, text.count("\n") + 1):
+            return "%s:%d" % (rel, number)
+    return None
+
+
+def hit_states(state):
+    return state.load("hits-state.json", {})
+
+
+def unit_status_from_hits(rows, states):
+    """A unit's status from its hits: planned (none settled), in_progress, blocked, candidate or covered."""
+    settled = [states.get(hid) for hid, *_ in rows]
+    if all(s is None for s in settled):
+        return "planned"
+    if any(s is None for s in settled):
+        return "in_progress"
+    kinds = {s["status"] for s in settled}
+    if kinds & {"finding", "lead"}:
+        return "candidate"
+    if "blocked" in kinds:
+        return "blocked"
+    return "covered"
+
+
+def sync_units(state, coverage):
+    """Write every unit's status and note from its hits (the notes of safe, hardening and blocked hits)."""
+    states = hit_states(state)
+    for unit in coverage["units"]:
+        rows = hit_rows(state, unit)
+        status = unit_status_from_hits(rows, states)
+        if status == "planned":
+            # No line judged through settle: the unit keeps what hunt and cover gave it.
+            continue
+        unit["status"] = status
+        notes = []
+        for hid, *_ in rows:
+            s = states.get(hid)
+            if s and s.get("note") and s["status"] in ("hardening", "blocked"):
+                notes.append(s["note"])
+        if notes:
+            unit["note"] = "; ".join(dict.fromkeys(notes))
+    state.save("coverage.json", coverage)
+
+
+def pending_records(state):
+    """Record files written for hits and not yet recorded."""
+    recorded = {f.get("hit") for f in state.findings()}
+    out = []
+    if os.path.isdir(state.drafts):
+        for name in sorted(os.listdir(state.drafts)):
+            if re.match(r"finding-\d+\.json$", name):
+                try:
+                    with open(os.path.join(state.drafts, name), encoding="utf-8") as handle:
+                        record = json.load(handle)
+                except (OSError, ValueError):
+                    continue
+                if record.get("hit") and record.get("hit") not in recorded:
+                    out.append((name, record["hit"]))
+    return out
+
+
+def print_unit_step(state, coverage, unit, catalog, first_time):
+    cls = catalog.by_id[unit["class"]]
+    states = hit_states(state)
+    rows = hit_rows(state, unit)
+    open_rows = [r for r in rows if r[0] not in states]
+    print("%s %s (%s): %d of %d lines open." % (unit["id"], cls["name"], unit["reason"], len(open_rows), len(rows)))
+    if first_time:
+        print("Invariant: " + cls["invariant"])
+        print("Look for:")
+        for item in cls["look"]:
+            print("  - " + item)
+        print("A finding here: " + cls["counts"])
+        print("Only a hardening note: " + cls["hardening"])
+        if not offline_here(state.root):
+            guidance = upstream_guidance(unit["class"])
+            if guidance:
+                print("Upstream guidance (Cloudflare security-audit skill, live):")
+                for line in guidance:
+                    print("  " + line)
+    shown = DEPS_PER_STEP if unit["class"] == "dependencies" else HITS_PER_STEP
+    # A file's run of lines with the same shape is one entry with an id range: one judgment
+    # settles them together (seen: 61 innerHTML lines of two static design files judged one by one).
+    entries = []
+    index = 0
+    while index < len(open_rows):
+        hid, rel, number, shape, text = open_rows[index]
+        run = [open_rows[index]]
+        while index + len(run) < len(open_rows) and open_rows[index + len(run)][1] == rel and open_rows[index + len(run)][3] == shape:
+            run.append(open_rows[index + len(run)])
+        if len(run) >= 3:
+            entries.append(("%s-%s" % (run[0][0], run[-1][0]), rel, 0, shape, "%d lines, e.g. :%d %s" % (len(run), number, text[:110])))
+        else:
+            entries.extend(run)
+        index += len(run)
+    print("Lines to judge now:")
+    for hid, rel, number, shape, text in entries[:shown]:
+        where = ("%s:%d" % (rel, number)) if number else rel
+        print("  %s  %s  [%s]  %s" % (hid, where, shape, text[:150]))
+    if len(entries) > shown:
+        print("  ... %d more come with the next `next` once these are settled (one control that covers a whole file or the unit settles them together: settle %s safe \"<the control>\")" % (len(entries) - shown, unit["id"]))
+    if any("-" in e[0] for e in entries[:shown]):
+        print("  A range (U3.4-U3.20) is one file's lines of one shape: settle the range with one reason, or a single id inside it.")
+    print("")
+    print("For each line: where does the value come from (read <path>:<from>-<to> around it, read graph://used-by/<function>), who controls it, which check stops it. Then settle it:")
+    print("  %s settle %s safe \"<the check or fact that settles it, with path:line>\"" % (tool(), open_rows[0][0] if open_rows else unit["id"]))
+    print("  %s settle <ids...> hardening \"<the note, e.g. the upgrade>\" | blocked \"<what could not be read or run>\"" % tool())
+    print("  %s settle <id> finding   (a confirmed vulnerability)  |  lead   (one fact outside the code decides)" % tool())
+    if unit["class"] == "previous":
+        print("  %s settle <ids...> fixed \"<what changed, with path:line>\"  |  still \"<re-verified how>\"   (a still finding or lead is carried into this report as it was)" % tool())
+    print("Several ids share one reason: settle U3.1 U3.2 U3.5 safe \"...\". A finding or lead gets a record file to fill before the next step.")
+    print("Next: settle the lines above, then %s next" % tool())
+
+
+def cmd_next(args):
+    root = os.getcwd()
+    state = State(root, default_out())
+    catalog = Catalog()
+    coverage = state.load("coverage.json", None)
+    if coverage is not None and os.path.isfile(state.path("REPORT.md")) and not coverage.get("report_stale", True):
+        # The last audit of this project is complete: this is a new run. recon archives the old one
+        # and seeds U0 with its issues.
+        coverage = None
+    if coverage is None:
+        cmd_recon([])
+        coverage = state.coverage()
+        print("")
+    pending = pending_records(state)
+    if pending:
+        name, hid = pending[0]
+        print("The record for %s is not written yet: %s still holds its template." % (hid, os.path.join(state.drafts_rel, name)))
+        print("Next: fill every '? ' value with edit, then %s finding %s" % (tool(), os.path.join(state.drafts_rel, name)))
+        sys.exit(1)
+    sync_units(state, coverage)
+    states = hit_states(state)
+    open_units = [u for u in coverage["units"] if any(r[0] not in states for r in hit_rows(state, u))]
+    # A unit whose step failed is shown after the others, and never dropped: it stays open until
+    # its lines are settled, and comes back for a retry; a second failure hands the model the
+    # settle that records the failure in the report.
+    open_units.sort(key=lambda u: 1 if u.get("error") else 0)
+    for position, unit in enumerate(open_units):
+        first_time = unit["status"] == "planned"
+        try:
+            if first_time:
+                unit["status"] = "in_progress"
+                state.save("coverage.json", coverage)
+            print_unit_step(state, coverage, unit, catalog, first_time)
+        except SystemExit:
+            raise
+        except Exception as error:  # noqa: BLE001 - any failure of one unit's step
+            message = "%s: %s" % (type(error).__name__, str(error)[:200])
+            failed_before = unit.get("error")
+            unit["error"] = message
+            state.save("coverage.json", coverage)
+            print("")
+            if failed_before or position == len(open_units) - 1:
+                print("%s %s could not be shown%s: %s" % (unit["id"], unit["class"], " again" if failed_before else "", message))
+                print("The unit stays open until its lines are settled; the report lists it as not assessed with this reason.")
+                print("Next: %s settle %s blocked \"the tool failed on this unit: %s\"" % (tool(), unit["id"], message.replace('"', "'")))
+                sys.exit(1)
+            print("%s %s could not be shown (%s); it stays open and comes back after the other units." % (unit["id"], unit["class"], message))
+            print("")
+            continue
+        if unit.pop("error", None) is not None:
+            state.save("coverage.json", coverage)
+        return
+    if not os.path.isfile(state.path("REPORT.md")) or coverage.get("report_stale", True):
+        coverage["report_stale"] = False
+        state.save("coverage.json", coverage)
+        print("Every line of every unit is settled. Writing the report.")
+        cmd_report([])
+        print("")
+        print("Next: %s next" % tool())
+        return
+    report_path = state.path("REPORT.md")
+    print("The audit is complete. The report (%s):" % report_path)
+    print("")
+    with open(report_path, encoding="utf-8") as handle:
+        print(handle.read())
+    print("Next: reply to the user with the report's summary, every confirmed finding (severity, title, path:line, result, fix), every lead with its missing fact, what was not covered, and the report's path %s." % report_path)
+
+
+def cmd_settle(args):
+    if len(args) < 2:
+        fail("usage: settle <id or unit>... safe|hardening|lead|finding|blocked [\"note\"]", "%s next" % tool())
+    state = State(os.getcwd(), default_out())
+    coverage = state.coverage()
+    catalog = Catalog()
+    ids, status, note = [], None, ""
+    for index, arg in enumerate(args):
+        if arg in HIT_STATUSES:
+            status, note = arg, " ".join(args[index + 1:]).strip().strip('"')
+            break
+        ids.append(arg.upper())
+    if status is None or not ids:
+        fail("usage: settle <id or unit>... safe|hardening|lead|finding|blocked [\"note\"]", "%s next" % tool())
+    if status in ("fixed", "still") and not all(i.startswith("U0") for i in ids):
+        fail("fixed and still are for the previous audit's issues (U0) only", "%s next" % tool())
+    if status in ("safe", "hardening", "blocked", "fixed", "still") and len(note) < 8:
+        fail("%s needs the reason (the check or fact, with path:line)" % status, "%s settle %s %s \"<reason>\"" % (tool(), " ".join(ids), status))
+    states = hit_states(state)
+    units = {u["id"]: u for u in coverage["units"]}
+    targets = []
+    for ident in ids:
+        unit_id = ident.split(".")[0]
+        unit = units.get(unit_id)
+        if unit is None:
+            fail("no unit %s" % unit_id, "%s next" % tool())
+        rows = hit_rows(state, unit)
+        if "-" in ident:
+            first, last = ident.split("-", 1)
+            if "." not in last:
+                last = unit_id + "." + last
+            index_of = {r[0]: i for i, r in enumerate(rows)}
+            if first not in index_of or last not in index_of or index_of[first] > index_of[last]:
+                fail("no range %s in %s (%s to %s)" % (ident, unit_id, rows[0][0], rows[-1][0]), "%s next" % tool())
+            targets.extend((unit, r) for r in rows[index_of[first]:index_of[last] + 1] if r[0] not in states)
+            continue
+        if "." in ident:
+            row = next((r for r in rows if r[0] == ident), None)
+            if row is None:
+                fail("no line %s (the unit has %s to %s)" % (ident, rows[0][0], rows[-1][0]), "%s next" % tool())
+            targets.append((unit, row))
+        else:
+            targets.extend((unit, r) for r in rows if r[0] not in states)
+            if not any(r[0] not in states for r in rows):
+                fail("%s has no open line" % unit_id, "%s next" % tool())
+    if status in ("finding", "lead") and len(targets) > 3:
+        fail("a finding or lead is one root cause: name at most three lines for one record", "%s settle <id> %s" % (tool(), status))
+    # One judgment over several lines stands on a place the reviewer read: the control that covers
+    # them, as path:line (a package or lockfile for the dependencies unit). Without it a unit could
+    # be waved through unread.
+    cited = None
+    if status == "blocked" and all(u.get("error") for u in {u["id"]: u for u, _ in targets}.values()):
+        cited = "tool failure"  # the unit's step failed: the failure is the reason, no line was shown
+    elif status in ("safe", "hardening", "blocked") and len(targets) > 1:
+        cited = cited_location(state, note, targets)
+        if cited is None:
+            first = targets[0][1]
+            example = ("%s:%d" % (first[1], first[2])) if first[1] and first[2] else (first[1] or "src/app.py:42")
+            if targets[0][0]["class"] == "dependencies":
+                fail("a judgment of %d packages names the package or lockfile it rests on" % len(targets), "%s settle %s %s \"<reason naming the package>\"" % (tool(), " ".join(ids), status))
+            fail("a judgment of %d lines names the place you read that covers them, as path:line in the project (e.g. %s)" % (len(targets), example), "%s settle %s %s \"<reason with path:line>\"" % (tool(), " ".join(ids), status))
+    written = []
+    previous = state.load(PREVIOUS_FILE, None) or {"issues": []}
+    for unit, (hid, rel, number, shape, text) in targets:
+        if status == "still" and unit["class"] == "previous":
+            issue = previous["issues"][int(hid.split(".")[1]) - 1] if "." in hid and hid.split(".")[1].isdigit() else None
+            if issue and issue.get("record"):
+                record = dict(issue["record"])
+                record["hit"] = hid
+                record["unit"] = unit["id"]
+                record["carried_from"] = previous.get("archived", "")
+                record["recorded"] = time.strftime("%Y-%m-%d %H:%M")
+                findings = [f for f in state.findings() if f.get("fingerprint") != record.get("fingerprint")]
+                findings.append(record)
+                state.save("findings.json", findings)
+                states[hid] = {"status": "finding" if record["verdict"] == "confirmed" else "lead", "note": "still open: " + note, "record": "carried"}
+            else:
+                states[hid] = {"status": "hardening", "note": "still open: " + note}
+            continue
+        if status in ("finding", "lead"):
+            os.makedirs(state.drafts, exist_ok=True)
+            n = 1
+            while os.path.exists(os.path.join(state.drafts, "finding-%d.json" % n)) or os.path.exists(state.path("finding-%d.json" % n)):
+                n += 1
+            name = "finding-%d.json" % n
+            record = json.loads(json.dumps(TEMPLATES["confirmed" if status == "finding" else "needs_validation"]))
+            record["class"] = unit["class"]
+            record["unit"] = unit["id"]
+            record["hit"] = hid
+            record["fingerprint"] = "? %s:%s:<function>" % (unit["class"], rel or "<file>")
+            if unit["class"] == "dependencies" and rel:
+                package = text.split(":")[0].split(" ")[1] if " " in text.split(":")[0] else text.split(":")[0]
+                record["fingerprint"] = ("dependencies:%s:%s" % (rel, package)).lower()
+                record["title"] = "? what a lower-trust party can do through %s at the pinned version" % package
+                lock_text = read_text(os.path.join(state.root, rel)) or ""
+                line_no = next((i for i, l in enumerate(lock_text.split("\n"), 1) if package.split("/")[-1] in l), 1)
+                record["trace"][-1] = {"kind": "sink", "file": rel, "line": line_no, "what": "? the package at its pinned version, and the call in this project that reaches the vulnerable code"}
+            elif rel and number:
+                record["trace"][-1] = {"kind": "sink", "file": rel, "line": number, "what": "? what the value does here: " + text[:80]}
+            with open(os.path.join(state.drafts, name), "w", encoding="utf-8") as handle:
+                json.dump(record, handle, indent=1)
+            written.append((hid, os.path.join(state.drafts_rel, name)))
+            states[hid] = {"status": status, "note": note, "record": name}
+        else:
+            states[hid] = {"status": status, "note": note}
+            if cited:
+                states[hid]["cited"] = cited
+    state.save("hits-state.json", states)
+    sync_units(state, coverage)
+    coverage = state.coverage()
+    coverage["report_stale"] = True
+    state.save("coverage.json", coverage)
+    closed = []
+    for unit in {u["id"]: u for u, _ in targets}.values():
+        if unit["status"] in ("covered", "candidate", "blocked"):
+            closed.append((unit, state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))))
+    print("Settled %s as %s." % (", ".join(hid for _, (hid, *_) in targets), status))
+    if written:
+        for hid, path in written:
+            print("Record for %s: %s" % (hid, path))
+        if status == "finding":
+            print("Severity comes from the demonstrated result, never from the class name; overall never exceeds impact:")
+            for anchor in SEVERITY_ANCHORS:
+                print("  " + anchor)
+        print("Next: fill every '? ' value of %s with edit (trace: entrypoint first, the sink is prefilled; a real path:line each), then %s finding %s" % (written[0][1], tool(), written[0][1]))
+        return
+    still_open = any(r[0] not in states for u in coverage["units"] for r in hit_rows(state, u))
+    if closed and still_open:
+        # A unit is one piece of the work: its one-line result goes to the user now, and the audit
+        # goes on with the next unit from the state on disk (the host continues the turn while the
+        # tool says work is open), so each unit starts from a short history.
+        for unit, report_path in closed:
+            print("%s is settled: %s" % (unit["id"], unit_line(state, unit, catalog, report_path)))
+        print("Next: reply to the user with that one line; the audit goes on with the next unit after it.")
+    else:
+        print("Next: %s next" % tool())
+
+
+def unit_line(state, unit, catalog, report_path):
+    """One line on a settled unit for the user: counts per verdict and where its report is."""
+    states = hit_states(state)
+    counts = {}
+    for hid, *_ in hit_rows(state, unit):
+        st = states.get(hid)
+        key = st["status"] if st else "open"
+        counts[key] = counts.get(key, 0) + 1
+    parts = ["%d %s" % (n, VERDICT_WORDS.get(k, k)) for k, n in sorted(counts.items(), key=lambda kv: -kv[1]) if k != "open"]
+    return "%s, %d lines reviewed: %s; report %s." % (catalog.by_id[unit["class"]]["name"], sum(counts.values()), ", ".join(parts) or "nothing judged", report_path)
+
+
+# ----------------------------------------------------------------------------- per-unit reports
+
+VERDICT_WORDS = {"safe": "no vulnerability", "hardening": "hardening recommended", "lead": "needs validation", "finding": "confirmed vulnerability", "blocked": "could not be assessed", "fixed": "fixed since the previous audit", "still": "still open"}
+
+
+def sentence(text):
+    text = str(text or "").strip().rstrip(".")
+    return (text[0].upper() + text[1:] + ".") if text else ""
+
+
+def unit_report(state, coverage, unit, catalog):
+    """Write `units/<id>-<class>.md`: the unit's review in full, as a reader would want it: what the
+    class is, why it applies here, each finding and lead in prose, the hardening notes, and every
+    line reviewed with its verdict and the reviewer's reasoning."""
+    cls = catalog.by_id[unit["class"]]
+    states = hit_states(state)
+    rows = hit_rows(state, unit)
+    judged = [(r, states.get(r[0])) for r in rows]
+    counts = {}
+    for _, st in judged:
+        counts[st["status"] if st else "open"] = counts.get(st["status"] if st else "open", 0) + 1
+    records = {f.get("hit"): f for f in state.findings() if f.get("hit")}
+    deps = (state.load("deps.json", {}) or {}).get("rows") or []
+    lines = []
+    add = lines.append
+    add("# %s: %s" % (unit["id"], cls["name"]))
+    add("")
+    add("Status: %s. %d lines reviewed%s." % (unit["status"].replace("_", " "), len(rows), "".join(", %d %s" % (n, VERDICT_WORDS.get(k, k)) for k, n in sorted(counts.items()) if k != "open") + (", %d still open" % counts["open"] if counts.get("open") else "")))
+    add("")
+    add("## Scope")
+    add("")
+    add("This class applies to the project because of: %s." % unit["reason"])
+    if unit.get("error"):
+        add("")
+        add("The audit tool failed while showing this unit's lines (%s); the lines below were judged from what could be shown, and the rest is marked not assessed." % unit["error"])
+    add("")
+    add("The property that must hold: %s" % sentence(cls["invariant"]))
+    add("")
+    add("What would count as a vulnerability here: %s" % sentence(cls["counts"]))
+    add("")
+    add("What is only a hardening note: %s" % sentence(cls["hardening"]))
+    findings = [(r, records[r[0]]) for r, st in judged if st and st["status"] in ("finding", "lead") and r[0] in records]
+    if findings:
+        add("")
+        add("## Findings and leads")
+        for (hid, rel, number, shape, text), rec in findings:
+            add("")
+            if rec["verdict"] == "confirmed":
+                add("### %s (%s severity)" % (rec["title"], rec["severity"]["overall"]))
+                add("")
+                add("Affected code: " + " then ".join("`%s:%d` (%s: %s)" % (s["file"], s["line"], s["kind"], s["what"]) for s in rec["trace"]) + ".")
+                add("")
+                add("Who can exploit it: %s" % sentence(rec["principal"]))
+                add("")
+                add("Why the existing controls do not stop it: %s" % sentence(rec["control"]))
+                add("")
+                add("Impact: %s" % sentence(rec["impact"]))
+                if rec.get("conditions"):
+                    add("")
+                    add("Conditions: " + "; ".join(rec["conditions"]) + ".")
+                add("")
+                add("Evidence: %s Observed: %s" % (sentence(rec["evidence"]["how"]), sentence(rec["evidence"]["observed"])))
+                add("")
+                add("Severity: likelihood %s, impact %s, overall %s." % (rec["severity"]["likelihood"], rec["severity"]["impact"], rec["severity"]["overall"]))
+                add("")
+                add("Recommended fix: in %s, %s Regression test: %s" % (rec["fix"]["where"], sentence(rec["fix"]["change"]), sentence(rec["fix"]["test"])))
+            else:
+                add("### %s (lead, needs validation)" % rec["title"])
+                add("")
+                add("Affected code: " + " then ".join("`%s:%d` (%s: %s)" % (s["file"], s["line"], s["kind"], s["what"]) for s in rec["trace"]) + ".")
+                add("")
+                add("Who could exploit it: %s" % sentence(rec["principal"]))
+                add("")
+                add("The one fact outside the code that decides: %s" % sentence(rec["blocker"]))
+                add("")
+                add("How to settle it without attacking anything: %s" % sentence(rec["check"]))
+    hardening = [(r, st) for r, st in judged if st and st["status"] == "hardening"]
+    if hardening:
+        add("")
+        add("## Hardening recommendations")
+        add("")
+        add("No reachable attack was found behind these lines, but each names a change worth making.")
+        add("")
+        seen = set()
+        for (hid, rel, number, shape, text), st in hardening:
+            where = ("`%s:%d`" % (rel, number)) if number else ("`%s`" % rel if rel else "")
+            key = (st["note"], rel)
+            if key in seen:
+                continue
+            seen.add(key)
+            add("- %s %s" % (where, sentence(st["note"])))
+    blocked = [(r, st) for r, st in judged if st and st["status"] == "blocked"]
+    if blocked:
+        add("")
+        add("## Not assessed")
+        add("")
+        for (hid, rel, number, shape, text), st in blocked:
+            add("- `%s%s`: %s" % (rel, ":%d" % number if number else "", sentence(st["note"])))
+    add("")
+    add("## Line-by-line review")
+    add("")
+    if unit["class"] == "dependencies":
+        groups = {}
+        for row in deps:
+            groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
+        for (hid, rel, number, shape, text), st in judged:
+            name = text.split(":")[0]
+            add("### %s %s" % (hid, name))
+            add("")
+            key = next((k for k in groups if "%s %s %s" % (k[0], k[1], k[2]) == name), None)
+            if key:
+                for row in groups[key]:
+                    ids = row["id"] + (" / " + row["aliases"][0] if row["aliases"] else "")
+                    add("- %s, %s: %s Fixed in %s." % (ids, row["severity"], sentence(row["summary"]), ", ".join(sorted(set(row["fixed"]))[:3]) or "no version listed"))
+                add("")
+            add("Verdict: %s. %s" % (VERDICT_WORDS.get(st["status"], st["status"]) if st else "open", sentence(st["note"]) if st and st.get("note") else ""))
+            add("")
+    else:
+        by_file = {}
+        for (hid, rel, number, shape, text), st in judged:
+            by_file.setdefault(rel or "(the unit as a whole)", []).append(((hid, rel, number, shape, text), st))
+        for rel, items in by_file.items():
+            add("### %s" % rel)
+            add("")
+            for (hid, _, number, shape, text), st in items:
+                where = ("line %d" % number) if number else "the unit"
+                verdict = VERDICT_WORDS.get(st["status"], st["status"]) if st else "not yet reviewed"
+                add("- %s, %s, flagged as %s: `%s`" % (hid, where, shape, text.replace("`", "'")[:140]))
+                add("  Verdict: %s.%s" % (verdict, (" " + sentence(st["note"])) if st and st.get("note") else ""))
+            add("")
+    os.makedirs(state.path("units"), exist_ok=True)
+    name = "%s-%s.md" % (unit["id"], unit["class"])
+    with open(state.path(os.path.join("units", name)), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+    return name
+
+
+# ----------------------------------------------------------------------------- previous audits
+
+PREVIOUS_FILE = "previous.json"
+
+
+def archive_previous(state):
+    """A new audit on a project with a finished one: keep the old run under runs/<stamp>/ and
+    return its issues (findings, leads, hardening notes) for the re-check, or None when there is
+    no previous run."""
+    if not os.path.isfile(state.path("REPORT.md")) and not os.path.isfile(state.path("hits-state.json")):
+        return None
+    findings = state.findings()
+    states = hit_states(state)
+    coverage = state.load("coverage.json", {}) or {}
+    issues = []
+    for record in findings:
+        if record.get("verdict") not in ("confirmed", "needs_validation"):
+            continue
+        sink = record["trace"][-1]
+        issues.append({"kind": "finding" if record["verdict"] == "confirmed" else "lead", "title": record["title"], "file": sink["file"], "line": sink["line"], "text": sink.get("text", ""), "severity": (record.get("severity") or {}).get("overall", ""), "record": record, "class": record.get("class", "")})
+    hits_by_unit = {}
+    for unit in coverage.get("units", []):
+        for hid, rel, number, shape, text in hit_rows(state, unit):
+            hits_by_unit[hid] = (unit, rel, number, shape, text)
+    for hid, st in states.items():
+        if st.get("status") != "hardening" or hid not in hits_by_unit:
+            continue
+        unit, rel, number, shape, text = hits_by_unit[hid]
+        issue = {"kind": "hardening", "title": st.get("note", ""), "file": rel, "line": number, "text": text, "class": unit["class"], "hit": hid}
+        if unit["class"] == "dependencies":
+            parts = text.split(":")[0].split(" ")
+            if len(parts) >= 3:
+                issue["package"] = {"eco": parts[0], "name": parts[1], "version": parts[2]}
+        issues.append(issue)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = state.path(os.path.join("runs", stamp))
+    os.makedirs(archive, exist_ok=True)
+    for name in ("REPORT.md", "findings.json", "hits-state.json", "coverage.json", "recon.json", "deps.json"):
+        if os.path.isfile(state.path(name)):
+            os.replace(state.path(name), os.path.join(archive, name))
+    for folder in ("units", "hits"):
+        if os.path.isdir(state.path(folder)):
+            os.replace(state.path(folder), os.path.join(archive, folder))
+    # The old run's record drafts (normally gone with the project's tmp/) must not block the new one.
+    if os.path.isdir(state.drafts):
+        for name in os.listdir(state.drafts):
+            if re.match(r"finding-\d+\.json$", name):
+                os.replace(os.path.join(state.drafts, name), os.path.join(archive, name))
+    previous = {"archived": stamp, "report": os.path.join("runs", stamp, "REPORT.md"), "issues": issues}
+    state.save(PREVIOUS_FILE, previous)
+    return previous
+
+
+def recheck_previous(state, previous, packages_now):
+    """What the code says about each previous issue now: the flagged line still present, moved or
+    gone; a flagged package still pinned at a vulnerable version, upgraded, or removed."""
+    for issue in previous["issues"]:
+        if issue.get("package"):
+            pkg = issue["package"]
+            current = next((v for (eco, name, v) in packages_now if eco == pkg["eco"] and name == pkg["name"]), None)
+            if current is None:
+                issue["now"] = "the package is no longer pinned in a lockfile"
+            elif current != pkg["version"]:
+                issue["now"] = "the package is now pinned at %s (was %s)" % (current, pkg["version"])
+            else:
+                issue["now"] = "still pinned at %s" % pkg["version"]
+            continue
+        rel = issue.get("file")
+        if not rel:
+            issue["now"] = "no line to compare"
+            continue
+        full = os.path.join(state.root, rel)
+        if not os.path.isfile(full):
+            issue["now"] = "the file %s no longer exists" % rel
+            continue
+        text = (issue.get("text") or "").strip()
+        content = read_text(full) or ""
+        lines = content.split("\n")
+        if text and issue.get("line") and 0 < issue["line"] <= len(lines) and lines[issue["line"] - 1].strip() == text:
+            issue["now"] = "the flagged line is unchanged at %s:%d" % (rel, issue["line"])
+        elif text and any(l.strip() == text for l in lines):
+            issue["now"] = "the flagged line still exists in %s, at another line" % rel
+        elif text:
+            issue["now"] = "the flagged line is gone from %s (changed or removed)" % rel
+        else:
+            issue["now"] = "the file still exists; compare %s:%d by hand" % (rel, issue.get("line") or 0)
+    state.save(PREVIOUS_FILE, previous)
+
+
+def previous_rows(state, unit):
+    """The U0 lines: one per previous issue."""
+    previous = state.load(PREVIOUS_FILE, None)
+    if not previous:
+        return []
+    out = []
+    for index, issue in enumerate(previous["issues"], 1):
+        where = ("%s:%d" % (issue["file"], issue["line"])) if issue.get("file") and issue.get("line") else (issue.get("file") or "")
+        label = {"finding": "confirmed finding, %s" % issue.get("severity", ""), "lead": "lead (needs validation)", "hardening": "hardening note"}[issue["kind"]]
+        text = "%s: %s. Now: %s" % (label, issue["title"][:120], issue.get("now", "not compared"))
+        out.append(("%s.%d" % (unit["id"], index), issue.get("file") or "", issue.get("line") or 0, "previous " + issue["kind"], text))
+    return out
+
+
 # ----------------------------------------------------------------------------- main
 
-COMMANDS = {"recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve}
+COMMANDS = {"next": cmd_next, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve}
 
 
 def main(argv):

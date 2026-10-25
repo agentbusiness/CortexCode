@@ -1,20 +1,41 @@
-//! Session journals: each session's patches ([`JournalPatch`]) in its stream in the memory plugin's
-//! main store (see [`crate::store`]), and an in-memory materialization per session while the frame
-//! runs. A session's journal is read from its stream the first time it is needed.
+//! Session journals: append-only `<home>/journal/<session_id>.jsonl` files of [`JournalPatch`]
+//! lines, an in-memory materialization per session, and one writer thread that appends in order
+//! and fsyncs in batches. The journal is the frame's own record: it needs no plugin to be read or
+//! written, so a session opens before the memory plugin is up and a patch never waits behind the
+//! graph's writes.
 //!
-//! Ordering: every mutation assigns its sequence, applies to the materialization, enqueues its
-//! patch in the store's outbox and publishes its event while holding one lock, so the stream
-//! order, the materialized order and the event order are identical. Callers wait until the store
-//! has the patch before they answer, so an acknowledged patch is kept.
+//! Ordering: every mutation assigns its sequence, applies to the materialization, enqueues its line
+//! for the writer and publishes its event while holding one lock, so the file order, the
+//! materialized order and the event order are identical. Callers wait for the batch fsync before
+//! they answer, so an acknowledged patch is durable.
+//!
+//! Journals written by earlier versions into the memory plugin's streams are moved into files once,
+//! after the records are loaded ([`Journal::migrate_streams`]); the stream is dropped when its file
+//! is written.
 
-use crate::store::{MemoryLink, Op, Outbox};
+use crate::store::MemoryLink;
 use cc_protocol::contracts::frame::{JournalEntry, JournalPatch};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::{RpcError, codes};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tokio::sync::oneshot;
+
+/// Open journal file handles kept between batches.
+const MAX_OPEN_JOURNALS: usize = 64;
+/// Written once every stream journal has been moved into its file.
+const MIGRATED_MARKER: &str = ".streams-migrated";
+
+enum WriterMsg {
+    Line { session_id: String, bytes: Vec<u8>, ack: oneshot::Sender<Result<(), String>> },
+    Flush(oneshot::Sender<()>),
+    /// Delete a session's file after the lines queued before it.
+    Remove(String),
+}
 
 struct SessionLog {
     entries: Vec<JournalEntry>,
@@ -23,14 +44,15 @@ struct SessionLog {
 }
 
 pub struct Journal {
-    outbox: Outbox,
-    link: Arc<MemoryLink>,
+    dir: PathBuf,
     sessions: Mutex<HashMap<String, SessionLog>>,
     /// Sessions deleted while the frame runs: their journals take no more patches.
     deleted: Mutex<std::collections::HashSet<String>>,
+    writer: Mutex<Option<std::sync::mpsc::Sender<WriterMsg>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// A pending acknowledgement: the store has the patch.
+/// A pending acknowledgement: the patch is on disk.
 pub struct Durable(oneshot::Receiver<Result<(), String>>);
 
 impl Durable {
@@ -38,14 +60,24 @@ impl Durable {
         match self.0.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(RpcError::internal(format!("journal write failed: {message}"))),
-            Err(_) => Err(RpcError::new(codes::UNAVAILABLE, "the store writer stopped")),
+            Err(_) => Err(RpcError::new(codes::UNAVAILABLE, "the journal writer stopped")),
         }
     }
 }
 
 impl Journal {
-    pub fn open(outbox: Outbox, link: Arc<MemoryLink>) -> Journal {
-        Journal { outbox, link, sessions: Mutex::new(HashMap::new()), deleted: Mutex::new(std::collections::HashSet::new()) }
+    pub fn open(dir: PathBuf) -> std::io::Result<Journal> {
+        std::fs::create_dir_all(&dir)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_dir = dir.clone();
+        let thread = std::thread::Builder::new().name("journal-writer".into()).spawn(move || writer_loop(writer_dir, rx))?;
+        Ok(Journal {
+            dir,
+            sessions: Mutex::new(HashMap::new()),
+            deleted: Mutex::new(std::collections::HashSet::new()),
+            writer: Mutex::new(Some(tx)),
+            thread: Mutex::new(Some(thread)),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionLog>> {
@@ -63,7 +95,6 @@ impl Journal {
         if kind.is_empty() {
             return Err(RpcError::invalid_params("journal entry kind must not be empty"));
         }
-        self.ensure_loaded(session_id)?;
         let mut sessions = self.lock();
         let log = self.loaded(&mut sessions, session_id)?;
         let seq = log.entries.len() as u64 + 1;
@@ -102,7 +133,6 @@ impl Journal {
             _ => return Err(RpcError::invalid_params("exactly one of `text` (append) or `value` (set) is required")),
         };
         let mut patch = patch;
-        self.ensure_loaded(session_id)?;
         let mut sessions = self.lock();
         let log = self.loaded(&mut sessions, session_id)?;
         patch.set_rev(log.rev + 1);
@@ -122,16 +152,14 @@ impl Journal {
 
     /// Materialized entries with `seq >= from`, and the revision they reflect.
     pub fn read(&self, session_id: &str, from: u64) -> Result<(Vec<JournalEntry>, u64), RpcError> {
-        self.ensure_loaded(session_id)?;
         let mut sessions = self.lock();
         let log = self.loaded(&mut sessions, session_id)?;
         let start = from.max(1) as usize - 1;
         Ok((log.entries.get(start..).map(<[JournalEntry]>::to_vec).unwrap_or_default(), log.rev))
     }
 
-    /// Forget a deleted session's journal: its materialization now; later patches for it are
-    /// refused. Its stream goes with its record (the state store's delete, after the patches
-    /// already queued).
+    /// Delete a session's journal: its materialization now, its file after the lines already
+    /// queued; later patches for it are refused.
     pub fn remove(&self, session_id: &str) -> Result<(), RpcError> {
         if !valid_session_id(session_id) {
             return Err(RpcError::invalid_params(format!("invalid session id `{session_id}`")));
@@ -139,76 +167,170 @@ impl Journal {
         let mut sessions = self.lock();
         self.deleted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(session_id.to_owned());
         sessions.remove(session_id);
-        Ok(())
+        let writer = self.writer.lock().map_err(|_| RpcError::internal("journal writer lock poisoned"))?;
+        let sender = writer.as_ref().ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "the frame is shutting down"))?;
+        sender.send(WriterMsg::Remove(session_id.to_owned())).map_err(|_| RpcError::new(codes::UNAVAILABLE, "the journal writer stopped"))
     }
 
-    /// Wait until everything enqueued so far is in the store.
+    /// Wait until everything enqueued so far is written and fsynced.
     pub async fn flush(&self) -> Result<(), RpcError> {
-        self.outbox.flush().await
+        let (tx, rx) = oneshot::channel();
+        let sent = self.writer.lock().ok().and_then(|writer| writer.as_ref().map(|w| w.send(WriterMsg::Flush(tx)).is_ok()));
+        match sent {
+            Some(true) => rx.await.map_err(|_| RpcError::new(codes::UNAVAILABLE, "the journal writer stopped before the flush")),
+            _ => Ok(()),
+        }
     }
 
-    /// Flush (the store writer stops with the frame).
+    /// Flush and stop the writer thread.
     pub async fn close(&self) -> Result<(), RpcError> {
-        self.flush().await
+        let flushed = self.flush().await;
+        if let Ok(mut writer) = self.writer.lock() {
+            writer.take();
+        }
+        let thread = self.thread.lock().ok().and_then(|mut thread| thread.take());
+        if let Some(thread) = thread {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+        flushed
+    }
+
+    /// Move the journals earlier versions kept in the memory plugin's streams into files, once:
+    /// every known session without a file gets its stream's patches written as lines, and the
+    /// stream is dropped once the file is on disk. A marker in the journal directory records that
+    /// the move happened, so a start without a memory plugin answer costs nothing later. Returns
+    /// how many journals were moved and how many streams could not be read (left in place).
+    pub async fn migrate_streams(&self, link: &MemoryLink, session_ids: &[String]) -> (usize, usize) {
+        let marker = self.dir.join(MIGRATED_MARKER);
+        if marker.is_file() {
+            return (0, 0);
+        }
+        let (mut moved, mut failed) = (0usize, 0usize);
+        for session_id in session_ids {
+            if !valid_session_id(session_id) || journal_path(&self.dir, session_id).exists() {
+                continue;
+            }
+            let patches = match crate::store::read_journal(link, session_id).await {
+                Ok(patches) => patches,
+                Err(error) => {
+                    tracing::warn!(session_id, %error.message, "a session's stream journal could not be read; left in the stream");
+                    failed += 1;
+                    continue;
+                }
+            };
+            if patches.is_empty() {
+                continue;
+            }
+            let path = journal_path(&self.dir, session_id);
+            if let Err(error) = write_lines(&path, &patches) {
+                tracing::warn!(session_id, %error, "writing a session's journal file failed; left in the stream");
+                failed += 1;
+                continue;
+            }
+            moved += 1;
+            if let Err(error) = crate::store::drop_journal(link, session_id).await {
+                tracing::info!(session_id, %error.message, "the journal's stream stays (its file is written)");
+            }
+        }
+        if failed == 0
+            && let Err(error) = std::fs::write(&marker, b"journals live in this directory as <session_id>.jsonl\n")
+        {
+            tracing::warn!(%error, "cannot write the journal migration marker");
+        }
+        (moved, failed)
     }
 
     fn enqueue(&self, session_id: &str, patch: &JournalPatch) -> Result<Durable, RpcError> {
+        let mut bytes = serde_json::to_vec(patch).map_err(|error| RpcError::internal(error.to_string()))?;
+        bytes.push(b'\n');
         let (ack, rx) = oneshot::channel();
-        self.outbox.send(Op::Patch { session_id: session_id.to_owned(), patch: patch.clone(), ack })?;
+        let writer = self.writer.lock().map_err(|_| RpcError::internal("journal writer lock poisoned"))?;
+        let sender = writer.as_ref().ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "the frame is shutting down"))?;
+        sender
+            .send(WriterMsg::Line { session_id: session_id.to_owned(), bytes, ack })
+            .map_err(|_| RpcError::new(codes::UNAVAILABLE, "the journal writer stopped"))?;
         Ok(Durable(rx))
     }
 
-    /// Read a session's journal from its stream the first time it is needed. Callers order their
-    /// patches on a connection, so the read happens in place (it takes a moment once per session):
-    /// the next patch must find the journal as the store has it.
-    fn ensure_loaded(&self, session_id: &str) -> Result<(), RpcError> {
+    /// The session's materialization, read from its file the first time it is needed.
+    fn loaded<'a>(
+        &self,
+        sessions: &'a mut HashMap<String, SessionLog>,
+        session_id: &str,
+    ) -> Result<&'a mut SessionLog, RpcError> {
         if !valid_session_id(session_id) {
             return Err(RpcError::invalid_params(format!("invalid session id `{session_id}`")));
         }
         if self.deleted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(session_id) {
             return Err(RpcError::not_found(format!("session `{session_id}` was deleted")));
         }
-        if self.lock().contains_key(session_id) {
-            return Ok(());
+        if !sessions.contains_key(session_id) {
+            let log = load(&self.dir, session_id).map_err(|error| RpcError::internal(error.to_string()))?;
+            sessions.insert(session_id.to_owned(), log);
         }
-        let link = self.link.clone();
-        let patches = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(crate::store::read_journal(&link, session_id)))?;
-        let log = replay(session_id, patches);
-        self.lock().entry(session_id.to_owned()).or_insert(log);
-        Ok(())
-    }
-
-    fn loaded<'a>(
-        &self,
-        sessions: &'a mut HashMap<String, SessionLog>,
-        session_id: &str,
-    ) -> Result<&'a mut SessionLog, RpcError> {
-        if self.deleted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(session_id) {
-            return Err(RpcError::not_found(format!("session `{session_id}` was deleted")));
-        }
-        Ok(sessions.entry(session_id.to_owned()).or_insert(SessionLog { entries: Vec::new(), rev: 0 }))
+        sessions.get_mut(session_id).ok_or_else(|| RpcError::internal("session log vanished"))
     }
 }
 
-/// Session ids name streams, so they are restricted structurally to a safe character set.
+/// Session ids name files, so they are restricted structurally to a safe character set.
 pub fn valid_session_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Materialize a journal from its patches. A patch the stream holds twice (a write retried after
-/// the store went away mid-call) carries a revision already applied and is skipped; a patch that
-/// does not apply is skipped with a warning.
-fn replay(session_id: &str, patches: Vec<JournalPatch>) -> SessionLog {
+fn journal_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.jsonl"))
+}
+
+/// Write a whole journal as lines: a temporary file, fsync, rename into place.
+fn write_lines(path: &Path, patches: &[JournalPatch]) -> std::io::Result<()> {
+    let mut bytes = Vec::new();
+    for patch in patches {
+        serde_json::to_writer(&mut bytes, patch).map_err(std::io::Error::other)?;
+        bytes.push(b'\n');
+    }
+    crate::home::write_atomic(path, &bytes)
+}
+
+/// Replay a journal file. A torn final line (crash mid-write) is cut off so later appends stay
+/// line-aligned; a corrupt line in the middle is skipped with a warning; a line carrying a revision
+/// already applied (a write retried after an ambiguous failure) is skipped.
+fn load(dir: &Path, session_id: &str) -> std::io::Result<SessionLog> {
+    let path = journal_path(dir, session_id);
     let mut log = SessionLog { entries: Vec::new(), rev: 0 };
-    for (index, patch) in patches.iter().enumerate() {
-        if patch.rev() != 0 && patch.rev() <= log.rev {
+    let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(log),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let complete = match bytes.iter().rposition(|b| *b == b'\n') {
+        Some(last) => last + 1,
+        None => 0,
+    };
+    if complete < bytes.len() {
+        tracing::warn!(session_id, torn_bytes = bytes.len() - complete, "cutting a torn final journal line");
+        file.set_len(complete as u64)?;
+        file.seek(SeekFrom::End(0))?;
+        file.sync_all()?;
+    }
+    for (index, line) in bytes[..complete].split(|b| *b == b'\n').enumerate() {
+        if line.is_empty() {
             continue;
         }
-        if let Err(error) = apply(&mut log, patch) {
-            tracing::warn!(session_id, record = index, %error, "skipping an inapplicable journal patch");
+        match serde_json::from_slice::<JournalPatch>(line) {
+            Ok(patch) => {
+                if patch.rev() != 0 && patch.rev() <= log.rev {
+                    continue;
+                }
+                if let Err(error) = apply(&mut log, &patch) {
+                    tracing::warn!(session_id, line = index + 1, %error, "skipping an inapplicable journal patch");
+                }
+            }
+            Err(error) => tracing::warn!(session_id, line = index + 1, %error, "skipping a corrupt journal line"),
         }
     }
-    log
+    Ok(log)
 }
 
 /// Apply a patch; a patch that applies advances the revision by one (lines written before
@@ -284,5 +406,89 @@ fn type_name(value: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
+    }
+}
+
+/// Batches: block for the first message, take everything queued behind it, write all lines in
+/// order, fsync each touched file once, then acknowledge.
+fn writer_loop(dir: PathBuf, rx: std::sync::mpsc::Receiver<WriterMsg>) {
+    let mut files: HashMap<String, File> = HashMap::new();
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+        let mut acks: Vec<(String, oneshot::Sender<Result<(), String>>)> = Vec::new();
+        let mut flushes = Vec::new();
+        let mut failed: HashMap<String, String> = HashMap::new();
+        let mut dirty: Vec<String> = Vec::new();
+        for message in batch {
+            match message {
+                WriterMsg::Line { session_id, bytes, ack } => {
+                    if !failed.contains_key(&session_id) {
+                        if let Err(error) = write_line(&dir, &mut files, &session_id, &bytes) {
+                            failed.insert(session_id.clone(), error.to_string());
+                            files.remove(&session_id);
+                        } else if !dirty.contains(&session_id) {
+                            dirty.push(session_id.clone());
+                        }
+                    }
+                    acks.push((session_id, ack));
+                }
+                WriterMsg::Flush(done) => flushes.push(done),
+                WriterMsg::Remove(session_id) => {
+                    files.remove(&session_id);
+                    dirty.retain(|dirty| dirty != &session_id);
+                    match std::fs::remove_file(journal_path(&dir, &session_id)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(session_id, %error, "deleting a journal file failed"),
+                    }
+                }
+            }
+        }
+        for session_id in dirty {
+            if failed.contains_key(&session_id) {
+                continue;
+            }
+            if let Some(file) = files.get(&session_id)
+                && let Err(error) = file.sync_data()
+            {
+                failed.insert(session_id.clone(), error.to_string());
+                files.remove(&session_id);
+            }
+        }
+        for (session_id, ack) in acks {
+            let outcome = match failed.get(&session_id) {
+                Some(error) => {
+                    tracing::error!(session_id, %error, "journal write failed");
+                    Err(error.clone())
+                }
+                None => Ok(()),
+            };
+            let _ = ack.send(outcome);
+        }
+        for done in flushes {
+            let _ = done.send(());
+        }
+        // Everything is synced here; bound the number of open journal files (one per session
+        // written since the last trim) so many sessions cannot exhaust file descriptors.
+        if files.len() > MAX_OPEN_JOURNALS {
+            files.clear();
+        }
+    }
+    for (_, file) in files {
+        let _ = file.sync_all();
+    }
+}
+
+fn write_line(dir: &Path, files: &mut HashMap<String, File>, session_id: &str, bytes: &[u8]) -> std::io::Result<()> {
+    if !files.contains_key(session_id) {
+        let file = OpenOptions::new().create(true).append(true).open(journal_path(dir, session_id))?;
+        files.insert(session_id.to_owned(), file);
+    }
+    match files.get_mut(session_id) {
+        Some(file) => file.write_all(bytes),
+        None => Err(std::io::Error::other("journal file handle missing")),
     }
 }

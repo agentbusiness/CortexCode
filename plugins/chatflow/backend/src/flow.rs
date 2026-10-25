@@ -890,13 +890,30 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         return Ok(TurnEnd { state: outcome.outcome.clone(), detail: outcome.summary.clone(), route: route_name, agent: Some(outcome) });
                     }
                     Ok(outcome) => {
-                        journal
-                            .append(
-                                kinds::NOTE,
-                                json!({"text": act_note(&outcome), "purpose": "explore_done", "run_id": env.run_id, "host_message": false, "outcome": outcome.outcome}),
-                            )
-                            .await?;
-                        agent_outcome = Some(outcome);
+                        // A skill that drives a procedure through a tool says when its work is
+                        // finished (`SkillInfo::done`): while it says the work is open, the turn goes
+                        // on with the command's output as the latest note, whose last line is the
+                        // next step (seen: an audit of 15 units ended at the first unit with a
+                        // progress report, twice). The steps so far fold into one note first, so
+                        // each piece of the work starts from a short history (the tool keeps the
+                        // state) instead of the engine re-reading every earlier piece. It goes on
+                        // only while the output changes between rounds: the same output twice means
+                        // the model made no progress, and the turn ends with what there is.
+                        let open = if outcome.outcome == "done" { work_open(env, journal).await? } else { None };
+                        if let Some(open) = open {
+                            crate::fit::fold_steps(journal).await?;
+                            journal
+                                .append(kinds::NOTE, json!({"text": env.data.text("work_open", &[("output", open.trim())]), "purpose": "work_open", "output": open.trim(), "run_id": env.run_id, "host_message": true}))
+                                .await?;
+                        } else {
+                            journal
+                                .append(
+                                    kinds::NOTE,
+                                    json!({"text": act_note(&outcome), "purpose": "explore_done", "run_id": env.run_id, "host_message": false, "outcome": outcome.outcome}),
+                                )
+                                .await?;
+                            agent_outcome = Some(outcome);
+                        }
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -1739,4 +1756,37 @@ fn local_task(env: &RunEnv, id: &str, brief: &str, contract: cc_protocol::contra
         contract_hash: None,
         contract_revisions: vec![],
     }
+}
+
+/// The output of the `done` command of a skill this run used, when it says the work is open (a
+/// non-zero exit); None when no used skill declares one, when every one says finished, or when the
+/// output is the one the previous round was continued with (no progress since: the model would
+/// only repeat itself).
+async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, RpcError> {
+    let entries = journal.entries_vec();
+    let used = skillsel::used_by_run(&entries, &env.run_id);
+    let commands: Vec<(&String, &String)> = used.iter().filter_map(|uri| env.prefix.skill_done.get(uri).map(|command| (uri, command))).collect();
+    if commands.is_empty() {
+        return Ok(None);
+    }
+    let previous = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == env.run_id && str_field(&entry.data, "purpose") == "work_open")
+        .map(|entry| str_field(&entry.data, "output").to_owned());
+    for (_, command) in commands {
+        let check = cc_protocol::contracts::memory::ContractCheck { name: "done".to_owned(), kind: "command".to_owned(), spec: command.clone(), expect: None };
+        let ran = crate::contract::run_check(&env.host, &env.scope.workspace, &check, &env.stops.any()).await?;
+        if ran.result.indeterminate {
+            continue;
+        }
+        if !ran.result.ok {
+            if previous.as_deref() == Some(ran.full_output.trim()) {
+                tracing::info!(session = %env.session_id, "work still open with no progress since the last round; the turn ends");
+                return Ok(None);
+            }
+            return Ok(Some(ran.full_output));
+        }
+    }
+    Ok(None)
 }

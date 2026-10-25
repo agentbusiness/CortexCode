@@ -1200,7 +1200,17 @@ pub async fn start_all(frame: Arc<Frame>) {
             let load_frame = frame.clone();
             let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui)| load_frame.state.load(projects, sessions, ui)) });
             match tokio::time::timeout(Duration::from_secs(180), loaded).await {
-                Ok(Ok(Ok(()))) => tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store"),
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store");
+                    // Journals an earlier version kept in the store's streams move into the frame's
+                    // files once; nothing else reads them.
+                    let ids: Vec<String> = frame.state.sessions(None).into_iter().map(|session| session.id).collect();
+                    match tokio::time::timeout(Duration::from_secs(180), frame.journal.migrate_streams(&frame.memory, &ids)).await {
+                        Ok((0, 0)) => {}
+                        Ok((moved, failed)) => tracing::info!(moved, failed, "session journals moved from the store's streams into files"),
+                        Err(_) => tracing::warn!("moving the session journals out of the store's streams did not finish within 180 s; the rest moves at the next start"),
+                    }
+                }
                 Ok(Ok(Err(error))) => tracing::error!(%error.message, "the store's records could not be read"),
                 Ok(Err(error)) => tracing::error!(%error, "reading the store's records failed"),
                 Err(_) => tracing::error!("the memory plugin did not answer within 180 s: starting without its records"),

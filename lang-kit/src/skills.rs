@@ -19,8 +19,10 @@
 //! shows none of a skill's conditions is not offered the skill; a skill without a table applies to
 //! every project. `always = true` makes a skill load into every session of a project it applies to
 //! (a language plugin's guide to its language), never offered as a choice. [`load`] validates it:
-//! every table is a skill of the directory, every key one of the four, every list non-empty and
-//! every item a non-empty word.
+//! every table is a skill of the directory, every key one of the five, every list non-empty and
+//! every item a non-empty word. `done = "<command>"` names the command whose exit status says
+//! whether the skill's work is finished (a skill that drives a procedure through a tool); the
+//! chat flow keeps a turn going while it says the work is open.
 //!
 //! ```toml
 //! [sql]
@@ -57,6 +59,8 @@ pub struct Skill {
     pub codes: Vec<String>,
     /// The projects the skill applies to ([`APPLIES_FILE`]); empty (everywhere) from [`list`].
     pub applies: Applies,
+    /// The command that says whether the skill's work is finished ([`APPLIES_FILE`] `done`).
+    pub done: Option<String>,
 }
 
 /// The live skills, relative to the plugin's folder in the code folder.
@@ -149,7 +153,7 @@ pub fn list(dir: &Path) -> Result<Vec<Skill>, String> {
             continue;
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        skills.push(Skill { name: name.to_owned(), summary: summary_of(&text), path, codes: Vec::new(), applies: Applies::default() });
+        skills.push(Skill { name: name.to_owned(), summary: summary_of(&text), path, codes: Vec::new(), applies: Applies::default(), done: None });
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(skills)
@@ -171,7 +175,10 @@ pub fn load(dir: &Path) -> Result<Vec<Skill>, String> {
     if let Some((path, text)) = read_beside(dir, APPLIES_FILE)? {
         let mut applies = parse_applies(&text, &names).map_err(|problem| format!("{}: {problem}", path.display()))?;
         for skill in &mut skills {
-            skill.applies = applies.remove(&skill.name).unwrap_or_default();
+            if let Some((conditions, done)) = applies.remove(&skill.name) {
+                skill.applies = conditions;
+                skill.done = done;
+            }
         }
     }
     Ok(skills)
@@ -188,8 +195,8 @@ fn read_beside(dir: &Path, name: &str) -> Result<Option<(PathBuf, String)>, Stri
 }
 
 /// The text of an [`APPLIES_FILE`], checked against the skills that exist (`skills`): skill name
-/// -> its conditions, lists in the file's order.
-pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, Applies>, String> {
+/// -> its conditions (lists in the file's order) and its `done` command.
+pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Applies, Option<String>)>, String> {
     let table: toml::Table = toml::from_str(text).map_err(|error| format!("not valid TOML: {}", error.message()))?;
     let mut applies = BTreeMap::new();
     let mut problems = Vec::new();
@@ -206,7 +213,15 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, App
             problems.push(format!("`{name}` declares no condition"));
         }
         let mut conditions = Applies::default();
+        let mut done = None;
         for (key, value) in fields {
+            if key == "done" {
+                match value.as_str() {
+                    Some(command) if !command.trim().is_empty() => done = Some(command.trim().to_owned()),
+                    _ => problems.push(format!("`{name}.done` must be a non-empty command")),
+                }
+                continue;
+            }
             if key == "always" {
                 match value.as_bool() {
                     Some(flag) => conditions.always = flag,
@@ -219,7 +234,7 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, App
                 "files" => &mut conditions.files,
                 "imports" => &mut conditions.imports,
                 _ => {
-                    problems.push(format!("`{name}.{key}` is not a condition (languages, files, imports or always)"));
+                    problems.push(format!("`{name}.{key}` is not a condition (languages, files, imports, always or done)"));
                     continue;
                 }
             };
@@ -243,7 +258,7 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, App
                 }
             }
         }
-        applies.insert(name, conditions);
+        applies.insert(name, (conditions, done));
     }
     if problems.is_empty() { Ok(applies) } else { Err(problems.join("; ")) }
 }

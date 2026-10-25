@@ -1,0 +1,6 @@
+# The projects each skill can help in: a skill not listed applies to every project. `done`: the
+# command whose exit status says whether the skill's work is finished (0 finished; otherwise its
+# output says what is left and ends with the next step), so a turn does not end on a progress note.
+
+[security-audit]
+done = "python3 \"$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py\" status"
