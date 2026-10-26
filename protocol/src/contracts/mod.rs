@@ -14,12 +14,14 @@ pub mod lang;
 pub mod skills;
 pub mod lifecycle;
 pub mod memory;
+pub mod mesh;
 pub mod model;
 pub mod notify;
 pub mod research;
 pub mod source;
 pub mod terminal;
 pub mod tools;
+pub mod update;
 pub mod vcs;
 
 /// Every category this frame knows, with the contract major it speaks.
@@ -36,6 +38,8 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("notify", "notify@1"),
     ("container", "container@1"),
     ("research", "research@1"),
+    ("update", "update@1"),
+    ("mesh", "mesh@1"),
 ];
 
 /// Families: any number of plugins, each in its own category `<family>-<name>` (lowercase letters,

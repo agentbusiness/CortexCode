@@ -69,11 +69,11 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
 
 - **OBSERVED** — parsed code: `Repo`, `Directory`, `File`, `Module`, `Function`, `Method`, `Class`,
   `Struct`, `Trait`, `Interface`, `Enum`, `TypeAlias`, `Field`, `Variant`, `Const`, `Static`,
-  `Variable`, `Param`, `Component`, `Prop`, `Route`, `IpcChannel`, `Command`, `ShellFunction`,
+  `Variable`, `Component`, `Prop`, `Route`, `IpcChannel`, `Command`, `ShellFunction`,
   `Test`, `EnvVar`, `Dependency`, `ExternalSymbol` (all carry `Code`; definitions also `Sym`), and the
   edges `CALLS {args, line, confidence}`, `INSTANTIATES`, `RENDERS {props}`, `USES_HOOK`, `READS`,
-  `WRITES`, `RETURNS`, `THROWS`, `OF_TYPE`, `HAS_PARAM`, `EXTENDS`, `IMPLEMENTS`, `OVERRIDES`,
-  `IMPORTS`, `EXPORTS`, `DEFINES`, `CONTAINS`, `HANDLES`, `REQUESTS {method, url}` (fetch/axios →
+  `WRITES`, `RETURNS`, `THROWS`, `OF_TYPE`, `TAKES`, `EXTENDS`, `IMPLEMENTS`, `OVERRIDES`,
+  `IMPORTS`, `DEFINES`, `CONTAINS`, `HANDLES`, `REQUESTS {method, url}` (fetch/axios →
   FastAPI/Flask/axum/actix/Express routes), `INVOKES {channel}` (Electron/Tauri IPC), `RUNS`
   (npm/cargo/pyproject commands → scripts → functions), `READS_CONFIG`, `TESTS`, `DEPENDS_ON`.
 - **KNOWLEDGE** — derived facts: cited notes, `Note` (`CITES` a `Source {url}`; see Notes), and
@@ -83,7 +83,12 @@ Every statement names its layers (`USE LAYER … WRITE LAYER …`):
   re-indexing and renames and go with the symbol when it is deleted.
 - **WORKSPACE** — `Task` (with `ContractCheck` nodes, `HAS_SUBTASK`, `DEPENDS_ON`, `TOUCHES` code),
   `BoardMessage` (`REFERS_TO`), `Agent` (`WORKS_ON`), `Rule` (`CONSTRAINS` code; CORTEX.md items
-  have source `cortex_md`), `Style`, `Run` (code `MODIFIED_IN` run), settings, registry.
+  have source `cortex_md`), `Style`, `Run` (code `MODIFIED_IN` run), settings, registry;
+  `Security:Finding` (`FOUND_BY` a `Security:Audit`; `AT {step, kind, what, line}` the code of each
+  trace step, the innermost symbol covering the line, else the file; `IN_PACKAGE` the `Dependency` a
+  quick fix upgrades; `FIXED_IN` a `Session`), `Security:Audit` (`src/security.rs`: a finding's
+  `trace`, `quick_fix` and `history` are JSON text on the node; indexes `security_finding_id`,
+  `security_finding_status`, `security_audit_id`).
 
 ## Indexing
 

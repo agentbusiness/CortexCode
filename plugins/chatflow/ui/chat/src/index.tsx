@@ -26,7 +26,7 @@ import {
   type FlowState,
   type JournalPatch,
   showPane,
-} from '@cortex/sdk';
+ runtime } from '@cortex/sdk';
 import { RevealContext, TurnView, type Reveal, type TurnActions } from './TurnView';
 import { isScaffolding } from './Activity';
 import { editSteps } from './Edits';
@@ -185,6 +185,17 @@ function Chat() {
     },
     // Undo a turn's edits: each file's current text with the turn's own hunks reverse-applied,
     // newest edit first, written back through the editor's save. Nothing else is touched.
+    undoSteps: workspace ? async (note) => {
+      const result = await client.call<{ restored: string[]; skipped: string[]; blocked_by: number[] }>('tools.undo', { workspace: note.workspace || workspace, seqs: note.seqs, cascade: true, session_id: sessionId, actor: 'user' });
+      if (result.skipped.length) throw new Error(result.skipped.join('; '));
+      runtime().queries.invalidate(`tools.timeline:${workspace}`);
+      runtime().queries.invalidate(`vcs.status:${workspace}`);
+      runtime().queries.invalidate('code.diff:');
+    } : null,
+    stepDiff: workspace ? async (note, path) => {
+      const result = await client.call<{ diff: string }>('tools.timeline.diff', { workspace: note.workspace || workspace, path, from_seq: note.fromSeq, to_seq: note.toSeq });
+      return result.diff;
+    } : null,
     undoEdits: workspace ? async (turn, files) => {
       const steps = editSteps(turn).reverse();
       for (const file of files) {

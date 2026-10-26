@@ -20,6 +20,7 @@ fn main() {
             cc_tools::langs::SKILLS_CHANGED.to_owned(),
             cc_protocol::contracts::frame::topics::SESSION_DELETED.to_owned(),
             cc_protocol::contracts::frame::topics::PROJECT_DELETED.to_owned(),
+            cc_protocol::contracts::vcs::topics::CHANGED.to_owned(),
         ];
         cc_protocol::run_plugin(hello, Arc::new(ToolsPlugin::new())).await
     });

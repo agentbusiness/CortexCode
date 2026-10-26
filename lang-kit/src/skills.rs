@@ -22,7 +22,10 @@
 //! every table is a skill of the directory, every key one of the five, every list non-empty and
 //! every item a non-empty word. `done = "<command>"` names the command whose exit status says
 //! whether the skill's work is finished (a skill that drives a procedure through a tool); the
-//! chat flow keeps a turn going while it says the work is open.
+//! chat flow keeps a turn going while it says the work is open. `units = "<command>"` lists the
+//! independent units the work falls into (`<id>\t<title>` per line) and `unit_done = "<command
+//! with {unit}>"` says when one unit is finished: the chat flow may then run every unit as an
+//! agent of its own at once, and one last task to finish the whole.
 //!
 //! ```toml
 //! [sql]
@@ -61,6 +64,10 @@ pub struct Skill {
     pub applies: Applies,
     /// The command that says whether the skill's work is finished ([`APPLIES_FILE`] `done`).
     pub done: Option<String>,
+    /// The command that lists the skill's independent units ([`APPLIES_FILE`] `units`).
+    pub units: Option<String>,
+    /// The `done` of one unit, `{unit}` standing for its id ([`APPLIES_FILE`] `unit_done`).
+    pub unit_done: Option<String>,
 }
 
 /// The live skills, relative to the plugin's folder in the code folder.
@@ -153,7 +160,7 @@ pub fn list(dir: &Path) -> Result<Vec<Skill>, String> {
             continue;
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        skills.push(Skill { name: name.to_owned(), summary: summary_of(&text), path, codes: Vec::new(), applies: Applies::default(), done: None });
+        skills.push(Skill { name: name.to_owned(), summary: summary_of(&text), path, codes: Vec::new(), applies: Applies::default(), done: None, units: None, unit_done: None });
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(skills)
@@ -175,9 +182,11 @@ pub fn load(dir: &Path) -> Result<Vec<Skill>, String> {
     if let Some((path, text)) = read_beside(dir, APPLIES_FILE)? {
         let mut applies = parse_applies(&text, &names).map_err(|problem| format!("{}: {problem}", path.display()))?;
         for skill in &mut skills {
-            if let Some((conditions, done)) = applies.remove(&skill.name) {
+            if let Some((conditions, commands)) = applies.remove(&skill.name) {
                 skill.applies = conditions;
-                skill.done = done;
+                skill.done = commands.done;
+                skill.units = commands.units;
+                skill.unit_done = commands.unit_done;
             }
         }
     }
@@ -196,7 +205,15 @@ fn read_beside(dir: &Path, name: &str) -> Result<Option<(PathBuf, String)>, Stri
 
 /// The text of an [`APPLIES_FILE`], checked against the skills that exist (`skills`): skill name
 /// -> its conditions (lists in the file's order) and its `done` command.
-pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Applies, Option<String>)>, String> {
+/// The commands a skill's table may name: `done`, `units`, `unit_done`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SkillCommands {
+    pub done: Option<String>,
+    pub units: Option<String>,
+    pub unit_done: Option<String>,
+}
+
+pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Applies, SkillCommands)>, String> {
     let table: toml::Table = toml::from_str(text).map_err(|error| format!("not valid TOML: {}", error.message()))?;
     let mut applies = BTreeMap::new();
     let mut problems = Vec::new();
@@ -213,12 +230,17 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Ap
             problems.push(format!("`{name}` declares no condition"));
         }
         let mut conditions = Applies::default();
-        let mut done = None;
+        let mut commands = SkillCommands::default();
         for (key, value) in fields {
-            if key == "done" {
+            if let Some(slot) = match key.as_str() {
+                "done" => Some(&mut commands.done),
+                "units" => Some(&mut commands.units),
+                "unit_done" => Some(&mut commands.unit_done),
+                _ => None,
+            } {
                 match value.as_str() {
-                    Some(command) if !command.trim().is_empty() => done = Some(command.trim().to_owned()),
-                    _ => problems.push(format!("`{name}.done` must be a non-empty command")),
+                    Some(command) if !command.trim().is_empty() => *slot = Some(command.trim().to_owned()),
+                    _ => problems.push(format!("`{name}.{key}` must be a non-empty command")),
                 }
                 continue;
             }
@@ -234,7 +256,7 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Ap
                 "files" => &mut conditions.files,
                 "imports" => &mut conditions.imports,
                 _ => {
-                    problems.push(format!("`{name}.{key}` is not a condition (languages, files, imports, always or done)"));
+                    problems.push(format!("`{name}.{key}` is not a condition (languages, files, imports, always, done, units or unit_done)"));
                     continue;
                 }
             };
@@ -258,7 +280,10 @@ pub fn parse_applies(text: &str, skills: &[&str]) -> Result<BTreeMap<String, (Ap
                 }
             }
         }
-        applies.insert(name, (conditions, done));
+        if commands.unit_done.as_ref().is_some_and(|command| !command.contains("{unit}")) {
+            problems.push(format!("`{name}.unit_done` must contain {{unit}}"));
+        }
+        applies.insert(name, (conditions, commands));
     }
     if problems.is_empty() { Ok(applies) } else { Err(problems.join("; ")) }
 }

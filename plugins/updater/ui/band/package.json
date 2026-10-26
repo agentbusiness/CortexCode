@@ -1,0 +1,35 @@
+{
+  "name": "@cortex-ui/updater-band",
+  "version": "0.1.0",
+  "description": "Updates in the brand band: progress, Restart to update, and the popup that asks about a plugin the user changed.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "updater.band",
+    "slot": "workbench.band@1",
+    "label": "Updates",
+    "order": 40
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4"
+  }
+}

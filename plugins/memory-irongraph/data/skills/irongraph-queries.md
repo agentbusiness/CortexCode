@@ -46,13 +46,12 @@ Labels:
 - Every node: `Code`.
 - Definitions: `Sym` plus one of `Function Method Class Struct Trait Interface Enum TypeAlias Const Static Field Variant Variable Component Prop Module Macro Test Route Command ShellFunction IpcChannel`.
 - Document headings: `Section` (not `Sym`); `signature` is the heading path, `doc` its text.
-- Other nodes: `File Directory Repo Param Package Dependency EnvVar Commit`.
+- Other nodes: `File Directory Repo Package Dependency EnvVar Commit`.
 
 Properties:
 - All: `sid kind name qname`. Code and files also: `path start_line end_line`.
-- `Sym`: `language signature doc return_type type_text value is_async is_static exported visibility decorators param_count body_hash description described_hash summary`. `Route` adds `http_method route_path framework`.
-- `File`: `language line_count size package parse_errors note` (`note`: why a file was read as text).
-- `Param`: `position type_text default_value optional variadic`.
+- `Sym`: `language signature doc return_type type_text exported param_names param_types param_defaults body_hash description described_hash summary` (the `param_` lists are in order; `''` is no type or default). `Route` adds `http_method route_path framework`.
+- `File`: `language end_line size package parse_errors note` (`note`: why a file was read as text).
 - `Dependency`: `ecosystem installed_version`.
 - `Commit`: `qname` = sha, `name` = subject, `author time_ms`.
 - sids: `<prefix>:<path>#<qname>`, prefix `rs py js go java cpp c sh html css` (`js` also for TypeScript), e.g. `py:server/store.py#load_user`. Others: `file:<path>`, `dir:<path>`, `dep:npm:<name>`, `env:<NAME>`, `commit:<sha>`.
@@ -60,8 +59,8 @@ Properties:
 Relationships:
 - Calls (code -> code): `CALLS`, `INSTANTIATES`, `RENDERS`, `USES_HOOK`, `HANDLES` (Route -> handler), `REQUESTS` (HTTP client call -> Route), `INVOKES` (-> IpcChannel), `RUNS` (Command -> file or command). Properties `line args confidence` (`heuristic`, or `ambiguous`: an untyped receiver linked to the only method of that name).
 - Data: `READS`, `WRITES`, `THROWS`, `READS_CONFIG` (-> EnvVar).
-- Types: `RETURNS`, `OF_TYPE`, `HAS_PARAM`, `EXTENDS`, `IMPLEMENTS`, `OVERRIDES`.
-- Structure: `DEFINES` (File -> Sym), `CONTAINS` (Directory -> File, parent -> member), `EXPORTS`, `IMPORTS {line, module}` (File -> File or Dependency), `DEPENDS_ON` (manifest -> Dependency), `TESTS` (Test -> code), `MODIFIED_IN` (File -> Commit).
+- Types: `RETURNS`, `TAKES` (-> a parameter's type), `OF_TYPE`, `EXTENDS`, `IMPLEMENTS`, `OVERRIDES`.
+- Structure: `DEFINES` (File -> Sym), `CONTAINS` (Directory -> File, parent -> member), `IMPORTS {line, module}` (File -> File or Dependency), `DEPENDS_ON` (manifest -> Dependency), `TESTS` (Test -> code), `MODIFIED_IN` (File -> Commit).
 - Documents: `MENTIONS {line, confidence}` (Section -> the symbol a backtick name in its text names).
 
 ## 5. Knowledge and work schema
@@ -81,7 +80,7 @@ WORKSPACE:
 
 ```cypher
 // functions nothing refers to
-USE LAYER OBSERVED MATCH (f:Function) WHERE size([(f)<-[c]-() WHERE type(c) <> 'DEFINES' AND type(c) <> 'CONTAINS' AND type(c) <> 'EXPORTS' | 1]) = 0 RETURN f.sid, f.exported LIMIT 200
+USE LAYER OBSERVED MATCH (f:Function) WHERE size([(f)<-[c]-() WHERE type(c) <> 'DEFINES' AND type(c) <> 'CONTAINS' | 1]) = 0 RETURN f.sid, f.exported LIMIT 200
 // routes and their handlers
 USE LAYER OBSERVED MATCH (r:Route)-[:HANDLES]->(h) RETURN r.http_method, r.route_path, h.sid, h.path, h.start_line
 // everything reaching save_order within four calls
@@ -100,7 +99,7 @@ USE LAYER OBSERVED MATCH (f:File)-[:IMPORTS]->(d:Dependency {name: 'requests'}) 
 USE LAYER OBSERVED MATCH (c:Code)-[:READS_CONFIG]->(e:EnvVar) RETURN e.name, c.sid
 USE LAYER OBSERVED MATCH (c:Code)-[:REQUESTS]->(r:Route) RETURN c.sid, r.http_method, r.route_path
 // functions with many parameters; a file's commits
-USE LAYER OBSERVED MATCH (n:Sym) WHERE (n:Function OR n:Method) AND n.param_count > 5 RETURN n.sid, n.param_count
+USE LAYER OBSERVED MATCH (n:Sym) WHERE (n:Function OR n:Method) AND size(n.param_names) > 5 RETURN n.sid, size(n.param_names)
 USE LAYER OBSERVED MATCH (f:File {path: 'src/db.ts'})-[:MODIFIED_IN]->(c:Commit) RETURN c.qname, c.name, c.time_ms
 // documentation sections that mention a symbol
 USE LAYER OBSERVED MATCH (s:Section)-[:MENTIONS]->(c:Code {name: 'save_order'}) RETURN s.path, s.signature, s.start_line

@@ -34,7 +34,7 @@ fn valid_segment(name: &str) -> bool {
 }
 
 /// clonefile(2): returns Ok(true) when cloned, Ok(false) when the volume does not support it.
-fn clone_tree(source: &Path, target: &Path) -> std::io::Result<bool> {
+pub(crate) fn clone_tree(source: &Path, target: &Path) -> std::io::Result<bool> {
     let src = CString::new(source.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     let dst = CString::new(target.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     // SAFETY: both arguments are valid NUL-terminated paths; flags 0 = follow nothing special.
@@ -49,7 +49,7 @@ fn clone_tree(source: &Path, target: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(source)?;
     if meta.file_type().is_symlink() {
         let link = std::fs::read_link(source)?;

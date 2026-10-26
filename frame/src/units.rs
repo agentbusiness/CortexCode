@@ -1234,6 +1234,14 @@ pub fn queue_bundled(root: &Path, packages: &Path) -> Vec<(String, String)> {
         if taken {
             continue;
         }
+        // An update installed a newer release than the app carries: the app's older one stays out.
+        let current = std::fs::read_to_string(root.join(id).join(CURRENT)).map(|text| text.trim().to_owned()).unwrap_or_default();
+        if cc_protocol::version::is_newer(&current, version) {
+            if let Err(error) = write_record(&root.join(id), BUNDLED, Some(version)) {
+                tracing::warn!(plugin = %id, %error, "cannot record the app version passed over");
+            }
+            continue;
+        }
         if let Err(error) = std::fs::create_dir_all(&incoming).and_then(|()| std::fs::copy(entry.path(), incoming.join(&name)).map(|_| ())) {
             tracing::error!(package = %name, %error, "cannot queue the app's plugin package");
             continue;

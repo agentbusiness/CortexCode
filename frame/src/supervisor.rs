@@ -136,7 +136,7 @@ impl Instance {
         conn.call_timeout(method, params, limit).await.map_err(|error| error.to_string())
     }
 
-    fn route(&self) -> Option<Route> {
+    pub(crate) fn route(&self) -> Option<Route> {
         let peer = self.peer.get()?;
         Some(Route { conn: peer.conn()?.clone(), instance: self.id.clone(), peer: peer.id })
     }
@@ -508,6 +508,7 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
         pending.insert(id.clone(), instance.clone());
     }
     slot.lock().others.push(instance.clone());
+    crate::children::record(&frame.home, pid, &instance.spec.exec, "plugin");
     tracing::info!(instance = %id, pid, exec = %instance.spec.exec.display(), "plugin process started");
     set_state(frame, &instance, "starting");
     let monitor_frame = frame.clone();
@@ -525,6 +526,7 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
         };
         // The plugin leads its own process group; take down anything it left behind.
         kill_group(pid);
+        crate::children::forget(&monitor_frame.home, pid);
         let description = match status {
             Ok(status) => match (status.code(), status.signal()) {
                 (Some(code), _) => format!("exited with code {code}"),

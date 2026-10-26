@@ -8,7 +8,11 @@
     python3 secaudit.py cover <unit> covered|candidate|blocked ["<note>"]
     python3 secaudit.py new confirmed|needs_validation|rejected
     python3 secaudit.py finding <file.json>
-    python3 secaudit.py status
+    python3 secaudit.py status [--fixing | --finding <id>]   (the fix session's guard: 0 once the finding is fixed)
+    python3 secaudit.py show <id>                   one finding from the project's graph, for a fix session
+    python3 secaudit.py fix-plan <id>               the exact upgrade commands of a dependency finding
+    python3 secaudit.py recheck <id>                what the code says now; a sink that is gone marks it fixed
+    python3 secaudit.py resolve <id> "<how>"        record a fix (the code must show it)
     python3 secaudit.py report [--partial]
     python3 secaudit.py scan [<path>...] [--changed [<ref>]]
     python3 secaudit.py deps
@@ -142,6 +146,8 @@ SECRET_FILE_NAMES = [".env", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "id_rs
 SEVERITY = ["informational", "low", "medium", "high", "critical"]
 STATUSES = ["planned", "in_progress", "covered", "candidate", "blocked"]
 VERDICTS = ["confirmed", "needs_validation", "rejected"]
+# What the graph records as the audit's tool version.
+SKILL_VERSION = "secaudit 2026-10-26"
 
 
 # ----------------------------------------------------------------------------- files
@@ -830,7 +836,7 @@ class State:
             return default
 
     def save(self, name, data):
-        os.makedirs(self.out, exist_ok=True)
+        os.makedirs(os.path.dirname(self.path(name)), exist_ok=True)
         tmp = self.path(name) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=1, ensure_ascii=False)
@@ -840,6 +846,7 @@ class State:
         data = self.load("coverage.json", None)
         if data is None:
             fail("no audit here yet", "python3 %s recon" % sys.argv[0])
+        sync_units(self, data)
         return data
 
     def unit(self, coverage, uid):
@@ -936,7 +943,8 @@ def cmd_recon(args):
     for unit in units:
         state.save(os.path.join("hits", unit["id"] + ".json"), hits.get(unit["class"], []))
     previous = state.load("coverage.json", None)
-    coverage = {"root": root, "scope": scope, "started": time.strftime("%Y-%m-%d %H:%M"), "units": units, "files": len(files)}
+    coverage = {"root": root, "scope": scope, "started": time.strftime("%Y-%m-%d %H:%M"), "started_ms": int(time.time() * 1000), "units": units, "files": len(files)}
+    coverage["audit_id"] = "audit-%s" % hashlib.sha1(("%s %d" % (root, coverage["started_ms"])).encode("utf-8")).hexdigest()[:12]
     if previous and previous.get("units"):
         done = {u["class"]: u for u in previous["units"] if u["status"] not in ("planned", "in_progress")}
         for unit in units:
@@ -1123,11 +1131,43 @@ def cmd_cover(args):
 
 
 def cmd_status(args):
+    positional, flags = parse_flags(args, {"finding": True, "unit": True})
     state = State(os.getcwd(), default_out())
+    # The fix session's guard: exit 0 once its finding is recorded fixed.
+    if flags.get("fixing") or flags.get("finding"):
+        if flags.get("finding"):
+            finding, _ = graph_finding(state, flags["finding"])
+            if finding is None:
+                fail("no finding %s in the project's graph" % flags["finding"], "%s show %s" % (tool(), flags["finding"]))
+            if finding.get("status") in STATUS_DONE:
+                print("%s is %s." % (finding["id"], finding["status"]))
+                return
+            print("Open: %s is %s: %s" % (finding["id"], finding.get("status", "open"), finding.get("title", "")))
+            print("Next: make the fix, run the test, then %s resolve %s \"<how>\"" % (tool(), finding["id"]))
+            sys.exit(1)
+        open_fixes = fixing_here(state)
+        if not open_fixes:
+            print("No fix is open in this session.")
+            return
+        for finding in open_fixes:
+            print("Open: %s (%s) %s; sink %s:%s" % (finding["id"], finding.get("severity_overall") or finding.get("verdict"), finding.get("title", ""), finding.get("sink_path") or "", finding.get("sink_line") or ""))
+        print("Next: make the fix at the sink, run the test, then %s resolve %s \"<how you verified it>\"" % (tool(), open_fixes[0]["id"]))
+        sys.exit(1)
     coverage = state.coverage()
     findings = state.findings()
-    sync_units(state, coverage)
     states = hit_states(state)
+    if flags.get("unit"):
+        unit = state.unit(coverage, flags["unit"])
+        rows = hit_rows(state, unit)
+        left = [r[0] for r in rows if r[0] not in states]
+        if left:
+            print("Open: %s %s, %d of %d lines (%s%s)." % (unit["id"], unit["class"], len(left), len(rows), ", ".join(left[:6]), ", ..." if len(left) > 6 else ""))
+            print("Next: %s next --unit %s" % (tool(), unit["id"]))
+            sys.exit(1)
+        catalog = Catalog()
+        report_path = state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))
+        print("%s is settled: %s" % (unit["id"], unit_line(state, unit, catalog, report_path)))
+        return
     open_units = []
     for unit in coverage["units"]:
         rows = hit_rows(state, unit)
@@ -1383,18 +1423,15 @@ def cmd_finding(args):
     if record.get("hit"):
         states = hit_states(state)
         states[record["hit"]] = {"status": "finding" if record["verdict"] == "confirmed" else "lead" if record["verdict"] == "needs_validation" else "safe", "note": record["title"], "record": os.path.basename(path)}
-        state.save("hits-state.json", states)
+        save_hit_states(state, states, sorted({hid.split(".")[0] for hid in states}))
         coverage = state.load("coverage.json", None)
         if coverage:
             sync_units(state, coverage)
     print("Recorded %s as %s%s." % (record["fingerprint"], record["verdict"], " (replaced the earlier record)" if replaced else ""))
     coverage = state.load("coverage.json", None)
-    unit = None
-    if coverage:
-        for u in coverage["units"]:
-            if u["class"] == record["class"] or u["id"] == record.get("unit"):
-                unit = u
-                break
+    if coverage and record["verdict"] in ("confirmed", "needs_validation"):
+        deps_rows = (state.load("deps.json", {}) or {}).get("rows") or []
+        push_findings(state, coverage, [record_to_finding(record, deps_rows)])
     print("Next: %s next" % tool())
 
 
@@ -1570,6 +1607,8 @@ def cmd_report(args):
         handle.write("\n".join(lines))
     rel = state.path("REPORT.md")
     print("Wrote %s." % rel)
+    if push_findings(state, coverage, all_graph_findings(state, coverage), finished=True):
+        print("The findings are in the project's graph (the Security tab lists them by priority).")
     print(summary_line)
     for f in confirmed:
         sink = f["trace"][-1]
@@ -1721,7 +1760,39 @@ def cited_location(state, note, targets):
 
 
 def hit_states(state):
-    return state.load("hits-state.json", {})
+    """Every settled line: the old single file, then one file per unit (`hits-state/<unit>.json`,
+    so agents settling different units at the same time never overwrite each other)."""
+    states = dict(state.load("hits-state.json", {}) or {})
+    folder = state.path("hits-state")
+    if os.path.isdir(folder):
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".json"):
+                states.update(state.load(os.path.join("hits-state", name), {}) or {})
+    return states
+
+
+def save_hit_states(state, states, unit_ids):
+    """Write the settled lines of `unit_ids`, each unit to its own file."""
+    for unit_id in unit_ids:
+        unit_states = {hid: st for hid, st in states.items() if hid.split(".")[0] == unit_id}
+        state.save(os.path.join("hits-state", unit_id + ".json"), unit_states)
+
+
+def report_current(state):
+    """The report stands: written after the last settle and the last record."""
+    report = state.path("REPORT.md")
+    if not os.path.isfile(report):
+        return False
+    written = os.path.getmtime(report)
+    newest = 0
+    for name in ("hits-state.json", "findings.json"):
+        if os.path.isfile(state.path(name)):
+            newest = max(newest, os.path.getmtime(state.path(name)))
+    folder = state.path("hits-state")
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            newest = max(newest, os.path.getmtime(os.path.join(folder, name)))
+    return written >= newest
 
 
 def unit_status_from_hits(rows, states):
@@ -1740,7 +1811,8 @@ def unit_status_from_hits(rows, states):
 
 
 def sync_units(state, coverage):
-    """Write every unit's status and note from its hits (the notes of safe, hardening and blocked hits)."""
+    """Every unit's status and note from its hits (the notes of safe, hardening and blocked hits),
+    in memory: agents settle units at the same time, so coverage.json is not rewritten here."""
     states = hit_states(state)
     for unit in coverage["units"]:
         rows = hit_rows(state, unit)
@@ -1756,7 +1828,6 @@ def sync_units(state, coverage):
                 notes.append(s["note"])
         if notes:
             unit["note"] = "; ".join(dict.fromkeys(notes))
-    state.save("coverage.json", coverage)
 
 
 def pending_records(state):
@@ -1830,19 +1901,26 @@ def print_unit_step(state, coverage, unit, catalog, first_time):
 
 
 def cmd_next(args):
+    positional, flags = parse_flags(args, {"unit": "one"})
+    only = (flags.get("unit") or "").upper() or None
     root = os.getcwd()
     state = State(root, default_out())
     catalog = Catalog()
     coverage = state.load("coverage.json", None)
-    if coverage is not None and os.path.isfile(state.path("REPORT.md")) and not coverage.get("report_stale", True):
+    if coverage is not None and only is None and report_current(state):
         # The last audit of this project is complete: this is a new run. recon archives the old one
         # and seeds U0 with its issues.
         coverage = None
     if coverage is None:
+        if only:
+            fail("no audit here yet", "%s units" % tool())
         cmd_recon([])
         coverage = state.coverage()
         print("")
     pending = pending_records(state)
+    if only:
+        # Another agent's unfilled record is not this unit's business.
+        pending = [(name, hid) for name, hid in pending if hid.split(".")[0] == only]
     if pending:
         name, hid = pending[0]
         print("The record for %s is not written yet: %s still holds its template." % (hid, os.path.join(state.drafts_rel, name)))
@@ -1850,6 +1928,18 @@ def cmd_next(args):
         sys.exit(1)
     sync_units(state, coverage)
     states = hit_states(state)
+    if only:
+        # One unit, for an agent that has this unit only: shown while it has open lines, its one
+        # line when it is settled; nothing of the shared state is written.
+        unit = state.unit(coverage, only)
+        if not any(r[0] not in states for r in hit_rows(state, unit)):
+            report_path = state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))
+            print("%s is settled: %s" % (unit["id"], unit_line(state, unit, catalog, report_path)))
+            print("Next: reply with that one line; this unit is done.")
+            return
+        first_time = not any(r[0] in states for r in hit_rows(state, unit))
+        print_unit_step(state, coverage, unit, catalog, first_time)
+        return
     open_units = [u for u in coverage["units"] if any(r[0] not in states for r in hit_rows(state, u))]
     # A unit whose step failed is shown after the others, and never dropped: it stays open until
     # its lines are settled, and comes back for a retry; a second failure hands the model the
@@ -1881,9 +1971,7 @@ def cmd_next(args):
         if unit.pop("error", None) is not None:
             state.save("coverage.json", coverage)
         return
-    if not os.path.isfile(state.path("REPORT.md")) or coverage.get("report_stale", True):
-        coverage["report_stale"] = False
-        state.save("coverage.json", coverage)
+    if not report_current(state):
         print("Every line of every unit is settled. Writing the report.")
         cmd_report([])
         print("")
@@ -1895,6 +1983,27 @@ def cmd_next(args):
     with open(report_path, encoding="utf-8") as handle:
         print(handle.read())
     print("Next: reply to the user with the report's summary, every confirmed finding (severity, title, path:line, result, fix), every lead with its missing fact, what was not covered, and the report's path %s." % report_path)
+
+
+def cmd_units(args):
+    """The open units, one per line as `<id>\t<title>`: what agents can take on at the same time
+    (each with `next --unit <id>`). Maps the project first when no audit is open."""
+    state = State(os.getcwd(), default_out())
+    coverage = state.load("coverage.json", None)
+    if coverage is not None and report_current(state):
+        coverage = None
+    if coverage is None:
+        # The map's own account goes to stderr: stdout is the list alone.
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            cmd_recon([])
+        coverage = state.coverage()
+    states = hit_states(state)
+    for unit in coverage["units"]:
+        rows = hit_rows(state, unit)
+        left = sum(1 for r in rows if r[0] not in states)
+        if left:
+            print("%s\t%s (%s)" % (unit["id"], unit["name"], unit["reason"]))
 
 
 def cmd_settle(args):
@@ -2004,11 +2113,8 @@ def cmd_settle(args):
             states[hid] = {"status": status, "note": note}
             if cited:
                 states[hid]["cited"] = cited
-    state.save("hits-state.json", states)
-    sync_units(state, coverage)
+    save_hit_states(state, states, sorted({u["id"] for u, _ in targets}))
     coverage = state.coverage()
-    coverage["report_stale"] = True
-    state.save("coverage.json", coverage)
     closed = []
     for unit in {u["id"]: u for u, _ in targets}.values():
         if unit["status"] in ("covered", "candidate", "blocked"):
@@ -2193,7 +2299,7 @@ def archive_previous(state):
     """A new audit on a project with a finished one: keep the old run under runs/<stamp>/ and
     return its issues (findings, leads, hardening notes) for the re-check, or None when there is
     no previous run."""
-    if not os.path.isfile(state.path("REPORT.md")) and not os.path.isfile(state.path("hits-state.json")):
+    if not os.path.isfile(state.path("REPORT.md")) and not os.path.isfile(state.path("hits-state.json")) and not os.path.isdir(state.path("hits-state")):
         return None
     findings = state.findings()
     states = hit_states(state)
@@ -2224,7 +2330,7 @@ def archive_previous(state):
     for name in ("REPORT.md", "findings.json", "hits-state.json", "coverage.json", "recon.json", "deps.json"):
         if os.path.isfile(state.path(name)):
             os.replace(state.path(name), os.path.join(archive, name))
-    for folder in ("units", "hits"):
+    for folder in ("units", "hits", "hits-state"):
         if os.path.isdir(state.path(folder)):
             os.replace(state.path(folder), os.path.join(archive, folder))
     # The old run's record drafts (normally gone with the project's tmp/) must not block the new one.
@@ -2287,9 +2393,441 @@ def previous_rows(state, unit):
     return out
 
 
+
+# ----------------------------------------------------------------------------- the project's graph
+
+# Findings live in the project's graph (the memory plugin, through the app): the Security tab lists
+# them by priority, starts fix sessions from them and marks them fixed. The script is the only
+# writer; the app is reached through `cx`, so an audit never waits for it: a push that finds no app
+# is noted and the next push carries everything again.
+
+GRAPH_METHODS = {
+    "audit": "memory.security.audit.put",
+    "put": "memory.security.findings.put",
+    "list": "memory.security.findings",
+    "get": "memory.security.finding",
+    "update": "memory.security.finding.update",
+    "summary": "memory.security.summary",
+}
+PRIORITY_BAND = {"critical": 400, "high": 300, "medium": 200, "low": 100, "informational": 50}
+STATUS_DONE = ("fixed", "verified")
+
+
+def graph_call(method, params):
+    """One call to the app (`cx call`): (True, result) or (False, why). The app not running is a
+    `why` like any other; callers that only push note it and go on."""
+    home = os.environ.get("CORTEX_HOME")
+    if not home:
+        return False, "no CORTEX_HOME"
+    cx = os.path.join(home, "bin", "cx")
+    if not os.path.isfile(cx):
+        return False, "cx is not installed in %s" % os.path.join(home, "bin")
+    try:
+        out = subprocess.run([cx, "call", method, json.dumps(params)], capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, "cx: %s" % error
+    if out.returncode != 0:
+        message = (out.stderr.strip() or out.stdout.strip() or "cx exited %d" % out.returncode).split("\n")[-1]
+        return False, message
+    try:
+        return True, json.loads(out.stdout) if out.stdout.strip() else {}
+    except ValueError:
+        return False, "cx answered something that is not JSON"
+
+
+def project_id(state):
+    """The app's id of the project this audit runs in: the `run` shell exports it; outside the app
+    the project list is matched by root."""
+    env = os.environ.get("CORTEX_PROJECT_ID")
+    if env:
+        return env
+    ok, result = graph_call("frame.project.list", {})
+    if ok:
+        want = os.path.realpath(state.root)
+        for project in (result or {}).get("projects", []) if isinstance(result, dict) else []:
+            if os.path.realpath(project.get("root", "")) == want:
+                return project["id"]
+    return None
+
+
+def audit_record(state, coverage, finished):
+    """The audit node: the run's id, times, size and counts."""
+    findings = state.findings()
+    states = hit_states(state)
+    audit = {
+        "id": coverage.get("audit_id") or "audit-%s" % hashlib.sha1(("%s %s" % (state.root, coverage.get("started", ""))).encode("utf-8")).hexdigest()[:12],
+        "started_ms": coverage.get("started_ms") or int(time.time() * 1000),
+        "units": len(coverage.get("units", [])),
+        "lines_judged": len(states),
+        "findings": sum(1 for f in findings if f.get("verdict") == "confirmed"),
+        "leads": sum(1 for f in findings if f.get("verdict") == "needs_validation"),
+        "hardening": sum(1 for s in states.values() if s.get("status") == "hardening"),
+        "scope": ", ".join(coverage.get("scope") or []) or None,
+        "skill_version": SKILL_VERSION,
+        "report_path": state.path("REPORT.md") if os.path.isfile(state.path("REPORT.md")) else None,
+    }
+    if finished:
+        audit["finished_ms"] = int(time.time() * 1000)
+    return audit
+
+
+def priority_of(finding):
+    """One number, higher first, from the facts the record states; the reason spells the terms out."""
+    terms = []
+    verdict = finding.get("verdict")
+    if verdict == "confirmed":
+        level = (finding.get("severity_overall") or "low").lower()
+        score = PRIORITY_BAND.get(level, 100)
+        terms.append("%s severity %d" % (level, score))
+        score += 50
+        terms.append("confirmed +50")
+    elif verdict == "needs_validation":
+        score = 150
+        terms.append("lead 150")
+    else:
+        score = 60
+        terms.append("hardening note 60")
+    who = (finding.get("principal") or "").lower()
+    if any(word in who for word in ("anonymous", "unauthenticated", "any visitor", "remote peer", "the network")):
+        score += 30
+        terms.append("anonymous party +30")
+    elif any(word in who for word in ("user", "authenticated", "logged", "member", "tenant")):
+        score += 15
+        terms.append("authenticated party +15")
+    if finding.get("quick_fix"):
+        score += 20
+        terms.append("quick fix available +20")
+    return score, ", ".join(terms)
+
+
+ECOSYSTEM_TOOLS = {
+    "npm": lambda name, to, lockdir: ["cd %s && npm install %s@%s" % (lockdir, name, to)],
+    "crates.io": lambda name, to, lockdir: ["cd %s && cargo update -p %s --precise %s" % (lockdir, name, to)],
+    "PyPI": lambda name, to, lockdir: ["cd %s && python3 -m pip install '%s==%s' && python3 -m pip freeze | grep -i '^%s==' " % (lockdir, name, to, name)],
+    "Go": lambda name, to, lockdir: ["cd %s && go get %s@v%s && go mod tidy" % (lockdir, name, to.lstrip("v"))],
+    "RubyGems": lambda name, to, lockdir: ["cd %s && bundle update %s" % (lockdir, name)],
+    "Packagist": lambda name, to, lockdir: ["cd %s && composer update %s" % (lockdir, name)],
+    "Maven": lambda name, to, lockdir: ["edit the version of %s to %s in %s/pom.xml, then: cd %s && mvn -q dependency:resolve" % (name, to, lockdir, lockdir)],
+    "NuGet": lambda name, to, lockdir: ["cd %s && dotnet add package %s --version %s" % (lockdir, name, to)],
+}
+
+
+def quick_fix_for(package_name, deps_rows, lockfile=None):
+    """The exact upgrade for a vulnerable package: the covering version and the commands of its
+    ecosystem; None when no fixed version exists."""
+    rows = [r for r in deps_rows if r["name"] == package_name and (lockfile is None or r["lockfile"] == lockfile)]
+    if not rows:
+        return None
+    to = covering_fix(rows)
+    if not to:
+        return None
+    row = rows[0]
+    lockdir = os.path.dirname(row["lockfile"]) or "."
+    make = ECOSYSTEM_TOOLS.get(row["eco"])
+    commands = make(row["name"], to, lockdir) if make else ["upgrade %s to %s in %s" % (row["name"], to, row["lockfile"])]
+    if row["lockfile"].endswith("requirements.txt"):
+        commands = ["sed -i '' 's/^%s==%s/%s==%s/' %s" % (re.escape(row["name"]), re.escape(row["version"]), row["name"], to, row["lockfile"]), "cd %s && python3 -m pip install -r %s" % (lockdir, os.path.basename(row["lockfile"]))]
+    return {"kind": "upgrade", "ecosystem": row["eco"], "package": row["name"], "from": row["version"], "to": to, "lockfile": row["lockfile"], "commands": commands}
+
+
+def record_to_finding(record, deps_rows):
+    """A validated record (confirmed or needs_validation) as the graph's finding."""
+    trace = [{"kind": step.get("kind", "step"), "file": step.get("file", ""), "line": int(step.get("line") or 0), "what": step.get("what", "")} for step in record.get("trace", [])]
+    sink = record.get("trace", [{}])[-1] if record.get("trace") else {}
+    verdict = record["verdict"]
+    severity = record.get("severity") or {}
+    fix = record.get("fix") or {}
+    evidence = record.get("evidence") or {}
+    quick_fix = None
+    if record.get("class") == "dependencies":
+        parts = record["fingerprint"].split(":")
+        if len(parts) >= 3:
+            quick_fix = quick_fix_for(parts[-1], deps_rows)
+    finding = {
+        "id": record["fingerprint"],
+        "class": record.get("class", ""),
+        "verdict": verdict,
+        "title": record.get("title", ""),
+        "principal": record.get("principal", ""),
+        "control": record.get("control", ""),
+        "impact": record.get("impact", ""),
+        "result": (evidence.get("observed") or record.get("impact") or "").split("\n")[0],
+        "evidence_how": evidence.get("how", ""),
+        "evidence_observed": evidence.get("observed", ""),
+        "severity_likelihood": severity.get("likelihood"),
+        "severity_impact": severity.get("impact"),
+        "severity_overall": severity.get("overall"),
+        "fix_where": fix.get("where", ""),
+        "fix_change": fix.get("change", ""),
+        "fix_test": fix.get("test", ""),
+        "missing_fact": ("%s. Check: %s" % (record.get("blocker", "").rstrip("."), record.get("check", ""))) if verdict == "needs_validation" else None,
+        "trace": trace,
+        "quick_fix": quick_fix,
+        "sink_path": sink.get("file") or None,
+        "sink_line": int(sink.get("line") or 0) or None,
+    }
+    finding["priority"], finding["priority_reason"] = priority_of(finding)
+    return finding
+
+
+def hardening_findings(state, coverage, deps_rows):
+    """Every hardening note as a finding of its own: the class, the line, the reviewer's note."""
+    states = hit_states(state)
+    out = []
+    for unit in coverage.get("units", []):
+        for hid, rel, number, shape, text in hit_rows(state, unit):
+            judged = states.get(hid)
+            if not judged or judged.get("status") != "hardening":
+                continue
+            quick_fix = None
+            package = None
+            if unit["class"] == "dependencies" and " " in text.split(":")[0]:
+                package = text.split(":")[0].split(" ")[1]
+                quick_fix = quick_fix_for(package, deps_rows, rel or None)
+            ident = ("hardening:%s:%s" % (unit["class"], package or ("%s:%d" % (rel or unit["id"], number or 0)))).lower()
+            finding = {
+                "id": ident,
+                "class": unit["class"],
+                "verdict": "hardening",
+                "title": judged.get("note", "") or "hardening note",
+                "principal": "",
+                "control": "",
+                "impact": "",
+                "result": "",
+                "evidence_how": "static: the reviewer's note on the flagged line",
+                "evidence_observed": text[:200],
+                "fix_where": ("%s:%d" % (rel, number)) if rel and number else (rel or ""),
+                "fix_change": judged.get("note", ""),
+                "fix_test": "",
+                "trace": [{"kind": "sink", "file": rel or "", "line": int(number or 0), "what": text[:160]}] if rel else [],
+                "quick_fix": quick_fix,
+                "sink_path": rel or None,
+                "sink_line": int(number or 0) or None,
+            }
+            finding["priority"], finding["priority_reason"] = priority_of(finding)
+            out.append(finding)
+    return out
+
+
+def all_graph_findings(state, coverage):
+    deps_rows = (state.load("deps.json", {}) or {}).get("rows") or []
+    findings = [record_to_finding(r, deps_rows) for r in state.findings() if r.get("verdict") in ("confirmed", "needs_validation")]
+    findings.extend(hardening_findings(state, coverage, deps_rows))
+    return findings
+
+
+def push_findings(state, coverage, findings, finished=False):
+    """Write the audit and these findings to the project's graph. One line when the app is away."""
+    pid = project_id(state)
+    if not pid:
+        print("(not written to the project's graph: the app is not reachable from here; the next push carries it)")
+        return False
+    audit = audit_record(state, coverage, finished)
+    ok, why = graph_call(GRAPH_METHODS["audit"], {"project_id": pid, "audit": audit})
+    if not ok:
+        print("(not written to the project's graph: %s)" % why)
+        return False
+    if findings:
+        ok, why = graph_call(GRAPH_METHODS["put"], {"project_id": pid, "audit_id": audit["id"], "findings": findings})
+        if not ok:
+            print("(findings not written to the project's graph: %s)" % why)
+            return False
+    return True
+
+
+def graph_finding(state, ident):
+    """A finding from the graph with its history: (finding, history), or (None, why)."""
+    pid = project_id(state)
+    if not pid:
+        return None, "the app is not reachable from here"
+    ok, result = graph_call(GRAPH_METHODS["get"], {"project_id": pid, "id": ident})
+    if not ok:
+        return None, result
+    return (result or {}).get("finding"), (result or {}).get("history", [])
+
+
+def local_finding(state, ident):
+    """The same finding from this folder's state (the records and the hardening notes), or None."""
+    coverage = state.load("coverage.json", None) or {"units": []}
+    for finding in all_graph_findings(state, coverage):
+        if finding["id"] == ident:
+            return finding
+    return None
+
+
+def now_at_sink(state, finding):
+    """What the code says about a finding now: the flagged line unchanged, moved or gone; the
+    package still pinned, upgraded or removed. (kind, sentence) with kind in unchanged|moved|gone|
+    upgraded|unknown."""
+    quick_fix = finding.get("quick_fix")
+    if finding.get("class") == "dependencies":
+        package = (quick_fix or {}).get("package") or finding["id"].split(":")[-1]
+        pinned = (quick_fix or {}).get("from")
+        current = None
+        for eco, name, version in project_packages(state.root, repo_files(state.root, [])):
+            if name == package:
+                current = version
+                break
+        if current is None:
+            return "gone", "%s is no longer pinned in a lockfile" % package
+        if pinned and current != pinned:
+            return "upgraded", "%s is now pinned at %s (was %s)" % (package, current, pinned)
+        return "unchanged", "%s is still pinned at %s" % (package, current)
+    sink = (finding.get("trace") or [{}])[-1] if finding.get("trace") else {}
+    rel, line, want = sink.get("file"), int(sink.get("line") or 0), (sink.get("text") or "").strip()
+    if not rel:
+        return "unknown", "the finding names no line to compare"
+    full = os.path.join(state.root, rel)
+    if not os.path.isfile(full):
+        return "gone", "the file %s no longer exists" % rel
+    lines = (read_text(full) or "").split("\n")
+    if not want:
+        # The stored finding carries no line text: the hits file or the record may.
+        for record in state.findings():
+            if record.get("fingerprint") == finding["id"] and record.get("trace"):
+                want = (record["trace"][-1].get("text") or "").strip()
+        if not want and finding.get("evidence_observed") and finding.get("verdict") == "hardening":
+            want = finding["evidence_observed"].split(":", 1)[-1].strip()[:80]
+    if want and 0 < line <= len(lines) and lines[line - 1].strip().startswith(want[:60]):
+        return "unchanged", "the flagged line is unchanged at %s:%d" % (rel, line)
+    if want and any(l.strip().startswith(want[:60]) for l in lines):
+        return "moved", "the flagged line still exists in %s, at another line" % rel
+    if want:
+        return "gone", "the flagged line is gone from %s (changed or removed)" % rel
+    return "unknown", "the file still exists; compare %s:%d by hand" % (rel, line)
+
+
+def cmd_show(args):
+    """Print one finding, readable, for the fix session."""
+    if not args:
+        fail("which finding?", "%s show <id>" % tool())
+    state = State(os.getcwd(), default_out())
+    finding, history = graph_finding(state, args[0])
+    if finding is None:
+        finding = local_finding(state, args[0])
+        history = []
+        if finding is None:
+            fail("no finding %s in the graph (%s) or in this audit's records" % (args[0], history if isinstance(history, str) else ""), "%s status" % tool())
+    level = finding.get("severity_overall") or {"needs_validation": "lead", "hardening": "hardening note"}.get(finding.get("verdict"), finding.get("verdict"))
+    print("%s [%s, %s] %s" % (finding["id"], level, finding.get("class", ""), finding.get("title", "")))
+    if finding.get("status"):
+        print("Status: %s%s." % (finding["status"], (" (" + finding.get("status_note", "") + ")") if finding.get("status_note") else ""))
+    for label, key in (("Who", "principal"), ("Result", "result"), ("Control", "control"), ("Impact", "impact"), ("Missing fact", "missing_fact")):
+        if finding.get(key):
+            print("%s: %s" % (label, finding[key]))
+    if finding.get("trace"):
+        print("Trace (entry point first, sink last):")
+        for step in finding["trace"]:
+            print("  %s %s:%d  %s" % (step.get("kind", "step"), step.get("file", ""), int(step.get("line") or 0), step.get("what", "")))
+    if finding.get("fix_change") or finding.get("fix_where"):
+        print("Fix: %s at %s" % (finding.get("fix_change", ""), finding.get("fix_where", "")))
+    if finding.get("fix_test"):
+        print("Test that proves it: %s" % finding["fix_test"])
+    if finding.get("quick_fix"):
+        qf = finding["quick_fix"]
+        print("Quick fix: %s %s %s -> %s in %s:" % (qf["ecosystem"], qf["package"], qf["from"], qf["to"], qf["lockfile"]))
+        for command in qf.get("commands", []):
+            print("  " + command)
+    kind, sentence = now_at_sink(state, finding)
+    print("Now: %s." % sentence)
+    print("Next: make the fix at the sink, run the test, then %s resolve %s \"<how you verified it>\"" % (tool(), finding["id"]))
+
+
+def cmd_fix_plan(args):
+    """The exact commands of a quick fix."""
+    if not args:
+        fail("which finding?", "%s fix-plan <id>" % tool())
+    state = State(os.getcwd(), default_out())
+    finding, _ = graph_finding(state, args[0])
+    if finding is None:
+        finding = local_finding(state, args[0])
+    if finding is None:
+        fail("no finding %s" % args[0], "%s status" % tool())
+    qf = finding.get("quick_fix")
+    if not qf:
+        print("%s has no quick fix: it needs a code change. Fix: %s at %s" % (finding["id"], finding.get("fix_change", ""), finding.get("fix_where", "")))
+        print("Next: %s show %s" % (tool(), finding["id"]))
+        return
+    print("Upgrade %s from %s to %s (%s, pinned in %s):" % (qf["package"], qf["from"], qf["to"], qf["ecosystem"], qf["lockfile"]))
+    for command in qf.get("commands", []):
+        print("  " + command)
+    print("Then run the project's tests, and: %s resolve %s \"upgraded %s to %s, tests pass\"" % (tool(), finding["id"], qf["package"], qf["to"]))
+
+
+def cmd_recheck(args):
+    """What the code says now about one finding; a sink that is gone or a package that moved on
+    marks the finding fixed in the graph (by: recheck)."""
+    if not args:
+        fail("which finding?", "%s recheck <id>" % tool())
+    state = State(os.getcwd(), default_out())
+    finding, _ = graph_finding(state, args[0])
+    if finding is None:
+        finding = local_finding(state, args[0])
+    if finding is None:
+        fail("no finding %s" % args[0], "%s status" % tool())
+    kind, sentence = now_at_sink(state, finding)
+    print("%s: %s." % (finding["id"], sentence))
+    if kind in ("gone", "upgraded") and finding.get("status") not in STATUS_DONE:
+        pid = project_id(state)
+        if pid:
+            ok, why = graph_call(GRAPH_METHODS["update"], {"project_id": pid, "id": finding["id"], "status": "fixed", "by": "recheck", "note": sentence})
+            print("Marked fixed in the project's graph." if ok else "(not marked in the graph: %s)" % why)
+    print("Next: %s next" % tool())
+
+
+def cmd_resolve(args):
+    """Record a fix: the code must show it (the sink changed or gone, the package moved on), then
+    the finding is fixed in the graph with how it was verified, the session and the commit."""
+    if len(args) < 2 or len(" ".join(args[1:]).strip().strip('"')) < 8:
+        fail("usage: resolve <id> \"<how you verified the fix: the test or run>\"", "%s show <id>" % tool())
+    ident, how = args[0], " ".join(args[1:]).strip().strip('"')
+    state = State(os.getcwd(), default_out())
+    finding, _ = graph_finding(state, ident)
+    if finding is None:
+        finding = local_finding(state, ident)
+    if finding is None:
+        fail("no finding %s" % ident, "%s status" % tool())
+    kind, sentence = now_at_sink(state, finding)
+    if kind == "unchanged":
+        fail("nothing changed: %s. A fix changes the sink or moves the package on" % sentence, "make the change, run the test, then %s resolve %s \"<how>\"" % (tool(), ident))
+    pid = project_id(state)
+    if not pid:
+        fail("the app is not reachable from here, so the fix cannot be recorded", "run this inside the app's session")
+    commit = None
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=state.root, capture_output=True, text=True, timeout=10)
+        commit = out.stdout.strip() or None if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        commit = None
+    params = {"project_id": pid, "id": ident, "status": "fixed", "by": "model", "note": "%s (%s)" % (how, sentence), "commit": commit}
+    session = os.environ.get("CORTEX_SESSION_ID")
+    if session:
+        params["session_id"] = session
+    ok, why = graph_call(GRAPH_METHODS["update"], params)
+    if not ok:
+        fail("the graph refused the fix: %s" % why, "%s show %s" % (tool(), ident))
+    print("Recorded %s as fixed: %s." % (ident, sentence))
+    print("Next: reply to the user with one line: what was changed (path:line), how it was verified, and that the finding is marked fixed.")
+
+
+def fixing_here(state):
+    """Findings this session is fixing (status fixing with this session's id; without an id in the
+    environment, every fixing finding of the project)."""
+    pid = project_id(state)
+    if not pid:
+        return []
+    ok, result = graph_call(GRAPH_METHODS["list"], {"project_id": pid, "status": ["fixing"]})
+    if not ok:
+        return []
+    session = os.environ.get("CORTEX_SESSION_ID")
+    found = (result or {}).get("findings", [])
+    mine = [f for f in found if not session or f.get("session_id") == session]
+    return mine if session else found
+
+
 # ----------------------------------------------------------------------------- main
 
-COMMANDS = {"next": cmd_next, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve}
+COMMANDS = {"next": cmd_next, "units": cmd_units, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve, "show": cmd_show, "fix-plan": cmd_fix_plan, "recheck": cmd_recheck, "resolve": cmd_resolve}
 
 
 def main(argv):

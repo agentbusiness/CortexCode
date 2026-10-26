@@ -13,6 +13,8 @@ pub mod methods {
     pub const STEER: &str = "chatflow.steer";
     pub const CANCEL: &str = "chatflow.cancel";
     pub const STATE: &str = "chatflow.state";
+    /// `{}` -> [`super::RunningResult`]: the sessions with a run going now (an update waits for none).
+    pub const RUNNING: &str = "chatflow.running";
     /// Run an agent loop on a task in a session to completion (streams progress items).
     pub const AGENT_RUN: &str = "chatflow.agent_run";
     /// Answer a pending approval (ask mode): [`super::ApproveParams`] -> `{state}`.
@@ -550,6 +552,11 @@ pub struct FlowState {
     pub stage: Option<String>,
     pub pending_steers: u32,
     pub pending_followups: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunningResult {
+    pub sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -11,10 +11,11 @@ use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
     ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
-    JobListParams, JobListResult, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RunParams, RunResult,
-    SaveParams, SaveResult, SchemasParams, SkillsShownParams, WorkspaceCreateParams, WorkspaceListParams, WorkspaceListResult, WorkspaceRemoveParams, methods,
-    topics,
+    JobListParams, JobListResult, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
+    RunnerSetParams, SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineApplyParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
+    WorkspaceListResult, WorkspaceRemoveParams, methods, topics,
 };
+use crate::undo::Attribution;
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -42,6 +43,12 @@ pub const PROVIDES: &[&str] = &[
     methods::CLEANUP,
     methods::TESTS_REPORT,
     methods::TESTS_BASELINE,
+    methods::TIMELINE,
+    methods::UNDO,
+    methods::REDO,
+    methods::TIMELINE_DIFF,
+    methods::TIMELINE_APPLY,
+    methods::RUNNER_SET,
 ];
 
 pub struct ToolsPlugin {
@@ -92,13 +99,42 @@ impl ToolsPlugin {
                     config = ctx.config();
                 }
                 let core = Core::new(&ctx.env.home, &ctx.env.data_dir, Config::from_value(&config));
-                core.jobs.set_publisher(Arc::new(CtxHost(ctx.clone())));
+                core.jobs.set_publisher(Arc::new(JobEnds { host: CtxHost(ctx.clone()), core: Arc::downgrade(&core) }));
+                core.steps.set_publisher(Arc::new(CtxHost(ctx.clone())));
                 core.jobs.adopt();
                 core
             })
             .await
             .clone()
         }
+    }
+}
+
+/// Publishes job events as the frame connection does and, when a job ended, records what its
+/// command changed in its workspace as that session's step.
+struct JobEnds {
+    host: CtxHost,
+    core: std::sync::Weak<Core>,
+}
+
+impl crate::jobs::Publisher for JobEnds {
+    fn publish(&self, topic: &str, data: Value) {
+        let ended = data.get("state").and_then(Value::as_str).is_some_and(|state| state != "running");
+        if ended
+            && let Some(core) = self.core.upgrade()
+            && let Some(job_id) = data.get("job_id").and_then(Value::as_str)
+            && let Some((meta, _)) = core.jobs.status(job_id)
+            && !meta.cwd.is_empty()
+        {
+            let who = Attribution::session(&meta.session_id, "run", &meta.command);
+            let log = core.steps.open(std::path::Path::new(&meta.cwd));
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || log.reconcile(&who));
+            } else {
+                log.reconcile(&who);
+            }
+        }
+        crate::jobs::Publisher::publish(&self.host, topic, data);
     }
 }
 
@@ -279,6 +315,10 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             }
             let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(core.config.default_timeout_ms));
             let sink = items.clone();
+            // The step log: what the command changes is the session's step (a check with side
+            // effects at home, or a member's command in a copy kept here).
+            let steps = core.steps.open(&session.workspace);
+            steps.begin();
             let result = core
                 .shells
                 .run(&identity, RunRequest { command: &command, cwd: None, env, toolchain: crate::shell::Toolchain::default(), timeout }, cancel.clone(), move |chunk: &[u8]| {
@@ -287,6 +327,10 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                     }
                 })
                 .await;
+            {
+                let who = crate::undo::Attribution::session(&context.session_id, "run", &params.command.chars().take(200).collect::<String>());
+                let _ = tokio::task::spawn_blocking(move || steps.end(&who)).await;
+            }
             if one_off {
                 // A one-off command's shell is not kept.
                 core.shells.drop_session(&identity.session_id).await;
@@ -384,8 +428,98 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::SAVE => {
             let params: SaveParams = parse_params(params)?;
-            let result = save(&core, &params)?;
+            let (root, target) = workspace_path(&params.workspace, Some(&params.path))?;
+            let before = std::fs::read(&target).ok();
+            let log = core.steps.open(&root);
+            log.begin();
+            let result = save(&core, &params);
+            if let Ok(result) = &result {
+                let mode = std::fs::metadata(&target).ok().map(|meta| { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() & 0o777 }).unwrap_or(0o644);
+                log.record_edit(&Attribution { actor: "user".to_owned(), session_id: None, label: "edit".to_owned(), detail: "editor".to_owned() }, &result.path, before.as_deref(), Some(params.content.as_bytes()), mode);
+            }
+            log.end_quiet();
+            let result = result?;
             host.publish(topics::FILES_CHANGED, json!({ "workspace": params.workspace, "paths": [result.path.clone()], "by": "user" }));
+            to_value(&result)
+        }
+        methods::TIMELINE => {
+            let params: TimelineParams = parse_params(params)?;
+            let log = core.steps.open(&util::expand_home(&params.workspace));
+            let result = tokio::task::spawn_blocking(move || {
+                log.reconcile(&Attribution::user("hand"));
+                log.timeline(&params)
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+            to_value(&result)
+        }
+        methods::TIMELINE_DIFF => {
+            let params: TimelineDiffParams = parse_params(params)?;
+            let log = core.steps.open(&util::expand_home(&params.workspace));
+            let result = tokio::task::spawn_blocking(move || log.diff(&params)).await.map_err(|error| RpcError::internal(error.to_string()))?;
+            to_value(&result)
+        }
+        methods::TIMELINE_APPLY => {
+            let params: TimelineApplyParams = parse_params(params)?;
+            let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
+            let log = core.steps.open(&workspace);
+            let core = core.clone();
+            let workspace_text = params.workspace.clone();
+            let paths: Vec<String> = params.files.iter().map(|file| file.path.clone()).collect();
+            let record = tokio::task::spawn_blocking(move || {
+                use base64::Engine as _;
+                let who = Attribution { actor: params.actor.clone(), session_id: params.session_id.clone(), label: if params.label.is_empty() { "sync".to_owned() } else { params.label.clone() }, detail: params.detail.clone() };
+                let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
+                let files: Vec<(String, Option<Vec<u8>>, u32)> = params
+                    .files
+                    .iter()
+                    .filter_map(|file| match &file.data {
+                        Some(data) => base64::engine::general_purpose::STANDARD.decode(data).ok().map(|bytes| (file.path.clone(), Some(bytes), file.mode)),
+                        None => Some((file.path.clone(), None, 0)),
+                    })
+                    .collect();
+                log.begin();
+                let (record, _) = log.apply(&who, files, &allowed);
+                log.end_quiet();
+                record
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+            host.publish(topics::FILES_CHANGED, json!({ "workspace": workspace_text, "paths": paths, "by": "mesh" }));
+            to_value(&record)
+        }
+        methods::RUNNER_SET => {
+            let params: RunnerSetParams = parse_params(params)?;
+            let runner = params.node.map(|node| crate::core::RunnerInfo { node, name: params.name, remote_workspace: params.remote_workspace });
+            core.set_runner(&params.session_id, runner);
+            Ok(json!({}))
+        }
+        methods::UNDO => {
+            let params: UndoParams = parse_params(params)?;
+            let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
+            let log = core.steps.open(&workspace);
+            let core = core.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
+                log.undo(&params, &allowed)
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?
+            .map_err(RpcError::invalid_params)?;
+            to_value(&result)
+        }
+        methods::REDO => {
+            let params: RedoParams = parse_params(params)?;
+            let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
+            let log = core.steps.open(&workspace);
+            let core = core.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
+                log.redo(params.session_id.as_deref(), params.actor.as_deref(), &allowed)
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?
+            .map_err(RpcError::invalid_params)?;
             to_value(&result)
         }
         methods::APPROVE => {
@@ -408,9 +542,16 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 return Err(RpcError::invalid_params("tools.cleanup needs workspace and session_id"));
             }
             let core = core.clone();
-            let removed = tokio::task::spawn_blocking(move || crate::cleanup::turn_end(&core, &util::expand_home(&workspace), &session_id, since_ms))
-                .await
-                .map_err(|error| RpcError::internal(error.to_string()))?;
+            let removed = tokio::task::spawn_blocking(move || {
+                let workspace = util::expand_home(&workspace);
+                let removed = crate::cleanup::turn_end(&core, &workspace, &session_id, since_ms);
+                // What the turn's commands left and the host took away, and anything else the
+                // turn changed that no step recorded yet, is the session's last step of the turn.
+                core.steps.open(&workspace).reconcile(&Attribution::session(&session_id, "run", "end of turn"));
+                removed
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?;
             Ok(json!({ "removed": removed }))
         }
         methods::TESTS_BASELINE => {
@@ -766,7 +907,13 @@ impl Plugin for ToolsPlugin {
         // A deleted session or project: this plugin's own data about it goes.
         let core = self.core(&ctx);
         Box::pin(async move {
-            if topic == frame_topics::SESSION_DELETED
+            if topic == cc_protocol::contracts::vcs::topics::CHANGED
+                && let Some(root) = data.get("root").and_then(Value::as_str)
+            {
+                // A commit, a checkout, a reset: what equals HEAD now leaves the step log.
+                let log = core.await.steps.open(std::path::Path::new(root));
+                let _ = tokio::task::spawn_blocking(move || log.on_head_change()).await;
+            } else if topic == frame_topics::SESSION_DELETED
                 && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data.clone())
             {
                 core.await.forget_session(&deleted.session_id, std::path::Path::new(&deleted.workspace)).await;

@@ -90,6 +90,14 @@ impl Config {
     }
 }
 
+/// A member of the mesh that runs a session's commands in its copy of the tree.
+#[derive(Debug, Clone)]
+pub struct RunnerInfo {
+    pub node: String,
+    pub name: String,
+    pub remote_workspace: String,
+}
+
 pub struct Core {
     pub home: PathBuf,
     pub data_dir: PathBuf,
@@ -99,6 +107,12 @@ pub struct Core {
     pub jobs: Arc<Jobs>,
     pub artifacts: Artifacts,
     pub workspaces: Workspaces,
+    /// The step log of every workspace: what each step changed, for undo (see [`crate::undo`]).
+    pub steps: crate::undo::StepLog,
+    /// One tree, many hands: file reservations, running commands, check copies (see [`crate::tree`]).
+    pub tree: crate::tree::Tree,
+    /// Per session: the member of the mesh that runs its commands, once asked (None: here).
+    pub runners: Mutex<HashMap<String, Option<RunnerInfo>>>,
     file_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// What each session's user let its commands do, kept in the app's main store
     /// (`tools.approvals`; see [`cc_protocol::stored`]).
@@ -202,6 +216,9 @@ impl Core {
             jobs: Jobs::new(home, bash),
             artifacts: Artifacts::new(home),
             workspaces: Workspaces::new(home),
+            steps: crate::undo::StepLog::new(data_dir),
+            tree: crate::tree::Tree::new(),
+            runners: Mutex::new(HashMap::new()),
             read_state: ReadState::default(),
             file_locks: Mutex::new(HashMap::new()),
             approvals: cc_protocol::stored::Stored::new("tools.approvals"),
@@ -229,6 +246,31 @@ impl Core {
             });
         }
         core
+    }
+
+    /// The member that runs `session`'s commands, asked of the mesh once per session (an absent
+    /// mesh plugin, or no suitable member, means here). `tools.runner.set` overrides it.
+    pub async fn runner(&self, host: &dyn crate::host::Host, session: &str, workspace: &Path, project_id: &str) -> Option<RunnerInfo> {
+        if let Some(known) = self.runners.lock().ok().and_then(|runners| runners.get(session).cloned()) {
+            return known;
+        }
+        let params = serde_json::json!({"workspace": workspace.to_string_lossy(), "session_id": session, "project_id": project_id});
+        let answer = host.call(cc_protocol::contracts::mesh::methods::RUNNER, params).await.ok();
+        let runner = answer.and_then(|value| {
+            let node = value.get("node").and_then(serde_json::Value::as_str)?.to_owned();
+            let remote_workspace = value.get("remote_workspace").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+            (!remote_workspace.is_empty()).then(|| RunnerInfo { node, name: value.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_owned(), remote_workspace })
+        });
+        if let Ok(mut runners) = self.runners.lock() {
+            runners.insert(session.to_owned(), runner.clone());
+        }
+        runner
+    }
+
+    pub fn set_runner(&self, session: &str, runner: Option<RunnerInfo>) {
+        if let Ok(mut runners) = self.runners.lock() {
+            runners.insert(session.to_owned(), runner);
+        }
     }
 
     /// Serialize edits to one file across sessions.
@@ -303,6 +345,10 @@ impl Core {
     /// A deleted session: its shell, background jobs, approvals and, when it worked in a workspace
     /// clone of its own, that clone and its venv go.
     pub async fn forget_session(&self, session: &str, workspace: &Path) {
+        self.tree.release_session(session);
+        if let Ok(mut runners) = self.runners.lock() {
+            runners.remove(session);
+        }
         self.shells.drop_session(session).await;
         for job in self.jobs.list(Some(session)) {
             self.jobs.kill(&job.job_id).await;
@@ -320,11 +366,13 @@ impl Core {
         for workspace in self.workspaces.list(Some(project_id)) {
             self.forget_workspace(Path::new(&workspace.path));
         }
+        self.steps.forget(root);
         let _ = std::fs::remove_dir_all(self.workspaces.root().join(project_id));
         let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, root));
     }
 
     fn forget_workspace(&self, workspace: &Path) {
+        self.steps.forget(workspace);
         if let Err(error) = self.workspaces.remove(&workspace.to_string_lossy()) {
             tracing::debug!(workspace = %workspace.display(), error = %error.message, "removing a deleted session's workspace");
         }

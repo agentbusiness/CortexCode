@@ -1139,6 +1139,133 @@ pub fn commands() -> Vec<Command> {
             build: plain_args,
             format: format_switch,
         },
+        Command {
+            path: "changed",
+            method: "tools.timeline",
+            summary: "This session's steps since the last commit, newest first: what each changed.",
+            positional: &[],
+            schema: schema(json!({"since_seq": integer("Only steps after this one."), "limit": integer("At most this many steps (default 20).")}), &[]),
+            prepare: Prepare::None,
+            build: timeline_args,
+            format: format_timeline,
+        },
+        Command {
+            path: "timeline",
+            method: "tools.timeline",
+            summary: "Every session's and the user's steps since the last commit, newest first.",
+            positional: &[],
+            schema: schema(json!({"since_seq": integer("Only steps after this one."), "limit": integer("At most this many steps (default 20).")}), &[]),
+            prepare: Prepare::None,
+            build: timeline_all_args,
+            format: format_timeline,
+        },
+        Command {
+            path: "undo",
+            method: "tools.undo",
+            summary: "Put files back as they were: one step (--step), or everything after a step (--to).",
+            positional: &[],
+            schema: schema(
+                json!({
+                    "step": integer("Undo this step (from `cx changed`)."),
+                    "to": integer("Undo every step after this one."),
+                    "cascade": boolean("With --step: also undo later steps that touched the same files.")
+                }),
+                &[],
+            ),
+            prepare: Prepare::None,
+            build: undo_args,
+            format: format_undo,
+        },
+        Command {
+            path: "redo",
+            method: "tools.redo",
+            summary: "Take the last undo back.",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: workspace_session_args,
+            format: format_undo,
+        },
+        Command {
+            path: "mesh status",
+            method: "mesh.status",
+            summary: "This computer and the computers joined with it: who is reachable, what runs where.",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_mesh_status,
+        },
+        Command {
+            path: "mesh pair",
+            method: "mesh.pair.start",
+            summary: "An invitation for one other computer to join with (one hour).",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_pair,
+        },
+        Command {
+            path: "mesh join",
+            method: "mesh.pair.join",
+            summary: "Join the computers an invitation came from (paste the invitation).",
+            positional: &["code"],
+            schema: schema(json!({"code": name("The code or the invitation."), "name": name("This computer's name for the others.")}), &["code"]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_member,
+        },
+        Command {
+            path: "mesh members",
+            method: "mesh.members",
+            summary: "The computers joined with this one.",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_members,
+        },
+        Command {
+            path: "mesh peers",
+            method: "mesh.peers",
+            summary: "Every member's card and whether it is reachable now.",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_peers,
+        },
+        Command {
+            path: "mesh leave",
+            method: "mesh.leave",
+            summary: "Leave the network this computer is on; the others drop it.",
+            positional: &[],
+            schema: schema(json!({}), &[]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_json,
+        },
+        Command {
+            path: "mesh revoke",
+            method: "mesh.revoke",
+            summary: "Take a computer out of this network.",
+            positional: &["node"],
+            schema: schema(json!({"node": name("The member's id.")}), &["node"]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_json,
+        },
+        Command {
+            path: "mesh name",
+            method: "mesh.name",
+            summary: "This computer's name as the members see it.",
+            positional: &["name"],
+            schema: schema(json!({"name": name("The name.")}), &["name"]),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_json,
+        },
     ]
 }
 
@@ -1271,6 +1398,181 @@ fn format_toggle(value: &Value) -> String {
     if !steps.is_empty() {
         out.push('\n');
         out.push_str(&steps);
+    }
+    out
+}
+
+fn workspace_session_args(context: &Context, args: Map<String, Value>) -> Result<Value, String> {
+    let mut args = args;
+    args.insert("workspace".to_owned(), json!(context.workspace));
+    if let Some(session) = &context.session_id {
+        args.entry("session_id").or_insert(json!(session));
+    }
+    Ok(Value::Object(args))
+}
+
+fn timeline_args(context: &Context, args: Map<String, Value>) -> Result<Value, String> {
+    let mut args = args;
+    args.entry("limit").or_insert(json!(20));
+    workspace_session_args(context, args)
+}
+
+fn timeline_all_args(context: &Context, args: Map<String, Value>) -> Result<Value, String> {
+    let mut args = args;
+    args.entry("limit").or_insert(json!(20));
+    args.insert("workspace".to_owned(), json!(context.workspace));
+    Ok(Value::Object(args))
+}
+
+fn undo_args(context: &Context, args: Map<String, Value>) -> Result<Value, String> {
+    let mut args = args;
+    let step = args.remove("step");
+    let to = args.remove("to");
+    match (step, to) {
+        (Some(step), None) => {
+            args.insert("seqs".to_owned(), json!([step]));
+        }
+        (None, Some(to)) => {
+            args.insert("to_seq".to_owned(), to);
+        }
+        (Some(_), Some(_)) => return Err("give --step or --to, not both".to_owned()),
+        (None, None) => return Err("give --step <n> (one step) or --to <n> (everything after step n); step numbers come from `cx changed`".to_owned()),
+    }
+    workspace_session_args(context, args)
+}
+
+fn format_timeline(value: &Value) -> String {
+    let records = value.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
+    if records.is_empty() {
+        return "No steps since the last commit.\n".to_owned();
+    }
+    let mut out = format!(
+        "Since the last commit: {} file{} changed, +{} -{} lines.\n",
+        value.get("files").and_then(Value::as_u64).unwrap_or(0),
+        if value.get("files").and_then(Value::as_u64) == Some(1) { "" } else { "s" },
+        value.get("added").and_then(Value::as_u64).unwrap_or(0),
+        value.get("removed").and_then(Value::as_u64).unwrap_or(0)
+    );
+    for record in &records {
+        let undone = record.get("undone").and_then(Value::as_bool).unwrap_or(false);
+        let actor = match s(record, "actor") {
+            "user" => "you".to_owned(),
+            "host" => "the host".to_owned(),
+            other => other
+                .strip_prefix("session:")
+                .map(|id| format!("session {}", &id[..id.len().min(8)]))
+                .or_else(|| other.strip_prefix("node:").map(|id| format!("member {}", &id[..id.len().min(10)])))
+                .unwrap_or_else(|| other.to_owned()),
+        };
+        let detail = s(record, "detail");
+        let _ = writeln!(
+            out,
+            "step {}{}: {} {}{}",
+            record.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            if undone { " (undone)" } else { "" },
+            actor,
+            s(record, "label"),
+            if detail.is_empty() { String::new() } else { format!(" ({})", detail.chars().take(80).collect::<String>()) }
+        );
+        for file in record.get("files").and_then(Value::as_array).into_iter().flatten() {
+            let state = match (file.get("before").is_some(), file.get("after").is_some()) {
+                (false, true) => "new ",
+                (true, false) => "deleted ",
+                _ => "",
+            };
+            let _ = writeln!(out, "  {state}{} +{} -{}", s(file, "path"), file.get("added").and_then(Value::as_u64).unwrap_or(0), file.get("removed").and_then(Value::as_u64).unwrap_or(0));
+        }
+    }
+    out
+}
+
+fn format_undo(value: &Value) -> String {
+    let blocked = value.get("blocked_by").and_then(Value::as_array).cloned().unwrap_or_default();
+    if !blocked.is_empty() {
+        let seqs: Vec<String> = blocked.iter().filter_map(Value::as_u64).map(|seq| seq.to_string()).collect();
+        return format!("Not undone: later step{} {} touched the same files. Add --cascade to undo them too, or undo with --to.\n", if seqs.len() == 1 { "" } else { "s" }, seqs.join(", "));
+    }
+    let restored = value.get("restored").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut out = if restored.is_empty() {
+        "Nothing to undo.\n".to_owned()
+    } else {
+        let paths: Vec<&str> = restored.iter().filter_map(Value::as_str).collect();
+        format!("Put back: {}. Read a file again before editing it.\n", paths.join(", "))
+    };
+    for skipped in value.get("skipped").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        let _ = writeln!(out, "Skipped {skipped}");
+    }
+    out
+}
+
+fn short_node(node: &str) -> String {
+    node.chars().take(10).collect()
+}
+
+fn format_mesh_status(value: &Value) -> String {
+    let mut out = format!("{} ({})\n", s(value, "name"), short_node(s(value, "node")));
+    match value.get("network") {
+        Some(network) => {
+            let _ = writeln!(out, "network {} (started by {}): {} computers, {} reachable", s(network, "id"), s(network, "founder"), network.get("members").and_then(Value::as_u64).unwrap_or(0), value.get("reachable").and_then(Value::as_u64).unwrap_or(0));
+        }
+        None => {
+            let _ = writeln!(out, "on no network");
+        }
+    }
+    if let Some(pairing) = value.get("pairing") {
+        let _ = writeln!(out, "an invitation is open: {}", s(pairing, "invitation"));
+    }
+    for pair in value.get("serving").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(category), Some(node)) = (pair.get(0).and_then(Value::as_str), pair.get(1).and_then(Value::as_str)) {
+            let _ = writeln!(out, "{category}: served by {}", short_node(node));
+        }
+    }
+    for placed in value.get("placed").and_then(Value::as_array).into_iter().flatten() {
+        let _ = writeln!(out, "session {}: model calls run on {}", s(placed, "session_id"), s(placed, "name"));
+    }
+    out
+}
+
+fn format_pair(value: &Value) -> String {
+    format!("On the other computer (Settings > Mesh > Join, or cx mesh join '<invitation>'):\n{}\nGood for one hour, for one computer.\n", s(value, "invitation"))
+}
+
+fn format_member(value: &Value) -> String {
+    format!("{} ({})\n", s(value, "name"), short_node(s(value, "node")))
+}
+
+fn format_members(value: &Value) -> String {
+    let members = value.get("members").and_then(Value::as_array).cloned().unwrap_or_default();
+    if members.is_empty() {
+        return "Joined with nobody yet: run `cx mesh pair` here and `cx mesh join '<invitation>'` on the other computer.\n".to_owned();
+    }
+    members.iter().map(format_member).collect()
+}
+
+fn format_peers(value: &Value) -> String {
+    let peers = value.get("peers").and_then(Value::as_array).cloned().unwrap_or_default();
+    if peers.is_empty() {
+        return "No other members.\n".to_owned();
+    }
+    let mut out = String::new();
+    for peer in &peers {
+        let member = peer.get("member").cloned().unwrap_or_default();
+        let reachable = peer.get("reachable").and_then(Value::as_bool).unwrap_or(false);
+        let path = s(peer, "path");
+        let rtt = peer.get("rtt_ms").and_then(Value::as_u64).unwrap_or(0);
+        let _ = write!(out, "{} ({}): {}", s(&member, "name"), short_node(s(&member, "node")), if reachable { format!("reachable, {path}, {rtt} ms") } else { "not reachable".to_owned() });
+        if let Some(card) = peer.get("card") {
+            let _ = write!(out, " · {} · {} GB", s(card, "chip"), card.get("memory_bytes").and_then(Value::as_u64).unwrap_or(0) / (1024 * 1024 * 1024));
+            if let Some(model) = card.get("model") {
+                let busy = model.get("slots_busy").and_then(Value::as_u64).unwrap_or(0) > 0 || model.get("queued").and_then(Value::as_u64).unwrap_or(0) > 0;
+                let _ = write!(out, " · model {} ({}), {}, {:.1} tok/s", s(model, "model_id"), s(model, "variant"), if busy { "busy" } else { "free" }, model.get("tok_s").and_then(Value::as_f64).unwrap_or(0.0));
+            }
+        }
+        let serving: Vec<&str> = peer.get("serving").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        if !serving.is_empty() {
+            let _ = write!(out, " · serves {} here", serving.join(", "));
+        }
+        out.push('\n');
     }
     out
 }

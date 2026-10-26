@@ -65,6 +65,7 @@ const STAGE: Record<string, string> = {
   act: 'Working on the code',
   verify: 'Checking the change',
   reply: 'Writing the answer',
+  wait: 'Waiting for a free model (this computer or a joined one)',
   approval: 'Waiting for you to allow a step',
 };
 

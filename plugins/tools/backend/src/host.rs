@@ -30,6 +30,12 @@ impl crate::jobs::Publisher for CtxHost {
     }
 }
 
+impl crate::undo::Publisher for CtxHost {
+    fn publish(&self, topic: &str, data: Value) {
+        self.0.publish(topic, data);
+    }
+}
+
 /// A host with no peers (used where no frame is attached, e.g. the probe).
 pub struct NoHost;
 

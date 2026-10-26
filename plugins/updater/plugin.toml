@@ -1,0 +1,48 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# UI packages, shell modules, verification and README together, separable into its own repository
+# (only cc-protocol and @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it
+# into a portable .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "updater"
+name = "Updates"
+version = "0.1.0"
+description = "Updates from the official releases: plugins the user did not change install by themselves when no run is going, a changed plugin asks first, a newer frame waits for Restart to update."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+[backend]
+category = "update"
+contract = "update@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-updater"
+provides = ["update.status", "update.check", "update.decide", "update.restart"]
+publishes = ["update.changed"]
+uses = [
+  "frame.plugins.list", "frame.plugins.install", "frame.plugins.install_many",
+  "frame.update.status", "frame.update.stage", "frame.update.restart",
+  "source.release.status", "source.release.merge", "chatflow.running",
+]
+
+[backend.config]
+enabled = true          # look for updates
+# repo = "agentbusiness/CortexCode"   # where releases come from
+# check_every_s = 3600
+
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui/band"
+id = "updater.band"
+slot = "workbench.band@1"
+
+[build]
+needs = ["rust", "node"]
+
+[source]
+repo = "cortexcode"
+subdir = "plugins/updater"

@@ -1,0 +1,35 @@
+{
+  "name": "@cortex-ui/tools-card-timeline",
+  "version": "0.1.0",
+  "description": "The step log in the card: what every step changed since the last commit, with undo and redo.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "tools.card-timeline",
+    "slot": "card.timeline@1",
+    "label": "Timeline",
+    "order": 15
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4"
+  }
+}

@@ -243,6 +243,8 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
         .count();
     if str_field(&last.data, "stage") == "route" {
         return match route {
+            // The work went to agents, one per unit of a skill (`units_delegation`).
+            "LOOKUP" | "DO" if note_after(&run, last.seq, "implement_done") => Stage::Done,
             "LOOKUP" | "ANSWER" if note_after(&run, last.seq, "explore_done") => Stage::Done,
             "LOOKUP" if names_files(last) && host_reads_after(&run, last.seq) == 0 && !note_after(&run, last.seq, "diagnostics_read") => {
                 Stage::Diagnostics { route_seq: last.seq }
@@ -284,6 +286,8 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
         "ANSWER" if reply_finished(&run, last.seq) => Stage::Done,
         "ANSWER" => Stage::Reply,
         "DO" if note_after(&run, last.seq, "act_done") => Stage::Done,
+        // The auto plan's tasks went to agents at once (computers were free for them).
+        "DO" if note_after(&run, last.seq, "implement_done") => Stage::Done,
         // A decided change is planned first, then carried out one step at a time (an IMPLEMENT
         // decision comes from a plan already and runs as one loop).
         "DO" if str_field(&last.data, "stage") == "decide" => match plan::for_run(entries, run_id).filter(|(seq, _)| *seq > last.seq) {
@@ -530,6 +534,9 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             }
             Stage::Commit { route_seq } => {
                 set_stage(env, journal, status_seq, "decide").await?;
+                if units_delegation(env, journal, route_seq).await? {
+                    continue;
+                }
                 let detail = journal.get(route_seq).and_then(|entry| entry.data.get("detail").cloned()).unwrap_or(Value::Null);
                 let list = |field: &str| detail.get(field).cloned().unwrap_or_else(|| json!([]));
                 // The files the request itself names are read before the plan (targeted, never a
@@ -884,6 +891,11 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             }
             Stage::Explore => {
                 set_stage(env, journal, status_seq, "explore").await?;
+                if let Some(route_seq) = entries.iter().rev().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == env.run_id && str_field(&entry.data, "stage") == "route").map(|entry| entry.seq)
+                    && units_delegation(env, journal, route_seq).await?
+                {
+                    continue;
+                }
                 let spec = LoopSpec { kind: LoopKind::Question, effort: effort.clone(), task: None, step: None };
                 match agent_loop::run(env, journal, &spec).await {
                     Ok(outcome) if outcome.outcome == "parked" || outcome.outcome == "cancelled" => {
@@ -956,7 +968,11 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             }
             Stage::Plan { auto, .. } => {
                 set_stage(env, journal, status_seq, "plan").await?;
-                run_plan(env, journal, auto).await
+                run_plan(env, journal, auto).await?;
+                if auto {
+                    parallel_implementation(env, journal).await?;
+                }
+                Ok(())
             }
             Stage::Implement { route_seq } => {
                 set_stage(env, journal, status_seq, "implement").await?;
@@ -1250,7 +1266,12 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         .with_catalog(&catalog, skills_max);
     // The planner is told how its plan is used: carried out at once task by task (auto), written
     // again after a task ended badly, or the next version of the open plan.
+    // Joined computers free to run tasks now (the mesh; none without it): the planner hears the
+    // number only. An auto plan with free computers runs its independent tasks as agents at once
+    // (`parallel_implementation`), so the planner is told that instead of "here, one at a time".
+    let free = mesh_capacity(env).await;
     let edit = match &mode {
+        PlanMode::Auto if free > 0 => env.data.text("plan_auto_parallel_live", &[("count", &free.to_string())]),
         PlanMode::Auto => env.data.text("plan_auto_live", &[]),
         PlanMode::Replan { failed, outcome, summary, .. } => {
             let plan = previous.clone().unwrap_or_default();
@@ -1268,8 +1289,9 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             .map(|(_, open)| env.data.text("plan_live_edit", &[("plan_id", &open.plan_id), ("version", &open.version.to_string())]))
             .unwrap_or_default(),
     };
+    let parallel = if free > 0 && !auto { env.data.text("plan_parallel", &[("count", &free.to_string())]) } else { String::new() };
     // Each task's `skills` choose from the catalog, shown last.
-    let live = joined(&[edit, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    let live = joined(&[edit, parallel, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (doc, tasks) = plan::from_output(&output, max, plan::Known { requirements: &requirement_ids, skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
@@ -1441,6 +1463,103 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
         text.push_str(&env.data.text("delegated_agents", &[("names", &started.join(", "))]));
     }
     Ok(text)
+}
+
+/// How many joined computers could take a session's model calls now (the mesh plugin; 0 without it).
+async fn mesh_capacity(env: &RunEnv) -> u64 {
+    env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
+}
+
+/// The auto plan just written: when two of its tasks could run at the same time and a joined
+/// computer is free to take one, every task goes to the agents now (the ready ones start, the
+/// rest as what they depend on finishes, each agent's model placed by the mesh), and this turn
+/// ends with the delegation note. Otherwise the Act stage carries the plan out here, task by task.
+async fn parallel_implementation(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
+    let entries = journal.entries_vec();
+    let Some((plan_seq, mut current)) = plan::for_run(&entries, &env.run_id) else { return Ok(()) };
+    if current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || mesh_capacity(env).await == 0 {
+        return Ok(());
+    }
+    let current_spec = spec::current(&entries).map(|(_, spec)| spec);
+    journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
+    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref()).await {
+        Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
+        Err(error) if error.code == codes::CANCELLED => Err(error),
+        // The agents could not take it: the Act stage does it here, task by task, as without the mesh.
+        Err(error) => {
+            tracing::warn!(%error, "the plan's tasks could not go to agents; carried out here");
+            Ok(())
+        }
+    }
+}
+
+/// A skill of the route whose work falls into independent units (`SkillInfo::units`), with a
+/// joined computer free to take them: the host lists the units with the skill's command and
+/// makes the plan itself, one task per unit and one last task that finishes the whole (the
+/// report), each unit's agent running the skill for its unit only; then the tasks go to the
+/// agents. The model plans none of it. Returns whether the work was handed over.
+async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Result<bool, RpcError> {
+    let Some(route) = journal.get(route_seq).cloned() else { return Ok(false) };
+    let Some((uri, (list_command, unit_done))) = skillsel::of_decision(&route).into_iter().find_map(|uri| env.prefix.skill_units.get(&uri).cloned().map(|commands| (uri, commands))) else {
+        return Ok(false);
+    };
+    if mesh_capacity(env).await == 0 {
+        return Ok(false);
+    }
+    let check = cc_protocol::contracts::memory::ContractCheck { name: "units".to_owned(), kind: "command".to_owned(), spec: list_command, expect: None };
+    let ran = crate::contract::run_check(&env.host, &env.scope.workspace, &check, &env.stops.any()).await?;
+    if !ran.result.ok {
+        return Ok(false);
+    }
+    let units: Vec<(String, String)> = ran.full_output.lines().filter_map(|line| line.split_once('\t')).map(|(id, title)| (id.trim().to_owned(), title.trim().to_owned())).filter(|(id, _)| !id.is_empty()).collect();
+    if units.len() < 2 {
+        return Ok(false);
+    }
+    let work = route.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default();
+    let done = env.prefix.skill_done.get(&uri).cloned();
+    let mut tasks: Vec<plan::PlanTask> = units
+        .iter()
+        .enumerate()
+        .map(|(index, (id, title))| plan::PlanTask {
+            n: index as u32 + 1,
+            title: format!("{id} {title}"),
+            brief: env.data.text("units_task_brief", &[("unit", id), ("title", title), ("skill", &uri)]),
+            checks: unit_done.iter().map(|command| command.replace("{unit}", id)).collect(),
+            skills: vec![uri.clone()],
+            ..Default::default()
+        })
+        .collect();
+    tasks.push(plan::PlanTask {
+        n: units.len() as u32 + 1,
+        title: env.data.text("units_summary_title", &[]),
+        brief: env.data.text("units_summary_brief", &[("skill", &uri)]),
+        depends_on: (1..=units.len() as u32).collect(),
+        checks: done.into_iter().collect(),
+        skills: vec![uri.clone()],
+        ..Default::default()
+    });
+    let mut made = plan::Plan {
+        plan_id: plan::new_id(),
+        version: 1,
+        doc: plan::PlanDoc { goal: work, ..Default::default() },
+        tasks,
+        status: plan_status::IMPLEMENTING.into(),
+        ..Default::default()
+    };
+    let plan_seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
+    journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
+    match implement_by_agents(env, journal, plan_seq, &mut made, None).await {
+        Ok(text) => {
+            journal.note(&env.run_id, "implement_done", &text, true).await?;
+            Ok(true)
+        }
+        Err(error) if error.code == codes::CANCELLED => Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "the skill's units could not go to agents; the work runs here");
+            journal.set(plan_seq, "status", json!(plan_status::DONE)).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// DECISIONS: what the latest exchange settled, proposed for the user to accept (at most
@@ -1758,10 +1877,15 @@ fn local_task(env: &RunEnv, id: &str, brief: &str, contract: cc_protocol::contra
     }
 }
 
+/// Rounds in a row the `done` output may stay the same before the turn ends: one round without a
+/// settled line is a unit the model is still reading (seen: 68 lines read, then a progress reply);
+/// two is the model repeating itself.
+const WORK_OPEN_STALL_ROUNDS: usize = 2;
+
 /// The output of the `done` command of a skill this run used, when it says the work is open (a
 /// non-zero exit); None when no used skill declares one, when every one says finished, or when the
-/// output is the one the previous round was continued with (no progress since: the model would
-/// only repeat itself).
+/// output has not changed for [`WORK_OPEN_STALL_ROUNDS`] rounds (no progress: the model would only
+/// repeat itself).
 async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, RpcError> {
     let entries = journal.entries_vec();
     let used = skillsel::used_by_run(&entries, &env.run_id);
@@ -1769,11 +1893,13 @@ async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, Rp
     if commands.is_empty() {
         return Ok(None);
     }
-    let previous = entries
+    let previous: Vec<String> = entries
         .iter()
         .rev()
-        .find(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == env.run_id && str_field(&entry.data, "purpose") == "work_open")
-        .map(|entry| str_field(&entry.data, "output").to_owned());
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == env.run_id && str_field(&entry.data, "purpose") == "work_open")
+        .map(|entry| str_field(&entry.data, "output").to_owned())
+        .take(WORK_OPEN_STALL_ROUNDS)
+        .collect();
     for (_, command) in commands {
         let check = cc_protocol::contracts::memory::ContractCheck { name: "done".to_owned(), kind: "command".to_owned(), spec: command.clone(), expect: None };
         let ran = crate::contract::run_check(&env.host, &env.scope.workspace, &check, &env.stops.any()).await?;
@@ -1781,12 +1907,18 @@ async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, Rp
             continue;
         }
         if !ran.result.ok {
-            if previous.as_deref() == Some(ran.full_output.trim()) {
-                tracing::info!(session = %env.session_id, "work still open with no progress since the last round; the turn ends");
+            let output = ran.full_output.trim();
+            if previous.len() >= WORK_OPEN_STALL_ROUNDS && previous.iter().all(|earlier| earlier == output) {
+                tracing::info!(session = %env.session_id, rounds = WORK_OPEN_STALL_ROUNDS, "work still open with no progress for several rounds; the turn ends");
                 return Ok(None);
             }
             return Ok(Some(ran.full_output));
         }
     }
     Ok(None)
+}
+
+/// True when this run was continued because a tool reports open work (its latest host note).
+pub fn work_open_round(entries: &[JournalEntry], run_id: &str) -> bool {
+    entries.iter().any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "purpose") == "work_open")
 }

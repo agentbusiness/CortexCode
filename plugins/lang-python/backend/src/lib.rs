@@ -105,6 +105,10 @@ impl LanguagePack for PythonPack {
     }
 
     /// `{file}` in a command is the file being checked; `requires` names what must be on PATH.
+    fn caches(&self) -> Vec<String> {
+        vec![".venv".to_owned(), "venv".to_owned(), "__pycache__".to_owned(), ".pytest_cache".to_owned(), ".mypy_cache".to_owned(), ".ruff_cache".to_owned()]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         let verifier = |name: &str, kind: &str, args: &[&str], when: &[&str], requires: &str| Verifier {
             files: Vec::new(),            name: name.into(),

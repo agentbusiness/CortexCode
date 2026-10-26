@@ -47,6 +47,10 @@ pub struct Hello {
     pub pid: u32,
     #[serde(default)]
     pub swap: SwapPolicy,
+    /// A client's hello only: `sessions` serves the category for the sessions routed to it
+    /// (`frame.route.set`) instead of taking the category over; empty serves the category.
+    #[serde(default)]
+    pub scope: String,
 }
 
 impl Hello {
@@ -58,6 +62,7 @@ impl Hello {
             contract: contract.to_owned(),
             provides: Vec::new(),
             subscribes: Vec::new(),
+            scope: String::new(),
             instance: String::new(),
             pid: 0,
             swap: SwapPolicy::BlueGreen,

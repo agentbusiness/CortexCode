@@ -71,10 +71,8 @@ where
             }
             // Drop ignored/build output before the bounded channel. Membership and history
             // controls must survive filtering so changes to those rules can remove old facts.
-            if !membership && !history {
-                if rel == ".git" || rel.starts_with(".git/") || !crate::tree::included(&watch_root, &rel) {
-                    continue;
-                }
+            if !membership && !history && (rel == ".git" || rel.starts_with(".git/") || !crate::tree::included(&watch_root, &rel)) {
+                continue;
             }
             match tx.try_send(path) {
                 Ok(()) => {}

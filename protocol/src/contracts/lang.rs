@@ -63,6 +63,11 @@ pub struct Description {
     /// Environment the toolchain needs in commands (`JAVA_HOME`, `GOROOT`, ...).
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Ignored directories of a project that a build may share between copies of the tree
+    /// (`target`, `node_modules`, `.venv`): a check run on a throw-away copy links them to the
+    /// project's own, so it does not build from nothing.
+    #[serde(default)]
+    pub caches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -180,6 +185,17 @@ pub struct SkillInfo {
     /// turn end on a reply while the command says the work is open. Not meant for the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<String>,
+    /// A command, run in the project root, that lists the independent units the skill's work
+    /// falls into, one per line as `<id>\t<title>` (an audit: one unit per attack class). Declared
+    /// with `units` in `applies.toml`. With it, the chat flow may hand every unit to an agent of
+    /// its own at once (joined computers free to run them) and one last task to finish the whole;
+    /// the model plans none of it. Not meant for the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units: Option<String>,
+    /// Like `done`, for one unit: `{unit}` stands for the unit's id (`unit_done` in
+    /// `applies.toml`). The agent of a unit is done when it exits 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_done: Option<String>,
 }
 
 /// Structural facts a project must show (any one) for a skill to apply to it. Every list is

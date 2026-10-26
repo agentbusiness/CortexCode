@@ -4,3 +4,9 @@
 
 [security-audit]
 done = "python3 \"$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py\" status"
+# The units agents can take at the same time (one per attack class), and when one unit is done.
+units = "python3 \"$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py\" units"
+unit_done = "python3 \"$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py\" status --unit {unit}"
+
+[security-fix]
+done = "python3 \"$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py\" status --fixing"

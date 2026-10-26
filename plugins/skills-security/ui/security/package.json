@@ -1,0 +1,35 @@
+{
+  "name": "@cortex-ui/security-pane",
+  "version": "0.1.0",
+  "description": "The Security tab: the last audit, the findings by priority, one finding's trace, fix and history, and the moves on it.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "skills-security.pane",
+    "slot": "pane.security@1",
+    "label": "Security",
+    "order": 45
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4"
+  }
+}

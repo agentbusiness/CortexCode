@@ -25,10 +25,9 @@ use cc_protocol::contracts::memory::{
     AgentListResult, AgentRecord, Contract, ContractCheck, ImpactResult, SearchResult, SymbolMatches, Task, TaskListResult,
     methods as memory_methods,
 };
+use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{ChatMessage, ModelInfo, Priority, methods as model_methods};
 use cc_protocol::contracts::now_ms;
-use cc_protocol::contracts::tools::{RunResult, Workspace, WorkspaceListResult, methods as tools_methods};
-use cc_protocol::contracts::vcs::{MergeResult, Status as VcsStatus, methods as vcs_methods};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, codes, parse_params, to_value};
 use crate::control::{Controller, Settings as ControlSettings, Window};
 use crate::scheduler::{AgentKey, Scheduler};
@@ -533,18 +532,10 @@ impl Agents {
             Some(name) => name,
             None => pick_name(&taken),
         };
-        let workspace: Workspace = host
-            .get(tools_methods::WORKSPACE_CREATE, json!({"project_id": project.id, "source": project.root, "name": name}))
-            .await?;
-        // The copy carries the project's uncommitted changes; commit them in the workspace as a
-        // snapshot so the agent's own work stays separable (merge_branch leaves them out).
-        let snapshot = run_in(&host, &workspace.path, &format!("bash -c {}", quote(SNAPSHOT_SCRIPT))).await?;
-        if snapshot.exit_code != Some(0) {
-            return Err(RpcError::internal(format!("snapshotting the project's uncommitted changes in the workspace failed: {}", snapshot.output.trim())));
-        }
-        if let Err(error) = host.call(memory_methods::WORKSPACE_ATTACH, json!({"project_id": project.id, "workspace": workspace.path})).await {
-            tracing::warn!(%error, "memory.workspace.attach failed; the agent reads the project graph without its overlay");
-        }
+        // Every session edits the project's own folder (one tree, many hands): the tools plugin
+        // reserves a file under edit for its session's turn and runs checks on a throw-away copy
+        // while others are active, so no clone, no snapshot and no merge are needed.
+        let workspace_path = project.root.clone();
         let session = host
             .session_create(&SessionCreateParams {
                 project_id: project.id.clone(),
@@ -552,7 +543,7 @@ impl Agents {
                 title: task.title.clone(),
                 agent: Some(name.clone()),
                 parent: params.from_session.clone(),
-                workspace: Some(workspace.path.clone()),
+                workspace: Some(workspace_path.clone()),
                 task_id: Some(task.id.clone()),
             })
             .await?;
@@ -564,7 +555,7 @@ impl Agents {
             status: "working".into(),
             session_id: Some(session.id.clone()),
             task_id: Some(task.id.clone()),
-            workspace: Some(workspace.path.clone()),
+            workspace: Some(workspace_path.clone()),
             tasks_done: 0,
             tasks_failed: 0,
             updated_ms: now_ms(),
@@ -575,7 +566,7 @@ impl Agents {
         // than this worker changes it (`agents.contract.propose`).
         update_task(&host, json!({"id": task.id, "status": "in_progress", "assignee": name, "session_id": session.id, "freeze": true})).await?;
         if let Some(from) = &params.from_session {
-            host.journal_append(from, kinds::AGENT_SPAWNED, json!({"agent": name, "task_id": task.id, "session_id": session.id, "workspace": workspace.path, "branch": workspace.branch}))
+            host.journal_append(from, kinds::AGENT_SPAWNED, json!({"agent": name, "task_id": task.id, "session_id": session.id, "workspace": workspace_path}))
                 .await?;
         }
         let data = self.inner.data.get();
@@ -697,6 +688,34 @@ impl Agents {
         for key in start {
             self.start(ctx.clone(), key);
         }
+        self.place_queued(ctx).await;
+    }
+
+    /// Agents waiting for this computer's model start on a joined computer's free model instead
+    /// (`mesh.place`, the host's decision; without the mesh plugin nothing changes).
+    async fn place_queued(&self, ctx: Ctx) {
+        let host = Host::new(ctx.clone());
+        let queued: Vec<AgentKey> = lock(&self.inner.scheduler).queued.iter().cloned().collect();
+        for key in queued {
+            let Ok(record) = agent(&host, &key.project_id, &key.name).await else { continue };
+            let Some(session_id) = record.session_id else { continue };
+            if self.place_agent(&host, &session_id, true).await.is_some() {
+                let start = lock(&self.inner.scheduler).start_remote(&key);
+                self.start(ctx.clone(), key);
+                for key in start {
+                    self.start(ctx.clone(), key);
+                }
+            }
+        }
+    }
+
+    /// Where an agent's model calls run: a joined computer's free model when one is (returns its
+    /// name), else here (None). `remote_only`: this computer's queue is full, so here is not an
+    /// option now.
+    async fn place_agent(&self, host: &Host, session_id: &str, remote_only: bool) -> Option<String> {
+        let placement = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "wait": false, "remote_only": remote_only})).await.ok()?;
+        placement.get("node").and_then(Value::as_str)?;
+        Some(placement.get("name").and_then(Value::as_str).unwrap_or_default().to_owned())
     }
 
     fn cancellation(&self, key: &AgentKey) -> CancellationToken {
@@ -765,47 +784,58 @@ impl Agents {
                 for key in next {
                     this.start(ctx.clone(), key);
                 }
+                this.place_queued(ctx).await;
             }
         });
     }
 
-    /// Drive one agent: its run, the merge steward, conflict hand-backs, then dependents.
+    /// Drive one agent: its run in the project's tree, the steward's verification, then dependents.
     async fn run_agent(&self, ctx: Ctx, key: AgentKey, cancel: CancellationToken) -> Result<(), RpcError> {
         let host = Host::with_cancel(ctx.clone(), cancel.clone());
-        loop {
-            let record = agent(&host, &key.project_id, &key.name).await?;
-            if record.status != "working" {
-                return Ok(());
+        let record = agent(&host, &key.project_id, &key.name).await?;
+        if record.status != "working" {
+            return Ok(());
+        }
+        let (Some(session_id), Some(task_id)) = (record.session_id.clone(), record.task_id.clone()) else {
+            return Err(RpcError::internal(format!("agent {} has no session or task", key.name)));
+        };
+        let effort = lock(&self.inner.efforts).get(&task_id).cloned().unwrap_or_else(|| "medium".into());
+        // Its model calls: here when this computer's model is free, else a joined computer's free
+        // model (then its place here goes to the next queued agent).
+        let already_remote = lock(&self.inner.scheduler).remote.contains(&key);
+        if !already_remote
+            && let Some(name) = self.place_agent(&host, &session_id, false).await
+        {
+            tracing::info!(agent = %key.name, on = %name, "the agent's model calls run on a joined computer");
+            let start = lock(&self.inner.scheduler).start_remote(&key);
+            for key in start {
+                self.start(ctx.clone(), key);
             }
-            let (Some(session_id), Some(task_id)) = (record.session_id.clone(), record.task_id.clone()) else {
-                return Err(RpcError::internal(format!("agent {} has no session or task", key.name)));
-            };
-            let effort = lock(&self.inner.efforts).get(&task_id).cloned().unwrap_or_else(|| "medium".into());
-            let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await?;
-            let task = task(&host, &task_id).await?;
-            match result.outcome.as_str() {
-                "done" => match self.steward(&ctx, &host, &record, &task, &result, false).await? {
-                    Stewarded::Merged => {
-                        self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
-                        return Ok(());
-                    }
-                    Stewarded::HandedBack => continue,
-                    Stewarded::Failed | Stewarded::BlockedByLocal(_) => return Ok(()),
-                },
-                "cancelled" => return Ok(()),
-                other => {
-                    let mut record = record;
-                    record.status = "blocked".into();
-                    record.tasks_failed += 1;
-                    upsert(&ctx, &host, record).await?;
-                    // Checks the host cannot decide leave the task INDETERMINATE (for a person to
-                    // judge), not failed.
-                    let status = if task.status == "indeterminate" { "indeterminate" } else { "failed" };
-                    update_task(&host, json!({"id": task.id, "status": status, "result": result.summary})).await?;
-                    let text = if result.summary.trim().is_empty() { self.inner.data.get().text("board_run_ended", &[("outcome", other)]) } else { result.summary.clone() };
-                    board(&host, &key.project_id, "blocker", &key.name, &text, std::slice::from_ref(&task.id)).await;
-                    return Ok(());
+        }
+        let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await;
+        let _ = host.call(mesh_methods::PLACE_END, json!({"session_id": session_id})).await;
+        let result = result?;
+        let task = task(&host, &task_id).await?;
+        match result.outcome.as_str() {
+            "done" => {
+                if let Stewarded::Verified = self.steward(&ctx, &host, &record, &task, &result, false).await? {
+                    self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
                 }
+                Ok(())
+            }
+            "cancelled" => Ok(()),
+            other => {
+                let mut record = record;
+                record.status = "blocked".into();
+                record.tasks_failed += 1;
+                upsert(&ctx, &host, record).await?;
+                // Checks the host cannot decide leave the task INDETERMINATE (for a person to
+                // judge), not failed.
+                let status = if task.status == "indeterminate" { "indeterminate" } else { "failed" };
+                update_task(&host, json!({"id": task.id, "status": status, "result": result.summary})).await?;
+                let text = if result.summary.trim().is_empty() { self.inner.data.get().text("board_run_ended", &[("outcome", other)]) } else { result.summary.clone() };
+                board(&host, &key.project_id, "blocker", &key.name, &text, std::slice::from_ref(&task.id)).await;
+                Ok(())
             }
         }
     }
@@ -825,62 +855,16 @@ impl Agents {
             return Err(RpcError::cancelled());
         }
         let project = host.project_get(&record.project_id).await?;
-        let Some(workspace) = record.workspace.clone() else {
-            return Err(RpcError::internal(format!("agent {} has no workspace", record.name)));
-        };
-        let branch = workspace_branch(host, &project.id, &workspace, &record.name).await;
         let session_id = record.session_id.clone().unwrap_or_default();
         host.check_cancelled()?;
-        let outcome = merge_branch(host, &project, &workspace, &branch, &format!("{} (agent {})", task.title, record.name)).await?;
-        if !outcome.ok && !outcome.blocked_by_local.is_empty() {
-            // Not the agent's to resolve: the user's uncommitted edits are in the way. Nothing
-            // changed; tell the user which files, where they look (the delegating session).
-            let data = self.inner.data.get();
-            let files = outcome.blocked_by_local.join(", ");
-            let text = data.text("merge_blocked_by_local", &[("files", &files)]);
-            let note = json!({"text": text, "purpose": "merge", "blocked_by_local": outcome.blocked_by_local, "agent": record.name, "task_id": task.id});
-            let parent = host.session_get(&session_id).await.ok().and_then(|session| session.parent);
-            for session in std::iter::once(&session_id).chain(parent.iter()) {
-                host.journal_append(session, kinds::NOTE, note.clone()).await?;
-            }
-            let post = data.text("board_blocked_by_local", &[("title", &task.title), ("files", &files), ("agent", &record.name)]);
-            board(host, &project.id, "blocker", "steward", &post, std::slice::from_ref(&task.id)).await;
-            let mut updated = record.clone();
-            updated.status = "blocked".into();
-            upsert(ctx, host, updated).await?;
-            return Ok(Stewarded::BlockedByLocal(outcome.blocked_by_local));
-        }
-        if !outcome.ok {
-            // Hand back: bring the project's current state into the workspace so the conflicts are
-            // in front of the agent, and tell it which files to resolve.
-            let data = self.inner.data.get();
-            let pulled = bring_project_into_workspace(host, &project, &workspace, &data).await;
-            let text = data.text("merge_conflict", &[("files", &outcome.conflicts.join(", ")), ("pulled", &pulled)]);
-            // Where each conflict is: the file in the agent's workspace and the line of its first
-            // conflict marker (so a click on the notification opens the hunk).
-            let conflicts: Vec<Value> = outcome
-                .conflicts
-                .iter()
-                .map(|path| json!({"path": path, "line": first_conflict_line(&std::path::Path::new(&workspace).join(path))}))
-                .collect();
-            host.journal_append(
-                &session_id,
-                kinds::NOTE,
-                json!({"text": format!("Merge conflict: {}", outcome.conflicts.join(", ")), "purpose": "merge", "conflicts": conflicts, "workspace": workspace}),
-            )
-            .await?;
-            host.call(chatflow_methods::STEER, json!({"session_id": session_id, "text": text, "kind": "followup"})).await?;
-            let post = data.text("board_conflict", &[("title", &task.title), ("files", &outcome.conflicts.join(", ")), ("agent", &record.name)]);
-            board(host, &project.id, "handoff", "steward", &post, std::slice::from_ref(&task.id)).await;
-            return Ok(Stewarded::HandedBack);
-        }
-        // The merged project must pass the task's contract too: the frozen one.
+        // The agent's work is in the project's tree as it happens; done means the task's frozen
+        // contract passes there now.
         frozen_intact(task)?;
         let (report, _) = contract::verify(host, &task.id, &project.root, &task.contract, &CancellationToken::new()).await?;
         record_verification(host, task, &report, &[&session_id]).await;
         let parent = host.session_get(&session_id).await.ok().and_then(|session| session.parent);
         if let Some(parent) = &parent {
-            let _ = host.journal_append(parent, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "merged": outcome.sha, "agent": record.name})).await;
+            let _ = host.journal_append(parent, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "agent": record.name})).await;
         }
         host.check_cancelled()?;
         let fresh = agent(host, &record.project_id, &record.name).await?;
@@ -889,24 +873,20 @@ impl Agents {
         }
         let mut updated = fresh;
         if report.ok {
-            update_task(host, json!({"id": task.id, "status": "done", "result": format!("merged {} and verified in the project: {}", outcome.sha.clone().unwrap_or_default(), result.summary)})).await?;
+            update_task(host, json!({"id": task.id, "status": "done", "result": format!("verified in the project: {}", result.summary)})).await?;
             updated.status = "done".into();
             updated.tasks_done += 1;
             upsert(ctx, host, updated).await?;
             let post = self.inner.data.get().text("board_done", &[("title", &task.title), ("summary", result.summary.trim())]);
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
             let _ = host.call(memory_methods::REFRESH, json!({"project_id": project.id})).await;
-            let _ = host.call(memory_methods::WORKSPACE_DETACH, json!({"project_id": project.id, "workspace": workspace})).await;
-            if let Err(error) = host.effect(tools_methods::WORKSPACE_REMOVE, json!({"path": workspace})).await {
-                tracing::warn!(%error, "workspace removal failed");
-            }
-            Ok(Stewarded::Merged)
+            Ok(Stewarded::Verified)
         } else {
-            update_task(host, json!({"id": task.id, "status": "failed", "result": "merged, but the contract fails in the project"})).await?;
+            update_task(host, json!({"id": task.id, "status": "failed", "result": "the contract fails in the project"})).await?;
             updated.status = "blocked".into();
             updated.tasks_failed += 1;
             upsert(ctx, host, updated).await?;
-            let post = self.inner.data.get().text("board_merged_failing", &[("title", &task.title)]);
+            let post = self.inner.data.get().text("board_failing", &[("title", &task.title)]);
             board(host, &project.id, "blocker", &record.name, &post, std::slice::from_ref(&task.id)).await;
             Ok(Stewarded::Failed)
         }
@@ -1011,21 +991,14 @@ impl Agents {
         let result = AgentRunResult { outcome: "done".into(), summary: String::new(), turns: 0, tool_calls: 0, changed_files: vec![], usage: Value::Null };
         let outcome = self.steward(&ctx, &host, &record, &task, &result, true).await?;
         Ok(match outcome {
-            Stewarded::Merged => {
-                // A merge that waited (blocked by local edits) releases the tasks that depend on it.
+            Stewarded::Verified => {
+                // A task verified later releases the tasks that depend on it.
                 if let Some(session_id) = &record.session_id {
                     self.start_dependents(&ctx, &host, &task, session_id, &record.mode).await;
                 }
-                MergeOutcome { ok: true, conflicts: vec![], sha: None, detail: "merged and verified".into() }
+                MergeOutcome { ok: true, conflicts: vec![], sha: None, detail: "verified in the project".into() }
             }
-            Stewarded::HandedBack => MergeOutcome { ok: false, conflicts: vec![], sha: None, detail: "conflicts handed back to the agent".into() },
-            Stewarded::Failed => MergeOutcome { ok: false, conflicts: vec![], sha: None, detail: "merged, but the contract fails in the project".into() },
-            Stewarded::BlockedByLocal(files) => MergeOutcome {
-                ok: false,
-                conflicts: vec![],
-                sha: None,
-                detail: self.inner.data.get().text("merge_blocked_by_local", &[("files", &files.join(", "))]),
-            },
+            Stewarded::Failed => MergeOutcome { ok: false, conflicts: vec![], sha: None, detail: "the contract fails in the project".into() },
         })
     }
 
@@ -1231,12 +1204,8 @@ impl Agents {
 }
 
 enum Stewarded {
-    Merged,
-    HandedBack,
+    Verified,
     Failed,
-    /// The merge would change files with the user's uncommitted edits: nothing changed; it goes
-    /// ahead with `agents.merge` once they are committed, stashed or moved.
-    BlockedByLocal(Vec<String>),
 }
 
 fn pick_name(taken: &BTreeSet<&str>) -> String {
@@ -1299,145 +1268,6 @@ async fn record_verification(host: &Host, task: &Task, report: &VerifyReport, se
         if let Err(error) = host.journal_append(session, kinds::VERIFICATION, json!({"task_id": task.id, "report": report})).await {
             tracing::warn!(%error, "could not journal the verification");
         }
-    }
-}
-
-async fn workspace_branch(host: &Host, project_id: &str, path: &str, name: &str) -> String {
-    host.get::<WorkspaceListResult>(tools_methods::WORKSPACE_LIST, json!({"project_id": project_id}))
-        .await
-        .ok()
-        .and_then(|list| list.workspaces.into_iter().find(|workspace| workspace.path == path))
-        .map(|workspace| workspace.branch)
-        .unwrap_or_else(|| format!("cortex/{name}"))
-}
-
-/// Shell-quote one argument (mechanical).
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
-async fn run_in(host: &Host, workspace: &str, command: &str) -> Result<RunResult, RpcError> {
-    host.get(tools_methods::RUN, json!({"workspace": workspace, "command": command, "timeout_ms": 600_000})).await
-}
-
-/// Commit the workspace, fetch its branch into the project and merge it there.
-async fn merge_branch(host: &Host, project: &Project, workspace: &str, branch: &str, message: &str) -> Result<MergeResult, RpcError> {
-    let status: VcsStatus = host.get(vcs_methods::STATUS, json!({"root": workspace})).await?;
-    if !status.files.is_empty() {
-        host.effect(vcs_methods::COMMIT, json!({"root": workspace, "message": message, "all": true})).await?;
-    }
-    // A workspace that started from uncommitted project changes holds them in a snapshot commit:
-    // the merge is prepared in the workspace (SQUASH_SCRIPT) with the agent's changes only, applied
-    // to the project's current HEAD, so the user's own uncommitted changes are never committed by an
-    // agent; the project then normally just moves to that commit.
-    let snapshot = run_in(host, workspace, "git rev-parse --verify -q refs/cortex/snapshot").await?;
-    let merge_message = format!("Merge {branch}: {message}");
-    let (source, no_ff) = if snapshot.exit_code == Some(0) {
-        let prepared = run_in(host, workspace, &format!("CORTEX_ROOT={} CORTEX_MSG={} bash -c {}", quote(&project.root), quote(&merge_message), quote(SQUASH_SCRIPT))).await?;
-        let listed = || prepared.output.lines().filter_map(|line| line.strip_prefix("PATH\t")).map(str::to_owned).collect::<Vec<String>>();
-        match prepared.exit_code {
-            Some(0) => {}
-            // The agent changed files whose uncommitted project edits it built on.
-            Some(4) => return Ok(MergeResult { ok: false, conflicts: Vec::new(), sha: None, aborted: false, blocked_by_local: listed() }),
-            Some(3) => return Ok(MergeResult { ok: false, conflicts: listed(), sha: None, aborted: true, blocked_by_local: Vec::new() }),
-            _ => return Err(RpcError::internal(format!("preparing the merge in the workspace failed: {}", prepared.output.trim()))),
-        }
-        ("refs/cortex/merge".to_owned(), false)
-    } else {
-        (branch.to_owned(), true)
-    };
-    // The branch lives in the workspace's own repository (a copy-on-write clone); bring it into the
-    // project's repository under the branch's name before merging.
-    let fetch = run_in(host, &project.root, &format!("git fetch --no-tags {} {}", quote(workspace), quote(&format!("+{source}:refs/heads/{branch}")))).await?;
-    if fetch.exit_code != Some(0) {
-        return Err(RpcError::internal(format!("fetching {branch} from the workspace failed: {}", fetch.output.trim())));
-    }
-    // The user may be editing the project meanwhile: the merge keeps their uncommitted changes (and
-    // a conflict leaves nothing half-merged).
-    host.get(vcs_methods::MERGE, json!({"root": project.root, "branch": branch, "message": merge_message, "keep_local_changes": true, "no_ff": no_ff}))
-        .await
-}
-
-/// Run in a new workspace: commit the project's uncommitted changes that came along in the copy
-/// (tracked and untracked; ignored files stay as they are) as a snapshot marked by
-/// `refs/cortex/snapshot`. The snapshot never reaches the project (see [`SQUASH_SCRIPT`]), so it
-/// has a fixed identity and skips the project's hooks.
-const SNAPSHOT_SCRIPT: &str = r#"set -e
-if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-  git add -A
-  git -c user.name=CortexCode -c user.email=cortexcode@localhost commit -q --no-verify -m "Cortex snapshot: the project's uncommitted changes when this agent started"
-  git update-ref refs/cortex/snapshot HEAD
-fi"#;
-
-/// Run in a workspace with a snapshot (`CORTEX_ROOT`: the project, `CORTEX_MSG`: the merge
-/// message). Prepares `refs/cortex/merge`: a merge commit on the project's current HEAD whose tree
-/// is the agent's changes (snapshot -> workspace HEAD) applied to that HEAD by a three-way merge with
-/// the snapshot as base, so the user's own uncommitted edits (in the snapshot, not in the project's
-/// HEAD) stay out. Its second parent is the agent's work alone on the base it started from (files
-/// only the user changed keep the base version there). Exits 4 listing (`PATH\t<path>` lines) the
-/// files the agent changed on top of uncommitted project edits that the project's HEAD does not
-/// have yet; 3 listing the conflicting files.
-const SQUASH_SCRIPT: &str = r#"set -e
-S=$(git rev-parse --verify -q refs/cortex/snapshot)
-B=$(git rev-parse "$S^")
-A=$(git rev-parse HEAD)
-dir=$(git rev-parse --absolute-git-dir)
-git fetch -q --no-tags "$CORTEX_ROOT" "+HEAD:refs/cortex/project-head"
-R=$(git rev-parse refs/cortex/project-head)
-git diff --name-only --no-renames -z "$S" "$A" > "$dir/cortex-agent-files"
-git diff --name-only --no-renames -z "$B" "$S" > "$dir/cortex-snapshot-files"
-: > "$dir/cortex-user-files"
-blocked=0
-while IFS= read -r -d '' f; do
-  found=0
-  while IFS= read -r -d '' g; do
-    if [ "$f" = "$g" ]; then found=1; break; fi
-  done < "$dir/cortex-agent-files"
-  if [ "$found" = 0 ]; then
-    printf '%s\0' "$f" >> "$dir/cortex-user-files"
-  elif [ "$(git rev-parse -q --verify "$R:$f" || true)" != "$(git rev-parse -q --verify "$S:$f" || true)" ]; then
-    printf 'PATH\t%s\n' "$f"
-    blocked=1
-  fi
-done < "$dir/cortex-snapshot-files"
-if [ "$blocked" = 1 ]; then rm -f "$dir/cortex-agent-files" "$dir/cortex-snapshot-files" "$dir/cortex-user-files"; exit 4; fi
-set +e
-git merge-tree --write-tree -z --name-only --merge-base="$S" "$R" "$A" > "$dir/cortex-merge-out"
-code=$?
-set -e
-if [ "$code" = 1 ]; then
-  # Records: the tree, the conflicted paths, an empty record, then messages.
-  { IFS= read -r -d '' tree; while IFS= read -r -d '' p && [ -n "$p" ]; do printf 'PATH\t%s\n' "$p"; done; } < "$dir/cortex-merge-out" | sort -u
-  rm -f "$dir/cortex-agent-files" "$dir/cortex-snapshot-files" "$dir/cortex-user-files" "$dir/cortex-merge-out"
-  exit 3
-fi
-[ "$code" = 0 ]
-IFS= read -r -d '' T < "$dir/cortex-merge-out" || true
-rm -f "$dir/cortex-merge-out"
-export GIT_INDEX_FILE="$dir/cortex-merge-index"
-rm -f "$GIT_INDEX_FILE"
-git read-tree "$A"
-if [ -s "$dir/cortex-user-files" ]; then git --literal-pathspecs reset -q "$B" --pathspec-from-file="$dir/cortex-user-files" --pathspec-file-nul; fi
-W=$(git commit-tree "$(git write-tree)" -p "$B" -m "$CORTEX_MSG (the agent's work on its base)")
-M=$(git commit-tree "$T" -p "$R" -p "$W" -m "$CORTEX_MSG")
-git update-ref refs/cortex/merge "$M"
-rm -f "$GIT_INDEX_FILE" "$dir/cortex-agent-files" "$dir/cortex-snapshot-files" "$dir/cortex-user-files""#;
-
-/// The 1-based line of the first git conflict marker (`<<<<<<< `, structural) in a file.
-fn first_conflict_line(path: &std::path::Path) -> Option<usize> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines().position(|line| line.starts_with("<<<<<<< ")).map(|index| index + 1)
-}
-
-async fn bring_project_into_workspace(host: &Host, project: &Project, workspace: &str, data: &Dataset) -> String {
-    let branch = host.get::<VcsStatus>(vcs_methods::STATUS, json!({"root": project.root})).await.map(|status| status.branch).unwrap_or_default();
-    if branch.is_empty() {
-        return data.text("branch_unknown", &[]);
-    }
-    match run_in(host, workspace, &format!("git pull --no-rebase --no-edit {} {}", quote(&project.root), quote(&branch))).await {
-        Ok(run) if run.exit_code == Some(0) => data.text("pulled_clean", &[]),
-        Ok(_) => data.text("pulled_conflicts", &[]),
-        Err(error) => data.text("pull_failed", &[("error", &error.to_string())]),
     }
 }
 

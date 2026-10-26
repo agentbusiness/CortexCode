@@ -1,0 +1,50 @@
+/* pane.security@1 — the audit's line and the severity chips as bars, findings as a ruled list, one finding's facts opened under its row. */
+#cc .cx-security{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-security>.bar{padding-left:16px;}
+#cc .cx-security-filters{row-gap:6px;}
+#cc .cx-security-scroll{flex:1;min-height:0;overflow:auto;padding:0 16px 24px 0;}
+#cc .cx-security .lst .t{font-size:14.5px;}
+#cc .cx-security .lst .r{align-items:center;flex-wrap:wrap;row-gap:4px;}
+#cc .cx-security .lst .r .cx-security-place{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-security .lst li[data-status="accepted"] .t,
+#cc .cx-security .lst li[data-status="fixed"] .t,
+#cc .cx-security .lst li[data-status="verified"] .t,
+#cc .cx-security .lst li[data-status="gone"] .t{color:var(--ink-3);}
+#cc .cx-security .empty-line{padding-left:16px;}
+#cc .cx-security .inline-error{margin-left:16px;}
+#cc .cx-security-empty-acts{padding-left:18px;}
+
+/* severity: the chip in the filter row and the mark on a row; the ladder is the design's inks */
+#cc .cx-security-chips{display:flex;gap:6px;flex-wrap:wrap;}
+#cc .cx-security-chips .chip{cursor:pointer;background:transparent;}
+#cc .cx-security-chips .chip .num{font-size:10px;color:var(--ink-3);}
+#cc .cx-security-chips .chip:hover{color:var(--ink);border-color:var(--ink-3);}
+#cc .cx-security-chips .chip[aria-pressed="true"]{color:var(--rubric);border-color:var(--rubric);}
+#cc .cx-security-chips .chip[aria-pressed="true"] .num{color:var(--rubric);}
+#cc .ap.cx-security-sev[data-sev="critical"]{color:var(--rubric-lift);}
+#cc .ap.cx-security-sev[data-sev="high"]{color:var(--rubric);}
+#cc .ap.cx-security-sev[data-sev="medium"]{color:var(--rubric-deep);}
+#cc .ap.cx-security-sev[data-sev="low"]{color:var(--ink-2);}
+#cc .ap.cx-security-sev[data-sev="lead"]{color:var(--counter);}
+#cc .ap.cx-security-sev[data-sev="hardening"],#cc .ap.cx-security-sev[data-sev="unrated"]{color:var(--ink-3);}
+
+/* the sink's place and a finding's id are set in the code face */
+#cc .cx-security-place,#cc .cx-security-id,#cc .cx-security-when{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-3);}
+
+/* one finding, opened under its row */
+#cc .cx-security-open{border-left:1px solid var(--rule-2);margin:0 0 12px 18px;padding:4px 0 12px 12px;display:flex;flex-direction:column;gap:8px;}
+#cc .cx-security-grade{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;}
+#cc .cx-security-grade .grow{flex:1;}
+#cc .cx-security-text{margin:0;font-size:14px;line-height:1.5;color:var(--ink-2);max-width:64ch;white-space:pre-wrap;}
+#cc .cx-security-facts{margin:0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 12px;align-items:baseline;}
+#cc .cx-security-facts dt{padding-top:3px;}
+#cc .cx-security-facts dd{margin:0;font-size:14px;line-height:1.5;color:var(--ink-2);max-width:64ch;overflow-wrap:anywhere;}
+#cc .cx-security-commands{margin:4px 0 0;font-family:var(--font-mono);font-size:12px;line-height:1.5;color:var(--ink-2);white-space:pre-wrap;}
+#cc .cx-security-trace,#cc .cx-security-history{list-style:none;margin:0;padding:0;}
+#cc .cx-security-trace li,#cc .cx-security-history li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-security-trace li[data-kind="sink"] .cx-file-link{color:var(--ink);}
+#cc .cx-security-what{font-size:13.5px;line-height:1.45;color:var(--ink-2);flex-basis:100%;overflow-wrap:anywhere;}
+#cc .cx-security-links{margin:0;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;}
+#cc .cx-security-acts{display:flex;gap:4px;flex-wrap:wrap;}
+#cc .cx-security-note{display:flex;flex-direction:column;gap:0;max-width:64ch;}
+#cc .cx-security-note .tools{margin-top:6px;}

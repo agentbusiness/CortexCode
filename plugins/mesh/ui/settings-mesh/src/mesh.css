@@ -1,0 +1,10 @@
+/* settings.mesh@1 */
+#cc .cx-mesh{display:flex;flex-direction:column;gap:14px;}
+#cc .cx-mesh-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+#cc .cx-mesh-row .grow{flex:1;}
+#cc .cx-mesh-inv{font-family:var(--font-mono);font-size:11px;color:var(--ink-2);word-break:break-all;max-height:60px;overflow:auto;}
+#cc .cx-mesh-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;}
+#cc .cx-mesh-list li{display:flex;flex-direction:column;gap:4px;padding:6px 0;border-top:1px solid var(--rule);}
+#cc .cx-mesh-card{font-size:12px;color:var(--ink-2);}
+#cc .cx-mesh-field{flex:1;min-width:200px;}
+#cc .cx-mesh-note{font-size:12px;color:var(--ink-2);}

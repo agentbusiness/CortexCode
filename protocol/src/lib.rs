@@ -13,8 +13,10 @@ pub mod envelope;
 pub mod hashline;
 pub mod host;
 pub mod plugin;
+pub mod release;
 pub mod sha256;
 pub mod stored;
+pub mod version;
 
 pub use conn::{BoxFuture, CallStream, Connection, Handler, IncomingRequest, ItemSink, NoHandler, Responder};
 pub use envelope::{Message, RpcError, codes, parse_params, to_value};

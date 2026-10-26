@@ -13,16 +13,17 @@ skill with `read skill://skills-security/<name>`.
 | `security-review-change` | a diff, pull request, file or function to review for security |
 | `security-triage` | a reported vulnerability, CVE, scanner alert or suspicious code to judge |
 
-One self-contained plugin folder, separable into its own repository (only `cc-protocol` and
-`cc-lang-kit` come from outside):
+One self-contained plugin folder, separable into its own repository (only `cc-protocol`,
+`cc-lang-kit` and `@cortex/sdk` come from outside):
 
 | Path | What |
 |---|---|
-| `plugin.toml` | identity, build command and output, `data/` as a backend asset, source location |
+| `plugin.toml` | identity, build commands and outputs, `data/` as a backend asset, the UI package, source location |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-skills-security`: category `skills-security`, contract `skills@1`, served by `cc_lang_kit::run_skills_plugin` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary of when to read it, a blank line, the Markdown body) |
 | `data/scripts/secaudit.py` | the audit tool (Python 3.8+, standard library only), run by the model through `run` from the code folder: `$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py` |
 | `data/scripts/classes-*.json` | the attack classes and the code shapes the tool searches for |
+| `ui/` | npm workspace with one package, `ui/security` (`skills-security.pane` on `pane.security@1`): the Security tab of the right pane |
 
 ## The tool
 
@@ -45,7 +46,27 @@ secaudit.py deps                             the project's pinned dependencies a
 secaudit.py cve <id>                         one advisory (GHSA or CVE), live: severity, affected and fixed versions, mitigations
 secaudit.py recon [--scope <path>...]        the map alone (a scoped audit runs it before next)
 secaudit.py status | report | hunt | cover | new   the pieces next drives, callable on their own
+secaudit.py show <id>                        one finding from the project's graph: who, what, trace, fix, test, what the code says now
+secaudit.py fix-plan <id>                    the exact upgrade commands of a dependency finding (its quick fix)
+secaudit.py recheck <id>                     what the code says now; a sink that is gone or a package that moved on marks it fixed
+secaudit.py resolve <id> "<how>"             record a fix: refused while the sink is unchanged; else fixed in the graph with the session and commit
+secaudit.py status --fixing                  the fix skill's done guard: 0 once this session's finding is recorded fixed
 ```
+
+## The Security tab and the findings in the graph
+
+Findings do not stay in files: `finding` and the report push every confirmed finding, lead and
+hardening note into the project's graph through the memory plugin's `memory.security.*` methods
+(the script calls the app with `cx`; without the app it notes that and the next push carries
+everything). Each finding carries a computed priority (severity band, verdict, who the attacker
+is, a quick fix at hand, age) and its reason in words. The plugin's UI package `ui/security`
+(slot `pane.security@1`) is the Security tab in the right pane: the last audit, the active findings
+by priority, each one's trace linked into the code view, and the actions: fix in a session, quick
+fix, accept risk, not an issue, reopen, forget. Fixing starts a session whose opening message
+names the finding, the sink and the fix; the `security-fix` skill drives it and its `done` guard
+(`status --fixing`) keeps the turn open until `resolve` has seen the change in the code and marked
+the finding fixed. Lifecycle: open, fixing, fixed, verified (the next audit's re-check), accepted,
+gone; fixed and verified leave the active list and stay as history.
 
 Everything it writes goes under `tmp/secaudit/` in the audited project (git ignores `tmp/`).
 Which classes apply is decided from structural facts, never from the model's judgment: languages,
@@ -89,10 +110,33 @@ check did not run, and the audit continues from the code. The `classes-*.json` b
 its own search heuristics (the code shapes to look at, written from the upstream guidance); they
 ship with the plugin and change with it.
 
+## The Security tab's controls
+
+The package `ui/security` (`skills-security.pane`) reads `memory.security.summary`,
+`memory.security.findings` and `memory.security.finding`, follows `memory.security.changed`, and
+writes through `memory.security.finding.update` as `by: "user"`:
+
+- The head bar: the last audit (when, units, lines judged) and "Audit now", which creates a chat
+  session "Security audit" and sends `security audit of this codebase` as its first message with
+  the person's default mode, as the composer does.
+- The severity chips (critical, high, medium, low, lead, note) carry the counts of open and fixing
+  findings and filter the list; "Show fixed" adds fixed, verified and gone findings.
+- A row: severity, title, the sink's `path:line`, class, status, "quick fix" when the host spelled
+  the fix out; accepted and closed findings are greyed. The row opens the finding under itself.
+- "Fix in a session" and "Quick fix" (open findings) create a session `Fix: <title>` whose first
+  message names the finding, the principal, result and control at the sink, the fix (or the quick
+  fix's commands and the version the lockfile must pin) and the `resolve` command to record it;
+  then the finding is `fixing` with that session, and the session is selected.
+- "Accept risk" (open) and "Not an issue" (open, accepted) take a note inline, required, and mark
+  it `accepted` or `gone`; "Reopen" (fixing, accepted, fixed, verified, gone) marks it `open`;
+  "Forget" (`memory.security.forget`, fixed, verified and gone) deletes it after a second click.
+  A refused move shows the store's answer under the actions.
+
 ## Build and run
 
 ```sh
 cd backend && cargo build --release && cargo clippy --release --all-targets -- -D warnings
+(cd ui && npm install && npm run build)     # -> ui/security/dist (index.js, style.css, manifest.json)
 cortex-pack build plugins/skills-security   # -> plugins/skills-security/target/skills-security-<version>-<target>.ccplugin
 ```
 

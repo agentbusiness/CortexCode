@@ -13,7 +13,7 @@ use crate::uiplugins::{UiChange, UiPlugins};
 use crate::units::Units;
 use cc_protocol::contracts::frame::{
     DeleteResult, InstallParams, JournalAppendParams, JournalAppendResult, JournalPatch, JournalPatchParams, JournalReadParams,
-    JournalReadResult, KeepAwakeParams, KeepAwakeResult, Machine, PluginInfo, PluginListResult, PluginToggleParams,
+    JournalReadResult, KeepAwakeParams, KeepAwakeResult, Machine, PluginInfo, PluginListResult, PluginToggleParams, RouteClearParams, RouteSetParams,
     ProjectDeleted, ProjectGetParams, ProjectListResult, ProjectOpenParams, ProvidersParams, RollbackParams, SessionCreateParams, SessionDeleted,
     SessionGetParams,
     SessionListParams, SessionListResult, SessionUpdateParams, SubscribeParams, SubscribeResult, SwapParams, SwitchParams,
@@ -50,8 +50,10 @@ pub struct Peer {
     pub hello: OnceLock<Hello>,
     pub instance: OnceLock<Arc<Instance>>,
     subs: Mutex<Vec<String>>,
-    /// The category this client serves after its hello.
+    /// The category this client serves after its hello (takes the category over).
     serves: Mutex<Option<String>>,
+    /// The category this client serves for the sessions routed to it (`frame.route.set`).
+    serves_sessions: Mutex<Option<String>>,
     pub connected_ms: u64,
     pub command_scope: Option<Arc<crate::access::CommandScope>>,
 }
@@ -113,6 +115,9 @@ pub struct Frame {
     pub shutdown: CancellationToken,
     peers: RwLock<HashMap<u64, Arc<Peer>>>,
     routes: RwLock<HashMap<String, Route>>,
+    /// Routes of one session's calls of a category, by `(category, key)`: a client serving the
+    /// category with scope `sessions` (a joined computer's model lent to one agent).
+    session_routes: RwLock<HashMap<(String, String), Route>>,
     /// WebSocket clients serving a category, oldest first; the newest one is routed.
     ws_servers: Mutex<HashMap<String, Vec<(u64, Hello)>>>,
     next_peer: AtomicU64,
@@ -160,6 +165,7 @@ impl Frame {
             shutdown: CancellationToken::new(),
             peers: RwLock::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
+            session_routes: RwLock::new(HashMap::new()),
             ws_servers: Mutex::new(HashMap::new()),
             next_peer: AtomicU64::new(1),
             config,
@@ -209,6 +215,7 @@ impl Frame {
             instance: OnceLock::new(),
             subs: Mutex::new(Vec::new()),
             serves: Mutex::new(None),
+            serves_sessions: Mutex::new(None),
             connected_ms: now_ms(),
             command_scope,
         });
@@ -229,6 +236,9 @@ impl Frame {
         let served = peer.serves.lock().ok().and_then(|mut serves| serves.take());
         if let Some(category) = served {
             self.ws_unserve(&category, peer.id);
+        }
+        if let Ok(mut routes) = self.session_routes.write() {
+            routes.retain(|_, route| route.peer != peer.id);
         }
         if let Some(instance) = peer.instance.get()
             && !instance.is_retiring()
@@ -306,6 +316,16 @@ impl Frame {
     /// routing table is read-locked, so a request is enqueued on the old instance strictly before
     /// a swap's commit (and therefore before its `plugin.drain`), or on the new one after it.
     fn dispatch(&self, category: &str, method: &str, params: Value) -> Result<(CallStream, String), RpcError> {
+        if let Some(key) = session_key(&params)
+            && let Some(route) = self
+                .session_routes
+                .read()
+                .ok()
+                .and_then(|routes| routes.get(&(category.to_owned(), key)).cloned())
+        {
+            let stream = route.conn.call_stream(method, params)?;
+            return Ok((stream, route.instance));
+        }
         let routes = self.routes.read().map_err(|_| RpcError::internal("routing table poisoned"))?;
         match routes.get(category) {
             Some(route) => {
@@ -485,7 +505,30 @@ impl Frame {
         if let Err(reason) = supervisor::check_contract(&hello.category, &hello.contract) {
             return reject(reason);
         }
-        if self.sup.slot(&hello.category).is_some() {
+        if hello.scope == "sessions" {
+            // Serves the category only for the sessions `frame.route.set` binds to it; the
+            // category's own plugin keeps serving everything else.
+            if peer.hello.get().is_some() {
+                return reject("this connection already said hello".into());
+            }
+            let instance = format!("ws-{}", peer.id);
+            let _ = peer.hello.set(hello.clone());
+            peer.add_subscriptions(&hello.subscribes);
+            if let Ok(mut serves) = peer.serves_sessions.lock() {
+                *serves = Some(hello.category.clone());
+            }
+            tracing::info!(category = %hello.category, peer = peer.id, "client serves a category for routed sessions");
+            return HelloAck { accepted: true, reason: String::new(), instance, frame_version: FRAME_VERSION.into(), config: Value::Null };
+        }
+        if !hello.scope.is_empty() {
+            return reject(format!("unknown hello scope `{}` (empty or `sessions`)", hello.scope));
+        }
+        // A category whose plugin runs here is the plugin's; a client may serve it while that
+        // plugin is disabled (a member of the mesh lending its model: the local one is unloaded
+        // first) or when no plugin of the category is installed.
+        if let Some(slot) = self.sup.slot(&hello.category)
+            && !slot.is_disabled()
+        {
             return reject(format!("`{}` is served by a supervised plugin process", hello.category));
         }
         if let Some(plugin) = self.units.disabled_server_of(&hello.category) {
@@ -522,12 +565,22 @@ impl Frame {
         };
         let Some((_, hello)) = removed else { return };
         let instance = format!("ws-{peer_id}");
-        if self.clear_route(category, &instance)
-            && let Some((next_peer, _)) = &next
-        {
-            let conn = self.peers.read().ok().and_then(|peers| peers.get(next_peer).and_then(|p| p.conn().cloned()));
-            if let Some(conn) = conn {
-                self.set_route(category, Route { conn, instance: format!("ws-{next_peer}"), peer: *next_peer });
+        if self.clear_route(category, &instance) {
+            match &next {
+                Some((next_peer, _)) => {
+                    let conn = self.peers.read().ok().and_then(|peers| peers.get(next_peer).and_then(|p| p.conn().cloned()));
+                    if let Some(conn) = conn {
+                        self.set_route(category, Route { conn, instance: format!("ws-{next_peer}"), peer: *next_peer });
+                    }
+                }
+                // No client serves it any more: the category's own plugin, which the client had
+                // taken over (a borrowed model, a borrowed tool), serves it again.
+                None => {
+                    if let Some(route) = self.sup.slot(category).and_then(|slot| slot.live_current()).and_then(|instance| instance.route()) {
+                        self.set_route(category, route);
+                        tracing::info!(category, "the category's own plugin serves it again");
+                    }
+                }
             }
         }
         tracing::info!(category, peer = peer_id, "client stopped serving a category");
@@ -586,12 +639,8 @@ impl Frame {
                 to_value(&ack)
             }
             methods::COMMAND_ACCESS => {
-                if peer.kind != PeerKind::Plugin
-                    || !peer
-                        .hello
-                        .get()
-                        .is_some_and(|hello| hello.category == "tools")
-                {
+                let tools_backend = peer.kind == PeerKind::Plugin && peer.hello.get().is_some_and(|hello| hello.category == "tools");
+                if !tools_backend {
                     return Err(RpcError::new(
                         codes::CONTRACT_VIOLATION,
                         "command credentials are issued only to the active tools backend",
@@ -674,6 +723,54 @@ impl Frame {
                 to_value(&SubscribeResult { topics: peer.add_subscriptions(&params.topics) })
             }
             methods::MACHINE => to_value(&self.machine),
+            methods::UPDATE_STATUS => to_value(&crate::update::status(&self.home.root)),
+            methods::UPDATE_RESTART => {
+                let status = crate::update::status(&self.home.root);
+                if status.staged.is_none() {
+                    return Err(RpcError::invalid_params("no newer frame is staged; nothing to restart into"));
+                }
+                tracing::info!(staged = ?status.staged, "restarting onto the staged frame");
+                crate::update::request_restart();
+                self.shell.quit.notify_one();
+                to_value(&status)
+            }
+            methods::ROUTE_SET => {
+                let params: RouteSetParams = parse_params(params)?;
+                if params.key.is_empty() {
+                    return Err(RpcError::invalid_params("key must not be empty"));
+                }
+                let peer_id = params
+                    .instance
+                    .strip_prefix("ws-")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .ok_or_else(|| RpcError::invalid_params(format!("`{}` is not a client instance (`ws-<peer>`)", params.instance)))?;
+                let target = self.peers.read().ok().and_then(|peers| peers.get(&peer_id).cloned());
+                let Some(target) = target else {
+                    return Err(RpcError::invalid_params(format!("`{}` is not connected", params.instance)));
+                };
+                let serves = target.serves_sessions.lock().ok().and_then(|serves| serves.clone());
+                if serves.as_deref() != Some(params.category.as_str()) {
+                    return Err(RpcError::invalid_params(format!(
+                        "`{}` does not serve `{}` for sessions (hello with scope `sessions`)",
+                        params.instance, params.category
+                    )));
+                }
+                let Some(conn) = target.conn().cloned() else {
+                    return Err(RpcError::invalid_params(format!("`{}` is not connected", params.instance)));
+                };
+                if let Ok(mut routes) = self.session_routes.write() {
+                    routes.insert((params.category.clone(), params.key.clone()), Route { conn, instance: params.instance.clone(), peer: peer_id });
+                }
+                tracing::info!(category = %params.category, key = %params.key, instance = %params.instance, "session routed");
+                Ok(json!({}))
+            }
+            methods::ROUTE_CLEAR => {
+                let params: RouteClearParams = parse_params(params)?;
+                if let Ok(mut routes) = self.session_routes.write() {
+                    routes.remove(&(params.category, params.key));
+                }
+                Ok(json!({}))
+            }
             methods::KEEP_AWAKE => {
                 let params: KeepAwakeParams = parse_params(params)?;
                 if params.holder.is_empty() {
@@ -706,6 +803,7 @@ impl Frame {
                 | methods::PLUGINS_INSTALL_MANY
                 | methods::PLUGINS_INSTALL_WAIT
                 | methods::PLUGINS_SWITCH
+                | methods::UPDATE_STAGE
         )
     }
 
@@ -773,6 +871,20 @@ impl Frame {
                 let (running, pid) = self.shell.open(&self).await?;
                 to_value(&UiOpenResult { running, pid })
             }
+            methods::UPDATE_STAGE => {
+                let params: cc_protocol::contracts::frame::UpdateStageParams = parse_params(params)?;
+                for path in [&params.frame_archive, &params.electron_archive] {
+                    if !path.is_empty() && !std::path::Path::new(path).is_absolute() {
+                        return Err(RpcError::invalid_params(format!("`{path}` must be an absolute path")));
+                    }
+                }
+                let root = self.home.root.clone();
+                let staged = tokio::task::spawn_blocking(move || crate::update::stage(&root, &params))
+                    .await
+                    .map_err(|e| RpcError::internal(e.to_string()))?
+                    .map_err(RpcError::invalid_params)?;
+                to_value(&staged)
+            }
             other => Err(RpcError::unknown_method(other)),
         }
     }
@@ -835,12 +947,12 @@ impl Handler for PeerHandler {
         let frame = self.frame.clone();
         let peer = self.peer.clone();
         let method = request.method.clone();
-        if let Some(scope) = &peer.command_scope {
-            if let Err(error) = scope.authorize(&method, &mut request.params) {
-                return Box::pin(async move {
-                    request.responder.err(error);
-                });
-            }
+        if let Some(scope) = &peer.command_scope
+            && let Err(error) = scope.authorize(&method, &mut request.params)
+        {
+            return Box::pin(async move {
+                request.responder.err(error);
+            });
         }
         if method != methods::HELLO && peer.kind == PeerKind::Plugin && peer.hello.get().is_none() {
             return Box::pin(async move {
@@ -1003,4 +1115,13 @@ fn renderer_build(ui_dir: &std::path::Path) -> String {
         Ok(bytes) => Sha256::digest(&bytes).iter().take(8).map(|byte| format!("{byte:02x}")).collect(),
         Err(_) => String::new(),
     }
+}
+
+/// The session a call belongs to, as its parameters name it: `cache_key` (model calls: the
+/// session or agent id), `session_id`, or `context.session_id`.
+fn session_key(params: &Value) -> Option<String> {
+    let direct = params.get("cache_key").or_else(|| params.get("session_id"));
+    let key = direct.or_else(|| params.get("context").and_then(|context| context.get("session_id")))?;
+    let key = key.as_str()?;
+    (!key.is_empty()).then(|| key.to_owned())
 }

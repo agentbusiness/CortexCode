@@ -3,9 +3,109 @@
 //! The package is written there under a hidden name and renamed into place, so the frame only ever
 //! sees whole files. A running frame installs it at once (hot-swap, or a new plugin started) and
 //! writes `<file>.result.json` beside it; a stopped frame installs it at its next start.
+//!
+//! Plugins read their live data (prompts, texts, stages, schemas, skills, scripts) from the code
+//! folder, `<home>/code/<source subdir>/`, not from the installed package, and the frame refreshes
+//! that folder only when the app brings a new source version. So an install from a repository also
+//! copies the plugin's data folders into the code folder ([`refresh_live_data`]): what was packed
+//! is what the new backend reads (seen: a day of prompt and script fixes installed as packages
+//! while the app kept running the old copies).
 
+use cc_protocol::contracts::frame::package::PluginToml;
+use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// The folders a plugin reads as live data, relative to its folder: the backend's declared assets
+/// and `backend/data` (the chat flow's prompts and texts), whichever exist.
+fn live_data_dirs(dir: &Path, toml: &PluginToml) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(backend) = &toml.backend {
+        for asset in &backend.assets {
+            if dir.join(asset).is_dir() && !dirs.contains(asset) {
+                dirs.push(asset.clone());
+            }
+        }
+        let data = format!("{}/data", backend.dir.trim_end_matches('/'));
+        if dir.join(&data).is_dir() && !dirs.contains(&data) {
+            dirs.push(data);
+        }
+    }
+    dirs
+}
+
+/// Mirror the plugin's live data folders into the code folder: every source file of those folders
+/// (what git tracks or would track, so build caches stay out) is copied over, and files the code
+/// folder has there that the plugin no longer has are removed. Returns a one-line summary, or None
+/// when the plugin has no `[source]`, no data folders, or the code folder does not hold it yet (the
+/// app brings the source at its first start; nothing to refresh before that).
+pub fn refresh_live_data(dir: &Path, toml: &PluginToml, home: &Path) -> Result<Option<String>, String> {
+    let Some(source) = &toml.source else { return Ok(None) };
+    let dest_root = home.join("code").join(&source.subdir);
+    if !dest_root.is_dir() {
+        return Ok(None);
+    }
+    let dirs = live_data_dirs(dir, toml);
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    let files = crate::pack::source_files(dir)?;
+    let mut copied = 0usize;
+    let mut removed = 0usize;
+    for data_dir in &dirs {
+        let prefix = format!("{data_dir}/");
+        let wanted: BTreeSet<&String> = files.iter().filter(|file| file.starts_with(&prefix)).collect();
+        for file in &wanted {
+            let from = dir.join(file);
+            let to = dest_root.join(file);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            if !same_contents(&from, &to) {
+                std::fs::copy(&from, &to).map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))?;
+                if let Ok(metadata) = std::fs::metadata(&from) {
+                    let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(metadata.permissions().mode()));
+                }
+                copied += 1;
+            }
+        }
+        let dest_dir = dest_root.join(data_dir);
+        for existing in files_under(&dest_dir) {
+            let relative = existing.strip_prefix(&dest_root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            if !wanted.contains(&&relative) {
+                std::fs::remove_file(&existing).map_err(|e| format!("cannot remove {}: {e}", existing.display()))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(Some(format!("live data in {}: {copied} file(s) copied, {removed} removed ({})", dest_root.display(), dirs.join(", "))))
+}
+
+/// Every regular file below `dir` (empty when it does not exist).
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&current) else { continue };
+        for entry in read.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(path),
+                Ok(kind) if kind.is_file() => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// The frame's home: `CORTEX_HOME`, else `~/.cortexcode`.
 pub fn home() -> PathBuf {

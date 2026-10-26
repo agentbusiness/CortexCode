@@ -29,6 +29,7 @@ use cc_protocol::contracts::frame::{
 };
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{Task, methods as memory_methods};
+use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{Priority, methods as model_methods};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
@@ -47,6 +48,7 @@ pub fn hello() -> Hello {
         methods::STEER,
         methods::CANCEL,
         methods::STATE,
+        methods::RUNNING,
         methods::AGENT_RUN,
         methods::APPROVE,
         methods::ATTACHMENT_PUT,
@@ -377,6 +379,14 @@ impl Chatflow {
             .map(|handle| (handle.run_id.clone(), handle.stops.clone(), handle.stage.clone(), handle.done.clone()))
     }
 
+    /// `chatflow.running`: the sessions with a run going now.
+    fn running(&self) -> cc_protocol::contracts::chatflow::RunningResult {
+        let runs = self.lock_runs();
+        let mut sessions: Vec<String> = runs.iter().filter(|(_, handle)| handle.done.borrow().is_none()).map(|(session, _)| session.clone()).collect();
+        sessions.sort();
+        cc_protocol::contracts::chatflow::RunningResult { sessions }
+    }
+
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         self.inner.tasks.spawn(future);
     }
@@ -698,6 +708,26 @@ impl Chatflow {
                     .environment(&host, &mut journal, &session, &run_id, &mode, Priority::Foreground, stops.clone(), stage.clone())
                     .await?;
                 ran = Some(env.clone());
+                // Where this turn's model calls run, decided by the host: this computer when its
+                // model is free for a person, else a joined computer's free model, else the first
+                // to free up (`mesh.place`; without the mesh plugin: here). A wait shows as a stage.
+                let placing = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "wait": true}));
+                tokio::pin!(placing);
+                let placed = tokio::select! {
+                    outcome = &mut placing => outcome,
+                    _ = tokio::time::sleep(Duration::from_millis(1500)) => {
+                        env.set_stage("wait");
+                        journal.set(status_seq, "stage", json!("wait")).await?;
+                        placing.await
+                    }
+                };
+                if let Ok(placement) = &placed
+                    && placement.get("node").and_then(Value::as_str).is_some()
+                {
+                    let name = placement.get("name").and_then(Value::as_str).unwrap_or_default();
+                    tracing::info!(session = %session_id, on = %name, "the turn's model calls run on a joined computer");
+                    journal.set(status_seq, "placed", json!(name)).await?;
+                }
                 let wake = journal.get(status_seq).is_some_and(|entry| str_field(&entry.data, "kind") == "wake");
                 if !wake {
                     return flow::run_turn(&env, &mut journal, status_seq).await;
@@ -736,7 +766,13 @@ impl Chatflow {
                     }
                     Err(error) => tracing::debug!(%error, "turn cleanup failed"),
                 }
+                // What the turn changed, from the step log (edits, commands' effects, deletions),
+                // kept in the transcript as the turn's Changed card even after a commit empties the log.
+                if let Some(note) = crate::afteraction::changed_note(&host, &env.scope.workspace, session_id, since_ms, &run_id).await {
+                    journal.append(kinds::NOTE, note).await?;
+                }
             }
+            let _ = host.call(mesh_methods::PLACE_END, json!({"session_id": session_id})).await;
             journal.append(kinds::STATUS, json!({"state": state, "detail": detail, "run_id": run_id, "data_version": self.inner.data.get().version()})).await?;
             self.learn(session_id, &run_id);
             let session_status = match state.as_str() {
@@ -1479,6 +1515,23 @@ impl Chatflow {
         };
         // The run goes into the graph (docs/PROJECT-KNOWLEDGE-PLAN.md P5); it cannot fail the run.
         let _ = crate::afteraction::record_run(&env, &journal, Some(&task.id), &outcome).await;
+        let run_started_ms = journal
+            .entries()
+            .find(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "state") == "running")
+            .map(|entry| entry.ts_ms)
+            .unwrap_or(0);
+        // The run's end is a turn's end for the tree: what its commands left behind goes, its file
+        // reservations free, and what it changed is recorded.
+        if let Err(error) = env
+            .host
+            .call(cc_protocol::contracts::tools::methods::CLEANUP, json!({"workspace": env.scope.workspace, "session_id": params.session_id, "since_ms": run_started_ms}))
+            .await
+        {
+            tracing::debug!(%error, "agent run cleanup failed");
+        }
+        if let Some(note) = crate::afteraction::changed_note(&env.host, &env.scope.workspace, &params.session_id, run_started_ms, &run_id).await {
+            journal.append(kinds::NOTE, note).await?;
+        }
         let result = AgentRunResult {
             outcome: outcome.outcome.clone(),
             summary: outcome.summary.clone(),
@@ -1671,6 +1724,7 @@ impl Plugin for Chatflow {
                 methods::STEER => this.steer(ctx, parse_params(call.params.clone())?).await,
                 methods::CANCEL => this.cancel(ctx, parse_params(call.params.clone())?).await,
                 methods::STATE => to_value(&this.state(ctx, parse_params(call.params.clone())?).await?),
+                methods::RUNNING => to_value(&this.running()),
                 methods::APPROVE => this.approve(ctx, parse_params(call.params.clone())?).await,
                 methods::ATTACHMENT_PUT => to_value(&this.attachment_put(ctx, parse_params(call.params.clone())?).await?),
                 methods::SPEC_UPDATE => this.spec_update(ctx, parse_params(call.params.clone())?).await,

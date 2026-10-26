@@ -179,25 +179,22 @@ impl CodeTree {
             let detail = self
                 .run(
                     &format!(
-                        "{} MATCH (n:Code {{sid: $sid}}) RETURN n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1])",
+                        "{} MATCH (n:Code {{sid: $sid}}) RETURN n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1]), n.param_names, n.param_types, n.param_defaults",
                         layer::OBSERVED_READ
                     ),
                     params! { "sid" => sid, "calls" => CALL_LIKE },
                 )
                 .await?;
             let row = detail.rows.first().cloned().unwrap_or_default();
-            let params_rows = self
-                .run(
-                    &format!("{} MATCH (n:Code {{sid: $sid}})-[:HAS_PARAM]->(p:Param) RETURN p.name, p.position, p.type_text, p.default_value", layer::OBSERVED_READ),
-                    params! { "sid" => sid },
-                )
-                .await?;
-            let mut params: Vec<ParamInfo> = params_rows
-                .rows
-                .iter()
-                .map(|r| ParamInfo { name: s(r, 0), position: u(r, 1), type_text: r.get(2).and_then(|v| v.as_str()).map(str::to_owned), default_value: r.get(3).and_then(|v| v.as_str()).map(str::to_owned) })
+            // Parameters are three lists on the definition, in order; "" is no type or default.
+            let column = |i: usize| -> Vec<String> { row.get(i).and_then(|v| v.as_array()).map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_owned()).collect()).unwrap_or_default() };
+            let (types, defaults) = (column(4), column(5));
+            let given = |list: &[String], i: usize| list.get(i).filter(|text| !text.is_empty()).cloned();
+            let params: Vec<ParamInfo> = column(3)
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ParamInfo { name, position: i as u32, type_text: given(&types, i), default_value: given(&defaults, i) })
                 .collect();
-            params.sort_by_key(|p| p.position);
             let tests = self.run(&format!("{} MATCH (t:Test)-[:TESTS]->(n:Code {{sid: $sid}}) RETURN {}", layer::OBSERVED_READ, sym_cols("t")), params! { "sid" => sid }).await?;
             let mut tests: Vec<SymbolRef> = tests.rows.iter().map(|r| sym_from(r, 0)).collect();
             tests.sort_by(|a, b| a.sid.cmp(&b.sid));
@@ -418,7 +415,7 @@ impl CodeTree {
         let mut excluded: HashMap<String, bool> = HashMap::new();
         for (sid, _) in &scores {
             let Some(symbol) = by_sid.get(sid) else { continue };
-            if matches!(symbol.kind.as_str(), "param" | "prop" | "variant" | "field") {
+            if matches!(symbol.kind.as_str(), "prop" | "variant" | "field") {
                 continue;
             }
             if *excluded.entry(symbol.path.clone()).or_insert_with(|| declared.excluded(&self.root, &symbol.path)) {
@@ -511,7 +508,7 @@ impl CodeTree {
         let rows = self
             .run(
                 &format!("{} MATCH (a:Code)-[r]->(b:Code) WHERE type(r) IN $rels RETURN a.sid, b.sid", layer::OBSERVED_READ),
-                params! { "rels" => ["CALLS", "INSTANTIATES", "RENDERS", "USES_HOOK", "REQUESTS", "INVOKES", "HANDLES", "RUNS", "IMPORTS", "DEFINES", "EXTENDS", "IMPLEMENTS", "OF_TYPE", "RETURNS", "READS", "WRITES", "TESTS", "CONTAINS"] },
+                params! { "rels" => ["CALLS", "INSTANTIATES", "RENDERS", "USES_HOOK", "REQUESTS", "INVOKES", "HANDLES", "RUNS", "IMPORTS", "DEFINES", "EXTENDS", "IMPLEMENTS", "OF_TYPE", "TAKES", "RETURNS", "READS", "WRITES", "TESTS", "CONTAINS"] },
             )
             .await?;
         let mut ids: HashMap<String, usize> = HashMap::new();

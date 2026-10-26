@@ -17,6 +17,7 @@ pub mod linestore;
 pub mod model;
 pub mod notes;
 pub mod queries;
+pub mod security;
 pub mod service;
 pub mod settings;
 pub mod skills;

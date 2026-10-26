@@ -13,6 +13,7 @@ pub mod paths;
 pub mod probe;
 pub mod proc;
 pub mod proposals;
+pub mod release;
 pub mod service;
 pub mod settings;
 pub mod share;
@@ -40,4 +41,6 @@ pub const PROVIDES: &[&str] = &[
     methods::SHARE_SEND,
     methods::SHARE_STATUS,
     methods::STORAGE,
+    methods::RELEASE_STATUS,
+    methods::RELEASE_MERGE,
 ];
