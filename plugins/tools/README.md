@@ -3,7 +3,8 @@
 The model's hands: `read` / `edit` / `write` with hashline anchors (`hashedit`, `textedit`), search,
 URI reads (`graph://`, `task://`, `knowledge://`, … through the memory plugin; the project's
 knowledge bound to a symbol or a file rides along with its read, one line per item), a persistent shell with background
-jobs and output offloading to artifacts, copy-on-write workspaces for parallel agents, the UI file
+jobs and output offloading to artifacts, the step log (what every step changed, for undo), one
+tree for every session (file reservations, checks on a throw-away copy), the UI file
 tree (`tools.files`, `tools.save`), tool-call repair for the shapes local models actually emit
 (`repair/`: tolerant JSON, XML-style calls, other harnesses' tool names), and the ask-mode gate
 (`tools.approve`). Agent commands run under `sandbox-exec` with a write allowlist (the workspace,
@@ -73,6 +74,50 @@ command past the sandbox in the session. A file `edit` created in the running tu
 whole again (the model's own draft); the list is cleared when the turn ends. A `.cortex-env` file (`KEY=VALUE` lines, `$NAME`
 expanded) in the workspace or above it is loaded into its shells and jobs: a toolchain the machine
 does not have on its PATH.
+
+## The step log and undo
+
+Every step that changes files is a record in the workspace's step log (`undo.rs`), kept until the
+next commit: the files it changed, their contents before and after (compressed blobs, shared
+between records), who did it (`user`, `session:<id>`, `host`) and what for. Records come from the
+edit tool and the editor's save (with the text in hand), from every command's end, the turn's
+cleanup and a quiet moment after a file-system event (`git status` compared with what the log
+knows, so a `sed`, a formatter or an edit by hand is a record too), and from the log's opening (what
+changed while the app was off). On `vcs.changed` with a new HEAD, every path whose content equals
+HEAD leaves the log, so a commit empties it and a partial commit keeps what stays uncommitted.
+Undo and redo are records too: `tools.undo {workspace, seqs | to_seq, cascade}` puts the
+before-contents back (a step whose files a later step touched is refused with `blocked_by` unless
+`cascade`), `tools.redo` undoes the newest active undo; `tools.timeline` lists the records (newest
+first, filtered by session or time; it records what changed on disk first), `tools.timeline.diff`
+gives one path's change over a range of steps. The event `tools.timeline {workspace, seq}` says the
+log changed. The card's Timeline section (`ui/card-timeline`) and the chat's Changed card read it;
+the model uses `cx changed`, `cx undo`, `cx redo`. A workspace that is not a repository is walked
+with the ignore rules instead and has its files recorded once when the log opens.
+
+## One tree, many hands
+
+Every session, chat or agent, edits the project's own folder (`tree.rs`). A path the edit tool
+writes is reserved for that session until its turn ends (`tools.cleanup` releases it); another
+session's edit of it is refused with who holds it and when it frees, nothing written. A command
+that is one of the project's checks (its first words are a verifier command the language plugins
+declare) runs on a `clonefile` copy of the tree when another session holds a reservation or runs a
+command in it: the copy drops what git ignores, links the caches the language plugins declare
+(`Description.caches`: `target`, `node_modules`, `.venv`) to the project's own, hosts the command
+with the session's shell and sandbox (the copy added as a writable grant), and goes when the
+command ends; the result says so and that files the command changed were not kept. Alone in the
+tree, a check runs in the tree.
+
+## Borrowed hands
+
+When the mesh plugin names a member that runs a session's commands (`mesh.runner`, asked once per
+session at its first `run`; `tools.runner.set` overrides), the model's `run` goes to that member
+through `mesh.call` and the member's own `tools.run`, in the member's copy of the tree
+(`exec.rs` `run_remote`): the output comes back with the member's paths shown as this tree's,
+and the result says where it ran. Files the member's command changed arrive through
+`tools.timeline.apply` (written here as one step attributed to the member, `node:<id>`), the
+same method the mesh uses to keep a member's copy in step with this tree. Host checks, background
+jobs, commands let past the sandbox and the probe always run here; a member that stops answering
+sends the session's commands back here.
 
 A host `tools.read` of `diagnostics://` may pass `wait_ms` (0: what the servers have now, nothing
 started or waited for, marked partial; the chat flow's reads) and `shown` (at most that many listed

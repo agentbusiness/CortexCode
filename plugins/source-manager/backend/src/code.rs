@@ -6,6 +6,9 @@
 //!   every Mac, and an update or a restore merges three trees with an explicit base (the shipped
 //!   tree the changes were made on), never by shared history.
 //! - `refs/cortexcode/drafts/<id>` holds a proposed code change until the user answers.
+//! - `refs/cortexcode/bundled` is the app's own source as last merged. The shipped source also
+//!   moves by releases (one plugin's source, or the frame's), so a start merges only what changed
+//!   in the app's source since then: a plugin a release updated keeps its release.
 //!
 //! Every commit carries trailers the history reads back: `Origin:` (shipped | update | edit |
 //! approved | revert | restore), `Plugins:`, `Shipped-Tree:` (shipped and update commits) and
@@ -25,6 +28,7 @@ pub const SHIPPED: &str = "refs/cortexcode/shipped";
 pub const DRAFTS: &str = "refs/cortexcode/drafts/";
 pub const BACKUP: &str = "refs/cortexcode/backup";
 pub const UPSTREAM: &str = "refs/cortexcode/upstream";
+pub const BUNDLED: &str = "refs/cortexcode/bundled";
 
 /// Folders never taken from the shipped source (build outputs, installs).
 const SKIPPED_DIRS: &[&str] = &["target", "node_modules", "dist", ".git"];
@@ -193,6 +197,7 @@ pub fn populate(dir: &Path, source: &Path) -> Result<()> {
     let commit = shipped_commit(&repo, tree)?;
     repo.reference(MAIN, commit, true, "shipped source").map_err(err)?;
     repo.reference(SHIPPED, commit, true, "shipped source").map_err(err)?;
+    repo.reference(BUNDLED, commit, true, "app source").map_err(err)?;
     repo.set_head(MAIN).map_err(err)?;
     repo.checkout_head(Some(CheckoutBuilder::new().force())).map_err(err)?;
     Ok(())
@@ -207,9 +212,102 @@ pub struct Updated {
     pub own_code: Vec<String>,
 }
 
-/// Merge the shipped source into the code folder.
+/// Merge the app's own source (`source`) into the code folder: what changed in it since the
+/// last start comes in.
 pub fn update(repo: &Repository, source: &Path) -> Result<Updated> {
-    let new_tree_id = shipped_tree(repo, source)?;
+    let bundle = shipped_tree(repo, source)?;
+    let shipped = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let previous = repo.find_reference(BUNDLED).and_then(|r| r.peel_to_tree()).map(|tree| tree.id()).unwrap_or(shipped.id());
+    if previous == bundle {
+        set_bundled(repo, bundle)?;
+        return Ok(Updated { state: "up_to_date", conflicts: Vec::new(), own_code: Vec::new() });
+    }
+    let new_shipped = if previous == shipped.id() {
+        bundle
+    } else {
+        let previous = repo.find_tree(previous).map_err(err)?;
+        let bundle_tree = repo.find_tree(bundle).map_err(err)?;
+        let mut index = repo.merge_trees(&previous, &shipped, &bundle_tree, None).map_err(err)?;
+        if index.has_conflicts() { bundle } else { index.write_tree_to(repo).map_err(err)? }
+    };
+    let updated = merge_shipped(repo, new_shipped, "Updated to the shipped source")?;
+    if updated.state != "conflicts" {
+        set_bundled(repo, bundle)?;
+    }
+    Ok(updated)
+}
+
+fn set_bundled(repo: &Repository, tree: Oid) -> Result<()> {
+    let commit = shipped_commit(repo, tree)?;
+    repo.reference(BUNDLED, commit, true, "app source").map_err(err)?;
+    Ok(())
+}
+
+/// The part of the source a release brings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scope {
+    /// One plugin's folder, `plugins/<id>`.
+    Plugin(String),
+    /// Everything outside `plugins/`.
+    Frame,
+}
+
+/// The shipped tree with `scope` replaced by the files of `source`.
+fn released_tree(repo: &Repository, base: &Tree, scope: &Scope, source: &Path) -> Result<Oid> {
+    let released = shipped_tree(repo, source)?;
+    let tree_mode = i32::from(FileMode::Tree);
+    match scope {
+        Scope::Plugin(id) => {
+            let plugins = match base.get_name("plugins") {
+                Some(entry) => Some(repo.find_tree(entry.id()).map_err(err)?),
+                None => None,
+            };
+            let mut builder = repo.treebuilder(plugins.as_ref()).map_err(err)?;
+            builder.insert(id, released, tree_mode).map_err(err)?;
+            let plugins = builder.write().map_err(err)?;
+            let mut root = repo.treebuilder(Some(base)).map_err(err)?;
+            root.insert("plugins", plugins, tree_mode).map_err(err)?;
+            root.write().map_err(err)
+        }
+        Scope::Frame => {
+            let released = repo.find_tree(released).map_err(err)?;
+            let mut root = repo.treebuilder(Some(&released)).map_err(err)?;
+            if root.get("plugins").map_err(err)?.is_some() {
+                root.remove("plugins").map_err(err)?;
+            }
+            if let Some(entry) = base.get_name("plugins") {
+                root.insert("plugins", entry.id(), entry.filemode()).map_err(err)?;
+            }
+            root.write().map_err(err)
+        }
+    }
+}
+
+/// Merge a released source into the code folder, keeping the user's changes.
+pub fn release(repo: &Repository, scope: &Scope, source: &Path, version: &str) -> Result<Updated> {
+    let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let new_tree = released_tree(repo, &base, scope, source)?;
+    let summary = match scope {
+        Scope::Plugin(id) => format!("Updated {id} to its release {version}"),
+        Scope::Frame => format!("Updated the frame to its release {version}"),
+    };
+    merge_shipped(repo, new_tree, &summary)
+}
+
+/// The files of `prefix` (`plugins/<id>/`) the user changed away from the shipped source,
+/// committed or not.
+pub fn edited(repo: &Repository, prefix: &str) -> Result<Vec<String>> {
+    let shipped = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let mut files: Vec<String> = changed_files(repo, Some(&shipped), Some(&head))?.into_iter().filter(|file| file.starts_with(prefix)).collect();
+    files.extend(changed_paths(repo)?.into_iter().filter(|file| file.starts_with(prefix)));
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Merge a new shipped tree into the code folder: three trees, the current shipped tree as base.
+fn merge_shipped(repo: &Repository, new_tree_id: Oid, summary: &str) -> Result<Updated> {
     let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let base_tree = base.tree().map_err(err)?;
     if base_tree.id() == new_tree_id {
@@ -234,7 +332,7 @@ pub fn update(repo: &Repository, source: &Path) -> Result<Updated> {
     }
     let shipped = shipped_commit(repo, new_tree_id)?;
     let shipped_parent = repo.find_commit(shipped).map_err(err)?;
-    let text = message("Updated to the shipped source", &[("Origin", "update".into()), ("Shipped-Tree", new_tree_id.to_string())]);
+    let text = message(summary, &[("Origin", "update".into()), ("Shipped-Tree", new_tree_id.to_string())]);
     let sig = signature(now_ms())?;
     let merged = repo.commit(None, &sig, &sig, &text, &result_tree, &[&head, &shipped_parent]).map_err(err)?;
     repo.reference(MAIN, merged, true, "update").map_err(err)?;

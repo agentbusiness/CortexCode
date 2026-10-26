@@ -1,0 +1,30 @@
+{
+  "name": "cortexcode",
+  "version": "0.1.0",
+  "description": "CortexCode, a local coding agent: npx cortexcode downloads the app for this machine from the official releases and starts it.",
+  "type": "module",
+  "bin": {
+    "cortexcode": "bin/cortexcode.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentbusiness/CortexCode.git"
+  },
+  "homepage": "https://github.com/agentbusiness/CortexCode"
+}

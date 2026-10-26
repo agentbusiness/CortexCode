@@ -135,6 +135,10 @@ impl LanguagePack for TypeScriptPack {
 
     /// Tools run only from the project's own `node_modules/.bin` (`npx --no` never installs: an
     /// install is the user's to approve); `npm test` runs the package's test script.
+    fn caches(&self) -> Vec<String> {
+        vec!["node_modules".to_owned()]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         let verifier = |name: &str, kind: &str, args: &[&str], when: &[&str]| Verifier {
             files: Vec::new(),            name: name.into(),

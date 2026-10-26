@@ -112,6 +112,45 @@ pub mod methods {
     /// Start the Electron shell again after the user closed it (no-op while it runs).
     /// `{}` -> [`super::UiOpenResult`].
     pub const UI_OPEN: &str = "frame.ui.open";
+    /// [`super::RouteSetParams`] -> `{}`: route one session's calls of a category to a client
+    /// that serves it with scope `sessions` (a member of the mesh lending its model to one agent).
+    pub const ROUTE_SET: &str = "frame.route.set";
+    /// [`super::RouteClearParams`] -> `{}`.
+    pub const ROUTE_CLEAR: &str = "frame.route.clear";
+    /// Unpack a downloaded frame release beside the running frame (`<home>/frame/<version>/`,
+    /// Electron in `<home>/electron/<version>/`); it runs from the next start.
+    /// [`super::UpdateStageParams`] -> [`super::UpdateStatus`].
+    pub const UPDATE_STAGE: &str = "frame.update.stage";
+    /// The running frame version and the newest staged one. `{}` -> [`super::UpdateStatus`].
+    pub const UPDATE_STATUS: &str = "frame.update.status";
+    /// Stop every plugin and the window as on quit, then start again on the newest staged frame.
+    /// `{}` -> [`super::UpdateStatus`] (answered before the shutdown begins).
+    pub const UPDATE_RESTART: &str = "frame.update.restart";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpdateStageParams {
+    /// The frame release version (`0.2.0`).
+    pub version: String,
+    /// Absolute path of the downloaded frame archive (`.tar.gz`).
+    pub frame_archive: String,
+    /// The Electron version the frame names.
+    pub electron_version: String,
+    /// Absolute path of the downloaded Electron archive; empty when that Electron is staged already.
+    #[serde(default)]
+    pub electron_archive: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UpdateStatus {
+    /// The version of the running frame.
+    pub running: String,
+    /// The newest staged frame newer than the running one (it starts at the next start).
+    #[serde(default)]
+    pub staged: Option<String>,
+    /// Electron versions staged in `<home>/electron/`.
+    #[serde(default)]
+    pub electron: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1203,4 +1242,19 @@ pub mod package {
         pub git_commit: Option<String>,
     }
 
+}
+
+/// [`methods::ROUTE_SET`] parameters: calls of `category` whose `cache_key`, `session_id` or
+/// `context.session_id` is `key` go to the client `instance` (`ws-<peer>` from its hello ack).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RouteSetParams {
+    pub category: String,
+    pub key: String,
+    pub instance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RouteClearParams {
+    pub category: String,
+    pub key: String,
 }

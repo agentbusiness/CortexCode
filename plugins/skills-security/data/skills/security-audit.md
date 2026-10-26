@@ -26,6 +26,8 @@ python3 "$SA" settle U3.7 finding
 python3 "$SA" settle U8.1 lead
 ```
 
+One unit only, when the task names it (other agents do the other units at the same time): `python3 "$SA" next --unit U3` shows that unit's lines and, once they are all settled, its one-line result; nothing else is yours.
+
 When the project was audited before, the first unit is U0, the previous audit's issues, each with what the code shows now: settle each as `fixed "<what changed>"` or `still "<re-verified how>"`. Several ids share one reason when one control covers them, and that reason names the control as path:line in the project (the tool checks the place exists): `settle U4 safe "every handler sits behind the loopback middleware, startup.rs:137"` settles a whole unit. Then `python3 "$SA" next` again. A unit the tool itself could not show stays open; it comes back after the other units, and if it fails again the tool prints the settle that records the failure.
 
 ## Finding or lead

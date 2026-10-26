@@ -146,12 +146,30 @@ pub async fn execute_in(
         canonical.notes.push("a read of `run:<command>` ran as run".to_owned());
     }
     let intent = canonical.args.get("intent").and_then(Value::as_str).unwrap_or("").to_owned();
+    // The step log: an edit records itself with the text in hand; a command's effects are found
+    // when it ends (the watcher leaves them alone meanwhile).
+    let steps = (canonical.tool != "read").then(|| core.steps.open(&session.workspace));
+    if let Some(steps) = &steps {
+        steps.begin();
+    }
     let mut out = match canonical.tool {
         "read" => exec_read(core, host, &session, &canonical.args).await,
         "edit" => exec_edit(core, host, &session, &canonical.args).await,
         "terminal" => exec_terminal(host, &session, &canonical.args, &cancel).await,
         _ => exec_run(core, host, &session, &canonical.args, &items, cancel).await,
     };
+    if let Some(steps) = steps {
+        if canonical.tool == "edit" {
+            steps.end_quiet();
+        } else {
+            let detail = match canonical.tool {
+                "terminal" => format!("terminal {}", canonical.args.get("action").and_then(Value::as_str).unwrap_or("")),
+                _ => canonical.args.get("command").and_then(Value::as_str).unwrap_or("").chars().take(200).collect(),
+            };
+            let who = crate::undo::Attribution::session(&session.context.session_id, "run", &detail);
+            let _ = tokio::task::spawn_blocking(move || steps.end(&who)).await;
+        }
+    }
     // An edit ends with one check of each file it changed: the syntax check's new errors and the
     // language server's view (type errors, not only syntax), as one list.
     let checks = std::mem::take(&mut out.checks);
@@ -801,7 +819,7 @@ fn definition_range(session: &Session<'_>, file: &str, name: &str) -> Result<Str
     let text = crate::util::read_host_text(&absolute).map_err(|_| format!("{file}: no such file."))?;
     let lines: Vec<&str> = text.lines().collect();
     let items = crate::lang::Lang::detect(&absolute, &text).and_then(|lang| crate::lang::outline(lang, &text)).ok_or_else(|| format!("{file}: its definitions cannot be listed; read a line range instead, e.g. {file}:1-100."))?;
-    let parts: Vec<&str> = name.split(|c: char| c == ':' || c == '.').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = name.split([':', '.']).filter(|part| !part.is_empty()).collect();
     let header = |item: &crate::lang::Item| -> String { lines.get(item.start..=item.header_end.min(lines.len().saturating_sub(1))).map(|rows| rows.join(" ")).unwrap_or_default() };
     let has_word = |text: &str, word: &str| {
         text.match_indices(word).any(|(at, _)| {
@@ -1059,7 +1077,7 @@ fn replaced_definitions(path: &Path, old: &str, line_map: &[Option<usize>], writ
         let total = span.clone().count();
         let gone = span.filter(|&index| line_map.get(index).is_some_and(Option::is_none)).count();
         // `written` holds 1-based ranges that got new text; `item` rows are 0-based.
-        let overwritten = written.iter().any(|&(at, to)| at <= item.end + 1 && to >= item.start + 1);
+        let overwritten = written.iter().any(|&(at, to)| at <= item.end + 1 && to > item.start);
         total >= 2 && gone * 2 >= total && body_lines(&lines, item) > 1 && overwritten
     };
     fn any_replaced(item: &crate::lang::Item, replaced: &dyn Fn(&crate::lang::Item) -> bool) -> bool {
@@ -1174,6 +1192,17 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     }
     if let Err(error) = util::atomic_write_checked(&absolute, new.as_bytes(), |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path)) {
         return Out::fail("io_error", format!("{display}: {error}"));
+    }
+    core.tree.reserve(&absolute, &session.workspace, &session.context.session_id);
+    {
+        let mode = std::fs::metadata(&absolute).ok().map(|meta| { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() & 0o777 }).unwrap_or(0o644);
+        core.steps.open(&session.workspace).record_edit(
+            &crate::undo::Attribution::session(&session.context.session_id, "edit", &display),
+            &display,
+            old.as_deref().map(str::as_bytes),
+            Some(new.as_bytes()),
+            mode,
+        );
     }
     let new_hash = util::content_hash(new.as_bytes());
     let doc = Doc::parse(&new);
@@ -1327,6 +1356,9 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         Err(out) => return *out,
     };
     let display = session.display(&absolute);
+    if let Some(out) = reserved_elsewhere(core, host, session, std::slice::from_ref(&absolute)).await {
+        return out;
+    }
     let lock = core.file_lock(&absolute);
     let _guard = lock.lock().await;
     let current = match current_text(&absolute, &display) {
@@ -1749,6 +1781,15 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
             }
         }
     }
+    let planned_paths: Vec<PathBuf> = plans
+        .iter()
+        .map(|plan| match plan {
+            Planned::Write { absolute, .. } | Planned::Remove { absolute, .. } => absolute.clone(),
+        })
+        .collect();
+    if let Some(out) = reserved_elsewhere(core, host, session, &planned_paths).await {
+        return out;
+    }
     let mut combined = Out::ok(String::new());
     let mut displays = Vec::new();
     for plan in plans {
@@ -1764,7 +1805,14 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
                 }
                 displays.push(out.display);
             }
-            Planned::Remove { absolute, display } => match util::remove_file_checked(&absolute, |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path)) {
+            Planned::Remove { absolute, display } => {
+                let before = std::fs::read(&absolute).ok();
+                let removed = util::remove_file_checked(&absolute, |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path));
+                if removed.is_ok() {
+                    core.tree.reserve(&absolute, &session.workspace, &session.context.session_id);
+                    core.steps.open(&session.workspace).record_edit(&crate::undo::Attribution::session(&session.context.session_id, "edit", &display), &display, before.as_deref(), None, 0);
+                }
+                match removed {
                 Ok(()) => {
                     let _ = writeln!(combined.output, "Deleted {display}.");
                     combined.changed_files.push(display.clone());
@@ -1776,12 +1824,86 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
                     combined.error_kind = Some("io_error".to_owned());
                     let _ = writeln!(combined.output, "Could not delete {display}: {error}");
                 }
-            },
+                }
+            }
         }
     }
     drop(guards);
     combined.display = json!({ "files": displays });
     combined
+}
+
+/// Run `command` on a member of the mesh, in its copy of the tree, through `mesh.call` and the
+/// member's own `tools.run`; the output comes back with the member's paths shown as this tree's.
+async fn run_remote(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>, runner: &crate::core::RunnerInfo, command: &str, cwd: Option<&Path>, timeout_ms: u64) -> Out {
+    let relative = cwd.and_then(|dir| dir.strip_prefix(&session.workspace).ok()).filter(|rel| !rel.as_os_str().is_empty());
+    let remote_command = match relative {
+        Some(rel) => format!("cd {} && {command}", util::shell_quote(&rel.to_string_lossy())),
+        None => command.to_owned(),
+    };
+    let params = json!({
+        "node": runner.node,
+        "method": cc_protocol::contracts::tools::methods::RUN,
+        "params": {"workspace": runner.remote_workspace, "command": remote_command, "timeout_ms": timeout_ms, "session_id": format!("mesh-{}", session.context.session_id), "env": {}}
+    });
+    let started = Instant::now();
+    let answer = match host.call(cc_protocol::contracts::mesh::methods::CALL, params).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            // The member is gone: this and the session's next commands run here.
+            core.set_runner(&session.context.session_id, None);
+            return Out::fail("unavailable", format!("Not run on {}: {}. The command runs here from now on; send it again.", runner.name, error.message));
+        }
+    };
+    let exit_code = answer.get("exit_code").and_then(Value::as_i64).map(|code| code as i32);
+    let duration_ms = answer.get("duration_ms").and_then(Value::as_u64).unwrap_or(started.elapsed().as_millis() as u64);
+    let timed_out = answer.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+    let output = answer.get("output").and_then(Value::as_str).unwrap_or("").replace(&runner.remote_workspace, &session.workspace.to_string_lossy());
+    let mut text = util::relative_paths(&output, &session.workspace);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = writeln!(text, "[ran on {}; files it changed there come back here as a step]", runner.name);
+    let (ok, kind) = if timed_out {
+        let _ = writeln!(text, "{}", timeout_line(timeout_ms));
+        (false, Some("timeout"))
+    } else {
+        match exit_code {
+            Some(code) => {
+                let _ = writeln!(text, "{}", exit_line(code, duration_ms));
+                (code == 0, (code != 0).then_some("nonzero_exit"))
+            }
+            None => {
+                let _ = writeln!(text, "[finished without an exit status]");
+                (false, Some("nonzero_exit"))
+            }
+        }
+    };
+    let tests = answer.get("tests").cloned().unwrap_or(Value::Null);
+    let mut out = Out { ok, output: text, error_kind: kind.map(str::to_owned), ..Out::default() };
+    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "tests": tests, "remote": {"node": runner.node, "name": runner.name} });
+    out
+}
+
+/// A refusal when one of `paths` is reserved by another session (its edit of this turn is not
+/// done): who holds it and the step to take. None when every path is free.
+async fn reserved_elsewhere(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, paths: &[PathBuf]) -> Option<Out> {
+    for path in paths {
+        let Some(other) = core.tree.reserved_by_other(path, &session.context.session_id) else { continue };
+        let display = session.display(path);
+        let who = match host.call("frame.session.get", json!({"id": other})).await {
+            Ok(value) => match value.get("agent").and_then(Value::as_str).filter(|agent| !agent.is_empty()) {
+                Some(agent) => format!("agent @{agent}"),
+                None => "another chat session".to_owned(),
+            },
+            Err(_) => "another session".to_owned(),
+        };
+        return Some(Out::fail(
+            "reserved",
+            format!("Not written: {display} is being edited by {who} right now; it frees when their turn ends. Work on another file first, then come back to this one."),
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2482,7 +2604,45 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     }
     let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(core.config.default_timeout_ms);
     let timeout = Duration::from_millis(timeout_ms);
+    // Borrowed hands: a member of the mesh runs this session's commands in its copy of the tree
+    // (kept in step by the mesh); what the command changes there comes back as a step here.
+    // Only a session of a project (the model's own runs; not the host's checks, not the probe).
+    if !lifted
+        && !session.context.project_id.is_empty()
+        && session.context.project_id != "probe"
+        && session.python_env
+        && let Some(runner) = core.runner(host.as_ref(), session_id, &session.workspace, &session.context.project_id).await
+    {
+        return run_remote(core, host, session, &runner, command, cwd.as_deref(), timeout_ms).await;
+    }
+    // One tree, many hands: a check (a verifier the language plugins declare) runs on a throw-away
+    // copy of the tree while another session is editing or running in it, so a half-finished edit
+    // of someone else cannot make it lie. Alone in the tree, it runs in the tree.
+    let mut cwd = cwd;
+    let mut check_copy: Option<crate::tree::CheckCopy> = None;
+    if !lifted && core.tree.others_active(&session.workspace, session_id) && core.tree.is_check(host.as_ref(), command).await {
+        let caches = core.tree.caches(host.as_ref()).await;
+        let (home, git, workspace) = (core.home.clone(), core.steps.git().map(Path::to_path_buf), session.workspace.clone());
+        match tokio::task::spawn_blocking(move || crate::tree::copy_for_check(&home, git.as_deref(), &workspace, &caches)).await {
+            Ok(Ok(copy)) => {
+                let mut grants = runtime.grants.clone();
+                grants.push(copy.path.clone());
+                if let Some(sandbox) = core.sandbox.sandbox(&session.workspace, venv_path.as_deref(), &grants) {
+                    identity.sandbox = Some(sandbox);
+                }
+                let relative = cwd.as_ref().and_then(|dir| dir.strip_prefix(&session.workspace).ok().map(Path::to_path_buf));
+                cwd = Some(match relative {
+                    Some(relative) => copy.path.join(relative),
+                    None => copy.path.clone(),
+                });
+                check_copy = Some(copy);
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "could not copy the tree for a check; running in the tree"),
+            Err(error) => tracing::warn!(%error, "could not copy the tree for a check; running in the tree"),
+        }
+    }
     let sink = items.clone();
+    core.tree.begin_run(&session.workspace, session_id);
     let result = core
         .shells
         .run(&identity, RunRequest { command, cwd, env: Vec::new(), toolchain, timeout }, cancel, move |chunk: &[u8]| {
@@ -2491,6 +2651,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             }
         })
         .await;
+    core.tree.end_run(&session.workspace, session_id);
     let run = match result {
         Ok(run) => run,
         Err(error) => return Out::fail("shell_error", format!("could not run the command: {error}")),
@@ -2507,23 +2668,31 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let eperm = refused.iter().any(|path| !writable(path.as_path()) && !is_program(path.as_path()));
     let code_hits = match &run.output {
         Captured::Mem(bytes) => verifier_hits(host, command, &bytes[..]).await,
-        Captured::File { path, .. } => match {
+        Captured::File { path, .. } => {
             use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
-        } {
-            Ok(file) => verifier_hits(host, command, std::io::BufReader::new(file)).await,
-            Err(_) => Vec::new(),
-        },
+            let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path);
+            match opened {
+                Ok(file) => verifier_hits(host, command, std::io::BufReader::new(file)).await,
+                Err(_) => Vec::new(),
+            }
+        }
     };
     let whole = run.output.whole(TEST_VIEW_BYTES).map(|whole| util::relative_paths(&whole, &session.workspace));
     let tests = whole.as_deref().and_then(crate::testout::summary);
     // A test command that found no tests: the host's done check reads it (a check that ran nothing).
     let no_tests = whole.as_deref().is_some_and(crate::testout::found_none);
     let (text, artifact, bytes) = present_output(core, run.output, core.config.run_limits);
+    let text = match &check_copy {
+        Some(copy) => text.replace(&copy.path.to_string_lossy().into_owned(), &session.workspace.to_string_lossy()),
+        None => text,
+    };
     let text = util::relative_paths(&text, &session.workspace);
     let (mut text, artifact) = test_view(core, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
+    }
+    if check_copy.take().is_some() {
+        text.push_str("[Ran on a copy of the tree as it is now, because another session is editing it; files the command changed were not kept.]\n");
     }
     let seconds = run.duration_ms as f64 / 1000.0;
     // Notes on how it ran come before its exit line, which stays last.

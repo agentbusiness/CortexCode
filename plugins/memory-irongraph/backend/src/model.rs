@@ -42,7 +42,6 @@ pub fn label_of(kind: &str) -> &'static str {
         "command" => "Command",
         "shell_function" => "ShellFunction",
         "ipc_channel" => "IpcChannel",
-        "param" => "Param",
         "file" => "File",
         "directory" => "Directory",
         "repo" => "Repo",
@@ -261,10 +260,6 @@ pub fn symbol_sid(prefix: &str, path: &str, qname: &str) -> String {
 /// The symbol-id prefix of a file's definitions.
 pub fn sid_prefix(file: &FileFacts) -> &str {
     if file.sid_prefix.is_empty() { &file.language } else { &file.sid_prefix }
-}
-
-pub fn param_sid(symbol_sid: &str, position: u32) -> String {
-    format!("{symbol_sid}({position})")
 }
 
 pub fn dep_sid(ecosystem: &str, name: &str) -> String {
@@ -1438,7 +1433,7 @@ fn opt(value: &Option<String>) -> Value {
     value.as_ref().map(|v| Value::String(v.clone())).unwrap_or(Value::Null)
 }
 
-/// Node rows defined by one file: the File node, its symbols and their parameters.
+/// Node rows defined by one file: the File node and its symbols (parameters are on them).
 pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
     let mut rows = Vec::new();
     let name = file.path.rsplit('/').next().unwrap_or(&file.path).to_owned();
@@ -1451,7 +1446,6 @@ pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
     props.insert("language".into(), json!(file.language));
     props.insert("content_hash".into(), json!(file.content_hash));
     props.insert("size".into(), json!(file.size));
-    props.insert("line_count".into(), json!(file.lines));
     props.insert("start_line".into(), json!(1));
     props.insert("end_line".into(), json!(file.lines.max(1)));
     props.insert("package".into(), opt(&file.package));
@@ -1485,37 +1479,19 @@ pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
         p.insert("start_line".into(), json!(symbol.start_line));
         p.insert("end_line".into(), json!(symbol.end_line));
         p.insert("body_hash".into(), json!(symbol.body_hash));
-        p.insert("sig_hash".into(), json!(symbol.sig_hash));
         p.insert("return_type".into(), opt(&symbol.return_type));
         p.insert("type_text".into(), opt(&symbol.type_text));
-        p.insert("value".into(), opt(&symbol.value));
-        p.insert("is_async".into(), json!(symbol.is_async));
-        p.insert("is_static".into(), json!(symbol.is_static));
         p.insert("exported".into(), json!(symbol.exported));
-        p.insert("visibility".into(), opt(&symbol.visibility));
-        p.insert("decorators".into(), json!(symbol.decorators));
         p.insert("http_method".into(), opt(&symbol.http_method));
         p.insert("route_path".into(), opt(&symbol.route_path));
         p.insert("framework".into(), opt(&symbol.framework));
-        p.insert("param_count".into(), json!(symbol.params.len()));
+        // Parameters in order, one list per column ("" where a parameter has no type or default).
+        let mut params: Vec<&crate::facts::ParamFact> = symbol.params.iter().collect();
+        params.sort_by_key(|param| param.position);
+        p.insert("param_names".into(), json!(params.iter().map(|param| param.name.as_str()).collect::<Vec<_>>()));
+        p.insert("param_types".into(), json!(params.iter().map(|param| param.type_text.as_deref().unwrap_or("")).collect::<Vec<_>>()));
+        p.insert("param_defaults".into(), json!(params.iter().map(|param| param.default_value.as_deref().unwrap_or("")).collect::<Vec<_>>()));
         rows.push(NodeRow { sid: sid.clone(), kind: symbol.kind.clone(), file: file.path.clone(), props: p });
-        for param in &symbol.params {
-            let psid = param_sid(&sid, param.position);
-            let mut pp = Map::new();
-            pp.insert("sid".into(), json!(psid));
-            pp.insert("kind".into(), json!("param"));
-            pp.insert("name".into(), json!(param.name));
-            pp.insert("qname".into(), json!(format!("{}({})", symbol.qname, param.name)));
-            pp.insert("path".into(), json!(file.path));
-            pp.insert("position".into(), json!(param.position));
-            pp.insert("type_text".into(), opt(&param.type_text));
-            pp.insert("default_value".into(), opt(&param.default_value));
-            pp.insert("optional".into(), json!(param.optional));
-            pp.insert("variadic".into(), json!(param.variadic));
-            pp.insert("start_line".into(), json!(symbol.start_line));
-            pp.insert("end_line".into(), json!(symbol.start_line));
-            rows.push(NodeRow { sid: psid, kind: "param".into(), file: file.path.clone(), props: pp });
-        }
     }
     for command in &file.commands {
         let sid = command_sid(file, &command.name);
@@ -1639,16 +1615,14 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
         if let Some(parent) = symbol.parent {
             edges.push(EdgeRow { rel: "CONTAINS", from: sid_of(parent), to: sid.clone(), props: Map::new() });
         }
-        if symbol.exported && symbol.parent.is_none() && file.language != "rust" && !matches!(symbol.kind.as_str(), "route" | "test" | "ipc_channel") {
-            edges.push(EdgeRow { rel: "EXPORTS", from: fsid.clone(), to: sid.clone(), props: Map::new() });
-        }
+        // TAKES: the types its parameters name (one edge per type; the sort and dedup below).
         for param in &symbol.params {
-            let psid = param_sid(&sid, param.position);
-            edges.push(EdgeRow { rel: "HAS_PARAM", from: sid.clone(), to: psid.clone(), props: props(&[("position", json!(param.position))]) });
             for type_name in &param.type_names {
                 for t in index.resolve(file, Some(i), RefKind::Instantiate, type_name, None).targets {
-                    if let Some(to) = target_sid(&t) {
-                        edges.push(EdgeRow { rel: "OF_TYPE", from: psid.clone(), to, props: Map::new() });
+                    if let Some(to) = target_sid(&t)
+                        && to != sid
+                    {
+                        edges.push(EdgeRow { rel: "TAKES", from: sid.clone(), to, props: Map::new() });
                     }
                 }
             }

@@ -174,12 +174,34 @@ pub mod methods {
     /// Drop a session's journal stream (after its file is written): `{session_id}` -> `{}`. A
     /// session without a stream is fine.
     pub const JOURNAL_DROP: &str = "memory.journal.drop";
+
+    // Security findings (the security plugin's audits, kept in the project's graph):
+    /// Create or replace an audit run's record: `{project_id, audit: SecurityAudit}` -> `{}`.
+    pub const SECURITY_AUDIT_PUT: &str = "memory.security.audit.put";
+    /// Create or update findings by id (their fingerprint): `{project_id, audit_id, findings:
+    /// [SecurityFinding]}` -> `{findings: [SecurityFinding]}` as stored. A finding seen before keeps
+    /// its status and history; one that was fixed, verified or gone and is seen again is open again.
+    pub const SECURITY_FINDINGS_PUT: &str = "memory.security.findings.put";
+    /// The project's findings, highest priority first: `{project_id, status?: [status], class?,
+    /// min_priority?}` -> `{findings: [SecurityFinding]}`. Without `status`: open, fixing and accepted.
+    pub const SECURITY_FINDINGS: &str = "memory.security.findings";
+    /// One finding with its history: `{project_id, id}` -> `SecurityFindingDetail`.
+    pub const SECURITY_FINDING: &str = "memory.security.finding";
+    /// A lifecycle move: `{project_id, id, status, note, by, session_id?, commit?}` -> the finding.
+    /// Refused when the lifecycle does not allow the move (see [`super::SecurityFinding::status`]).
+    pub const SECURITY_FINDING_UPDATE: &str = "memory.security.finding.update";
+    /// Counts and the last audit: `{project_id}` -> `SecuritySummary`.
+    pub const SECURITY_SUMMARY: &str = "memory.security.summary";
+    /// Delete a finding and its history (the user's explicit delete): `{project_id, id}` -> `{}`.
+    pub const SECURITY_FORGET: &str = "memory.security.forget";
 }
 
 pub mod topics {
     /// `{project_id, files, ms}` after an incremental or full index.
     pub const INDEXED: &str = "memory.indexed";
     pub const TASK_CHANGED: &str = "memory.task.changed";
+    /// `{project_id, id?, status?}` after any write to the security findings or audits.
+    pub const SECURITY_CHANGED: &str = "memory.security.changed";
     pub const BOARD_POSTED: &str = "memory.board.posted";
     /// `{path, value, by}` after a settings set or delete (`value` null when deleted).
     pub const SETTINGS_CHANGED: &str = "memory.settings.changed";
@@ -1121,6 +1143,262 @@ pub struct JournalReadResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalDropParams {
     pub session_id: String,
+}
+
+// ----- security findings -----
+
+/// One audit run of a project by the security plugin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAudit {
+    pub id: String,
+    pub started_ms: u64,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// Units (attack classes) the audit had, and lines it judged.
+    #[serde(default)]
+    pub units: u32,
+    #[serde(default)]
+    pub lines_judged: u32,
+    /// Confirmed findings, leads and hardening notes it produced.
+    #[serde(default)]
+    pub findings: u32,
+    #[serde(default)]
+    pub leads: u32,
+    #[serde(default)]
+    pub hardening: u32,
+    /// The scope the audit was limited to (a path), when any.
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub skill_version: String,
+    /// Where the Markdown export of the report was written, when it was.
+    #[serde(default)]
+    pub report_path: Option<String>,
+}
+
+/// One step of a finding's trace, entry point first, sink last.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityTraceStep {
+    /// `entrypoint`, `step` or `sink`.
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub what: String,
+}
+
+/// A fix the host can spell out exactly (today: a dependency upgrade).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityQuickFix {
+    /// `upgrade`.
+    pub kind: String,
+    pub ecosystem: String,
+    pub package: String,
+    pub from: String,
+    pub to: String,
+    pub lockfile: String,
+    /// The commands that make the change, in order.
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+/// One security finding of a project: a confirmed vulnerability, a lead (one fact outside the code
+/// decides) or a hardening note. Identified by its fingerprint (`<class>:<file>:<function>`).
+///
+/// `status` lifecycle, moves the store allows: `open` -> `accepted` | `fixing` | `gone`, and
+/// `fixed` by a re-check; `fixing` -> `fixed` | `open`; `accepted` -> `open` | `gone`;
+/// `fixed` -> `verified` | `open`; `verified` -> `open`; `gone` -> `open`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFinding {
+    pub id: String,
+    pub class: String,
+    /// `confirmed`, `needs_validation` or `hardening`.
+    pub verdict: String,
+    pub title: String,
+    #[serde(default)]
+    pub principal: String,
+    #[serde(default)]
+    pub control: String,
+    #[serde(default)]
+    pub impact: String,
+    /// The demonstrated result, one line.
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub evidence_how: String,
+    #[serde(default)]
+    pub evidence_observed: String,
+    #[serde(default)]
+    pub severity_likelihood: Option<String>,
+    #[serde(default)]
+    pub severity_impact: Option<String>,
+    /// `critical`, `high`, `medium` or `low` for confirmed findings.
+    #[serde(default)]
+    pub severity_overall: Option<String>,
+    #[serde(default)]
+    pub fix_where: String,
+    #[serde(default)]
+    pub fix_change: String,
+    #[serde(default)]
+    pub fix_test: String,
+    /// For a lead: the fact outside the code that decides it.
+    #[serde(default)]
+    pub missing_fact: Option<String>,
+    #[serde(default)]
+    pub trace: Vec<SecurityTraceStep>,
+    #[serde(default)]
+    pub quick_fix: Option<SecurityQuickFix>,
+    /// Computed by the writer: higher first.
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub priority_reason: String,
+    // Lifecycle, owned by the store (ignored on put for a finding already known):
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub status_note: String,
+    /// `user`, `model` or `recheck`.
+    #[serde(default)]
+    pub status_by: String,
+    #[serde(default)]
+    pub status_ms: u64,
+    #[serde(default)]
+    pub first_seen_ms: u64,
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    /// How many audits reported it.
+    #[serde(default)]
+    pub seen_in: u32,
+    #[serde(default)]
+    pub audit_id: Option<String>,
+    /// The session that fixes or fixed it, and the commit that holds the fix.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub fixed_commit: Option<String>,
+    /// The sink's place (the trace's last step), for the list.
+    #[serde(default)]
+    pub sink_path: Option<String>,
+    #[serde(default)]
+    pub sink_line: Option<u32>,
+}
+
+/// One lifecycle move of a finding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityStatusChange {
+    pub status: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub by: String,
+    pub ms: u64,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// [`methods::SECURITY_AUDIT_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAuditPutParams {
+    pub project_id: String,
+    pub audit: SecurityAudit,
+}
+
+/// [`methods::SECURITY_FINDINGS_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingsPutParams {
+    pub project_id: String,
+    #[serde(default)]
+    pub audit_id: Option<String>,
+    pub findings: Vec<SecurityFinding>,
+}
+
+/// [`methods::SECURITY_FINDINGS`] parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingsParams {
+    pub project_id: String,
+    /// Statuses to list (absent: open, fixing and accepted).
+    #[serde(default)]
+    pub status: Option<Vec<String>>,
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub min_priority: Option<i64>,
+}
+
+/// [`methods::SECURITY_FINDINGS`] and [`methods::SECURITY_FINDINGS_PUT`] result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingsResult {
+    pub findings: Vec<SecurityFinding>,
+}
+
+/// [`methods::SECURITY_FINDING`] and [`methods::SECURITY_FORGET`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingParams {
+    pub project_id: String,
+    pub id: String,
+}
+
+/// [`methods::SECURITY_FINDING`] result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingDetail {
+    pub finding: SecurityFinding,
+    #[serde(default)]
+    pub history: Vec<SecurityStatusChange>,
+}
+
+/// [`methods::SECURITY_FINDING_UPDATE`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityFindingUpdateParams {
+    pub project_id: String,
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub note: String,
+    /// `user`, `model` or `recheck`.
+    pub by: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// [`methods::SECURITY_SUMMARY`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecuritySummaryParams {
+    pub project_id: String,
+}
+
+/// [`methods::SECURITY_SUMMARY`] result: the active list's shape and the last audit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecuritySummary {
+    #[serde(default)]
+    pub last_audit: Option<SecurityAudit>,
+    #[serde(default)]
+    pub open: u32,
+    #[serde(default)]
+    pub fixing: u32,
+    #[serde(default)]
+    pub accepted: u32,
+    #[serde(default)]
+    pub fixed: u32,
+    #[serde(default)]
+    pub verified: u32,
+    /// Open and fixing findings by overall severity (`critical`, `high`, `medium`, `low`,
+    /// `lead`, `hardening`).
+    #[serde(default)]
+    pub by_severity: std::collections::BTreeMap<String, u32>,
+}
+
+/// [`topics::SECURITY_CHANGED`] payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityChanged {
+    pub project_id: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// [`methods::NOTE_ADD`] parameters.

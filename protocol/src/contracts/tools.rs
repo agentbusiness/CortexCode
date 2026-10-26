@@ -54,6 +54,25 @@ pub mod methods {
     /// `{checked, ran, failed, exit_code, timed_out}`; `checked: false` with `reason` when the turn
     /// changed no code file.
     pub const TESTS_BASELINE: &str = "tools.tests.baseline";
+    /// The workspace's step log, newest first: [`super::TimelineParams`] -> [`super::TimelineResult`].
+    /// Every call first records what changed on disk since the log last looked (a command's side
+    /// effects, an edit by hand).
+    pub const TIMELINE: &str = "tools.timeline";
+    /// Put files back as they were: [`super::UndoParams`] -> [`super::UndoResult`]. One step, a set
+    /// of steps, or everything after a step; the undo is itself a step of the log.
+    pub const UNDO: &str = "tools.undo";
+    /// Undo the newest active undo: [`super::RedoParams`] -> [`super::UndoResult`].
+    pub const REDO: &str = "tools.redo";
+    /// The change of one path over a range of steps as a unified diff:
+    /// [`super::TimelineDiffParams`] -> [`super::TimelineDiffResult`].
+    pub const TIMELINE_DIFF: &str = "tools.timeline.diff";
+    /// [`super::TimelineApplyParams`] -> [`super::TimelineRecord`] (or `null` when nothing
+    /// changed): write files into a workspace as one step with the given attribution (what a
+    /// member's command changed, applied here; the mesh uses it).
+    pub const TIMELINE_APPLY: &str = "tools.timeline.apply";
+    /// [`super::RunnerSetParams`] -> `{}`: a session's commands run on a member of the mesh, in
+    /// its copy of the tree (`node` absent: here again).
+    pub const RUNNER_SET: &str = "tools.runner.set";
 }
 
 /// Approval classes beyond the ask-mode action classes.
@@ -74,6 +93,161 @@ pub mod topics {
     pub const JOB_EVENT: &str = "tools.job";
     /// `{workspace, paths}` after an edit changed files.
     pub const FILES_CHANGED: &str = "tools.files_changed";
+    /// `{workspace, seq}` when the step log of a workspace grew, was undone or lost committed
+    /// files ([`super::TimelineResult`] reads it again).
+    pub const TIMELINE: &str = "tools.timeline";
+}
+
+/// One file of a step of the log ([`TimelineRecord::files`]): what it was and what it became.
+/// `before` and `after` name the stored contents (content hashes; absent: the file did not exist).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineFile {
+    /// Relative to the workspace.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Unix permission bits of the file after the step (0 when it was deleted).
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub removed: u32,
+    /// The counts are not line counts: the file is not text.
+    #[serde(default)]
+    pub binary: bool,
+    /// Size after the step.
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// One step of a workspace's log: what changed, by whom, when.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineRecord {
+    pub seq: u64,
+    pub ts_ms: u64,
+    /// `user` (by hand, or the editor), `session:<id>` (the model's edit or a command's effects),
+    /// `host` (the app itself, e.g. a turn's cleanup).
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// `edit` | `run` | `hand` | `host` | `undo` | `redo` | `baseline`
+    pub label: String,
+    /// What the step was for, when known (the tool call's intent, a command's text).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    pub files: Vec<TimelineFile>,
+    /// The steps this one reverted (an undo or a redo).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undoes: Vec<u64>,
+    /// The step is reverted now (a later undo stands against it).
+    #[serde(default)]
+    pub undone: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineParams {
+    pub workspace: String,
+    /// Only steps after this one.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Only this session's steps.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// At most this many steps (newest).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Only steps at or after this time.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineResult {
+    /// Newest first.
+    pub records: Vec<TimelineRecord>,
+    /// The newest step's number (0: an empty log).
+    pub head_seq: u64,
+    /// The commit the log stands on (what "since the last commit" means), when the workspace is a
+    /// repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Totals since the last commit over the active steps: files touched, lines added and removed.
+    #[serde(default)]
+    pub files: u32,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub removed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UndoParams {
+    pub workspace: String,
+    /// Undo these steps (each with the later steps that touched the same files when `cascade`).
+    #[serde(default)]
+    pub seqs: Vec<u64>,
+    /// Undo every active step after this one.
+    #[serde(default)]
+    pub to_seq: Option<u64>,
+    /// Also undo later steps that touched the same files; without it such a step is refused and
+    /// named in `blocked_by`.
+    #[serde(default)]
+    pub cascade: bool,
+    /// Who undoes (recorded on the undo step).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RedoParams {
+    pub workspace: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UndoResult {
+    /// The undo step, when something was undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<TimelineRecord>,
+    /// Later active steps that touched the same files, when the undo was refused for them.
+    #[serde(default)]
+    pub blocked_by: Vec<u64>,
+    /// Paths put back.
+    #[serde(default)]
+    pub restored: Vec<String>,
+    /// Paths that could not be written (protected, outside the workspace), with the reason.
+    #[serde(default)]
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineDiffParams {
+    pub workspace: String,
+    pub path: String,
+    /// The first step of the range (the content before it is the diff's left side).
+    pub from_seq: u64,
+    /// The last step of the range (the content after it is the right side); absent: `from_seq`.
+    #[serde(default)]
+    pub to_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineDiffResult {
+    pub path: String,
+    /// A unified diff (`--- a/path`, `+++ b/path`); empty when the file is not text or did not change.
+    pub diff: String,
+    #[serde(default)]
+    pub binary: bool,
+    /// `added` | `modified` | `deleted` | `unchanged`
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -395,4 +569,42 @@ pub struct ApproveParams {
 pub struct ApproveResult {
     /// Every class approved for the session so far.
     pub approved: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineApplyFile {
+    pub path: String,
+    #[serde(default)]
+    pub mode: u32,
+    /// Base64 of the content; absent: delete the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TimelineApplyParams {
+    pub workspace: String,
+    pub files: Vec<TimelineApplyFile>,
+    /// `session:<id>` | `node:<id>` | `user` | `host`
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunnerSetParams {
+    pub session_id: String,
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    /// The member's copy of the tree.
+    #[serde(default)]
+    pub remote_workspace: String,
 }

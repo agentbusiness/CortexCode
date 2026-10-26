@@ -127,7 +127,7 @@ fn add_file(entries: &mut BTreeMap<String, Entry>, name: &str, from: PathBuf, ex
 
 /// The plugin's source files: what git tracks or would track in the folder (honouring
 /// .gitignore), or, outside a git repository, every file but build outputs and installs.
-fn source_files(dir: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn source_files(dir: &Path) -> Result<Vec<String>, String> {
     if let Some(listing) = output("git", &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."], dir) {
         let mut files: Vec<String> = listing.split('\0').filter(|f| !f.is_empty()).map(str::to_owned).collect();
         // A tracked file deleted in the working tree is not part of the source any more.

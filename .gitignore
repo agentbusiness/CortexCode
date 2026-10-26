@@ -2,6 +2,7 @@
 # Private: design notes and working documents never leave this machine.
 # ---------------------------------------------------------------------------
 /docs/
+/research/
 
 # ---------------------------------------------------------------------------
 # Rust build output
@@ -24,6 +25,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Release outputs (scripts/release-*.sh; their configuration .env.release is covered by .env.*)
+/artifacts/
 
 # Packaged plugins and app bundles
 *.ccplugin
@@ -62,6 +66,7 @@ CLAUDE.local.md
 .env
 .env.*
 !.env.example
+!.env.release.example
 *.pem
 *.key
 *.p12

@@ -736,7 +736,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // verify); the spec keeps tracking requirements for the conversation.
         // A planned change: the loop is told its step (the plan itself is in the conversation).
         LoopKind::Foreground => ("DO", spec.step.as_ref().map(|step| step_live(&env.data, step)).unwrap_or_default()),
-        LoopKind::Question => ("ASK", String::new()),
+        // A turn continued because a skill's tool reports open work (`flow::work_open`): the
+        // stage's last line says the next step is the one the tool printed, so the ASK rules'
+        // "reply when you know the answer" does not win over it (seen: the model answered with a
+        // progress report at "Current stage: ASK" while the tool had 168 lines open).
+        LoopKind::Question => ("ASK", if crate::flow::work_open_round(&entries, &env.run_id) { env.data.text("work_open_stage", &[]) } else { String::new() }),
         LoopKind::Agent { name } => ("TASK", env.data.text("agent_live", &[("name", name)])),
     };
     env.set_stage("act");

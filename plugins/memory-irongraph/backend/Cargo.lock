@@ -947,9 +947,9 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "irongraph-sdk"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10f413ae42fa596d97cd18bf29ba08cb1e1dcacf45b8fab1f05aede2fb4afc85"
+checksum = "af3c3937a9228339eae2ebc3c7a23e7fcd048115732ce2930eff4b64b254596f"
 dependencies = [
  "reqwest",
  "serde",

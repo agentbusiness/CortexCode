@@ -151,6 +151,8 @@ impl Plugin for SourcePlugin {
                     let storage = tokio::task::spawn_blocking(move || storage::measure(&home, &code)).await.map_err(|e| rpc(e.to_string()))?;
                     to_value(&storage)
                 }
+                methods::RELEASE_STATUS => to_value(&cc_source::release::status(&service, parse_params(call.params)?).await?),
+                methods::RELEASE_MERGE => to_value(&cc_source::release::merge(&service, &ctx, parse_params(call.params)?).await?),
                 other => Err(RpcError::new(codes::UNKNOWN_METHOD, format!("cc-source does not serve `{other}`"))),
             }
         })

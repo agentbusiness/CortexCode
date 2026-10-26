@@ -16,7 +16,7 @@ use cc_protocol::contracts::chatflow::{PlanEditParams, kinds as chatflow_kinds, 
 use cc_protocol::contracts::frame::JournalEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PlanDoc {
@@ -707,6 +707,25 @@ pub fn task_numbers(max_tasks: usize) -> Vec<String> {
 }
 
 /// A new plan id.
+/// Whether two of the tasks could run at the same time: neither depends, directly or through
+/// others, on the other. A plan that is one chain has none.
+pub fn has_parallel(tasks: &[PlanTask]) -> bool {
+    let closure = |task: &PlanTask| {
+        let mut all: HashSet<u32> = HashSet::new();
+        let mut open: Vec<u32> = task.depends_on.clone();
+        while let Some(n) = open.pop() {
+            if all.insert(n)
+                && let Some(dependency) = tasks.iter().find(|other| other.n == n)
+            {
+                open.extend(dependency.depends_on.iter().copied());
+            }
+        }
+        all
+    };
+    let closures: Vec<HashSet<u32>> = tasks.iter().map(closure).collect();
+    tasks.iter().enumerate().any(|(i, a)| tasks.iter().enumerate().skip(i + 1).any(|(j, b)| !closures[j].contains(&a.n) && !closures[i].contains(&b.n)))
+}
+
 pub fn new_id() -> String {
     format!("plan-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }

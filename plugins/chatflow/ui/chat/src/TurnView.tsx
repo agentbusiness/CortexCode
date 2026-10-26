@@ -3,7 +3,7 @@ import { clock, duration, kinds, useQuery, useSelection, type Json, type Journal
 import { Activity, activityItems, isScaffolding } from './Activity';
 import { Attachments } from './Attachments';
 import { ChangeCard } from './Change';
-import { Edits, type EditedFile } from './Edits';
+import { Edits, type ChangedNote, type EditedFile } from './Edits';
 import { DECISION, IDEATION, KNOWLEDGE, PLAN, SPEC } from './ideation';
 import { DecisionCard, IdeasCard, OptionsCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
 import { MarkdownBlock } from './Markdown';
@@ -32,8 +32,13 @@ export interface TurnActions extends IdeationActions {
   decide: (id: string, approve: boolean) => Promise<void>;
   openFile: (path: string) => void;
   openLink: (url: string) => void;
-  /** Put the files a turn edited back as they were before it (null: not possible here). */
+  /** Put the files a turn edited back as they were before it, from the edit tool's own results
+   * (turns without a Changed note; null: not possible here). */
   undoEdits: ((turn: Turn, files: EditedFile[]) => Promise<void>) | null;
+  /** Undo a turn's steps through the step log (null: not possible here). */
+  undoSteps: ((note: ChangedNote) => Promise<void>) | null;
+  /** The net diff of one path over a turn's steps, from the step log. */
+  stepDiff: ((note: ChangedNote, path: string) => Promise<string>) | null;
 }
 
 /** A turn's blocks in reading order: each run of scaffolding as one group, everything else as itself. */
@@ -172,7 +177,7 @@ export const TurnView = memo(function TurnView({ turn, actions, live, progress =
       </section>
     )
     : item));
-  if (!live) rendered.push(<Edits key="edits" turn={turn} onOpenFile={actions.openFile} onUndo={actions.undoEdits ? (files) => actions.undoEdits!(turn, files) : null} />);
+  if (!live) rendered.push(<Edits key="edits" turn={turn} actions={{ onOpenFile: actions.openFile, onUndoSteps: actions.undoSteps, onUndoLegacy: actions.undoEdits ? (files) => actions.undoEdits!(turn, files) : null, stepDiff: actions.stepDiff }} />);
   return (
     <>
       {turn.user && (

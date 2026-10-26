@@ -5,7 +5,8 @@
  * repaints their screen from `terminal.snapshot`.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
@@ -45,6 +46,7 @@ function TerminalPane({ active }: { active?: boolean }) {
   const [exited, setExited] = useState<Record<string, number | null>>({});
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
+  const [link, setLink] = useState<string | null>(null);
   const list = workspace ? terms[workspace] ?? [] : [];
   const termId = workspace ? current[workspace] ?? list[0] ?? null : null;
 
@@ -126,22 +128,47 @@ function TerminalPane({ active }: { active?: boolean }) {
         </div>
       )}
       {termId && (
-        <XTerm key={termId} termId={termId} active={Boolean(active)}
+        <XTerm key={termId} termId={termId} active={Boolean(active)} onLink={setLink}
           onExit={(code) => setExited((all) => ({ ...all, [termId]: code }))} />
       )}
       {termId && exited[termId] !== undefined && (
         <p className="hint cx-terminal-ended">The shell ended{exited[termId] !== null ? ` with code ${exited[termId]}` : ''}.</p>
       )}
+      {link && <LinkDialog url={link} onOpen={() => { window.open(link, '_blank', 'noopener'); setLink(null); }} onCancel={() => setLink(null)} />}
     </div>
   );
 }
 
-function XTerm({ termId, active, onExit }: { termId: string; active: boolean; onExit: (code: number | null) => void }) {
+/** A link a program printed (OSC 8) asks in the theme's modal before it opens, not in the browser's confirm. */
+function LinkDialog({ url, onOpen, onCancel }: { url: string; onOpen: () => void; onCancel: () => void }) {
+  const openButton = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => openButton.current?.focus(), []);
+  // Over the whole window, inside the theme's scope.
+  return createPortal(
+    <div className="modal-backdrop" role="presentation" onClick={(event) => event.target === event.currentTarget && onCancel()}
+      onKeyDown={(event) => event.key === 'Escape' && onCancel()}>
+      <div className="modal-card cx-terminal-link" role="alertdialog" aria-modal="true" aria-labelledby="cx-terminal-link-title" aria-describedby="cx-terminal-link-body">
+        <h2 id="cx-terminal-link-title" className="cx-terminal-link-title">Open this link?</h2>
+        <p id="cx-terminal-link-body" className="cx-terminal-link-body">A program in the terminal printed it; open it only if you trust where it leads.</p>
+        <p className="cx-terminal-link-url">{url}</p>
+        <div className="modal-actions cx-terminal-link-actions">
+          <button type="button" className="detent" onClick={onCancel}>Cancel</button>
+          <button type="button" className="detent warn" ref={openButton} onClick={onOpen}>Open link</button>
+        </div>
+      </div>
+    </div>,
+    document.getElementById('cc') ?? document.body,
+  );
+}
+
+function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boolean; onExit: (code: number | null) => void; onLink: (url: string) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const exitRef = useRef(onExit);
   exitRef.current = onExit;
+  const linkRef = useRef(onLink);
+  linkRef.current = onLink;
   const activeRef = useRef(active);
   activeRef.current = active;
 
@@ -158,6 +185,8 @@ function XTerm({ termId, active, onExit }: { termId: string; active: boolean; on
       allowProposedApi: true,
       scrollback: 10_000,
       theme: palette(),
+      // xterm's own handler asks with window.confirm; the pane asks in the theme's modal.
+      linkHandler: { activate: (_event, uri) => linkRef.current(uri) },
     });
     const fit = new FitAddon();
     fitRef.current = fit;

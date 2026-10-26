@@ -17,4 +17,6 @@ while [ -L "$self" ]; do
 done
 cd "$(dirname "$self")" || exit 1
 scripts/build-app.sh build || exit 1
+# The development start runs this build, never a frame an update staged in ~/.cortexcode/frame.
+export CORTEX_NO_HANDOVER=1
 exec build/CortexCode.app/Contents/MacOS/CortexCode "$@"

@@ -59,7 +59,7 @@ impl SkillsPlugin {
         Ok(Description {
             id: self.id.clone(),
             name: self.name.clone(),
-            skills: listed.into_iter().map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done }).collect(),
+            skills: listed.into_iter().map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done, units: skill.units, unit_done: skill.unit_done }).collect(),
         })
     }
 

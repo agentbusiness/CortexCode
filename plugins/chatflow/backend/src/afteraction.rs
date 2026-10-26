@@ -74,3 +74,50 @@ pub async fn record_run(env: &RunEnv, journal: &Journal, task_id: Option<&str>, 
         }
     }
 }
+
+/// The turn's Changed card: what the session's steps since `since_ms` changed in `workspace`,
+/// from the step log (`tools.timeline`), as a transcript-only note `{purpose: "changed"}`. None
+/// when nothing changed or the tools plugin is away. Files are the net of the turn's active steps:
+/// a file edited then undone in the turn is not listed.
+pub async fn changed_note(host: &crate::host::Host, workspace: &str, session_id: &str, since_ms: u64, run_id: &str) -> Option<Value> {
+    use cc_protocol::contracts::tools::{TimelineResult, methods as tools_methods};
+    let params = json!({"workspace": workspace, "session_id": session_id, "since_ms": since_ms});
+    let timeline: TimelineResult = serde_json::from_value(host.call(tools_methods::TIMELINE, params).await.ok()?).ok()?;
+    let active: Vec<&cc_protocol::contracts::tools::TimelineRecord> = timeline.records.iter().filter(|record| !record.undone && record.undoes.is_empty()).collect();
+    if active.is_empty() {
+        return None;
+    }
+    // Oldest first: a file's first `before` and last `after` make its net change.
+    #[derive(Default)]
+    struct Net {
+        before: Option<String>,
+        after: Option<String>,
+        added: u32,
+        removed: u32,
+        binary: bool,
+    }
+    let mut files: std::collections::BTreeMap<String, Net> = std::collections::BTreeMap::new();
+    for record in active.iter().rev() {
+        for file in &record.files {
+            let entry = files.entry(file.path.clone()).or_insert_with(|| Net { before: file.before.clone(), binary: file.binary, ..Net::default() });
+            entry.after = file.after.clone();
+            entry.added += file.added;
+            entry.removed += file.removed;
+        }
+    }
+    let seqs: Vec<u64> = active.iter().map(|record| record.seq).collect();
+    let listed: Vec<Value> = files
+        .into_iter()
+        .filter(|(_, net)| net.before != net.after)
+        .map(|(path, net)| {
+            json!({"path": path, "added": net.added, "removed": net.removed, "created": net.before.is_none(), "deleted": net.after.is_none(), "binary": net.binary})
+        })
+        .collect();
+    if listed.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "purpose": "changed", "text": "", "run_id": run_id, "workspace": workspace,
+        "files": listed, "seqs": seqs, "from_seq": seqs.iter().min(), "to_seq": seqs.iter().max(),
+    }))
+}

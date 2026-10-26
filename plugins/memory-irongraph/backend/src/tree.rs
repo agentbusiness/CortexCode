@@ -421,7 +421,9 @@ impl CodeTree {
         }
         // Rebuild outgoing edges on reconciliation/cold passes, including a previous process
         // that stopped after writing File metadata but before writing its edges.
-        let repairing = self.sync_pending.load(Ordering::Acquire);
+        // A graph from before parameters moved onto their definitions has every node written again.
+        let params_as_nodes = !self.run(&format!("{} MATCH (p:Param) RETURN p.sid LIMIT 1", layer::OBSERVED_READ), Map::new()).await?.rows.is_empty();
+        let repairing = self.sync_pending.load(Ordering::Acquire) || params_as_nodes;
         self.invalidate_write_caches().await;
         self.sync_pending.store(true, Ordering::Release);
         let on_disk: HashSet<String> = parsed.iter().map(|(f, _)| f.path.clone()).collect();
@@ -450,6 +452,9 @@ impl CodeTree {
         }
         if let Err(error) = self.move_descriptions().await {
             tracing::warn!(%error, "moving descriptions onto their symbols failed");
+        }
+        if params_as_nodes && let Err(error) = self.drop_unread_properties().await {
+            tracing::warn!(%error, "removing properties earlier versions stored failed");
         }
         *self.coverage_key.lock().await = Some(snapshot.key.clone());
         report.parse_ms += parse_ms;
@@ -686,7 +691,7 @@ impl CodeTree {
             let mut by_hash_removed: HashMap<(String, String), Vec<String>> = HashMap::new();
             for sid in &removed {
                 let (kind, body, _, _) = &old[sid];
-                if !body.is_empty() && kind != "param" && kind != "file" {
+                if !body.is_empty() && kind != "file" {
                     by_hash_removed.entry((kind.clone(), body.clone())).or_default().push(sid.clone());
                 }
             }
@@ -762,7 +767,7 @@ impl CodeTree {
         let mut summary_updates: Vec<(u64, u64)> = Vec::with_capacity(pending.len());
 
         // 7. Upsert nodes whose properties changed. Symbols first: IronGraph embeds in write order,
-        // so the searchable definitions become searchable before parameters and files.
+        // so the searchable definitions become searchable before files.
         let edge_hash_of: HashMap<&str, &str> = all_edges.iter().map(|(p, _, h)| (p.as_str(), h.as_str())).collect();
         let mut to_write: Vec<NodeRow> = Vec::new();
         for node in &new_nodes {
@@ -790,11 +795,7 @@ impl CodeTree {
                 edge_hash_updates.push(json!({"sid": model::file_sid(path), "hash": hash}));
             }
         }
-        to_write.sort_by_key(|n| match n.kind.as_str() {
-            "param" => 2,
-            "file" => 3,
-            _ => 1,
-        });
+        to_write.sort_by_key(|n| n.kind == "file");
         report.nodes_written = to_write.len();
         statements += self.write_nodes(&to_write).await?;
         // Summaries of definitions whose node is not written otherwise.
@@ -1111,6 +1112,20 @@ impl CodeTree {
     async fn drop_code(&self) -> Result<(), RpcError> {
         self.run(&format!("{} MATCH (n:Code) WHERE n.code IS NOT NULL REMOVE n.code", layer::OBSERVED_WRITE), Map::new()).await?;
         self.run(&format!("{} MATCH (f:File) WHERE f.extractor IS NOT NULL AND f.text IS NOT NULL REMOVE f.text", layer::OBSERVED_WRITE), Map::new()).await?;
+        Ok(())
+    }
+
+    /// Remove what earlier versions stored and nothing reads: parameter nodes (and their edges), and
+    /// properties a definition's signature or code already shows. Node writes merge properties,
+    /// so rewriting a node leaves them.
+    async fn drop_unread_properties(&self) -> Result<(), RpcError> {
+        self.run(&format!("{} MATCH (p:Param) DETACH DELETE p", layer::OBSERVED_WRITE), Map::new()).await?;
+        self.run(
+            &format!("{} MATCH (n:Sym) REMOVE n.value, n.sig_hash, n.is_async, n.is_static, n.visibility, n.decorators, n.param_count", layer::OBSERVED_WRITE),
+            Map::new(),
+        )
+        .await?;
+        self.run(&format!("{} MATCH (f:File) REMOVE f.line_count", layer::OBSERVED_WRITE), Map::new()).await?;
         Ok(())
     }
 

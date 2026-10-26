@@ -45,6 +45,43 @@ pub mod methods {
     pub const SHARE_STATUS: &str = "source.share.status";
     /// `{}` -> [`super::Storage`].
     pub const STORAGE: &str = "source.storage";
+    /// [`super::ReleaseStatusParams`] -> [`super::ReleaseStatus`]. Whether the user changed a
+    /// plugin away from the shipped source (an update of it then asks first).
+    pub const RELEASE_STATUS: &str = "source.release.status";
+    /// [`super::ReleaseMergeParams`] -> [`super::UpdateResult`]. Merge a released source (one
+    /// plugin's, or the frame's: everything outside `plugins/`) into the code folder, keeping the
+    /// user's changes; the user's own code on the new base is built again.
+    pub const RELEASE_MERGE: &str = "source.release.merge";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseStatusParams {
+    pub plugin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseStatus {
+    pub plugin: String,
+    /// The code folder is managed (false for a developer checkout: nothing is merged there).
+    pub managed: bool,
+    /// The user changed the plugin's files (committed or not) away from the shipped source.
+    pub edited: bool,
+    /// The changed files, relative to the code folder.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseMergeParams {
+    /// `plugin` (one plugin's folder, `plugins/<plugin>`) or `frame` (everything outside `plugins/`).
+    pub scope: String,
+    #[serde(default)]
+    pub plugin: String,
+    /// The released source: a folder holding exactly the files of that scope.
+    pub dir: String,
+    /// The release version, for the history.
+    #[serde(default)]
+    pub version: String,
 }
 
 pub mod topics {

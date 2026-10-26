@@ -27,6 +27,8 @@ pub mod shell;
 pub mod term;
 pub mod testout;
 pub mod textedit;
+pub mod tree;
+pub mod undo;
 pub mod uris;
 pub mod util;
 pub mod workspace;

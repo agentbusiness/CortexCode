@@ -115,8 +115,41 @@ speaks the same contract.
 
 ## Requirements
 
-- A Mac with Apple silicon and **32 GB** of unified memory or more.
+- A Mac with Apple silicon and **32 GB** of unified memory or more (Linux x64 and arm64 builds are
+  prepared; the Linux model engine is not there yet).
 - Disk space for the model (downloaded on first start).
+
+## Install
+
+```sh
+npx cortexcode
+```
+
+The first run downloads the app for your machine from this repository's releases, checks it
+against the checksum in the release catalog and starts it; later runs start it at once. Or download it
+from [Releases](https://github.com/agentbusiness/CortexCode/releases/latest): on macOS open the
+`.dmg` and move CortexCode to Applications. The app is not signed by Apple yet, so the first start
+from a download asks once: System Settings > Privacy & Security > Open Anyway.
+
+Updates come by themselves. A plugin you have not changed updates as soon as no run is going; a
+plugin you changed asks first (merge the update into your change, or keep yours). A new frame
+waits for *Restart to update*.
+
+## Releasing
+
+Everything is built on a Mac with Apple silicon; Linux builds run in Docker on it. Each plugin is
+released on its own, so a change to one plugin builds only that plugin:
+
+| Script | What it releases |
+|---|---|
+| `scripts/release-plugin.sh <plugin> [version]` | one plugin (`--changed`: every plugin whose source changed) |
+| `scripts/release-frame.sh [version]` | the frame, cx, cortex-pack and the window code |
+| `scripts/release-app.sh [version]` | the full app for new users (`.dmg`, `.tar.gz`), from the released parts |
+| `scripts/release-npm.sh [version]` | the `npx cortexcode` launcher |
+
+Without a version each takes the next one after the released one: three numbers, each 0 to 99
+(`0.3.99` is followed by `0.4.0`). Every script takes `--dry-run` (build into `artifacts/`, upload
+nothing). Configuration: `.env.release` (see `.env.release.example`).
 
 ## Status
 

@@ -25,6 +25,8 @@ res="$contents/Resources"
 cd "$repo"
 
 step() { printf 'build-app: %s\n' "$*"; }
+# shellcheck source=app/electron.sh
+. "$repo/scripts/app/electron.sh"
 # The source files git tracks or would track under the given paths, that exist (NUL-separated).
 sources() {
   git ls-files -co --exclude-standard -z -- "$@" | while IFS= read -r -d '' file; do
@@ -92,22 +94,7 @@ electron_src="ui/node_modules/electron"
 electron_dst="$res/ui/node_modules/electron"
 if [ "$(cat "$electron_dst/version" 2>/dev/null)" != "$(cat "$electron_src/package.json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" ]; then
   step "copying Electron"
-  rm -rf "$electron_dst"
-  mkdir -p "$electron_dst/dist"
-  source_app="$(ls -d "$electron_src"/dist/*.app | head -1)"
-  ditto "$source_app" "$electron_dst/dist/CortexCode.app"
-  # Branded as CortexCode: the Dock, Force Quit and Activity Monitor take the name and icon from it.
-  macos="$electron_dst/dist/CortexCode.app/Contents/MacOS"
-  [ -f "$macos/Electron" ] && mv "$macos/Electron" "$macos/CortexCode"
-  plist="$electron_dst/dist/CortexCode.app/Contents/Info.plist"
-  for key in CFBundleName CFBundleDisplayName CFBundleExecutable; do
-    /usr/libexec/PlistBuddy -c "Set :$key CortexCode" "$plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$key string CortexCode" "$plist"
-  done
-  cp ui/shell/assets/CortexCode.icns "$electron_dst/dist/CortexCode.app/Contents/Resources/CortexCode.icns"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile CortexCode.icns" "$plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string CortexCode.icns" "$plist"
-  codesign --force --deep --sign - "$electron_dst/dist/CortexCode.app" >/dev/null 2>&1
-  printf '%s' "CortexCode.app/Contents/MacOS/CortexCode" > "$electron_dst/path.txt"
-  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"], end="")' "$electron_src/package.json" > "$electron_dst/version"
+  electron_mac_branded "$electron_src" "$electron_dst" ui/shell/assets/CortexCode.icns
 fi
 
 # --- the frame and the app's own files ---------------------------------------------------------

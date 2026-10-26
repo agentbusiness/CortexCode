@@ -144,6 +144,7 @@ async fn supervise(frame: Arc<Frame>) {
         };
         let pid = child.id().unwrap_or(0);
         shell.pid.store(pid, Ordering::SeqCst);
+        crate::children::record(&frame.home, pid, &shell.electron(), "shell");
         tracing::info!(pid, "Electron shell started");
         let status = tokio::select! {
             status = child.wait() => status,
@@ -158,11 +159,13 @@ async fn supervise(frame: Arc<Frame>) {
                     }
                 }
                 shell.pid.store(0, Ordering::SeqCst);
+                crate::children::forget(&frame.home, pid);
                 tracing::info!("Electron shell stopped");
                 return;
             }
         };
         shell.pid.store(0, Ordering::SeqCst);
+        crate::children::forget(&frame.home, pid);
         match status {
             Ok(status) if status.code() == Some(0) => {
                 tracing::info!("the UI was closed by the user; quitting");

@@ -1,0 +1,196 @@
+//! This node's capability card: a projection of what the frame and the plugins already report,
+//! nothing typed by hand. Refreshed on a timer and on change; sent to every connected member.
+
+use cc_protocol::Ctx;
+use cc_protocol::contracts::frame::{Machine, PluginInfo, Session, SessionStatus};
+use cc_protocol::contracts::lang::Description;
+use cc_protocol::contracts::mesh::{Card, LanguageCard, ModelCard, PluginCard};
+use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, SlotsResult};
+use cc_protocol::contracts::now_ms;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::Duration;
+
+/// A session that ran within this long counts as a person working here.
+const ACTIVE_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+async fn get<T: serde::de::DeserializeOwned>(ctx: &Ctx, method: &str, params: Value) -> Option<T> {
+    let value = tokio::time::timeout(Duration::from_secs(5), ctx.call(method, params)).await.ok()?.ok()?;
+    serde_json::from_value(value).ok()
+}
+
+fn free_disk(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid NUL-terminated path and a zeroed statvfs the call fills.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return 0;
+    }
+    u64::from(stat.f_bavail) * stat.f_frsize
+}
+
+fn free_memory() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.available_memory()
+}
+
+/// SHA-256 over a plugin's live data folders (relative paths and contents), empty when it has none.
+fn data_hash(code_dir: Option<&Path>, plugin_id: &str) -> String {
+    let Some(code) = code_dir else { return String::new() };
+    let plugin = code.join("plugins").join(plugin_id);
+    let mut files: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+    for dir in [plugin.join("data"), plugin.join("backend").join("data")] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut stack = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&plugin) {
+                    files.insert(relative.to_string_lossy().into_owned(), path);
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for (relative, path) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        if let Ok(bytes) = std::fs::read(&path) {
+            hasher.update(&bytes);
+        }
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// A repository's identity: its root commit (read-only git).
+fn git_program() -> Option<std::path::PathBuf> {
+    for candidate in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+        if Path::new(candidate).is_file() {
+            return Some(std::path::PathBuf::from(candidate));
+        }
+    }
+    std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("git")).find(|git| git.is_file()))
+}
+
+fn repository_id(root: &str) -> Option<String> {
+    let git = git_program()?;
+    let output = std::process::Command::new(git).arg("-C").arg(root).args(["rev-list", "--max-parents=0", "HEAD"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().next().map(|line| line.trim().to_owned()).filter(|id| !id.is_empty())
+}
+
+/// The model's load now: busy slots, those a person waits for, the queue.
+pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
+    if let Some(slots) = get::<SlotsResult>(ctx, "model.slots", json!({})).await {
+        model.slots_busy = slots.busy;
+        model.busy_foreground = slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32;
+        model.queued = slots.queued;
+    }
+}
+
+pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
+    let machine: Machine = get(ctx, "frame.machine", json!({})).await.unwrap_or_default();
+    let plugins: Vec<PluginInfo> = get::<Value>(ctx, "frame.plugins.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("plugins").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
+    let code_dir = ctx.env.code_dir.clone();
+    let plugin_cards: Vec<PluginCard> = plugins
+        .iter()
+        .filter(|plugin| !plugin.instance.starts_with("ws-"))
+        .map(|plugin| PluginCard {
+            id: if plugin.plugin.is_empty() { plugin.plugin_id.clone() } else { plugin.plugin.clone() },
+            category: plugin.category.clone(),
+            // The installed package's version (with its build), not the plugin's bare semver: two
+            // nodes lend hands to each other only on the very same build.
+            version: if plugin.build.is_empty() { plugin.version.clone() } else { plugin.build.clone() },
+            data_hash: data_hash(code_dir.as_deref(), if plugin.plugin.is_empty() { &plugin.plugin_id } else { &plugin.plugin }),
+            active: plugin.state == "active",
+        })
+        .collect();
+    let mut languages = Vec::new();
+    for plugin in plugins.iter().filter(|plugin| plugin.contract == cc_protocol::contracts::lang::CONTRACT && plugin.state == "active") {
+        if let Some(description) = get::<Description>(ctx, &format!("{}.describe", plugin.category), json!({})).await {
+            let version = description.server.as_ref().and_then(|server| server.version.clone()).unwrap_or_default();
+            languages.push(LanguageCard { id: description.id, version });
+        }
+    }
+    let model = match get::<ModelInfo>(ctx, "model.info", json!({})).await {
+        Some(info) => {
+            let slots: Option<SlotsResult> = get(ctx, "model.slots", json!({})).await;
+            let metrics: Option<LiveMetrics> = get(ctx, "model.metrics", json!({})).await;
+            let plugin = plugins.iter().find(|plugin| plugin.category == "model" && plugin.state == "active").map(|plugin| plugin.plugin_id.clone()).unwrap_or_default();
+            Some(ModelCard {
+                plugin,
+                model_id: info.model_id,
+                variant: info.variant,
+                family: info.family,
+                ctx_total: info.ctx_total,
+                slots: info.slots,
+                slots_busy: slots.as_ref().map(|slots| slots.busy).unwrap_or(0),
+                busy_foreground: slots.as_ref().map(|slots| slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32).unwrap_or(0),
+                queued: slots.as_ref().map(|slots| slots.queued).unwrap_or(0),
+                tok_s: metrics.map(|metrics| metrics.decode_tps_per_stream).unwrap_or(0.0),
+            })
+        }
+        None => None,
+    };
+    let sessions: Vec<Session> = get::<Value>(ctx, "frame.session.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("sessions").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
+    let now = now_ms();
+    let running = sessions.iter().filter(|session| session.status == SessionStatus::Running).count() as u32;
+    let agents_running = sessions.iter().filter(|session| session.status == SessionStatus::Running && session.agent.is_some()).count() as u32;
+    let user_active = sessions.iter().any(|session| session.agent.is_none() && now.saturating_sub(session.updated_ms) < ACTIVE_WINDOW_MS);
+    let agent_limit = get::<Value>(ctx, "agents.scheduler", json!({})).await.and_then(|v| v.get("max_parallel").and_then(Value::as_u64)).unwrap_or(0) as u32;
+    let docker = get::<Value>(ctx, "container.list", json!({})).await.is_some();
+    let projects: Vec<Value> = get::<Value>(ctx, "frame.project.list", json!({})).await.and_then(|v| v.get("projects").and_then(Value::as_array).cloned()).unwrap_or_default();
+    let repositories: Vec<String> = projects.iter().filter_map(|project| project.get("root").and_then(Value::as_str)).filter_map(repository_id).collect();
+    let on_mains = on_mains();
+    Card {
+        node: node.to_owned(),
+        name: name.to_owned(),
+        software: "cortexcode".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        chip: machine.chip,
+        memory_bytes: machine.memory_bytes,
+        cpu_cores: machine.cpu_cores,
+        gpu_cores: machine.gpu_cores,
+        os_version: machine.os_version,
+        free_disk_bytes: free_disk(home),
+        free_memory_bytes: free_memory(),
+        on_mains,
+        user_active,
+        model,
+        plugins: plugin_cards,
+        languages,
+        docker,
+        sessions_running: running,
+        agents_running,
+        agent_limit,
+        repositories,
+        updated_ms: now,
+    }
+}
+
+/// Whether the Mac runs on mains power (`pmset -g batt`: "AC Power"); true when it cannot be told
+/// (a desktop has no battery).
+fn on_mains() -> bool {
+    match std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"]).output() {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            !text.contains("Battery Power")
+        }
+        Err(_) => true,
+    }
+}

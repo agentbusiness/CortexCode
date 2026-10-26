@@ -51,7 +51,10 @@ void runtime.state.attach({
 }).then(() => {
   const view = runtime.state.get<ThemePreference>('workbench', 'view');
   if (view) applyTheme(view);
-  // The app opens on the chat: the right pane starts collapsed (the card opens with it).
+  // The app opens on the chat: the right pane starts collapsed (the card opens with it), and the
+  // settings window and the overlay never come back from the saved state.
+  runtime.state.set('workbench', 'settings.open', null);
+  runtime.state.set('workbench', 'overlay.open', false);
   runtime.state.set('workbench', 'layout.paneCollapsed', true);
 });
 

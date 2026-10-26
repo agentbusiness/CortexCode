@@ -97,6 +97,11 @@ pub trait LanguagePack: Send + Sync + 'static {
     fn sample(&self) -> Sample;
     /// Commands that check work in this language.
     fn verifiers(&self) -> Vec<Verifier>;
+    /// Ignored directories a build may share between copies of a project's tree (`target`,
+    /// `node_modules`): see `Description::caches`.
+    fn caches(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The language server, None when the language has none.
     fn server(&self) -> Option<ServerSpec>;
     /// The installed toolchain commands need (blocking): directories for PATH and environment
@@ -355,7 +360,7 @@ impl<P: LanguagePack> LangPlugin<P> {
             .and_then(|dir| skills::load(dir).or_else(|_| skills::list(dir)).ok())
             .unwrap_or_default()
             .into_iter()
-            .map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done })
+            .map(|skill| SkillInfo { name: skill.name, summary: skill.summary, codes: skill.codes, applies: skill.applies, done: skill.done, units: skill.units, unit_done: skill.unit_done })
             .collect();
         let toolchain = {
             let shared = self.shared.clone();
@@ -370,6 +375,7 @@ impl<P: LanguagePack> LangPlugin<P> {
             skills,
             path: toolchain.path,
             env: toolchain.env,
+            caches: pack.caches(),
         }
     }
 

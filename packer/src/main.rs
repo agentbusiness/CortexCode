@@ -3,6 +3,7 @@
 //! ```text
 //! cortex-pack build <plugin-dir> [--install] [--release] [-o <file.ccplugin>] [--no-source] [--no-build]
 //! cortex-pack info <plugin-dir>
+//! cortex-pack release next|newer|check <version> ...
 //! ```
 //!
 //! `build` reads `plugin.toml`, runs the backend's build (`cargo build --release` in `backend/`)
@@ -15,10 +16,13 @@
 //! A build is a dev build, versioned `<version>+dev.<UTC date>.<time>`, unless `--release` keeps
 //! plugin.toml's version or `--build-id <id>` versions it `<version>+<id>`. `--install` hands the package to the frame (`CORTEX_HOME`, default
 //! `~/.cortexcode`): a running frame hot-swaps to it and this command prints the outcome; a stopped
-//! frame installs it at its next start. `info` prints the validated plugin.toml as JSON.
+//! frame installs it at its next start. It also copies the plugin's data folders into the code
+//! folder (`<home>/code/<source subdir>/`), where plugins read their live data. `info` prints the
+//! validated plugin.toml as JSON.
 
 mod install;
 mod pack;
+mod release;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -60,20 +64,36 @@ enum Command {
     },
     /// Print the plugin folder's validated plugin.toml as JSON.
     Info { dir: PathBuf },
+    /// The version rule (for scripts/release-*.sh).
+    #[command(subcommand)]
+    Release(release::Release),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
         Command::Build { dir, install, release, out, build_id, no_source, no_build } => {
+            let plugin_dir = dir.clone();
             pack::build(&pack::Options { dir, out, source: !no_source, run_build: !no_build, release, build_id }).and_then(|packed| {
                 println!("packed {} {} ({} bytes) -> {}", packed.manifest.plugin.id, packed.manifest.plugin.version, packed.bytes, packed.path.display());
-                if install { install::install(&packed.path, &install::home()) } else { Ok(()) }
+                if install {
+                    let home = install::home();
+                    // The new backend reads its live data from the code folder: bring it along.
+                    match std::fs::canonicalize(&plugin_dir).map_err(|e| e.to_string()).and_then(|dir| pack::read_plugin_toml(&dir).and_then(|toml| install::refresh_live_data(&dir, &toml, &home))) {
+                        Ok(Some(summary)) => println!("{summary}"),
+                        Ok(None) => {}
+                        Err(error) => println!("live data not refreshed: {error}"),
+                    }
+                    install::install(&packed.path, &home)
+                } else {
+                    Ok(())
+                }
             })
         }
         Command::Info { dir } => pack::read_plugin_toml(&dir).and_then(|toml| {
             serde_json::to_string_pretty(&toml).map(|json| println!("{json}")).map_err(|e| e.to_string())
         }),
+        Command::Release(command) => release::run(command),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,

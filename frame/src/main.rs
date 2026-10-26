@@ -1,7 +1,8 @@
 //! `cortex-frame`: the CortexCode frame.
 //!
 //! `cortex-frame [--config <cortex.toml>] [--headless] [--home <dir>]` (without `--config`: the app
-//! bundle's `Contents/Resources/cortex.toml`)
+//! bundle's `Contents/Resources/cortex.toml`, or `cortex.toml` beside the binary; a newer frame an
+//! update staged runs instead, see `update.rs`)
 
 // The frame relays requests with their JSON key order intact (serde_json `preserve_order`, see
 // Cargo.toml), which makes `serde_json::Value` and so `RpcError` 136 bytes, just over clippy's
@@ -10,6 +11,7 @@
 #![allow(clippy::result_large_err)]
 
 mod access;
+mod children;
 mod config;
 mod fswatch;
 mod home;
@@ -25,6 +27,7 @@ mod store;
 mod supervisor;
 mod uiplugins;
 mod units;
+mod update;
 
 use clap::Parser;
 use config::Config;
@@ -79,6 +82,8 @@ fn main() -> ExitCode {
         (None, None, Some(home)) => config::resolve(&config.base, home),
         (None, None, None) => config::expand_tilde("~/.cortexcode"),
     };
+    // A newer frame staged by an update runs instead of this one (the app's own frame is the safe copy).
+    update::handover(cli.config.is_some(), &home_root);
     let home = Home::new(home_root);
     if let Err(error) = home.create_layout() {
         eprintln!("cortex-frame: cannot create {}: {error}", home.root.display());
@@ -117,6 +122,10 @@ fn main() -> ExitCode {
     };
     let code = runtime.block_on(run(cli, config, home));
     drop(lock);
+    if update::restart_requested() {
+        update::exec_restart();
+    }
+    drop(runtime);
     code
 }
 
@@ -161,6 +170,12 @@ async fn run(cli: Cli, config: Config, home: Home) -> ExitCode {
 
 async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let machine = tokio::task::spawn_blocking(machine::measure).await.map_err(|e| e.to_string())?;
+    // Only one CortexCode runs: the home lock kept a second frame out; what a frame that died
+    // without its shutdown left running (its plugins, the shell) is stopped before this one starts.
+    let reaped = children::reap(&home).await;
+    if reaped > 0 {
+        tracing::warn!(reaped, "processes of a previous frame were stopped before this start");
+    }
     // The frame's records live in the memory plugin's store, written through one ordered outbox;
     // the session journals are the frame's own files under the home.
     let memory = store::MemoryLink::new();
@@ -239,6 +254,7 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let start_frame = frame.clone();
     tokio::spawn(async move {
         supervisor::start_all(start_frame.clone()).await;
+        update::mark_good(&start_frame.home.root);
         if want_ui && !start_frame.is_shutting_down() {
             start_frame.shell.launch(&start_frame);
         }
@@ -303,9 +319,15 @@ async fn shutdown(frame: &Arc<Frame>) {
     frame.power.release_all();
 }
 
-/// `Contents/Resources/cortex.toml` of the app bundle this binary runs from, when there is one.
+/// `Contents/Resources/cortex.toml` of the app bundle this binary runs from, or `cortex.toml`
+/// beside it (the Linux app folder and a staged frame, `<home>/frame/<version>/`).
 fn bundle_config() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let config = exe.parent()?.parent()?.join("Resources").join("cortex.toml");
-    config.is_file().then_some(config)
+    let dir = exe.parent()?;
+    let bundled = dir.parent()?.join("Resources").join("cortex.toml");
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    let beside = dir.join("cortex.toml");
+    beside.is_file().then_some(beside)
 }

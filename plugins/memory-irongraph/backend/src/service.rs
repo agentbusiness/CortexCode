@@ -7,6 +7,7 @@ use crate::langs::Languages;
 use crate::params;
 use crate::tree::{self, CodeTree, SyncReport};
 use crate::watch::{self, TreeWatcher};
+use crate::security::SecurityStore;
 use crate::settings::Settings;
 use crate::work::WorkStore;
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
@@ -16,7 +17,7 @@ use cc_protocol::contracts::memory::{
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
-    RunRecordResult, Scope, SearchParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
+    RunRecordResult, Scope, SearchParams, SecurityAuditPutParams, SecurityChanged, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecuritySummaryParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
     TaskListResult, TaskUpdateParams, UndescribedParams, WorkspaceParams, methods, topics,
 };
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, parse_params, to_value};
@@ -156,6 +157,13 @@ pub const PROVIDES: &[&str] = &[
     methods::TASK_UPDATE,
     methods::TASK_GET,
     methods::TASK_LIST,
+    methods::SECURITY_AUDIT_PUT,
+    methods::SECURITY_FINDINGS_PUT,
+    methods::SECURITY_FINDINGS,
+    methods::SECURITY_FINDING,
+    methods::SECURITY_FINDING_UPDATE,
+    methods::SECURITY_SUMMARY,
+    methods::SECURITY_FORGET,
     methods::BOARD_POST,
     methods::BOARD_LIST,
     methods::AGENT_UPSERT,
@@ -701,6 +709,18 @@ impl Memory {
         Ok(Arc::new(WorkStore::new(graph, ig, project_id.to_owned())))
     }
 
+    /// Security store of a project: the same graph and scope as its work store.
+    async fn security(&self, project_id: &str) -> Result<SecurityStore, RpcError> {
+        let work = self.work(project_id).await?;
+        Ok(SecurityStore::new(work.graph.clone(), work.ig_id.clone(), work.scope.clone()))
+    }
+
+    /// Tell the listeners (the security plugin, the UI) that a project's findings changed.
+    fn security_changed(&self, project_id: &str, id: Option<&str>, status: Option<&str>) {
+        let payload = SecurityChanged { project_id: project_id.to_owned(), id: id.map(str::to_owned), status: status.map(str::to_owned) };
+        self.publish(topics::SECURITY_CHANGED, serde_json::to_value(payload).unwrap_or(Value::Null));
+    }
+
     /// A loaded project (opening it from the registry after a restart).
     async fn project(self: &Arc<Self>, project_id: &str) -> Result<Arc<Project>, RpcError> {
         if let Some(project) = self.projects.read().await.get(project_id) {
@@ -1145,6 +1165,50 @@ impl Memory {
                 let p: TaskListParams = parse_params(params)?;
                 let store = self.work(&p.project_id).await?;
                 to_value(&TaskListResult { tasks: store.task_list(p.status.as_deref(), p.parent_id.as_deref()).await? })
+            }
+            methods::SECURITY_AUDIT_PUT => {
+                let p: SecurityAuditPutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security audits").await?;
+                self.security(&p.project_id).await?.audit_put(&p.audit).await?;
+                self.security_changed(&p.project_id, None, None);
+                to_value(&json!({}))
+            }
+            methods::SECURITY_FINDINGS_PUT => {
+                let p: SecurityFindingsPutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security findings").await?;
+                let findings = self.security(&p.project_id).await?.findings_put(p.audit_id.as_deref(), p.findings).await?;
+                self.security_changed(&p.project_id, None, None);
+                to_value(&SecurityFindingsResult { findings })
+            }
+            methods::SECURITY_FINDINGS => {
+                let p: SecurityFindingsParams = parse_params(params)?;
+                to_value(&SecurityFindingsResult { findings: self.security(&p.project_id).await?.findings(&p).await? })
+            }
+            methods::SECURITY_FINDING => {
+                let p: SecurityFindingParams = parse_params(params)?;
+                let detail = self.security(&p.project_id).await?.finding(&p.id).await?.ok_or_else(|| RpcError::not_found(format!("finding {} not found", p.id)))?;
+                to_value(&detail)
+            }
+            methods::SECURITY_FINDING_UPDATE => {
+                let p: SecurityFindingUpdateParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security findings").await?;
+                let (project_id, id) = (p.project_id.clone(), p.id.clone());
+                let finding = self.security(&project_id).await?.finding_update(p).await?.ok_or_else(|| RpcError::not_found(format!("finding {id} not found")))?;
+                self.security_changed(&project_id, Some(&finding.id), Some(&finding.status));
+                to_value(&finding)
+            }
+            methods::SECURITY_SUMMARY => {
+                let p: SecuritySummaryParams = parse_params(params)?;
+                to_value(&self.security(&p.project_id).await?.summary().await?)
+            }
+            methods::SECURITY_FORGET => {
+                let p: SecurityFindingParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security findings").await?;
+                if !self.security(&p.project_id).await?.forget(&p.id).await? {
+                    return Err(RpcError::not_found(format!("finding {} not found", p.id)));
+                }
+                self.security_changed(&p.project_id, Some(&p.id), None);
+                to_value(&json!({}))
             }
             methods::BOARD_POST => {
                 let p: BoardPostParams = parse_params(params)?;

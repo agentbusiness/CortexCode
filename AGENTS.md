@@ -84,7 +84,25 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 - The frame runs plugins only from installed packages (`~/.cortexcode/plugins/<id>/<version>/`),
   never from a plugin folder: a cargo or npm build alone does not reach the app. Deliver a changed
   plugin with `packer/target/release/cortex-pack build plugins/<name> --install` (a dev build; the
-  running app swaps to it live, backend and UI together); `cx plugin rollback <name>` undoes it.
+  running app swaps to it live, backend and UI together, and the plugin's data folders are copied
+  into the code folder `~/.cortexcode/code/plugins/<name>/`, where plugins read prompts, texts and
+  scripts live); `cx plugin rollback <name>` undoes the swap.
+- One CortexCode runs at a time: the home lock refuses a second frame, and a frame stops the
+  processes a dead predecessor left (`<home>/run/children.json`) before it starts its own.
 - When the model does the wrong thing, read its steps (the session's journal) before changing
   anything: the fix goes to the mechanism (stage, schema, cue), not to wording.
 - No locks or quiet waits in code.
+
+## Releases
+
+- Everything is built on the owner's Mac (Linux in Docker on it), never on GitHub; files go to the
+  repository's GitHub releases and the catalog (release `catalog`) names what is current.
+  Guide: `README.md` "Releasing"; design: `docs/RELEASES.md`.
+- Each plugin is released on its own (`scripts/release-plugin.sh <plugin>` or `--changed`); the
+  frame (`scripts/release-frame.sh`), the full app (`scripts/release-app.sh`) and the npx launcher
+  (`scripts/release-npm.sh`) each on their own. Versions: three numbers, each 0 to 99.
+- The app updates itself through `plugins/updater` (`update@1`): plugins the user did not change
+  install when no run is going, changed ones ask first, a new frame waits for Restart to update
+  (`frame/src/update.rs`: staged frames in `<home>/frame/<version>/`, the app's own frame is the
+  safe copy).
+- The release scripts change only version lines; committing them is the owner's call.

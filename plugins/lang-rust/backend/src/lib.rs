@@ -90,6 +90,10 @@ impl LanguagePack for RustPack {
         }
     }
 
+    fn caches(&self) -> Vec<String> {
+        vec!["target".to_owned()]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         let cargo = |name: &str, kind: &str, args: &[&str]| Verifier { files: Vec::new(),name: name.into(), kind: kind.into(), command: strings(args), when: strings(&["Cargo.toml"]), requires: strings(&["cargo"]) };
         vec![

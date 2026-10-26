@@ -19,10 +19,21 @@ dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-tools"
 
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+[[ui.package]]
+dir = "ui/card-timeline"
+id = "tools.card-timeline"
+slot = "card.timeline@1"
+
 # What building this plugin's code needs on a Mac: code editing is offered only when all of it
 # is present (data editing always is).
 [build]
-needs = ["rust", "apple-clt"]
+needs = ["rust", "apple-clt", "node"]
 
 # Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
 [source]

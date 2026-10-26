@@ -362,10 +362,10 @@ impl Policy {
             let root = sbpl_string(root).unwrap_or_else(|| "\"/\"".to_owned());
             control.push_str(&format!("(deny file-read* file-write* (subpath {root}))\n"));
         }
-        if let Some(socket) = self.socket.lock().ok().and_then(|socket| socket.clone()) {
-            if let Some(socket) = sbpl_string(&socket) {
-                control.push_str(&format!("(deny network-outbound (remote unix-socket (path-literal {socket})))\n"));
-            }
+        if let Some(socket) = self.socket.lock().ok().and_then(|socket| socket.clone())
+            && let Some(socket) = sbpl_string(&socket)
+        {
+            control.push_str(&format!("(deny network-outbound (remote unix-socket (path-literal {socket})))\n"));
         }
         format!("(deny file-write*\n  (require-not\n    (require-any\n{allowed}    )))\n(deny file-write*\n{protected})\n{control}")
     }

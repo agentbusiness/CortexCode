@@ -130,19 +130,15 @@ impl CommandScope {
                 ),
             ));
         }
-        if let Some(workspace) = params.get("workspace").and_then(Value::as_str) {
-            if std::fs::canonicalize(workspace).ok().as_deref() != Some(self.workspace.as_path()) {
-                return Err(RpcError::invalid_params(
-                    "command access belongs to its original workspace",
-                ));
-            }
+        if let Some(workspace) = params.get("workspace").and_then(Value::as_str)
+            && std::fs::canonicalize(workspace).ok().as_deref() != Some(self.workspace.as_path())
+        {
+            return Err(RpcError::invalid_params("command access belongs to its original workspace"));
         }
-        if let Some(session) = params.get("session_id").and_then(Value::as_str) {
-            if session != self.session_id {
-                return Err(RpcError::invalid_params(
-                    "command access belongs to its original session",
-                ));
-            }
+        if let Some(session) = params.get("session_id").and_then(Value::as_str)
+            && session != self.session_id
+        {
+            return Err(RpcError::invalid_params("command access belongs to its original session"));
         }
         if method.starts_with("browser.") {
             if let Some(url) = params.get("url").and_then(Value::as_str) {
