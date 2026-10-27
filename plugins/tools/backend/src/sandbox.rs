@@ -1,4 +1,4 @@
-//! The write sandbox every agent command runs in (macOS `sandbox-exec`).
+//! The write sandbox every agent command runs in (macOS `sandbox-exec`, Linux Landlock).
 //!
 //! The profile is structural: it names directories, never commands. Reads, process execution and
 //! the network stay as they are; a write (create, modify, delete, rename, chmod, xattr, times) is
@@ -29,6 +29,37 @@
 //! The sandbox reports nothing to the parent process, so a refused write shows up as the OS error
 //! EPERM ("Operation not permitted") in the command's own output; [`mentions_eperm`] recognizes that
 //! fixed `strerror(EPERM)` text (a mechanical rule, not a judgement) so the model can be told why.
+//!
+//! On Linux the same policy is a Landlock ruleset (`crate::landlock`), applied in the child before
+//! it runs the shell. Landlock over bubblewrap: it needs no user namespaces (Ubuntu 24.04 restricts
+//! unprivileged ones through AppArmor, and container seccomp profiles refuse them), no extra program
+//! on the machine, and it keeps the network and localhost as they are; it needs Linux 5.13 with
+//! Landlock enabled, and without it commands are not run. Where it differs from macOS:
+//! - Landlock only grants, never denies, and grants whole trees. A root holding a protected path
+//!   (CORTEX_HOME, the plugin-data folder, the jobs folder) is granted child by child, so nothing new
+//!   can be made directly in it; the reads of the frame credential (`control_paths`) are kept out the
+//!   same way, so a file or folder made directly in an ancestor of those (`/`, the home folder,
+//!   CORTEX_HOME) after the shell started cannot be read by it until the shell restarts.
+//! - The rules are a snapshot when the shell or job starts: a root missing then gets no rule (the
+//!   package caches under the home folder are made first so commands can fill them, as on macOS where
+//!   a rule names a path before it exists); a protected file that does not exist yet stays
+//!   unwritable because its folder is never granted whole.
+//! - The git entries of the workspace (its `.git`, a linked worktree's pointer files) stay writable:
+//!   protecting them would leave the workspace root without the right to make files. The git
+//!   directories a session may write are pinned when it starts and checked against their back
+//!   links, so a rewritten pointer never widens the sandbox.
+//! - Landlock does not cover chmod, chown, extended attributes or times, nor truncate(2) before
+//!   Linux 6.2; a move or link across folders is refused before Linux 5.19 (EXDEV, which `mv` turns
+//!   into copy and delete).
+//! - The frame's unix socket stays connectable (Landlock cannot refuse a connect by socket path);
+//!   the credential it needs is unreadable, and another process's memory and environment
+//!   (/proc/<pid>/environ) are out of reach of a Landlock-confined process.
+//! - Commands run with no-new-privileges: a setuid program (sudo, su) starts without its rights.
+//! - An offline workspace gets no IP sockets at all, localhost included (a seccomp filter on
+//!   `socket(2)`; Landlock can refuse TCP only by port, not by address); unix sockets stay.
+//! - A caller-supplied `sandbox-exec` profile cannot be honoured, so such a wrapped command is
+//!   refused rather than run with less confinement than it asked for.
+//! - A refused write is EACCES ("Permission denied"), which [`mentions_eperm`] also recognizes.
 
 use crate::util;
 use std::collections::{BTreeSet, HashMap};
@@ -36,6 +67,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// The OS error text of a write the sandbox refused, as command output shows it.
+#[cfg(not(target_os = "linux"))]
+pub const REFUSED_TEXT: &str = "Operation not permitted";
+#[cfg(target_os = "linux")]
+pub const REFUSED_TEXT: &str = "Permission denied";
 /// Approval classes that widen the sandbox for a session: `write_outside:<absolute dir>`.
 pub const WRITE_CLASS_PREFIX: &str = cc_protocol::contracts::tools::approval_classes::WRITE_OUTSIDE_PREFIX;
 
@@ -60,6 +97,7 @@ pub fn network_rules(workspace: &Path) -> String {
 }
 
 /// How one shell or job is confined: `sandbox-exec [-D key=value]... -p <profile> <program>`.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     pub exec: PathBuf,
@@ -67,7 +105,15 @@ pub struct Sandbox {
     pub params: Vec<(String, String)>,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Sandbox {
+    /// `program` confined: run through `sandbox-exec`.
+    pub fn command(&self, program: &Path) -> std::io::Result<std::process::Command> {
+        let mut command = std::process::Command::new(&self.exec);
+        command.args(self.args()).arg(program);
+        Ok(command)
+    }
+
     /// Arguments for `sandbox-exec` before the confined program.
     pub fn args(&self) -> Vec<String> {
         let mut args = Vec::new();
@@ -90,11 +136,36 @@ impl Sandbox {
     }
 }
 
+/// How one shell or job is confined: a Landlock ruleset applied in the child (see the module doc).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox(crate::landlock::Rules);
+
+#[cfg(target_os = "linux")]
+impl Sandbox {
+    /// `program` confined: the ruleset is applied in the child before it runs.
+    pub fn command(&self, program: &Path) -> std::io::Result<std::process::Command> {
+        self.0.command(program)
+    }
+
+    /// Identity of the confinement (a shell started under another one must be restarted).
+    pub fn key(&self) -> String {
+        self.0.key()
+    }
+}
+
 /// The machine-wide part of the policy, computed once per plugin instance.
 #[derive(Debug, Clone)]
 pub struct Policy {
     /// `sandbox-exec`, when this system has it.
+    #[cfg(not(target_os = "linux"))]
     pub exec: Option<PathBuf>,
+    /// The kernel's Landlock ABI version, or what is missing.
+    #[cfg(target_os = "linux")]
+    landlock: Result<i32, String>,
+    /// `<CORTEX_HOME>/jobs` (its jobs' metadata and scripts are protected).
+    #[cfg(target_os = "linux")]
+    jobs: PathBuf,
     /// Directories writable for every session (home, data dir, temp, caches, configured extras).
     pub roots: Vec<PathBuf>,
     /// Single files writable for every session (cargo's lock and cache databases).
@@ -156,12 +227,23 @@ fn cache_roots(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     roots.push(env_path("npm_config_cache").or_else(|| env_path("NPM_CONFIG_CACHE")).unwrap_or_else(|| home.join(".npm")));
     let xdg_cache = env_path("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
     roots.push(env_path("UV_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("uv")));
-    roots.push(env_path("PIP_CACHE_DIR").unwrap_or_else(|| home.join("Library/Caches/pip")));
-    let caches = home.join("Library/Caches");
-    for name in ["node-gyp", "Yarn", "pnpm", "go-build", "uv"] {
-        roots.push(caches.join(name));
+    #[cfg(not(target_os = "linux"))]
+    {
+        roots.push(env_path("PIP_CACHE_DIR").unwrap_or_else(|| home.join("Library/Caches/pip")));
+        let caches = home.join("Library/Caches");
+        for name in ["node-gyp", "Yarn", "pnpm", "go-build", "uv"] {
+            roots.push(caches.join(name));
+        }
+        roots.push(home.join("Library/pnpm/store"));
     }
-    roots.push(home.join("Library/pnpm/store"));
+    #[cfg(target_os = "linux")]
+    {
+        roots.push(env_path("PIP_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pip")));
+        for name in ["node-gyp", "yarn", "pnpm", "go-build"] {
+            roots.push(xdg_cache.join(name));
+        }
+        roots.push(env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")).join("pnpm/store"));
+    }
     roots.push(home.join(".bun/install/cache"));
     if let Some(gocache) = env_path("GOCACHE") {
         roots.push(gocache);
@@ -172,7 +254,10 @@ fn cache_roots(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 fn temp_roots() -> Vec<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
     let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/private/var/tmp"), PathBuf::from("/private/var/folders")];
+    #[cfg(target_os = "linux")]
+    let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
     roots.push(std::env::temp_dir());
     if let Some(tmp) = env_path("TMPDIR") {
         roots.push(tmp);
@@ -219,6 +304,7 @@ fn outermost(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 impl Policy {
     pub fn new(cortex_home: &Path, data_dir: &Path, extra: &[String]) -> Policy {
+        #[cfg(not(target_os = "linux"))]
         let exec = Path::new(SANDBOX_EXEC).is_file().then(|| PathBuf::from(SANDBOX_EXEC));
         let mut roots = vec![cortex_home.to_path_buf(), data_dir.to_path_buf()];
         roots.extend(temp_roots());
@@ -247,7 +333,12 @@ impl Policy {
             .map(|jobs| vec![format!("^{jobs}/[^/]+/(meta\\.json|cmd\\.sh|runner\\.sh)$")])
             .unwrap_or_default();
         Policy {
+            #[cfg(not(target_os = "linux"))]
             exec,
+            #[cfg(target_os = "linux")]
+            landlock: crate::landlock::abi(),
+            #[cfg(target_os = "linux")]
+            jobs: home.join("jobs"),
             roots,
             files,
             protected_subpaths,
@@ -288,8 +379,28 @@ impl Policy {
         controls
     }
 
+    /// The paths commands may neither read nor write (the frame credential).
+    pub fn hidden_paths(&self) -> &[PathBuf] {
+        &self.control_read_paths
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn available(&self) -> bool {
         self.exec.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn available(&self) -> bool {
+        self.landlock.is_ok()
+    }
+
+    /// Why commands cannot be confined here (None when they can), naming what is missing.
+    pub fn unavailable(&self) -> Option<String> {
+        #[cfg(not(target_os = "linux"))]
+        let missing = self.exec.is_none().then(|| format!("{SANDBOX_EXEC}, which this system does not have"));
+        #[cfg(target_os = "linux")]
+        let missing = self.landlock.as_ref().err().cloned();
+        missing.map(|missing| format!("the write sandbox needs {missing}"))
     }
 
     /// Writable roots of one session: the base roots plus its workspace, git dirs, venv and grants.
@@ -325,7 +436,14 @@ impl Policy {
             return false;
         }
         let path = real(path);
-        self.files.contains(&path) || self.session_roots(workspace, venv, grants).iter().any(|root| path.starts_with(root))
+        if self.files.contains(&path) {
+            return true;
+        }
+        let roots = self.session_roots(workspace, venv, grants);
+        #[cfg(target_os = "linux")]
+        return crate::landlock::Rules::new(self, 0, roots, self.jobs.clone(), false).covers(&path);
+        #[cfg(not(target_os = "linux"))]
+        roots.iter().any(|root| path.starts_with(root))
     }
 
     /// The deny rules of the profile (without the `(version 1)(allow default)` header).
@@ -371,14 +489,38 @@ impl Policy {
     }
 
     /// The complete profile for a session's shell or job.
+    #[cfg(not(target_os = "linux"))]
     pub fn sandbox(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
         let exec = self.exec.clone()?;
         let profile = format!("(version 1)\n(allow default)\n{}{}", network_rules(workspace), self.rules(workspace, venv, grants));
         Some(Sandbox { exec, profile, params: Vec::new() })
     }
 
+    /// The Landlock rules for a session's shell or job. The machine-wide roots under the home
+    /// folder (package caches) are made first: a rule can only name a path that exists.
+    #[cfg(target_os = "linux")]
+    pub fn sandbox(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
+        let abi = *self.landlock.as_ref().ok()?;
+        if let Some(home) = user_home().map(|home| real(&home)) {
+            for root in self.roots.iter().filter(|root| root.starts_with(&home) && !root.exists() && !self.protected(root)) {
+                let _ = std::fs::create_dir_all(root);
+            }
+        }
+        let offline = workspace.join(OFFLINE_MARKER).exists();
+        let roots = self.session_roots(workspace, venv, grants);
+        Some(Sandbox(crate::landlock::Rules::new(self, abi, roots, self.jobs.clone(), offline)))
+    }
+
+    /// A caller-supplied profile: SBPL means nothing to Landlock, and running the command with less
+    /// confinement than it asked for is not safe ([`unwrap_sandbox_exec`] refuses it first).
+    #[cfg(target_os = "linux")]
+    pub fn compose(&self, _inner: &InnerProfile, _workspace: &Path, _venv: Option<&Path>, _grants: &[PathBuf]) -> Option<Sandbox> {
+        None
+    }
+
     /// A caller-supplied profile (from a `sandbox-exec -p ...` wrapper) intersected with the session's
     /// write rules: their rules first, ours last (in SBPL the last matching rule wins).
+    #[cfg(not(target_os = "linux"))]
     pub fn compose(&self, inner: &InnerProfile, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
         let exec = self.exec.clone()?;
         let mut profile = String::new();
@@ -444,27 +586,51 @@ pub fn write_class(path: &Path) -> String {
     format!("{WRITE_CLASS_PREFIX}{}", real(path).display())
 }
 
-/// Whether command output contains the text of `strerror(EPERM)`, which is what a refused write
-/// looks like from inside the sandbox (mechanical match of the OS error message, any case).
+/// The OS error texts (lowercase) of a write the sandbox refused: `strerror(EPERM)` from macOS's
+/// sandbox; `strerror(EACCES)` from Landlock, and `strerror(EXDEV)` for a move across folders it
+/// refused.
+#[cfg(not(target_os = "linux"))]
+const REFUSED_NEEDLES: &[&str] = &["operation not permitted"];
+#[cfg(target_os = "linux")]
+const REFUSED_NEEDLES: &[&str] = &["permission denied", "invalid cross-device link"];
+
+/// Whether command output contains the OS error text of a refused write ([`REFUSED_NEEDLES`]),
+/// which is what a refused write looks like from inside the sandbox (mechanical match of the OS
+/// error message, any case).
 pub fn mentions_eperm(bytes: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"operation not permitted";
-    bytes.windows(NEEDLE.len()).any(|window| window.eq_ignore_ascii_case(NEEDLE))
+    REFUSED_NEEDLES.iter().any(|needle| bytes.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle.as_bytes())))
 }
 
-/// The absolute paths (`/x`, `~/x`) on the lines of command output that report EPERM: what a write
-/// the sandbox refused names. Structural: the OS error text, then the path-shaped words of that
-/// line (split at whitespace, quotes, `:` and `,`).
+/// Whether the plugin itself may write `path` (or, when it does not exist, its nearest existing
+/// folder): on Linux "Permission denied" is also the file permissions' answer, which is not the
+/// sandbox's doing.
+#[cfg(target_os = "linux")]
+fn owner_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(existing) = path.ancestors().find(|path| path.symlink_metadata().is_ok()) else { return false };
+    let Ok(text) = std::ffi::CString::new(existing.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `text` is a valid NUL-terminated path.
+    unsafe { libc::access(text.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// The absolute paths (`/x`, `~/x`) on the lines of command output that report a refused write
+/// ([`REFUSED_NEEDLES`]): what a write the sandbox refused names. Structural: the OS error text,
+/// then the path-shaped words of that line (split at whitespace, quotes, `:` and `,`).
 pub fn eperm_paths(bytes: &[u8]) -> Vec<PathBuf> {
-    const NEEDLE: &str = "operation not permitted";
     let text = String::from_utf8_lossy(bytes);
     let mut paths = Vec::new();
-    for line in text.lines().filter(|line| line.to_ascii_lowercase().contains(NEEDLE)) {
+    for line in text.lines().filter(|line| {
+        let line = line.to_ascii_lowercase();
+        REFUSED_NEEDLES.iter().any(|needle| line.contains(needle))
+    }) {
         for word in line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ':' | ',' | '(' | ')')) {
             let path = if let Some(rest) = word.strip_prefix("~/") {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
             } else {
                 word.starts_with('/').then(|| PathBuf::from(word))
             };
+            #[cfg(target_os = "linux")]
+            let path = path.filter(|path| owner_writable(path));
             if let Some(path) = path
                 && !paths.contains(&path)
             {
@@ -647,6 +813,9 @@ pub fn unwrap_sandbox_exec(argv: &[String], cwd: &Path) -> Option<Result<Wrapped
     let program = argv.first()?;
     if program.rsplit('/').next() != Some("sandbox-exec") {
         return None;
+    }
+    if cfg!(target_os = "linux") {
+        return Some(Err("`sandbox-exec` profiles are macOS-only; run the command without the wrapper (it runs in the write sandbox)".to_owned()));
     }
     let mut profile_text: Option<String> = None;
     let mut params = Vec::new();

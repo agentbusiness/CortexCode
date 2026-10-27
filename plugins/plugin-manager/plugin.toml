@@ -10,7 +10,7 @@ name = "Plugin manager"
 version = "0.1.0"
 description = "Settings > Plugins: every plugin with enable/disable, every service with replace, roll back and restart; a service that is not running, in the brand band."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

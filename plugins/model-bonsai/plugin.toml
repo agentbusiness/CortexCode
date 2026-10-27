@@ -9,7 +9,7 @@ name = "Model (Bonsai)"
 version = "0.1.0"
 description = "Ternary Bonsai 2 27B (PrismML's ternary Qwen3.8-27B, PQ2_0, 7.2 GB) in-process on PrismML's llama.cpp with Metal: the model engine for Macs with 24 GB of memory or less."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace, the
 # vendored PrismML llama.cpp under backend/vendor, built by CMake from backend/build.rs).

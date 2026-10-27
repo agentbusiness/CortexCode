@@ -10,7 +10,7 @@ name = "Shell"
 version = "0.1.0"
 description = "Everything CortexCode knows about shell scripts: the code graph's facts of sh, bash and zsh scripts, bash-language-server with ShellCheck diagnostics, definition, references and hover, shellcheck / bash -n verifiers and shell skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

@@ -10,7 +10,7 @@ name = "Notifications"
 version = "0.1.0"
 description = "macOS notifications when a run finishes or fails, an approval is needed, an agent is blocked, a contract is verified or fails, a merge conflicts or a plugin swap rolls back; delivered through the app window when it is open and natively otherwise; clicks open the target."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 # The CortexCode icon (docs/brand/final); the notification app shows it on every notification.
 icon = "backend/helper/CortexCode.icns"
 

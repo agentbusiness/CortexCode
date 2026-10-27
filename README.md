@@ -142,6 +142,7 @@ released on its own, so a change to one plugin builds only that plugin:
 
 | Script | What it releases |
 |---|---|
+| `scripts/release.sh` | **whatever changed since the last release**, in order: frame, plugins, app, npx (`--plan` says what, `--dry-run` builds without uploading) |
 | `scripts/release-plugin.sh <plugin> [version]` | one plugin (`--changed`: every plugin whose source changed) |
 | `scripts/release-frame.sh [version]` | the frame, cx, cortex-pack and the window code |
 | `scripts/release-app.sh [version]` | the full app for new users (`.dmg`, `.tar.gz`), from the released parts |

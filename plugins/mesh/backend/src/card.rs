@@ -183,8 +183,18 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
     }
 }
 
-/// Whether the Mac runs on mains power (`pmset -g batt`: "AC Power"); true when it cannot be told
-/// (a desktop has no battery).
+/// Whether the machine runs on mains power (macOS `pmset -g batt`: "AC Power"; Linux: a mains
+/// supply in /sys/class/power_supply that is online); true when it cannot be told (a desktop has
+/// no battery).
+#[cfg(not(target_os = "macos"))]
+fn on_mains() -> bool {
+    let Ok(supplies) = std::fs::read_dir("/sys/class/power_supply") else { return true };
+    let read = |dir: &std::path::Path, file: &str| std::fs::read_to_string(dir.join(file)).unwrap_or_default().trim().to_owned();
+    let mains: Vec<_> = supplies.flatten().map(|entry| entry.path()).filter(|dir| read(dir, "type") == "Mains").collect();
+    mains.is_empty() || mains.iter().any(|dir| read(dir, "online") == "1")
+}
+
+#[cfg(target_os = "macos")]
 fn on_mains() -> bool {
     match std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"]).output() {
         Ok(output) => {

@@ -192,6 +192,11 @@ pub fn build(options: &Options) -> Result<Packed, String> {
             let from = dir.join(asset);
             let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| format!("asset `{asset}` has no name"))?;
             let packed = format!("backend/{name}");
+            // A macOS app bundle exists only in a macOS build: other platforms ship without it.
+            if !from.exists() && !cfg!(target_os = "macos") && name.ends_with(".app") {
+                eprintln!("cortex-pack: {asset} left out (a macOS app bundle; not building for macOS)");
+                continue;
+            }
             if from.is_dir() {
                 add_tree(&mut entries, &from, &packed, &[])?;
             } else if from.is_file() {

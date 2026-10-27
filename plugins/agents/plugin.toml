@@ -10,7 +10,7 @@ name = "Agents"
 version = "0.1.0"
 description = "Delegation of a goal into a task tree with contracts, named agents in copy-on-write workspaces, the scheduler, contract verification, the project board and the merge steward; the board pane and the agents, tasks and board card sections."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 [backend]

@@ -27,6 +27,7 @@ done
 load_env
 need_tools node
 build_packer
+[ $dry_run = 1 ] || need_publishing
 
 source_dir="$repo/npm/cortexcode"
 name="$(jq -r .name "$source_dir/package.json")"
@@ -42,8 +43,16 @@ rsync -a --exclude node_modules "$source_dir/" "$out/package/"
 (cd "$out/package" && node --check bin/cortexcode.mjs)
 leak_scan "$out/package"
 
+scratch work
+catalog="$work/catalog.json"
+fetch_catalog "$catalog"
+jq --arg name "$name" --arg v "$version" --arg digest "$(npm_digest)" '.npm = {name: $name, version: $v, digest: $digest}' "$catalog" > "$catalog.next"
+mv "$catalog.next" "$catalog"
+
 if [ $dry_run = 1 ]; then
   (cd "$out/package" && npm pack --silent --pack-destination "$out" >/dev/null)
+  mkdir -p "$artifacts"
+  cp "$catalog" "$artifacts/catalog.preview.json"
   step "dry run: the package is in artifacts/npm/$version/"
   exit 0
 fi
@@ -53,3 +62,4 @@ if [ -n "${NPM_TOKEN:-}" ]; then
 fi
 (cd "$out/package" && npm publish --access public)
 step "published: npx $name"
+publish_catalog "$catalog"

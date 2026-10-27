@@ -10,7 +10,7 @@ name = "Frontend design skills"
 version = "0.1.0"
 description = "Frontend design know-how for the model: one UI design guide (direction, colour, typography, layout, motion, interaction and accessibility, anti-patterns) and checking the rendered result in a browser."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One skills plugin per body of know-how: the `skills` family, category `skills-<id>`, contract

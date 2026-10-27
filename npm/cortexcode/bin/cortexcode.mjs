@@ -8,13 +8,15 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 const REPO = process.env.CORTEXCODE_REPO || 'agentbusiness/CortexCode';
-const CATALOG_URL = `https://github.com/${REPO}/releases/download/catalog/catalog.json`;
+// CORTEXCODE_CATALOG: another catalog (a mirror, or a release under test).
+const CATALOG_URL = process.env.CORTEXCODE_CATALOG || `https://github.com/${REPO}/releases/download/catalog/catalog.json`;
 const HOME = process.env.CORTEX_HOME || join(homedir(), '.cortexcode');
 const APPS = join(HOME, 'app');
 const READY = '.ready';
@@ -39,6 +41,28 @@ function version(text) {
 function compare(a, b) {
   for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] - b[i];
   return 0;
+}
+
+/** The response to a GET of `url`, after redirects (GitHub sends release files from another host). */
+function get(url, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https:') ? https : http;
+    const request = client.get(url, { headers: { 'user-agent': 'cortexcode-npx' } }, (response) => {
+      const status = response.statusCode ?? 0;
+      if (status >= 300 && status < 400 && response.headers.location && redirects > 0) {
+        response.resume();
+        resolve(get(new URL(response.headers.location, url).toString(), redirects - 1));
+        return;
+      }
+      if (status !== 200) {
+        response.resume();
+        reject(new Error(`${url} answered ${status}`));
+        return;
+      }
+      resolve(response);
+    });
+    request.on('error', reject);
+  });
 }
 
 /** The release catalog: the current version of the app and every part, with their files. */
@@ -68,12 +92,12 @@ async function install(app, asset) {
   const archive = join(APPS, `.download-${app.version}.tar.gz`);
   const staging = join(APPS, `.staging-${app.version}`);
   say(`downloading CortexCode ${app.version} (${Math.round(asset.size / 1e6)} MB)`);
-  const response = await fetch(asset.url, { headers: { 'user-agent': 'cortexcode-npx' } });
-  if (!response.ok || !response.body) throw new Error(`${asset.url} answered ${response.status}`);
+  // node:http rather than fetch: fetch's stream fails when a server closes the connection while the
+  // file write is behind.
+  const body = await get(asset.url);
   const hash = createHash('sha256');
   let received = 0;
   let reported = 0;
-  const body = Readable.fromWeb(response.body);
   body.on('data', (chunk) => {
     hash.update(chunk);
     received += chunk.length;

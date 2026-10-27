@@ -270,11 +270,7 @@ impl Shells {
         let (reader, writer) = std::io::pipe()?;
         let writer_err = writer.try_clone()?;
         let mut command = match &identity.sandbox {
-            Some(sandbox) => {
-                let mut command = std::process::Command::new(&sandbox.exec);
-                command.args(sandbox.args()).arg(&self.config.bash);
-                command
-            }
+            Some(sandbox) => sandbox.command(&self.config.bash)?,
             None => std::process::Command::new(&self.config.bash),
         };
         command

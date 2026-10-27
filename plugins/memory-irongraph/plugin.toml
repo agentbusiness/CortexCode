@@ -10,7 +10,7 @@ name = "Memory (IronGraph)"
 version = "0.1.0"
 description = "The code graph on embedded IronGraph (symbols, call sites with argument text, cross-language edges, semantic search), the line store, persistent tasks, board, agents, rules, style and the main settings database, cited notes (research findings) and project knowledge (concepts, facts, decisions, theories, questions bound to code) in the knowledge layer, searchable by meaning; the Index and Knowledge card sections; its own skill for querying the store (irongraph-queries)."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 [backend]

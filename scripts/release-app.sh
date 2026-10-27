@@ -152,7 +152,8 @@ if [ $dry_run = 0 ]; then
     gh_upload "$rid" "$file"
   done
 fi
-jq --arg v "$version" --arg tag "$tag" --argjson files "$files" '.app = {version: $v, tag: $tag, files: $files}' "$catalog" > "$catalog.next"
+jq --arg v "$version" --arg tag "$tag" --arg frame "$frame_version" --argjson files "$files" \
+  '.app = {version: $v, tag: $tag, frame: $frame, files: $files}' "$catalog" > "$catalog.next"
 mv "$catalog.next" "$catalog"
 
 mkdir -p "$artifacts"

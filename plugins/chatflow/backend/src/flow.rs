@@ -780,6 +780,13 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         // from the next); a step that ended well and is not the last ends here, and
                         // the next loop takes the following step.
                         if let Some((plan_seq, plan, n)) = planned {
+                            // The user wrote during the task: the planner writes the tasks still to
+                            // do (this one included) from what they ask now.
+                            if outcome.outcome == "steered" {
+                                set_stage(env, journal, status_seq, "plan").await?;
+                                write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: outcome.outcome.clone(), summary: outcome.summary.clone() }).await?;
+                                continue;
+                            }
                             // A task whose work is verified as it stands (a command that passed
                             // since its last edit) is done, also when its loop ended with nothing
                             // left to do or was stopped for re-running that same passing check.
@@ -827,6 +834,12 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                     set_stage(env, journal, status_seq, "plan").await?;
                                     write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: outcome_name.clone(), summary: found }).await?;
                                 }
+                                // The next task starts from its own context: this task's steps
+                                // become one note (its calls, the files it changed, its last test
+                                // run), and the next step message lists its reply under "Done so
+                                // far" (seen: five tasks of one plan each worked inside every earlier
+                                // task's reads, edits and test logs, the prompt grown past 190k).
+                                crate::fit::fold_steps(journal).await?;
                                 continue;
                             }
                             // A task that ended badly: the plan is written again from the first
@@ -1299,8 +1312,13 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             let plan = previous.clone().unwrap_or_default();
             let done = plan.steps_done.iter().filter(|step| step.outcome == "done").count();
             let title = plan.tasks.get(*failed as usize - 1).map(|task| task.title.clone()).unwrap_or_default();
-            // A task that ended well but showed the rest must change (REVIEW), or one that ended badly.
-            let key = if outcome == "done" { "plan_revise_live" } else { "plan_replan_live" };
+            // A task that ended well but showed the rest must change (REVIEW), one the user wrote
+            // during (a steer), or one that ended badly.
+            let key = match outcome.as_str() {
+                "done" => "plan_revise_live",
+                "steered" => "plan_steer_live",
+                _ => "plan_replan_live",
+            };
             joined(&[
                 env.data.text("plan_auto_live", &[]),
                 env.data.text(key, &[("n", &failed.to_string()), ("title", &title), ("outcome", outcome), ("summary", summary.trim()), ("done", &done.to_string())]),
@@ -1323,7 +1341,14 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // One task is the default: the request is split only where it names several parts (the
     // planner's call); several requirements of one part stay one task.
     let mut made = match (&mode, &previous) {
-        (PlanMode::Replan { .. }, Some(previous)) => plan::replanned(previous, doc, tasks, output.note.trim()),
+        (PlanMode::Replan { outcome, .. }, Some(previous)) => {
+            let mut replanned = plan::replanned(previous, doc, tasks, output.note.trim());
+            // The user's word is not a failure: it does not use up the replans.
+            if outcome == "steered" {
+                replanned.replans = previous.replans;
+            }
+            replanned
+        }
         _ => plan::Plan {
             plan_id: open.as_ref().map(|(_, open)| open.plan_id.clone()).unwrap_or_else(plan::new_id),
             version: open.as_ref().map(|(_, open)| open.version + 1).unwrap_or(1),

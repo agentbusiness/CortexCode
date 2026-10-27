@@ -98,9 +98,10 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 - Everything is built on the owner's Mac (Linux in Docker on it), never on GitHub; files go to the
   repository's GitHub releases and the catalog (release `catalog`) names what is current.
   Guide: `README.md` "Releasing"; design: `docs/RELEASES.md`.
-- Each plugin is released on its own (`scripts/release-plugin.sh <plugin>` or `--changed`); the
-  frame (`scripts/release-frame.sh`), the full app (`scripts/release-app.sh`) and the npx launcher
-  (`scripts/release-npm.sh`) each on their own. Versions: three numbers, each 0 to 99.
+- `scripts/release.sh` releases whatever changed since the last release (content digests against
+  the catalog): the frame, each changed plugin, the app when the frame moved, the npx launcher when
+  `npm/cortexcode` changed. The parts also run on their own (`scripts/release-plugin.sh <plugin>`,
+  `release-frame.sh`, `release-app.sh`, `release-npm.sh`). Versions: three numbers, each 0 to 99.
 - The app updates itself through `plugins/updater` (`update@1`): plugins the user did not change
   install when no run is going, changed ones ask first, a new frame waits for Restart to update
   (`frame/src/update.rs`: staged frames in `<home>/frame/<version>/`, the app's own frame is the

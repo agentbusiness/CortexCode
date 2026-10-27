@@ -10,7 +10,7 @@ name = "Web (HTML, CSS)"
 version = "0.1.0"
 description = "Everything CortexCode knows about HTML and CSS (SCSS, Less): the code graph's facts of pages and stylesheets, vscode-html-language-server and vscode-css-language-server diagnostics, definition, references and hover, the project's html-validate / stylelint as verifiers and web skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

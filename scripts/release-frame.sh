@@ -129,8 +129,9 @@ if [ $dry_run = 0 ]; then
     gh_upload "$rid" "$file"
   done
 fi
-jq --arg v "$version" --arg tag "$tag" --arg e "$electron_version" --argjson files "$files" \
-  '.frame = {version: $v, tag: $tag, electron: $e, files: $files}' "$catalog" > "$catalog.next"
+# What it was built from (after the builds: they write the version into the lock files).
+jq --arg v "$version" --arg tag "$tag" --arg e "$electron_version" --arg digest "$(frame_digest)" --argjson files "$files" \
+  '.frame = {version: $v, tag: $tag, electron: $e, digest: $digest, files: $files}' "$catalog" > "$catalog.next"
 mv "$catalog.next" "$catalog"
 
 mkdir -p "$artifacts"

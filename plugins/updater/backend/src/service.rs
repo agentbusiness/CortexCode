@@ -321,7 +321,7 @@ impl Updater {
                     }
                 },
             };
-            item.action = if unit.version != item.release {
+            item.action = if !same_version(&unit.version, &item.release) {
                 reset_actions::INSTALL
             } else if item.files.is_empty() {
                 reset_actions::NONE
@@ -661,7 +661,10 @@ impl Updater {
                 .failed
                 .iter()
                 .filter(|(plugin, failed)| {
-                    items.iter().find(|(item, _)| item.plugin == **plugin).is_none_or(|(item, _)| item.release != failed.version || item.installed == failed.version)
+                    items
+                        .iter()
+                        .find(|(item, _)| item.plugin == **plugin)
+                        .is_none_or(|(item, _)| item.release != failed.version || same_version(&item.installed, &failed.version))
                 })
                 .map(|(plugin, _)| plugin.clone())
                 .collect()
@@ -916,6 +919,15 @@ enum Merged {
 
 fn names(set: &[(Planned, PathBuf)]) -> String {
     set.iter().map(|(plan, _)| format!("{} {}", plan.id, plan.version)).collect::<Vec<_>>().join(", ")
+}
+
+/// Whether two versions are the same release: the build tag after `+` is not compared (a plugin
+/// without a backend reports `0.1.0+b1a2b3`, the catalog names `0.1.0`).
+fn same_version(a: &str, b: &str) -> bool {
+    match (release::Version::parse(a), release::Version::parse(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// A build of the user's own (`cortex-pack build --install`): `0.1.0+dev.20261027.004548`.

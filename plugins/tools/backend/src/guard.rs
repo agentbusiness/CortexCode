@@ -5,7 +5,7 @@
 //! - a run that holds more memory than the machine has (it can live only in swap: seen, a test
 //!   stuck at 99 GB on a 48 GB Mac, using no CPU, the model paged out under it);
 //! - a run that holds more than half of the machine's memory while it still grows or while macOS
-//!   reports memory pressure;
+//!   reports memory pressure (on Linux: the kernel's memory pressure stall information);
 //! - a run that keeps growing and holds the most while macOS reports memory pressure;
 //! - at critical memory pressure, the run that holds the most;
 //! - a background job that printed nothing, used no CPU and served no port for an hour (hung).
@@ -15,8 +15,10 @@
 //! running it again.
 
 use crate::jobs::Jobs;
+#[cfg(not(target_os = "linux"))]
 use libc::{c_int, c_void};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(target_os = "linux"))]
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +49,7 @@ pub struct Proc {
     pub start_s: u64,
 }
 
+#[cfg(not(target_os = "linux"))]
 /// A run's processes: the members of process group `pgid` and all their descendants.
 pub fn tree(pgid: i32) -> Vec<Proc> {
     if pgid <= 1 {
@@ -70,6 +73,7 @@ pub fn tree(pgid: i32) -> Vec<Proc> {
     procs
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The pids a libproc list call writes (it returns a count or a byte size depending on the call;
 /// the buffer starts zeroed, so both read the same).
 fn pids(list: impl Fn(*mut c_void, c_int) -> c_int) -> Vec<i32> {
@@ -84,6 +88,7 @@ fn pids(list: impl Fn(*mut c_void, c_int) -> c_int) -> Vec<i32> {
     buffer
 }
 
+#[cfg(not(target_os = "linux"))]
 fn proc_info(pid: i32) -> Option<Proc> {
     // SAFETY: zeroed plain-data structs the kernel fills.
     let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
@@ -101,6 +106,7 @@ fn proc_info(pid: i32) -> Option<Proc> {
     Some(Proc { pid, footprint: usage.ri_phys_footprint, cpu_ns: (ticks * numer as u128 / denom.max(1) as u128) as u64, start_s })
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The Mach timebase (CPU times come in its ticks).
 #[allow(deprecated)]
 fn timebase() -> (u32, u32) {
@@ -113,6 +119,7 @@ fn timebase() -> (u32, u32) {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 fn sysctl_u64(name: &str) -> Option<u64> {
     let name = CString::new(name).ok()?;
     let mut value = [0u8; 8];
@@ -128,16 +135,19 @@ fn sysctl_u64(name: &str) -> Option<u64> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 /// macOS memory pressure: 1 normal, 2 warning, 4 critical.
 pub fn pressure() -> u64 {
     sysctl_u64("kern.memorystatus_vm_pressure_level").unwrap_or(1)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The machine's physical memory in bytes.
 pub fn memsize() -> u64 {
     sysctl_u64("hw.memsize").unwrap_or(0)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// A process's command line (`KERN_PROCARGS2`), or its name.
 pub fn command_line(pid: i32) -> String {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
@@ -160,11 +170,120 @@ pub fn command_line(pid: i32) -> String {
     if args.is_empty() { name(pid) } else { args.join(" ") }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn name(pid: i32) -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: the callee writes at most the buffer's size.
     let n = unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if n <= 0 { format!("pid {pid}") } else { String::from_utf8_lossy(&buffer[..n as usize]).into_owned() }
+}
+
+/// Linux: the pid, parent pid and process group of every process (`/proc/<pid>/stat`).
+#[cfg(target_os = "linux")]
+fn proc_table() -> Vec<(i32, i32, i32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(|pid| {
+            let fields = stat_fields(pid)?;
+            Some((pid, fields.get(1)?.parse().ok()?, fields.get(2)?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The fields of `/proc/<pid>/stat` after the command name (state first: index 0 is field 3).
+#[cfg(target_os = "linux")]
+fn stat_fields(pid: i32) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name is in parentheses and may hold spaces and parentheses itself.
+    let rest = &text[text.rfind(')')? + 1..];
+    Some(rest.split_whitespace().map(str::to_owned).collect())
+}
+
+/// A run's processes: the members of process group `pgid` and all their descendants.
+#[cfg(target_os = "linux")]
+pub fn tree(pgid: i32) -> Vec<Proc> {
+    if pgid <= 1 {
+        return Vec::new();
+    }
+    let table = proc_table();
+    let mut queue: Vec<i32> = table.iter().filter(|(_, _, group)| *group == pgid).map(|(pid, _, _)| *pid).collect();
+    let mut seen = HashSet::new();
+    while let Some(pid) = queue.pop() {
+        if seen.insert(pid) {
+            queue.extend(table.iter().filter(|(_, parent, _)| *parent == pid).map(|(child, _, _)| *child));
+        }
+    }
+    let mut procs: Vec<Proc> = seen.into_iter().filter_map(proc_info).collect();
+    procs.sort_by_key(|proc| proc.pid);
+    procs
+}
+
+/// Linux: resident plus swapped memory (`VmRSS` + `VmSwap`), CPU time and start time of `pid`.
+#[cfg(target_os = "linux")]
+fn proc_info(pid: i32) -> Option<Proc> {
+    let fields = stat_fields(pid)?;
+    // SAFETY: sysconf only reads a constant.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let field = |n: usize| fields.get(n - 3).and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+    let cpu_ns = (field(14) + field(15)).saturating_mul(1_000_000_000 / ticks);
+    let start_s = boot_time() + field(22) / ticks;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let kb = |key: &str| {
+        status.lines().find_map(|line| line.strip_prefix(key)).and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok()).unwrap_or(0)
+    };
+    Some(Proc { pid, footprint: (kb("VmRSS:") + kb("VmSwap:")) * 1024, cpu_ns, start_s })
+}
+
+/// Seconds since the epoch when the machine booted (`btime` in /proc/stat).
+#[cfg(target_os = "linux")]
+fn boot_time() -> u64 {
+    static BOOT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+        text.lines().find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Memory pressure on the macOS scale (1 normal, 2 warning, 4 critical), from the kernel's
+/// pressure stall information: some task stalled on memory over the last 10 s (warning), or all
+/// of them (critical).
+#[cfg(target_os = "linux")]
+pub fn pressure() -> u64 {
+    let text = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
+    let avg10 = |kind: &str| {
+        text.lines()
+            .find(|line| line.starts_with(kind))
+            .and_then(|line| line.split_whitespace().find_map(|word| word.strip_prefix("avg10=")?.parse::<f64>().ok()))
+            .unwrap_or(0.0)
+    };
+    if avg10("full") >= 10.0 {
+        4
+    } else if avg10("some") >= 10.0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The machine's physical memory in bytes.
+#[cfg(target_os = "linux")]
+pub fn memsize() -> u64 {
+    // SAFETY: sysconf only reads constants.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    (pages.max(0) as u64).saturating_mul(page.max(0) as u64)
+}
+
+/// A process's command line (`/proc/<pid>/cmdline`), or its name.
+#[cfg(target_os = "linux")]
+pub fn command_line(pid: i32) -> String {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let args: Vec<String> = bytes.split(|byte| *byte == 0).filter(|arg| !arg.is_empty()).map(|arg| String::from_utf8_lossy(arg).into_owned()).collect();
+    if !args.is_empty() {
+        return args.join(" ");
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).map(|name| name.trim().to_owned()).unwrap_or_else(|_| format!("pid {pid}"))
 }
 
 /// Bytes in words: `41 GB`, `3.2 GB`, `640 MB`.
@@ -209,7 +328,7 @@ pub fn describe(procs: &[Proc], cwd: &str) -> Option<String> {
 }
 
 /// Signal every process of a run (the group and the descendants that left it).
-pub fn signal(pgid: i32, procs: &[Proc], signal: c_int) {
+pub fn signal(pgid: i32, procs: &[Proc], signal: libc::c_int) {
     if pgid > 1 {
         // SAFETY: plain syscalls on processes this plugin started.
         unsafe {

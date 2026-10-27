@@ -10,7 +10,7 @@ name = "Cortex theme"
 version = "0.1.0"
 description = "CortexCode's design language: tokens for both grounds, the bundled faces, base and component styles, and the derived CodeMirror and xterm themes."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

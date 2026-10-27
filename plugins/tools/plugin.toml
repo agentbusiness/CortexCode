@@ -8,7 +8,7 @@ name = "Tools"
 version = "0.1.0"
 description = "The agent's hands: hashline read/edit/write, search, shell runs in a write sandbox with a per-workspace Python venv, background jobs, tool-call repair and ask-mode approval."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # `cx_path` (the cx CLI agent commands call) comes from the frame config's [plugin.config].

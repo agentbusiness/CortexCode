@@ -206,9 +206,9 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     }
     let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, code, safe: cli.safe });
     frame.port.store(port, Ordering::SeqCst);
-    // The Mac does not idle-sleep while the frame runs (window open or not); shutdown releases it.
+    // The machine does not idle-sleep while the frame runs (window open or not); shutdown releases it.
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {
-        tracing::error!(%error, "cannot keep the Mac awake");
+        tracing::error!(%error, "cannot keep the machine awake");
     }
 
     // Accept plugin connections.

@@ -10,7 +10,7 @@ name = "Docker"
 version = "0.1.0"
 description = "Everything CortexCode knows about Docker: the code graph's facts of Dockerfiles and Compose files, dockerfile-language-server and compose-language-service diagnostics, definition, references and hover, docker compose config / docker build --check / hadolint verifiers, the docker CLI on commands' PATH and Docker skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

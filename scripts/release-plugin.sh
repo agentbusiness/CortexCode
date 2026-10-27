@@ -110,6 +110,8 @@ release_one() {
     done
   fi
   [ ${#files[@]} -gt 0 ] || die "$id runs on $platforms; none of RELEASE_PLATFORMS ($RELEASE_PLATFORMS)"
+  # What it was built from, after the build (which may update the plugin's lock file).
+  digest="$(plugin_digest "$dir")"
   leak_scan "${files[@]}"
   (cd "$out" && shasum -a 256 -- *.ccplugin > SHA256SUMS)
 

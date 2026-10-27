@@ -10,7 +10,7 @@ name = "TypeScript"
 version = "0.1.0"
 description = "Everything CortexCode knows about TypeScript and JavaScript: the code graph's facts of .ts/.tsx/.js files and package.json, typescript-language-server diagnostics, definition, references and hover, tsc / npm test / eslint verifiers and TypeScript skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

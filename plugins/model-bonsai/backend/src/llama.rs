@@ -216,7 +216,7 @@ impl Context {
                 params.n_seq_max,
                 kv,
                 1,
-                0,
+                crate::machine::engine_threads(),
                 error.as_mut_ptr().cast(),
                 error.len(),
             )

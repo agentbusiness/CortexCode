@@ -2727,7 +2727,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         let _ = writeln!(text, "[{} could not start: a command in the sandbox cannot start a program that needs more rights than it has. {PROGRAM_STEP}]", names.join(", "));
     }
     if eperm {
-        let _ = writeln!(text, "[\"Operation not permitted\": the sandbox stopped this (commands may write only in {WRITABLE}). {LIFT_STEP}]");
+        let _ = writeln!(text, "[\"{}\": the sandbox stopped this (commands may write only in {WRITABLE}). {LIFT_STEP}]", sandbox::REFUSED_TEXT);
     }
     let missing = missing_programs(&text);
     if !missing.is_empty() {

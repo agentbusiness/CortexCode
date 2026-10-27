@@ -1,3 +1,25 @@
+//! Context per unit of work. A session is one conversation, but what the model works from is cut
+//! at the boundaries the host sees, so it stays the size of the work at hand instead of the
+//! session's whole history (seen: one session of 7 requests grew to 193k tokens, routing and
+//! planning new requests inside 155k of earlier work, writing at 10.5 tok/s instead of 41, until
+//! the GPU memory ran out):
+//! - **A request** ([`cut_turns`]): when a turn ends, every finished turn becomes its digest (its
+//!   user message, plans, spec changes, one note listing its calls, and its final answer), so the
+//!   next request starts from the system block, the spec and that digest.
+//! - **A plan task** ([`fold_steps`], called by the flow before the next task): the finished task's
+//!   steps become one note listing their calls with the files they changed and their last test
+//!   run; the next task's step message lists every finished task's reply ("Done so far").
+//! - **Inside a long task** ([`prepare`]): at a wait past `limits.compact_early_tokens`, the least
+//!   compaction that reaches `limits.compact_target_tokens` or halves the prompt is made (older
+//!   tool outputs folded, then older steps as one note; the newest `limits.history_tail_steps`
+//!   steps stay whole). Halving bounds the re-reads: the next one comes only after the prompt has
+//!   doubled again.
+//!
+//! A cut changes the conversation near its start, so the model re-reads what follows the system
+//! block (its recurrent state cannot be cut back). At a boundary that is the small new context (the
+//! system block is a shared leading block the engine keeps), prefilled in the background where
+//! there is a wait.
+//!
 //! Every model call fits the conversation's share of the context. The prompt is counted exactly
 //! (`model.count`: the model's own chat template and tokenizer) and, when it does not leave
 //! `limits.answer_reserve_tokens` free for the answer, the conversation is compacted.
@@ -6,18 +28,13 @@
 //! `digested_through` (finished turns at or before it are shown as their user message, one note
 //! listing their calls, and their final answer), `folded_through` (older tool outputs become one
 //! line) and `steps_through` (layer 2: the running turn's steps at or before it become one note
-//! listing their calls; its newest `limits.history_tail_steps` steps always stay whole). The
-//! possible compactions are ordered least first ([`levels`]: older finished turns digested, then
+//! listing their calls; its newest `limits.history_tail_steps` steps always stay whole).
+//! The possible compactions are ordered least first ([`levels`]: older finished turns digested, then
 //! older tool outputs folded, then the newest finished turn digested, then the running turn's older
-//! steps) and the least
-//! one that brings the prompt down to `limits.compact_target_tokens` is chosen by
-//! bisection, checked by counting. Every compaction changes the conversation near its start, so the
-//! model re-reads everything after that point (its recurrent state cannot be cut back): compacting
-//! to the target, not merely to what fits, keeps those re-reads rare.
+//! steps) and the least one that reaches the goal is chosen by bisection, checked by counting.
 //!
-//! [`prepare`] compacts earlier, at a wait: while the run's tools execute once the prompt is past
-//! `limits.compact_early_tokens`, and when the turn ended past `limits.compact_idle_tokens`
-//! (lower: the user reads the answer, so the next turn starts with room). It prefills the compacted prompt in the
+//! [`prepare`] runs at a wait: while the run's tools execute, and when the turn ended (the user
+//! reads the answer, so the next turn starts with room). It prefills the cut prompt in the
 //! background (`model.prewarm`), so the next call finds it warm instead of re-reading while the user
 //! waits. The next model call cancels a prewarm still running; what it prefilled is kept.
 //!
@@ -84,10 +101,12 @@ pub async fn fitted(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
 }
 
 /// Settle the conversation up to its newest entry when that saves at least
-/// `limits.settle_min_tokens`: the in-place rewrites (outdated reads, earlier echoes of an edited
-/// file, outputs of a command run again, replaced plans, the pinned spec) then apply from here on.
-/// A settle makes the engine re-read the history after the system block once, so one that saves
-/// little is not made (seen: 12k re-read every 8 steps for about 1k saved). True when settled.
+/// `limits.settle_min_tokens` and a quarter of the prompt: the in-place rewrites (outdated reads,
+/// earlier echoes of an edited file, outputs of a command run again, replaced plans, the pinned
+/// spec) then apply from here on. A settle makes the engine re-read the history after the system
+/// block once, so one that saves little of what it re-reads is not made (seen: 12k re-read every 8
+/// steps for about 1k saved; 182k re-read, 11 minutes, for 21k saved). Boundaries settle anyway.
+/// True when settled.
 pub async fn settle(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[JournalEntry]) -> Vec<ChatMessage>) -> Result<bool, RpcError> {
     let Some((context_seq, current)) = journal.context_entry().map(|entry| (entry.seq, Marks::of(entry))) else { return Ok(false) };
     let newest = journal.last_seq();
@@ -100,7 +119,7 @@ pub async fn settle(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
         return Ok(false);
     };
     let saved = before.saturating_sub(after);
-    if saved < env.data.limits.settle_min_tokens {
+    if saved < env.data.limits.settle_min_tokens || saved < before / 4 {
         tracing::debug!(session = %env.session_id, before, after, "not settled: it would save too little");
         return Ok(false);
     }
@@ -138,6 +157,25 @@ pub async fn compact_now(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[J
     Ok(compact(env, journal, &build, u64::MAX, target(env), budget).await?.is_some_and(|(_, tokens)| tokens <= budget))
 }
 
+/// Cut at the request boundary: every finished turn not digested yet becomes its digest, and the
+/// conversation is settled through its newest entry (the in-place rewrites apply with the cut,
+/// which re-reads after the system block anyway). True when the mark moved.
+pub async fn cut_turns(journal: &mut Journal) -> Result<bool, RpcError> {
+    let Some((context_seq, current)) = journal.context_entry().map(|entry| (entry.seq, Marks::of(entry))) else { return Ok(false) };
+    let entries = journal.entries_vec();
+    let Some(newest_end) = finished_runs(&entries).into_values().max() else { return Ok(false) };
+    if newest_end <= current.digested_through {
+        return Ok(false);
+    }
+    journal.set(context_seq, "digested_through", json!(newest_end)).await?;
+    let newest = journal.last_seq();
+    let settled_before = journal.context_entry().and_then(|entry| entry.data.get(SETTLED).and_then(Value::as_u64)).unwrap_or(0);
+    if newest > settled_before {
+        journal.set(context_seq, SETTLED, json!(newest)).await?;
+    }
+    Ok(true)
+}
+
 /// A background prefill of a prompt prefix; dropping it cancels what is still running.
 pub struct Prewarm(pub(crate) CancellationToken);
 
@@ -147,12 +185,13 @@ impl Drop for Prewarm {
     }
 }
 
-/// At a wait: when the conversation before `before` (entries with a lower seq; `u64::MAX` = all)
-/// is past `trigger` tokens (`limits.compact_early_tokens` while tools run,
-/// `limits.compact_idle_tokens` when the turn ended), compact it to the target and prefill the compacted
-/// prompt in the background. `build` makes the prompt without a stage message (system and
-/// projection): what every later call starts with. Best effort: a failure leaves the conversation
-/// as it was, for [`fitted`] to handle.
+/// At a wait: first the request cut ([`cut_turns`]); then, when the conversation before `before`
+/// (entries with a lower seq; `u64::MAX` = all) is past `trigger` tokens
+/// (`limits.compact_early_tokens` while tools run, `limits.compact_idle_tokens` when the turn
+/// ended), the least compaction that reaches the target or halves it. What was cut is prefilled in
+/// the background. `build` makes the prompt without a stage message (system and projection): what
+/// every later call starts with. Best effort: a failure leaves the conversation as it was, for
+/// [`fitted`] to handle.
 pub async fn prepare(
     env: &RunEnv,
     journal: &mut Journal,
@@ -162,25 +201,30 @@ pub async fn prepare(
     build: impl Fn(&[JournalEntry]) -> Vec<ChatMessage>,
 ) -> Option<Prewarm> {
     let limits = &env.data.limits;
-    if env.prefix.ctx_window == 0 || trigger == 0 {
+    if env.prefix.ctx_window == 0 {
         return None;
     }
+    let cut = match cut_turns(journal).await {
+        Ok(cut) => cut,
+        Err(error) => {
+            tracing::warn!(%error, "cutting at the request boundary failed");
+            false
+        }
+    };
     // A background agent waiting on a long tool hands its slot back (hibernation); a prewarm would
     // hold it.
-    if env.priority == Priority::Agent && limits.hibernate_after_ms > 0 {
+    if trigger == 0 || (env.priority == Priority::Agent && limits.hibernate_after_ms > 0) {
         return None;
     }
     let early = u64::from(trigger);
     // The newest call's prompt and answer bound the conversation since (its prompt held all of it
-    // and a stage message): below the share no exact count is needed.
+    // and a stage message): below the share no exact count is needed. A cut made it smaller still.
     let newest = journal.entries().filter(|entry| entry.kind == kinds::USAGE).last().map(|usage| {
         let tokens = |field: &str| usage.data.get(field).and_then(Value::as_u64).unwrap_or(0);
         (tokens("prompt_tokens"), tokens("completion_tokens"))
     });
-    if let Some((prompt, completion)) = newest
-        && prompt > 0
-        && prompt + completion < early
-    {
+    let small = newest.is_some_and(|(prompt, completion)| prompt > 0 && prompt + completion < early);
+    if small && !cut {
         return None;
     }
     let tokens = match count(env, &build(&upto(&journal.entries_vec(), before))).await {
@@ -190,24 +234,36 @@ pub async fn prepare(
             return None;
         }
     };
-    if u64::from(tokens) < early {
-        return None;
+    if cut {
+        let before_cut = newest.map(|(prompt, _)| prompt).unwrap_or(0);
+        tracing::info!(session = %env.session_id, before = before_cut, after = tokens, "cut at the request boundary");
     }
-    // Only a compaction that reaches the target is made: one that saves little would be made again
-    // at every wait, each time re-reading the conversation for nothing (seen: 163k -> 161k, then a
-    // 12-minute re-read).
-    let target = target(env);
-    match compact(env, journal, &build, before, target, target).await {
-        Ok(Some((marks, compacted))) if compacted <= target => tracing::info!(session = %env.session_id, tokens, compacted, ?marks, "compacted early"),
-        Ok(Some((_, most))) => {
-            tracing::debug!(session = %env.session_id, tokens, most, target, "no early compaction: none reaches the target");
-            return None;
+    if u64::from(tokens) >= early {
+        // The least compaction that reaches the target or halves the prompt: one that saves little
+        // would be made again at every wait, each time re-reading the conversation for nothing
+        // (seen: 163k -> 161k, then a 12-minute re-read), and one held to a target below what can
+        // never be compacted (the system block, spec, plans, the newest steps) is never made (seen:
+        // a 24k target, nothing compacted all night, the prompt grown to 193k).
+        let goal = target(env).max(tokens / 2);
+        match compact(env, journal, &build, before, goal, goal).await {
+            Ok(Some((marks, compacted))) if compacted <= goal => tracing::info!(session = %env.session_id, tokens, compacted, ?marks, "compacted early"),
+            Ok(Some((_, most))) => {
+                tracing::info!(session = %env.session_id, tokens, most, goal, "no early compaction: none halves the prompt yet");
+                if !cut {
+                    return None;
+                }
+            }
+            Ok(None) if !cut => return None,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "early compaction failed");
+                if !cut {
+                    return None;
+                }
+            }
         }
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(%error, "early compaction failed");
-            return None;
-        }
+    } else if !cut {
+        return None;
     }
     let messages = crate::prewarm::closed(build(&upto(&journal.entries_vec(), before)));
     Some(crate::prewarm::send(&env.host, &env.cache_key(), messages, &env.prefix.tools, "the compacted conversation", false, when, |_| {}))

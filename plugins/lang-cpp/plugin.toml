@@ -10,7 +10,7 @@ name = "C/C++"
 version = "0.1.0"
 description = "Everything CortexCode knows about C and C++: the code graph's facts of C/C++ sources and headers and CMakeLists.txt, clangd diagnostics, definition, references and hover (pointed at the workspace's compile_commands.json), CMake / ctest / make verifiers and C/C++ skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

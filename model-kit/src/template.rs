@@ -4,6 +4,8 @@
 
 use cc_protocol::RpcError;
 use cc_protocol::contracts::model::{ChatMessage, ContentPart, Thinking, ToolSpec};
+use minijinja::syntax::SyntaxConfig;
+use minijinja::value::Serde;
 use minijinja::{Environment, Error, ErrorKind, Value as JinjaValue};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -42,8 +44,8 @@ pub struct ChatTemplate {
 impl ChatTemplate {
     pub fn new(source: &'static str) -> Result<Self, String> {
         let mut env = Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        let syntax = SyntaxConfig::builder().trim_blocks(true).lstrip_blocks(true).build();
+        env.set_syntax(syntax.map_err(|error| format!("chat template syntax: {error}"))?);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", |value: JinjaValue| -> Result<JinjaValue, Error> {
             let json = serde_json::to_value(&value)
@@ -68,7 +70,7 @@ impl ChatTemplate {
         }
         context.entry("add_generation_prompt").or_insert(Value::Bool(true));
         template
-            .render(JinjaValue::from_serialize(Value::Object(context)))
+            .render(JinjaValue::from(Serde(Value::Object(context))))
             .map_err(|error| RpcError::invalid_params(format!("the chat template rejected the conversation: {error:#}")))
     }
 
