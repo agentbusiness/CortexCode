@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Release the app new users download: put the current frame, Electron and every plugin named in
-# the catalog together (nothing is built), as CortexCode.app (a .dmg and a .tar.gz) for macOS and a
+# the catalog together (nothing is built), as CortexCode.app (a .tar.gz; a .dmg too with RELEASE_DMG=yes) for macOS and a
 # `cortexcode` folder (.tar.gz) for Linux, in a GitHub release `v<version>`, named in the catalog
 # (the npx launcher installs it from there). Release the frame and the plugins first.
 #
@@ -112,16 +112,21 @@ for platform in $RELEASE_PLATFORMS; do
       codesign --force --sign - "$app/Contents/MacOS/CortexCode" >/dev/null 2>&1
       archive="$out/CortexCode-$version-darwin-arm64.tar.gz"
       tar_dir "$bundle" "$archive"
-      dmg_source="$base/dmg"
-      mkdir -p "$dmg_source"
-      ditto "$app" "$dmg_source/CortexCode.app"
-      ln -s /Applications "$dmg_source/Applications"
-      dmg="$out/CortexCode-$version-arm64.dmg"
-      step "making the disk image"
-      hdiutil create -quiet -volname "CortexCode $version" -srcfolder "$dmg_source" -ov -format UDZO "$dmg"
       leak_scan "$archive"
-      uploads+=("$archive" "$dmg")
-      files="$(jq --arg p "$platform" --argjson a "$(asset_json "$archive" "$tag")" --argjson d "$(asset_json "$dmg" "$tag")" '.[$p] = {archive: $a, dmg: $d}' <<<"$files")"
+      uploads+=("$archive")
+      files="$(jq --arg p "$platform" --argjson a "$(asset_json "$archive" "$tag")" '.[$p] = {archive: $a}' <<<"$files")"
+      # The disk image only when RELEASE_DMG=yes: an unsigned one is not offered for download.
+      if [ "$RELEASE_DMG" = yes ]; then
+        dmg_source="$base/dmg"
+        mkdir -p "$dmg_source"
+        ditto "$app" "$dmg_source/CortexCode.app"
+        ln -s /Applications "$dmg_source/Applications"
+        dmg="$out/CortexCode-$version-arm64.dmg"
+        step "making the disk image"
+        hdiutil create -quiet -volname "CortexCode $version" -srcfolder "$dmg_source" -ov -format UDZO "$dmg"
+        uploads+=("$dmg")
+        files="$(jq --arg p "$platform" --argjson d "$(asset_json "$dmg" "$tag")" '.[$p].dmg = $d' <<<"$files")"
+      fi
       ;;
     linux-*)
       folder="$base/bundle/cortexcode"
@@ -145,7 +150,8 @@ done
 (cd "$out" && shasum -a 256 -- * > SHA256SUMS)
 
 if [ $dry_run = 0 ]; then
-  notes="CortexCode $version (frame $frame_version). Run it with \`npx cortexcode\`, or download it below: on macOS open the .dmg and move CortexCode to Applications (the first start asks in System Settings > Privacy & Security > Open Anyway: the app is not signed by Apple yet); on Linux unpack the .tar.gz and run cortexcode/CortexCode. Updates come by themselves."
+  notes="CortexCode $version (frame $frame_version). Run it with \`npx cortexcode\` (macOS on Apple silicon, Linux arm64 and x64). On Linux you can also unpack the .tar.gz below and run cortexcode/CortexCode. Updates come by themselves."
+  [ "$RELEASE_DMG" != yes ] || notes="$notes On macOS you can also open the .dmg and move CortexCode to Applications (the first start asks in System Settings > Privacy & Security > Open Anyway: the app is not signed by Apple yet)."
   rid="$(gh_release "$tag" "CortexCode $version" "$notes" true false)"
   for file in "${uploads[@]}"; do
     step "uploading $(basename "$file")"
