@@ -52,3 +52,5 @@ cortex-pack build plugins/chatflow                  # -> plugins/chatflow/target
 ```
 
 `cortex-pack build plugins/chatflow --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the backend and the UI packages together; Settings > Plugins disables and enables the whole plugin.
+
+A conversation is named by its first message (`title_from` in `chatflow.rs`): the first line's first words, at most 48 characters, an opening "please" or "can you" left out. A conversation created with a title (a fix conversation, a security audit) keeps it.

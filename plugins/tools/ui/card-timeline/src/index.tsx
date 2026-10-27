@@ -107,12 +107,6 @@ function TimelineSection() {
           <button type="button" className="cx-cs-row" onClick={() => setOpen(!open)} aria-expanded={open} data-action="toggle" title="Every step since the last commit, newest first">
             <span className="t">{summary}</span>
             <span className="grow" />
-            {standing.length > 0 && (
-              <>
-                <span className="ap cx-plus" data-testid="timeline-added">+{data.added}</span>
-                <span className="ap cx-minus" data-testid="timeline-removed">−{data.removed}</span>
-              </>
-            )}
           </button>
           <button type="button" className="detent tiny" data-action="undo-last" disabled={busy || standing.length === 0} onClick={undoLast} title="Undo the newest step (and later steps that touched its files)">Undo</button>
           <button type="button" className="detent tiny" data-action="redo" disabled={busy || !canRedo} onClick={redo} title="Take the last undo back">Redo</button>

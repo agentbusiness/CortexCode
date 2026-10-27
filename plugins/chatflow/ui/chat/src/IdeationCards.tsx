@@ -214,8 +214,8 @@ function DecisionList({ decisions }: { decisions: Decided[] }) {
       {decisions.map((decision, index) => (
         <li key={index}>
           <span className="cx-decided">{decision.decided}</span>
-          {decision.because && <span className="ap faint"> because {decision.because}</span>}
-          {decision.rejected && <span className="ap faint"> · rejected: {decision.rejected}</span>}
+          {decision.because && <span className="cx-aside"> <span className="ap faint">because</span> {decision.because}</span>}
+          {decision.rejected && <span className="cx-aside"> <span className="ap faint">rejected</span> {decision.rejected}</span>}
         </li>
       ))}
     </ul>
@@ -239,11 +239,15 @@ export function DecisionCard({ entry, actions }: { entry: JournalEntry; actions:
       <span className="kindmark" />
       <span className="ap lbl">{pending ? 'Decision proposed' : state === 'accepted' ? 'Decision accepted' : 'Decision rejected'}</span>
       <p className="cx-decided">{str(entry.data.decided)}</p>
-      {str(entry.data.because) && <p className="ap faint">Because: {str(entry.data.because)}</p>}
-      {str(entry.data.rejected) && <p className="ap faint">Rejected: {str(entry.data.rejected)}</p>}
+      {(str(entry.data.because) || str(entry.data.rejected)) && (
+        <dl className="cx-option-meta">
+          {str(entry.data.because) && <><dt className="ap faint">because</dt><dd>{str(entry.data.because)}</dd></>}
+          {str(entry.data.rejected) && <><dt className="ap faint">rejected</dt><dd>{str(entry.data.rejected)}</dd></>}
+        </dl>
+      )}
       {pending && (
         <div className="acts">
-          <button type="button" className="detent" data-action="accept" disabled={busy !== null} onClick={() => void act('accept', () => actions.answerDecision(entry.seq, true))}>{busy === 'accept' ? 'Accepting…' : 'Accept'}</button>
+          <button type="button" className="detent" data-action="accept" disabled={busy !== null} title="Adds the decision to the spec; it starts no work" onClick={() => void act('accept', () => actions.answerDecision(entry.seq, true))}>{busy === 'accept' ? 'Accepting…' : 'Accept'}</button>
           <button type="button" className="detent warn" data-action="reject" disabled={busy !== null} onClick={() => void act('reject', () => actions.answerDecision(entry.seq, false))}>{busy === 'reject' ? 'Rejecting…' : 'Reject'}</button>
         </div>
       )}
@@ -458,7 +462,7 @@ export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: Ide
         {plan.goal && <span className="cx-plan-goal">{plan.goal}</span>}
       </summary>
       {plan.goal && <p className="prose">{plan.goal}</p>}
-      {plan.note && <p className="ap faint">{plan.note}</p>}
+      {plan.note && <p className="cx-aside">{plan.note}</p>}
       {plan.analysis && <p className="prose"><span className="ap faint">Thought through </span>{plan.analysis}</p>}
       {plan.approach && <p className="prose"><span className="ap faint">Approach </span>{plan.approach}</p>}
       {plan.steps.length > 0 && plan.tasks.length === 0 && (
@@ -480,13 +484,17 @@ export function PlanCard({ entry, actions }: { entry: JournalEntry; actions: Ide
               <li key={task.n} data-task={task.n} data-state={stepState}>
                 <span className="cx-task-title">{task.title}</span>
                 {done && done.summary && <span className="cx-plan-step-summary">{done.summary}</span>}
-                {task.depends_on.length > 0 && <span className="ap faint" data-depends> after {task.depends_on.map(titleOf).join(', ')}</span>}
+                {task.depends_on.length > 0 && <span className="cx-aside" data-depends> <span className="ap faint">after</span> {task.depends_on.map(titleOf).join(', ')}</span>}
                 {task.brief && <p className="cx-task-brief">{task.brief}</p>}
                 {task.rules.length > 0 && <ul className="cx-plan-rules" aria-label="Rules">{task.rules.map((rule, at) => <li key={at}>{rule}</li>)}</ul>}
-                {task.touches.length > 0 && <p className="ap faint">touches {task.touches.join(', ')}</p>}
-                {task.checks.length > 0 && <p className="ap faint">checks {task.checks.map((check) => `\`${check}\``).join(', ')}</p>}
-                {task.covers.length > 0 && <p className="ap faint">covers {task.covers.join(', ')}</p>}
-                {task.skills.length > 0 && <p className="ap faint">skills {task.skills.join(', ')}</p>}
+                {(task.touches.length > 0 || task.checks.length > 0 || task.covers.length > 0 || task.skills.length > 0) && (
+                  <dl className="cx-task-meta">
+                    {task.touches.length > 0 && <><dt className="ap faint">touches</dt><dd>{task.touches.map((file, at) => <code key={at}>{file}</code>)}</dd></>}
+                    {task.checks.length > 0 && <><dt className="ap faint">checks</dt><dd>{task.checks.map((check, at) => <code key={at}>{check}</code>)}</dd></>}
+                    {task.covers.length > 0 && <><dt className="ap faint">covers</dt><dd>{task.covers.join(', ')}</dd></>}
+                    {task.skills.length > 0 && <><dt className="ap faint">skills</dt><dd>{task.skills.join(', ')}</dd></>}
+                  </dl>
+                )}
                 <CommentList comments={onTask(task)} onRemove={remove} />
                 {open && (commenting === task.n
                   ? <CommentBox label={`Comment on task ${task.n}`} onSend={(text) => actions.commentPlan(plan.planId, task.n, text)} onClose={() => setCommenting(null)} />
@@ -544,9 +552,11 @@ function Finding({ found }: { found: FoundView }) {
   const linked = /^https?:\/\//.test(found.ref);
   return (
     <li data-kind={found.kind}>
-      <span className="ap faint">{where} </span>
-      {linked ? <a href={found.ref} target="_blank" rel="noreferrer">{found.text || found.ref}</a> : <code>{found.ref}</code>}
-      {!linked && found.text && <span className="ap faint"> {found.text}</span>}
+      <span className="ap faint">{where}</span>
+      <span className="cx-finding-body">
+        {linked ? <a href={found.ref} target="_blank" rel="noreferrer">{found.text || found.ref}</a> : <code>{found.ref}</code>}
+        {!linked && found.text && <span className="cx-finding-text">{found.text}</span>}
+      </span>
     </li>
   );
 }
@@ -557,13 +567,13 @@ export function IdeasCard({ entry }: { entry: JournalEntry }) {
   return (
     <details className="cx-ideas" data-seq={entry.seq} data-kind="ideas">
       <summary className="ap faint">Weighed {view.ideas.length} ideas{view.question ? ` for: ${view.question}` : ''}</summary>
-      {view.constraints.length > 0 && <p className="ap faint">Constraints: {view.constraints.join('; ')}</p>}
+      {view.constraints.length > 0 && <p className="cx-labelled"><span className="ap faint">Constraints</span>{view.constraints.join('; ')}</p>}
       <ol className="cx-ideas-list">
         {view.ideas.map((idea) => (
           <li key={idea.n} data-idea={idea.n}>
-            <span className="cx-idea-name">{idea.name}</span> <span className="ap faint">({idea.principle})</span>
+            <span className="cx-idea-name">{idea.name}</span> <span className="cx-idea-principle">{idea.principle}</span>
             <p className="cx-idea-mechanism">{idea.mechanism}</p>
-            {idea.found.length > 0 ? <ul className="cx-findings">{idea.found.map((found, at) => <Finding key={at} found={found} />)}</ul> : <p className="ap faint">nothing found</p>}
+            {idea.found.length > 0 ? <ul className="cx-findings">{idea.found.map((found, at) => <Finding key={at} found={found} />)}</ul> : <p className="cx-faint-line">Nothing found.</p>}
           </li>
         ))}
       </ol>
@@ -575,12 +585,16 @@ function OptionBody({ choice }: { choice: ChoiceView }) {
   return (
     <>
       <p className="cx-option-mechanism">{choice.mechanism}</p>
-      {choice.why && <p className="prose"><span className="ap faint">Why </span>{choice.why}</p>}
+      {(choice.why || choice.priorArt || choice.cost || choice.risk || choice.settleBy) && (
+        <dl className="cx-option-meta">
+          {choice.why && <><dt className="ap faint">why</dt><dd>{choice.why}</dd></>}
+          {choice.priorArt && <><dt className="ap faint">done before</dt><dd>{choice.priorArt}</dd></>}
+          {choice.cost && <><dt className="ap faint">cost</dt><dd>{choice.cost}</dd></>}
+          {choice.risk && <><dt className="ap faint">risk</dt><dd>{choice.risk}</dd></>}
+          {choice.settleBy && <><dt className="ap faint">settle early</dt><dd>{choice.settleBy}</dd></>}
+        </dl>
+      )}
       {choice.grounding.length > 0 && <ul className="cx-findings" aria-label="Builds on">{choice.grounding.map((found, at) => <Finding key={at} found={found} />)}</ul>}
-      {choice.priorArt && <p className="ap faint">Done before: {choice.priorArt}</p>}
-      {choice.cost && <p className="ap faint">Cost: {choice.cost}</p>}
-      {choice.risk && <p className="ap faint">Risk: {choice.risk}</p>}
-      {choice.settleBy && <p className="ap faint">Settle early by: {choice.settleBy}</p>}
     </>
   );
 }
@@ -604,7 +618,12 @@ export function OptionsCard({ entry, actions }: { entry: JournalEntry; actions: 
       <span className="kindmark" />
       <span className="ap lbl">Options{chosen ? ` · chose ${chosen === 'radical' ? 'the radical one' : chosen}` : ''}</span>
       {view.question && <p className="cx-plan-goal">{view.question}</p>}
-      {view.criteria.length > 0 && <p className="ap faint">Compared by {view.criteria.join('; ')}</p>}
+      {view.criteria.length > 0 && (
+        <div className="cx-criteria">
+          <span className="ap faint">Compared by</span>
+          <ul>{view.criteria.map((criterion, at) => <li key={at}>{criterion}</li>)}</ul>
+        </div>
+      )}
       {view.options.length === 0 && <p className="prose">No idea held up; the reasons are below.</p>}
       <ol className="cx-option-list">
         {view.options.map((choice) => (
@@ -625,19 +644,24 @@ export function OptionsCard({ entry, actions }: { entry: JournalEntry; actions: 
               <span className="cx-option-name">{view.radical.name}</span>
               {!chosen && <button type="button" className="detent" data-action="choose" disabled={busy !== null} onClick={() => choose('radical')}>{busy === 'choose:radical' ? 'Choosing…' : 'Choose'}</button>}
             </div>
-            <p className="prose"><span className="ap faint">Drops </span>{view.radical.drops}</p>
-            <p className="prose"><span className="ap faint">Buys </span>{view.radical.buys}</p>
-            <p className="ap faint">Wins if {view.radical.wins_if}</p>
+            <dl className="cx-option-meta">
+              <dt className="ap faint">drops</dt><dd>{view.radical.drops}</dd>
+              <dt className="ap faint">buys</dt><dd>{view.radical.buys}</dd>
+              <dt className="ap faint">wins if</dt><dd>{view.radical.wins_if}</dd>
+            </dl>
           </li>
         )}
       </ol>
       {view.recommend && (
-        <p className="prose"><span className="ap faint">Recommended {view.recommend} </span>because {view.because}{view.wouldChangeIf ? <span className="ap faint"> · would change if {view.wouldChangeIf}</span> : null}</p>
+        <dl className="cx-option-meta cx-recommend">
+          <dt className="ap live">recommended {view.recommend}</dt><dd>{view.because}</dd>
+          {view.wouldChangeIf && <><dt className="ap faint">would change if</dt><dd>{view.wouldChangeIf}</dd></>}
+        </dl>
       )}
       {dropped.length > 0 && (
         <details className="cx-plan-diff">
           <summary className="ap faint">Set aside · {dropped.length}</summary>
-          <ul>{dropped.map((item) => <li key={item.idea}>Idea {item.idea}: {item.why}</li>)}</ul>
+          <ul>{dropped.map((item) => <li key={item.idea}><span className="ap faint">idea {item.idea}</span> {item.why}</li>)}</ul>
         </details>
       )}
       {chosen && chosenName && (
@@ -646,7 +670,7 @@ export function OptionsCard({ entry, actions }: { entry: JournalEntry; actions: 
             onClick={() => planIt(chosenName, chosen === 'radical' ? 'radical' : chosen)}>{busy === 'plan' ? 'Sending…' : 'Plan it'}</button>
         </div>
       )}
-      {!chosen && <p className="ap faint">Choose one, or write what to change.</p>}
+      {!chosen && <p className="cx-faint-line">Choose one, or write what to change.</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
     </section>
   );

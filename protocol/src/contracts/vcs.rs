@@ -167,6 +167,9 @@ pub struct FileDiff {
     pub old_path: Option<String>,
     pub status: String,
     pub binary: bool,
+    /// The change is too large to carry: `hunks` is empty, the counts still say how much.
+    #[serde(default)]
+    pub truncated: bool,
     pub hunks: Vec<Hunk>,
     #[serde(default)]
     pub added: u32,

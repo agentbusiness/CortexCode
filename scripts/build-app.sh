@@ -25,6 +25,19 @@ res="$contents/Resources"
 cd "$repo"
 
 step() { printf 'build-app: %s\n' "$*"; }
+
+# Nothing changed since the last complete build: the app is current, there is nothing to do. The
+# stamp covers every source file (tracked or not, ignored ones left out) by path, size and mtime,
+# and HEAD; it is written only when a build ran through.
+stamp_of() {
+  { git rev-parse HEAD 2>/dev/null; git ls-files -co --exclude-standard -z | xargs -0 stat -f '%N %z %m' 2>/dev/null; } | shasum -a 256 | cut -c1-16
+}
+stamp="$(stamp_of)"
+if [ -x "$contents/MacOS/CortexCode" ] && [ "$(cat "$out/.stamp" 2>/dev/null)" = "$stamp" ]; then
+  step "nothing changed since the last build; the app is current"
+  exit 0
+fi
+rm -f "$out/.stamp"
 # shellcheck source=app/electron.sh
 . "$repo/scripts/app/electron.sh"
 # The source files git tracks or would track under the given paths, that exist (NUL-separated).
@@ -107,3 +120,6 @@ sed -e "s/@VERSION@/$version/" -e "s/@BUILD@/$build/" scripts/app/Info.plist > "
 codesign --force --sign - "$contents/MacOS/CortexCode" >/dev/null 2>&1
 
 step "done: $app"
+
+# The build ran through: remember what it was built from.
+printf '%s\n' "$stamp" > "$out/.stamp"

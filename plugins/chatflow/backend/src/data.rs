@@ -57,6 +57,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/experiment_rule_checks.md", include_str!("../data/prompts/experiment_rule_checks.md")),
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
+    ("prompts/discover.md", include_str!("../data/prompts/discover.md")),
     ("prompts/ideas.md", include_str!("../data/prompts/ideas.md")),
     ("prompts/options.md", include_str!("../data/prompts/options.md")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
@@ -79,7 +80,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "IDEAS", "OPTIONS"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "DISCOVER", "IDEAS", "OPTIONS"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);

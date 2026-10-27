@@ -9,7 +9,7 @@ export interface ServiceRow {
 }
 
 /** A plugin as one unit (frame.plugins.list `units`); a disabled one's service is meant to be off. */
-export interface PluginUnit { id: string; enabled: boolean; category?: string | null }
+export interface PluginUnit { id: string; enabled: boolean; category?: string | null; version?: string }
 
 /** One row per category: the active instance when there is one, else the newest; missing ones too. */
 export function serviceRows(list: readonly PluginInfo[]): ServiceRow[] {

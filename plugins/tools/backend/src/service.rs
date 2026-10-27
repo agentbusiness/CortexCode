@@ -11,7 +11,7 @@ use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
     ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
-    JobListParams, JobListResult, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
+    JobListParams, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
     RunnerSetParams, SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineApplyParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
     WorkspaceListResult, WorkspaceRemoveParams, methods, topics,
 };
@@ -102,6 +102,7 @@ impl ToolsPlugin {
                 core.jobs.set_publisher(Arc::new(JobEnds { host: CtxHost(ctx.clone()), core: Arc::downgrade(&core) }));
                 core.steps.set_publisher(Arc::new(CtxHost(ctx.clone())));
                 core.jobs.adopt();
+                crate::guard::Guard::start(core.jobs.clone(), core.shells.groups.clone());
                 core
             })
             .await
@@ -352,15 +353,47 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::JOB_KILL => {
             check_command_job(&core, &params)?;
+            // The card's buttons: `mode` "stop" (SIGTERM) or "kill" (SIGKILL now), and the job's
+            // output ends saying the user did it; without a mode (`cx job kill`) it escalates.
+            let mode = params.get("mode").and_then(Value::as_str).map(str::to_owned);
             let params: JobParams = parse_params(params)?;
-            core.jobs.kill(&params.job_id).await.ok_or_else(|| RpcError::not_found(format!("no job `{}`", params.job_id)))?;
+            let found = match mode.as_deref() {
+                Some("stop") => core.jobs.stop(&params.job_id, "[stopped by the user]", crate::jobs::StopMode::Term).await,
+                Some("kill") => core.jobs.stop(&params.job_id, "[killed by the user]", crate::jobs::StopMode::Kill).await,
+                _ => core.jobs.kill(&params.job_id).await,
+            };
+            found.ok_or_else(|| RpcError::not_found(format!("no job `{}`", params.job_id)))?;
             to_value(&job_status(&core, &params.job_id)?)
         }
         methods::JOB_LIST => {
+            // The card asks for the running jobs of one project (`running`, `project_id`) and shows
+            // each one's command and memory: those come as extra fields of each entry.
+            let running_only = params.get("running").and_then(Value::as_bool).unwrap_or(false);
+            let project = params.get("project_id").and_then(Value::as_str).map(str::to_owned);
             let params: JobListParams = if params.is_null() { JobListParams::default() } else { parse_params(params)? };
-            let jobs =
-                core.jobs.list(params.session_id.as_deref()).into_iter().filter_map(|meta| job_status(&core, &meta.job_id).ok()).collect();
-            to_value(&JobListResult { jobs })
+            let metas: Vec<_> = core
+                .jobs
+                .list(params.session_id.as_deref())
+                .into_iter()
+                .filter(|meta| !running_only || meta.state == "running")
+                .filter(|meta| project.as_deref().is_none_or(|project| meta.project_id == project))
+                .collect();
+            let mut jobs = Vec::new();
+            for meta in metas {
+                let Ok(status) = job_status(&core, &meta.job_id) else { continue };
+                let mut entry = to_value(&status)?;
+                let memory: u64 = if meta.state == "running" { crate::guard::tree(meta.pid).iter().map(|proc| proc.footprint).sum() } else { 0 };
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("command".into(), json!(meta.command));
+                    object.insert("cwd".into(), json!(meta.cwd));
+                    object.insert("session_id".into(), json!(meta.session_id));
+                    object.insert("project_id".into(), json!(meta.project_id));
+                    object.insert("memory_bytes".into(), json!(memory));
+                    object.insert("note".into(), json!(meta.note));
+                }
+                jobs.push(entry);
+            }
+            Ok(json!({ "jobs": jobs }))
         }
         methods::ARTIFACT => {
             let params: ArtifactParams = parse_params(params)?;

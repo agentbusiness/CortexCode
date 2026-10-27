@@ -11,7 +11,7 @@
  */
 
 import { Fragment, useState, type ReactNode } from 'react';
-import { definePlugin, duration, errorMessage, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
+import { definePlugin, duration, errorMessage, setShared, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
 import { ResetAll, version } from './ResetAll';
 import './plugins.css';
 
@@ -158,6 +158,14 @@ function PluginsPanel() {
               {process && service.state === 'active' ? (
                 <div className="cx-plugin-acts">
                   <button className="detent" type="button" disabled={busy !== null} data-action="restart" onClick={() => void restart(service.category)}>{busy === service.category ? 'Restarting…' : 'Restart'}</button>
+                </div>
+              ) : null}
+              {process && service.state !== 'active' ? (
+                <div className="cx-plugin-acts">
+                  <button className="detent warn" type="button" data-action="fix-in-chat" title="Start a conversation on CortexCode's own source about this service"
+                    onClick={() => setShared('plugins.fix', { plugin: unit.id, category: service.category, version: service.version, ts: Date.now(), reason: service.state === 'crashed' ? `stops right after it starts: ${service.restarts ?? 0} exits in a row, and CortexCode keeps restarting it` : `is ${service.state} and does not serve` })}>
+                    Fix it in a chat
+                  </button>
                 </div>
               ) : null}
             </td>

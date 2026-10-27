@@ -20,8 +20,10 @@ outside):
 | `plugin.toml` | identity, build command and output, source location, verification commands |
 | `backend/` | Cargo workspace (depends on `cc-protocol` by path), binary `cc-tools`: category `tools`, contract `tools@1` |
 
-The plugin has no UI package of its own: the file tree and editor are the code-view plugin's, which
-call `tools.files` and `tools.save`.
+The file tree and editor are the code-view plugin's, which call `tools.files` and `tools.save`. The
+plugin's own UI packages are two rows of the project card: `card.timeline@1` (the step log, below)
+and `card.jobs@1` (the running background jobs, under the model: command, age, memory, Stop and
+Kill; the job's output then ends saying the user stopped it).
 
 ## Build and run
 
@@ -74,6 +76,29 @@ command past the sandbox in the session. A file `edit` created in the running tu
 whole again (the model's own draft); the list is cleared when the turn ends. A `.cortex-env` file (`KEY=VALUE` lines, `$NAME`
 expanded) in the workspace or above it is loaded into its shells and jobs: a toolchain the machine
 does not have on its PATH.
+
+## The machine guard
+
+`guard.rs` measures every run's processes every two seconds (each session shell's process group,
+each background job's group, and their descendants, also ones that left the group) and stops a run
+that would take the machine down or that nobody runs any more; it never stops work for how long it
+runs. A stopped run's result ends with the host's note (why, then what to fix), so the model fixes
+the code instead of running it again:
+
+- **Memory runaway:** a run that holds more memory than the machine has (it lives only in swap); one
+  that holds more than half of it while it grows or while macOS reports memory pressure; one
+  that grows and holds the most while macOS reports memory pressure; at critical pressure, the run
+  that holds the most. Growing: up by 5% (at least 256 MB) over 30 s.
+- **Hung job:** a background job that printed nothing, used no CPU and served no TCP port for an
+  hour.
+- **Repeat:** starting the same command again (same session and folder; `command_head` compares
+  the first real step without its redirections) stops the earlier background job; the new result
+  says so.
+- **Left behind:** what a job's command left running when it ended (`server &` inside a job) is
+  stopped with its note.
+
+A timeout names what the command was really running when it was killed (the test binary, not the
+build), so a hanging test does not read as a slow build.
 
 ## The step log and undo
 

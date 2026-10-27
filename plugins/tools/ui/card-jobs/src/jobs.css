@@ -1,0 +1,3 @@
+/* card.jobs@1 */
+#cc .cx-job .t.cx-mono{flex:1 1 auto;font-family:var(--font-mono);font-size:12px;}
+#cc .cx-job + .cx-job{margin-top:2px;}

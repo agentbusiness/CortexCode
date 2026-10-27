@@ -184,7 +184,7 @@ export const TurnView = memo(function TurnView({ turn, actions, live, progress =
         <article className="turn you" data-seq={turn.user.seq} aria-label="Your message">
           <div className="turn-h">
             <span className="ap">{typeof turn.user.data.from_steer === 'number' ? 'You steered' : 'You asked'}</span>
-            {typeof turn.user.data.from_steer === 'number' && <span className="ap faint">arrived as the last run ended, so it started this one</span>}
+            {typeof turn.user.data.from_steer === 'number' && <span className="cx-aside">arrived as the last run ended, so it started this one</span>}
             <span className="grow" />
             <time className="ap faint">{clock(turn.user.ts_ms)}</time>
           </div>

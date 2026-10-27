@@ -3,7 +3,8 @@
 # the UI, every plugin built and packed, cx, cortex-pack and the source) into build/ with
 # scripts/build-app.sh, then run it. Its first start installs the packed plugins into ~/.cortexcode,
 # syncs the source into ~/.cortexcode/code and puts cx and cortex-pack into ~/.cortexcode/bin, as the
-# downloaded app does. A plugin whose source did not change keeps its package.
+# downloaded app does. A plugin whose source did not change keeps its package, and a start with
+# nothing changed since the last complete build (build/.stamp) skips the build altogether.
 #
 # Usage: cortexcode [frame options, e.g. --headless or --safe]   (a link to this file works too)
 self="$0"
