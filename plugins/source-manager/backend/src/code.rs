@@ -255,20 +255,8 @@ pub enum Scope {
 /// The shipped tree with `scope` replaced by the files of `source`.
 fn released_tree(repo: &Repository, base: &Tree, scope: &Scope, source: &Path) -> Result<Oid> {
     let released = shipped_tree(repo, source)?;
-    let tree_mode = i32::from(FileMode::Tree);
     match scope {
-        Scope::Plugin(id) => {
-            let plugins = match base.get_name("plugins") {
-                Some(entry) => Some(repo.find_tree(entry.id()).map_err(err)?),
-                None => None,
-            };
-            let mut builder = repo.treebuilder(plugins.as_ref()).map_err(err)?;
-            builder.insert(id, released, tree_mode).map_err(err)?;
-            let plugins = builder.write().map_err(err)?;
-            let mut root = repo.treebuilder(Some(base)).map_err(err)?;
-            root.insert("plugins", plugins, tree_mode).map_err(err)?;
-            root.write().map_err(err)
-        }
+        Scope::Plugin(id) => with_plugin(repo, base, id, released),
         Scope::Frame => {
             let released = repo.find_tree(released).map_err(err)?;
             let mut root = repo.treebuilder(Some(&released)).map_err(err)?;
@@ -281,6 +269,66 @@ fn released_tree(repo: &Repository, base: &Tree, scope: &Scope, source: &Path) -
             root.write().map_err(err)
         }
     }
+}
+
+/// `root` with `plugins/<id>` replaced by the tree `plugin`.
+fn with_plugin(repo: &Repository, root: &Tree, id: &str, plugin: Oid) -> Result<Oid> {
+    let tree_mode = i32::from(FileMode::Tree);
+    let plugins = match root.get_name("plugins") {
+        Some(entry) => Some(repo.find_tree(entry.id()).map_err(err)?),
+        None => None,
+    };
+    let mut builder = repo.treebuilder(plugins.as_ref()).map_err(err)?;
+    builder.insert(id, plugin, tree_mode).map_err(err)?;
+    let plugins = builder.write().map_err(err)?;
+    let mut out = repo.treebuilder(Some(root)).map_err(err)?;
+    out.insert("plugins", plugins, tree_mode).map_err(err)?;
+    out.write().map_err(err)
+}
+
+/// Put one plugin's folder back to its released source (`source`: exactly the plugin's files).
+/// The user's changes in it, committed or not, are dropped; the rest of the code folder, including
+/// uncommitted edits elsewhere, stays. Returns `reset` with the files put back, or `up_to_date`.
+pub fn reset_plugin(repo: &Repository, id: &str, source: &Path, version: &str) -> Result<(&'static str, Vec<String>)> {
+    let prefix = format!("plugins/{id}/");
+    let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let new_shipped_id = released_tree(repo, &base, &Scope::Plugin(id.to_owned()), source)?;
+    let new_shipped = repo.find_tree(new_shipped_id).map_err(err)?;
+    let released = new_shipped.get_path(Path::new(&format!("plugins/{id}"))).map_err(err)?.id();
+    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
+    let head_tree = head.tree().map_err(err)?;
+    let result = repo.find_tree(with_plugin(repo, &head_tree, id, released)?).map_err(err)?;
+    let mut files = changed_files(repo, Some(&head_tree), Some(&result))?;
+    // Uncommitted changes in the folder: edits go back with the checkout, additions are removed.
+    let uncommitted: Vec<String> = changed_paths(repo)?.into_iter().filter(|file| file.starts_with(&prefix)).collect();
+    if files.is_empty() && uncommitted.is_empty() && base.id() == new_shipped_id {
+        return Ok(("up_to_date", Vec::new()));
+    }
+    let work = repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
+    for file in &uncommitted {
+        if result.get_path(Path::new(file)).is_err() {
+            let _ = std::fs::remove_file(work.join(file));
+        }
+    }
+    files.extend(uncommitted);
+    files.sort();
+    files.dedup();
+    // The plugin's folder only: the user's uncommitted edits elsewhere are not touched.
+    let mut builder = CheckoutBuilder::new();
+    builder.force().path(format!("plugins/{id}"));
+    repo.checkout_tree(result.as_object(), Some(&mut builder)).map_err(err)?;
+    let shipped = shipped_commit(repo, new_shipped_id)?;
+    let shipped_parent = repo.find_commit(shipped).map_err(err)?;
+    let text = message(
+        &format!("Reset {id} to its release {version}"),
+        &[("Origin", "update".into()), ("Plugins", id.to_owned()), ("Shipped-Tree", new_shipped_id.to_string())],
+    );
+    let sig = signature(now_ms())?;
+    let commit = repo.commit(None, &sig, &sig, &text, &result, &[&head, &shipped_parent]).map_err(err)?;
+    repo.reference(MAIN, commit, true, "reset").map_err(err)?;
+    repo.reference(SHIPPED, shipped, true, "reset").map_err(err)?;
+    set_index(repo, &result)?;
+    Ok(("reset", files))
 }
 
 /// Merge a released source into the code folder, keeping the user's changes.
@@ -589,12 +637,17 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<Change>> {
     let mut reverted: HashMap<String, String> = HashMap::new();
     let mut commit = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
     loop {
+        // A root commit is the shipped source itself: the starting point, not a change.
+        let Ok(parent) = commit.parent(0) else { break };
         let (summary, trailers) = parse_message(commit.message().unwrap_or_default());
         let origin = trailers.get("Origin").cloned().unwrap_or_else(|| "edit".into());
-        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let parent_tree = parent.tree().ok();
         let tree = commit.tree().map_err(err)?;
-        // A shipped or update commit's own files are the whole source: list none.
-        let files = if matches!(origin.as_str(), "shipped" | "update" | "restore") { Vec::new() } else { changed_files(repo, parent_tree.as_ref(), Some(&tree))? };
+        // What the commit changed against its first parent. An update or restore lists no files of
+        // its own (they can be many), but its kind still says what came in.
+        let changed = changed_files(repo, parent_tree.as_ref(), Some(&tree))?;
+        let kind = kind_of(&changed);
+        let files = if matches!(origin.as_str(), "update" | "restore") { Vec::new() } else { changed };
         let id = commit.id().to_string();
         if let Some(target) = trailers.get("Reverts") {
             reverted.insert(target.clone(), id.clone());
@@ -610,17 +663,14 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<Change>> {
             origin,
             summary,
             plugins,
-            kind: kind_of(&files).into(),
+            kind: kind.into(),
             files,
             shared: None,
         });
         if changes.len() >= limit {
             break;
         }
-        match commit.parent(0) {
-            Ok(parent) => commit = parent,
-            Err(_) => break,
-        }
+        commit = parent;
     }
     Ok(changes)
 }
@@ -711,8 +761,8 @@ pub fn diff_trees(repo: &Repository, old: Option<&Tree>, new: Option<&Tree>) -> 
 /// A commit's change (against its first parent).
 pub fn diff_commit(repo: &Repository, commit: Oid) -> Result<Vec<FileDiff>> {
     let commit = repo.find_commit(commit).map_err(err)?;
-    let parent = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    diff_trees(repo, parent.as_ref(), Some(&commit.tree().map_err(err)?))
+    let parent = commit.parent(0).map_err(|_| "the shipped source is the starting point, not a change; there is nothing to show against".to_owned())?;
+    diff_trees(repo, Some(&parent.tree().map_err(err)?), Some(&commit.tree().map_err(err)?))
 }
 
 // ----- remotes -----

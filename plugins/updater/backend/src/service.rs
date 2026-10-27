@@ -1,21 +1,33 @@
-//! The updater: what the catalog offers against what runs here, and applying it.
+//! The updater: every plugin on the latest version, by itself.
 //!
-//! - A plugin release the user did not change installs by itself when no run is going: its source
-//!   goes into the code folder first (plugins read their live data there), then the package is
-//!   installed and swapped in (`frame.plugins.install_many`: all or none).
-//! - A plugin the user changed waits for their answer (the popup): merge the release into their
-//!   version (built here when they changed its code), or keep theirs until the next release.
+//! The latest version of a plugin is its official release from the catalog; when no catalog can be
+//! read, it is the package the app itself came with (`frame.plugins.bundled`).
+//! - A plugin the user did not change goes to the latest by itself when no run is going: its
+//!   source goes into the code folder first (plugins read their live data there), then the package
+//!   is installed and swapped in (`frame.plugins.install_many`: all or none).
+//! - A plugin the user changed waits for their answer (the popup): use the newer version and drop
+//!   the changes, or keep theirs until the next version.
+//! - A version that cannot start (the frame's check refused it and the previous one keeps running)
+//!   is not tried again; the popup and Settings > Plugins say so with the reason (`failed`).
+//! - A build of the user's own (`+dev.` version) is left alone; Settings > Plugins shows it.
 //! - A newer frame is downloaded and staged; it runs from the next start ("Restart to update").
+//! - A reset (`update.reset`, Settings > Plugins) puts every plugin back to the latest at once,
+//!   the user's own builds and changes included, after one confirmation.
 
 use crate::fetch;
 use cc_protocol::contracts::chatflow::{RunningResult, methods as chatflow_methods};
 use cc_protocol::contracts::frame::{
-    InstallManyParams, InstallManyResult, InstallParams, PackageSwapResult, PluginListResult, UpdateStageParams, UpdateStatus as FrameStatus,
-    methods as frame_methods,
+    BundledResult, InstallManyParams, InstallManyResult, InstallParams, PackageSwapResult, PluginListResult, UpdateStageParams,
+    UpdateStatus as FrameStatus, methods as frame_methods,
 };
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
-use cc_protocol::contracts::source::{ReleaseMergeParams, ReleaseStatus, ReleaseStatusParams, UpdateResult, methods as source_methods};
-use cc_protocol::contracts::update::{Applied, DecideParams, FrameUpdate, Pending, Status, choices, methods, topics};
+use cc_protocol::contracts::source::{
+    ReleaseMergeParams, ReleaseResetParams, ReleaseResetResult, ReleaseStatus, ReleaseStatusParams, UpdateResult, methods as source_methods,
+};
+use cc_protocol::contracts::update::{
+    Applied, DecideParams, DismissParams, Failed, FrameUpdate, Pending, ResetItem, ResetPlan, ResetResult, Status, choices, methods, reset_actions,
+    reset_sources, topics,
+};
 use cc_protocol::release::{self, Asset, Catalog, PluginEntry};
 use cc_protocol::{Ctx, RpcError, parse_params, to_value};
 use serde::de::DeserializeOwned;
@@ -25,7 +37,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -68,19 +80,27 @@ struct Saved {
     /// Plugin -> the release the user chose to stay off ("Keep mine", or a merge that clashed).
     #[serde(default)]
     kept: BTreeMap<String, String>,
-    /// Plugin -> the release the user chose to merge, until it is applied.
+    /// Plugin -> the version the user chose to use (or merge), until it is applied.
     #[serde(default)]
     approved: BTreeMap<String, String>,
+    /// Plugin -> the version the user chose to use with their changes merged in, not dropped.
+    #[serde(default)]
+    merged: BTreeMap<String, String>,
+    /// Plugin -> the version that could not start (not tried again).
+    #[serde(default)]
+    failed: BTreeMap<String, Failed>,
     #[serde(default)]
     recent: Vec<Applied>,
 }
 
-/// A plugin release to apply now.
+/// A plugin version to apply now.
 struct Planned {
     id: String,
-    entry: PluginEntry,
-    asset: Asset,
-    installed: Option<String>,
+    name: String,
+    version: String,
+    package: Package,
+    /// Drop the user's changes to the plugin's folder (they chose the newer version).
+    drop_changes: bool,
 }
 
 pub struct Updater {
@@ -89,6 +109,9 @@ pub struct Updater {
     status: Mutex<Status>,
     saved: Mutex<Saved>,
     ctx: OnceLock<Ctx>,
+    /// The last catalog lookup (or why it failed), so the status line in Settings > Plugins does
+    /// not go to the network every time it is drawn.
+    catalog: Mutex<Option<(Instant, Result<Catalog, String>)>>,
     /// A check is running; a second request only asks it to look once more.
     checking: AtomicBool,
     again: AtomicBool,
@@ -102,13 +125,14 @@ fn now_ms() -> u64 {
 impl Updater {
     pub fn new(data_dir: PathBuf) -> Arc<Updater> {
         let saved: Saved = std::fs::read(data_dir.join(SAVED)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let status = Status { enabled: true, state: "idle".into(), recent: saved.recent.clone(), ..Status::default() };
+        let status = Status { enabled: true, state: "idle".into(), recent: saved.recent.clone(), failed: saved.failed.values().cloned().collect(), ..Status::default() };
         Arc::new(Updater {
             data_dir,
             config: Mutex::new(Config::from_value(&Value::Null)),
             status: Mutex::new(status),
             saved: Mutex::new(saved),
             ctx: OnceLock::new(),
+            catalog: Mutex::new(None),
             checking: AtomicBool::new(false),
             again: AtomicBool::new(false),
             wake: Notify::new(),
@@ -169,15 +193,16 @@ impl Updater {
         out
     }
 
-    fn record(&self, plugin: &str, version: &str, outcome: &str, detail: impl Into<String>) {
+    fn record(&self, plugin: &str, version: &str, outcome: &str, detail: impl Into<String>) -> Applied {
         let applied = Applied { plugin: plugin.into(), version: version.into(), ms: now_ms(), outcome: outcome.into(), detail: detail.into() };
         tracing::info!(plugin, version, outcome, detail = %applied.detail, "update");
         let recent = self.with_saved(|saved| {
-            saved.recent.insert(0, applied);
+            saved.recent.insert(0, applied.clone());
             saved.recent.truncate(RECENT);
             saved.recent.clone()
         });
         self.with_status(|status| status.recent = recent);
+        applied
     }
 
     // ----- methods -----
@@ -199,7 +224,233 @@ impl Updater {
                 ctx.call(frame_methods::UPDATE_RESTART, json!({})).await?;
                 to_value(&self.status())
             }
+            methods::DISMISS => {
+                let params: DismissParams = parse_params(params)?;
+                let failed = self.with_saved(|saved| {
+                    if let Some(failed) = saved.failed.get_mut(&params.plugin) {
+                        failed.seen = true;
+                    }
+                    saved.failed.values().cloned().collect::<Vec<_>>()
+                });
+                self.with_status(|status| status.failed = failed);
+                to_value(&self.status())
+            }
+            methods::RESET_PLAN => to_value(&self.reset_plan().await?),
+            methods::RESET => to_value(&self.reset().await?),
             other => Err(RpcError::unknown_method(other)),
+        }
+    }
+
+    // ----- the reset -----
+
+    /// Where a reset takes a plugin's package from. `fresh` looks the catalog up now; otherwise a
+    /// lookup younger than the check interval serves (the status line is drawn often).
+    async fn reset_sources(&self, fresh: bool) -> Result<(Ctx, Option<reqwest::Client>, Option<Catalog>, Option<String>, BundledResult, &'static str, String), RpcError> {
+        let ctx = self.ctx.get().cloned().ok_or_else(|| RpcError::internal("not connected to the frame yet"))?;
+        let platform = release::platform().unwrap_or("");
+        let config = self.config();
+        // The official releases when they can be read; otherwise the app's own packages stand in.
+        let (client, catalog, offline) = match fetch::client() {
+            Ok(client) => {
+                let outcome = match self.recent_catalog(config.every).filter(|_| !fresh) {
+                    Some(outcome) => outcome,
+                    None => self.lookup_catalog(&client, &config.catalog_url).await,
+                };
+                match outcome {
+                    Ok(catalog) => (Some(client), Some(catalog), None),
+                    Err(error) => (None, None, Some(error)),
+                }
+            }
+            Err(error) => (None, None, Some(error)),
+        };
+        let bundled: BundledResult = call(&ctx, frame_methods::PLUGINS_BUNDLED, json!({})).await.unwrap_or_default();
+        if catalog.is_none() && bundled.packages.is_empty() {
+            return Err(RpcError::internal(format!(
+                "The official releases could not be read ({}) and this app carries no plugin packages of its own; nothing to reset to.",
+                offline.clone().unwrap_or_default()
+            )));
+        }
+        let running_frame = ctx.frame_version().unwrap_or_default();
+        Ok((ctx, client, catalog, offline, bundled, platform, running_frame))
+    }
+
+    /// Every installed plugin against the latest version (an official release, else the app's own
+    /// package) with what a reset does to it, and the package: a release asset (downloaded) or the
+    /// app's package file.
+    async fn reference_items(&self, ctx: &Ctx, catalog: Option<&Catalog>, bundled: &BundledResult, platform: &str, running_frame: &str) -> Result<Vec<(ResetItem, Option<Package>)>, RpcError> {
+        let list: PluginListResult = call(ctx, frame_methods::PLUGINS_LIST, json!({})).await?;
+        let mut items = Vec::new();
+        for unit in &list.units {
+            let files = call::<ReleaseStatus>(ctx, source_methods::RELEASE_STATUS, json!(ReleaseStatusParams { plugin: unit.id.clone() }))
+                .await
+                .map(|status| status.files)
+                .unwrap_or_default();
+            let mut item = ResetItem {
+                plugin: unit.id.clone(),
+                name: if unit.name.is_empty() { unit.id.clone() } else { unit.name.clone() },
+                installed: unit.version.clone(),
+                release: String::new(),
+                from: String::new(),
+                files,
+                action: reset_actions::UNOFFICIAL.into(),
+            };
+            let official = catalog.and_then(|catalog| catalog.plugins.get(&unit.id)).and_then(|entry| {
+                let fits = entry.platforms.is_empty() || entry.platforms.iter().any(|os| os == release::os_name());
+                entry.file_for(platform).filter(|_| fits).map(|asset| (entry.clone(), asset.clone()))
+            });
+            let package = match official {
+                Some((entry, asset)) => {
+                    item.release = entry.version.clone();
+                    item.from = reset_sources::RELEASE.into();
+                    if !entry.min_frame.is_empty() && release::is_newer(&entry.min_frame, running_frame) {
+                        item.action = reset_actions::FRAME.into();
+                        items.push((item, None));
+                        continue;
+                    }
+                    Package::Release(asset)
+                }
+                None => match bundled.packages.iter().find(|package| package.id == unit.id) {
+                    Some(package) => {
+                        item.release = package.version.clone();
+                        item.from = reset_sources::APP.into();
+                        Package::App(PathBuf::from(&package.path))
+                    }
+                    None => {
+                        items.push((item, None));
+                        continue;
+                    }
+                },
+            };
+            item.action = if unit.version != item.release {
+                reset_actions::INSTALL
+            } else if item.files.is_empty() {
+                reset_actions::NONE
+            } else {
+                reset_actions::SOURCE
+            }
+            .into();
+            items.push((item, Some(package)));
+        }
+        Ok(items)
+    }
+
+    pub async fn reset_plan(&self) -> Result<ResetPlan, RpcError> {
+        let (ctx, _, catalog, offline, bundled, platform, running_frame) = self.reset_sources(false).await?;
+        let items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
+        Ok(ResetPlan { plugins: items.into_iter().map(|(item, _)| item).collect(), running: self.run_going(&ctx).await, offline })
+    }
+
+    /// Every plugin back to its official release, or to the app's own package when the releases
+    /// cannot be read. Refused while a run is going (the install would cut it off) or while a
+    /// check runs.
+    pub async fn reset(self: &Arc<Self>) -> Result<ResetResult, RpcError> {
+        let ctx = self.ctx.get().cloned().ok_or_else(|| RpcError::internal("not connected to the frame yet"))?;
+        if self.run_going(&ctx).await {
+            return Err(RpcError::invalid_params("A conversation is running and the reset would cut it off. Wait for it to end, then reset again."));
+        }
+        if self.checking.swap(true, Ordering::SeqCst) {
+            return Err(RpcError::invalid_params("An update check is running. Try again in a moment."));
+        }
+        let outcome = self.reset_all().await;
+        self.with_status(|status| {
+            status.state = "idle".into();
+            status.detail = String::new();
+        });
+        self.checking.store(false, Ordering::SeqCst);
+        // A check follows: plugins new to this machine and the frame.
+        self.wake.notify_one();
+        outcome
+    }
+
+    async fn reset_all(&self) -> Result<ResetResult, RpcError> {
+        let (ctx, client, catalog, _, bundled, platform, running_frame) = self.reset_sources(true).await?;
+        let items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
+        let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
+        let mut outcomes = Vec::new();
+        let mut packages: Vec<(ResetItem, PathBuf)> = Vec::new();
+        for (item, package) in items {
+            let Some(package) = package else { continue };
+            if item.action == reset_actions::NONE {
+                continue;
+            }
+            let (id, version) = (item.plugin.clone(), item.release.clone());
+            let package = match package {
+                Package::App(path) => path,
+                Package::Release(asset) => {
+                    let Some(client) = &client else { continue };
+                    self.state("downloading", format!("Downloading {id} {version}"));
+                    match fetch::asset(client, &asset, &work.join("downloads"), |percent| {
+                        self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))
+                    })
+                    .await
+                    {
+                        Ok(package) => package,
+                        Err(error) => {
+                            outcomes.push(self.record(&id, &version, "failed", error));
+                            continue;
+                        }
+                    }
+                }
+            };
+            // The source first: the plugin's folder in the code folder back to the package's.
+            self.state("installing", format!("Resetting the source of {id}"));
+            if let Err(error) = self.reset_source(&ctx, &id, &version, &package, &work).await {
+                outcomes.push(self.record(&id, &version, "failed", error));
+                continue;
+            }
+            self.with_saved(|saved| {
+                saved.kept.remove(&id);
+                saved.approved.remove(&id);
+                saved.merged.remove(&id);
+                saved.failed.remove(&id);
+            });
+            if item.action == reset_actions::INSTALL {
+                packages.push((item, package));
+            } else {
+                outcomes.push(self.record(&id, &version, "reset", "Your changes are dropped; this package was running already."));
+            }
+        }
+        if !packages.is_empty() {
+            let names = packages.iter().map(|(item, _)| format!("{} {}", item.plugin, item.release)).collect::<Vec<_>>().join(", ");
+            self.state("installing", format!("Installing {names}"));
+            // Recorded before the install: when the set holds this plugin, its own process is
+            // replaced mid-call and the outcome would otherwise be lost.
+            for (item, _) in &packages {
+                outcomes.push(self.record(&item.plugin, &item.release, "reset", "Your changes are dropped and the package installed."));
+            }
+            let together = install_many(&ctx, packages.iter().map(|(_, package)| package.as_path()).collect()).await;
+            match together {
+                Ok(()) => {}
+                Err(error) if packages.len() == 1 => outcomes.push(self.record(&packages[0].0.plugin, &packages[0].0.release, "failed", error)),
+                Err(_) => {
+                    for (item, package) in &packages {
+                        if let Err(error) = install_many(&ctx, vec![package.as_path()]).await {
+                            outcomes.push(self.record(&item.plugin, &item.release, "failed", error));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&work).await;
+        Ok(ResetResult { plugins: outcomes })
+    }
+
+    /// The package's source over the plugin's folder in the code folder.
+    async fn reset_source(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<(), String> {
+        let unpacked = work.join("unpacked").join(id);
+        fetch::untar(package, &unpacked).await?;
+        let source = unpacked.join("source");
+        if !source.is_dir() {
+            return Err("the release package carries no source; the plugin's folder in the code folder was left as it is".into());
+        }
+        let params = ReleaseResetParams { plugin: id.to_owned(), dir: source.to_string_lossy().into_owned(), version: version.to_owned() };
+        match call::<ReleaseResetResult>(ctx, source_methods::RELEASE_RESET, json!(params)).await {
+            Ok(_) => Ok(()),
+            // Without the source manager the package still installs (its packaged data serves).
+            Err(error) => {
+                tracing::warn!(plugin = id, error = %error.message, "the plugin's source was not reset in the code folder");
+                Ok(())
+            }
         }
     }
 
@@ -213,10 +464,19 @@ impl Updater {
                 self.with_saved(|saved| saved.kept.insert(params.plugin.clone(), params.version.clone()));
                 self.record(&params.plugin, &params.version, "kept", "Your version stays; the next release asks again.");
             }
-            choices::MERGE => {
-                self.with_saved(|saved| saved.approved.insert(params.plugin.clone(), params.version.clone()));
+            choices::USE => {
+                self.with_saved(|saved| {
+                    saved.approved.insert(params.plugin.clone(), params.version.clone());
+                    saved.merged.remove(&params.plugin);
+                });
             }
-            other => return Err(RpcError::invalid_params(format!("choice `{other}`: give `{}` or `{}`", choices::MERGE, choices::KEEP))),
+            choices::MERGE => {
+                self.with_saved(|saved| {
+                    saved.approved.insert(params.plugin.clone(), params.version.clone());
+                    saved.merged.insert(params.plugin.clone(), params.version.clone());
+                });
+            }
+            other => return Err(RpcError::invalid_params(format!("choice `{other}`: give `{}`, `{}` or `{}`", choices::USE, choices::KEEP, choices::MERGE))),
         }
         self.with_status(|status| status.pending.retain(|pending| pending.plugin != params.plugin));
         self.wake.notify_one();
@@ -288,26 +548,98 @@ impl Updater {
     }
 
     async fn check_catalog(self: &Arc<Self>, ctx: &Ctx, config: &Config) -> Result<(), String> {
-        let platform = release::platform().ok_or("CortexCode releases are not built for this machine")?;
+        let platform = release::platform().unwrap_or("");
         let client = fetch::client()?;
-        let catalog = fetch::catalog(&client, &config.catalog_url).await?;
+        let catalog = self.lookup_catalog(&client, &config.catalog_url).await;
         let running_frame = ctx.frame_version().unwrap_or_default();
         let mut errors = Vec::new();
-        if let Err(error) = self.frame_update(ctx, &client, &catalog, platform, &running_frame).await {
-            errors.push(error);
-        }
-        let (auto, pending) = self.plan(ctx, &catalog, platform, &running_frame).await?;
+        let catalog = match catalog {
+            Ok(catalog) => {
+                if let Err(error) = self.frame_update(ctx, &client, &catalog, platform, &running_frame).await {
+                    errors.push(error);
+                }
+                Some(catalog)
+            }
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        };
+        let bundled: BundledResult = call(ctx, frame_methods::PLUGINS_BUNDLED, json!({})).await.unwrap_or_default();
+        let items = self.reference_items(ctx, catalog.as_ref(), &bundled, platform, &running_frame).await.map_err(|e| e.message)?;
+        // A released plugin this machine has not installed yet.
+        let known: Vec<String> = items.iter().map(|(item, _)| item.plugin.clone()).collect();
+        let new: Vec<(PluginEntry, Asset)> = catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .plugins
+                    .iter()
+                    .filter(|(id, entry)| {
+                        !known.contains(id)
+                            && (entry.platforms.is_empty() || entry.platforms.iter().any(|os| os == release::os_name()))
+                            && (entry.min_frame.is_empty() || !release::is_newer(&entry.min_frame, &running_frame))
+                    })
+                    .filter_map(|(_, entry)| entry.file_for(platform).map(|asset| (entry.clone(), asset.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (auto, pending) = self.plan(items);
         self.with_status(|status| status.pending = pending);
-        if auto.is_empty() {
+        if auto.is_empty() && new.is_empty() {
             self.with_status(|status| status.waiting.clear());
         } else if self.run_going(ctx).await {
-            let ids = auto.iter().map(|planned| planned.id.clone()).collect();
+            let ids = auto.iter().map(|planned| planned.id.clone()).chain(new.iter().map(|(entry, _)| entry.name.clone())).collect();
             self.with_status(|status| status.waiting = ids);
         } else {
             self.with_status(|status| status.waiting.clear());
             self.apply(ctx, &client, auto).await;
+            self.install_new(ctx, &client, new, &catalog).await;
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+
+    /// Install released plugins this machine does not have yet, one by one.
+    async fn install_new(&self, ctx: &Ctx, client: &reqwest::Client, new: Vec<(PluginEntry, Asset)>, catalog: &Option<Catalog>) {
+        let Some(catalog) = catalog else { return };
+        let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
+        for (entry, asset) in new {
+            let Some(id) = catalog.plugins.iter().find(|(_, e)| **e == entry).map(|(id, _)| id.clone()) else { continue };
+            let version = entry.version.clone();
+            self.state("downloading", format!("Downloading {id} {version}"));
+            let package = match fetch::asset(client, &asset, &work.join("downloads"), |percent| self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))).await {
+                Ok(package) => package,
+                Err(error) => {
+                    self.record(&id, &version, "failed", error);
+                    continue;
+                }
+            };
+            if let Err(error) = self.merge_source(ctx, &id, &version, &package, &work).await {
+                self.record(&id, &version, "failed", error);
+                continue;
+            }
+            self.state("installing", format!("Installing {id} {version}"));
+            let params = InstallParams { path: package.to_string_lossy().into_owned() };
+            match call::<PackageSwapResult>(ctx, frame_methods::PLUGINS_INSTALL, json!(params)).await {
+                Ok(result) if result.ok => drop(self.record(&id, &version, "installed", "")),
+                Ok(result) => drop(self.record(&id, &version, "failed", result.error.unwrap_or_default())),
+                Err(error) => drop(self.record(&id, &version, "failed", error.message)),
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&work).await;
+    }
+
+    /// Download the catalog and remember the outcome.
+    async fn lookup_catalog(&self, client: &reqwest::Client, url: &str) -> Result<Catalog, String> {
+        let outcome = fetch::catalog(client, url).await;
+        *self.catalog.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), outcome.clone()));
+        outcome
+    }
+
+    /// The last catalog lookup when it is younger than the check interval.
+    fn recent_catalog(&self, max_age: Duration) -> Option<Result<Catalog, String>> {
+        let cached = self.catalog.lock().unwrap_or_else(|p| p.into_inner());
+        cached.as_ref().filter(|(at, _)| at.elapsed() < max_age).map(|(_, outcome)| outcome.clone())
     }
 
     /// Whether a conversation run is going (an update would cut it off).
@@ -318,154 +650,171 @@ impl Updater {
         }
     }
 
-    /// Split the catalog's newer plugin releases: what applies now, and what asks the user.
-    async fn plan(&self, ctx: &Ctx, catalog: &Catalog, platform: &str, running_frame: &str) -> Result<(Vec<Planned>, Vec<Pending>), String> {
-        let list: PluginListResult = call(ctx, frame_methods::PLUGINS_LIST, json!({})).await.map_err(|e| e.message)?;
+    /// Split what differs from the latest: what applies now, and what asks the user. A build of
+    /// the user's own, a version the user keeps, and one that could not start are left alone.
+    fn plan(&self, items: Vec<(ResetItem, Option<Package>)>) -> (Vec<Planned>, Vec<Pending>) {
+        // A failure is over when a newer version came, or when that version runs after all (the
+        // frame installs the app's packages at start by itself).
+        let stale: Vec<String> = {
+            let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner());
+            saved
+                .failed
+                .iter()
+                .filter(|(plugin, failed)| {
+                    items.iter().find(|(item, _)| item.plugin == **plugin).is_none_or(|(item, _)| item.release != failed.version || item.installed == failed.version)
+                })
+                .map(|(plugin, _)| plugin.clone())
+                .collect()
+        };
+        if !stale.is_empty() {
+            let all = self.with_saved(|saved| {
+                saved.failed.retain(|plugin, _| !stale.contains(plugin));
+                saved.failed.values().cloned().collect::<Vec<_>>()
+            });
+            self.with_status(|status| status.failed = all);
+        }
         let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let (mut auto, mut pending) = (Vec::new(), Vec::new());
-        for (id, entry) in &catalog.plugins {
-            if !entry.platforms.is_empty() && !entry.platforms.iter().any(|os| os == release::os_name()) {
+        for (item, package) in items {
+            let Some(package) = package else { continue };
+            if item.action != reset_actions::INSTALL || is_own_build(&item.installed) {
                 continue;
             }
-            let Some(asset) = entry.file_for(platform) else { continue };
-            let installed = list.units.iter().find(|unit| unit.id == *id).map(|unit| unit.version.clone());
-            if installed.as_deref().is_some_and(|installed| !release::is_newer(&entry.version, installed)) {
+            if saved.kept.get(&item.plugin) == Some(&item.release) || saved.failed.get(&item.plugin).is_some_and(|failed| failed.version == item.release) {
                 continue;
             }
-            // Built with a newer frame: it waits for the frame update.
-            if !entry.min_frame.is_empty() && release::is_newer(&entry.min_frame, running_frame) {
+            let approved = saved.approved.get(&item.plugin) == Some(&item.release);
+            if !item.files.is_empty() && !approved {
+                pending.push(Pending {
+                    plugin: item.plugin.clone(),
+                    name: item.name.clone(),
+                    version: item.release.clone(),
+                    from: item.from.clone(),
+                    installed: item.installed.clone(),
+                    files: item.files.clone(),
+                });
                 continue;
             }
-            if saved.kept.get(id) == Some(&entry.version) {
-                continue;
-            }
-            let approved = saved.approved.get(id) == Some(&entry.version);
-            if installed.is_some() && !approved {
-                let edited = call::<ReleaseStatus>(ctx, source_methods::RELEASE_STATUS, json!(ReleaseStatusParams { plugin: id.clone() })).await;
-                if let Ok(status) = edited
-                    && status.edited
-                {
-                    pending.push(Pending {
-                        plugin: id.clone(),
-                        name: entry.name.clone(),
-                        version: entry.version.clone(),
-                        installed: installed.clone().unwrap_or_default(),
-                        files: status.files,
-                    });
-                    continue;
-                }
-            }
-            auto.push(Planned { id: id.clone(), entry: entry.clone(), asset: asset.clone(), installed });
+            let merge = saved.merged.get(&item.plugin) == Some(&item.release);
+            auto.push(Planned { id: item.plugin, name: item.name, version: item.release, package, drop_changes: approved && !merge });
         }
-        Ok((auto, pending))
+        (auto, pending)
     }
 
-    /// Download, merge the source, install: every planned plugin.
+    /// Get the package, put its source in, install: every planned plugin.
     async fn apply(&self, ctx: &Ctx, client: &reqwest::Client, planned: Vec<Planned>) {
         let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
-        let mut existing: Vec<(Planned, PathBuf)> = Vec::new();
-        let mut new: Vec<(Planned, PathBuf)> = Vec::new();
+        let mut set: Vec<(Planned, PathBuf)> = Vec::new();
         for plan in planned {
-            let (id, version) = (plan.id.clone(), plan.entry.version.clone());
-            self.state("downloading", format!("Downloading {id} {version}"));
-            let package = match fetch::asset(client, &plan.asset, &work.join("downloads"), |percent| {
-                self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))
-            })
-            .await
-            {
-                Ok(package) => package,
-                Err(error) => {
-                    self.record(&id, &version, "failed", error);
-                    continue;
+            let (id, version) = (plan.id.clone(), plan.version.clone());
+            let package = match &plan.package {
+                Package::App(path) => path.clone(),
+                Package::Release(asset) => {
+                    self.state("downloading", format!("Downloading {id} {version}"));
+                    match fetch::asset(client, asset, &work.join("downloads"), |percent| self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))).await {
+                        Ok(package) => package,
+                        Err(error) => {
+                            self.record(&id, &version, "failed", error);
+                            continue;
+                        }
+                    }
                 }
             };
             // The source first: the plugin reads its live data from the code folder.
-            match self.merge_source(ctx, &plan, &package, &work).await {
-                Ok(Merged::Install) => {}
+            let source = if plan.drop_changes {
+                self.state("installing", format!("Dropping your changes to {id}"));
+                self.reset_source(ctx, &id, &version, &package, &work).await.map(|()| Merged::Install)
+            } else {
+                self.merge_source(ctx, &id, &version, &package, &work).await
+            };
+            match source {
+                Ok(Merged::Install) => set.push((plan, package)),
                 Ok(Merged::Built) => {
-                    self.with_saved(|saved| saved.approved.remove(&id));
-                    self.record(&id, &version, "built", "Your change and the release are merged and built here.");
-                    continue;
-                }
-                Err(error) => {
-                    // A clash asks no more for this release; the user sees why.
                     self.with_saved(|saved| {
                         saved.approved.remove(&id);
+                        saved.merged.remove(&id);
+                    });
+                    self.record(&id, &version, "built", "Your change and the newer version are merged and built here.");
+                }
+                Err(error) => {
+                    // A clash asks no more for this version; the user sees why.
+                    self.with_saved(|saved| {
+                        saved.approved.remove(&id);
+                        saved.merged.remove(&id);
                         saved.kept.insert(id.clone(), version.clone());
                     });
                     self.record(&id, &version, "failed", error);
-                    continue;
                 }
             }
-            if plan.installed.is_some() { existing.push((plan, package)) } else { new.push((plan, package)) }
         }
-        if !existing.is_empty() {
-            self.state("installing", format!("Installing {}", names(&existing)));
-            self.install_existing(ctx, existing).await;
-        }
-        for (plan, package) in new {
-            self.state("installing", format!("Installing {} {}", plan.id, plan.entry.version));
-            let params = InstallParams { path: package.to_string_lossy().into_owned() };
-            match call::<PackageSwapResult>(ctx, frame_methods::PLUGINS_INSTALL, json!(params)).await {
-                Ok(result) if result.ok => self.installed(&plan),
-                Ok(result) => self.record(&plan.id, &plan.entry.version, "failed", result.error.unwrap_or_default()),
-                Err(error) => self.record(&plan.id, &plan.entry.version, "failed", error.message),
-            }
+        if !set.is_empty() {
+            self.state("installing", format!("Installing {}", names(&set)));
+            self.install_set(ctx, set).await;
         }
         let _ = tokio::fs::remove_dir_all(&work).await;
     }
 
     fn installed(&self, plan: &Planned) {
-        self.with_saved(|saved| saved.approved.remove(&plan.id));
-        self.record(&plan.id, &plan.entry.version, "installed", "");
+        self.with_saved(|saved| {
+            saved.approved.remove(&plan.id);
+            saved.merged.remove(&plan.id);
+            saved.failed.remove(&plan.id);
+        });
+        self.record(&plan.id, &plan.version, "installed", "");
+        self.with_status(|status| status.failed.retain(|failed| failed.plugin != plan.id));
+    }
+
+    /// A version the frame refused (its check failed, the previous version keeps running): not
+    /// tried again; the popup and Settings > Plugins say why.
+    fn could_not_start(&self, plan: &Planned, error: String) {
+        let failed = Failed { plugin: plan.id.clone(), name: plan.name.clone(), version: plan.version.clone(), error: error.clone(), ms: now_ms(), seen: false };
+        let all = self.with_saved(|saved| {
+            saved.approved.remove(&plan.id);
+            saved.failed.insert(plan.id.clone(), failed);
+            saved.failed.values().cloned().collect::<Vec<_>>()
+        });
+        self.record(&plan.id, &plan.version, "failed", error);
+        self.with_status(|status| status.failed = all);
     }
 
     /// All together; when the set fails, one at a time, so one bad package does not hold back the rest.
-    async fn install_existing(&self, ctx: &Ctx, set: Vec<(Planned, PathBuf)>) {
+    async fn install_set(&self, ctx: &Ctx, set: Vec<(Planned, PathBuf)>) {
         let together = install_many(ctx, set.iter().map(|(_, package)| package.as_path()).collect()).await;
         match together {
             Ok(()) => set.iter().for_each(|(plan, _)| self.installed(plan)),
-            Err(error) if set.len() == 1 => self.record(&set[0].0.id, &set[0].0.entry.version, "failed", error),
+            Err(error) if set.len() == 1 => self.could_not_start(&set[0].0, error),
             Err(_) => {
                 for (plan, package) in &set {
                     match install_many(ctx, vec![package.as_path()]).await {
                         Ok(()) => self.installed(plan),
-                        Err(error) => self.record(&plan.id, &plan.entry.version, "failed", error),
+                        Err(error) => self.could_not_start(plan, error),
                     }
                 }
             }
         }
     }
 
-    /// Merge the package's source into the code folder.
-    async fn merge_source(&self, ctx: &Ctx, plan: &Planned, package: &Path, work: &Path) -> Result<Merged, String> {
-        let unpacked = work.join("unpacked").join(&plan.id);
+    /// Merge the package's source into the code folder, keeping the user's changes.
+    async fn merge_source(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<Merged, String> {
+        let unpacked = work.join("unpacked").join(id);
         fetch::untar(package, &unpacked).await?;
         let source = unpacked.join("source");
         if !source.is_dir() {
             return Ok(Merged::Install);
         }
-        let params = ReleaseMergeParams {
-            scope: "plugin".into(),
-            plugin: plan.id.clone(),
-            dir: source.to_string_lossy().into_owned(),
-            version: plan.entry.version.clone(),
-        };
+        let params = ReleaseMergeParams { scope: "plugin".into(), plugin: id.to_owned(), dir: source.to_string_lossy().into_owned(), version: version.to_owned() };
         let merged = match call::<UpdateResult>(ctx, source_methods::RELEASE_MERGE, json!(params)).await {
             Ok(merged) => merged,
             // Without the source manager the package still installs (its packaged data serves).
             Err(error) => {
-                tracing::warn!(plugin = %plan.id, error = %error.message, "the release's source was not merged into the code folder");
+                tracing::warn!(plugin = id, error = %error.message, "the package's source was not merged into the code folder");
                 return Ok(Merged::Install);
             }
         };
         if merged.state == "conflicts" {
-            return Err(format!(
-                "Your change and the release clash in {}; both stay as they were (Settings > History).",
-                merged.conflicts.join(", ")
-            ));
+            return Err(format!("Your change and the newer version clash in {}; both stay as they were (Settings > History).", merged.conflicts.join(", ")));
         }
-        Ok(if merged.rebuilt.contains(&plan.id) { Merged::Built } else { Merged::Install })
+        Ok(if merged.rebuilt.iter().any(|built| built == id) { Merged::Built } else { Merged::Install })
     }
 
     /// Stage a newer frame for the next start.
@@ -550,6 +899,14 @@ impl Updater {
     }
 }
 
+/// Where a reset's package comes from.
+enum Package {
+    /// An official release: downloaded and checked.
+    Release(Asset),
+    /// The app's own package file.
+    App(PathBuf),
+}
+
 enum Merged {
     /// Install the release package.
     Install,
@@ -558,7 +915,12 @@ enum Merged {
 }
 
 fn names(set: &[(Planned, PathBuf)]) -> String {
-    set.iter().map(|(plan, _)| format!("{} {}", plan.id, plan.entry.version)).collect::<Vec<_>>().join(", ")
+    set.iter().map(|(plan, _)| format!("{} {}", plan.id, plan.version)).collect::<Vec<_>>().join(", ")
+}
+
+/// A build of the user's own (`cortex-pack build --install`): `0.1.0+dev.20261027.004548`.
+fn is_own_build(version: &str) -> bool {
+    version.split('+').nth(1).is_some_and(|tag| tag.starts_with("dev."))
 }
 
 async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<(), String> {

@@ -153,6 +153,7 @@ impl Plugin for SourcePlugin {
                 }
                 methods::RELEASE_STATUS => to_value(&cc_source::release::status(&service, parse_params(call.params)?).await?),
                 methods::RELEASE_MERGE => to_value(&cc_source::release::merge(&service, &ctx, parse_params(call.params)?).await?),
+                methods::RELEASE_RESET => to_value(&cc_source::release::reset(&service, &ctx, parse_params(call.params)?).await?),
                 other => Err(RpcError::new(codes::UNKNOWN_METHOD, format!("cc-source does not serve `{other}`"))),
             }
         })

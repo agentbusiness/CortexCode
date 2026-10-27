@@ -18,12 +18,12 @@ contract = "update@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-updater"
-provides = ["update.status", "update.check", "update.decide", "update.restart"]
+provides = ["update.status", "update.check", "update.decide", "update.restart", "update.dismiss", "update.reset_plan", "update.reset"]
 publishes = ["update.changed"]
 uses = [
-  "frame.plugins.list", "frame.plugins.install", "frame.plugins.install_many",
+  "frame.plugins.list", "frame.plugins.install", "frame.plugins.install_many", "frame.plugins.bundled",
   "frame.update.status", "frame.update.stage", "frame.update.restart",
-  "source.release.status", "source.release.merge", "chatflow.running",
+  "source.release.status", "source.release.merge", "source.release.reset", "chatflow.running",
 ]
 
 [backend.config]

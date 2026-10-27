@@ -9,3 +9,10 @@
 #cc .cx-variant .r .ap{white-space:nowrap;}
 #cc .cx-variant .grow{flex:1;}
 #cc .cx-model-test{margin:0 0 12px;}
+/* The serving engine's weights, inside its card: one line when it has one, a list with Select when
+   it has several. */
+#cc .cx-weights{margin-top:10px;padding-top:8px;border-top:1px solid var(--rule);}
+#cc .cx-weight{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;}
+#cc .cx-weight .ap{white-space:nowrap;}
+#cc .cx-weights .cx-variants{margin:4px 0 0;}
+#cc .cx-weights .cx-variants>li:last-child{border-bottom:0;}

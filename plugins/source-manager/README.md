@@ -11,7 +11,9 @@ CortexCode's own source, live and editable, as one git repository in the code fo
 - **Releases.** The updater merges a released plugin's source (`plugins/<id>`) or the frame's
   (everything outside `plugins/`) in the same way (`source.release.merge`), and asks
   `source.release.status` whether the user changed a plugin away from the shipped source (then the
-  update asks first).
+  update asks first). A reset (`source.release.reset`, from Settings > Plugins > Reset all plugins)
+  puts one plugin's folder back to its released source, dropping the user's changes in it, committed
+  or not; the rest of the code folder, uncommitted edits included, stays.
 - **Data is live.** Every plugin reads its data (skills, guides, prompts, texts) from its folder in
   the code folder (the frame passes `CORTEX_PLUGIN_SOURCE`). An edited data file is in use at once;
   once it has settled it is committed, so History lists it and it can be reverted. The chat flow's
@@ -54,7 +56,7 @@ Relative paths are relative to the frame config's folder.
 
 `source.status`, `source.update`, `source.history`, `source.revert`, `source.diff`,
 `source.proposals`, `source.propose`, `source.decide`, `source.backup.status|set|push|restore`,
-`source.share.candidates|send|status`, `source.storage`, `source.release.status|merge`; topics `source.changed` and
+`source.share.candidates|send|status`, `source.storage`, `source.release.status|merge|reset`; topics `source.changed` and
 `source.progress`. The contract and its types are in `protocol/src/contracts/source.rs`.
 
 ## Run

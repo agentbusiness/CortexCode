@@ -43,4 +43,5 @@ pub const PROVIDES: &[&str] = &[
     methods::STORAGE,
     methods::RELEASE_STATUS,
     methods::RELEASE_MERGE,
+    methods::RELEASE_RESET,
 ];
