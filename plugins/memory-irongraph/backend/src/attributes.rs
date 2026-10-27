@@ -1,7 +1,9 @@
 //! Files a repository declares as not its own code, read from its `.gitattributes` files and
 //! `.git/info/attributes`: the `linguist-vendored` and `linguist-generated` attributes (GitHub
-//! Linguist's convention for third-party and generated code). The repository map leaves them out;
-//! they stay in the code graph.
+//! Linguist's convention for third-party and generated code), and, where no attribute says either
+//! way, the directories Linguist treats as vendored by default (`vendor/`, `third_party/`,
+//! `node_modules/`, ...). The repository map leaves them out and search ranks them after the
+//! repository's own code; they stay in the code graph.
 //!
 //! Git's attribute rules, mechanically: a line is a pattern followed by attributes (`attr` or
 //! `attr=true` sets, `-attr` or `attr=false` unsets, `!attr` makes unspecified); patterns use
@@ -15,6 +17,17 @@ use std::path::{Path, PathBuf};
 
 /// The attributes that mark a file as not the repository's own code.
 const ATTRIBUTES: &[&str] = &["linguist-vendored", "linguist-generated"];
+const VENDORED: usize = 0;
+
+/// Directory names Linguist treats as vendored without an attribute (its `vendor.yml` defaults,
+/// compared lowercase): a file under one of them is third-party unless `-linguist-vendored` says not.
+const VENDOR_DIRS: &[&str] = &["vendor", "vendors", "third_party", "third-party", "thirdparty", "3rdparty", "3rd_party", "3rd-party", "node_modules", "bower_components"];
+
+fn under_vendor_dir(rel: &str) -> bool {
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    parts.iter().any(|part| VENDOR_DIRS.contains(&part.to_ascii_lowercase().as_str()))
+}
 
 /// One attributes file: the directory its patterns are relative to, and per attribute a matcher
 /// whose "ignore" means set and "whitelist" means unset or unspecified.
@@ -107,24 +120,33 @@ impl Declared {
         Self { sources: texts.iter().map(|(dir, text)| source(root, dir, text)).collect() }
     }
 
-    /// Whether the repository declares `rel` (repository-relative) vendored or generated.
-    pub fn excluded(&self, root: &Path, rel: &str) -> bool {
-        (0..ATTRIBUTES.len()).any(|index| {
-            for source in self.sources.iter().rev() {
-                let applies = source.dir.is_empty() || rel.starts_with(&format!("{}/", source.dir));
-                if !applies {
-                    continue;
-                }
-                let matched = source.matchers[index].matched(root.join(rel), false);
-                if matched.is_ignore() {
-                    return true;
-                }
-                if matched.is_whitelist() {
-                    return false;
-                }
+    /// What the attributes say about `rel` for one attribute: Some(true) set, Some(false) unset,
+    /// None nothing.
+    fn declared(&self, root: &Path, rel: &str, index: usize) -> Option<bool> {
+        for source in self.sources.iter().rev() {
+            let applies = source.dir.is_empty() || rel.starts_with(&format!("{}/", source.dir));
+            if !applies {
+                continue;
             }
-            false
-        })
+            let matched = source.matchers[index].matched(root.join(rel), false);
+            if matched.is_ignore() {
+                return Some(true);
+            }
+            if matched.is_whitelist() {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    /// Whether `rel` (repository-relative) is not the repository's own code: declared vendored or
+    /// generated, or under a default vendor directory that no attribute claims as its own.
+    pub fn excluded(&self, root: &Path, rel: &str) -> bool {
+        let states: Vec<Option<bool>> = (0..ATTRIBUTES.len()).map(|index| self.declared(root, rel, index)).collect();
+        if states.contains(&Some(true)) {
+            return true;
+        }
+        states[VENDORED].is_none() && under_vendor_dir(rel)
     }
 
     pub fn is_empty(&self) -> bool {

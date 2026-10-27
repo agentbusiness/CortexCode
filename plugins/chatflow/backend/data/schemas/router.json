@@ -22,6 +22,17 @@
         "IMPLEMENT"
       ]
     },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "x-when": {
+        "route": [
+          "IDEATE"
+        ]
+      }
+    },
     "skills": {
       "type": "array",
       "items": {
@@ -79,6 +90,7 @@
     "work",
     "asks",
     "route",
+    "queries",
     "skills",
     "effort",
     "spec",

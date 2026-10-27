@@ -6,7 +6,7 @@ use crate::core::{Core, Runtime};
 use crate::doc::{Doc, text_to_lines};
 use crate::hashedit::{self, EditOp, LineRef, OpKind};
 use crate::host::Host;
-use crate::jobs::{StartRequest, Wake};
+use crate::jobs::{StartRequest, StopMode, Wake};
 use crate::lang::{self, Lang};
 use crate::pyenv::PyEnv;
 use crate::read::{self, split_path_range};
@@ -1865,7 +1865,7 @@ async fn run_remote(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_
     }
     let _ = writeln!(text, "[ran on {}; files it changed there come back here as a step]", runner.name);
     let (ok, kind) = if timed_out {
-        let _ = writeln!(text, "{}", timeout_line(timeout_ms));
+        let _ = writeln!(text, "{}", timeout_line(timeout_ms, None));
         (false, Some("timeout"))
     } else {
         match exit_code {
@@ -2097,12 +2097,31 @@ fn exit_line(code: i32, duration_ms: u64) -> String {
     if duration_ms > 10_000 { format!("[exit {code}, {}s]", duration_ms / 1000) } else { format!("[exit {code}]") }
 }
 
-/// A command that ran out of time.
-fn timeout_line(timeout_ms: u64) -> String {
+/// A command that ran out of time, with what it was really running then (a test binary, not the
+/// build: seen read as "the build is slow" four times while the tests hung).
+fn timeout_line(timeout_ms: u64, running: Option<&str>) -> String {
+    let running = running.map(|what| format!(" At that point it was running {what}.")).unwrap_or_default();
     format!(
-        "[timed out after {} s; the command and everything it started were killed. If it waits for input or never ends, fix that; run a server or watcher with background: true.]",
+        "[timed out after {} s; the command and everything it started were killed.{running} If it waits for input or never ends, fix that; a run that needs longer (a long build or test) or a server goes in background: true, which has no time limit.]",
         timeout_ms.div_ceil(1000)
     )
+}
+
+/// Stop this session's background jobs that run what `command` runs in `cwd`: running it again
+/// means the earlier run is not waited for any more (seen: one test started three times, all
+/// three running and growing). The note for the new run's result, when any was stopped.
+async fn stop_repeats(core: &Core, session_id: &str, cwd: &Path, command: &str) -> Option<String> {
+    let repeats = core.jobs.same_command(session_id, cwd, command);
+    if repeats.is_empty() {
+        return None;
+    }
+    let mut named = Vec::new();
+    for job in &repeats {
+        let what = crate::guard::describe(&crate::guard::tree(job.pid), &job.cwd).map(|what| format!(", which was running {what}")).unwrap_or_default();
+        core.jobs.stop(&job.job_id, "[stopped by the host: the same command was started again]", StopMode::Escalate).await;
+        named.push(format!("{}{what}", job.job_id));
+    }
+    Some(format!("[background job {} ran the same command; it was stopped]", named.join(" and ")))
 }
 
 /// How a background job was started, in one message (the same for the Mac and a container).
@@ -2397,7 +2416,7 @@ async fn run_in_container(
     }
     let (ok, kind) = match (timed_out, exit_code) {
         (true, _) => {
-            let _ = writeln!(text, "{}", timeout_line(timeout_ms));
+            let _ = writeln!(text, "{}", timeout_line(timeout_ms, None));
             (false, Some("timeout"))
         }
         (false, Some(code)) => {
@@ -2582,6 +2601,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             ("CORTEX_COMMAND_URL".to_owned(), runtime.command_access.url.clone()),
             ("CORTEX_COMMAND_TOKEN".to_owned(), runtime.command_access.token.clone()),
         ];
+        let repeats = stop_repeats(core, &identity.session_id, &effective_cwd, command).await;
         return match core.jobs.start(StartRequest {
             session_id: &identity.session_id,
             project_id: &identity.project_id,
@@ -2595,7 +2615,9 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             toolchain: toolchain.clone(),
         }) {
             Ok(meta) => {
-                let mut out = Out::ok(started_line(&meta.job_id, &meta.artifact, &wake));
+                let mut line = repeats.map(|note| format!("{note}\n")).unwrap_or_default();
+                line.push_str(&started_line(&meta.job_id, &meta.artifact, &wake));
+                let mut out = Out::ok(line);
                 out.display = json!({ "job_id": meta.job_id, "pid": meta.pid, "artifact": meta.artifact, "background": true });
                 out
             }
@@ -2641,6 +2663,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Err(error) => tracing::warn!(%error, "could not copy the tree for a check; running in the tree"),
         }
     }
+    let repeats = stop_repeats(core, session_id, &effective_cwd, command).await;
     let sink = items.clone();
     core.tree.begin_run(&session.workspace, session_id);
     let result = core
@@ -2696,6 +2719,9 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     }
     let seconds = run.duration_ms as f64 / 1000.0;
     // Notes on how it ran come before its exit line, which stays last.
+    if let Some(note) = &repeats {
+        let _ = writeln!(text, "{note}");
+    }
     if !blocked_programs.is_empty() {
         let names: Vec<String> = blocked_programs.iter().map(|name| format!("`{name}`")).collect();
         let _ = writeln!(text, "[{} could not start: a command in the sandbox cannot start a program that needs more rights than it has. {PROGRAM_STEP}]", names.join(", "));
@@ -2717,8 +2743,11 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         );
     }
     let (ok, kind) = if run.timed_out {
-        let _ = writeln!(text, "{}", timeout_line(timeout_ms));
+        let _ = writeln!(text, "{}", timeout_line(timeout_ms, run.running.as_deref()));
         (false, Some("timeout"))
+    } else if let Some(note) = &run.stopped {
+        let _ = writeln!(text, "{note}");
+        (false, Some("stopped"))
     } else if run.cancelled {
         let _ = writeln!(text, "[cancelled after {seconds:.1}s; the command and its processes were killed]");
         (false, Some("cancelled"))

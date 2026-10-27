@@ -8,6 +8,7 @@
     "build": "npm run build --workspaces --if-present"
   },
   "workspaces": [
-    "card-timeline"
+    "card-timeline",
+    "card-jobs"
   ]
 }

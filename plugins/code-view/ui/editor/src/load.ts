@@ -32,9 +32,19 @@ export interface FileModel {
   note: string;
 }
 
-async function fileDiff(client: Client, root: string, scope: string, path: string, base?: string | null): Promise<Hunk[]> {
+/** The hunks of one file in one scope. A change too large to carry comes back as no hunks with
+ * `truncated` set (the counts still say how much); the editor then shows the file without controls. */
+interface FileHunks { hunks: Hunk[]; truncated: boolean; added: number; removed: number }
+
+async function fileDiff(client: Client, root: string, scope: string, path: string, base?: string | null): Promise<FileHunks> {
   const diff = await client.call<Diff>('vcs.diff', base ? { root, scope, path, base } : { root, scope, path });
-  return (diff.files.find((file) => file.path === path) ?? diff.files[0])?.hunks ?? [];
+  const file = (diff.files.find((f) => f.path === path) ?? diff.files[0]) as { hunks?: Hunk[]; truncated?: boolean; added?: number; removed?: number } | undefined;
+  return { hunks: file?.hunks ?? [], truncated: file?.truncated === true, added: file?.added ?? 0, removed: file?.removed ?? 0 };
+}
+
+/** What a too-large change leaves to say. */
+function tooLarge(file: FileHunks): string {
+  return `This change is too large to show line by line (${file.added} added, ${file.removed} removed).`;
 }
 
 function count(hunks: readonly Hunk[], kind: '+' | '-'): number {
@@ -75,20 +85,30 @@ export async function loadFile(client: Client, root: string, path: string, scope
       return { key, doc: current, original: '', editable, hunks: [], controls: 'stage-revert', untracked, deleted, added: current ? current.split('\n').length - (current.endsWith('\n') ? 1 : 0) : 0, removed: 0, staged: 0, note };
     }
     const [unstaged, staged] = await Promise.all([fileDiff(client, root, 'unstaged', path), fileDiff(client, root, 'staged', path)]);
-    const index = reverseApply(current, unstaged);
+    if (unstaged.truncated || staged.truncated) {
+      const big = unstaged.truncated ? unstaged : staged;
+      return { key, doc: current, original: null, editable: editable && !deleted, hunks: [], controls: 'none', untracked, deleted, added: unstaged.added + staged.added, removed: unstaged.removed + staged.removed, staged: staged.added + staged.removed, note: tooLarge(big) };
+    }
+    const index = reverseApply(current, unstaged.hunks);
     return {
-      key, doc: current, original: index, editable: editable && !deleted, hunks: unstaged, controls: 'stage-revert', untracked, deleted,
-      added: count(unstaged, '+') + count(staged, '+'), removed: count(unstaged, '-') + count(staged, '-'), staged: count(staged, '+') + count(staged, '-'), note,
+      key, doc: current, original: index, editable: editable && !deleted, hunks: unstaged.hunks, controls: 'stage-revert', untracked, deleted,
+      added: count(unstaged.hunks, '+') + count(staged.hunks, '+'), removed: count(unstaged.hunks, '-') + count(staged.hunks, '-'), staged: count(staged.hunks, '+') + count(staged.hunks, '-'), note,
     };
   }
   if (scope === 'staged') {
     const [unstaged, staged] = await Promise.all([fileDiff(client, root, 'unstaged', path), fileDiff(client, root, 'staged', path)]);
-    const index = reverseApply(current, unstaged);
-    const head = reverseApply(index, staged);
-    return { key, doc: index, original: head, editable: false, hunks: staged, controls: 'unstage', untracked, deleted, added: count(staged, '+'), removed: count(staged, '-'), staged: 0, note: 'The staged text; unstage changes here, edit them in Uncommitted.' };
+    if (unstaged.truncated || staged.truncated) {
+      return { key, doc: current, original: null, editable: false, hunks: [], controls: 'none', untracked, deleted, added: staged.added, removed: staged.removed, staged: 0, note: tooLarge(staged.truncated ? staged : unstaged) };
+    }
+    const index = reverseApply(current, unstaged.hunks);
+    const head = reverseApply(index, staged.hunks);
+    return { key, doc: index, original: head, editable: false, hunks: staged.hunks, controls: 'unstage', untracked, deleted, added: count(staged.hunks, '+'), removed: count(staged.hunks, '-'), staged: 0, note: 'The staged text; unstage changes here, edit them in Uncommitted.' };
   }
-  const uncommitted = untracked ? [] : await fileDiff(client, root, 'uncommitted', path);
-  const head = untracked ? '' : reverseApply(current, uncommitted);
+  const uncommitted = untracked ? { hunks: [], truncated: false, added: 0, removed: 0 } : await fileDiff(client, root, 'uncommitted', path);
   const branch = await fileDiff(client, root, 'branch', path, base);
-  return { key, doc: head, original: reverseApply(head, branch), editable: false, hunks: branch, controls: 'none', untracked, deleted, added: count(branch, '+'), removed: count(branch, '-'), staged: 0, note: 'The file at HEAD against the base; read-only.' };
+  if (uncommitted.truncated || branch.truncated) {
+    return { key, doc: current, original: null, editable: false, hunks: [], controls: 'none', untracked, deleted, added: branch.added, removed: branch.removed, staged: 0, note: tooLarge(branch.truncated ? branch : uncommitted) };
+  }
+  const head = untracked ? '' : reverseApply(current, uncommitted.hunks);
+  return { key, doc: head, original: reverseApply(head, branch.hunks), editable: false, hunks: branch.hunks, controls: 'none', untracked, deleted, added: count(branch.hunks, '+'), removed: count(branch.hunks, '-'), staged: 0, note: 'The file at HEAD against the base; read-only.' };
 }

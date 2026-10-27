@@ -15,11 +15,12 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 - DO: a change, a fix, new code or a command to run in this repository, now. Big or small.
 - LOOKUP: a question about this repository, answered by reading it, or a review or security audit of its code. Nothing is changed.
 - ANSWER: a general question or conversation that needs nothing from this repository.
-4. `skills`: skills from the Skills list whose summary matches the work in `work`. Usually none: sharing only the language or the topic is not a match. A skill used in the previous turn applies again when the user continues that work.
-5. `effort`: how hard the work is to think through: none, low, medium, high or xhigh.
-6. `spec`: new when the message describes work with several requirements worth keeping as a checklist (or the user asks for a spec); amend when a spec exists (shown at the start) and the message adds, drops or changes requirements; none otherwise.
-7. `settles`: yes when the message settles a choice the conversation was weighing (the user picks an option, agrees to a proposal, sets a convention); no otherwise.
-8. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
-9. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
+4. `queries` (IDEATE only): two or three code searches for the part of the software the question is about, a few words each: its subject, not the request ("report cache", "export column order").
+5. `skills`: skills from the Skills list whose summary matches the work in `work`. Usually none: sharing only the language or the topic is not a match. A skill used in the previous turn applies again when the user continues that work.
+6. `effort`: how hard the work is to think through: none, low, medium, high or xhigh.
+7. `spec`: new when the message describes work with several requirements worth keeping as a checklist (or the user asks for a spec); amend when a spec exists (shown at the start) and the message adds, drops or changes requirements; none otherwise.
+8. `settles`: yes when the message settles a choice the conversation was weighing (the user picks an option, agrees to a proposal, sets a convention); no otherwise.
+9. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
+10. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
 
 Examples: "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is IDEATE.

@@ -2,10 +2,10 @@
 id: ideas
 stage: IDEAS
 ---
-Think up different answers to the open design question above. Nothing is changed; the host looks each idea up in the code and in earlier findings next.
+Think up different answers to the open design question, starting from what you found above. Nothing is changed; the host looks each idea up in the code and in earlier findings next.
 
-1. `question`: the decision to make, in one sentence.
-2. `constraints`: what every answer must respect, each with where it comes from: the user, a requirement id, or the code (name the file or symbol). Empty when none is stated.
+1. `question`: the decision to make, in one sentence, as your findings frame it.
+2. `constraints`: what every answer must respect, each with where it comes from: the user, a requirement id, a document you read, or the code (name the file or symbol). Empty when none is stated.
 3. `criteria`: two or three measurable ways to compare answers ("reads per request", "files changed", "memory per item").
 4. `ideas`: one idea per field, each made by its field's principle, so the ideas differ in how they work, not in wording. `name` is a few words; `mechanism` is one sentence saying how it works.
 - `first`: the answer that comes to mind first.

@@ -84,6 +84,9 @@ enum Stage {
     /// IDEATE: the host grounds the question (a code-graph search for it, the files it names,
     /// what the project knows, earlier notes), before the ideas are written.
     IdeateReads { route_seq: u64 },
+    /// IDEATE: the model finds out what the question depends on with its tools (docs, the code,
+    /// how it behaves now); its findings are the last message before IDEAS.
+    IdeateDiscover,
     /// IDEATE: one idea per principle, then the host looks each up ([`crate::ideation`]).
     Ideas,
     /// IDEATE: the critique, the options and a recommendation: the turn's answer.
@@ -147,7 +150,9 @@ fn round_reads(scope: &reads::Scope, session_id: &str, decision: &JournalEntry, 
     let list = |field: &str| detail_list(decision, field);
     let (symbols, files, queries, focus) = (list("symbols"), list("files"), list("queries"), list("focus"));
     let first = str_field(&decision.data, "stage") == "route";
-    let work = first.then(|| decision.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default());
+    // The searches the decision named are the topic; the work sentence restates the request
+    // ("The user wants ...") and finds code that matches the request's words, not its subject.
+    let work = (first && queries.iter().all(|query| query.trim().is_empty())).then(||decision.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default());
     let change = matches!(route, "DO" | "DELEGATE" | "PLAN");
     let diagnostics = reads_diagnostics(decision, route).then_some(reads::DiagnosticsFor { session_id, languages, shown: limits.diagnostics_shown });
     let wanted = Wanted { symbols: &symbols, files: &files, queries: &queries, focus: &focus, work: work.as_deref(), change, session_id, diagnostics };
@@ -261,7 +266,8 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
             "IDEATE" => match ideation::phase_after(&run, last.seq).as_deref() {
                 Some(ideation::PHASE_OPTIONS) => Stage::Done,
                 Some(_) => Stage::Options,
-                None if ideation::grounded(&run, last.seq) => Stage::Ideas,
+                None if ideation::discovered(&run, last.seq) => Stage::Ideas,
+                None if ideation::grounded(&run, last.seq) => Stage::IdeateDiscover,
                 None => Stage::IdeateReads { route_seq: last.seq },
             },
             // A change: plan first, from the conversation and the repository map in the prefix (no
@@ -985,9 +991,25 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let any = env.stops.any();
                 reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await?;
                 knowledge_note(env, journal).await?;
+                // Notes on the topic the router named, else on the work sentence.
+                let queries = detail_list(&entry, "queries");
                 let work = entry.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default();
-                ideation::notes_note(env, journal, &work).await?;
+                let about = if queries.is_empty() { work } else { queries.join("; ") };
+                ideation::notes_note(env, journal, &about).await?;
                 journal.note(&env.run_id, ideation::GROUNDED, "", false).await.map(|_| ())
+            }
+            Stage::IdeateDiscover => {
+                set_stage(env, journal, status_seq, "explore").await?;
+                let spec = LoopSpec { kind: LoopKind::Discover, effort: effort.clone(), task: None, step: None };
+                match agent_loop::run(env, journal, &spec).await {
+                    Ok(outcome) if outcome.outcome == "parked" || outcome.outcome == "cancelled" => {
+                        return Ok(TurnEnd { state: outcome.outcome.clone(), detail: outcome.summary.clone(), route: route_name, agent: Some(outcome) });
+                    }
+                    // A loop that ended without findings (context full, repeating) still leaves the
+                    // reads it made: the ideas are written from those.
+                    Ok(_) => journal.note(&env.run_id, ideation::DISCOVERED, "", false).await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
             }
             Stage::Ideas => {
                 set_stage(env, journal, status_seq, "ideas").await?;

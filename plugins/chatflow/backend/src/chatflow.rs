@@ -645,7 +645,22 @@ impl Chatflow {
         if !params.mentions.is_empty() {
             message["mentions"] = json!(params.mentions);
         }
+        let first_message = !journal.entries().any(|entry| entry.kind == kinds::USER_MESSAGE);
         journal.append(kinds::USER_MESSAGE, attachments::with(message, &attached)).await?;
+        // The conversation's name comes from its first message; without one it would stay "New
+        // conversation" among twenty others.
+        if first_message
+            && let Ok(session) = host.session_get(&params.session_id).await
+            && session.title.trim().is_empty()
+        {
+            let title = title_from(&params.text);
+            if !title.is_empty() {
+                let record = SessionUpdateParams { id: params.session_id.clone(), title: Some(title), status: None, task_id: None, model: None };
+                if let Err(error) = host.session_update(&record).await {
+                    tracing::debug!(error = %error.message, "the conversation was not named");
+                }
+            }
+        }
         if let Some(note) = note(&run_id) {
             journal.append(kinds::NOTE, note).await?;
         }
@@ -1273,8 +1288,11 @@ impl Chatflow {
     async fn state(&self, ctx: Ctx, params: SessionParams) -> Result<FlowState, RpcError> {
         let host = Host::new(ctx);
         let journal = Journal::load(host, &params.session_id).await?;
-        let local = self.active(&params.session_id);
+        // The journal says whether a run is going: a run's handle outlives its final status (it
+        // still learns and records the session's status), and the UI asks again only when a status
+        // entry lands, so a handle counted as running there would keep the run going in the UI.
         let status = running_status(&journal);
+        let local = self.active(&params.session_id).filter(|_| status.is_some());
         let stage = match &local {
             Some((_, _, stage, _)) => stage.lock().ok().map(|stage| stage.clone()),
             None => status.as_ref().map(|entry| str_field(&entry.data, "stage").to_owned()),
@@ -1825,4 +1843,50 @@ fn knowledge_name(statement: &str) -> String {
         name.push_str(word);
     }
     if name.is_empty() { statement.chars().take(60).collect() } else { name }
+}
+
+/// A conversation's name from its first message: the first line's first words, at most 48
+/// characters, cut at a word; markdown marks and trailing punctuation left out.
+pub fn title_from(text: &str) -> String {
+    const MAX: usize = 48;
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    let mut line = line.trim_start_matches(|c: char| matches!(c, '#' | '-' | '*' | '>' | ' '));
+    // An opening courtesy says nothing about the conversation.
+    for opener in ["please ", "pls ", "can you ", "could you ", "would you ", "hey ", "hi "] {
+        if line.len() > opener.len() && line[..opener.len()].eq_ignore_ascii_case(opener) {
+            line = line[opener.len()..].trim_start();
+        }
+    }
+    let mut out = String::new();
+    for word in line.split_whitespace() {
+        let word = word.trim_matches(|c: char| matches!(c, '`' | '"' | '*' | '_' | '(' | ')'));
+        if word.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out = word.chars().take(MAX).collect();
+            continue;
+        }
+        if out.chars().count() + 1 + word.chars().count() > MAX {
+            break;
+        }
+        out.push(' ');
+        out.push_str(word);
+    }
+    // A cut never ends on a joining word or punctuation.
+    let mut out = out.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '…')).to_owned();
+    loop {
+        let last = out.rsplit(' ').next().unwrap_or("").to_ascii_lowercase();
+        let dangling = matches!(last.as_str(), "and" | "or" | "but" | "the" | "a" | "an" | "to" | "of" | "with" | "for" | "in" | "on" | "at" | "that" | "which" | "so" | "then" | "than" | "by" | "from" | "is" | "are" | "it");
+        if !dangling || !out.contains(' ') {
+            break;
+        }
+        out.truncate(out.len() - last.len());
+        out = out.trim_end_matches(|c: char| c == ' ' || matches!(c, '.' | ',' | ';' | ':')).to_owned();
+    }
+    let mut chars = out.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }

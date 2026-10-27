@@ -7,7 +7,7 @@
  * until seen.
  */
 
-import { definePlugin, errorMessage, useClient, useNow, useQuery, useShared } from '@cortex/sdk';
+import { definePlugin, errorMessage, setShared, useClient, useNow, useQuery, useShared } from '@cortex/sdk';
 import { useState, type ReactNode } from 'react';
 
 interface Pending { plugin: string; name?: string; version: string; from?: string; installed?: string; files?: string[] }
@@ -122,6 +122,10 @@ function Updates() {
           </div>
           <div className="sheet-f">
             <button className="detent" type="button" onClick={() => { setSettings('plugins'); setOverlay(true); }}>Open Plugins</button>
+            <button className="detent" type="button" data-action="fix-in-chat" title="Start a conversation on CortexCode's own source about this version"
+              onClick={() => { setShared('plugins.fix', { plugin: broke.plugin, version: broke.version, ts: Date.now(), reason: `could not start its version ${short(broke.version)}: ${broke.error ?? 'its start-up check failed'}; the previous version keeps running` }); void act('dismiss', 'update.dismiss', { plugin: broke.plugin }); }}>
+              Fix it in a chat
+            </button>
             <span className="grow" />
             <button className="detent send" type="button" disabled={busy !== null} data-action="dismiss"
               onClick={() => void act('dismiss', 'update.dismiss', { plugin: broke.plugin })}>

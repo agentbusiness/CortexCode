@@ -30,12 +30,19 @@ pub struct ParsedFile {
     pub hunks: Vec<ParsedHunk>,
 }
 
+/// The most of one file's change that travels in an answer. Beyond it only the counts go: a
+/// generated or data file of tens of megabytes would otherwise make the whole answer larger than
+/// one message may be, and nobody reads such a diff line by line.
+pub const MAX_FILE_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
 impl ParsedFile {
     pub fn to_contract(&self) -> FileDiff {
         let mut added = 0;
         let mut removed = 0;
+        let mut bytes = 0;
         for hunk in &self.hunks {
             for line in &hunk.hunk.lines {
+                bytes += line.text.len() + 1;
                 match line.kind.as_str() {
                     "+" => added += 1,
                     "-" => removed += 1,
@@ -43,12 +50,14 @@ impl ParsedFile {
                 }
             }
         }
+        let truncated = bytes > MAX_FILE_DIFF_BYTES;
         FileDiff {
             path: self.path.clone(),
             old_path: self.old_path.clone(),
             status: self.status.clone(),
             binary: self.binary,
-            hunks: self.hunks.iter().map(|h| h.hunk.clone()).collect(),
+            truncated,
+            hunks: if truncated { Vec::new() } else { self.hunks.iter().map(|h| h.hunk.clone()).collect() },
             added,
             removed,
         }

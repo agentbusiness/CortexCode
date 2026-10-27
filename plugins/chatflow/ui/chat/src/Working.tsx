@@ -42,7 +42,7 @@ export function Working({ since, detail, stage: statusStage, flow, reasoning, pr
           {decision.map((line, index) => <span key={index} className="chat-working-latest cx-working-decision" aria-live="off">{line}</span>)}
           {thought && <span className="chat-working-thinking" aria-live="off">{thought}</span>}
         </summary>
-        <p className="ap faint">
+        <p className="cx-aside">
           {flow
             ? `${flow.pending_steers} steer${flow.pending_steers === 1 ? '' : 's'} and ${flow.pending_followups} follow-up${flow.pending_followups === 1 ? '' : 's'} waiting.`
             : 'The conductor has not reported its stage.'}

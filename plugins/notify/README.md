@@ -119,3 +119,8 @@ cortex-pack build plugins/notify --install
 
 - `report` notifications are posted by whoever produces a report (`notify.send`); no event derives
   them yet.
+
+- **A service that keeps crashing** (`plugin.state` with `crashed` and three or more restarts in a
+  row): "<plugin> keeps stopping", with *Fix it* (a conversation on CortexCode's own source about
+  the service, started by the plugin manager's band) and *Open Plugins*; one per service, updated
+  while it goes on.

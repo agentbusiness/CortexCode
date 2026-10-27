@@ -360,7 +360,7 @@ export function ideationOf(entry: JournalEntry): IdeationView {
       const option = record(item);
       return {
         letter: str(option.letter), idea: num(option.idea), name: str(option.name), mechanism: str(option.mechanism), why: str(option.why),
-        grounding: list(option.grounding).map(found), priorArt: str(option.prior_art), cost: str(option.cost), risk: str(option.risk), settleBy: str(option.settle_by),
+        grounding: list(option.grounding).map(found).filter((item, at, all) => all.findIndex((other) => other.ref === item.ref) === at), priorArt: str(option.prior_art), cost: str(option.cost), risk: str(option.risk), settleBy: str(option.settle_by),
       };
     }),
     radical: radical && str(radical.name) ? { name: str(radical.name), drops: str(radical.drops), buys: str(radical.buys), wins_if: str(radical.wins_if) } : null,

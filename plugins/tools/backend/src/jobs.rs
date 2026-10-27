@@ -3,7 +3,6 @@
 //! `tools.job` event when the job exits and, optionally, when its output matches a regex or has been
 //! silent for N seconds (wake rules). A successor instance adopts running jobs from disk.
 
-use crate::shell::kill_group;
 use crate::util;
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
@@ -48,6 +47,71 @@ pub struct JobMeta {
     pub wake: Wake,
     /// Artifact id of the job's full output.
     pub artifact: String,
+    /// Why the job was stopped, or what it left running (the host's note at the end of its output).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// How a job is stopped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopMode {
+    /// SIGTERM only: the program may clean up (it can ignore it).
+    Term,
+    /// SIGKILL now.
+    Kill,
+    /// SIGTERM, then SIGKILL to what is left after 1.5 s.
+    Escalate,
+}
+
+/// What a command runs, for telling a repeat of it: the first step that is not `cd`, `export` or
+/// `source`, without its redirections, in single spaces (`cargo test csp:: 2>&1 | tail -30` and
+/// `cargo test csp:: > log` both run `cargo test csp::`).
+pub fn command_head(command: &str) -> String {
+    let mut steps = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), _) if c == q => {
+                quote = None;
+                current.push(c);
+            }
+            (Some(_), _) => current.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                current.push(c);
+            }
+            // `2>&1`, `>&2` and `&>file` are redirections, not a background `&`.
+            (None, '&') if current.ends_with(['>', '<']) || chars.peek() == Some(&'>') => current.push(c),
+            (None, ';' | '|' | '&' | '\n') => {
+                steps.push(std::mem::take(&mut current));
+                while chars.peek().is_some_and(|next| matches!(next, '|' | '&')) {
+                    chars.next();
+                }
+            }
+            (None, _) => current.push(c),
+        }
+    }
+    steps.push(current);
+    let skip = ["cd", "export", "source", ".", "set", "ulimit"];
+    let step = steps.iter().map(|step| step.trim()).find(|step| !step.is_empty() && !step.split_whitespace().next().is_some_and(|word| skip.contains(&word))).unwrap_or("");
+    let mut words = Vec::new();
+    let mut redirect_target = false;
+    for word in step.split_whitespace() {
+        if redirect_target {
+            redirect_target = false;
+            continue;
+        }
+        let bare = word.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches('&');
+        if bare.starts_with('>') || bare.starts_with('<') {
+            // `>file` carries its target; `>` alone takes the next word.
+            redirect_target = bare.trim_start_matches(['>', '<', '&']).is_empty();
+            continue;
+        }
+        words.push(word);
+    }
+    words.join(" ")
 }
 
 /// Something that can publish events (the frame connection, or a test sink).
@@ -237,6 +301,7 @@ impl Jobs {
             exit_code: None,
             wake: request.wake,
             artifact,
+            note: None,
         };
         self.write_meta(&meta);
         if let Ok(mut running) = self.running.lock() {
@@ -351,8 +416,11 @@ impl Jobs {
             }
             // Exit.
             let exited = std::fs::read_to_string(dir.join("exit")).ok().and_then(|text| text.trim().parse::<i32>().ok());
-            let own_child_done = self.reap(&meta.job_id);
-            let alive = exited.is_none() && !own_child_done && process_group_alive(meta.pid);
+            // The runner ending is not the job ending: when it is killed first, the command it
+            // started still runs in the job's group (seen: a `sleep` left running, the job shown
+            // as ended and Kill finding nothing to kill).
+            self.reap(&meta.job_id);
+            let alive = exited.is_none() && process_group_alive(meta.pid);
             if exited.is_some() || !alive {
                 // The job can write its final bytes after the size sample above. Drain them
                 // in bounded chunks, but do not loop forever when the artifact cannot be read.
@@ -362,7 +430,27 @@ impl Jobs {
                     continue;
                 }
                 let current = self.meta(&meta.job_id).unwrap_or(meta.clone());
-                meta.state = if current.state == "killed" {
+                let mut notes = Vec::new();
+                // What the job's command left running when it ended: nobody waits for it.
+                let left = crate::guard::tree(meta.pid);
+                if !left.is_empty() {
+                    let what = crate::guard::describe(&left, &meta.cwd).unwrap_or_default();
+                    crate::guard::stop(meta.pid).await;
+                    notes.push(format!("[it left {what} running after it ended; the host stopped that. Start a program that must keep running as the background job itself, not with `&` inside one.]"));
+                }
+                let stopped = std::fs::read_to_string(dir.join("stop-note")).ok().filter(|note| !note.trim().is_empty());
+                if let Some(note) = &stopped {
+                    notes.insert(0, note.trim().to_owned());
+                }
+                if !notes.is_empty() {
+                    let text = notes.join("\n");
+                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&output_path) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "\n{text}");
+                    }
+                    meta.note = Some(text);
+                }
+                meta.state = if current.state == "killed" || stopped.is_some() {
                     "killed".to_owned()
                 } else if exited.is_some() {
                     "exited".to_owned()
@@ -438,10 +526,47 @@ impl Jobs {
         if meta.state == "running" {
             meta.state = "killed".to_owned();
             self.write_meta(&meta);
-            kill_group(meta.pid).await;
+            crate::guard::stop(meta.pid).await;
             self.reap(job_id);
         }
         Some(meta)
+    }
+
+    /// Stop a running job, with the note its output ends with (why, and what to do next). The job
+    /// counts as killed once its processes are gone.
+    pub async fn stop(&self, job_id: &str, note: &str, mode: StopMode) -> Option<JobMeta> {
+        let meta = self.meta(job_id)?;
+        if meta.state != "running" && crate::guard::tree(meta.pid).is_empty() {
+            return Some(meta);
+        }
+        let _ = util::atomic_write(&self.dir(job_id).join("stop-note"), note.as_bytes());
+        match mode {
+            StopMode::Escalate => crate::guard::stop(meta.pid).await,
+            StopMode::Term => crate::guard::signal(meta.pid, &crate::guard::tree(meta.pid), libc::SIGTERM),
+            StopMode::Kill => crate::guard::signal(meta.pid, &crate::guard::tree(meta.pid), libc::SIGKILL),
+        }
+        self.reap(job_id);
+        Some(meta)
+    }
+
+    /// The running jobs.
+    pub fn running(&self) -> Vec<JobMeta> {
+        self.list(None).into_iter().filter(|meta| meta.state == "running").collect()
+    }
+
+    /// How much a job has printed so far, in bytes.
+    pub fn output_len(&self, meta: &JobMeta) -> u64 {
+        std::fs::metadata(self.output_path(meta)).map(|file| file.len()).unwrap_or(0)
+    }
+
+    /// The running jobs of `session` in `cwd` that run what `command` runs (see [`command_head`]).
+    pub fn same_command(&self, session: &str, cwd: &Path, command: &str) -> Vec<JobMeta> {
+        let head = command_head(command);
+        if head.is_empty() {
+            return Vec::new();
+        }
+        let cwd = cwd.to_string_lossy();
+        self.running().into_iter().filter(|meta| meta.session_id == session && meta.cwd == cwd && command_head(&meta.command) == head).collect()
     }
 
     pub fn list(&self, session: Option<&str>) -> Vec<JobMeta> {

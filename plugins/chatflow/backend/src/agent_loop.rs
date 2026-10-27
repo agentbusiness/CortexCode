@@ -135,6 +135,8 @@ pub enum LoopKind {
     Foreground,
     /// A question (the router's LOOKUP or ANSWER): explore with the tools and answer.
     Question,
+    /// IDEATE's discovery: explore with the tools and report what the question depends on.
+    Discover,
     /// A named background agent working a task.
     Agent { name: String },
 }
@@ -741,6 +743,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // "reply when you know the answer" does not win over it (seen: the model answered with a
         // progress report at "Current stage: ASK" while the tool had 168 lines open).
         LoopKind::Question => ("ASK", if crate::flow::work_open_round(&entries, &env.run_id) { env.data.text("work_open_stage", &[]) } else { String::new() }),
+        LoopKind::Discover => ("DISCOVER", String::new()),
         LoopKind::Agent { name } => ("TASK", env.data.text("agent_live", &[("name", name)])),
     };
     env.set_stage("act");

@@ -132,7 +132,8 @@ impl CodeTree {
         // descriptions are on them) and files (bind first, then rank: the corpus is chosen before SEARCH).
         // Document sections (`lang-markdown`, label `Section`, kind `section`) rank with the code.
         let label_filter = if include_external { "n:Sym OR n:File OR n:Section OR n:ExternalSymbol" } else { "n:Sym OR n:File OR n:Section" };
-        let want = (limit * 3).max(limit + 10);
+        // A wide pool: vendored code can fill a small one and leave the repository's own out.
+        let want = (limit * 8).max(limit + 30);
         let rows = self
             .run(
                 &format!(
@@ -155,14 +156,27 @@ impl CodeTree {
         if !sids.is_empty() {
             let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) RETURN {cols}", layer::OBSERVED_READ), params! { "sids" => sids }).await?;
             let by_sid: HashMap<String, SymbolRef> = rows.rows.iter().map(|r| (s(r, 0), sym_from(r, 0))).collect();
-            for (sid, score) in ranked {
+            // The repository's own code and documents first, then vendored or generated files
+            // ([`Declared`]), each by score: third-party code is what the work reads last.
+            let declared = {
+                let model = self.model.read().await;
+                Declared::read(&self.root, model.files.keys().cloned())
+            };
+            let mut excluded: HashMap<String, bool> = HashMap::new();
+            let (mut own, mut other): (Vec<(&SymbolRef, f64)>, Vec<(&SymbolRef, f64)>) = (Vec::new(), Vec::new());
+            for (sid, score) in &ranked {
+                let Some(symbol) = by_sid.get(sid).filter(|symbol| kind_ok(&symbol.kind)) else { continue };
+                if *excluded.entry(symbol.path.clone()).or_insert_with(|| declared.excluded(&self.root, &symbol.path)) {
+                    other.push((symbol, *score));
+                } else {
+                    own.push((symbol, *score));
+                }
+            }
+            for (symbol, score) in own.into_iter().chain(other) {
                 if hits.len() >= limit {
                     break;
                 }
-                if let Some(symbol) = by_sid.get(&sid)
-                    && kind_ok(&symbol.kind)
-                    && seen.insert(sid.clone())
-                {
+                if seen.insert(symbol.sid.clone()) {
                     hits.push(SearchHit { symbol: symbol.clone(), score, matched: "semantic".into() });
                 }
             }

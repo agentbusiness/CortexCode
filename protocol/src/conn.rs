@@ -1,11 +1,12 @@
 //! A bidirectional RPC connection over any async byte stream.
 //!
 //! Both ends can issue requests, answer requests (with optional stream items), publish events and
-//! cancel open requests. One writer task serializes outgoing frames; one reader task dispatches
+//! cancel open requests. An answer too large for one frame fails only its request. One writer
+//! task serializes outgoing frames; one reader task dispatches
 //! incoming frames. Incoming requests are handed to a [`Handler`] on their own task so a slow
 //! request never blocks the connection.
 
-use crate::codec::{read_message, write_message};
+use crate::codec::{CodecError, MAX_FRAME_BYTES, read_message, write_message};
 use crate::envelope::{Message, RpcError};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -337,12 +338,30 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut rx: mpsc::Unbounde
             // Queued messages first, so a final response queued before `close()` is delivered.
             biased;
             message = rx.recv() => match message {
-                Some(message) => {
-                    if let Err(error) = write_message(&mut writer, &message).await {
+                Some(message) => match write_message(&mut writer, &message).await {
+                    Ok(()) => {}
+                    // An answer too large for one message fails that one request; the
+                    // connection, and everything else on it, goes on.
+                    Err(CodecError::TooLarge(bytes)) => {
+                        tracing::warn!(bytes, "a message exceeds the frame limit; its request gets an error instead");
+                        if let Message::Res { id, .. } = &message {
+                            let error = RpcError::internal(format!(
+                                "the answer is {} MB; at most {} MB fits in one message. Ask for a smaller part: one file, one page.",
+                                bytes / (1024 * 1024),
+                                MAX_FRAME_BYTES / (1024 * 1024)
+                            ));
+                            let reply = Message::Res { id: *id, ok: false, result: None, error: Some(error) };
+                            if let Err(error) = write_message(&mut writer, &reply).await {
+                                tracing::debug!(%error, "connection write failed");
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
                         tracing::debug!(%error, "connection write failed");
                         break;
                     }
-                }
+                },
                 None => break,
             },
             _ = shutdown.cancelled() => break,

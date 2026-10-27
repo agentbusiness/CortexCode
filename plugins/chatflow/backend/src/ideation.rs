@@ -1,8 +1,11 @@
 //! Ideation (docs/IDEATION-WORKFLOW.md, part 4): an open design question (route IDEATE) worked
 //! through by the host in small steps, so the model never has to hold the whole procedure:
 //!
-//! 1. grounding (host): a code-graph search for the question and the files it names, what the
-//!    project knows, and earlier research notes on it;
+//! 1. grounding (host): a code-graph search for the topic the router named and the files it
+//!    names, what the project knows, and earlier research notes on it;
+//! 1b. discovery (the model, with its tools): the documents, the code and how it behaves now; its
+//!    findings are the message right before IDEAS, so the ideas start from evidence rather than
+//!    from the project's rules in the prefix;
 //! 2. IDEAS (one constrained call): the question, its constraints and criteria, and one idea per
 //!    generating principle; the principles are the schema's field names, so the ideas differ by
 //!    construction instead of by an instruction to differ;
@@ -383,7 +386,13 @@ fn options_from(ideas: &Ideas, findings: &[Found], output: OptionsOutput) -> Opt
             let text = clean(text);
             if text.is_empty() { fallback.cloned().unwrap_or_default() } else { text }
         };
-        let grounding: Vec<Found> = option.grounding.iter().filter_map(|reference| findings.iter().find(|found| &found.reference == reference)).cloned().collect();
+        // The grammar lets a pick repeat; a finding counts once.
+        let mut grounding: Vec<Found> = Vec::new();
+        for found in option.grounding.iter().filter_map(|reference| findings.iter().find(|found| &found.reference == reference)) {
+            if !grounding.iter().any(|known| known.reference == found.reference) {
+                grounding.push(found.clone());
+            }
+        }
         options.push(Choice {
             letter: LETTERS[options.len()].to_owned(),
             idea,
@@ -424,7 +433,19 @@ pub fn is_answer(entry: &JournalEntry) -> bool {
 /// The note that marks the grounding stage done.
 pub const GROUNDED: &str = "ideate_grounded";
 
+/// The note that marks the discovery loop done.
+pub const DISCOVERED: &str = "ideate_discovered";
+
+fn noted(run: &[&JournalEntry], seq: u64, purpose: &str) -> bool {
+    run.iter().any(|entry| entry.seq > seq && entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == purpose)
+}
+
 /// Whether the run grounded its question after `seq`.
 pub fn grounded(run: &[&JournalEntry], seq: u64) -> bool {
-    run.iter().any(|entry| entry.seq > seq && entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == GROUNDED)
+    noted(run, seq, GROUNDED)
+}
+
+/// Whether the run's discovery loop finished after `seq`.
+pub fn discovered(run: &[&JournalEntry], seq: u64) -> bool {
+    noted(run, seq, DISCOVERED)
 }

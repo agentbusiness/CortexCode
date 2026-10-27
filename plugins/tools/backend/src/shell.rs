@@ -209,11 +209,17 @@ pub struct RunOutput {
     /// Each stage's exit status of the command's last pipeline (one entry when it is no pipe;
     /// empty when the shell did not get that far).
     pub pipe_status: Vec<i32>,
+    /// Why the machine guard stopped the command (its note), when it did.
+    pub stopped: Option<String>,
+    /// At a timeout: what the command was really running when it was killed, in words.
+    pub running: Option<String>,
 }
 
 pub struct Shells {
     config: ShellConfig,
     shells: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Shell>>>>>,
+    /// The shells' process groups, for the machine guard.
+    pub groups: Arc<crate::guard::ShellGroups>,
 }
 
 fn sanitize(key: &str) -> String {
@@ -223,7 +229,7 @@ fn sanitize(key: &str) -> String {
 
 impl Shells {
     pub fn new(config: ShellConfig) -> Self {
-        Self { config, shells: Mutex::new(HashMap::new()) }
+        Self { config, shells: Mutex::new(HashMap::new()), groups: Arc::new(crate::guard::ShellGroups::default()) }
     }
 
     pub fn config(&self) -> &ShellConfig {
@@ -311,6 +317,7 @@ impl Shells {
         drop(command);
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("shell stdin unavailable"))?;
         let pid = child.id() as i32;
+        self.groups.started(&identity.session_id, pid, &identity.workspace.to_string_lossy());
         let (tx, rx) = mpsc::unbounded_channel();
         std::thread::Builder::new().name(format!("shell-{pid}")).spawn(move || {
             let mut reader = reader;
@@ -444,6 +451,7 @@ impl Shells {
             shell.stdin.write_all(line.as_bytes()).and_then(|_| shell.stdin.flush()).map_err(|_| error)?;
         }
 
+        let shell_pid = shell.pid;
         let mut capture = Capture::new(&identity.home.join("artifacts"));
         let mut pending = std::mem::take(&mut shell.leftover);
         let deadline = tokio::time::sleep(request.timeout);
@@ -455,6 +463,7 @@ impl Shells {
         let mut cancelled = false;
         let mut shell_exited = false;
         let mut finished = false;
+        let mut running = None;
         loop {
             // Look for the sentinel in what we have.
             if let Some(position) = find(&pending, &marker_bytes) {
@@ -511,6 +520,9 @@ impl Shells {
             };
             on_output(&tail);
             capture.push(&tail);
+            if timed_out {
+                running = crate::guard::describe(&crate::guard::tree(shell.pid), &start.to_string_lossy());
+            }
             terminate(&mut shell).await;
             let _ = std::fs::remove_file(&command_file);
             // The shell is gone; the next command starts a new one with the saved state.
@@ -526,6 +538,7 @@ impl Shells {
             .map(|text| text.split_whitespace().filter_map(|code| code.parse().ok()).collect())
             .unwrap_or_default();
         let _ = std::fs::remove_file(&pipe_file);
+        let stopped = if shell_exited { self.groups.take_stopped(shell_pid) } else { None };
         Ok(RunOutput {
             exit_code,
             timed_out,
@@ -534,6 +547,8 @@ impl Shells {
             output: capture.finish(),
             duration_ms: started.elapsed().as_millis() as u64,
             pipe_status,
+            stopped,
+            running,
         })
     }
 

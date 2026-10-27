@@ -91,7 +91,7 @@ pub const PROVIDES: &[&str] = &[
 ];
 
 /// Event topic prefixes this plugin subscribes to.
-pub const SUBSCRIBES: &[&str] = &["journal.", "agents.changed", "plugin.swapped", "tools.job", topics::FOCUS, "memory.settings.changed"];
+pub const SUBSCRIBES: &[&str] = &["journal.", "agents.changed", "plugin.swapped", "plugin.state", "tools.job", topics::FOCUS, "memory.settings.changed"];
 
 /// Calls into the rest of the system (the frame in production, a table in unit tests).
 pub trait Bus: Send + Sync + 'static {
@@ -845,6 +845,7 @@ impl Notifier {
             match topic {
                 agents::topics::AGENT_CHANGED => derive::from_agents_changed(&data),
                 "plugin.swapped" => derive::from_swapped(&data),
+                "plugin.state" => derive::from_plugin_state(&data),
                 tools::topics::JOB_EVENT => derive::from_job(&data),
                 topics::FOCUS => {
                     self.set_focus(data);

@@ -270,7 +270,15 @@ schema = "schemas/plan.json"
 effort = "none"
 sampling = "auto"
 
-# An open design question (route IDEATE), in two calls around a host step. IDEAS: the question,
+# An open design question (route IDEATE). DISCOVER first: a tool loop that finds what the question
+# depends on (the documents, the code, how it behaves now) and replies with its findings, the last
+# message before IDEAS (outside the prefix: its rules are the step's own last message).
+[stage.DISCOVER]
+rules = "discover"
+effort = "decided"
+sampling = "auto"
+
+# Then two calls around a host step. IDEAS: the question,
 # its constraints and criteria, and one idea per generating principle (the schema's field names
 # are the principles, so the ideas differ by construction). The host then looks every idea up
 # (code graph, research notes, work elsewhere when online). OPTIONS: critique, the two or three

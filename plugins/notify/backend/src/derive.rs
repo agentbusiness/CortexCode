@@ -41,6 +41,9 @@ pub enum Trigger {
     AgentBlocked { project_id: String, agent: String, task_id: Option<String>, session_id: Option<String> },
     /// `plugin.swapped` with `ok: false` or `rolled_back: true`.
     Swap { result: SwapResult },
+    /// `plugin.state` saying a service crashed again and again (a crash loop): the frame keeps
+    /// restarting it, and the person should know and be able to hand it to a conversation.
+    Crash { plugin_id: String, category: String, version: String, restarts: u64 },
     /// `tools.job` with a final state (exited, killed).
     Job { job_id: String, session_id: Option<String>, state: String, exit_code: Option<i32> },
 }
@@ -64,7 +67,7 @@ impl Trigger {
             | Trigger::Spawned { session_id, .. }
             | Trigger::Conflict { session_id, .. } => Some(session_id),
             Trigger::Job { session_id, .. } | Trigger::AgentBlocked { session_id, .. } => session_id.as_deref(),
-            Trigger::Swap { .. } => None,
+            Trigger::Swap { .. } | Trigger::Crash { .. } => None,
         }
     }
 
@@ -87,6 +90,7 @@ impl Trigger {
             | Trigger::Conflict { session_id, seq, .. } => format!("journal:{session_id}#{seq}"),
             Trigger::AgentBlocked { .. } => "agents.changed".into(),
             Trigger::Swap { .. } => "plugin.swapped".into(),
+            Trigger::Crash { category, .. } => format!("plugin.state:{category}"),
             Trigger::Job { job_id, .. } => format!("tools.job:{job_id}"),
         }
     }
@@ -250,6 +254,22 @@ pub fn from_swapped(data: &Value) -> Option<Trigger> {
         return None;
     }
     Some(Trigger::Swap { result })
+}
+
+/// Crashes in a row before a service counts as crash-looping (the frame falls back at the same count).
+pub const CRASH_LOOP: u64 = 3;
+
+/// A trigger from `plugin.state` (a `PluginInfo`): a service that crashed [`CRASH_LOOP`] times or
+/// more in a row.
+pub fn from_plugin_state(data: &Value) -> Option<Trigger> {
+    if str_of(data, "state")? != "crashed" {
+        return None;
+    }
+    let restarts = data.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+    if restarts < CRASH_LOOP {
+        return None;
+    }
+    Some(Trigger::Crash { plugin_id: str_of(data, "plugin_id")?, category: str_of(data, "category")?, version: str_of(data, "version").unwrap_or_default(), restarts })
 }
 
 /// A trigger from `tools.job` (`{job_id, session_id, state, exit_code?}`). `running` is a wake-rule
@@ -579,6 +599,19 @@ fn compose(trigger: &Trigger, ctx: &Context, prefs: &Prefs) -> Option<Notificati
                 subtitle: versions.map(|v| format!("{} {v}", result.category)),
             }
         }
+        Trigger::Crash { plugin_id, category, version, restarts } => Notification {
+            kind: kinds::FAILED.into(),
+            title: format!("{plugin_id} keeps stopping"),
+            body: format!(
+                "The {category} service stopped {restarts} times in a row right after starting; CortexCode keeps restarting it. Fix it hands the problem to a conversation on CortexCode's own source."
+            ),
+            key: Some(format!("crash:{category}")),
+            project_id: None,
+            session_id: None,
+            target: json!({"open": "fix_plugin", "plugin": plugin_id, "category": category, "version": version, "restarts": restarts}),
+            actions: vec!["Fix it".into(), "Open Plugins".into()],
+            subtitle: Some(format!("{plugin_id} {}", version.split('+').next().unwrap_or(version))),
+        },
         Trigger::Job { job_id, session_id, state, exit_code } => {
             let ran = ctx.job_started_ms.map(|started| ctx.now_ms.saturating_sub(started));
             // Only long jobs are worth a notification; the threshold is a user preference.
