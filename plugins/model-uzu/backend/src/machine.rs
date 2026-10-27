@@ -8,6 +8,9 @@ use serde::Serialize;
 pub struct Machine {
     pub chip: String,
     pub physical_bytes: u64,
+    /// The kernel's limit on all wired memory together (`vm.global_user_wire_limit`); zero when
+    /// unknown.
+    pub wire_limit_bytes: u64,
     /// What the kernel can hand out now without memory pressure.
     pub available_bytes: u64,
     pub cpu_cores: u32,
@@ -61,6 +64,7 @@ impl Machine {
         Self {
             chip: sysctl_string(c"machdep.cpu.brand_string").unwrap_or_default(),
             physical_bytes,
+            wire_limit_bytes: sysctl_u64(c"vm.global_user_wire_limit").unwrap_or(0),
             available_bytes: physical_bytes / 100 * level,
             cpu_cores: sysctl_u64(c"hw.ncpu").and_then(|cores| u32::try_from(cores).ok()).unwrap_or(0),
             performance_cores: sysctl_u64(c"hw.perflevel0.physicalcpu")

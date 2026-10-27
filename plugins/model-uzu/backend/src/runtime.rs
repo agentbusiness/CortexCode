@@ -611,14 +611,14 @@ impl Runtime {
         vision::install::install(tower, spec.id, &dir, &cache, &progress).await.map(|_| ())
     }
 
-    /// The memory fit, from the machine itself (the GPU's working-set limit and physical RAM less a
-    /// quarter), never from what happens to be free: the model loads at once. The pool is shared, so
+    /// The memory fit, from the machine itself (the GPU's working-set limit, physical RAM less a
+    /// quarter and the kernel's wired limit less an eighth of RAM), never from what happens to be free: the model loads at once. The pool is shared, so
     /// no conversation count is planned; a machine whose pool cannot hold one conversation with the
     /// minimum agent context is a plain load error.
     fn fit(&self, geometry: &Geometry) -> Result<Plan, String> {
         let min = self.config.min_context_per_slot.unwrap_or(DEFAULT_MIN_CONTEXT_PER_SLOT);
         let machine = Machine::measure();
-        let budget = Budget::new(metal_working_set(), machine.physical_bytes, self.config.memory_limit_bytes);
+        let budget = Budget::new(metal_working_set(), machine.physical_bytes, machine.wire_limit_bytes, self.config.memory_limit_bytes);
         let mut plan = fit::fit(geometry, &budget);
         if let Some(ctx) = self.config.ctx_total {
             plan.ctx_total = ctx;

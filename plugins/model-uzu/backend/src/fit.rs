@@ -2,12 +2,20 @@
 //!
 //! Every term is read from the model directory (weights, the attention KV and recurrent-state
 //! geometry of `config.json` and `speculator/config.json`) or measured on this machine. The budget
-//! is the smaller of the Metal working set (`recommendedMaxWorkingSetSize`) and physical RAM less a
-//! quarter (left for the application, the browser and the system). Metal memory is wired: macOS
-//! cannot page or compress it and raises no memory pressure for it, so the budget is a hard ceiling
-//! the model never passes. Without the reserve the plan reached the whole working set (40.2 GB of a
-//! 48 GB Mac), the model held 41.6 GB and the GPU driver panicked the machine; we measured
-//! that a tenth held back drove a 48 GB Mac into memory pressure with a 27B model, a quarter did not.
+//! is the smallest of the Metal working set (`recommendedMaxWorkingSetSize`), physical RAM less a
+//! quarter (left for the application, the browser and the system), and the kernel's wired-memory
+//! limit less an eighth of RAM. Metal memory is wired: macOS cannot page or compress it and raises
+//! no memory pressure for it, so the budget is a hard ceiling the model never passes. Without the
+//! RAM reserve the plan reached the whole working set (40.2 GB of a 48 GB Mac), the model held
+//! 41.6 GB and the GPU driver panicked the machine; we measured that a tenth held back drove a
+//! 48 GB Mac into memory pressure with a 27B model, a quarter did not.
+//!
+//! The wired limit (`vm.global_user_wire_limit`, 40.7 GB on a 48 GB Mac) bounds all wired memory
+//! together: the kernel's own, the GPU memory of the window server, the app and the browsers, and
+//! the model's. A wiring past it fails (`kIOReturnNoMemory`) and the GPU driver panics on that
+//! failure: seen at a 193k-token conversation, the model near 37 GB within its 38.7 GB plan, memory
+//! otherwise fine. An eighth of RAM stays below the limit for everyone else's wired memory (4.3 GB
+//! was wired with no model loaded).
 //!
 //! uzu keeps every conversation's attention KV in sparse Metal buffers whose pages are committed as
 //! the conversation grows, so the KV pool is one budget shared by all conversations: any one of them
@@ -24,6 +32,9 @@ const GIB: u64 = 1024 * MIB;
 
 /// A quarter of physical RAM stays outside the budget, for everything else on the machine.
 pub const RAM_RESERVE_DIVISOR: u64 = 4;
+/// An eighth of physical RAM stays below the kernel's wired limit, for the wired memory of the
+/// kernel and every other GPU user.
+pub const WIRE_RESERVE_DIVISOR: u64 = 8;
 /// Pool sizes are whole multiples of this many tokens.
 pub const CONTEXT_GRANULARITY: u64 = 1024;
 /// Rows every attention cache keeps beyond its prefix for the suffix being processed (uzu's
@@ -148,17 +159,22 @@ pub struct Budget {
     /// Physical RAM less [`RAM_RESERVE_DIVISOR`]'s share (or the operator limit, when lower). Read
     /// from the machine, never from what happens to be free at load.
     pub ram_bytes: u64,
+    /// The kernel's wired-memory limit less [`WIRE_RESERVE_DIVISOR`]'s share of RAM; zero when the
+    /// limit is unknown.
+    #[serde(default)]
+    pub wire_bytes: u64,
     pub physical_bytes: u64,
 }
 
 impl Budget {
-    pub fn new(device_bytes: u64, physical_bytes: u64, limit: Option<u64>) -> Self {
+    pub fn new(device_bytes: u64, physical_bytes: u64, wire_limit: u64, limit: Option<u64>) -> Self {
         let ram = physical_bytes - physical_bytes / RAM_RESERVE_DIVISOR;
-        Self { device_bytes, ram_bytes: limit.map_or(ram, |limit| ram.min(limit)), physical_bytes }
+        let wire_bytes = if wire_limit == 0 { 0 } else { wire_limit.saturating_sub(physical_bytes / WIRE_RESERVE_DIVISOR) };
+        Self { device_bytes, ram_bytes: limit.map_or(ram, |limit| ram.min(limit)), wire_bytes, physical_bytes }
     }
 
     pub fn usable(&self) -> u64 {
-        if self.device_bytes == 0 { self.ram_bytes } else { self.device_bytes.min(self.ram_bytes) }
+        [self.device_bytes, self.wire_bytes].into_iter().filter(|bytes| *bytes > 0).fold(self.ram_bytes, u64::min)
     }
 }
 
