@@ -126,10 +126,10 @@ npx cortexcode
 ```
 
 The first run downloads the app for your machine from this repository's releases, checks it
-against the checksum in the release catalog and starts it; later runs start it at once. Or download it
-from [Releases](https://github.com/agentbusiness/CortexCode/releases/latest): on macOS open the
-`.dmg` and move CortexCode to Applications. The app is not signed by Apple yet, so the first start
-from a download asks once: System Settings > Privacy & Security > Open Anyway.
+against the checksum in the release catalog and starts it; later runs start it at once. On Linux you
+can also unpack the `.tar.gz` from [Releases](https://github.com/agentbusiness/CortexCode/releases/latest)
+and run `cortexcode/CortexCode`. The macOS app is not signed by Apple yet, so it is not offered as a
+`.dmg` download; `npx cortexcode` installs it.
 
 Updates come by themselves. A plugin you have not changed updates as soon as no run is going; a
 plugin you changed asks first (merge the update into your change, or keep yours). A new frame
@@ -145,7 +145,7 @@ released on its own, so a change to one plugin builds only that plugin:
 | `scripts/release.sh` | **whatever changed since the last release**, in order: frame, plugins, app, npx (`--plan` says what, `--dry-run` builds without uploading) |
 | `scripts/release-plugin.sh <plugin> [version]` | one plugin (`--changed`: every plugin whose source changed) |
 | `scripts/release-frame.sh [version]` | the frame, cx, cortex-pack and the window code |
-| `scripts/release-app.sh [version]` | the full app for new users (`.dmg`, `.tar.gz`), from the released parts |
+| `scripts/release-app.sh [version]` | the full app for new users (`.tar.gz`; `.dmg` with `RELEASE_DMG=yes`), from the released parts |
 | `scripts/release-npm.sh [version]` | the `npx cortexcode` launcher |
 
 Without a version each takes the next one after the released one: three numbers, each 0 to 99

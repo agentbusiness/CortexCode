@@ -9,6 +9,8 @@
 #   GITHUB_TOKEN        a token of the repository's owner that may create releases (required to upload)
 #   RELEASE_REPO        default agentbusiness/CortexCode
 #   RELEASE_PLATFORMS   default "darwin-arm64"; "darwin-arm64 linux-arm64 linux-x64" for all (Docker)
+#   RELEASE_DMG         yes: also a macOS .dmg in the app release (default no: the app is not signed
+#                       yet, so macOS users start it with `npx cortexcode`)
 #   NPM_TOKEN           for scripts/release-npm.sh (else the npm login of this Mac)
 #   RELEASE_FORBIDDEN   names no released file may hold (extended regex, any case); required
 #   RELEASE_CATALOG     a local catalog to start from instead of the published one (scripts/release.sh
@@ -81,6 +83,7 @@ load_env() {
   fi
   RELEASE_REPO="${RELEASE_REPO:-agentbusiness/CortexCode}"
   RELEASE_PLATFORMS="${RELEASE_PLATFORMS:-darwin-arm64}"
+  RELEASE_DMG="${RELEASE_DMG:-no}"
   forbidden="${RELEASE_FORBIDDEN:-}"
 }
 
