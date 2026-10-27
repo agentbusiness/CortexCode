@@ -10,7 +10,7 @@ name = "Workbench"
 version = "0.1.0"
 description = "The workbench's right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

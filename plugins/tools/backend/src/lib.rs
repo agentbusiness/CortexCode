@@ -15,6 +15,8 @@ pub mod hashedit;
 pub mod host;
 pub mod jobs;
 pub mod lang;
+#[cfg(target_os = "linux")]
+pub mod landlock;
 pub mod langs;
 pub mod pyenv;
 pub mod read;

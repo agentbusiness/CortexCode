@@ -10,7 +10,7 @@ name = "Go"
 version = "0.1.0"
 description = "Everything CortexCode knows about Go: the code graph's facts of .go files and go.mod, gopls diagnostics, definition, references and hover, go build / vet / test verifiers, Go, gopls and delve installed into the toolchains directory, and Go skills."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.

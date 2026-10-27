@@ -1,7 +1,7 @@
 //! The pairing code: four words from a list of 256 (32 bits), typed on the other computer. The
 //! words are short, distinct and easy to say aloud.
 
-use rand::RngCore;
+use rand::Rng;
 
 pub const WORDS: [&str; 256] = [
     "acid", "acorn", "actor", "amber", "angel", "ankle", "apple", "apron", "arrow", "atlas", "badge", "bagel", "baker", "basil", "beach", "beard",

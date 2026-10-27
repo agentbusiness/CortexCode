@@ -117,7 +117,11 @@ fn computer_name() -> String {
             return name;
         }
     }
-    std::env::var("HOSTNAME").ok().filter(|name| !name.is_empty()).unwrap_or_else(|| "this computer".to_owned())
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|name| name.trim().to_owned()))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this computer".to_owned())
 }
 
 impl Mesh {

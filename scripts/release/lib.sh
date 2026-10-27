@@ -8,9 +8,12 @@
 # Configuration: `.env.release` in the repository root (git-ignored), or the environment:
 #   GITHUB_TOKEN        a token of the repository's owner that may create releases (required to upload)
 #   RELEASE_REPO        default agentbusiness/CortexCode
-#   RELEASE_PLATFORMS   default "darwin-arm64"; add "linux-x64 linux-arm64" once the frame builds on Linux
+#   RELEASE_PLATFORMS   default "darwin-arm64"; "darwin-arm64 linux-arm64 linux-x64" for all (Docker)
 #   NPM_TOKEN           for scripts/release-npm.sh (else the npm login of this Mac)
 #   RELEASE_FORBIDDEN   names no released file may hold (extended regex, any case); required
+#   RELEASE_CATALOG     a local catalog to start from instead of the published one (scripts/release.sh
+#                       --dry-run chains its steps through artifacts/catalog.preview.json); files it
+#                       names are then taken from artifacts/ when they are there
 #
 # One release script runs at a time: each rewrites the catalog.
 
@@ -22,6 +25,10 @@ artifacts="$repo/artifacts"
 release_name="${release_name:-release}"
 # Shared code every plugin builds with (the plugin digest covers it, as in scripts/build-app.sh).
 shared_sources=(protocol model-kit lang-kit ui/sdk rust-toolchain.toml)
+# What the frame release is built from (the frame digest covers it).
+frame_sources=(frame cli packer protocol ui scripts/app rust-toolchain.toml)
+# The npx launcher.
+npm_sources=(npm/cortexcode)
 # Names that must never be in a released file: RELEASE_FORBIDDEN (load_env), kept out of the
 # repository so the list itself is never released.
 forbidden=""
@@ -148,6 +155,34 @@ plugin_digest() {
   (cd "$repo" && sources "$1" "${shared_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
 }
 
+# The digest of what the frame release is built from.
+frame_digest() {
+  (cd "$repo" && sources "${frame_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
+}
+
+# The digest of the npx launcher's source.
+npm_digest() {
+  (cd "$repo" && sources "${npm_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
+}
+
+# Files under <paths> with uncommitted changes other than version lines (the release scripts write
+# those), one per line.
+uncommitted() {
+  local file
+  (cd "$repo" && git status --porcelain -z --untracked-files=all -- "$@") | while IFS= read -r -d '' entry; do
+    file="${entry:3}"
+    case "$entry" in
+      " M"*|"M "*|"MM"*)
+        # Only version lines changed: `version = "..."` (TOML) or `"version": "..."` (JSON).
+        if ! (cd "$repo" && git diff -U0 HEAD -- "$file") | grep -E '^[-+][^-+]' | grep -qvE '^[-+](version = "|  "version": ")'; then
+          continue
+        fi
+        ;;
+    esac
+    printf '%s\n' "$file"
+  done
+}
+
 # Copy the source outside plugins/ (the frame's part) into <dir>.
 copy_frame_source() {
   mkdir -p "$1"
@@ -161,11 +196,12 @@ copy_frame_source() {
 sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 size_of() { stat -f%z "$1"; }
 
-# A .tar.gz of the contents of <dir> (no ./ prefix, no macOS metadata files).
+# A .tar.gz of the contents of <dir> (no ./ prefix, no macOS metadata files or extended attributes:
+# GNU tar on Linux warns about every macOS attribute header).
 tar_dir() {
   local dir="$1" out="$2"
   rm -f "$out"
-  (cd "$dir" && COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$out" -- *)
+  (cd "$dir" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -czf "$out" -- *)
 }
 
 # Refuse a file or folder that holds a forbidden name or the release configuration.
@@ -201,7 +237,13 @@ fetch_asset() {
   url="$(jq -r .url <<<"$asset")"
   sha="$(jq -r .sha256 <<<"$asset")"
   mkdir -p "$dir"
-  curl -fsSL -o "$dir/$name" "$url" || die "cannot download $url"
+  local copy=""
+  [ -z "${RELEASE_CATALOG:-}" ] || copy="$(find "$artifacts" -type f -name "$name" -not -path "*/downloads/*" 2>/dev/null | head -1)"
+  if [ -n "$copy" ]; then
+    cp "$copy" "$dir/$name"
+  else
+    curl -fsSL -o "$dir/$name" "$url" || die "cannot download $url"
+  fi
   [ "$(sha256_of "$dir/$name")" = "$sha" ] || die "$name does not match the catalog's checksum"
   printf '%s' "$dir/$name"
 }
@@ -255,6 +297,10 @@ catalog_url() { printf 'https://github.com/%s/releases/download/catalog/catalog.
 # fetch_catalog <out>: the published catalog (an empty one before the first release).
 fetch_catalog() {
   local out="$1" code
+  if [ -n "${RELEASE_CATALOG:-}" ] && [ -f "$RELEASE_CATALOG" ]; then
+    cp "$RELEASE_CATALOG" "$out"
+    return
+  fi
   code="$(curl -sSL -o "$out" -w '%{http_code}' "$(catalog_url)")"
   case "$code" in
     200) jq -e '.format == "cortexcode-catalog/1"' "$out" >/dev/null || die "the published catalog is not a catalog" ;;

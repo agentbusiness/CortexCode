@@ -130,45 +130,8 @@ impl Cmd {
             if &resolved != scratch {
                 return Err(RpcError::new(codes::CONTRACT_VIOLATION, "Git inspection scratch was redirected; restore the plugin data directory in the app"));
             }
-            if !Path::new("/usr/bin/sandbox-exec").is_file() {
-                return Err(RpcError::new(
-                    codes::UNAVAILABLE,
-                    "Git inspection needs the macOS sandbox; open this repository in the app on macOS",
-                ));
-            }
-            let quote = |path: &Path| -> Result<String, RpcError> {
-                let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                let text = path
-                    .to_str()
-                    .ok_or_else(|| RpcError::invalid_params("Git sandbox path is not UTF-8"))?;
-                if text.chars().any(char::is_control) {
-                    return Err(RpcError::invalid_params(
-                        "Git sandbox path contains control characters",
-                    ));
-                }
-                Ok(format!(
-                    "\"{}\"",
-                    text.replace('\\', "\\\\").replace('"', "\\\"")
-                ))
-            };
-            let home = std::env::var_os("CORTEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default()
-                        .join(".cortexcode")
-                });
-            let home = home.canonicalize().unwrap_or(home);
-            let profile = format!(
-                "(version 1)(allow default)\n(deny network*)\n(deny process-info*)\n(allow process-info* (target self))\n(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n(deny file-read* (subpath {}) (subpath {}))\n(deny file-write* (require-not (require-any (subpath {}) (subpath \"/dev\"))))\n",
-                quote(&home.join("run"))?,
-                quote(&home.join("plugins-data/ui/electron"))?,
-                quote(scratch)?
-            );
-            let mut command = Command::new("/usr/bin/sandbox-exec");
+            let mut command = confined(&self.program, scratch)?;
             command.env("TMPDIR", scratch).env("TMP", scratch).env("TEMP", scratch);
-            command.args(["-p", &profile]).arg(&self.program);
             command
         } else {
             Command::new(&self.program)
@@ -251,6 +214,67 @@ impl Cmd {
             Err(command_error(&display, &output))
         }
     }
+}
+
+/// The frame's credentials, which a Git inspection never reads.
+fn hidden_trees() -> [PathBuf; 2] {
+    let home = std::env::var_os("CORTEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".cortexcode")
+        });
+    let home = home.canonicalize().unwrap_or(home);
+    [home.join("run"), home.join("plugins-data/ui/electron")]
+}
+
+/// `program` under the macOS sandbox: repository-controlled config, hooks and filters run without
+/// network, process information of others, the frame's credentials, or writes outside `scratch`.
+#[cfg(target_os = "macos")]
+fn confined(program: &Path, scratch: &Path) -> Result<Command, RpcError> {
+    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Err(RpcError::new(
+            codes::UNAVAILABLE,
+            "Git inspection needs the macOS sandbox; open this repository in the app on macOS",
+        ));
+    }
+    let quote = |path: &Path| -> Result<String, RpcError> {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let text = path
+            .to_str()
+            .ok_or_else(|| RpcError::invalid_params("Git sandbox path is not UTF-8"))?;
+        if text.chars().any(char::is_control) {
+            return Err(RpcError::invalid_params(
+                "Git sandbox path contains control characters",
+            ));
+        }
+        Ok(format!(
+            "\"{}\"",
+            text.replace('\\', "\\\\").replace('"', "\\\"")
+        ))
+    };
+    let [run, electron] = hidden_trees();
+    let profile = format!(
+        "(version 1)(allow default)\n(deny network*)\n(deny process-info*)\n(allow process-info* (target self))\n(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n(deny file-read* (subpath {}) (subpath {}))\n(deny file-write* (require-not (require-any (subpath {}) (subpath \"/dev\"))))\n",
+        quote(&run)?,
+        quote(&electron)?,
+        quote(scratch)?
+    );
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command.args(["-p", &profile]).arg(program);
+    Ok(command)
+}
+
+/// `program` under Landlock and seccomp, the same rules as on macOS (see [`crate::landlock`] for
+/// what differs).
+#[cfg(target_os = "linux")]
+fn confined(program: &Path, scratch: &Path) -> Result<Command, RpcError> {
+    let mut command = Command::new(program);
+    crate::landlock::confine(&mut command, scratch, &hidden_trees())
+        .map_err(|missing| RpcError::new(codes::UNAVAILABLE, format!("Git inspection needs {missing}; run the app on a kernel with Landlock enabled")))?;
+    Ok(command)
 }
 
 /// Error for a git command that exited nonzero, carrying git's own message.

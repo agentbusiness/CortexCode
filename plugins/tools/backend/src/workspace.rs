@@ -5,7 +5,9 @@
 
 use crate::util;
 use cc_protocol::contracts::tools::Workspace;
+#[cfg(not(target_os = "linux"))]
 use std::ffi::CString;
+#[cfg(not(target_os = "linux"))]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,7 @@ fn valid_segment(name: &str) -> bool {
 }
 
 /// clonefile(2): returns Ok(true) when cloned, Ok(false) when the volume does not support it.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn clone_tree(source: &Path, target: &Path) -> std::io::Result<bool> {
     let src = CString::new(source.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     let dst = CString::new(target.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
@@ -47,6 +50,12 @@ pub(crate) fn clone_tree(source: &Path, target: &Path) -> std::io::Result<bool> 
         Some(libc::ENOTSUP) | Some(libc::EXDEV) => Ok(false),
         _ => Err(error),
     }
+}
+
+/// Linux has no whole-tree clone: Ok(false), so the tree is copied.
+#[cfg(target_os = "linux")]
+pub(crate) fn clone_tree(_source: &Path, _target: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 pub(crate) fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {

@@ -1,6 +1,7 @@
 //! The GitHub connection, through GitHub's REST API with the user's own sign-in: the device flow
 //! (a code the user approves in the browser) or a personal access token. The token lives only in
-//! the macOS Keychain; the app's main store keeps the account and the dev folder (`vcs.github`; the
+//! the macOS Keychain (on Linux: a file only the user can read, `github-token` in the plugin's data
+//! folder); the app's main store keeps the account and the dev folder (`vcs.github`; the
 //! `settings.json` it was kept in before is read once and removed). Nothing here contacts GitHub
 //! unless a method asks for it.
 
@@ -18,11 +19,6 @@ const API: &str = "https://api.github.com";
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const SCOPES: &str = "repo read:user";
-/// The Keychain item holding the token (a generic password).
-const KEYCHAIN_SERVICE: &str = "CortexCode GitHub";
-const KEYCHAIN_ACCOUNT: &str = "token";
-/// `errSecItemNotFound`.
-const KEYCHAIN_NOT_FOUND: i32 = -25300;
 const REPO_PAGES: u32 = 5;
 const FORK_READY_TRIES: u32 = 30;
 const FORK_READY_STEP: Duration = Duration::from_secs(2);
@@ -159,14 +155,82 @@ async fn keychain<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     tokio::task::spawn_blocking(work).await.map_err(|error| RpcError::internal(format!("keychain task: {error}")))
 }
 
+/// Where the token is kept: the macOS Keychain.
+#[cfg(target_os = "macos")]
+mod secret {
+    use std::path::Path;
+
+    pub const STORE: &str = "the Keychain";
+    /// The Keychain item holding the token (a generic password).
+    const SERVICE: &str = "CortexCode GitHub";
+    const ACCOUNT: &str = "token";
+    /// `errSecItemNotFound`.
+    const NOT_FOUND: i32 = -25300;
+
+    pub fn get(_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+        match security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.code() == NOT_FOUND => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn set(_dir: &Path, secret: &[u8]) -> Result<(), String> {
+        security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, secret).map_err(|error| error.to_string())
+    }
+
+    pub fn delete(_dir: &Path) -> Result<(), String> {
+        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
+            Err(error) if error.code() != NOT_FOUND => Err(error.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Where the token is kept: `github-token` in the plugin's data folder, readable by the user only.
+#[cfg(not(target_os = "macos"))]
+mod secret {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    pub const STORE: &str = "the token file";
+    const FILE: &str = "github-token";
+
+    pub fn get(dir: &Path) -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(dir.join(FILE)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn set(dir: &Path, secret: &[u8]) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        let path = dir.join(FILE);
+        let _ = std::fs::remove_file(&path);
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(|error| error.to_string())?;
+        file.write_all(secret).map_err(|error| error.to_string())
+    }
+
+    pub fn delete(dir: &Path) -> Result<(), String> {
+        match std::fs::remove_file(dir.join(FILE)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
 pub struct Github {
     http: reqwest::Client,
     settings_path: PathBuf,
+    /// The plugin's data folder (the token file on Linux).
+    data_dir: PathBuf,
     settings: cc_protocol::stored::Stored<Settings>,
     /// The GitHub app's client id for the device flow (`github_client_id`); empty: unavailable.
     client_id: Mutex<String>,
     device: Mutex<Option<Device>>,
-    /// The token once read from the Keychain (read once per process).
+    /// The token once read from the secret store (read once per process).
     token: Mutex<Option<String>>,
 }
 
@@ -185,6 +249,7 @@ impl Github {
         Ok(Self {
             http,
             settings_path: data_dir.join("settings.json"),
+            data_dir: data_dir.to_path_buf(),
             settings: cc_protocol::stored::Stored::new("vcs.github"),
             client_id: Mutex::new(String::new()),
             device: Mutex::new(None),
@@ -243,7 +308,7 @@ impl Github {
         Ok(self.status())
     }
 
-    /// The saved token: from memory, else from the Keychain. A connection whose Keychain item is
+    /// The saved token: from memory, else from the secret store. A connection whose stored token is
     /// gone is forgotten.
     async fn token(&self) -> Result<String, RpcError> {
         if self.settings.get().login.is_none() {
@@ -252,15 +317,15 @@ impl Github {
         if let Some(token) = lock(&self.token).clone() {
             return Ok(token);
         }
-        let stored = keychain(|| security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT))
-            .await?;
+        let dir = self.data_dir.clone();
+        let stored = keychain(move || secret::get(&dir)).await?;
         match stored {
-            Ok(bytes) => {
+            Ok(Some(bytes)) => {
                 let token = String::from_utf8(bytes).map_err(|_| not_connected())?;
                 *lock(&self.token) = Some(token.clone());
                 Ok(token)
             }
-            Err(error) if error.code() == KEYCHAIN_NOT_FOUND => {
+            Ok(None) => {
                 self.update(|settings| {
                     let dev_folder = settings.dev_folder.take();
                     *settings = Settings { dev_folder, ..Settings::default() };
@@ -269,7 +334,7 @@ impl Github {
             }
             Err(error) => Err(RpcError::new(
                 codes::UNAVAILABLE,
-                format!("the Keychain did not give back the GitHub sign-in: {error}"),
+                format!("{} did not give back the GitHub sign-in: {error}", secret::STORE),
             )),
         }
     }
@@ -311,15 +376,13 @@ impl Github {
         })
     }
 
-    /// Check `token`, keep it in the Keychain and the account in the settings.
+    /// Check `token`, keep it in the secret store and the account in the settings.
     async fn connect(&self, token: String, method: &str, granted: Vec<String>) -> Result<GithubStatus, RpcError> {
         let account = self.account(&token).await?;
-        let secret = token.clone();
-        keychain(move || {
-            security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, secret.as_bytes())
-        })
-        .await?
-        .map_err(|error| RpcError::internal(format!("the Keychain did not keep the GitHub sign-in: {error}")))?;
+        let (dir, value) = (self.data_dir.clone(), token.clone());
+        keychain(move || secret::set(&dir, value.as_bytes()))
+            .await?
+            .map_err(|error| RpcError::internal(format!("{} did not keep the GitHub sign-in: {error}", secret::STORE)))?;
         *lock(&self.token) = Some(token);
         let scopes = if account.scopes.is_empty() { granted } else { account.scopes };
         self.update(|settings| {
@@ -341,13 +404,9 @@ impl Github {
     }
 
     pub async fn disconnect(&self) -> Result<GithubStatus, RpcError> {
-        let deleted =
-            keychain(|| security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT))
-                .await?;
-        if let Err(error) = deleted
-            && error.code() != KEYCHAIN_NOT_FOUND
-        {
-            return Err(RpcError::internal(format!("the Keychain did not remove the GitHub sign-in: {error}")));
+        let dir = self.data_dir.clone();
+        if let Err(error) = keychain(move || secret::delete(&dir)).await? {
+            return Err(RpcError::internal(format!("{} did not remove the GitHub sign-in: {error}", secret::STORE)));
         }
         *lock(&self.token) = None;
         *lock(&self.device) = None;

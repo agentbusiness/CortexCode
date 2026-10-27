@@ -23,9 +23,24 @@ set(LLAMA_BUILD_UI        OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL         OFF CACHE BOOL "" FORCE)
 set(LLAMA_TOOLS_INSTALL   OFF CACHE BOOL "" FORCE)
 set(LLAMA_SUBPROCESS      OFF CACHE BOOL "" FORCE)
-# Portable CPU code: the binary must run on every supported Mac, not only the build machine.
+# Portable CPU code: the binary must run on every supported machine, not only the build machine.
 set(GGML_NATIVE           OFF CACHE BOOL "" FORCE)
 set(GGML_STATIC           ON  CACHE BOOL "" FORCE)
+if (NOT APPLE)
+    # ggml's own thread pool: no libgomp on the user's machine.
+    set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+    # The CPU is the engine on Linux: a floor every supported machine meets, with its vector units.
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # Haswell (2013) and later.
+        set(GGML_AVX  ON CACHE BOOL "" FORCE)
+        set(GGML_AVX2 ON CACHE BOOL "" FORCE)
+        set(GGML_FMA  ON CACHE BOOL "" FORCE)
+        set(GGML_F16C ON CACHE BOOL "" FORCE)
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        # Neoverse N1, Cortex-A76 (Raspberry Pi 5) and later.
+        set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+    endif()
+endif()
 if (APPLE)
     set(GGML_METAL               ON CACHE BOOL "" FORCE)
     # Kernel sources are embedded and compiled for the running GPU at load time (no Xcode Metal

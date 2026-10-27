@@ -289,13 +289,13 @@ fn changed_files_of(entries: &[JournalEntry], run_id: &str) -> BTreeSet<String> 
         .collect()
 }
 
-/// Deliver pending `steer` entries at this tool boundary. Returns how many were delivered.
-pub async fn deliver_steers(journal: &mut Journal) -> Result<usize, RpcError> {
+/// Deliver pending `steer` entries at this tool boundary. Returns their texts.
+pub async fn deliver_steers(journal: &mut Journal) -> Result<Vec<String>, RpcError> {
     let pending = journal.pending_steers("steer");
     for steer in &pending {
         journal.consume_steer(steer.seq).await?;
     }
-    Ok(pending.len())
+    Ok(pending.iter().map(|steer| str_field(&steer.data, "text").trim().to_owned()).filter(|text| !text.is_empty()).collect())
 }
 
 /// Deliver board messages addressed to this agent since the last delivery.
@@ -712,10 +712,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     if of_run(&entries, &env.run_id).any(|entry| entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "verify" | "repeat")) {
         effort = max_effort(&effort, &env.data.effort.escalate);
     }
-    let mut awaiting_fix = of_run(&entries, &env.run_id)
-        .filter(|entry| matches!(entry.kind.as_str(), kinds::NOTE | kinds::TOOL_CALL))
-        .last()
-        .is_some_and(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "verify");
     // The last test command found no tests (`display.no_tests`): a "done" after it is checked by
     // nothing, and is answered once with the step that makes it a check (seen: a fix "verified" by
     // a jest run that found no tests, and the same failure handed back).
@@ -773,9 +769,16 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             return Ok(outcome("cancelled", "Cancelled.".into(), turns, tool_calls, &changed, None));
         }
         journal.sync().await?;
-        if deliver_steers(journal).await? > 0 {
+        let steers = deliver_steers(journal).await?;
+        if !steers.is_empty() {
             detector.reset();
-            awaiting_fix = false;
+            // A plan task is one part of a plan: a message during it goes to the planner, which
+            // writes the tasks still to do so that they do what the user asks now (seen: "fix all
+            // the issues" answered eleven times with "task 1 is complete", the step message saying
+            // "do this task only" after it at every step).
+            if spec.step.is_some() {
+                return Ok(outcome("steered", steers.join("\n\n"), turns, tool_calls, &changed, None));
+            }
         }
         if let LoopKind::Agent { name } = &spec.kind {
             deliver_board(journal, env, name).await?;
@@ -900,17 +903,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
             };
-            if awaiting_fix {
-                // The checks failed and the model answered without trying a fix: it reports a block.
-                return Ok(outcome("blocked", summary, turns, tool_calls, &changed, Some(false)));
-            }
             env.set_stage("verify");
             let mut report = match verify_task(&env.host, journal, task, &env.scope.workspace, &any).await {
                 Ok(report) => report,
                 Err(error) if error.code == codes::CANCELLED => continue,
                 Err(error) => return Err(error),
             };
-            let mut before = crate::checks::failed_before(journal, &env.run_id, &mut report);
             let fixable = |report: &VerifyReport| report.checks.iter().any(|check| !check.ok && !check.indeterminate);
             if fixable(&report) {
                 // A check can turn out to be broken in itself only now. The worker may only propose
@@ -938,7 +936,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             Err(error) if error.code == codes::CANCELLED => continue,
                             Err(error) => return Err(error),
                         };
-                        before = crate::checks::failed_before(journal, &env.run_id, &mut report);
                     }
                 }
             }
@@ -956,19 +953,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             env.set_stage("act");
             if report.ok {
-                let mut summary = summary;
-                if !before.settled.is_empty() {
-                    let note = env.data.text("checks_failed_before", &[("tests", &before.settled.join(", "))]);
-                    journal.note(&env.run_id, "failed_before", &note, false).await?;
-                    let _ = env.host.call(memory_methods::TASK_UPDATE, json!({"id": task.id, "status": "done"})).await;
-                    summary = format!("{summary}\n\n{note}");
-                }
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
             }
-            let mut failures = report_text(&env.data, &report);
-            if !before.also_before.is_empty() {
-                failures.push_str(&env.data.text("checks_partly_failed_before", &[("tests", &before.also_before.join(", "))]));
-            }
+            let failures = report_text(&env.data, &report);
             match detector.observe("contract", &failures) {
                 Verdict::Stop(_) => {
                     let summary = format!("The contract kept failing the same way after a corrective replan:{failures}");
@@ -980,13 +967,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 }
                 Verdict::Fine | Verdict::Reread(_) => {}
             }
+            let failures = format!("{failures}{}", crate::checks::failed_before(&env.data, journal, &env.run_id, &report));
             journal.note(&env.run_id, "verify", &prompts::contract_failure(&env.data, &failures), true).await?;
             effort = max_effort(&effort, &env.data.effort.escalate);
-            awaiting_fix = true;
             continue;
         }
 
-        awaiting_fix = false;
         // Journal the model's calls as written, then execute them in order.
         let mut call_seqs = Vec::new();
         for call in &result.tool_calls {

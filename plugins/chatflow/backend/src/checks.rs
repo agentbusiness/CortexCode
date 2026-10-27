@@ -196,51 +196,46 @@ pub async fn propose_after_failure(env: &RunEnv, journal: &mut Journal, current:
     Ok(Some((revised, live)))
 }
 
-/// Each failed check's failing tests by its command (only checks whose report names them all).
+/// Each failed check's failing tests by its command: the names when its report names them all,
+/// `null` when it does not (its tests never ran, a build error first, or a report naming fewer):
+/// unknown, never "no failing tests" (seen: a baseline whose `cargo test` stopped at a build error
+/// recorded as `{}`, the same as nothing failing).
 fn failed_tests_by_command(report: &VerifyReport) -> Value {
     let mut map = serde_json::Map::new();
     for check in report.checks.iter().filter(|check| !check.ok) {
-        if let (Some(names), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) {
-            map.insert(spec.spec.clone(), json!(names));
+        if let Some(spec) = report.contract.checks.iter().find(|spec| spec.name == check.name) {
+            map.insert(spec.spec.clone(), check.failed_tests.as_ref().map_or(Value::Null, |names| json!(names)));
         }
     }
     Value::Object(map)
 }
 
-/// The tests a check failed before the work too, out of the ones failing now.
-pub struct FailedBefore {
-    /// Checks that pass now except for tests that failed before the work too: counted as passed.
-    pub settled: Vec<String>,
-    /// Failing tests that failed before the work too, in checks that still fail for other tests.
-    pub also_before: Vec<String>,
-}
-
-/// Compare the failed checks with the run before the work (the latest baseline of this run): a
-/// check whose failing tests all failed before the work too is the project's state, not this
-/// work's, so it counts as passed (seen: a project's temp-folder tests failing in the sandbox sent
-/// the model to rewrite the project's test helper). A check without the names on both sides stays
-/// failed.
-pub fn failed_before(journal: &Journal, run_id: &str, report: &mut VerifyReport) -> FailedBefore {
-    let mut outcome = FailedBefore { settled: Vec::new(), also_before: Vec::new() };
-    let Some(before) = run_notes(journal, run_id, "baseline").last().and_then(|note| note.data.get("failed_tests")).and_then(Value::as_object).cloned() else {
-        return outcome;
-    };
-    let specs: Vec<(String, String)> = report.contract.checks.iter().map(|spec| (spec.name.clone(), spec.spec.clone())).collect();
-    for check in report.checks.iter_mut().filter(|check| !check.ok && !check.indeterminate) {
-        let Some(now) = &check.failed_tests else { continue };
-        let Some(spec) = specs.iter().find(|(name, _)| *name == check.name).map(|(_, spec)| spec) else { continue };
-        let Some(earlier) = before.get(spec).and_then(Value::as_array) else { continue };
-        let earlier: Vec<&str> = earlier.iter().filter_map(Value::as_str).collect();
-        let (old, new): (Vec<&String>, Vec<&String>) = now.iter().partition(|name| earlier.contains(&name.as_str()));
-        if new.is_empty() {
-            check.ok = true;
-            outcome.settled.extend(old.into_iter().cloned());
-        } else {
-            outcome.also_before.extend(old.into_iter().cloned());
+/// The failing tests of `report` that a baseline of this session named as failing before (the
+/// newest baseline that knows that command's failing tests), as one line for the work's failure
+/// note; empty when none did or no baseline knows. The work is still done only when the checks
+/// pass: the line saves the steps spent proving that a failure was there before.
+pub fn failed_before(data: &Dataset, journal: &Journal, run_id: &str, report: &VerifyReport) -> String {
+    let mut lines = String::new();
+    for check in report.checks.iter().filter(|check| !check.ok) {
+        let (Some(now), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) else { continue };
+        let known = journal.entries().filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "baseline").filter_map(|note| {
+            let names = note.data.get("failed_tests")?.get(&spec.spec)?.as_array()?;
+            Some((str_field(&note.data, "run_id") == run_id, names.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<String>>()))
+        }).last();
+        let Some((this_run, before)) = known else { continue };
+        let both: Vec<&String> = now.iter().filter(|name| before.contains(name)).collect();
+        if both.is_empty() {
+            continue;
         }
+        const SHOWN: usize = 10;
+        let mut names = both.iter().take(SHOWN).map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
+        if both.len() > SHOWN {
+            names = data.text("failed_before_more", &[("names", &names), ("more", &(both.len() - SHOWN).to_string())]);
+        }
+        let key = if this_run { "failed_before" } else { "failed_before_earlier" };
+        lines.push_str(&data.text(key, &[("command", &spec.spec), ("count", &both.len().to_string()), ("of", &now.len().to_string()), ("names", &names)]));
     }
-    report.ok = report.checks.iter().all(|check| check.ok);
-    outcome
+    lines
 }
 
 /// The baseline output a proposal made before the work rests on.

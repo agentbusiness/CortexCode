@@ -23,7 +23,7 @@ cc-protocol = { path = "../../../protocol" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
-toml = "0.9"
+toml = "1.1"
 # Git as a library (no git program on the user's Mac); https through macOS's Secure Transport.
 # libgit2-sys also declares OpenSSL on every unix target although macOS never calls it: vendored,
 # so the binary links no Homebrew library (as in the vcs plugin).

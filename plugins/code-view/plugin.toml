@@ -10,7 +10,7 @@ name = "Code view"
 version = "0.1.0"
 description = "The right pane's code view: toolbar, CodeMirror editor with the inline unified diff, attributions and per-hunk accept/reject, and the file tree."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

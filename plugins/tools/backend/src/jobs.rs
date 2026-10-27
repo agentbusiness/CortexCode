@@ -148,6 +148,13 @@ pub struct StartRequest<'a> {
     pub venv: Option<&'a Path>,
 }
 
+/// Where a job's runner writes its exit code: a folder of its own, because on Linux the sandbox
+/// can let the job write there only by granting the whole folder, and the job's own folder holds
+/// its protected metadata and scripts.
+fn exit_file(dir: &Path) -> PathBuf {
+    dir.join("status").join("exit")
+}
+
 fn tail_of(artifacts: &crate::artifacts::Artifacts, id: &str, bytes: u64) -> String {
     let Ok(mut file) = artifacts.open(id) else { return String::new() };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -230,6 +237,7 @@ impl Jobs {
         let artifact = job_id.clone();
         let output_path = self.artifacts_dir.join(&artifact);
         std::fs::write(dir.join("cmd.sh"), request.command)?;
+        std::fs::create_dir_all(exit_file(&dir).parent().unwrap_or(&dir))?;
         let q = |path: &Path| util::shell_quote(&path.to_string_lossy());
         let mut runner = String::new();
         if let Some(env_file) = request.env_file {
@@ -250,19 +258,15 @@ impl Jobs {
             q(request.cwd),
             q(&self.bash),
             q(&dir.join("cmd.sh")),
-            q(&dir.join("exit")),
-            q(&dir.join("exit")),
-            q(&dir.join("exit")),
+            q(&exit_file(&dir)),
+            q(&exit_file(&dir)),
+            q(&exit_file(&dir)),
         ));
         std::fs::write(dir.join("runner.sh"), runner)?;
         let output = std::fs::File::create(&output_path)?;
         let errors = output.try_clone()?;
         let mut command = match request.sandbox {
-            Some(sandbox) => {
-                let mut command = std::process::Command::new(&sandbox.exec);
-                command.args(sandbox.args()).arg(&self.bash);
-                command
-            }
+            Some(sandbox) => sandbox.command(&self.bash)?,
             None => std::process::Command::new(&self.bash),
         };
         command
@@ -415,7 +419,10 @@ impl Jobs {
                 }
             }
             // Exit.
-            let exited = std::fs::read_to_string(dir.join("exit")).ok().and_then(|text| text.trim().parse::<i32>().ok());
+            // A job started by an earlier version of the plugin wrote `exit` beside its metadata.
+            let exited = [exit_file(&dir), dir.join("exit")]
+                .iter()
+                .find_map(|path| std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<i32>().ok()));
             // The runner ending is not the job ending: when it is killed first, the command it
             // started still runs in the job's group (seen: a `sleep` left running, the job shown
             // as ended and Kill finding nothing to kill).

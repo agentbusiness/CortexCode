@@ -5,6 +5,8 @@ pub mod clone;
 pub mod diff;
 pub mod git;
 pub mod github;
+#[cfg(target_os = "linux")]
+mod landlock;
 pub mod ops;
 pub mod probe;
 pub mod remote;

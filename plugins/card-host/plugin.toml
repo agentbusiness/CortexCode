@@ -10,7 +10,7 @@ name = "Card host"
 version = "0.1.0"
 description = "The card at the right of the brand band: a toggle with a live summary and Open pane, the card it opens with every card section, its project header, and the settings window host."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

@@ -117,24 +117,28 @@ answer_reserve_tokens = 8192
 # The compaction shares below apply to this. Off: a 48k cap compacted a working task every minute,
 # folding the model's own reads and edits away, and it rewrote its code from memory.
 context_tokens = 0
-# A compaction (older tool outputs folded, finished turns digested) brings the prompt down to at
-# most this many tokens; one that cannot reach it is not made. A fixed size: what the model works
-# from stays small whatever the window holds (shares of a 230k window let a turn grow to 220k, each
-# compaction saving 2k and costing a 15-minute re-read).
+# Context per unit of work (fit.rs): when a turn ends, every finished turn becomes its digest, and
+# before each plan task the earlier task's steps become one note; these cuts need no size. Inside a
+# long task, a compaction (older tool outputs folded, then older steps as one note) brings the prompt
+# down to this many tokens or to half of it, whichever is larger. Halving bounds the re-reads (the
+# next comes after the prompt doubled again; shares of a 230k window let a turn grow to 220k, each
+# compaction saving 2k and costing a 15-minute re-read); a fixed target alone was never reached
+# (the system block, spec, plans and newest steps were above it: nothing compacted all night).
 compact_target_tokens = 24576
 # At a wait (the run's tools executing) a prompt past this many tokens is compacted then, and the
 # compacted prompt is prefilled in the background (model.prewarm). 0 = only when a prompt no longer
 # fits.
 compact_early_tokens = 49152
 # When a turn ends (the user reads the answer, the model is idle) a prompt past this many tokens is
-# compacted then, so the next turn starts with room. 0 = only at the early size.
+# compacted then (after the turn cut), so the next turn starts with room. 0 = only at the early size.
 compact_idle_tokens = 32768
 # Steps of an agent loop between settles: a settle applies the in-place rewrites (outdated reads,
 # earlier edit echoes, outputs of a command run again) up to the newest entry; between settles the
 # prompt only grows and the engine continues its state. 0 = only at compactions.
 settle_steps = 8
-# A settle is made only when it shrinks the prompt by at least this many tokens (it costs one re-read
-# of the history after the system block; seen: 12k re-read for about 1k saved).
+# A settle is made only when it shrinks the prompt by at least this many tokens and by a quarter (it
+# costs one re-read of the history after the system block; seen: 12k re-read for about 1k saved,
+# 182k re-read in 11 minutes for 21k saved).
 settle_min_tokens = 3072
 # Steps of the running turn a compaction keeps whole (the newest). When folding older outputs does
 # not bring a long turn under its target, its older steps become one note listing their calls.

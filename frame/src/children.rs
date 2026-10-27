@@ -150,8 +150,8 @@ fn exec_of(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn exec_of(_pid: u32) -> Option<PathBuf> {
-    None
+fn exec_of(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// Two paths name the same file (through links), or are spelled the same.

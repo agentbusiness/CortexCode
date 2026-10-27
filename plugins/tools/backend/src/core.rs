@@ -301,11 +301,8 @@ impl Core {
         workspace: &Path,
         python_env: bool,
     ) -> Result<Runtime, String> {
-        if !self.sandbox.available() {
-            return Err(format!(
-                "commands are not run: the write sandbox needs {}, which this system does not have. Work with read and edit.",
-                crate::sandbox::SANDBOX_EXEC
-            ));
+        if let Some(missing) = self.sandbox.unavailable() {
+            return Err(format!("commands are not run: {missing}. Work with read and edit."));
         }
         let mut venv_error = None;
         let venv = if !python_env {

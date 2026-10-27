@@ -30,6 +30,20 @@ docs/IDEATION-WORKFLOW.md part 2 (`backend/src/references.rs`). The composer com
 
 `backend/src/prewarm.rs`, `backend/src/live.rs`. Every call of a session starts with the same system message (with the skills catalog when `limits.skills_in_prefix`, the default: session order, so it is cached across turns; ROUTE's stage message then names only the previous turn's skills) and the projected conversation (`prewarm::conversation`, the one builder every call uses). `chatflow.prewarm` (the composer calls it, debounced, while the person writes; the flow itself when a turn ends, then only while the model has nothing else to do; opening a conversation loads nothing) prefills that prefix closed by a placeholder message (`model.prewarm`, background priority) once per session state (a hash of the exact request), so the next ROUTE reads only the new message and its stage message. The model plugin stops a prewarm when a real request for the conversation arrives, and the next turn cancels it. While a constrained decision streams, its free-text fields (the schema's top-level strings: ROUTE's `work`, DECIDE's `missing`, `brief`, `note`) are published as `chatflow.live` (at most every 250 ms, a last one `done`). The chat's working line shows them with `model.progress` ("Reading the conversation · 4,200 / 9,800 tokens", "Writing · 120 tokens · 41 tok/s"); a turn's steps, reasoning and notes for the model fold into one activity line per run of work, in the order it ran, with the model's prose after the line it followed; while a command runs the line shows it with its elapsed time and the output it has printed so far (`tool_call.live_output`, appended by the loop as the tools plugin streams it); a finished turn ends with a card of the files it edited (counts per file, the diffs, and Undo, which reverse-applies the turn's own hunks). `verify/live.mjs` checks all of it through the real frame against the scripted model (DEBUG builds).
 
+## Context per unit of work
+
+`backend/src/fit.rs`. A session is one conversation, but what the model works from is cut at the
+boundaries the host sees, so it stays the size of the work at hand: when a turn ends, every
+finished turn becomes its digest (its user message, plans, spec changes, one note listing its calls,
+its final answer; `fit::cut_turns`); before each plan task the earlier task's steps become one note
+with the files they changed and their last test run, and the step message lists every finished
+task's reply (`fit::fold_steps`); inside a long task, at a wait past `limits.compact_early_tokens`,
+the least compaction that reaches `limits.compact_target_tokens` or halves the prompt is made. A
+cut re-reads what follows the system block (the engine keeps that block), prefilled in the
+background where there is a wait. Before: one session of 7 requests grew to 193k tokens with
+nothing compacted (the fixed target sat below what can never be compacted), routing new requests
+inside 155k of earlier work and writing at 10.5 tok/s instead of 41 until the GPU memory ran out.
+
 ## Spec, decisions, plans
 
 The composable parts of docs/IDEATION-WORKFLOW.md (1, 5, 6), each usable alone (`backend/src/spec.rs`, `backend/src/plan.rs`, stages in `flow.rs`, rules and schemas in `backend/data/`):

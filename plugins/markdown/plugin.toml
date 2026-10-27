@@ -10,7 +10,7 @@ name = "Markdown"
 version = "0.1.0"
 description = "Markdown documents: the right pane's rendered view of the workspace's Markdown, and the code graph's facts of a repository's prose (README, docs/, ADRs): one section per heading with its text, and the code symbols a section mentions, indexed beside the code so what a project says about itself is searchable."
 license = "UNLICENSED"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # The logic plugin: a `lang@1` language pack (category `lang-markdown`, the `lang` family) served
 # by cc-lang-kit, like the lang-* plugins. It parses documents into sections and mentions; it has
