@@ -24,6 +24,10 @@ needed; far too slow for use, a development aid only).
 
 ## Variants (`model.variants`, `model.select`)
 
+Settings > Model shows them inside the serving engine's card (the weights belong to the engine
+that loads them): one line when the engine offers one variant, a list with Select or Download when
+it offers several. Below, the loaded model's facts (`model.info`).
+
 | id | repository @ revision | notes |
 |---|---|---|
 | `qwen3.8-27b-m` (default) | `trymirai/Qwen3.8-27B-M@8b878f5` | Mirai M 4-bit, DFlash speculator |

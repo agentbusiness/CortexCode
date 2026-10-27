@@ -6,11 +6,13 @@
  * (frame.plugins.swap: the same version, blue/green), showing the swap's steps and timings; its UI
  * packages (slot, version, hash) with Reload; its shell modules. Under a plugin's name, what can
  * be edited in it on this Mac (source.status `plugins`: data always, code when every tool its build
- * needs is present). Live from plugin.state, plugin.swapped, plugin.unit and source.changed.
+ * needs is present). Live from plugin.state, plugin.swapped, plugin.unit and source.changed. At the
+ * top, Reset all plugins (ResetAll.tsx): every plugin back to its official release, after asking.
  */
 
 import { Fragment, useState, type ReactNode } from 'react';
 import { definePlugin, duration, errorMessage, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
+import { ResetAll, version } from './ResetAll';
 import './plugins.css';
 
 interface SwapStep { step: string; ok: boolean; ms: number; detail?: string }
@@ -22,6 +24,15 @@ interface Unit { id: string; name?: string; version?: string; enabled: boolean; 
 interface PackageSwap { ok: boolean; plugin: string; from_version?: string; to_version?: string; error?: string | null; steps: SwapStep[] }
 /** What can be edited in a plugin on this Mac (source.status `plugins`). */
 interface PluginEditing { id: string; data_editable: boolean; code_editable: boolean; missing: string[] }
+interface UpdateStatus { pending?: { plugin: string; version: string; files?: string[] }[]; failed?: { plugin: string; version: string; error?: string }[] }
+
+/** Where a package version came from, by its build tag: `+dev.` a build of yours, `+b` the app's
+ * build, none a release. */
+function origin(full: string | undefined): string {
+  if (!full) return '';
+  const tag = full.split('+')[1] ?? '';
+  return tag.startsWith('dev.') ? 'your build' : tag.startsWith('b') ? "the app's build" : 'release';
+}
 
 /** `Data: editable · Code: needs Rust, Apple's command line tools`. */
 function editingLine(editing: PluginEditing): string {
@@ -53,6 +64,10 @@ function PluginsPanel() {
   }, { topics: ['plugin.state', 'plugin.swapped', 'plugin.unit'] });
   const source = useQuery<{ plugins: PluginEditing[] }>('source.status', (c) => c.call('source.status', {}), { topics: ['source.changed'] });
   const editing = new Map((source.data?.plugins ?? []).map((plugin) => [plugin.id, plugin]));
+  // What the updater knows per plugin: a newer version waiting for an answer, or one that could not start.
+  const updates = useQuery<UpdateStatus>('update.status:plugins', (c) => c.call<UpdateStatus>('update.status', {}), { topics: ['update.changed'] });
+  const pendingOf = new Map((updates.data?.pending ?? []).map((pending) => [pending.plugin, pending]));
+  const failedOf = new Map((updates.data?.failed ?? []).map((failed) => [failed.plugin, failed]));
   const [busy, setBusy] = useState<string | null>(null);
   const [results, setResults] = useState<Record<string, SwapResult | string>>({});
   const [toggleErrors, setToggleErrors] = useState<Record<string, string>>({});
@@ -134,7 +149,7 @@ function PluginsPanel() {
               <span className={service.state === 'active' ? 'cx-on' : 'cx-off'}>{service.state}</span>
               <span className="ap faint cx-sub">
                 {process ? <>pid <span className="num">{service.pid || '—'}</span></> : 'served by the app'}
-                {service.build ? <> · <span className="num">{service.build}</span></> : null}
+
                 {service.known_good ? ' · known good' : null}
                 {process ? ` · ${service.restarts ?? 0} restart${service.restarts === 1 ? '' : 's'}` : null}
               </span>
@@ -159,7 +174,8 @@ function PluginsPanel() {
   return (
     <div className="cx-settings-panel-body" data-build={__CORTEX_BUILD__} data-panel="plugins">
       <h3 className="cx-settings-title">Plugins</h3>
-      <p className="hint cx-settings-lead">Each plugin is one installed package: its service, its UI and its app-shell parts, at one version. Disabling a plugin stops its service and removes everything it adds to the workbench until it is enabled again.</p>
+      <p className="hint cx-settings-lead">Every plugin is kept on its latest version by itself: the official release, or the build this app came with. Only a plugin you changed waits for your answer. Disabling a plugin stops its service and removes everything it adds to the workbench until it is enabled again.</p>
+      <ResetAll />
       {listed.error && !listed.data && <p className="inline-error">The frame did not list its plugins: {listed.error}</p>}
       <table className="tbl cx-plugins">
         <colgroup><col className="cx-col-name" /><col className="cx-col-facts" /><col className="cx-col-acts" /></colgroup>
@@ -177,14 +193,15 @@ function PluginsPanel() {
                     {editing.has(name) && <span className="cx-editing" data-editing={name}>{editingLine(editing.get(name)!)}</span>}
                   </td>
                   <td>
-                    <span className="ap faint num">{unit.version || '—'}</span>
+                    <span className="ap faint num" title={unit.version || undefined}>{unit.version ? version(unit.version) : '—'}</span>
+                    {unit.version && <span className="ap faint cx-sub">{origin(unit.version)}</span>}
                     {off && <span className="ap live cx-sub">disabled</span>}
                   </td>
                   <td>
                     <div className="cx-plugin-acts">
                       {unit.previous_version && !off ? (
-                        <button className="detent" type="button" disabled={busy !== null} data-action="rollback-plugin" title={`Back to ${unit.previous_version}`}
-                          onClick={() => void rollbackUnit(name)}>Roll back to {unit.previous_version}</button>
+                        <button className="detent" type="button" disabled={busy !== null} data-action="rollback-plugin" title={`Back to ${unit.previous_version} (${origin(unit.previous_version)}), the version the last install replaced`}
+                          onClick={() => void rollbackUnit(name)}>Use previous version</button>
                       ) : null}
                       {toggleable || off ? (
                         <button className={`detent${off ? '' : ' warn'}`} type="button" disabled={busy !== null} data-action={off ? 'enable' : 'disable'}
@@ -193,6 +210,16 @@ function PluginsPanel() {
                     </div>
                   </td>
                 </tr>
+                {failedOf.has(name) && (
+                  <tr className="cx-swap-row" data-update-failed-for={name}>
+                    <td colSpan={3}><p className="inline-error" data-update-failed={name}>Version {version(failedOf.get(name)!.version)} could not start, so this version keeps running: {failedOf.get(name)!.error}</p></td>
+                  </tr>
+                )}
+                {pendingOf.has(name) && (
+                  <tr className="cx-swap-row" data-update-pending-for={name}>
+                    <td colSpan={3}><p className="hint" data-update-pending={name}>Version {version(pendingOf.get(name)!.version)} is ready. You changed this plugin ({pendingOf.get(name)!.files?.length ?? 0} files), so the popup at the bottom right asks whether to use it.</p></td>
+                  </tr>
+                )}
                 {toggleErrors[name] && (
                   <tr className="cx-swap-row" data-toggle-error-for={name}>
                     <td colSpan={3}><p className="inline-error" data-toggle-error={name}>The frame did not {off ? 'enable' : 'disable'} {name}: {toggleErrors[name]}</p></td>
@@ -201,7 +228,7 @@ function PluginsPanel() {
                 {result && (typeof result === 'string'
                   ? <Outcome attr={{ 'data-unit-swap-for': name }} text={result} ok={false} steps={[]} />
                   : <Outcome attr={{ 'data-unit-swap-for': name }} ok={result.ok} steps={result.steps}
-                      text={result.ok ? `rolled back ${result.from_version ?? ''} → ${result.to_version ?? ''}` : `failed: ${result.error ?? ''}`} />)}
+                      text={result.ok ? `now ${version(result.to_version ?? '')} (was ${version(result.from_version ?? '')})` : `failed: ${result.error ?? ''}`} />)}
                 {!off && unit.category ? serviceRows(unit) : null}
                 {off && unit.category ? (
                   <tr className="cx-part" data-category={unit.category} data-state="disabled"><td><span className="cx-part-kind">service</span> {unit.category}</td><td colSpan={2}><span className="ap faint">stopped</span></td></tr>
@@ -214,7 +241,7 @@ function PluginsPanel() {
                       <td>
                         {loaded ? <>
                           <span className="ap faint">{loaded.slot}</span>
-                          <span className="ap faint cx-sub"><span className="num">{loaded.version}</span> · <span className="num">{loaded.hash.slice(0, 12)}</span></span>
+                          <span className="ap faint cx-sub" title={`${loaded.version} · ${loaded.hash}`}><span className="num">{loaded.version}</span></span>
                         </> : <span className="ap faint">not loaded</span>}
                       </td>
                       <td>{loaded ? <div className="cx-plugin-acts"><button className="detent" type="button" data-action="reload" onClick={() => host.reloadPlugin(id)}>Reload</button></div> : null}</td>

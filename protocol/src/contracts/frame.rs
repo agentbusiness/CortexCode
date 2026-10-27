@@ -84,6 +84,10 @@ pub mod methods {
     /// model can have several: one serves, the others wait as alternatives).
     /// [`super::ProvidersParams`] -> [`super::ProvidersResult`].
     pub const PLUGINS_PROVIDERS: &str = "frame.plugins.providers";
+    /// The plugin packages the app itself carries (`<packages>/<id>@<version>.ccplugin`, installed
+    /// at start): what a reset falls back to when no official release is reachable.
+    /// `{}` -> [`super::BundledResult`].
+    pub const PLUGINS_BUNDLED: &str = "frame.plugins.bundled";
     /// Serve a category with another of its installed plugins: the serving plugin is drained and
     /// stopped (its idle state handed over), the chosen one started in the same slot, and the UI
     /// packages follow. On failure the previous plugin is restored. The choice persists.
@@ -593,6 +597,22 @@ pub struct ProviderInfo {
     /// This machine is inside the declared range (None: no range declared).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fits_machine: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BundledResult {
+    /// The packages folder (empty: the app carries none).
+    #[serde(default)]
+    pub dir: String,
+    pub packages: Vec<BundledPackage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BundledPackage {
+    pub id: String,
+    pub version: String,
+    /// Absolute path of the `.ccplugin` file.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -1251,6 +1251,25 @@ pub fn queue_bundled(root: &Path, packages: &Path) -> Vec<(String, String)> {
     queued
 }
 
+/// The app's prebuilt packages, for `frame.plugins.bundled`.
+pub fn bundled(packages: Option<&Path>) -> cc_protocol::contracts::frame::BundledResult {
+    use cc_protocol::contracts::frame::{BundledPackage, BundledResult};
+    let Some(packages) = packages else { return BundledResult::default() };
+    let mut list = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(packages) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((id, version)) = name.strip_suffix(".ccplugin").and_then(|stem| stem.split_once('@')) else { continue };
+            if !cc_protocol::contracts::frame::package::valid_id(id) || !crate::package::valid_version(version) {
+                continue;
+            }
+            list.push(BundledPackage { id: id.to_owned(), version: version.to_owned(), path: entry.path().to_string_lossy().into_owned() });
+        }
+    }
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    BundledResult { dir: packages.to_string_lossy().into_owned(), packages: list }
+}
+
 /// Record the app versions that installed (a failed install is queued again at the next start).
 pub fn mark_bundled(root: &Path, queued: &[(String, String)]) {
     for (id, version) in queued {

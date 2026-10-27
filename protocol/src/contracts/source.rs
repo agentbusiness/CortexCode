@@ -52,6 +52,10 @@ pub mod methods {
     /// plugin's, or the frame's: everything outside `plugins/`) into the code folder, keeping the
     /// user's changes; the user's own code on the new base is built again.
     pub const RELEASE_MERGE: &str = "source.release.merge";
+    /// [`super::ReleaseResetParams`] -> [`super::ReleaseResetResult`]. Put one plugin's folder back
+    /// to its released source: the user's changes in it (committed or not) are dropped, the rest
+    /// of the code folder stays.
+    pub const RELEASE_RESET: &str = "source.release.reset";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +86,25 @@ pub struct ReleaseMergeParams {
     /// The release version, for the history.
     #[serde(default)]
     pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseResetParams {
+    pub plugin: String,
+    /// The released source: a folder holding exactly the plugin's files.
+    pub dir: String,
+    /// The release version, for the history.
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseResetResult {
+    /// reset | up_to_date | unmanaged
+    pub state: String,
+    /// The files put back (relative to the code folder).
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 pub mod topics {

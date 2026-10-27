@@ -10,4 +10,4 @@ pub mod service;
 use cc_protocol::contracts::update::methods;
 
 /// Methods this plugin serves.
-pub const PROVIDES: &[&str] = &[methods::STATUS, methods::CHECK, methods::DECIDE, methods::RESTART];
+pub const PROVIDES: &[&str] = &[methods::STATUS, methods::CHECK, methods::DECIDE, methods::RESTART, methods::DISMISS, methods::RESET_PLAN, methods::RESET];

@@ -713,6 +713,7 @@ impl Frame {
                 let params: ProvidersParams = parse_params(params)?;
                 to_value(&self.units.providers(&params.category))
             }
+            methods::PLUGINS_BUNDLED => to_value(&crate::units::bundled(self.config.packages.as_deref())),
             methods::UI_STATE_GET => to_value(&self.state.ui_state()),
             methods::UI_STATE_PUT => {
                 let params: UiStatePutParams = parse_params(params)?;

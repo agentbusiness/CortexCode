@@ -46,7 +46,8 @@ fn round_trip(dir: &Path) -> Result<String, String> {
     }
     let history = code::history(&repo, 10)?;
     let origins: Vec<&str> = history.iter().map(|c| c.origin.as_str()).collect();
-    if origins != ["revert", "update", "edit", "shipped"] {
+    // The shipped root commit is the starting point, not a change: History leaves it out.
+    if origins != ["revert", "update", "edit"] {
         return Err(format!("unexpected history {origins:?}"));
     }
     Ok("created, edited, updated and reverted a code folder".into())

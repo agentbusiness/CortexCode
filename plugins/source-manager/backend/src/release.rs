@@ -5,7 +5,7 @@ use crate::code::{self, Scope};
 use crate::service::Service;
 use crate::{paths, proposals};
 use cc_protocol::contracts::frame::package::valid_id;
-use cc_protocol::contracts::source::{ReleaseMergeParams, ReleaseStatus, ReleaseStatusParams, UpdateResult};
+use cc_protocol::contracts::source::{ReleaseMergeParams, ReleaseResetParams, ReleaseResetResult, ReleaseStatus, ReleaseStatusParams, UpdateResult};
 use cc_protocol::{Ctx, RpcError};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,4 +57,21 @@ pub async fn merge(service: &Arc<Service>, ctx: &Ctx, params: ReleaseMergeParams
     }
     service.changed(ctx);
     Ok(result)
+}
+
+/// `source.release.reset`: one plugin's folder back to its released source, the user's changes in
+/// it dropped.
+pub async fn reset(service: &Arc<Service>, ctx: &Ctx, params: ReleaseResetParams) -> Result<ReleaseResetResult, RpcError> {
+    let plugin = plugin_id(&params.plugin)?;
+    let dir = PathBuf::from(&params.dir);
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err(RpcError::invalid_params(format!("`{}` must be an absolute path of a folder", params.dir)));
+    }
+    if !code::is_managed(&service.code_dir) {
+        return Ok(ReleaseResetResult { state: "unmanaged".into(), files: Vec::new() });
+    }
+    let version = params.version.clone();
+    let (state, files) = service.git(move |repo| code::reset_plugin(repo, &plugin, &dir, &version)).await?;
+    service.changed(ctx);
+    Ok(ReleaseResetResult { state: state.into(), files })
 }

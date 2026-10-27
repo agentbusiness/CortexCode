@@ -15,6 +15,15 @@ pub mod methods {
     pub const DECIDE: &str = "update.decide";
     /// `{}` -> [`super::Status`]. Restart on the staged frame.
     pub const RESTART: &str = "update.restart";
+    /// [`super::DismissParams`] -> [`super::Status`]. The notice about a version that could not
+    /// start has been seen.
+    pub const DISMISS: &str = "update.dismiss";
+    /// `{}` -> [`super::ResetPlan`]. What a reset of every plugin to its official release would do.
+    pub const RESET_PLAN: &str = "update.reset_plan";
+    /// `{}` -> [`super::ResetResult`]. Put every plugin back to its official release: the user's
+    /// changes to it in the code folder are dropped and the release package installed. Refused
+    /// while a run is going.
+    pub const RESET: &str = "update.reset";
 }
 
 pub mod topics {
@@ -24,6 +33,8 @@ pub mod topics {
 
 /// The answers for a plugin the user changed.
 pub mod choices {
+    /// Use the newer version: the user's changes to the plugin are dropped and the package installed.
+    pub const USE: &str = "use";
     /// Merge the release into the user's version (built here when the user changed its code).
     pub const MERGE: &str = "merge";
     /// Keep the user's version; ask again at the next release of the plugin.
@@ -56,6 +67,30 @@ pub struct Status {
     /// Recently installed updates, newest first.
     #[serde(default)]
     pub recent: Vec<Applied>,
+    /// Newer versions that could not start (the previous version keeps running), one per plugin.
+    #[serde(default)]
+    pub failed: Vec<Failed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Failed {
+    pub plugin: String,
+    #[serde(default)]
+    pub name: String,
+    /// The version that could not start.
+    pub version: String,
+    /// Why, in plain words.
+    #[serde(default)]
+    pub error: String,
+    pub ms: u64,
+    /// The user has seen the notice (it stays in Settings > Plugins).
+    #[serde(default)]
+    pub seen: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DismissParams {
+    pub plugin: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -69,8 +104,11 @@ pub struct Pending {
     pub plugin: String,
     #[serde(default)]
     pub name: String,
-    /// The released version.
+    /// The newer version.
     pub version: String,
+    /// One of [`reset_sources`]: an official release, or the build the app came with.
+    #[serde(default)]
+    pub from: String,
     /// The version installed now.
     #[serde(default)]
     pub installed: String,
@@ -95,6 +133,66 @@ pub struct DecideParams {
     pub plugin: String,
     /// The release version the answer is for.
     pub version: String,
-    /// [`choices::MERGE`] or [`choices::KEEP`].
+    /// [`choices::USE`], [`choices::KEEP`] or [`choices::MERGE`].
     pub choice: String,
+}
+
+/// What a reset would do to one plugin.
+pub mod reset_actions {
+    /// Drop the user's changes and install the release package.
+    pub const INSTALL: &str = "install";
+    /// The release package runs already; only the user's changes in the code folder go.
+    pub const SOURCE: &str = "source";
+    /// Already the release, unchanged.
+    pub const NONE: &str = "none";
+    /// The release needs a newer frame: it waits for the frame update.
+    pub const FRAME: &str = "frame";
+    /// Not in the official releases: left as it is.
+    pub const UNOFFICIAL: &str = "unofficial";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResetPlan {
+    pub plugins: Vec<ResetItem>,
+    /// A run is going: the reset is refused until it ends.
+    #[serde(default)]
+    pub running: bool,
+    /// The official releases could not be read (why); the app's own packages stand in.
+    #[serde(default)]
+    pub offline: Option<String>,
+}
+
+/// Where a reset's version comes from.
+pub mod reset_sources {
+    /// The official release from the catalog.
+    pub const RELEASE: &str = "release";
+    /// The package the app itself carries.
+    pub const APP: &str = "app";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResetItem {
+    pub plugin: String,
+    #[serde(default)]
+    pub name: String,
+    /// The version installed now.
+    #[serde(default)]
+    pub installed: String,
+    /// The version the reset goes to (empty when there is none).
+    #[serde(default)]
+    pub release: String,
+    /// One of [`reset_sources`] (empty when there is none).
+    #[serde(default)]
+    pub from: String,
+    /// The user's changed files in the code folder.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// One of [`reset_actions`].
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResetResult {
+    /// One outcome per plugin the reset touched: reset | failed.
+    pub plugins: Vec<Applied>,
 }

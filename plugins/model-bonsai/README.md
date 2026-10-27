@@ -36,6 +36,9 @@ the settings panel (`model-bonsai.settings-model`).
 
 ## Variant (`model.variants`, `model.select`)
 
+Settings > Model shows it inside the serving engine's card (the weights belong to the engine that
+loads them): one line for a single variant, a list with Select for several.
+
 | id | file | notes |
 |---|---|---|
 | `bonsai2-27b-pq2` | `prism-ml/Ternary-Bonsai-2-27B-gguf@b072e1d`, `…-PQ2_0.gguf`, 7.21 GB | ternary weights in 2-bit slots; the only variant (owner's choice) |

@@ -21,3 +21,13 @@
 #cc .cx-swap{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;}
 #cc .cx-steps{display:flex;flex-wrap:wrap;gap:4px 12px;min-width:0;}
 #cc .cx-settings-lead{margin:0 0 8px;}
+/* Reset all plugins: one line and its button above the table; the sheet lists one plugin per row. */
+#cc .cx-reset-all{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin:0 0 14px;padding:10px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);}
+#cc .cx-reset-status{flex:1;min-width:240px;display:flex;flex-direction:column;gap:2px;}
+#cc .cx-reset-status .t{color:var(--ink);line-height:1.4;}
+#cc .cx-reset-status .cx-settings-line{margin:0;}
+#cc .cx-reset-all[data-reset-state="differs"] .cx-reset-status .t{color:var(--rubric);}
+#cc .cx-reset-list{list-style:none;margin:8px 0 0;padding:0;max-height:40vh;overflow:auto;}
+#cc .cx-reset-list li{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;padding:5px 0;border-bottom:1px solid var(--rule);}
+#cc .cx-reset-list li .t{flex:1;min-width:140px;}
+#cc .cx-reset-list li .ap{text-align:right;}

@@ -3,9 +3,11 @@
  * switch to another (frame.plugins.switch). The frame drains the serving engine, starts the other
  * in its place and serves the other's panels; a failed start brings the previous engine back. This
  * file is the same in every model plugin's settings panel (the panel shown is the serving engine's).
+ * `serving` renders inside the serving engine's card: the weights it loads belong to it, not next
+ * to it. With one engine installed there is no choice to show, and `serving` renders alone.
  */
 
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { duration, errorMessage, useClient, useNow, useQuery } from '@cortex/sdk';
 
 interface MachineFit { min_memory_bytes?: number | null; max_memory_bytes?: number | null }
@@ -37,14 +39,14 @@ export function chosenBy(providers: Providers): string {
   }
 }
 
-export function EngineChoice({ category = 'model' }: { category?: string }) {
+export function EngineChoice({ category = 'model', serving }: { category?: string; serving?: ReactNode }) {
   const client = useClient();
   const providers = useQuery<Providers>(`frame.plugins.providers:${category}`, (c) => c.call<Providers>('frame.plugins.providers', { category }), { topics: ['plugin.swapped', 'plugin.unit'] });
   const [switching, setSwitching] = useState<{ plugin: string; started: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const now = useNow(250, switching !== null);
   const data = providers.data;
-  if (!data || data.providers.length < 2) return null;
+  if (!data || data.providers.length < 2) return <>{serving ?? null}</>;
   const choose = async (plugin: string) => {
     setSwitching({ plugin, started: Date.now() });
     setError(null);
@@ -84,6 +86,7 @@ export function EngineChoice({ category = 'model' }: { category?: string }) {
                 </div>
                 {provider.fits_machine === false && !provider.serving && <p className="cx-settings-line">Made for {range}: on this Mac it may not load, and the current engine then keeps serving.</p>}
                 {provider.description && <p className="cx-settings-line">{provider.description}</p>}
+                {provider.serving && serving}
               </div>
             </li>
           );
