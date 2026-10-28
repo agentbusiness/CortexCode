@@ -108,6 +108,18 @@ build_packer() {
   (cd "$repo/packer" && cargo build --release --quiet)
 }
 
+# The UI core and SDK on this Mac, as scripts/release/in-docker.sh does in the container: plugin UI
+# packages build against their own copy of the SDK, which `npm run build` in ui/ builds and copies
+# into every plugin's npm root, so no package builds against a missing or old SDK. Installed again
+# when the lock file changed since the last install.
+build_ui_core() {
+  step "building the UI core and SDK"
+  (cd "$repo/ui" && {
+    { [ -f node_modules/.package-lock.json ] && cmp -s package-lock.json node_modules/.cortex-pack-lock.json; } ||
+      { npm ci --no-audit --no-fund && cp package-lock.json node_modules/.cortex-pack-lock.json; }
+  } && npm run build --silent)
+}
+
 # ----- versions --------------------------------------------------------------------------------
 
 version_check() { "$pack" release check "$1"; }

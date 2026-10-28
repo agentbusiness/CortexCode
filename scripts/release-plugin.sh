@@ -69,6 +69,8 @@ if [ $changed = 1 ]; then
   step "changed since their release: ${plugins[*]}"
 fi
 
+build_ui_core
+
 # release_one <plugin id>: build, upload and name one plugin in the catalog.
 release_one() {
   local id="$1" dir="plugins/$1" info name toml_v platforms has_backend latest released digest version out tag notes rid
