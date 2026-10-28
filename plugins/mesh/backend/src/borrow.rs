@@ -46,12 +46,12 @@ pub struct Client {
 }
 
 #[derive(serde::Deserialize)]
-struct FrameInfo {
-    port: u16,
-    token: String,
+pub(crate) struct FrameInfo {
+    pub port: u16,
+    pub token: String,
 }
 
-fn frame_info(home: &std::path::Path) -> Result<FrameInfo, String> {
+pub(crate) fn frame_info(home: &std::path::Path) -> Result<FrameInfo, String> {
     let path = home.join("run").join("frame.json");
     let text = std::fs::read_to_string(&path).map_err(|error| format!("the frame is not running ({}: {error})", path.display()))?;
     serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))

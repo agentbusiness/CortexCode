@@ -9,6 +9,7 @@ pub mod members;
 pub mod net;
 pub mod pairing;
 pub mod place;
+pub mod projects;
 pub mod service;
 pub mod tree;
 pub mod words;

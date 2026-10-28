@@ -1,10 +1,13 @@
 /**
- * The workbench runtime shared by the host and every UI plugin: one connection, one journal
- * registry, one query cache and one durable state store. The host installs it once at boot; the
- * SDK module is shared through the import map, so every plugin version sees the same instance.
+ * The workbench runtime shared by the host and every UI plugin: a connection, a journal registry
+ * and a query cache per computer, and one durable state store. The host installs this computer's
+ * at boot; another computer's is opened on first use, through the link the mesh gives to that
+ * computer's frame. The project shown decides which computer the regions talk to (its sessions,
+ * files and memory live there); a `ComputerScope` names one for a subtree (the sidebar's rows).
+ * The SDK module is shared through the import map, so every plugin version sees the same instances.
  */
 
-import { createContext, createElement, useCallback, useContext, useEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { ComponentType, ReactNode } from 'react';
 import { JournalRegistry, type JournalSnapshot } from './journal';
 import { QueryCache, type QueryState } from './query';
@@ -13,6 +16,8 @@ import { SlotStateStore } from './store';
 import type { UiPlugin } from './types';
 
 export interface Runtime {
+  /** The computer this runtime talks to: null for this one, else the member's node. */
+  node: string | null;
   client: Client;
   journals: JournalRegistry;
   queries: QueryCache;
@@ -20,20 +25,75 @@ export interface Runtime {
 }
 
 let installed: Runtime | null = null;
+const computers = new Map<string, Runtime>();
 
 /** Create the runtime for a frame connection (host only). */
 export function createRuntime(url: string): Runtime {
   const client = new Client({ url });
-  return { client, journals: new JournalRegistry(client), queries: new QueryCache(client), state: new SlotStateStore() };
+  return { node: null, client, journals: new JournalRegistry(client), queries: new QueryCache(client), state: new SlotStateStore() };
 }
 
 export function installRuntime(runtime: Runtime): void {
   installed = runtime;
 }
 
-export function runtime(): Runtime {
+/** This computer's runtime: its frame, the layout and the network's project list. */
+export function ownRuntime(): Runtime {
   if (!installed) throw new Error('the CortexCode runtime is not installed (the workbench host installs it at boot)');
   return installed;
+}
+
+/** A computer's runtime (null: this one). Another's connects through the mesh's link to its
+ * frame, asked again at every reconnection; the durable state stays this computer's. */
+export function runtimeFor(node: string | null | undefined): Runtime {
+  const own = ownRuntime();
+  if (!node) return own;
+  let found = computers.get(node);
+  if (!found) {
+    const client = new Client({
+      url: async () => {
+        const link = await own.client.call<{ url: string; token: string }>('mesh.link', { node });
+        return `${link.url.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(link.token)}`;
+      },
+    });
+    found = { node, client, journals: new JournalRegistry(client), queries: new QueryCache(client), state: own.state };
+    computers.set(node, found);
+  }
+  return found;
+}
+
+/** The computer of the project shown (null: this one). */
+export function activeComputer(): string | null {
+  return installed?.state.get<string | null>('workbench', 'projectNode') ?? null;
+}
+
+/** The runtime of the project shown. */
+export function runtime(): Runtime {
+  return runtimeFor(activeComputer());
+}
+
+const ComputerContext = createContext<{ node: string | null } | null>(null);
+
+/** Everything inside talks to `node`'s frame (null: this computer's), whatever project is shown. */
+export function ComputerScope({ node, children }: { node: string | null; children?: ReactNode }) {
+  const value = useMemo(() => ({ node }), [node]);
+  return createElement(ComputerContext.Provider, { value }, children);
+}
+
+/** The runtime a component talks to: its `ComputerScope`'s, else the project shown's. */
+export function useRuntime(): Runtime {
+  const scoped = useContext(ComputerContext);
+  const { state } = ownRuntime();
+  const active = useSyncExternalStore(
+    useCallback((listener: () => void) => state.subscribe('workbench', 'projectNode', listener), [state]),
+    () => state.get<string | null>('workbench', 'projectNode') ?? null,
+  );
+  return runtimeFor(scoped ? scoped.node : active);
+}
+
+/** The computer a component's data comes from (null: this one). */
+export function useComputer(): string | null {
+  return useRuntime().node;
 }
 
 // ─── host and slot context ──────────────────────────────────────────────────
@@ -143,13 +203,13 @@ export function definePlugin<P extends object = object>(definition: {
 // ─── hooks ──────────────────────────────────────────────────────────────────
 
 export function useClient(): Client {
-  return runtime().client;
+  return useRuntime().client;
 }
 
 export function useConnection(): ConnectionState {
-  const client = runtime().client;
+  const client = useRuntime().client;
   return useSyncExternalStore(
-    (listener) => client.onState(listener),
+    useCallback((listener: () => void) => client.onState(listener), [client]),
     () => client.state,
   );
 }
@@ -158,10 +218,11 @@ export function useConnection(): ConnectionState {
 export function useEvent(prefix: string | null, handler: (topic: string, data: unknown) => void): void {
   const ref = useRef(handler);
   ref.current = handler;
+  const { client } = useRuntime();
   useEffect(() => {
     if (!prefix) return;
-    return runtime().client.on(prefix, (topic, data) => ref.current(topic, data));
-  }, [prefix]);
+    return client.on(prefix, (topic, data) => ref.current(topic, data));
+  }, [prefix, client]);
 }
 
 export interface QueryOptions {
@@ -180,7 +241,7 @@ export interface QueryResult<T> extends QueryState<T> {
  * one of `topics` fires. Renders from the cache immediately, so a pre-mounted version draws data.
  */
 export function useQuery<T>(key: string | null, fetcher: (client: Client) => Promise<T>, options: QueryOptions = {}): QueryResult<T> {
-  const { queries } = runtime();
+  const { queries, client } = useRuntime();
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
   const whenRef = useRef(options.when);
@@ -211,7 +272,6 @@ export function useQuery<T>(key: string | null, fetcher: (client: Client) => Pro
   const topics = (options.topics ?? []).join('\n');
   useEffect(() => {
     if (!key || !topics) return;
-    const client = runtime().client;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const offs = topics.split('\n').map((prefix) => client.on(prefix, (topic, data) => {
       if (whenRef.current && !whenRef.current(topic, data)) return;
@@ -226,7 +286,7 @@ export function useQuery<T>(key: string | null, fetcher: (client: Client) => Pro
       if (timer) clearTimeout(timer);
       for (const off of offs) off();
     };
-  }, [key, topics, queries]);
+  }, [key, topics, queries, client]);
   return { ...state, refresh };
 }
 
@@ -234,7 +294,7 @@ const EMPTY_QUERY: QueryState<unknown> = { data: undefined, error: undefined, lo
 
 /** Several cached queries at once (a list whose length varies: one per folder, per agent…). */
 export function useQueries<T>(specs: Array<{ key: string; fetch: (client: Client) => Promise<T> }>, options: QueryOptions = {}): QueryState<T>[] {
-  const { queries } = runtime();
+  const { queries, client } = useRuntime();
   const keys = specs.map((spec) => spec.key).join('\n');
   const specsRef = useRef(specs);
   specsRef.current = specs;
@@ -249,7 +309,6 @@ export function useQueries<T>(specs: Array<{ key: string; fetch: (client: Client
   const topics = (options.topics ?? []).join('\n');
   useEffect(() => {
     if (!keys || !topics) return;
-    const client = runtime().client;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const offs = topics.split('\n').map((prefix) => client.on(prefix, (topic, data) => {
       if (whenRef.current && !whenRef.current(topic, data)) return;
@@ -263,7 +322,7 @@ export function useQueries<T>(specs: Array<{ key: string; fetch: (client: Client
       if (timer) clearTimeout(timer);
       offs.forEach((off) => off());
     };
-  }, [keys, topics, queries]);
+  }, [keys, topics, queries, client]);
   // The same array while every query's state is the same object, so callers can memoize on it.
   const next = specs.map((spec) => queries.get<T>(spec.key));
   const last = useRef<QueryState<T>[]>(next);
@@ -274,7 +333,7 @@ const LOADING_JOURNAL: JournalSnapshot = { status: 'loading', entries: [] };
 
 /** The materialized journal of a session (null: none). */
 export function useJournal(sessionId: string | null): JournalSnapshot {
-  const { journals } = runtime();
+  const { journals } = useRuntime();
   const [, force] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
     if (!sessionId) return;
@@ -291,7 +350,7 @@ export function useJournal(sessionId: string | null): JournalSnapshot {
 }
 
 function useStoreValue<T>(ns: string, key: string, initial: T): [T, (value: T | ((current: T) => T)) => void] {
-  const { state } = runtime();
+  const { state } = ownRuntime();
   const value = useSyncExternalStore(
     useCallback((listener: () => void) => state.subscribe(ns, key, listener), [state, ns, key]),
     () => state.get<T>(ns, key),
@@ -319,11 +378,11 @@ export function useShared<T>(key: string, initial: T): [T, (value: T | ((current
 
 /** Write a shared value from outside React (e.g. after an async call). */
 export function setShared(key: string, value: unknown): void {
-  runtime().state.set('workbench', key, value);
+  ownRuntime().state.set('workbench', key, value);
 }
 
 export function getShared<T>(key: string): T | undefined {
-  return runtime().state.get<T>('workbench', key);
+  return ownRuntime().state.get<T>('workbench', key);
 }
 
 /** The current time, re-rendered every `intervalMs` while `active`. */

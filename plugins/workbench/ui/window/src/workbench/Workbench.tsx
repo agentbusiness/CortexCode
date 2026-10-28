@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
-import { Cross, Divider, HostContext, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
+import { ComputerScope, Cross, Divider, HostContext, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
 import { SlotHost } from './SlotHost';
 import { Splash } from './Splash';
 import { WorkbenchContext, importPlugin, linkStyle, type WorkbenchServices } from './context';
@@ -79,7 +79,10 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
     <WorkbenchContext.Provider value={services}>
       <HostContext.Provider value={host}>
         <div id="cc" data-view={VIEW_ATTR[view]} className="drawn" data-theme-ready={ready ? 'true' : 'false'}>
-          <BoundSlot registry={registry} name="theme@1" className="cx-theme-slot" />
+          {/* The theme and the band are this computer's, whichever computer's project is shown. */}
+          <ComputerScope node={null}>
+            <BoundSlot registry={registry} name="theme@1" className="cx-theme-slot" />
+          </ComputerScope>
           {ready && (<>
           <svg className="reg tl" viewBox="0 0 11 11" aria-hidden><path d="M5.5 0v11M0 5.5h11" stroke="currentColor" strokeWidth="1" /></svg>
           <svg className="reg tr" viewBox="0 0 11 11" aria-hidden><path d="M5.5 0v11M0 5.5h11" stroke="currentColor" strokeWidth="1" /></svg>
@@ -90,7 +93,9 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
               <i>IronGraph</i>
             </div>
             <div className="grow" />
-            <SlotList registry={registry} name="workbench.band@1" className="cx-band-item" />
+            <ComputerScope node={null}>
+              <SlotList registry={registry} name="workbench.band@1" className="cx-band-item" />
+            </ComputerScope>
           </div>
           <div ref={layout.work} className="cx-work" data-pane={layout.collapsed ? 'collapsed' : 'open'} data-sidebar={layout.strip ? 'strip' : 'open'} style={layout.style}>
             <div className="cx-left">

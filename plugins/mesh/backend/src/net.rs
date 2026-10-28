@@ -10,7 +10,9 @@
 //!
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
 //! (the membership log), `mesh.provides {category}` (the methods a category's plugin serves here),
-//! `mesh.events {prefixes}` (a stream of the frame's events with those prefixes, as items).
+//! `mesh.events {prefixes}` (a stream of the frame's events with those prefixes, as items),
+//! `mesh.window.ticket` (this frame's token) and `mesh.window` (the rest of the stream is one
+//! connection of the member's window to this frame: [`crate::projects`]).
 //!
 //! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
 
@@ -142,6 +144,14 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let provides = mesh.provides(&category).await;
             let message = answer(Ok(json!({"category": category, "provides": provides})));
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
+        "mesh.window.ticket" => {
+            let message = answer(crate::projects::ticket(&mesh.home));
+            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
+        "mesh.window" => {
+            // The rest of the stream is a connection of the member's window to this frame.
+            crate::projects::serve_window(&mesh.home, &mut send, &mut recv).await?;
         }
         "mesh.card" => {
             let card = mesh.my_card().await;

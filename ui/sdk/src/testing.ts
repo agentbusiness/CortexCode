@@ -71,7 +71,7 @@ export interface TestRuntime {
 export function installTestRuntime(handlers: Record<string, FakeHandler> = {}): TestRuntime {
   const client = new FakeClient(handlers);
   const asClient = client as unknown as Client;
-  const runtime: Runtime = { client: asClient, journals: new JournalRegistry(asClient), queries: new QueryCache(asClient), state: new SlotStateStore() };
+  const runtime: Runtime = { node: null, client: asClient, journals: new JournalRegistry(asClient), queries: new QueryCache(asClient), state: new SlotStateStore() };
   installRuntime(runtime);
   return { client, runtime };
 }

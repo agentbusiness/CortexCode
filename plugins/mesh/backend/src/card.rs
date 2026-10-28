@@ -4,7 +4,8 @@
 use cc_protocol::Ctx;
 use cc_protocol::contracts::frame::{Machine, PluginInfo, Session, SessionStatus};
 use cc_protocol::contracts::lang::Description;
-use cc_protocol::contracts::mesh::{Card, LanguageCard, ModelCard, PluginCard};
+use cc_protocol::contracts::memory::{knowledge, methods as memory_methods};
+use cc_protocol::contracts::mesh::{Card, LanguageCard, ModelCard, PluginCard, ProjectCard};
 use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, SlotsResult};
 use cc_protocol::contracts::now_ms;
 use serde_json::{Value, json};
@@ -156,6 +157,13 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
     let docker = get::<Value>(ctx, "container.list", json!({})).await.is_some();
     let projects: Vec<Value> = get::<Value>(ctx, "frame.project.list", json!({})).await.and_then(|v| v.get("projects").and_then(Value::as_array).cloned()).unwrap_or_default();
     let repositories: Vec<String> = projects.iter().filter_map(|project| project.get("root").and_then(Value::as_str)).filter_map(repository_id).collect();
+    let mut project_cards = Vec::new();
+    for project in &projects {
+        let Some(id) = project.get("id").and_then(Value::as_str) else { continue };
+        let name = project.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let created_ms = project.get("created_ms").and_then(Value::as_u64).unwrap_or(0);
+        project_cards.push(ProjectCard { id: id.to_owned(), name, description: description(ctx, id).await, created_ms });
+    }
     let on_mains = on_mains();
     Card {
         node: node.to_owned(),
@@ -179,7 +187,19 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
         agents_running,
         agent_limit,
         repositories,
+        projects: project_cards,
         updated_ms: now,
+    }
+}
+
+/// The project's description from its memory: its opening paragraph (the sidebar shows a line).
+async fn description(ctx: &Ctx, project_id: &str) -> String {
+    let listed = get::<Value>(ctx, memory_methods::KNOWLEDGE_LIST, json!({"project_id": project_id, "kind": knowledge::DESCRIPTION})).await;
+    let text = listed.as_ref().and_then(|value| value.get("items")).and_then(Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("text")).and_then(Value::as_str).unwrap_or_default();
+    let paragraph = text.trim().split("\n\n").next().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+    match paragraph.char_indices().nth(400) {
+        Some((cut, _)) => format!("{}…", paragraph[..cut].trim_end()),
+        None => paragraph,
     }
 }
 

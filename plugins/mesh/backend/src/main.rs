@@ -55,6 +55,10 @@ impl Plugin for MeshPlugin {
         Box::pin(async move {
             if topic == cc_protocol::contracts::tools::topics::TIMELINE {
                 mesh.timeline_event(&data).await;
+            } else if topic.starts_with("project.")
+                || (topic == cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED && data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION))
+            {
+                mesh.projects_changed().await;
             } else {
                 mesh.event(&topic, &data);
             }

@@ -30,6 +30,17 @@
 }
 #cc .cx-proj.on .cx-proj-name{color:var(--ink);}
 #cc .cx-proj.on .cx-caret{color:var(--rubric);}
+/* Another computer's project: its name in the counter blue, selected or not. */
+#cc .cx-proj.cx-proj-remote .cx-proj-name,#cc .cx-proj.cx-proj-remote .cx-proj-open[aria-pressed="true"] .cx-proj-name{color:var(--counter);}
+#cc .cx-proj-away{opacity:.5;}
+#cc .cx-proj-away .cx-proj-toggle{cursor:default;}
+/* Under the name: the computer (another one's) and the project's description, one line. */
+#cc .cx-proj-about{
+  margin:0;padding:0 16px 4px 16px;font-size:12px;line-height:1.35;color:var(--ink-3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#cc .cx-proj-host{font-family:var(--font-apparatus);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--counter);}
+#cc .cx-strip-remote .cx-strip-code{color:var(--counter);}
 
 #cc .cx-sessions,#cc .cx-agents{margin:0;}
 #cc .cx-sessions li:last-child,#cc .cx-agents li:last-child{border-bottom:0;}

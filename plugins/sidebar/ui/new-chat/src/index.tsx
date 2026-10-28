@@ -1,12 +1,22 @@
 /**
- * sidebar.actions@1 — New chat: a conversation in the selected project, selected at once.
+ * sidebar.actions@1 — New chat: a conversation in the selected project, selected at once, on the
+ * computer the project lives on.
  */
 
 import { useState } from 'react';
-import { Cross, definePlugin, errorMessage, useClient, useHost, useSelection, type Session } from '@cortex/sdk';
+import { ComputerScope, Cross, definePlugin, errorMessage, useClient, useHost, useSelection, useShared, type Session } from '@cortex/sdk';
 
 /** Props: `{ compact }` — in the sidebar's strip, a square with the register cross. */
 function NewChat({ compact = false }: { compact?: boolean }) {
+  const [node] = useShared<string | null>('projectNode', null);
+  return (
+    <ComputerScope node={node}>
+      <NewChatButton compact={compact} />
+    </ComputerScope>
+  );
+}
+
+function NewChatButton({ compact }: { compact: boolean }) {
   const client = useClient();
   const host = useHost();
   const selection = useSelection();

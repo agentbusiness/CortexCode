@@ -17,7 +17,7 @@ use crate::service::Mesh;
 use base64::Engine as _;
 use cc_protocol::contracts::mesh::{Runner, RunnerParams, TreeApplyParams, TreeFile, TreeFilesParams};
 use cc_protocol::contracts::tools::{TimelineApplyFile, TimelineApplyParams, TimelineParams, TimelineResult, methods as tools_methods};
-use cc_protocol::{ItemSink, RpcError, codes};
+use cc_protocol::{ItemSink, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -59,10 +59,6 @@ pub struct Trees {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn key_of(owner: &str, project_id: &str) -> String {
-    format!("{}:{}", &owner[..owner.len().min(12)], project_id)
 }
 
 fn git_program() -> Option<PathBuf> {
@@ -163,61 +159,10 @@ impl Mesh {
 
     // --- the borrower's side ---------------------------------------------------------------
 
-    /// The member that runs `session`'s commands in `workspace`, with its copy made ready.
-    pub async fn runner(self: &Arc<Self>, params: RunnerParams) -> Result<Runner, RpcError> {
-        let workspace = PathBuf::from(&params.workspace);
-        if let Some(lent) = lock(&self.trees.lent).get(&workspace).cloned() {
-            if self.connection(&lent.node).is_some() {
-                let name = self.member(&lent.node).map(|member| member.name).unwrap_or_default();
-                return Ok(Runner { node: Some(lent.node), name, remote_workspace: lent.remote_workspace, reason: String::new() });
-            }
-            lock(&self.trees.lent).remove(&workspace);
-        }
-        let my_card = self.my_card().await;
-        let my_tools = my_card.plugins.iter().find(|plugin| plugin.category == "tools").cloned();
-        let me = self.me.hex();
-        let cards = lock(&self.cards).clone();
-        let conns = self.connections();
-        let mut candidates: Vec<(String, bool, bool)> = Vec::new();
-        let mut reasons: Vec<String> = Vec::new();
-        for member in self.members().into_values().filter(|member| member.node != me) {
-            if !conns.contains_key(&member.node) {
-                reasons.push(format!("{} is not reachable", member.name));
-                continue;
-            }
-            let Some(card) = cards.get(&member.node) else {
-                reasons.push(format!("{} has not sent its card yet", member.name));
-                continue;
-            };
-            let their_tools = card.plugins.iter().find(|plugin| plugin.category == "tools");
-            let same = match (&my_tools, their_tools) {
-                (Some(mine), Some(theirs)) => mine.version == theirs.version && mine.data_hash == theirs.data_hash,
-                _ => false,
-            };
-            if !same {
-                reasons.push(format!("{} runs another tools plugin (version or data)", member.name));
-                continue;
-            }
-            candidates.push((member.node.clone(), !card.user_active, card.on_mains));
-        }
-        candidates.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
-        let Some((node, _, _)) = candidates.into_iter().next() else {
-            return Ok(Runner { node: None, name: String::new(), remote_workspace: String::new(), reason: reasons.join("; ") });
-        };
-        let key = key_of(&me, &params.project_id);
-        lock(&self.trees.expecting).insert(node.clone(), workspace.clone());
-        let ready = self.call_member(&node, "mesh.tree.ready", json!({"key": key, "owner_workspace": params.workspace}), None, CancellationToken::new()).await;
-        lock(&self.trees.expecting).remove(&node);
-        let ready = ready?;
-        let remote_workspace = ready.get("path").and_then(Value::as_str).unwrap_or("").to_owned();
-        if remote_workspace.is_empty() {
-            return Err(RpcError::new(codes::UNAVAILABLE, "the member did not make a copy of the tree"));
-        }
-        let head_seq = self.ctx()?.call(tools_methods::TIMELINE, json!({"workspace": params.workspace, "limit": 1})).await.ok().and_then(|v| serde_json::from_value::<TimelineResult>(v).ok()).map(|t| t.head_seq).unwrap_or(0);
-        lock(&self.trees.lent).insert(workspace, Lent { node: node.clone(), key, remote_workspace: remote_workspace.clone(), sent_through: head_seq });
-        let name = self.member(&node).map(|member| member.name).unwrap_or_default();
-        self.notify("serving");
-        Ok(Runner { node: Some(node), name, remote_workspace, reason: String::new() })
+    /// Who runs a session's commands: the project's own computer, always (§12: execution stays
+    /// where the project, its files and its memory are; the model is what other computers lend).
+    pub async fn runner(self: &Arc<Self>, _params: RunnerParams) -> Result<Runner, RpcError> {
+        Ok(Runner { node: None, name: self.name(), remote_workspace: String::new(), reason: "commands run on the project's own computer".to_owned() })
     }
 
     /// The tree's files, streamed to a member making its copy.

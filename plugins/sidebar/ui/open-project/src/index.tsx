@@ -18,6 +18,8 @@ function OpenProject({ compact = false }: { compact?: boolean }) {
   const [fromGithub, setFromGithub] = useState(false);
   const select = async (project: Project) => {
     await projects.refresh();
+    // A project opened here lives on this computer.
+    setShared('projectNode', null);
     setShared('projectId', project.id);
     setShared('sessionId', null);
   };

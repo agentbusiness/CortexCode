@@ -68,7 +68,9 @@ export interface SocketLike {
 }
 
 export interface ClientOptions {
-  url: string;
+  /** The frame's WebSocket address, or how to find it at every (re)connection (another
+   * computer's frame, reached through a link the mesh opens). */
+  url: string | (() => Promise<string>);
   /** Creates the socket; defaults to the browser WebSocket. */
   socket?: (url: string) => SocketLike;
 }
@@ -76,7 +78,7 @@ export interface ClientOptions {
 const OPEN = 1;
 
 export class Client {
-  private readonly url: string;
+  private readonly url: string | (() => Promise<string>);
   private readonly makeSocket: (url: string) => SocketLike;
   private socket: SocketLike | null = null;
   private nextId = 1;
@@ -171,7 +173,30 @@ export class Client {
   private open(): void {
     if (this.stopped) return;
     this.setState('connecting');
-    const socket = this.makeSocket(this.url);
+    if (typeof this.url === 'string') {
+      this.connect(this.url);
+      return;
+    }
+    // The address is not there (the other computer is away): calls fail now instead of waiting.
+    this.url().then((url) => this.connect(url), (error: unknown) => {
+      this.fail(error instanceof RpcError ? error : new RpcError('unavailable', error instanceof Error ? error.message : String(error), true));
+      this.retry();
+    });
+  }
+
+  private retry(): void {
+    if (this.stopped) {
+      this.setState('closed');
+      return;
+    }
+    this.setState('connecting');
+    this.retryTimer = setTimeout(() => this.open(), this.retryMs);
+    this.retryMs = Math.min(this.retryMs * 2, 4000);
+  }
+
+  private connect(url: string): void {
+    if (this.stopped) return;
+    const socket = this.makeSocket(url);
     this.socket = socket;
     socket.onopen = () => {
       if (this.stopped || this.socket !== socket) return;
@@ -196,13 +221,7 @@ export class Client {
       if (this.socket !== socket) return;
       this.socket = null;
       this.fail(new RpcError('connection_closed', 'connection to the frame closed', true));
-      if (this.stopped) {
-        this.setState('closed');
-        return;
-      }
-      this.setState('connecting');
-      this.retryTimer = setTimeout(() => this.open(), this.retryMs);
-      this.retryMs = Math.min(this.retryMs * 2, 4000);
+      this.retry();
     };
   }
 
