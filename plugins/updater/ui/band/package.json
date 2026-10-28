@@ -8,7 +8,7 @@
     "id": "updater.band",
     "slot": "workbench.band@1",
     "label": "Updates",
-    "order": 40
+    "order": 10
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && vite build"

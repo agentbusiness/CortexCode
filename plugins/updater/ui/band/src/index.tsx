@@ -1,5 +1,6 @@
 /**
- * workbench.band@1 — updates. In the band only "Restart to update" when a newer frame is staged.
+ * workbench.band@1 — updates. In the band only "Restart to update" when a newer frame is staged; it is
+ * the band's first item (order 10), so it takes the empty middle and the card at the right stays put.
  * At the bottom right: the round, every update of a check together, one row per plugin with where
  * it stands; it leaves by itself a few seconds after the last one is done (a failure stays until
  * hidden). Below it, one question at a time: a plugin the user changed that has a newer version,
