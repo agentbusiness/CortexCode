@@ -2,7 +2,8 @@
 
 The frame starts it as `ui/node_modules/.bin/electron ui` with `CORTEX_FRAME_URL` and
 `CORTEX_FRAME_TOKEN` (without them it reads `<CORTEX_HOME>/run/frame.json`). It opens one window
-on `${CORTEX_FRAME_URL}/ui/?token=…`, which the frame serves from `ui/renderer/dist`.
+on `${CORTEX_FRAME_URL}/ui/?token=…`, which the frame serves from the window package (`window@1`,
+the workbench plugin's `ui/window`).
 
 - `main.js`: the window, the preload's IPC (`cortex:pick-folder` (with an optional title), `cortex:pick-file`,
   `cortex:save-attachment` (pasted bytes into `<CORTEX_HOME>/attachments/incoming/`, where

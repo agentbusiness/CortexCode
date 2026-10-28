@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Release the frame: the frame, cx and the window code (shell and renderer), plus Electron when its
-# version changed, in a GitHub release `frame-v<version>`, named in the catalog. The app downloads
-# it, and it runs after "Restart to update". Plugins are released on their own (scripts/release-plugin.sh).
+# Release the frame: the frame and its Electron shell (ui/shell), plus Electron when its version
+# changed, in a GitHub release `frame-v<version>`, named in the catalog. The app downloads it, and it
+# runs after "Restart to update". Everything else is a plugin, released on its own
+# (scripts/release-plugin.sh): the window is the workbench plugin's, cx the tools plugin's.
 #
 #   scripts/release-frame.sh [version] [--dry-run]
 #
 # Version: the one given (newer than the released one), else the next after the released one
-# (each part 0 to 99), else frame/Cargo.toml's for a first release. It is written into the frame,
-# cx and cortex-pack Cargo.toml files and ui/package.json (commit them). Platforms: RELEASE_PLATFORMS.
+# (each part 0 to 99), else frame/Cargo.toml's for a first release. It is written into
+# frame/Cargo.toml and ui/package.json (commit them). Platforms: RELEASE_PLATFORMS.
+#
+# The catalog records the frame's interface (the protocol files that are not features) and the
+# first frame version with it (`interface_since`): plugins built against it name that version as
+# their min_frame, so a frame release that keeps the interface never holds plugin updates back.
 set -euo pipefail
 self="${CORTEX_RELEASE_ORIGINAL:-$0}"
 release_name="release-frame"
@@ -46,17 +51,12 @@ fi
 step "frame $version"
 
 # --- the version everywhere the frame reports it ----------------------------------------------
-for crate in frame cli packer; do
-  stamp_toml_version "$repo/$crate/Cargo.toml" "$version"
-done
+stamp_toml_version "$repo/frame/Cargo.toml" "$version"
 stamp_json_version "$repo/ui/package.json" "$version"
 [ ! -f "$repo/ui/package-lock.json" ] || stamp_json_version "$repo/ui/package-lock.json" "$version"
-build_packer
 
-# --- the window code (the same on every platform) ----------------------------------------------
+# --- the shell's runtime packages (the same on every platform) ---------------------------------
 [ -f "$repo/ui/node_modules/.package-lock.json" ] || (cd "$repo/ui" && npm ci --no-audit --no-fund)
-step "building the window code"
-(cd "$repo/ui" && npm run build --silent >/dev/null)
 electron_version="$(jq -r .version "$repo/ui/node_modules/electron/package.json")"
 
 out="$artifacts/frame/$version"
@@ -68,31 +68,24 @@ uploads=()
 
 for platform in $RELEASE_PLATFORMS; do
   stage="$work/$platform/frame"
-  mkdir -p "$stage/bin" "$stage/ui/renderer" "$stage/ui/node_modules"
+  mkdir -p "$stage/ui/node_modules"
   case "$platform" in
     darwin-arm64)
-      for crate in frame cli; do
-        step "building $crate"
-        (cd "$repo/$crate" && cargo build --release --quiet)
-      done
+      step "building the frame"
+      (cd "$repo/frame" && cargo build --release --quiet)
       cp "$repo/frame/target/release/cortex-frame" "$stage/CortexCode"
-      cp "$repo/cli/target/release/cx" "$stage/bin/cx"
-      for binary in "$stage/CortexCode" "$stage/bin/cx"; do
-        codesign --force --sign - "$binary" >/dev/null 2>&1
-      done
+      codesign --force --sign - "$stage/CortexCode" >/dev/null 2>&1
       ;;
     linux-*)
       step "building the frame for $platform (Docker)"
       in_docker "$platform" "$work/$platform/built" frame
       cp "$work/$platform/built/bin/CortexCode" "$stage/CortexCode"
-      cp "$work/$platform/built/bin/cx" "$stage/bin/cx"
       ;;
     *) die "unknown platform $platform" ;;
   esac
   cp "$repo/scripts/app/cortex.frame.toml" "$stage/cortex.toml"
   cp "$repo/ui/package.json" "$stage/ui/package.json"
   rsync -a "$repo/ui/shell/" "$stage/ui/shell/"
-  rsync -a "$repo/ui/renderer/dist/" "$stage/ui/renderer/dist/"
   rsync -a "$repo/ui/node_modules/ws/" "$stage/ui/node_modules/ws/"
   frame_file="$out/frame-$version-$platform.tar.gz"
   tar_dir "$stage" "$frame_file"
@@ -125,9 +118,14 @@ if [ $dry_run = 0 ]; then
     gh_upload "$rid" "$file"
   done
 fi
-# What it was built from (after the builds: they write the version into the lock files).
-jq --arg v "$version" --arg tag "$tag" --arg e "$electron_version" --arg digest "$(frame_digest)" --argjson files "$files" \
-  '.frame = {version: $v, tag: $tag, electron: $e, digest: $digest, files: $files}' "$catalog" > "$catalog.next"
+# What it was built from (after the builds: they write the version into the lock files), and the
+# first frame with this interface.
+interface="$(interface_digest)"
+since="$(jq -r --arg i "$interface" 'if .frame.interface == $i then (.frame.interface_since // empty) else empty end' "$catalog")"
+[ -n "$since" ] || since="$version"
+jq --arg v "$version" --arg tag "$tag" --arg e "$electron_version" --arg digest "$(frame_digest)" \
+  --arg interface "$interface" --arg since "$since" --argjson files "$files" \
+  '.frame = {version: $v, tag: $tag, electron: $e, digest: $digest, interface: $interface, interface_since: $since, files: $files}' "$catalog" > "$catalog.next"
 mv "$catalog.next" "$catalog"
 
 mkdir -p "$artifacts"

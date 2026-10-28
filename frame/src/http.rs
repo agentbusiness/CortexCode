@@ -3,7 +3,7 @@
 //! - `GET /health` (open)
 //! - `GET /ws?token=` - one JSON envelope per text message, the same protocol plugins speak
 //! - `POST /api/rpc` (token) - `{method, params}` -> `{ok, result | error, items}` for scripts
-//! - `/ui/` - the renderer (`<ui_dir>/renderer/dist`), `/ui-plugins/<id>/<hash>/<file>` - UI plugins
+//! - `/ui/` - the window (the `window@1` UI package a plugin provides), `/ui-plugins/<id>/<hash>/<file>` - UI plugins
 
 use crate::hub::{FRAME_VERSION, Frame, PeerKind};
 use axum::Router;
@@ -22,7 +22,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
 struct AppState {
@@ -31,8 +30,6 @@ struct AppState {
 }
 
 pub fn router(frame: Arc<Frame>) -> Router {
-    let dist = frame.config.ui_dir.join("renderer/dist");
-    let renderer = ServeDir::new(&dist).fallback(ServeFile::new(dist.join("index.html")));
     let state = AppState { frame, started: Instant::now() };
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
@@ -40,7 +37,9 @@ pub fn router(frame: Arc<Frame>) -> Router {
         .route("/ws", get(ws_upgrade))
         .route("/api/rpc", post(api_rpc))
         .route("/ui-plugins/{id}/{hash}/{*file}", get(ui_plugin_file))
-        .nest_service("/ui", renderer)
+        .route("/ui", get(|| async { Redirect::permanent("/ui/") }))
+        .route("/ui/", get(|State(state): State<AppState>| async move { serve_window(&state, "").await }))
+        .route("/ui/{*file}", get(|State(state): State<AppState>, UrlPath(file): UrlPath<String>| async move { serve_window(&state, &file).await }))
         .with_state(state)
 }
 
@@ -260,6 +259,41 @@ async fn api_rpc(
     client.close();
     axum::Json(body).into_response()
 }
+
+/// A file of the window (the `window@1` package); a path that names no file is the page itself (the
+/// window routes inside the page). Revalidated on every load: a new window version shows at once.
+/// Until a plugin provides a window, a page that waits for it.
+async fn serve_window(state: &AppState, file: &str) -> Response {
+    let Some(window) = state.frame.ui_plugins.window() else {
+        let mut response = Response::new(Body::from(WAITING_PAGE));
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    };
+    let named = crate::uiplugins::safe_relative(file).map(|relative| window.dir.join(relative)).filter(|path| path.is_file());
+    let path = named.unwrap_or_else(|| window.dir.join("index.html"));
+    let inside = std::fs::canonicalize(&path).ok().zip(std::fs::canonicalize(&window.dir).ok()).is_some_and(|(path, root)| path.starts_with(root));
+    if !inside {
+        return (StatusCode::NOT_FOUND, "no such window file").into_response();
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            let headers = response.headers_mut();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(crate::uiplugins::content_type(&path)));
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            response
+        }
+        Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    }
+}
+
+/// What `/ui/` shows while no plugin provides the window (the workbench plugin is installing or
+/// disabled): it asks again every two seconds.
+const WAITING_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"2\">\
+<title>CortexCode</title><style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0d0f12;color:#9aa3ad;\
+font:14px -apple-system,system-ui,sans-serif}</style></head><body>Waiting for the window (the Workbench plugin)</body></html>";
 
 async fn ui_plugin_file(State(state): State<AppState>, UrlPath((id, hash, file)): UrlPath<(String, String, String)>) -> Response {
     let Some(path) = state.frame.ui_plugins.resolve(&id, &hash, &file) else {

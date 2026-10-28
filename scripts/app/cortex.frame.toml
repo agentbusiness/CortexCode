@@ -8,7 +8,3 @@ home = "~/.cortexcode"
 port = 0
 ui = true
 ui_dir = "ui"
-
-# cx, copied into <home>/bin for the model's shells.
-[plugin.tools.config]
-cx_path = "bin/cx"

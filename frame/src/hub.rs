@@ -127,11 +127,9 @@ pub struct Frame {
     /// Serializes UI rescans, so `ui_plugin.changed` events go out in scan order.
     ui_scan: tokio::sync::Mutex<()>,
     /// File watches on the UI sources, by directory; a change triggers a rescan.
-    ui_watches: Mutex<HashMap<PathBuf, crate::fswatch::FsWatch>>,
-    ui_changed: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
-    /// Digest of the served renderer's `index.html` (it names the hashed bundles, so it changes
-    /// with every renderer build); a change is announced as `ui.renderer.changed`.
-    renderer_build: Mutex<String>,
+    /// The served window's bundle hash (empty while none is served); a change is announced as
+    /// `ui.renderer.changed`.
+    window_build: Mutex<String>,
 }
 
 pub struct FrameParts {
@@ -154,14 +152,13 @@ impl Frame {
         let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, live, safe } = parts;
         let disabled = units.disabled();
         let ui_plugins = UiPlugins::new(units.ui_sources(), disabled.clone());
+        let window_build = ui_plugins.window().map(|window| window.plugin.hash).unwrap_or_default();
         let sup = Supervisor::new(&units.backends(), &disabled);
         let shell = Shell::new(config.ui_dir.clone());
         Arc::new(Frame {
             units,
             ui_scan: tokio::sync::Mutex::new(()),
-            ui_watches: Mutex::new(HashMap::new()),
-            ui_changed: Mutex::new(None),
-            renderer_build: Mutex::new(renderer_build(&config.ui_dir)),
+            window_build: Mutex::new(window_build),
             power: KeepAwake::new(),
             port: AtomicU16::new(0),
             records_waiting: Mutex::new(Some(Vec::new())),
@@ -396,65 +393,44 @@ impl Frame {
             };
             self.publish(topics::UI_PLUGIN_CHANGED, &data);
         }
-        // A rebuilt renderer: an open workbench reloads, so it never runs the old layout with the
-        // new plugin packages.
-        let build = renderer_build(&self.config.ui_dir);
-        let renderer_changed = self.renderer_build.lock().ok().is_some_and(|mut last| {
-            let changed = !build.is_empty() && *last != build;
-            if changed {
-                *last = build.clone();
-            }
+        // A new window: an open workbench reloads, so it never runs the old layout with the new
+        // plugin packages.
+        let build = self.ui_plugins.window().map(|window| window.plugin.hash).unwrap_or_default();
+        let window_changed = self.window_build.lock().ok().is_some_and(|mut last| {
+            let changed = !build.is_empty() && !last.is_empty() && *last != build;
+            *last = build.clone();
             changed
         });
-        if renderer_changed {
-            tracing::info!(%build, "renderer rebuilt; open workbenches reload");
+        if window_changed {
+            tracing::info!(%build, "the window changed; open workbenches reload");
             self.publish(topics::UI_RENDERER_CHANGED, &json!({"build": build}));
         }
         changes
     }
 
-    /// Watch the renderer build; a rebuild rescans after a 200 ms quiet period.
-    pub fn start_ui_watch(self: &Arc<Self>) {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        if let Ok(mut slot) = self.ui_changed.lock() {
-            *slot = Some(tx);
-        }
-        self.watch_ui_sources();
-        let frame = self.clone();
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {
-                // Debounce: rescan after 200 ms without further changes.
-                loop {
-                    match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                        Ok(Some(())) => continue,
-                        Ok(None) => return,
-                        Err(_) => break,
-                    }
-                }
-                if frame.is_shutting_down() {
-                    return;
-                }
-                frame.refresh_ui().await;
-            }
-        });
-    }
-
-    fn watch_ui_sources(&self) {
-        let Some(tx) = self.ui_changed.lock().ok().and_then(|slot| slot.clone()) else {
-            return;
+    /// Whether a command in the model's shells may call `method`: the frame's own read methods,
+    /// and the methods the plugin serving the category declared in its hello (`commands`).
+    fn command_permitted(&self, method: &str, params: &Value) -> Result<(), RpcError> {
+        let category = category_of(method);
+        let declared = if category == "frame" {
+            crate::access::FRAME_COMMANDS.contains(&method)
+        } else {
+            let session_route = session_key(params).and_then(|key| {
+                self.session_routes.read().ok().and_then(|routes| routes.get(&(category.to_owned(), key)).cloned())
+            });
+            let Some(route) = session_route.or_else(|| self.routes.read().ok().and_then(|routes| routes.get(category).cloned())) else {
+                return Err(self.unavailable(category));
+            };
+            let peer = self.peers.read().ok().and_then(|peers| peers.get(&route.peer).cloned());
+            peer.and_then(|peer| peer.hello.get().map(|hello| hello.commands.iter().any(|known| known == method))).unwrap_or(false)
         };
-        let Ok(mut watches) = self.ui_watches.lock() else {
-            return;
-        };
-        let renderer = self.config.ui_dir.join("renderer/dist");
-        if !renderer.is_dir() || watches.contains_key(&renderer) {
-            return;
-        }
-        match crate::fswatch::watch(&renderer, tx) {
-            Ok(watch) => {
-                watches.insert(renderer, watch);
-            }
-            Err(error) => tracing::warn!(dir = %renderer.display(), %error, "cannot watch the renderer build"),
+        if declared {
+            Ok(())
+        } else {
+            Err(RpcError::new(
+                codes::CONTRACT_VIOLATION,
+                format!("`{method}` requires the user's app connection; use the CortexCode window to approve or perform it"),
+            ))
         }
     }
 
@@ -999,7 +975,7 @@ impl Handler for PeerHandler {
         let peer = self.peer.clone();
         let method = request.method.clone();
         if let Some(scope) = &peer.command_scope
-            && let Err(error) = scope.authorize(&method, &mut request.params)
+            && let Err(error) = frame.command_permitted(&method, &request.params).and_then(|()| scope.authorize(&method, &mut request.params))
         {
             return Box::pin(async move {
                 request.responder.err(error);
@@ -1172,15 +1148,6 @@ async fn relay(mut stream: CallStream, responder: &Responder, cancel: &Cancellat
         }
     }
     (stream.finish().await, items)
-}
-
-/// Digest of `<ui_dir>/renderer/dist/index.html` (empty when there is none).
-fn renderer_build(ui_dir: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
-    match std::fs::read(ui_dir.join("renderer/dist/index.html")) {
-        Ok(bytes) => Sha256::digest(&bytes).iter().take(8).map(|byte| format!("{byte:02x}")).collect(),
-        Err(_) => String::new(),
-    }
 }
 
 /// The session a call belongs to, as its parameters name it: `cache_key` (model calls: the

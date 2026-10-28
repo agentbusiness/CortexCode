@@ -4,7 +4,7 @@ use cc_protocol::contracts::lifecycle::{Hello, ProbeReport};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, run_plugin};
 use cc_research::config::Config;
 use cc_research::peers::FramePeers;
-use cc_research::service::{Core, PROVIDES};
+use cc_research::service::{COMMANDS, Core, PROVIDES};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -97,6 +97,7 @@ fn main() {
         }
         let mut hello = Hello::new("cc-research", env!("CARGO_PKG_VERSION"), "research", "research@1");
         hello.provides = PROVIDES.iter().map(|m| (*m).to_owned()).collect();
+        hello.commands = COMMANDS.iter().map(|m| (*m).to_owned()).collect();
         let plugin = Arc::new(ResearchPlugin { peers: FramePeers::default(), core: OnceLock::new(), home: env.home.clone(), data: env.data_dir.clone() });
         match run_plugin(hello, plugin).await {
             Ok(()) => 0,

@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build CortexCode.app: the frame, the Electron UI, every plugin built and packed (with its data),
-# cx and the app's configuration. No source code goes into the app.
+# Build CortexCode.app: the frame, its Electron shell, every plugin built and packed (with its data;
+# the window is the workbench plugin's, cx the tools plugin's) and the app's configuration. No source
+# code goes into the app.
 #
 #   scripts/build-app.sh [out-dir] [--live]     # default dist/  ->  <out-dir>/CortexCode.app
 #
@@ -9,16 +10,15 @@
 # its package (its version carries a digest of its source), so a rebuild only builds what changed.
 #
 # `--live` is the build `./cortexcode` runs beside an app already started from <out-dir>: each
-# changed plugin is installed into the running frame as it is packed (a hot-swap), the frame and
-# the window's core take effect at the next start, and nothing the app runs is overwritten in
-# place. Its progress lines go to fd 3 (the terminal), everything else to the caller's output.
+# changed plugin is installed into the running frame as it is packed (a hot-swap; the window too,
+# it is the workbench plugin's), the frame and its shell take effect at the next start, and nothing
+# the app runs is overwritten in place. Its progress lines go to fd 3 (the terminal), everything else to the caller's output.
 #
 # Contents/MacOS/CortexCode          the frame; it reads Contents/Resources/cortex.toml
 # Contents/Resources/cortex.toml     every path inside the bundle (scripts/app/cortex.toml)
 # Contents/Resources/packages/       <id>@<version>.ccplugin for every plugin, installed at start;
 #                                    their data folders make ~/.cortexcode/live
-# Contents/Resources/bin/            cx, copied into ~/.cortexcode/bin at start
-# Contents/Resources/ui/             the Electron shell, the renderer and Electron (as CortexCode.app)
+# Contents/Resources/ui/             the Electron shell and Electron (as CortexCode.app)
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -62,35 +62,27 @@ fi
 rm -f "$out/.stamp"
 # shellcheck source=app/electron.sh
 . "$repo/scripts/app/electron.sh"
-# The source files git tracks or would track under the given paths, that exist (NUL-separated).
-sources() {
-  git ls-files -co --exclude-standard -z -- "$@" | while IFS= read -r -d '' file; do
-    [ -f "$file" ] && printf '%s\0' "$file"
-  done
-}
+mkdir -p "$contents/MacOS" "$res/packages" "$res/ui/node_modules"
 
-mkdir -p "$contents/MacOS" "$res/packages" "$res/bin" "$res/ui/node_modules"
-
-# --- the frame, cx and cortex-pack (which packs the plugins here) ------------------------------
-for crate in frame cli packer; do
+# --- the frame and cortex-pack (which packs the plugins here) ----------------------------------
+for crate in frame packer; do
   step "building $crate"
   (cd "$crate" && cargo build --release --quiet)
 done
 pack="$repo/packer/target/release/cortex-pack"
 
-# --- the UI core (renderer and SDK) ------------------------------------------------------------
+# --- the SDK and every UI package (each plugin's UI builds against the SDK just built) ----------
 [ -d ui/node_modules ] || (cd ui && npm ci --no-audit --no-fund)
-step "building the UI core"
+step "building the UI packages"
 (cd ui && npm run build --silent >/dev/null)
 
 # --- every plugin, built and packed -------------------------------------------------------------
-# The digest covers the plugin's own files and the shared code it builds with.
-shared=(protocol model-kit lang-kit ui/sdk rust-toolchain.toml)
+# The digest covers what the plugin builds with (scripts/release/digest.mjs), as a release's does.
 wanted=()
 for toml in plugins/*/plugin.toml; do
   dir="$(dirname "$toml")"
   read -r id version < <("$pack" info "$dir" | /usr/bin/python3 -c 'import json,sys; p=json.load(sys.stdin)["plugin"]; print(p["id"], p["version"].split("+")[0])')
-  digest="$(sources "$dir" "${shared[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)"
+  digest="$(node scripts/release/digest.mjs plugin "$dir")"
   name="$id@$version+b$digest.ccplugin"
   wanted+=("$name")
   if [ -f "$res/packages/$name" ]; then
@@ -124,18 +116,17 @@ for file in "$res/packages"/*.ccplugin; do
   [ $keep = 1 ] || rm -f "$file"
 done
 
-# --- cx ----------------------------------------------------------------------------------------
-place cli/target/release/cx "$res/bin/cx"
-# Earlier builds also carried the packer and the full source.
-rm -rf "$res/bin/cortex-pack" "$res/source" "$res/.source-next" "$res/.source-old"
+# Earlier builds also carried the packer and the full source, and cx (the tools plugin ships it
+# now) and the window (the workbench plugin's now), which a running earlier frame still uses: those
+# go with a build that is not beside a running app.
+rm -rf "$res/source" "$res/.source-next" "$res/.source-old"
+[ $live = 1 ] || rm -rf "$res/bin" "$res/ui/renderer"
 
-# --- the UI: shell, renderer, its runtime packages and Electron ---------------------------------
-mkdir -p "$res/ui/renderer"
+# --- the shell, its runtime packages and Electron ----------------------------------------------
 place ui/package.json "$res/ui/package.json"
-# Compared by content (the UI build rewrites unchanged files); a file sent or deleted is a change.
+# Compared by content; a file sent or deleted is a change.
 ui_sent="$(
   rsync -aci --delete ui/shell/ "$res/ui/shell/" || exit 1
-  rsync -aci --delete ui/renderer/dist/ "$res/ui/renderer/dist/" || exit 1
   rsync -aci --delete ui/node_modules/ws/ "$res/ui/node_modules/ws/" || exit 1
 )"
 ui_changed="$(printf '%s\n' "$ui_sent" | grep -E '^(>f|\*deleting)' || true)"
@@ -168,7 +159,7 @@ codesign --force --sign - "$frame_exe" >/dev/null 2>&1
 
 if [ $live = 1 ]; then
   [ $frame_changed = 0 ] || step "the frame changed: it runs from the next start"
-  [ -z "$ui_changed" ] || step "the window's core changed: it loads at the next start"
+  [ -z "$ui_changed" ] || step "the shell changed: it loads at the next start"
 fi
 step "done: $app"
 

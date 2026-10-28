@@ -6,7 +6,7 @@
 //! ([`crate::journal`]); the store's journal streams are read here only to move them into files.
 
 use cc_protocol::contracts::frame::{JournalPatch, Project, Session, UiStateDocument};
-use cc_protocol::contracts::memory::{methods, AppProjectsResult, AppSessionsResult, JournalReadResult};
+use cc_protocol::contracts::records::{methods, AppProjectsResult, AppSessionsResult, JournalReadResult};
 use cc_protocol::{codes, Connection, RpcError};
 use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};

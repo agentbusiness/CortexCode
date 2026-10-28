@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // `npx cortexcode`: start CortexCode. The first run downloads the app for this machine from the
 // official releases (the catalog), checks its checksum and unpacks it into ~/.cortexcode/app/<version>/;
-// later runs start it at once and fetch a newer app when the catalog names one. The app runs on its
-// own: closing the terminal does not quit it (its start output goes to ~/.cortexcode/logs/start.log).
-// Plugin and frame updates come through the app itself. Arguments go to the app (`--headless`, `--safe`).
+// later runs start the installed app at once, without looking at the catalog: the app updates its
+// frame and plugins itself, so a newer app release is only for machines that have none. The app runs
+// on its own: closing the terminal does not quit it (its start output goes to ~/.cortexcode/logs/start.log).
+// Arguments go to the app (`--headless`, `--safe`).
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -163,24 +164,18 @@ async function main() {
     return 0;
   }
   const key = platform();
-  let wanted = null;
-  try {
-    const listed = await catalog();
-    const files = listed.app?.files?.[key];
-    if (listed.app && files?.archive) wanted = { app: listed.app, asset: files.archive };
-    else say(`no CortexCode app is released for ${key} yet`);
-  } catch (error) {
-    say(`cannot look for a new version (${error.message})`);
-  }
-  if (wanted && !installed().includes(wanted.app.version)) {
+  // The installed app updates itself (frame and plugins): only a machine without one downloads.
+  if (installed().length === 0) {
     try {
-      await install(wanted.app, wanted.asset);
+      const listed = await catalog();
+      const files = listed.app?.files?.[key];
+      if (listed.app && files?.archive) await install(listed.app, files.archive);
+      else say(`no CortexCode app is released for ${key} yet`);
     } catch (error) {
-      say(error.message);
+      say(`cannot download CortexCode (${error.message})`);
     }
   }
-  const versions = installed();
-  const chosen = wanted && versions.includes(wanted.app.version) ? wanted.app.version : versions[0];
+  const chosen = installed()[0];
   if (!chosen) {
     say('CortexCode is not installed and could not be downloaded');
     return 1;

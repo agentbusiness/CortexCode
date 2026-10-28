@@ -40,6 +40,10 @@ pub struct Hello {
     /// Event topic prefixes this instance wants delivered.
     #[serde(default)]
     pub subscribes: Vec<String>,
+    /// Methods of this category a command in the model's shells may call (through `cx`); the
+    /// frame refuses every other method of the category from a shell.
+    #[serde(default)]
+    pub commands: Vec<String>,
     /// Filled in by `run_plugin` from the environment.
     #[serde(default)]
     pub instance: String,
@@ -62,6 +66,7 @@ impl Hello {
             contract: contract.to_owned(),
             provides: Vec::new(),
             subscribes: Vec::new(),
+            commands: Vec::new(),
             scope: String::new(),
             instance: String::new(),
             pid: 0,

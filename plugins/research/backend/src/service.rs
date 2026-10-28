@@ -18,6 +18,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// The methods a command in the model's shells may call (`cx`): all of research but its settings.
+pub const COMMANDS: &[&str] = &[
+    methods::SEARCH,
+    methods::FETCH,
+    methods::NOTE_ADD,
+    methods::NOTES,
+    methods::NOTE_SEARCH,
+    methods::DEEP,
+    methods::JOB_STATUS,
+    methods::JOBS,
+    methods::JOB_CANCEL,
+    methods::SOURCES,
+];
+
 pub const PROVIDES: &[&str] = &[
     methods::SEARCH,
     methods::FETCH,

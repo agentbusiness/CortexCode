@@ -1,6 +1,6 @@
 //! Capabilities handed to sandboxed command descendants. The UI credential never enters a shell.
 use cc_protocol::contracts::frame::{CommandAccessParams, CommandAccessResult};
-use cc_protocol::{RpcError, codes};
+use cc_protocol::RpcError;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,70 +66,22 @@ impl CommandAccess {
     }
 }
 
+/// The frame's own methods a command in the model's shells may call. Plugins declare theirs in
+/// their hello (`commands`).
+pub const FRAME_COMMANDS: &[&str] = &[
+    "frame.project.list",
+    "frame.project.get",
+    "frame.session.get",
+    "frame.machine",
+    "frame.plugins.list",
+    "frame.plugins.providers",
+];
+
 impl CommandScope {
+    /// Hold a permitted call to its command's workspace and session, and tell the serving plugin
+    /// which session's command calls it (`_command_session`), so the plugin keeps that command to
+    /// its own session's things.
     pub fn authorize(&self, method: &str, params: &mut Value) -> Result<(), RpcError> {
-        let permitted = matches!(
-            method,
-            "frame.project.list"
-                | "frame.project.get"
-                | "frame.session.get"
-                | "frame.machine"
-                | "frame.plugins.list"
-                | "frame.plugins.providers"
-                | "memory.task.list"
-                | "memory.task.get"
-                | "memory.task.create"
-                | "memory.task.update"
-                | "memory.board.list"
-                | "memory.board.post"
-                | "memory.agent.list"
-                | "memory.search"
-                | "memory.symbol"
-                | "memory.callers"
-                | "memory.callees"
-                | "memory.impact"
-                | "memory.path"
-                | "memory.outline"
-                | "memory.project.list"
-                | "research.search"
-                | "research.fetch"
-                | "research.note.add"
-                | "research.notes"
-                | "research.note.search"
-                | "research.deep"
-                | "research.job.status"
-                | "research.jobs"
-                | "research.job.cancel"
-                | "research.sources"
-                | "browser.open"
-                | "browser.navigate"
-                | "browser.tabs"
-                | "browser.select"
-                | "browser.close"
-                | "browser.back"
-                | "browser.forward"
-                | "browser.reload"
-                | "browser.snapshot"
-                | "browser.screenshot"
-                | "browser.console"
-                | "browser.network"
-                | "browser.eval"
-                | "browser.click"
-                | "browser.type"
-                | "browser.press"
-                | "browser.metrics"
-                | "tools.job.list"
-                | "tools.job.status"
-                | "tools.job.kill"
-        );
-        if !permitted {
-            return Err(RpcError::new(
-                codes::CONTRACT_VIOLATION,
-                format!(
-                    "`{method}` requires the user's app connection; use the CortexCode window to approve or perform it"
-                ),
-            ));
-        }
         if let Some(workspace) = params.get("workspace").and_then(Value::as_str)
             && std::fs::canonicalize(workspace).ok().as_deref() != Some(self.workspace.as_path())
         {
@@ -140,40 +92,13 @@ impl CommandScope {
         {
             return Err(RpcError::invalid_params("command access belongs to its original session"));
         }
-        if method.starts_with("browser.") {
-            if let Some(url) = params.get("url").and_then(Value::as_str) {
-                let lower = url.trim().to_ascii_lowercase();
-                if !(lower.starts_with("http://")
-                    || lower.starts_with("https://")
-                    || lower == "about:blank"
-                    || lower.starts_with("data:")
-                    || (!lower.starts_with('/') && !lower.contains(':'))
-                    || (!lower.contains("://") && lower.rsplit_once(':').is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))))
-                {
-                    return Err(RpcError::invalid_params(
-                        "command browser navigation supports web URLs; open local files in the app",
-                    ));
-                }
-            }
-            if !params.is_object() {
+        if !method.starts_with("frame.") {
+            if params.is_null() {
                 *params = serde_json::json!({});
             }
-            params["_command_session"] = Value::String(self.session_id.clone());
-            if method == "browser.open" {
-                params["session_id"] = Value::String(self.session_id.clone());
+            if let Some(object) = params.as_object_mut() {
+                object.insert("_command_session".into(), Value::String(self.session_id.clone()));
             }
-        }
-        if method.starts_with("tools.job.") {
-            if !params.is_object() {
-                *params = serde_json::json!({});
-            }
-            params["_command_session"] = Value::String(self.session_id.clone());
-        }
-        if method == "tools.job.list" {
-            if !params.is_object() {
-                *params = serde_json::json!({});
-            }
-            params["session_id"] = Value::String(self.session_id.clone());
         }
         Ok(())
     }

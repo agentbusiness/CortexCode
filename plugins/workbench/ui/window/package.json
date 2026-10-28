@@ -1,0 +1,30 @@
+{
+  "name": "@cortex-ui/workbench-window",
+  "version": "0.1.0",
+  "description": "The window: the page the shell opens, which loads every UI plugin into its slots (the slot engine), lays out the workbench and shows the start-up splash. It serves React and @cortex/sdk to every plugin through its import map.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "workbench.window",
+    "slot": "window@1"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@fontsource-variable/archivo": "5.3.0",
+    "@fontsource-variable/source-serif-4": "5.3.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.5"
+  }
+}

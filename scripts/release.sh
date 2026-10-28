@@ -8,15 +8,18 @@
 #   scripts/release.sh --plan      only say what would be released
 #   add --dirty to release uncommitted changes as well
 #
-# What changed is decided by content, against the published catalog:
-#   frame    the digest of frame/, cli/, packer/, protocol/, ui/, scripts/app/ differs from the
+# What changed is decided by content, against the published catalog (scripts/release/digest.mjs
+# says what each part is built from):
+#   frame    the frame, its Electron shell and the frame's interface in protocol/ differ from the
 #            released frame's (scripts/release-frame.sh)
-#   plugins  each plugin whose digest (its folder and the shared code) differs from its release
-#            (scripts/release-plugin.sh); a protocol change releases the frame and every plugin
+#   plugins  each plugin whose digest differs from its release: its folder, the local crates it
+#            builds with, the frame's interface and the protocol contracts its crates name
+#            (scripts/release-plugin.sh). A contract change releases the plugins that use it; a
+#            change to the frame's interface releases the frame and every plugin with a backend
 #   app      the released app carries an older frame than the catalog's, or there is none yet
 #            (scripts/release-app.sh); new users start from it, so it follows the frame
 #   npx      npm/cortexcode differs from the published launcher (scripts/release-npm.sh); it
-#            only downloads the app the catalog names, so a new frame or plugin never needs it
+#            starts the installed app and downloads one only where there is none
 #
 # Uncommitted changes in a part to release stop the run (another session may be halfway through
 # them), except the version lines the release scripts write; --dirty releases them anyway. Linux
@@ -86,10 +89,11 @@ fi
 # ----- uncommitted changes ---------------------------------------------------------------------
 
 paths=()
-[ $frame = 0 ] || paths+=("${frame_sources[@]}")
-for id in "${plugins[@]+"${plugins[@]}"}"; do paths+=("plugins/$id"); done
-[ ${#plugins[@]} -eq 0 ] || paths+=("${shared_sources[@]}")
-[ $npx = 0 ] || paths+=("${npm_sources[@]}")
+if [ $frame = 1 ]; then while IFS= read -r path; do paths+=("$path"); done < <(part_paths frame); fi
+for id in "${plugins[@]+"${plugins[@]}"}"; do
+  while IFS= read -r path; do paths+=("$path"); done < <(part_paths plugin "plugins/$id")
+done
+if [ $npx = 1 ]; then while IFS= read -r path; do paths+=("$path"); done < <(part_paths npm); fi
 if [ ${#paths[@]} -gt 0 ]; then
   changes="$(uncommitted "${paths[@]}" | sort -u)"
   if [ -n "$changes" ] && [ $dirty = 0 ]; then
@@ -158,6 +162,6 @@ if [ $dry_run = 1 ]; then
   step "dry run of ${done_parts[*]} done in ${minutes} min: files in artifacts/, the catalog in artifacts/catalog.preview.json"
 else
   step "released ${done_parts[*]} in ${minutes} min; installs update themselves. Commit the version lines the release wrote:"
-  (cd "$repo" && git status --short -- frame/Cargo.toml cli/Cargo.toml packer/Cargo.toml ui/package.json ui/package-lock.json \
+  (cd "$repo" && git status --short -- frame/Cargo.toml ui/package.json ui/package-lock.json \
     'plugins/*/plugin.toml' npm/cortexcode/package.json) | sed 's/^/  /'
 fi

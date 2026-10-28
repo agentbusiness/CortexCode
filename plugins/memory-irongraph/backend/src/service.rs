@@ -133,6 +133,26 @@ pub fn unique_name(base: &str, taken: &HashSet<String>) -> String {
     (2..).map(|n| format!("{base}-{n}")).find(|name| free(name)).unwrap_or_default()
 }
 
+/// The methods a command in the model's shells may call (`cx`): tasks, the board, agents, the
+/// code graph and the project list.
+pub const COMMANDS: &[&str] = &[
+    methods::TASK_LIST,
+    methods::TASK_GET,
+    methods::TASK_CREATE,
+    methods::TASK_UPDATE,
+    methods::BOARD_LIST,
+    methods::BOARD_POST,
+    methods::AGENT_LIST,
+    methods::SEARCH,
+    methods::SYMBOL,
+    methods::CALLERS,
+    methods::CALLEES,
+    methods::IMPACT,
+    methods::PATH,
+    methods::OUTLINE,
+    methods::PROJECT_LIST,
+];
+
 /// Every method this plugin serves.
 pub const PROVIDES: &[&str] = &[
     methods::PROJECT_OPEN,

@@ -32,8 +32,11 @@ cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
 cortex-pack build plugins/tools        # -> plugins/tools/target/tools-<version>-<target>.ccplugin
 ```
 
-The frame runs it once installed (`cortex-pack build plugins/tools --install`); the frame config's
-`[plugin.config] cx_path` names the `cx` CLI that agent commands call.
+The frame runs it once installed (`cortex-pack build plugins/tools --install`). The backend
+workspace also builds `cx` (`backend/cx`), the command line the model's shells use, which ships
+beside `cc-tools` and is put on the shells' PATH (`[plugin.config] cx_path` or `CORTEX_CX_BIN` name
+another one when the package has none). The methods `cx` may call from a shell are each plugin's
+`commands` in its hello; this plugin's are its session's background jobs.
 
 Reads of another project (`graph://<project>/...`, `symbol://<project>/<name>`,
 `outline://<project>/<path>`; `src/xproject.rs`) wait for that project's index at most

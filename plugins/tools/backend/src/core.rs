@@ -147,10 +147,14 @@ fn inside(root: &Path, path: &Path) -> bool {
     crate::util::canonical_lenient(path).starts_with(crate::util::canonical_lenient(root))
 }
 
-/// Locate the `cx` binary: the `cx_path` plugin config, else the `CORTEX_CX_BIN` environment
-/// variable, else a `cx` shipped next to this executable (the plugin package layout). The plugin
+/// Locate the `cx` binary: the one this plugin ships next to its executable (built from the same
+/// source), else the `cx_path` plugin config or the `CORTEX_CX_BIN` environment variable. The plugin
 /// never assumes a repository layout.
 pub fn find_cx(configured: Option<&str>) -> Option<PathBuf> {
+    let beside = std::env::current_exe().and_then(|exe| exe.canonicalize()).ok().and_then(|exe| Some(exe.parent()?.join("cx")));
+    if let Some(beside) = beside.filter(|path| path.is_file()) {
+        return Some(beside);
+    }
     find_program("cx", configured, "CORTEX_CX_BIN")
 }
 

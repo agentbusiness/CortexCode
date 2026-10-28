@@ -18,6 +18,29 @@ description = "Cortex Plugin Protocol: framing, RPC connection, plugin runtime a
 # `serde_json::Value` (and so `RpcError`) larger, which plugins that do not need it should not pay.
 [features]
 preserve_order = ["serde_json/preserve_order"]
+# The plugin contracts and shared helpers (src/contracts/mod.rs): a crate names the ones it uses.
+# The frame's interface (frame, lifecycle, records) is always built.
+agents = ["chatflow", "memory"]
+browser = []
+chatflow = []
+container = []
+lang = []
+memory = []
+mesh = []
+model = []
+notify = []
+research = []
+skills = ["lang", "memory"]
+source = []
+terminal = []
+tools = ["model"]
+update = []
+vcs = []
+checks = ["memory"]
+hashline = []
+host = []
+release = []
+stored = ["memory"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

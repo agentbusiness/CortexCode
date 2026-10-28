@@ -1,7 +1,6 @@
-// Builds everything the workbench serves, each package on its own: the SDK, every UI plugin
-// package (`npm run build` in its folder, wherever its plugin folder is), the renderer core with
-// its shared vendor modules, and installs the plugin builds into ui/plugins-dist (the assembled set
-// the UI verification scripts serve; the frame serves plugin folders directly).
+// Builds every UI package, each on its own: the SDK, then every UI plugin package (`npm run build`
+// in its folder, wherever its plugin folder is; the window is the workbench plugin's), and installs
+// the builds into ui/plugins-dist (the assembled set; the frame serves plugin folders directly).
 //
 // Each plugin's ui/ is its own npm root (own package-lock.json and node_modules) holding a copy of
 // @cortex/sdk (install-links). Before plugin packages build, missing installs are made with npm ci
@@ -11,7 +10,6 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildRenderer } from './build-renderer.mjs';
 import { installAll } from './install-plugins.mjs';
 import { SDK_DIR, npmRoots, uiPackages } from './packages.mjs';
 
@@ -20,7 +18,8 @@ const quiet = process.argv.includes('--quiet');
 export function npmRun(dir, script) {
   return new Promise((resolve, reject) => {
     // A child decides its own mode (Vite sets NODE_ENV=production in this process when it builds).
-    const env = { ...process.env };
+    // The SDK is built first (CORTEX_SDK_BUILT): a package that would build it itself (the window) does not.
+    const env = { ...process.env, CORTEX_SDK_BUILT: '1' };
     delete env.NODE_ENV;
     const child = spawn('npm', ['run', script, '--silent'], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env });
     let output = '';
@@ -99,8 +98,6 @@ export async function buildAll() {
     }
   });
   if (failures.length) throw new Error(failures.join('\n\n'));
-  await buildRenderer({ quiet: true });
-  if (!quiet) console.log('built the renderer core');
   return installAll();
 }
 

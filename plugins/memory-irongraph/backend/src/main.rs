@@ -1,6 +1,6 @@
 //! `cc-memory`: the memory@1 plugin process.
 
-use cc_memory::service::{Memory, MemoryPlugin, PROVIDES};
+use cc_memory::service::{COMMANDS, Memory, MemoryPlugin, PROVIDES};
 use cc_protocol::contracts::lifecycle::{Hello, SwapPolicy};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +37,7 @@ fn main() {
         });
         let mut hello = Hello::new("cc-memory", env!("CARGO_PKG_VERSION"), "memory", "memory@1");
         hello.provides = PROVIDES.iter().map(|m| (*m).to_owned()).collect();
+        hello.commands = COMMANDS.iter().map(|m| (*m).to_owned()).collect();
         // Language plugins starting, stopping and swapping change which plugin extracts which files;
         hello.subscribes = vec![
             cc_protocol::contracts::frame::topics::PLUGIN_STATE.to_owned(),

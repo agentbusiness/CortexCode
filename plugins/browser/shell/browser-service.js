@@ -269,12 +269,13 @@ export class BrowserService {
       case 'browser.open': {
         // A background tab (research reading a search page) is neither shown nor listed.
         const background = params.background === true;
-        const tab = await this.openTab(requireString(params, 'url'), { sessionId: params.session_id ?? null, activate: !background, internal: background });
+        // A command's tab belongs to the command's session (`_command_session`, set by the frame).
+        const tab = await this.openTab(requireUrl(params), { sessionId: params._command_session ?? params.session_id ?? null, activate: !background, internal: background });
         return tab.info();
       }
       case 'browser.navigate': {
         const tab = this.tab(params);
-        await this.load(tab, requireString(params, 'url'));
+        await this.load(tab, requireUrl(params));
         return tab.info();
       }
       case 'browser.tabs':
@@ -581,6 +582,22 @@ export class BrowserService {
  * @param {any} params
  * @param {string} field
  */
+/**
+ * The `url` to open. A command in the model's shells (`_command_session`) opens web pages only:
+ * local files open in the app.
+ * @param {any} params
+ */
+function requireUrl(params) {
+  const url = requireString(params, 'url');
+  if (!params._command_session) return url;
+  const lower = url.trim().toLowerCase();
+  const web = lower.startsWith('http://') || lower.startsWith('https://') || lower === 'about:blank' || lower.startsWith('data:');
+  // A bare host (`example.com`) or host and port (`localhost:3000`).
+  const bare = (!lower.startsWith('/') && !lower.includes(':')) || (!lower.includes('://') && /:\d+$/.test(lower));
+  if (!web && !bare) throw new RpcError('invalid_params', 'command browser navigation supports web URLs; open local files in the app');
+  return url;
+}
+
 function requireString(params, field) {
   const value = params?.[field];
   if (typeof value !== 'string' || value === '') throw new RpcError('invalid_params', `\`${field}\` must be a non-empty string`);

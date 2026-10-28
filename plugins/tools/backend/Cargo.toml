@@ -7,8 +7,11 @@ rust-version = "1.94"
 publish = false
 description = "CortexCode tools plugin (tools@1): hashline read/edit, persistent shell, argument repair, URI reads, copy-on-write workspaces."
 
-# Standalone workspace (each plugin directory is its own Cargo workspace).
+# Standalone workspace (each plugin directory is its own Cargo workspace) holding cx, the command
+# line the model's shells use, which ships beside cc-tools (`[backend] assets`).
 [workspace]
+members = ["cx"]
+default-members = [".", "cx"]
 
 [lib]
 name = "cc_tools"
@@ -19,7 +22,7 @@ name = "cc-tools"
 path = "src/main.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol" }
+cc-protocol = { path = "../../../protocol", features = ["agents", "hashline", "lang", "memory", "mesh", "model", "skills", "stored", "tools", "vcs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["full"] }

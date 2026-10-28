@@ -8,7 +8,7 @@
 id = "workbench"
 name = "Workbench"
 version = "0.1.2"
-description = "The workbench's right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
+description = "The window (the slot engine, the workbench layout and the start-up splash), the right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
@@ -32,3 +32,10 @@ slot = "workbench.rightPane@1"
 dir = "ui/settings-appearance"
 id = "workbench.settings-appearance"
 slot = "settings.appearance@1"
+
+# The window: the page the frame serves at /ui/ (window@1). It loads every plugin's UI packages
+# into their slots and serves React and @cortex/sdk to them through its import map.
+[[ui.package]]
+dir = "ui/window"
+id = "workbench.window"
+slot = "window@1"

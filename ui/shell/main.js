@@ -53,7 +53,7 @@ function frameAddress() {
 /** The mark (docs/brand/final/cortexcode.svg), drawn on the waiting page before the frame serves any. */
 const MARK = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="76" height="76"><rect width="64" height="64" fill="#14171A"/><path d="M17 16 7 32l10 16M47 16l10 16-10 16" fill="none" stroke="#E9EBEC" stroke-width="3.5" stroke-linecap="square"/><path d="M23 23H41V41H23Z M23 23 41 41 M41 23 23 41" fill="none" stroke="#6E9BB5" stroke-width="1.6"/><rect x="19.5" y="19.5" width="7" height="7" fill="#E9EBEC"/><rect x="37.5" y="19.5" width="7" height="7" fill="#E9EBEC"/><rect x="19.5" y="37.5" width="7" height="7" fill="#E9EBEC"/><rect x="37.5" y="37.5" width="7" height="7" fill="#E2603F"/></svg>';
 
-/** The start-up splash's look (ui/renderer/src/splash.css) while the frame is not reachable: the
+/** The start-up splash's look (plugins/workbench/ui/window/src/splash.css) while the frame is not reachable: the
  * mark, the word mark and the step, with the bar at its start. */
 function waitingPage(/** @type {string} */ text) {
   const html = `<!doctype html><meta charset="utf-8"><title>CortexCode</title><style>

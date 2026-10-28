@@ -11,13 +11,15 @@ license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
-# `cx_path` (the cx CLI agent commands call) comes from the frame config's [plugin.config].
+# cx, the command line the model's shells call, is built in the same workspace and ships beside
+# cc-tools, which puts it on the shells' PATH.
 [backend]
 category = "tools"
 contract = "tools@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-tools"
+assets = ["backend/target/release/cx"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

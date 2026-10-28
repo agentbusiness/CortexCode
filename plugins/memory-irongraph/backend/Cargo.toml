@@ -19,7 +19,7 @@ name = "cc_memory"
 path = "src/lib.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol" }
+cc-protocol = { path = "../../../protocol", features = ["hashline", "lang", "memory", "model", "skills"] }
 # Its own skills (data/skills, the skills format of the language and skills plugins).
 cc-lang-kit = { path = "../../../lang-kit" }
 irongraph-sdk = "=0.1.13"

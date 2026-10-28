@@ -247,7 +247,6 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     home::write_frame_info(&home.frame_json(), &info).map_err(|e| format!("cannot write frame.json: {e}"))?;
     tracing::info!(home = %home.root.display(), port, socket = %socket.display(), version = FRAME_VERSION, "frame listening");
 
-    frame.start_ui_watch();
     units::watch_incoming(&frame);
 
     // Plugins in order; then the UI shell.

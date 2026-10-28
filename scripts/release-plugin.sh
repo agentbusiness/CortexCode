@@ -11,6 +11,10 @@
 # (each part 0 to 99: 0.3.99 -> 0.4.0), else plugin.toml's for a first release. The version is
 # written into the plugin's plugin.toml (commit it). A plugin without a backend is one package for
 # every platform. Linux packages are built in Docker for plugins whose plugin.toml lists linux.
+#
+# min_frame: the first released frame with the frame interface the plugin is built against (the
+# catalog's `frame.interface_since`). When the interface changed since the released frame, the
+# frame is released first (scripts/release.sh does).
 set -euo pipefail
 self="${CORTEX_RELEASE_ORIGINAL:-$0}"
 release_name="release-plugin"
@@ -48,7 +52,11 @@ build_packer
 scratch work
 catalog="$work/catalog.json"
 fetch_catalog "$catalog"
-min_frame="$(toml_version "$repo/frame/Cargo.toml")"
+if [ "$(jq -r '.frame.interface // empty' "$catalog")" = "$(interface_digest)" ]; then
+  min_frame="$(jq -r '.frame.interface_since' "$catalog")"
+else
+  die "the frame's interface in protocol/ changed since the released frame: release the frame first (scripts/release.sh)"
+fi
 commit="$(git -C "$repo" rev-parse --short HEAD)"
 
 if [ $changed = 1 ]; then
