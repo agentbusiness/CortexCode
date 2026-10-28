@@ -21,8 +21,9 @@ use crate::fit::Prewarm;
 use crate::host::Host;
 use crate::projection::project_with;
 use cc_protocol::contracts::frame::JournalEntry;
+use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{ChatMessage, ToolSpec, methods as model_methods};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -88,6 +89,7 @@ pub fn send(
     let token = CancellationToken::new();
     let cancel = token.clone();
     let host = host.clone();
+    let key = cache_key.to_owned();
     let mut params = json!({"cache_key": cache_key, "messages": messages, "tools": tools});
     if shared_only {
         params["shared_only"] = json!(true);
@@ -96,6 +98,21 @@ pub fn send(
         params["idle_only"] = json!(true);
     }
     tokio::spawn(async move {
+        // On the model the next call will take: the best one free now in the network. A busy
+        // network is not warmed; the model is not held for a warm-up (it gives way to any call).
+        match crate::llm::claim_key(&host, &key, false, Some(&cancel)).await {
+            Err(_) => {
+                ended(true);
+                return;
+            }
+            Ok(Some(placed)) if placed.get("tier").and_then(Value::as_str) == Some("busy") => {
+                ended(false);
+                return;
+            }
+            Ok(_) => {
+                let _ = host.ctx().call(mesh_methods::RELEASE, json!({"kind": "model", "session_id": key})).await;
+            }
+        }
         let Ok(mut stream) = host.ctx().call_stream(model_methods::PREWARM, params) else {
             ended(false);
             return;

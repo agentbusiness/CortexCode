@@ -460,6 +460,8 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
     if existing.iter().any(|item| item.get("evidence").and_then(Value::as_array).is_some_and(|evidence| evidence.iter().any(|e| e.as_str() == Some(hash.as_str())))) {
         return;
     }
+    // The call is keyed by the project, so the network places it on its best free model.
+    let key = format!("describe:{project_id}");
     let messages = vec![
         ChatMessage::new("system", data.prompt("describe").to_owned()),
         ChatMessage::new("user", inputs.clone()),
@@ -471,8 +473,9 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
         "thinking": crate::llm::thinking("none"),
         "priority": "background",
         "max_tokens": 700,
+        "cache_key": key,
     });
-    match host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params).await {
+    match crate::llm::on_best_model(host, &key, None, host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params)).await {
         Ok(result) if !result.content.trim().is_empty() => {
             let upsert = json!({
                 "project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::DESCRIPTION, "name": "project",

@@ -109,6 +109,42 @@ async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Pri
     Ok(placed.and_then(|placement| placement.get("name").and_then(Value::as_str).map(str::to_owned)))
 }
 
+/// One use of the best free model in the network for `key` (`wait` false: only a model free
+/// now; the answer's tier is then `busy` when none is). Ok(None) without the mesh plugin: the
+/// call runs here. Err when cancelled while waiting.
+pub async fn claim_key(host: &crate::host::Host, key: &str, wait: bool, cancel: Option<&CancellationToken>) -> Result<Option<Value>, RpcError> {
+    let params = json!({"kind": "model", "session_id": key, "wait": wait});
+    let Ok(mut call) = host.ctx().call_stream(mesh_methods::CLAIM, params) else { return Ok(None) };
+    let stopped = async {
+        match cancel {
+            Some(cancel) => cancel.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(stopped);
+    loop {
+        tokio::select! {
+            item = call.next() => if item.is_none() { break },
+            _ = &mut stopped => {
+                call.cancel();
+                return Err(RpcError::cancelled());
+            }
+        }
+    }
+    Ok(call.finish().await.ok())
+}
+
+/// A background model call keyed `key` (learning from a run, a project description) on the best
+/// free model in the network: claimed before it (waiting like any run), given back and its run
+/// ended after, so nothing stays held. Without the mesh plugin it runs here.
+pub async fn on_best_model<T>(host: &crate::host::Host, key: &str, cancel: Option<&CancellationToken>, call: impl std::future::Future<Output = Result<T, RpcError>>) -> Result<T, RpcError> {
+    claim_key(host, key, true, cancel).await?;
+    let outcome = call.await;
+    let _ = host.ctx().call(mesh_methods::RELEASE, json!({"kind": "model", "session_id": key})).await;
+    let _ = host.ctx().call(mesh_methods::PLACE_END, json!({"session_id": key})).await;
+    outcome
+}
+
 /// After each model call (done, failed or cancelled): the model is free for the next run.
 async fn release(journal: &Journal, session: &str) {
     let _ = journal.host().ctx().call(mesh_methods::RELEASE, json!({"kind": "model", "session_id": session})).await;
