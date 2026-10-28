@@ -16,6 +16,9 @@
 //                 features (a plugin needs a frame at least as new as the one that brought it)
 //   npm           the npx launcher (npm/cortexcode)
 //
+// protocol/Cargo.toml counts with only the `[features]` lines of the features a part uses, so a
+// change to one feature's line (`mesh = ["model"]`) releases only the parts that use that feature.
+//
 //   digest.mjs <part> [dir]          the digest
 //   digest.mjs paths <part> [dir]    the paths it covers, one per line (for uncommitted changes)
 
@@ -26,6 +29,7 @@ import path from 'node:path';
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PROTOCOL = 'protocol';
+const PROTOCOL_MANIFEST = `${PROTOCOL}/Cargo.toml`;
 
 /** The files git tracks or would track under `paths` that exist, sorted (repository-relative). */
 function sources(paths) {
@@ -52,11 +56,19 @@ function featureFiles(feature, files) {
   return files.filter((file) => file === `${PROTOCOL}/src/contracts/${feature}.rs` || file.startsWith(`${PROTOCOL}/src/contracts/${feature}/`) || file === `${PROTOCOL}/src/${feature}.rs`);
 }
 
-/** The frame's interface: every protocol file that belongs to no feature. */
+/** The frame's interface: every protocol file that belongs to no feature (Cargo.toml counts apart). */
 function interfaceFiles() {
   const files = sources([PROTOCOL]);
   const features = new Set([...protocolFeatures().keys()].flatMap((feature) => featureFiles(feature, files)));
-  return files.filter((file) => !features.has(file));
+  return files.filter((file) => !features.has(file) && file !== PROTOCOL_MANIFEST);
+}
+
+/** protocol/Cargo.toml as a part builds with it: `[features]` holds only the lines of `features`. */
+function protocolManifest(features) {
+  const used = new Set(['preserve_order', ...features]);
+  const text = read(PROTOCOL_MANIFEST).replace(/^\[features\]\n([\s\S]*?)(?=^\[|(?![\s\S]))/m, (_, section) =>
+    `[features]\n${section.split('\n').filter((line) => used.has(/^([a-z_]+)\s*=/.exec(line)?.[1])).join('\n')}\n\n`);
+  return [`${PROTOCOL_MANIFEST} (features: ${[...used].sort().join(' ')})`, text];
 }
 
 /**
@@ -106,7 +118,7 @@ function protocolFilesFor(features) {
 /** The paths a part covers (for uncommitted changes) and its inputs: files and extra texts. */
 function inputs(part, dir) {
   if (part === 'interface') {
-    return { paths: [PROTOCOL], files: interfaceFiles(), texts: [] };
+    return { paths: [PROTOCOL], files: interfaceFiles(), texts: [protocolManifest([])] };
   }
   if (part === 'npm') {
     return { paths: ['npm/cortexcode'], files: sources(['npm/cortexcode']), texts: [] };
@@ -119,7 +131,7 @@ function inputs(part, dir) {
     return {
       paths: [...own, ...rust.local, PROTOCOL, 'ui/package.json'],
       files: [...sources([...own, ...rust.local]), ...protocolFilesFor(rust.features)],
-      texts: [['ui/package.json (shipped part)', shipped]],
+      texts: [['ui/package.json (shipped part)', shipped], protocolManifest(rust.features)],
     };
   }
   if (part === 'plugin') {
@@ -128,10 +140,12 @@ function inputs(part, dir) {
     const manifests = own.filter((file) => path.basename(file) === 'Cargo.toml');
     const paths = [dir];
     const files = [...own];
+    const texts = [];
     if (manifests.length > 0) {
       const rust = rustInputs(manifests);
       paths.push(...rust.local, PROTOCOL, 'rust-toolchain.toml');
       files.push(...sources([...rust.local, 'rust-toolchain.toml']), ...protocolFilesFor(rust.features));
+      texts.push(protocolManifest(rust.features));
     }
     if (own.some((file) => path.basename(file) === 'package.json' && file.startsWith(`${dir}/ui`))) {
       // The window ships the SDK's runtime; other UI packages only build with its preset.
@@ -140,7 +154,7 @@ function inputs(part, dir) {
       paths.push(...sdk);
       files.push(...sources(sdk));
     }
-    return { paths, files, texts: [] };
+    return { paths, files, texts };
   }
   throw new Error(`unknown part ${part} (plugin <dir> | frame | interface | npm)`);
 }
