@@ -1,11 +1,17 @@
 # CortexCode patches to the vendored uzu
 
-Source: https://github.com/trymirai/uzu at `391abc29abb26f18aa812f6f02e8b023aed11364` (main,
-2026-10-15; release 0.6.7 plus CI-only commits), see `REVISION`. Only the crates the engine needs are
-vendored: `uzu-engine`, `uzu-engine-macros`, `legacy/shoji` (stream metrics type), `legacy/bindings`
+Source: https://github.com/trymirai/uzu at `1763a366c048e2065343619a28524d493faf5391` (main,
+2026-10-28; release 0.6.13 plus 14 commits up to #1027, before the WebGPU runtime merge
+`f1231705`), see `REVISION`. Upgraded from `391abc29` (0.6.7) on 2026-10-28: the patches merged
+as text except the attention state, which upstream rebuilt around `KVStorage` for the int8 KV cache
+(P1 below). Only the crates the engine needs are vendored: `uzu-engine`, `uzu-engine-macros`, `legacy/shoji` (stream metrics type), `legacy/bindings`
 and `legacy/bindings-types` (proc macros shoji uses). The workspace manifest lists only these and
-drops the workspace dependencies of the crates left out; `uzu-engine`'s dev-dependencies are removed
-(its unit tests are not built here).
+drops the workspace dependencies of the crates left out; `uzu-engine`'s dev-dependencies and its
+`unit/` folder are removed (its unit tests are not built here).
+
+uzu's engine API is async since 0.6.13 (for WebGPU): on Metal its futures wait for the device. The
+patches below that wait for a command buffer (snapshots, restores, token embeddings, the vision
+tower) drive it with `futures::executor::block_on`, as uzu itself does in its synchronous paths.
 
 Each change is marked `CortexCode patch Pn` in the source.
 
@@ -19,6 +25,11 @@ convolution), `TransformerState` and `DFlashState` snapshot their layers, and
 - `SnapshotMode::Full` copies everything (attention K/V rows `[0, length)`, recurrent state, the
   speculator's context) into CPU-visible buffers; written to disk it restores into a fresh state of the
   same model. Used for hibernation.
+- Attention layers copy what their `KVStorage` holds for rows `[0, length)` (`KVStorage::row_buffers`):
+  keys and values in bf16, or with the int8 KV cache the codes and then the per-key scales. Int8 is
+  laid out by blocks of 32 keys, so the rows are a prefix of every buffer. The layer's scalars name
+  the format; a snapshot of the other format, or of a build before int8 (five scalars), does not
+  restore, and that conversation starts cold.
 - `SnapshotMode::Checkpoint` copies the recurrent state and records attention lengths only: an
   append-only cache's earlier rows stay valid, so a state can be rolled back to the checkpoint.
   Used for context checkpoints (prefix reuse when a history diverges) and stored next to a hibernated
@@ -64,7 +75,10 @@ the position) and dropping the token a finished stream sampled but never fed bac
 
 `Context::device_facts` (default: none; Metal: name, GPU cores and family, whether the M5 matrix
 units are in use, `recommendedMaxWorkingSetSize`, `currentAllocatedSize`, sparse buffer support),
-exposed as `Engine::device_facts`.
+exposed as `Engine::device_facts`. `LanguageModelState::kv_bytes_per_token` (through
+`TransformerState` and `MixerState::kv_bytes_per_token`, attention only) measures the attention KV
+bytes one more token takes in the format uzu chose for this device; the plugin sizes its pool by it
+(Qwen3.8-27B-M on M5: 33,024 B with int8 instead of 65,536 B with bf16).
 
 ## P6: releasing cached buffers
 

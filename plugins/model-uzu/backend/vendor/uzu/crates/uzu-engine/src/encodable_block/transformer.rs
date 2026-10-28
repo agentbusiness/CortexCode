@@ -114,6 +114,17 @@ impl<B: Backend> TransformerState<B> {
     }
 
     /// CortexCode patch P1: snapshot every owned layer state (`None` for layers sharing another's KV).
+    /// CortexCode patch P5: attention KV bytes per token across the owned layers.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        self.layer_states
+            .iter()
+            .map(|layer_state| match layer_state {
+                TransformerLayerStateType::Owned(state) => state.kv_bytes_per_token(),
+                TransformerLayerStateType::Shared(_) => 0,
+            })
+            .sum()
+    }
+
     pub fn encode_snapshot(
         &self,
         mode: SnapshotMode,

@@ -51,6 +51,12 @@ pub trait MixerState<B: Backend>: Any + Send {
         snapshot: &MixerSnapshot<B>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<(), MixerSnapshotError<B>>;
+
+    /// CortexCode patch P5: bytes of attention KV cache one more token of context takes in this
+    /// state (in the format uzu chose for this device; 0 for recurrent mixers).
+    fn kv_bytes_per_token(&self) -> u64 {
+        0
+    }
 }
 
 /// CortexCode patch P1: what a snapshot holds.

@@ -41,9 +41,10 @@ instant. Nothing is ever downloaded at startup for a variant that is not install
 everything runs offline. `cc-model-uzu install <variant> [--models-dir DIR]` installs without a frame.
 
 The 27B variant also has a vision tower (image input, see [Images](#images-vendor-patch-p7)): only
-its tensors are fetched from the upstream checkpoint into `<variant dir>/vision/` by
-`cc-model-uzu install-vision [variant]` or by `model.select` (progress as `model.install` events;
-a failed fetch leaves the model text-only and does not stop the switch).
+its tensors are fetched from the upstream checkpoint into `<variant dir>/vision/` in the same step
+that downloads the model (a first start, `model.select`, `cc-model-uzu install <variant>`), and by
+`cc-model-uzu install-vision [variant]` for a model installed without it (progress as
+`model.install` events; a failed fetch leaves the model text-only and does not stop the load).
 
 `trymirai/Qwen3.8-27B-S-experimental` is not offered: its 2.4-bit QTIP codec runs only on Mirai's
 `ryan/qtip-s-agent` branch (`e743055a`), which diverged from main 159 commits earlier with a

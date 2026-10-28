@@ -26,10 +26,9 @@ template <
     uint REDUCTION_LANES,
     uint GROUP_LANES,
     uint NUM_SIMDGROUPS>
-VARIANTS(AT, bfloat, float)
-VARIANTS(BT, bfloat, float)
-VARIANTS(DT, bfloat, float)
-CONSTRAINT(BT != "float" || (AT == "float" && DT == "float"))
+VARIANTS(AT, bfloat)
+VARIANTS(BT, bfloat)
+VARIANTS(DT, bfloat)
 VARIANTS(
     B_PROLOGUE,
     GemmBPrologueKind::FullPrecision,
@@ -48,7 +47,6 @@ VARIANTS(NUM_SIMDGROUPS, 2, 4, 8)
 
 CONSTRAINT((B_PROLOGUE == GemmBPrologueKind::FullPrecision) == (BITS == 0))
 CONSTRAINT((BITS == 0) == (GROUP_SIZE == 0))
-CONSTRAINT(B_PROLOGUE == GemmBPrologueKind::FullPrecision || BT != "float")
 CONSTRAINT(B_PROLOGUE != GemmBPrologueKind::ScaleZeroPointDequant || BITS == 4)
 CONSTRAINT(B_PROLOGUE != GemmBPrologueKind::ScaleSymmetricDequant || BITS == 8)
 CONSTRAINT(B_PROLOGUE != GemmBPrologueKind::ScaleBiasDequant || BITS == 4)
@@ -130,6 +128,7 @@ KERNEL(Gemv)(
     const GemmDTransform output_transform SPECIALIZE,
     const bool gathered SPECIALIZE,
     const bool signed_codes SPECIALIZE,
+    const GemmBLayout gemm_b_layout SPECIALIZE,
     const bool full_tile SPECIALIZE,
     threadgroup float shared_results[INPUT_ROW_TILE * OUTPUT_ROW_TILE * K_SPLIT],
     const uint input_tile_idx GROUPS(batch_size.div_ceil(INPUT_ROW_TILE)),
@@ -151,7 +150,8 @@ KERNEL(Gemv)(
       soft_cap,
       output_transform,
       gathered,
-      signed_codes
+      signed_codes,
+      gemm_b_layout
   };
   dispatch_bool(full_tile, [&](auto full_tile_constant) {
     constexpr bool FullTile = decltype(full_tile_constant)::value;

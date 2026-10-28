@@ -10,13 +10,18 @@ pub use arguments::MatmulArguments;
 pub use d_ops::MatmulDOps;
 pub use kernel::MatmulKernel;
 pub use matmul_a::{Int8CodeLayout, MatmulA};
-#[cfg(backend = "metal")]
-pub use matmul_b::TrellisFormat;
 pub use matmul_b::{MatmulB, QuantizedB, QuantizedCorrection};
+#[cfg(backend = "metal")]
+pub use matmul_b::{TRELLIS_CODES_TAIL_BYTES, TrellisFormat};
 pub use output::{MatmulOutput, MatmulOutputError};
 pub use routing::{ActivationFormat, MatmulShape};
 
-use crate::backends::common::gpu_types::{matmul::QUANT_PARAMS_GROUP_OUTPUT_ALIGNMENT, quantization::QuantizationMode};
+use crate::backends::common::{
+    Backend, Kernels,
+    gpu_types::{matmul::QUANT_PARAMS_GROUP_OUTPUT_ALIGNMENT, quantization::QuantizationMode},
+};
+
+pub type WeightsLayout<B> = <<<B as Backend>::Kernels as Kernels>::MatmulKernel as MatmulKernel>::WeightsLayout;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum QuantParamsLayout {

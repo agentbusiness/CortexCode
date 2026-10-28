@@ -1,7 +1,7 @@
 //! `cc-model-uzu`: the CortexCode model plugin process (`model@1`) on uzu.
 //!
 //! Started by the frame. `cc-model-uzu install <variant> [--models-dir DIR]` installs a catalog
-//! variant (download with resume, digest verification) without a frame;
+//! variant with its vision tower (download with resume, digest verification) without a frame;
 //! `cc-model-uzu install-vision [variant] [--models-dir DIR]` fetches the variant's vision tower
 //! (only the vision tensors of the upstream checkpoint, by HTTP range requests).
 // `cc_protocol::RpcError` (128 bytes) is the protocol's error type for every contract method; the
@@ -78,16 +78,26 @@ async fn install(args: &[String]) -> i32 {
     let report = |progress: variants::Progress| {
         eprintln!("{}", serde_json::to_string(&progress).unwrap_or_default());
     };
-    match variants::install(spec, &models_dir, &cache, &report).await {
-        Ok(path) => {
-            println!("{}", serde_json::json!({"variant": spec.id, "path": path}));
-            0
-        }
+    let path = match variants::install(spec, &models_dir, &cache, &report).await {
+        Ok(path) => path,
         Err(error) => {
             eprintln!("install failed: {error}");
-            1
+            return 1;
         }
-    }
+    };
+    // The variant's vision tower comes with it, as in the app.
+    let vision = match spec.vision {
+        Some(tower) => match cc_model_uzu::vision::install::install(tower, spec.id, &spec.local_dir(&models_dir), &cache, &report).await {
+            Ok(vision) => Some(vision),
+            Err(error) => {
+                eprintln!("the model is installed, but its vision tower failed: {error} (retry with `cc-model-uzu install-vision {}`)", spec.id);
+                return 1;
+            }
+        },
+        None => None,
+    };
+    println!("{}", serde_json::json!({"variant": spec.id, "path": path, "vision": vision}));
+    0
 }
 
 async fn install_vision(args: &[String]) -> i32 {

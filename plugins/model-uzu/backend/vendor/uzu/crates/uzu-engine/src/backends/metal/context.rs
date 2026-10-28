@@ -115,7 +115,7 @@ impl MetalContext {
 impl Context for MetalContext {
     type Backend = Metal;
 
-    fn new() -> Result<Arc<Self>, MetalError> {
+    async fn new() -> Result<Arc<Self>, MetalError> {
         if CAPTURE_MATCHER.enabled() {
             unsafe {
                 std::env::set_var("METAL_CAPTURE_ENABLED", "1");
@@ -148,7 +148,6 @@ impl Context for MetalContext {
         let sparse_queue = device
             .new_mtl4_command_queue_with_descriptor(&queue_descriptor)
             .map_err(|_| MetalError::CannotCreateCommandQueue)?;
-        sparse_queue.add_residency_set(&residency_set);
 
         let sparse_event = device.new_event().ok_or(MetalError::CannotCreateEvent)?;
         sparse_event.set_label(Some("sparse event"));

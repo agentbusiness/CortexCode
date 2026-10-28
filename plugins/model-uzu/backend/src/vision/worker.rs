@@ -77,7 +77,7 @@ impl Drop for VisionWorker {
 
 fn run<B: Backend>(weights: PathBuf, config: Arc<VisionConfig>, jobs: mpsc::Receiver<Job>, deliver: Deliver) {
     let started = Instant::now();
-    let loaded = Engine::<B>::new().map_err(|error| format!("cannot start an engine for the vision tower: {error}")).and_then(|engine| {
+    let loaded = futures::executor::block_on(Engine::<B>::new()).map_err(|error| format!("cannot start an engine for the vision tower: {error}")).and_then(|engine| {
         engine
             .load_vision_model(&weights, config.engine())
             .map(|model| (engine, model))

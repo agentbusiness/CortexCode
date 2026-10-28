@@ -54,6 +54,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::fit::Plan;
 use crate::vision::VisionConfig;
 use crate::vision::prompt::{ImageSpan, PromptImage, identity};
 use crate::vision::worker::{self as vision_worker, VisionWorker};
@@ -63,6 +64,7 @@ use std::sync::atomic::AtomicU64;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
+use futures::executor::block_on;
 use uzu_engine::backends::{Backend, BackendSelection, DeviceFacts, select_backend};
 use uzu_engine::engine::Engine;
 use uzu_engine::engine::language_model::LanguageModel;
@@ -94,6 +96,11 @@ const HIBERNATION_MAGIC: &[u8; 8] = b"CCUZUHB1";
 const LONG_PREFILL_TOKENS: usize = 4096;
 
 pub type Publisher = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+/// The memory fit again, from the attention KV bytes per token the loaded model's states measure:
+/// uzu picks the KV format per device at load (int8 on chips with matrix units, else bf16), which
+/// `config.json` does not say.
+pub type Refit = Arc<dyn Fn(u64) -> Result<Plan, String> + Send + Sync>;
 
 /// What the engine needs to know at load.
 #[derive(Clone)]
@@ -135,6 +142,8 @@ pub struct EngineConfig {
     /// KV pool bytes per token (the plan's): while the tower is resident, admission counts it as
     /// this many pool tokens, so growing conversations make room for it instead of overcommitting.
     pub bytes_per_token: u64,
+    /// Replaces the sizing above once the model is loaded (see [`Refit`]).
+    pub refit: Refit,
 }
 
 /// Image embeddings kept in RAM by image and grid, so an image that left the prefix cache is not
@@ -339,6 +348,10 @@ pub struct Loaded {
     pub max_context_length: Option<u32>,
     pub default_temperature: Option<f32>,
     pub peak_memory_bytes: Option<u64>,
+    /// Attention KV bytes per token of the target model, measured on an empty state.
+    pub kv_bytes_per_token: u64,
+    /// The memory fit with that measurement (the engine sizes its pool by it).
+    pub plan: Plan,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -430,11 +443,11 @@ pub fn start(config: EngineConfig, publisher: Publisher, costs: Arc<dyn CostSink
     impl BackendSelection for Start {
         type Output = EngineHandle;
         type Error = String;
-        fn select<B: Backend>(self) -> Result<EngineHandle, String> {
-            spawn_worker::<B>(self.config, self.publisher, self.costs)
+        fn select<B: Backend>(self) -> impl Future<Output = Result<EngineHandle, String>> + Send {
+            std::future::ready(spawn_worker::<B>(self.config, self.publisher, self.costs))
         }
     }
-    select_backend(Start { config, publisher, costs }, "unknown uzu backend (UZU_BACKEND)".to_owned())
+    block_on(select_backend(Start { config, publisher, costs }, "unknown uzu backend (UZU_BACKEND)".to_owned()))
 }
 
 fn spawn_worker<B: Backend>(
@@ -454,7 +467,7 @@ fn spawn_worker<B: Backend>(
         .spawn(move || {
             let started = Instant::now();
             let loaded = (|| -> Result<(Arc<Engine<B>>, LanguageModel<B>), String> {
-                let engine = Engine::<B>::new().map_err(|error| format!("cannot start uzu: {error}"))?;
+                let engine = block_on(Engine::<B>::new()).map_err(|error| format!("cannot start uzu: {error}"))?;
                 let model = engine
                     .load_language_model(&config.model_dir)
                     .map_err(|error| format!("cannot load {}: {error}", config.model_dir.display()))?;
@@ -467,6 +480,27 @@ fn spawn_worker<B: Backend>(
                     return;
                 }
             };
+            let mut config = config;
+            let refitted = model
+                .create_empty_state(Some(1), rand_seed())
+                .map_err(|error| format!("cannot create a conversation state: {error}"))
+                .and_then(|probe| {
+                    let kv_bytes_per_token = probe.kv_bytes_per_token();
+                    (config.refit)(kv_bytes_per_token).map(|plan| (kv_bytes_per_token, plan))
+                });
+            let (kv_bytes_per_token, plan) = match refitted {
+                Ok(pair) => pair,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            config.state_capacity = u32::try_from(plan.ctx_total.min(plan.ctx_native)).unwrap_or(u32::MAX);
+            config.pool_tokens = plan.ctx_total;
+            config.conversation_tokens = plan.conversation_tokens;
+            config.checkpoints = usize::try_from(plan.checkpoints).unwrap_or(usize::MAX);
+            config.bytes_per_token = plan.bytes_per_token;
+            config.memory_budget.store(plan.budget.usable(), Ordering::SeqCst);
             let tokenizer = model.tokenizer().clone();
             let generation = model.generation_config().clone();
             let facts: DeviceFactsJson = engine.device_facts().into();
@@ -478,6 +512,8 @@ fn spawn_worker<B: Backend>(
                 max_context_length: model.max_context_length(),
                 default_temperature: generation.temperature,
                 peak_memory_bytes: engine.peak_memory_usage().map(|bytes| bytes as u64),
+                kv_bytes_per_token,
+                plan,
             };
             if let Ok(mut slot) = worker_device.lock() {
                 *slot = facts;
@@ -1550,7 +1586,7 @@ impl<B: Backend> Worker<B> {
             }
             None => {
                 let Phase::Generate(generation) = &mut self.active[index].phase else { return Ok(()) };
-                let next = generation.stream.next();
+                let next = block_on(generation.stream.generate()).transpose();
                 let max_tokens = generation.max_tokens;
                 let stop_tokens = generation.stop_tokens.clone();
                 match next {

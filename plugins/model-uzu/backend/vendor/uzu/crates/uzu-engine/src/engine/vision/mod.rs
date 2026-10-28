@@ -26,7 +26,8 @@ use crate::{
         Context, Kernels,
         gpu_types::activation_type::ActivationType,
         kernel::{
-            ActivationKernel, AttentionArguments, AttentionKernel, AttentionKernelConfig, AttentionPrepareKernel,
+            ActivationKernel, AttentionArguments, AttentionInput, AttentionKernel, AttentionKernelConfig,
+            AttentionPrepareKernel, FullPrecisionInput,
             NormalizationKernel, TensorAddScaleKernel,
             matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulOutput},
         },
@@ -478,7 +479,9 @@ impl<B: Backend> VisionModel<B> {
             self.context.create_buffer((elements as usize) * DataType::BF16.size_in_bytes()).map_err(backend)?;
         let pool = self.context.create_allocation_pool();
         let submit = |command_buffer: <B::CommandBuffer as crate::backends::common::CommandBuffer>::Encoding| {
-            command_buffer.end_encoding().submit().wait_until_completed().map(|_| ()).map_err(VisionError::Backend)
+            futures::executor::block_on(command_buffer.end_encoding().submit().wait_until_completed())
+                .map(|_| ())
+                .map_err(VisionError::Backend)
         };
 
         // Patch embedding plus the interpolated position embedding.
@@ -535,10 +538,12 @@ impl<B: Backend> VisionModel<B> {
                 .kernels
                 .attention
                 .encode(
-                    AttentionArguments {
+                    AttentionInput::FullPrecision(FullPrecisionInput {
                         queries: &queries,
                         keys: &keys,
                         values: &values,
+                    }),
+                    AttentionArguments {
                         suffix_length: count,
                         trie: None::<&B::GlobalBuffer>,
                         sinks: None,

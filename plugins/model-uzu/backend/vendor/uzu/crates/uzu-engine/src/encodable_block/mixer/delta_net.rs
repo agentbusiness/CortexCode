@@ -3,10 +3,9 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable,
-        CommandBufferPending, Context, Kernels,
+        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Context, Kernels,
         kernel::{
-            Conv1dPackKernel, ConvTreeScanKernel, DeltaNetConvScanKernel, DeltaNetConvUpdateKernel,
+            ConvTreeScanKernel, DeltaNetConvPackKernel, DeltaNetConvScanKernel, DeltaNetConvUpdateKernel,
             DeltaNetNormGateKernel, DeltaNetPrefillKernel, DeltaNetPrefillPrepKernel, DeltaNetUpdateKernel,
             StateAdvanceKernel,
             delta_net_chunked_prefill::{DeltaNetChunkedPrefill, DeltaNetChunkedPrefillArgs},
@@ -31,6 +30,9 @@ use crate::{
 pub(crate) mod tree_verify;
 
 const INNER_DATA_TYPE: DataType = DataType::F32;
+// Prefill conv: up to CONV_TILES token tiles of at least CONV_MIN_TILE_TOKENS (correctness needs >= KERNEL_SIZE - 1).
+const CONV_TILES: u32 = 16;
+const CONV_MIN_TILE_TOKENS: u32 = 16;
 
 enum DeltaNetSuffixStatus<B: Backend> {
     Flat {
@@ -51,6 +53,7 @@ pub struct DeltaNetState<B: Backend> {
     ssm_state: B::GlobalBuffer,
     suffix_status: Option<DeltaNetSuffixStatus<B>>,
     state_advance: <B::Kernels as Kernels>::StateAdvanceKernel,
+    is_empty: bool,
 }
 
 impl<B: Backend> MixerState<B> for DeltaNetState<B> {
@@ -168,7 +171,7 @@ pub struct DeltaNet<B: Backend> {
     conv_weight: B::GlobalBuffer,
     conv_bias: Option<B::GlobalBuffer>,
     conv_update: <B::Kernels as Kernels>::DeltaNetConvUpdateKernel,
-    conv_pack: <B::Kernels as Kernels>::Conv1dPackKernel,
+    conv_pack: <B::Kernels as Kernels>::DeltaNetConvPackKernel,
     conv_scan: <B::Kernels as Kernels>::DeltaNetConvScanKernel,
     conv_tree_scan: <B::Kernels as Kernels>::ConvTreeScanKernel,
     a_log: B::GlobalBuffer,
@@ -205,9 +208,9 @@ impl<B: Backend> DeltaNet<B> {
         parameter_tree: &ParameterTree<B>,
         context: &B::Context,
     ) -> Result<(Self, Option<B::GlobalBuffer>), DeltaNetNewError<B>> {
-        if config.kernel_size < 2 {
+        if config.kernel_size != 4 {
             return Err(DeltaNetNewError::UnsupportedConfiguration(format!(
-                "kernel_size must be >= 2, got {}",
+                "kernel_size must be 4, got {}",
                 config.kernel_size
             )));
         }
@@ -228,6 +231,12 @@ impl<B: Backend> DeltaNet<B> {
         let value_dim = config.num_heads * config.value_head_dim;
         let conv_dim = key_dim * 2 + value_dim;
         let total_proj_dim = conv_dim + value_dim + config.num_heads + config.num_heads;
+        // The prefill conv scan moves 8 channels per thread as vec4 pairs: the in_proj row stride must be a multiple of 8.
+        if !total_proj_dim.is_multiple_of(8) {
+            return Err(DeltaNetNewError::UnsupportedConfiguration(format!(
+                "in_proj width must be a multiple of 8, got {total_proj_dim}"
+            )));
+        }
 
         let (in_projection, in_projection_input_hadamard_factors) =
             <dyn Linear<B>>::new_with_input_rht_mixed_precision(
@@ -253,11 +262,16 @@ impl<B: Backend> DeltaNet<B> {
         let conv_update =
             <B::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(context, outer_data_type, conv_config.has_biases)
                 .map_err(DeltaNetNewError::Backend)?;
-        let conv_pack = <B::Kernels as Kernels>::Conv1dPackKernel::new(context, INNER_DATA_TYPE, outer_data_type)
-            .map_err(DeltaNetNewError::Backend)?;
-        let conv_scan =
-            <B::Kernels as Kernels>::DeltaNetConvScanKernel::new(context, outer_data_type, conv_config.has_biases)
+        let conv_pack =
+            <B::Kernels as Kernels>::DeltaNetConvPackKernel::new(context, outer_data_type, config.kernel_size)
                 .map_err(DeltaNetNewError::Backend)?;
+        let conv_scan = <B::Kernels as Kernels>::DeltaNetConvScanKernel::new(
+            context,
+            outer_data_type,
+            config.kernel_size,
+            conv_config.has_biases,
+        )
+        .map_err(DeltaNetNewError::Backend)?;
         let conv_tree_scan = <B::Kernels as Kernels>::ConvTreeScanKernel::new(
             context,
             outer_data_type,
@@ -315,8 +329,13 @@ impl<B: Backend> DeltaNet<B> {
                 None
             };
 
-        let chunked = <B::Kernels as Kernels>::DeltaNetChunkedPrefill::new(context, outer_data_type, config.head_dim)
-            .map_err(DeltaNetNewError::Backend)?;
+        let chunked = <B::Kernels as Kernels>::DeltaNetChunkedPrefill::new(
+            context,
+            outer_data_type,
+            config.head_dim,
+            config.num_heads / config.num_groups,
+        )
+        .map_err(DeltaNetNewError::Backend)?;
 
         let out_projection = <dyn Linear<B>>::new_mixed_precision(
             value_dim,
@@ -432,7 +451,7 @@ impl<B: Backend> DeltaNet<B> {
             command_buffer,
         );
 
-        let mut delta_output = tree_verify
+        let delta_output = tree_verify
             .encode(
                 TreeVerifyEncodeArguments {
                     q: &q,
@@ -442,24 +461,16 @@ impl<B: Backend> DeltaNet<B> {
                     log_decay: &log_decay,
                     beta: &beta,
                     h0: &state.ssm_state,
+                    in_proj: &tree_projected,
+                    norm_weight: &self.norm_weight,
+                    conv_dim: self.conv_dim,
+                    total_proj_dim: self.total_proj_dim,
+                    norm_epsilon: self.norm_epsilon,
                     tree_size,
                 },
                 command_buffer,
             )
             .map_err(MixerEncodeError::Backend)?;
-        self.delta_net_norm_gate.encode(
-            &mut delta_output,
-            &tree_projected,
-            &self.norm_weight,
-            self.num_heads,
-            self.value_head_dim,
-            self.value_dim,
-            self.conv_dim,
-            self.total_proj_dim,
-            self.norm_epsilon,
-            tree_size,
-            command_buffer,
-        );
 
         let output = self.out_projection.encode(delta_output, tree_size, command_buffer)?;
         state.suffix_status = Some(DeltaNetSuffixStatus::Tree {
@@ -488,16 +499,10 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
         _max_context_length: Option<u32>,
         context: &B::Context,
     ) -> Result<Box<dyn MixerState<B>>, B::Error> {
-        let mut conv_state =
+        let conv_state =
             context.create_buffer(size_for_shape(&[self.conv_dim, self.kernel_size - 1], INNER_DATA_TYPE))?;
-
-        let mut ssm_state = context
+        let ssm_state = context
             .create_buffer(size_for_shape(&[self.num_heads, self.value_head_dim, self.head_dim], INNER_DATA_TYPE))?;
-
-        let mut zero_command_buffer = context.create_command_buffer(None, None)?;
-        zero_command_buffer.encode_fill(&mut conv_state, 0);
-        zero_command_buffer.encode_fill(&mut ssm_state, 0);
-        zero_command_buffer.end_encoding().submit().wait_until_completed()?;
 
         let state_advance = <B::Kernels as Kernels>::StateAdvanceKernel::new(
             context,
@@ -512,6 +517,7 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
             ssm_state,
             suffix_status: None,
             state_advance,
+            is_empty: true,
         }))
     }
 
@@ -534,6 +540,12 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
         };
 
         assert!(state.suffix_status.is_none(), "delta net called with state with an unaccepted suffix");
+
+        if state.is_empty {
+            command_buffer.encode_fill(&mut state.conv_state, 0);
+            command_buffer.encode_fill(&mut state.ssm_state, 0);
+            state.is_empty = false;
+        }
 
         let mut in_projected = self.in_projection.encode(hidden, batch_dim.size(), command_buffer)?;
 
@@ -574,32 +586,29 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
                 command_buffer,
             );
         } else {
-            let mut padded = command_buffer
-                .allocate_scratch_for_shape(
-                    &[batch_dim.size() + self.kernel_size - 1, self.total_proj_dim],
-                    INNER_DATA_TYPE,
-                )
+            let conv_tile_tokens = batch_dim.size().div_ceil(CONV_TILES).max(CONV_MIN_TILE_TOKENS);
+            debug_assert!(conv_tile_tokens >= self.kernel_size - 1);
+            let mut packed = command_buffer
+                .allocate_scratch_for_shape(&[CONV_TILES, self.kernel_size - 1, self.conv_dim], INNER_DATA_TYPE)
                 .map_err(MixerEncodeError::Backend)?;
             self.conv_pack.encode(
                 &state.conv_state,
                 &in_projected,
-                &mut padded,
-                self.kernel_size - 1,
-                self.total_proj_dim,
+                &mut packed,
                 batch_dim.size(),
+                conv_tile_tokens,
+                self.total_proj_dim,
                 self.conv_dim,
                 command_buffer,
             );
             self.conv_scan.encode(
-                &padded,
+                &packed,
                 &self.conv_weight,
                 self.conv_bias.as_ref(),
                 &mut in_projected,
                 &mut state.conv_state,
                 batch_dim.size(),
-                self.kernel_size,
-                self.total_proj_dim,
-                self.kernel_size - 1,
+                conv_tile_tokens,
                 self.conv_dim,
                 self.total_proj_dim,
                 command_buffer,

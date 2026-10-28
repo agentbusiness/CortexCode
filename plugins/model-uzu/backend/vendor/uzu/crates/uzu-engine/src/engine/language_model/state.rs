@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 
 use derive_more::Debug;
+use futures::executor::block_on;
 use thiserror::Error;
 
 use crate::{
@@ -37,6 +38,12 @@ impl<B: Backend> LanguageModelState<B> {
     /// CortexCode patch P4: the context capacity this state was created with.
     pub fn max_context_length(&self) -> Option<u32> {
         self.max_context_length
+    }
+
+    /// CortexCode patch P5: attention KV bytes one more token of context takes in the target model
+    /// (in the KV format uzu chose for this device: int8 on chips with matrix units, else bf16).
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        self.transformer_state.kv_bytes_per_token()
     }
 
     /// CortexCode patch P4: re-seed the sampler (seeds derive from this and the token position).
@@ -288,7 +295,7 @@ impl<B: Backend> LanguageModel<B> {
             .as_ref()
             .map(|speculator| speculator.encode_snapshot(mode, &mut command_buffer))
             .transpose()?;
-        command_buffer.end_encoding().submit().wait_until_completed().map_err(LanguageModelSnapshotError::Backend)?;
+        block_on(command_buffer.end_encoding().submit().wait_until_completed()).map_err(LanguageModelSnapshotError::Backend)?;
         Ok(LanguageModelStateSnapshot {
             mode,
             tokens: state.tokens.clone(),
@@ -332,7 +339,7 @@ impl<B: Backend> LanguageModel<B> {
         {
             speculator.encode_restore(layers, *context_length, &mut command_buffer)?;
         }
-        command_buffer.end_encoding().submit().wait_until_completed().map_err(LanguageModelSnapshotError::Backend)?;
+        block_on(command_buffer.end_encoding().submit().wait_until_completed()).map_err(LanguageModelSnapshotError::Backend)?;
         state.tokens = snapshot.tokens.clone();
         state.last_output_token = None;
         Ok(())
