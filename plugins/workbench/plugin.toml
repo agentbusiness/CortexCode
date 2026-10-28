@@ -7,7 +7,7 @@
 [plugin]
 id = "workbench"
 name = "Workbench"
-version = "0.1.3"
+version = "0.1.4"
 description = "The window (the slot engine, the workbench layout and the start-up splash), the right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
