@@ -212,7 +212,7 @@ impl Vcs {
             methods::PUSH => {
                 let p: PushParams = parse_params(params)?;
                 let repo = self.repo(&p.root).await?;
-                to_value(&remote::push(git, &repo, p.remote.as_deref(), p.branch.as_deref()).await?)
+                to_value(&remote::push(git, &self.github, &repo, p.remote.as_deref(), p.branch.as_deref()).await?)
             }
             methods::PR_STATUS => {
                 let p: RootParams = parse_params(params)?;

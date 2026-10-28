@@ -3,6 +3,7 @@
 //! Processes run detached from any terminal (no password prompt can block) and with a deadline.
 
 use crate::git::{Cmd, Git};
+use crate::github::Github;
 use crate::repo::Repo;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::vcs::{PrStatus, PushResult};
@@ -34,7 +35,35 @@ async fn pick_remote(git: &Git, repo: &Repo, branch: &str) -> Result<Option<Stri
     Ok(if all.len() == 1 { all.into_iter().next() } else { None })
 }
 
-pub async fn push(git: &Git, repo: &Repo, remote: Option<&str>, branch: Option<&str>) -> Result<PushResult, RpcError> {
+/// github.com over SSH: pushed over HTTPS when the push uses the Settings sign-in.
+const GITHUB_SSH: &[&str] = &["git@github.com:", "ssh://git@github.com/"];
+
+/// A credential helper that answers with the Settings sign-in, read from the push's own environment.
+const TOKEN_HELPER: &str =
+    "credential.helper=!f() { test \"$1\" = get && printf 'username=x-access-token\\npassword=%s\\n' \"$CORTEX_PUSH_TOKEN\"; }; f";
+
+/// Whether the repository brings its own way to push to `remote`: a remote that is not plain
+/// github.com (an SSH alias, another host, a user in the URL), or credential, SSH or URL settings
+/// in the repository's own config or in a file included for it (an `includeIf` for its folder).
+async fn own_setup(git: &Git, repo: &Repo, remote: &str) -> Result<bool, RpcError> {
+    let url = git.try_text(&repo.top, ["remote", "get-url", "--push", remote]).await?.unwrap_or_default();
+    let url = url.trim();
+    if !(url.starts_with("https://github.com/") || GITHUB_SSH.iter().any(|prefix| url.starts_with(prefix))) {
+        return Ok(true);
+    }
+    const KEYS: &str = r"^(credential\..*|core\.sshcommand|url\..*)$";
+    let listed = |includes: &'static str| git.try_text(&repo.top, ["config", includes, "--show-scope", "--get-regexp", KEYS]);
+    let with = listed("--includes").await?.unwrap_or_default();
+    if with.lines().any(|line| line.starts_with("local\t") || line.starts_with("worktree\t")) {
+        return Ok(true);
+    }
+    let without = listed("--no-includes").await?.unwrap_or_default();
+    Ok(with.lines().count() > without.lines().count())
+}
+
+/// Push `branch` to `remote`. The repository's own setup pushes as it is; otherwise the GitHub
+/// sign-in from Settings pushes, when there is one; otherwise git's defaults.
+pub async fn push(git: &Git, github: &Github, repo: &Repo, remote: Option<&str>, branch: Option<&str>) -> Result<PushResult, RpcError> {
     let branch = match branch {
         Some(branch) => branch.to_owned(),
         None => repo
@@ -66,7 +95,16 @@ pub async fn push(git: &Git, repo: &Repo, remote: Option<&str>, branch: Option<&
     let merge_key = format!("branch.{branch}.merge");
     let has_upstream = git.try_text(&repo.top, ["config", "--get", merge_key.as_str()]).await?.is_some();
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let mut cmd = git.cmd(&repo.top).args(["push", "--porcelain"]);
+    let token = if own_setup(git, repo, &remote).await? { None } else { github.clone_token().await };
+    let mut cmd = git.cmd(&repo.top);
+    if let Some(token) = &token {
+        // The empty helper drops every configured one, so nothing else answers or stores the token.
+        cmd = cmd.args(["-c", "credential.helper=", "-c", TOKEN_HELPER]).env("CORTEX_PUSH_TOKEN", token);
+        for prefix in GITHUB_SSH {
+            cmd = cmd.arg("-c").arg(format!("url.https://github.com/.insteadOf={prefix}"));
+        }
+    }
+    let mut cmd = cmd.args(["push", "--porcelain"]);
     if !has_upstream {
         cmd = cmd.arg("--set-upstream");
     }
@@ -90,6 +128,9 @@ pub async fn push(git: &Git, repo: &Repo, remote: Option<&str>, branch: Option<&
             detail.push_str("; ");
         }
         detail.push_str(&stderr);
+        if token.is_some() && !reached {
+            detail.push_str("; this push used the GitHub sign-in from Settings: connect it again there if it has expired");
+        }
     }
     Ok(PushResult { ok: output.success() && reached && !rejected, available: reached, remote, branch, detail })
 }

@@ -2033,6 +2033,24 @@ fn refused_paths(captured: &Captured) -> Vec<PathBuf> {
     }
 }
 
+/// A plain push the git plugin can carry out: `git push [-u|--set-upstream] [remote [branch]]`,
+/// as (remote, branch); `HEAD` is the current branch. None for any other form (a refspec with `:`,
+/// `--force`, `--tags`, several branches), which runs as typed.
+fn plain_push(command: &str) -> Option<(Option<String>, Option<String>)> {
+    let argv = crate::approval::simple_argv(command)?;
+    let [git, push, rest @ ..] = argv.as_slice() else { return None };
+    if git != "git" || push != "push" {
+        return None;
+    }
+    let words: Vec<&String> = rest.iter().filter(|word| !matches!(word.as_str(), "-u" | "--set-upstream")).collect();
+    if words.len() > 2 || words.iter().any(|word| word.starts_with('-') || word.contains(':')) {
+        return None;
+    }
+    let remote = words.first().map(|word| word.to_string());
+    let branch = words.get(1).map(|word| word.to_string()).filter(|branch| branch != "HEAD");
+    Some((remote, branch))
+}
+
 /// Programs that walk a directory tree for files or text.
 const SEARCHERS: &[&str] = &["find", "grep", "egrep", "fgrep", "rg", "ag", "ack", "fd"];
 
@@ -2523,6 +2541,22 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             out.needs_approval = true;
             out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false } });
             return out;
+        }
+        // An approved plain push goes through the git plugin, the same push as the app's Push
+        // button: the repository's own setup first, else the GitHub sign-in from Settings.
+        if let Some((remote, branch)) = plain_push(command) {
+            let params = json!({ "root": effective_cwd.display().to_string(), "remote": remote, "branch": branch });
+            return match host.call(cc_protocol::contracts::vcs::methods::PUSH, params).await {
+                Ok(result) => {
+                    let text = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                        Out::ok(format!("Pushed {} to {}. {}", text("branch"), text("remote"), text("detail")).trim_end().to_owned())
+                    } else {
+                        Out::fail("push_failed", format!("Push failed: {}", text("detail")))
+                    }
+                }
+                Err(error) => Out::fail("push_failed", format!("Push failed: {}", error.message)),
+            };
         }
     }
     // Past the sandbox: the model asks with `permission` (why the command needs it); the user decides
