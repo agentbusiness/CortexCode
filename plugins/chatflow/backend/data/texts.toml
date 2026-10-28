@@ -33,6 +33,7 @@ learned_note = "Learned {count} {items}."
 # The skills catalog, in the stage messages of the stages that choose skills (ROUTE, PLAN).
 skills_list = "Skills list (how-tos):\n{text}"
 section_guide = "## Guide ({uri}): always applies in this project\n{text}"
+language_guide = "## Guide ({uri}): applies to every {language} file in this project\n{text}"
 skills_previous = "Skills used in the previous turn: {uris}. Choose them again when the latest message continues that work."
 skills_chosen = "Skill for this work ({uri}):\n{text}"
 skills_also = "\n\nAlso chosen; read each with `read` when you reach that part:\n{uris}"

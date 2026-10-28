@@ -856,6 +856,10 @@ impl Runtime {
             ToolChoice::Named(name) => {
                 constraints.push(Constraint::Lark(constraint::tool_call_grammar(&params.tools, Some(name))))
             }
+            // With tools listed and no other constraint, `none` is enforced: no tool-call token.
+            ToolChoice::None if !params.tools.is_empty() && constraints.is_empty() => {
+                constraints.push(Constraint::Lark(constraint::no_tool_call_grammar()))
+            }
             ToolChoice::Auto | ToolChoice::None => {}
         }
         if constraints.len() > 1 {

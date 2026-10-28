@@ -18,6 +18,7 @@ pub mod contract;
 pub mod data;
 pub mod fit;
 pub mod flow;
+pub mod guides;
 pub mod host;
 pub mod ideation;
 pub mod impact;

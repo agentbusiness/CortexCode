@@ -17,17 +17,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let data = std::env::var_os("CORTEX_PLUGIN_DATA").map(PathBuf::from);
+    // <CORTEX_HOME>/irongraph; CORTEX_HOME, else derived from <home>/plugins-data/<id>.
+    let home = std::env::var_os("CORTEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| data.as_ref().and_then(|d| d.parent()).and_then(|p| p.parent()).map(PathBuf::from));
+    let (Some(home), Some(data)) = (home, data) else {
+        eprintln!("cc-memory: CORTEX_HOME / CORTEX_PLUGIN_DATA are not set; plugins are started by the frame");
+        std::process::exit(2);
+    };
+    let memory = Memory::new(home, data);
     let code = runtime.block_on(async {
-        let data = std::env::var_os("CORTEX_PLUGIN_DATA").map(PathBuf::from);
-        // <CORTEX_HOME>/irongraph; CORTEX_HOME, else derived from <home>/plugins-data/<id>.
-        let home = std::env::var_os("CORTEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| data.as_ref().and_then(|d| d.parent()).and_then(|p| p.parent()).map(PathBuf::from));
-        let (Some(home), Some(data)) = (home, data) else {
-            eprintln!("cc-memory: CORTEX_HOME / CORTEX_PLUGIN_DATA are not set; plugins are started by the frame");
-            return 2;
-        };
-        let memory = Memory::new(home, data);
         // Open the database while the frame finishes the handshake (model load takes seconds).
         let warm = memory.clone();
         tokio::spawn(async move {
@@ -59,5 +59,21 @@ fn main() {
             }
         }
     });
+    // The runtime's tasks hold the database too: once they are gone, the last holder closes it.
+    // A running statement gets a moment to finish.
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    let tasks_ms = started.elapsed().as_millis() as u64;
+    let closed = match Arc::try_unwrap(memory) {
+        Ok(memory) => memory.into_graph().map(|graph| graph.close()),
+        Err(_) => Some(Ok(false)),
+    };
+    let ms = started.elapsed().as_millis() as u64;
+    match closed {
+        None => tracing::info!(tasks_ms, "irongraph was never opened"),
+        Some(Ok(true)) => tracing::info!(tasks_ms, ms, "irongraph closed"),
+        Some(Ok(false)) => tracing::warn!(tasks_ms, ms, "irongraph still held at exit; it was flushed, the next open repairs it"),
+        Some(Err(error)) => tracing::warn!(tasks_ms, ms, error = %error.message, "closing irongraph failed"),
+    }
     std::process::exit(code);
 }

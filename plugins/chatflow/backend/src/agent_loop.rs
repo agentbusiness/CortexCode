@@ -783,6 +783,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         if let LoopKind::Agent { name } = &spec.kind {
             deliver_board(journal, env, name).await?;
         }
+        // The guide of a language the work just reached its first file of, before the next step.
+        if !matches!(spec.kind, LoopKind::Discover) {
+            crate::guides::deliver(env, journal).await?;
+        }
         // A prewarm still running ends here: the call continues from what it prefilled.
         drop(prewarm.take());
         // Every `settle_steps` steps the in-place rewrites apply up to the newest entry (outdated

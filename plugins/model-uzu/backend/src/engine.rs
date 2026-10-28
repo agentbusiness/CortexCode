@@ -1047,6 +1047,12 @@ impl<B: Backend> Worker<B> {
             }));
             return Placement::Admitted;
         }
+        // A shared leading block being prefilled right now (for a conversation not created yet)
+        // that this request starts with: the request waits for it and starts from its copy, instead
+        // of reading the same block beside it (two reads of one block, each at half speed).
+        if !matches!(self.waiting[position].work, Work::Prewarm) && self.adopt_shared_prewarm(position) {
+            return Placement::Wait;
+        }
         let priority = self.waiting[position].priority;
         // A higher class waiting for a slot blocks lower classes from taking one.
         let blocked_by_higher = self.waiting.iter().enumerate().any(|(index, other)| {
@@ -1105,6 +1111,34 @@ impl<B: Backend> Worker<B> {
         let Some(request) = self.waiting.remove(position) else { return Placement::Wait };
         self.start(slot, request, reserve);
         Placement::Admitted
+    }
+
+    /// Whether a running `shared_only` prewarm fills the leading block the waiting request at
+    /// `position` starts with (and its own conversation holds less of it): that prewarm then runs
+    /// at the request's priority, and the request waits for its copy.
+    fn adopt_shared_prewarm(&mut self, position: usize) -> bool {
+        let request = &self.waiting[position];
+        if !request.images.is_empty() {
+            return false;
+        }
+        let own = self.slots.iter().find(|slot| slot.key.as_deref() == Some(request.key.as_str())).map_or(0, |slot| slot.n_tokens as usize);
+        let priority = request.priority;
+        let Some(index) = self.active.iter().position(|active| {
+            let other = &active.request;
+            other.shared_only
+                && matches!(other.work, Work::Prewarm)
+                && other.images.is_empty()
+                && !other.stop.load(Ordering::SeqCst)
+                && other.shared.is_some_and(|point| point > own && point < request.prompt.len() && point <= other.prompt.len() && other.prompt[..point] == request.prompt[..point])
+        }) else {
+            return false;
+        };
+        let prewarm = &mut self.active[index].request;
+        if class(priority) < class(prewarm.priority) {
+            tracing::info!(key = %request.key, block = %prewarm.key, "a request waits for the leading block being prefilled");
+            prewarm.priority = priority;
+        }
+        true
     }
 
     /// Stop the running prewarm a waiting request of `priority` for `key` outranks (see

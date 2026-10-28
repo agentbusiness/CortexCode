@@ -628,10 +628,10 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                     messages
                 })
                 .await?;
-                // A reply runs no tools, so its prompt offers none: with them listed the model
-                // wrote a tool call into the answer as text.
-                let mut call = env.call("REPLY", &effort, messages, None, None, next_step(journal, &env.run_id), true);
-                call.tools = Vec::new();
+                // A reply runs no tools. They stay listed, so the system block matches the other
+                // calls' and is read from the cache; `none` makes the model plugin refuse the
+                // tool-call token (listed and allowed, the model wrote a tool call into the answer).
+                let call = env.call("REPLY", &effort, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
                 let any = env.stops.any();
                 llm::chat(journal, call, &any).await.map(|_| ())
             }
