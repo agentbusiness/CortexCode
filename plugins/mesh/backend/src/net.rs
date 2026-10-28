@@ -5,15 +5,16 @@
 //! closed at once. On `cortex/frame/1` every request is its own bidirectional stream carrying the
 //! frame's own envelopes ([`cc_protocol::envelope::Message`]): the requester writes one `Req`, the
 //! serving side answers with `Item`s and one `Res`, and a `Cancel` or a closed stream cancels the
-//! forwarded call. What a member may ask is fixed ([`lendable`]: the model, the hands); the serving
-//! side forwards such a call to its own frame (`ctx.call_stream`) and nothing else.
+//! forwarded call. What a member may ask is fixed ([`lendable`]: the model); the serving side
+//! forwards such a call to its own frame (`ctx.call_stream`) and nothing else.
 //!
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
 //! (the membership log), `mesh.provides {category}` (the methods a category's plugin serves here),
 //! `mesh.events {prefixes}` (a stream of the frame's events with those prefixes, as items),
 //! `mesh.window.ticket` (this frame's token), `mesh.window` (the rest of the stream is one
 //! connection of the member's window to this frame: [`crate::projects`]), `mesh.model.claim |
-//! release` (one use of this computer's model for a member's run: [`crate::claims`]).
+//! release` (one use of this computer's model for a member's run, when the model has the run's
+//! tag: [`crate::claims`]).
 //!
 //! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
 
@@ -38,15 +39,10 @@ pub const FRAME_ALPN: &[u8] = b"cortex/frame/1";
 /// How long a dial may take before the member counts as unreachable for now.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// What every member lends every other: its model and its hands (commands, language servers,
-/// containers). Everything else is private to the node, never forwarded.
+/// What every member lends every other: its model. Everything else is private to the node, never
+/// forwarded (a member's window reaches this frame's projects through `mesh.window` instead).
 pub fn lendable(method: &str) -> bool {
-    let category = cc_protocol::contracts::category_of(method);
-    match category {
-        "model" | "container" => true,
-        "tools" => matches!(method, "tools.run" | "tools.job.status" | "tools.job.kill" | "tools.job.list" | "tools.artifact" | "tools.files" | "tools.read"),
-        _ => category.starts_with("lang-"),
-    }
+    cc_protocol::contracts::category_of(method) == "model"
 }
 
 // --- accepting ---------------------------------------------------------------------------------
@@ -152,6 +148,12 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let session = params.get("session_id").and_then(Value::as_str).unwrap_or("").to_owned();
             let since = params.get("since_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
             let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            let tag = params.get("tag").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(cc_protocol::contracts::model::default_tag);
+            if !mesh.local_serves(&tag).await {
+                let message = answer(Ok(json!({"granted": false})));
+                write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+                return Ok(());
+            }
             mesh.start_granting();
             let withdrawn = CancellationToken::new();
             let watcher = {
@@ -218,48 +220,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                 }
             }
             drop(rx);
-        }
-        "mesh.tree.ready" | "mesh.tree.apply" | "mesh.tree.files" => {
-            if !mesh.tree_request_allowed(&node, &method, &params) {
-                let message = answer(Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{method}` is not open to this member for that tree"))));
-                write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-                return Ok(());
-            }
-            match method.as_str() {
-                "mesh.tree.ready" => {
-                    let outcome = mesh.tree_ready(&node, params).await;
-                    let message = answer(outcome);
-                    write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-                }
-                "mesh.tree.apply" => {
-                    let outcome = match serde_json::from_value::<cc_protocol::contracts::mesh::TreeApplyParams>(params) {
-                        Ok(params) => mesh.tree_apply(&node, params).await,
-                        Err(error) => Err(RpcError::invalid_params(error.to_string())),
-                    };
-                    let message = answer(outcome);
-                    write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-                }
-                _ => {
-                    // The tree's files stream from this node's own method.
-                    let ctx = mesh.ctx().map_err(|e| e.message)?;
-                    let mut call = match ctx.call_stream(&method, params) {
-                        Ok(call) => call,
-                        Err(error) => {
-                            let message = answer(Err(error));
-                            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-                            return Ok(());
-                        }
-                    };
-                    while let Some(data) = call.next().await {
-                        if write_message(&mut send, &Message::Item { id, data }).await.is_err() {
-                            call.cancel();
-                            break;
-                        }
-                    }
-                    let message = answer(call.finish().await);
-                    let _ = write_message(&mut send, &message).await;
-                }
-            }
         }
         _ => {
             if !lendable(&method) {

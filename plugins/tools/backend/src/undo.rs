@@ -468,58 +468,6 @@ impl ProjectLog {
         Some(record)
     }
 
-    /// Write files and record them as one step of `who`, under the log's lock, so no look at
-    /// the tree in between can take them for someone else's. `files`: path, content (None:
-    /// delete), mode. `allowed` says which paths may be written.
-    pub fn apply(&self, who: &Attribution, files: Vec<(String, Option<Vec<u8>>, u32)>, allowed: &dyn Fn(&Path) -> bool) -> (Option<TimelineRecord>, Vec<String>) {
-        let mut state = lock(&self.state);
-        let mut changes = Vec::new();
-        let mut written = Vec::new();
-        for (path, content, mode) in files {
-            let absolute = self.workspace.join(&path);
-            if path.contains("..") || !util::is_inside(&absolute, &self.workspace) || !allowed(&absolute) {
-                continue;
-            }
-            let before = self.read(&path).map(|(bytes, _)| bytes);
-            let outcome = match &content {
-                Some(bytes) => {
-                    if let Some(parent) = absolute.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    util::atomic_write_checked(&absolute, bytes, allowed).and_then(|()| {
-                        if mode != 0 {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(mode))
-                        } else {
-                            Ok(())
-                        }
-                    })
-                }
-                None => match std::fs::remove_file(&absolute) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(error),
-                },
-            };
-            if outcome.is_err() {
-                continue;
-            }
-            written.push(path.clone());
-            let found = Found { path: path.clone(), before, after: content, mode };
-            if let Some(file) = self.file_change(&found) {
-                state.stats.insert(path, (file.bytes, 0));
-                changes.push(file);
-            }
-        }
-        if changes.is_empty() {
-            return (None, written);
-        }
-        let record = self.append(&mut state, who, changes, Vec::new());
-        drop(state);
-        self.publish(record.seq);
-        (Some(record), written)
-    }
-
     /// Record what changed on disk since the log last looked, attributed to `who`.
     pub fn reconcile(&self, who: &Attribution) -> Option<TimelineRecord> {
         let mut state = lock(&self.state);

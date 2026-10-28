@@ -7,6 +7,22 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The work a model is for. A model plugin declares its model's tags ([`ModelInfo::tags`]); a
+/// request names one (`mesh.claim {tag}`), and only a model with that tag takes it. Requests and
+/// models from before tags were all coding.
+pub mod tags {
+    /// Writing and changing code: the chat flow, its agents and their background calls.
+    pub const CODING: &str = "coding";
+}
+
+pub fn default_tag() -> String {
+    tags::CODING.to_owned()
+}
+
+pub fn default_tags() -> Vec<String> {
+    vec![default_tag()]
+}
+
 pub mod methods {
     pub const INFO: &str = "model.info";
     /// Chat completion. Streams [`super::ChatDelta`] items, ends with [`super::ChatResult`].
@@ -95,6 +111,9 @@ pub struct ModelInfo {
     pub variant: String,
     pub path: String,
     pub family: String,
+    /// The work the model is for ([`tags`]).
+    #[serde(default = "default_tags")]
+    pub tags: Vec<String>,
     pub quant: String,
     pub file_bytes: u64,
     /// Tokens of the shared pool. It is not divided among conversations: any one may use all of

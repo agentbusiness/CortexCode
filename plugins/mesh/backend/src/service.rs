@@ -5,8 +5,8 @@ use crate::identity::Identity;
 use crate::members::{Entry, Log, log_path};
 use crate::pairing::JoinerRecord;
 use cc_protocol::contracts::mesh::{
-    CallParams, Card, Changed, ClaimParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, RunnerParams,
-    TreeApplyParams, TreeFilesParams, methods, topics,
+    CallParams, CapacityParams, Card, Changed, ClaimParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
+    topics,
 };
 use cc_protocol::contracts::model::ModelInfo;
 use cc_protocol::contracts::now_ms;
@@ -35,9 +35,6 @@ pub const PROVIDES: &[&str] = &[
     methods::PEERS,
     methods::CALL,
     methods::NAME,
-    methods::RUNNER,
-    methods::TREE_FILES,
-    methods::TREE_APPLY,
     methods::PLACE,
     methods::PLACE_END,
     methods::CAPACITY,
@@ -46,7 +43,7 @@ pub const PROVIDES: &[&str] = &[
     methods::CLAIM,
     methods::RELEASE,
 ];
-pub const SUBSCRIBES: &[&str] = &["model.", "session.changed", "tools.timeline", "project.", "memory.knowledge.changed"];
+pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"];
 
 /// An invitation lives this long; it is used once.
 const PAIRING_WINDOW: Duration = Duration::from_secs(3600);
@@ -100,7 +97,6 @@ pub struct Mesh {
     pairing: Mutex<Option<Pending>>,
     pub borrows: Mutex<HashMap<String, Borrow>>,
     event_subs: Mutex<Vec<EventSub>>,
-    pub trees: crate::tree::Trees,
     pub placements: crate::place::Placements,
     pub links: crate::projects::Links,
     pub claims: crate::claims::Claims,
@@ -147,7 +143,6 @@ impl Mesh {
             pairing: Mutex::new(None),
             borrows: Mutex::new(HashMap::new()),
             event_subs: Mutex::new(Vec::new()),
-            trees: crate::tree::Trees::default(),
             placements: crate::place::Placements::default(),
             links: crate::projects::Links::default(),
             claims: crate::claims::Claims::default(),
@@ -344,6 +339,7 @@ impl Mesh {
 
     pub fn connected(&self, node: &str, connection: Connection) {
         lock(&self.conns).insert(node.to_owned(), connection);
+        self.models_changed();
         self.notify("peers");
     }
 
@@ -355,6 +351,7 @@ impl Mesh {
             lock(&self.event_subs).retain(|sub| sub.node != node);
             self.member_gone(node);
             self.requester_gone(node);
+            self.models_changed();
             self.notify("peers");
         }
     }
@@ -363,6 +360,7 @@ impl Mesh {
 
     pub fn card_received(&self, node: &str, card: Card) {
         lock(&self.cards).insert(node.to_owned(), card);
+        self.models_changed();
         self.notify("cards");
     }
 
@@ -395,18 +393,6 @@ impl Mesh {
         lock(&self.event_subs).push(EventSub { node: node.to_owned(), prefixes, tx });
     }
 
-    /// A step of a tree here: to the member that runs its commands, or back to the member whose
-    /// copy it is.
-    pub async fn timeline_event(self: &std::sync::Arc<Self>, data: &Value) {
-        let Some(workspace) = data.get("workspace").and_then(Value::as_str).map(std::path::PathBuf::from) else { return };
-        let seq = data.get("seq").and_then(Value::as_u64).unwrap_or(0);
-        if lock(&self.trees.lent).contains_key(&workspace) {
-            self.forward_steps(&workspace, seq).await;
-        } else if lock(&self.trees.copy_paths).contains_key(&workspace) {
-            self.return_steps(&workspace, seq).await;
-        }
-    }
-
     /// An event of this frame: to every member subscribed to its prefix.
     pub fn event(&self, topic: &str, data: &Value) {
         let mut subs = lock(&self.event_subs);
@@ -431,13 +417,13 @@ impl Mesh {
         if !active {
             return Vec::new();
         }
-        let lent: Vec<&str> = match category {
-            "model" => vec![c::model::methods::INFO, c::model::methods::CHAT, c::model::methods::COMPLETE, c::model::methods::TOKENIZE, c::model::methods::COUNT, c::model::methods::SLOTS, c::model::methods::HIBERNATE, c::model::methods::HOLD, c::model::methods::PREWARM, c::model::methods::VARIANTS],
-            "container" => vec![c::container::methods::ATTACH, c::container::methods::STATUS, c::container::methods::EXEC, c::container::methods::DETACH, c::container::methods::LIST, c::container::methods::SHELL_COMMAND, c::container::methods::IMAGES, c::container::methods::BUILD, c::container::methods::PULL, c::container::methods::LOGS, c::container::methods::PS, c::container::methods::PORTS],
-            _ if category.starts_with("lang-") => c::lang::methods::ALL.to_vec(),
-            _ => Vec::new(),
-        };
-        lent.into_iter().map(|verb| if category.starts_with("lang-") { format!("{category}.{verb}") } else { verb.to_owned() }).collect()
+        if category != "model" {
+            return Vec::new();
+        }
+        [c::model::methods::INFO, c::model::methods::CHAT, c::model::methods::COMPLETE, c::model::methods::TOKENIZE, c::model::methods::COUNT, c::model::methods::SLOTS, c::model::methods::HIBERNATE, c::model::methods::HOLD, c::model::methods::PREWARM, c::model::methods::VARIANTS]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     // --- pairing -------------------------------------------------------------------------------
@@ -610,19 +596,6 @@ impl Mesh {
                 let _ = pump.await;
                 outcome
             }
-            methods::RUNNER => {
-                let params: RunnerParams = parse_params(params)?;
-                to_value(&self.runner(params).await?)
-            }
-            methods::TREE_FILES => {
-                let params: TreeFilesParams = parse_params(params)?;
-                self.tree_files(params, items).await
-            }
-            methods::TREE_APPLY => {
-                // Called by this node's own frame only (members reach it through their stream).
-                let params: TreeApplyParams = parse_params(params)?;
-                self.tree_apply(&self.me.hex(), params).await
-            }
             methods::PLACE => {
                 let params: PlaceParams = parse_params(params)?;
                 to_value(&self.place(params, cancel).await?)
@@ -633,7 +606,10 @@ impl Mesh {
                 self.place_end(&params.session_id).await;
                 Ok(json!({}))
             }
-            methods::CAPACITY => to_value(&self.capacity().await),
+            methods::CAPACITY => {
+                let params: CapacityParams = parse_params(params)?;
+                to_value(&self.capacity(params).await)
+            }
             methods::PROJECTS => to_value(&self.projects().await),
             methods::CLAIM => {
                 let params: ClaimParams = parse_params(params)?;
@@ -691,7 +667,8 @@ impl Mesh {
         }
         let cards = lock(&self.cards).clone();
         let mut candidates = Vec::new();
-        for mut candidate in self.candidates(None) {
+        // The borrowed model serves every call here; coding is the one kind of work today.
+        for mut candidate in self.candidates(None, cc_protocol::contracts::model::tags::CODING) {
             let Some(node) = candidate.node.clone() else { continue };
             let free = cards.get(&node).and_then(|card| card.model.as_ref()).is_some_and(|model| model.slots > model.slots_busy);
             let info = self.call_member(&node, "model.info", json!({}), None, CancellationToken::new()).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());

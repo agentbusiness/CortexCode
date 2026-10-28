@@ -8,8 +8,9 @@ n0's public relays elsewhere; a relay carries only encrypted traffic and holds n
 (`<home>/mesh/members.jsonl`); a connection from a key the log does not hold is refused, and no
 server can add a node.
 
-Nothing to set. One invitation joins a computer; Remove takes it out. Every member lends every
-other its model and its hands. What runs where is decided by the host from what each computer
+Nothing to set. One invitation joins a computer; Remove takes it out. A project lives on its own
+computer, and every member's window works in it there; every member lends every other its model,
+for the work the model is tagged for. What runs where is decided by the host from what each computer
 reports, never by the model; the model is told one number when it plans (how many other computers
 can run tasks at the same time), nothing else.
 
@@ -51,19 +52,25 @@ cortex-pack build plugins/mesh --install  # packs and installs; the frame hot-sw
   the selected path is `lan` (direct, a private address), `direct` (hole-punched across networks)
   or `relay`. On `cortex/frame/1` every request is one bidirectional stream carrying the frame's
   own envelopes: one `Req`, then `Item`s and one `Res`; a `Cancel` or a closed stream cancels the
-  forwarded call. The serving side forwards only what members lend (`lendable`: `model.*`;
-  `tools.run`, `tools.job.*`, `tools.artifact`, `tools.files`, `tools.read`; `lang-*.*`;
-  `container.*`) to its own frame, nothing else.
+  forwarded call. The serving side forwards only what members lend (`lendable`: `model.*`) to
+  its own frame, nothing else.
 - **Cards** (`card.rs`): what the frame and the plugins report (machine, free disk and memory,
-  mains, a person active, the model with its variant, family, busy slots and speed, every plugin
+  mains, a person active, the model with its variant, family, tags, busy slots and speed, every plugin
   with the hash of its live data, languages, Docker, sessions and agents running, repositories by
   root commit), pushed to every member on connect and every 15 s.
-- **Where a session's model runs** (`place.rs`, `mesh.place {session_id, wait, remote_only}`):
+- **Tags**: a model plugin declares the work its model is for (`ModelInfo.tags`, today
+  `coding`); every request names one (`mesh.claim`, `mesh.place`, `mesh.capacity` take `tag`,
+  `coding` when absent), and only a model with that tag takes it, here or on a member. A coding
+  call never lands on a model that is there for other work, and the reverse.
+  A claim whose tag no model has yet waits for one (one wait per tag, in age order): it looks
+  again whenever the models change (a model plugin here starts or swaps, a member connects, goes
+  or sends its card); a claim that does not wait hears `busy`.
+- **Where a session's model runs** (`place.rs`, `mesh.place {session_id, tag, wait, remote_only}`):
   the host's decision, once per run; the frame then routes that session's model calls (their
   `cache_key` is the session id) to the chosen computer until `mesh.place.end`. The order is
   fixed: this computer first, then the local network, then remote; within a tier the higher
   variant wins (medium over small), then the faster one; only a model of the same family as this
-  computer's counts. A model is taken only when free: running nothing (an agent never slows
+  computer's, tagged for the session's work, counts. A model is taken only when free: running nothing (an agent never slows
   another's tokens down) or, for a person's turn, nothing a person waits for (the engine gives a
   person's request every step over agent work). A person's turn waits for the first model to free
   up (the chat shows "Waiting for a free model"); an agent takes what is free now or stays queued
@@ -76,14 +83,6 @@ cortex-pack build plugins/mesh --install  # packs and installs; the frame hot-sw
   separate and names what must wait for what (`depends_on`).
 - **A node without a model** (`service.rs` `auto_place`): borrows a reachable member's whole
   model category (the client takes the category over) and stops when that member goes away.
-- **Borrowed hands** (`tree.rs`, `mesh.runner`): the tools plugin asks once per session which
-  member runs its commands; the mesh picks from the cards (reachable, the same tools plugin build
-  with the same live data, nobody working there, on mains), asks that member to make its copy of
-  the tree ready (`mesh.tree.ready`, which pulls the files through `mesh.tree.files` the first
-  time, into `<home>/mesh/work/<owner>/<project>/`), and from then on every step of the home step
-  log for that tree goes to the copy (`mesh.tree.apply`, from the `tools.timeline` events) and
-  every step the member's commands make in the copy comes back into the home tree as a step
-  attributed to the member. The code stays home; a command runs where the CPU is.
 - `mesh.call {node, method, params}` forwards one lendable call to a member, with stream items
   passed through.
 - Relays: n0's public ones by default; a company's own go in the plugin's config (`relays`).
@@ -92,5 +91,5 @@ cortex-pack build plugins/mesh --install  # packs and installs; the frame hot-sw
 
 This computer's name and the network it is on (who started it, when), with Leave; Make / Copy
 the invitation; Join (paste an invitation); the joined computers: where they are (this network,
-remote), what they have (model, free or busy, languages, Docker), what they do for this computer
+remote), what they have (model and its tags, free or busy, languages, Docker), what they do for this computer
 right now, and Remove.

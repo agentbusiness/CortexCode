@@ -66,13 +66,6 @@ pub mod methods {
     /// The change of one path over a range of steps as a unified diff:
     /// [`super::TimelineDiffParams`] -> [`super::TimelineDiffResult`].
     pub const TIMELINE_DIFF: &str = "tools.timeline.diff";
-    /// [`super::TimelineApplyParams`] -> [`super::TimelineRecord`] (or `null` when nothing
-    /// changed): write files into a workspace as one step with the given attribution (what a
-    /// member's command changed, applied here; the mesh uses it).
-    pub const TIMELINE_APPLY: &str = "tools.timeline.apply";
-    /// [`super::RunnerSetParams`] -> `{}`: a session's commands run on a member of the mesh, in
-    /// its copy of the tree (`node` absent: here again).
-    pub const RUNNER_SET: &str = "tools.runner.set";
 }
 
 /// Approval classes beyond the ask-mode action classes.
@@ -571,40 +564,3 @@ pub struct ApproveResult {
     pub approved: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TimelineApplyFile {
-    pub path: String,
-    #[serde(default)]
-    pub mode: u32,
-    /// Base64 of the content; absent: delete the file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TimelineApplyParams {
-    pub workspace: String,
-    pub files: Vec<TimelineApplyFile>,
-    /// `session:<id>` | `node:<id>` | `user` | `host`
-    #[serde(default)]
-    pub actor: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct RunnerSetParams {
-    pub session_id: String,
-    pub workspace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    #[serde(default)]
-    pub name: String,
-    /// The member's copy of the tree.
-    #[serde(default)]
-    pub remote_workspace: String,
-}

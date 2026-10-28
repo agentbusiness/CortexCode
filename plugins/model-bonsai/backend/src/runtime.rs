@@ -704,6 +704,7 @@ impl Runtime {
             variant: loaded.variant.clone(),
             path: loaded.dir.join(spec.weights).display().to_string(),
             family: spec.family.to_owned(),
+            tags: spec.tags.iter().map(|tag| (*tag).to_owned()).collect(),
             quant: spec.quant.to_owned(),
             file_bytes: spec.weights().map_or(0, |file| file.bytes),
             ctx_total: facts.n_ctx,

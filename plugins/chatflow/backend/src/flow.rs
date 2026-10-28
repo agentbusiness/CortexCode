@@ -1514,7 +1514,7 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
 
 /// How many joined computers could take a session's model calls now (the mesh plugin; 0 without it).
 async fn mesh_capacity(env: &RunEnv) -> u64 {
-    env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
+    env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({"tag": cc_protocol::contracts::model::tags::CODING})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
 }
 
 /// The auto plan just written: when two of its tasks could run at the same time and a joined

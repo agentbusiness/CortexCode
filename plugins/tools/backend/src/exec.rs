@@ -1833,58 +1833,6 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
     combined
 }
 
-/// Run `command` on a member of the mesh, in its copy of the tree, through `mesh.call` and the
-/// member's own `tools.run`; the output comes back with the member's paths shown as this tree's.
-async fn run_remote(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>, runner: &crate::core::RunnerInfo, command: &str, cwd: Option<&Path>, timeout_ms: u64) -> Out {
-    let relative = cwd.and_then(|dir| dir.strip_prefix(&session.workspace).ok()).filter(|rel| !rel.as_os_str().is_empty());
-    let remote_command = match relative {
-        Some(rel) => format!("cd {} && {command}", util::shell_quote(&rel.to_string_lossy())),
-        None => command.to_owned(),
-    };
-    let params = json!({
-        "node": runner.node,
-        "method": cc_protocol::contracts::tools::methods::RUN,
-        "params": {"workspace": runner.remote_workspace, "command": remote_command, "timeout_ms": timeout_ms, "session_id": format!("mesh-{}", session.context.session_id), "env": {}}
-    });
-    let started = Instant::now();
-    let answer = match host.call(cc_protocol::contracts::mesh::methods::CALL, params).await {
-        Ok(answer) => answer,
-        Err(error) => {
-            // The member is gone: this and the session's next commands run here.
-            core.set_runner(&session.context.session_id, None);
-            return Out::fail("unavailable", format!("Not run on {}: {}. The command runs here from now on; send it again.", runner.name, error.message));
-        }
-    };
-    let exit_code = answer.get("exit_code").and_then(Value::as_i64).map(|code| code as i32);
-    let duration_ms = answer.get("duration_ms").and_then(Value::as_u64).unwrap_or(started.elapsed().as_millis() as u64);
-    let timed_out = answer.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
-    let output = answer.get("output").and_then(Value::as_str).unwrap_or("").replace(&runner.remote_workspace, &session.workspace.to_string_lossy());
-    let mut text = util::relative_paths(&output, &session.workspace);
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    let _ = writeln!(text, "[ran on {}; files it changed there come back here as a step]", runner.name);
-    let (ok, kind) = if timed_out {
-        let _ = writeln!(text, "{}", timeout_line(timeout_ms, None));
-        (false, Some("timeout"))
-    } else {
-        match exit_code {
-            Some(code) => {
-                let _ = writeln!(text, "{}", exit_line(code, duration_ms));
-                (code == 0, (code != 0).then_some("nonzero_exit"))
-            }
-            None => {
-                let _ = writeln!(text, "[finished without an exit status]");
-                (false, Some("nonzero_exit"))
-            }
-        }
-    };
-    let tests = answer.get("tests").cloned().unwrap_or(Value::Null);
-    let mut out = Out { ok, output: text, error_kind: kind.map(str::to_owned), ..Out::default() };
-    out.display = json!({ "exit_code": exit_code, "duration_ms": duration_ms, "timed_out": timed_out, "tests": tests, "remote": {"node": runner.node, "name": runner.name} });
-    out
-}
-
 /// A refusal when one of `paths` is reserved by another session (its edit of this turn is not
 /// done): who holds it and the step to take. None when every path is free.
 async fn reserved_elsewhere(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, paths: &[PathBuf]) -> Option<Out> {
@@ -2660,17 +2608,6 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     }
     let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(core.config.default_timeout_ms);
     let timeout = Duration::from_millis(timeout_ms);
-    // Borrowed hands: a member of the mesh runs this session's commands in its copy of the tree
-    // (kept in step by the mesh); what the command changes there comes back as a step here.
-    // Only a session of a project (the model's own runs; not the host's checks, not the probe).
-    if !lifted
-        && !session.context.project_id.is_empty()
-        && session.context.project_id != "probe"
-        && session.python_env
-        && let Some(runner) = core.runner(host.as_ref(), session_id, &session.workspace, &session.context.project_id).await
-    {
-        return run_remote(core, host, session, &runner, command, cwd.as_deref(), timeout_ms).await;
-    }
     // One tree, many hands: a check (a verifier the language plugins declare) runs on a throw-away
     // copy of the tree while another session is editing or running in it, so a half-finished edit
     // of someone else cannot make it lie. Alone in the tree, it runs in the tree.

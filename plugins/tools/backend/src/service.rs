@@ -12,7 +12,7 @@ use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
     ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
     JobListParams, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
-    RunnerSetParams, SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineApplyParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
+    SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
     WorkspaceListResult, WorkspaceRemoveParams, methods, topics,
 };
 use crate::undo::Attribution;
@@ -50,8 +50,6 @@ pub const PROVIDES: &[&str] = &[
     methods::UNDO,
     methods::REDO,
     methods::TIMELINE_DIFF,
-    methods::TIMELINE_APPLY,
-    methods::RUNNER_SET,
 ];
 
 pub struct ToolsPlugin {
@@ -499,41 +497,6 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let log = core.steps.open(&util::expand_home(&params.workspace));
             let result = tokio::task::spawn_blocking(move || log.diff(&params)).await.map_err(|error| RpcError::internal(error.to_string()))?;
             to_value(&result)
-        }
-        methods::TIMELINE_APPLY => {
-            let params: TimelineApplyParams = parse_params(params)?;
-            let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
-            let log = core.steps.open(&workspace);
-            let core = core.clone();
-            let workspace_text = params.workspace.clone();
-            let paths: Vec<String> = params.files.iter().map(|file| file.path.clone()).collect();
-            let record = tokio::task::spawn_blocking(move || {
-                use base64::Engine as _;
-                let who = Attribution { actor: params.actor.clone(), session_id: params.session_id.clone(), label: if params.label.is_empty() { "sync".to_owned() } else { params.label.clone() }, detail: params.detail.clone() };
-                let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
-                let files: Vec<(String, Option<Vec<u8>>, u32)> = params
-                    .files
-                    .iter()
-                    .filter_map(|file| match &file.data {
-                        Some(data) => base64::engine::general_purpose::STANDARD.decode(data).ok().map(|bytes| (file.path.clone(), Some(bytes), file.mode)),
-                        None => Some((file.path.clone(), None, 0)),
-                    })
-                    .collect();
-                log.begin();
-                let (record, _) = log.apply(&who, files, &allowed);
-                log.end_quiet();
-                record
-            })
-            .await
-            .map_err(|error| RpcError::internal(error.to_string()))?;
-            host.publish(topics::FILES_CHANGED, json!({ "workspace": workspace_text, "paths": paths, "by": "mesh" }));
-            to_value(&record)
-        }
-        methods::RUNNER_SET => {
-            let params: RunnerSetParams = parse_params(params)?;
-            let runner = params.node.map(|node| crate::core::RunnerInfo { node, name: params.name, remote_workspace: params.remote_workspace });
-            core.set_runner(&params.session_id, runner);
-            Ok(json!({}))
         }
         methods::UNDO => {
             let params: UndoParams = parse_params(params)?;

@@ -4,15 +4,15 @@
 //!
 //! The best free model wins, wherever it runs: the strongest first (of one family, the larger
 //! weights: more bits per weight or more parameters), then this computer, the local network,
-//! remote members, then the faster one. Only a model of the
-//! same family as this computer's counts. A model is taken only when it is free: running nothing
+//! remote members, then the faster one. Only a model of the same family as this computer's, and
+//! tagged for the session's work (`coding`), counts. A model is taken only when it is free: running nothing
 //! (an agent must not slow another's tokens down) or, for a person's turn, nothing a person
 //! waits for (the engine gives a person's request every step over agent work). A person's turn
 //! waits for the first model to free up; an agent takes what is free now or stays queued here.
 
 use crate::borrow::Client;
 use crate::service::{Mesh, lock};
-use cc_protocol::contracts::mesh::{Capacity, PlaceParams, Placement};
+use cc_protocol::contracts::mesh::{Capacity, CapacityParams, PlaceParams, Placement};
 use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, Priority, SlotsResult};
 use cc_protocol::{RpcError, codes};
 use serde_json::{Value, json};
@@ -51,6 +51,7 @@ pub(crate) fn best_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 
 struct Local {
     family: String,
+    tags: Vec<String>,
     weights: u64,
     tok_s: f64,
     busy: u32,
@@ -72,6 +73,7 @@ impl Mesh {
         let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
         Some(Local {
             family: info.family,
+            tags: info.tags,
             weights: info.file_bytes,
             tok_s,
             busy: slots.busy,
@@ -81,10 +83,15 @@ impl Mesh {
         })
     }
 
-    /// Reachable members with a model of `family` (any family when None) that no session of
-    /// ours is placed on. Whether the model is free now, and how strong it is, are asked live
+    /// Whether this computer's own model (not a borrowed one) is tagged for `tag`.
+    pub async fn local_serves(&self, tag: &str) -> bool {
+        self.local_model().await.is_some_and(|local| local.tags.iter().any(|own| own == tag))
+    }
+
+    /// Reachable members with a model of `family` (any family when None), tagged for `tag`, that
+    /// no session of ours is placed on. Whether the model is free now, and how strong it is, are asked live
     /// ([`Self::free_weights`]): a card is up to 15 s old.
-    pub(crate) fn candidates(&self, family: Option<&str>) -> Vec<Candidate> {
+    pub(crate) fn candidates(&self, family: Option<&str>, tag: &str) -> Vec<Candidate> {
         let me = self.me.hex();
         let cards = lock(&self.cards).clone();
         let conns = self.connections();
@@ -98,6 +105,9 @@ impl Mesh {
                 let card = cards.get(&member.node)?;
                 let model = card.model.as_ref()?;
                 if family.is_some_and(|family| !family.is_empty() && model.family != family) {
+                    return None;
+                }
+                if !model.tags.iter().any(|own| own == tag) {
                     return None;
                 }
                 if placed.values().any(|node| *node == member.node) {
@@ -121,10 +131,10 @@ impl Mesh {
         Some(info.file_bytes)
     }
 
-    /// Free members' models of `family`, best first.
-    async fn free_candidates(&self, family: Option<&str>) -> Vec<Candidate> {
+    /// Free members' models of `family` tagged for `tag`, best first.
+    async fn free_candidates(&self, family: Option<&str>, tag: &str) -> Vec<Candidate> {
         let mut free = Vec::new();
-        for mut candidate in self.candidates(family) {
+        for mut candidate in self.candidates(family, tag) {
             let Some(node) = candidate.node.clone() else { continue };
             if let Some(weights) = self.free_weights(&node).await {
                 candidate.weights = weights;
@@ -135,10 +145,10 @@ impl Mesh {
         free
     }
 
-    /// How many members could take a session's model calls now.
-    pub async fn capacity(&self) -> Capacity {
+    /// How many members could take a session's model calls for `tag` now.
+    pub async fn capacity(&self, params: CapacityParams) -> Capacity {
         let family = self.local_model().await.map(|local| local.family);
-        let names: Vec<String> = self.free_candidates(family.as_deref()).await.into_iter().map(|candidate| candidate.name).collect();
+        let names: Vec<String> = self.free_candidates(family.as_deref(), &params.tag).await.into_iter().map(|candidate| candidate.name).collect();
         Capacity { free: names.len() as u32, names }
     }
 
@@ -160,9 +170,9 @@ impl Mesh {
             }
             let local = self.local_model().await;
             let family = local.as_ref().map(|local| local.family.clone());
-            let mut options = self.free_candidates(family.as_deref()).await;
+            let mut options = self.free_candidates(family.as_deref(), &params.tag).await;
             if !params.remote_only
-                && let Some(local) = &local
+                && let Some(local) = local.as_ref().filter(|local| local.tags.contains(&params.tag))
             {
                 // A person's turn: free unless another person's request runs or waits here. An
                 // agent: free only when nothing runs here at all.
