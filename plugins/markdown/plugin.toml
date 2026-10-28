@@ -7,7 +7,7 @@
 [plugin]
 id = "markdown"
 name = "Markdown"
-version = "0.1.0"
+version = "0.1.1"
 description = "Markdown documents: the right pane's rendered view of the workspace's Markdown, and the code graph's facts of a repository's prose (README, docs/, ADRs): one section per heading with its text, and the code symbols a section mentions, indexed beside the code so what a project says about itself is searchable."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

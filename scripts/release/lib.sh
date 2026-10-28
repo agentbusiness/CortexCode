@@ -177,7 +177,7 @@ uncommitted() {
     case "$entry" in
       " M"*|"M "*|"MM"*)
         # Only version lines changed: `version = "..."` (TOML) or `"version": "..."` (JSON).
-        if ! (cd "$repo" && git diff -U0 HEAD -- "$file") | grep -E '^[-+][^-+]' | grep -qvE '^[-+](version = "|  "version": ")'; then
+        if ! (cd "$repo" && git diff -U0 HEAD -- "$file") | grep -E '^[-+][^-+]' | grep -qvE '^[-+](version = "|[[:space:]]*"version": ")'; then
           continue
         fi
         ;;

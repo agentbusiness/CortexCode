@@ -7,7 +7,7 @@
 [plugin]
 id = "plugin-manager"
 name = "Plugin manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "Settings > Plugins: every plugin with enable/disable, every service with replace, roll back and restart; a service that is not running, in the brand band."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
