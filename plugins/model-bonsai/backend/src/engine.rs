@@ -24,10 +24,17 @@
 //! - **Sampling** on the host from the logits: the grammar's mask, penalties, then greedy or
 //!   stochastic (`sampler.rs`); a reasoning block that reaches its budget is closed by feeding Qwen's
 //!   own closing sentence.
+//! - **Drafts** (a file with an MTP layer): each generation step, the MTP head guesses the token
+//!   after the one being fed, and both go through the model in one pass. The token sampled from
+//!   the first row is the real next token; when it equals the guess, the second row's logits give
+//!   the token after it, so the step yields two tokens. Else the guess is removed again (a
+//!   recurrent-state snapshot, `n_rs_seq`). The output is exactly what plain decoding samples.
+//!   The draft context holds the MTP layer's own cache for every sequence: each row pairs a token
+//!   with the model's hidden state at the position before it, fed as the model reads them.
 
 use crate::fit::{self, Budget, Geometry, Plan};
 use crate::grammar::{Grammar, GrammarCompiler, GrammarSpec};
-use crate::llama::{self, Context, ContextParams, Gpu, Model};
+use crate::llama::{self, Context, ContextParams, Gpu, Logits, Model};
 use crate::sampler::{Sampler, SamplingPlan};
 use cc_protocol::contracts::model::{Priority, QueueDepth, SlotState, progress_phase, topics as model_topics};
 use serde::Serialize;
@@ -99,6 +106,8 @@ pub struct Loaded {
     pub stop_token_ids: Vec<u32>,
     /// Conversations resident at once (sequences).
     pub resident: u64,
+    /// Tokens the MTP head drafts per step (0: the file has no MTP layer).
+    pub draft_tokens: u32,
 }
 
 /// A reasoning budget: once the open reasoning block has produced `tokens` tokens without closing,
@@ -183,6 +192,9 @@ pub struct Outcome {
     pub prefill_ms: f64,
     pub decode_ms: f64,
     pub slot: u32,
+    /// Drafted tokens and how many of them the model kept.
+    pub draft_total: u32,
+    pub draft_accepted: u32,
 }
 
 pub enum Command {
@@ -239,6 +251,10 @@ impl Drop for EngineHandle {
     }
 }
 
+/// What a load hands the engine thread: the model's context, the drafter, the tokenizer, the
+/// grammar compiler and the facts.
+type LoadedEngine = (Context, Option<Drafter>, Arc<Tokenizer>, GrammarCompiler, Loaded);
+
 /// Load the model, fit the context to the machine and start the engine thread.
 pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle, String> {
     let (tx, rx) = mpsc::channel::<Command>();
@@ -249,12 +265,13 @@ pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle,
         .name("bonsai-engine".into())
         .spawn(move || {
             let started = Instant::now();
-            let loaded = (|| -> Result<(Context, Arc<Tokenizer>, GrammarCompiler, Loaded), String> {
+            let loaded = (|| -> Result<LoadedEngine, String> {
                 llama::init(2);
                 let gpu_before = llama::gpu();
                 let json = std::fs::read(&config.tokenizer).map_err(|error| format!("cannot read {}: {error}", config.tokenizer.display()))?;
                 let tokenizer = Tokenizer::from_bytes(&json).map_err(|error| format!("cannot read {}: {error}", config.tokenizer.display()))?;
                 let model = Model::load(&config.weights)?;
+                let drafts = model.n_layer_nextn() > 0;
                 check_tokenizer(&model, &tokenizer)?;
                 let geometry = Geometry::read(&model)?;
                 let budget = Budget {
@@ -273,20 +290,36 @@ pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle,
                 if let Some(ctx) = config.ctx_total {
                     plan.ctx_total = ctx;
                 }
+                let drafts = drafts && plan.draft_tokens > 0;
                 let params = ContextParams {
                     n_ctx: u32::try_from(plan.ctx_total).unwrap_or(u32::MAX),
                     n_batch: fit::BATCH,
                     n_ubatch: fit::MICRO_BATCH,
                     n_seq_max: u32::try_from(plan.sequences).unwrap_or(1),
                     kv_type: plan.kv_type,
+                    n_rs_seq: if drafts { plan.draft_tokens } else { 0 },
+                    mtp: false,
                 };
                 let mut context = Context::new(model.clone(), params)?;
+                let drafter = if drafts {
+                    // The model hands out its hidden state for every row it reads (the MTP rows).
+                    context.set_embeddings_nextn(true, false);
+                    let mut draft_context = Context::new(model.clone(), ContextParams { n_rs_seq: 0, mtp: true, ..params })?;
+                    draft_context.set_embeddings_nextn(true, true);
+                    Some(Drafter::new(draft_context, model.n_embd_out(), plan.sequences as usize))
+                } else {
+                    None
+                };
                 // One token on the first sequence: compiles the kernels before the first request
                 // and shows what a recurrent state really takes (a checkpoint's size).
                 let first = tokenizer.encode("Hello", false).map_err(|error| format!("tokenizer: {error}"))?.get_ids().to_vec();
                 context.decode(&first[..1], 0, 0, false)?;
                 let measured_recurrent_bytes = context.state(0, true).len() as u64;
                 context.seq_rm(0, -1, -1);
+                let mut drafter = drafter;
+                if let Some(drafter) = drafter.as_mut() {
+                    drafter.warm_up(first[0])?;
+                }
                 let n_vocab = model.n_vocab();
                 let stop_token_ids: Vec<u32> = (0..n_vocab as u32).filter(|token| model.is_eog(*token)).collect();
                 let compiler = GrammarCompiler::new(&json, &stop_token_ids, n_vocab).map_err(|error| format!("cannot prepare grammar support: {error}"))?;
@@ -302,20 +335,21 @@ pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle,
                     measured_recurrent_bytes,
                     stop_token_ids,
                     resident,
+                    draft_tokens: if drafter.is_some() { plan.draft_tokens } else { 0 },
                 };
-                Ok((context, Arc::new(tokenizer), compiler, loaded))
+                Ok((context, drafter, Arc::new(tokenizer), compiler, loaded))
             })();
-            let (context, compiler, loaded) = match loaded {
-                Ok((context, tokenizer, compiler, loaded)) => {
+            let (context, drafter, compiler, loaded) = match loaded {
+                Ok((context, drafter, tokenizer, compiler, loaded)) => {
                     let _ = ready_tx.send(Ok((tokenizer, loaded.clone())));
-                    (context, compiler, loaded)
+                    (context, drafter, compiler, loaded)
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
-            let mut worker = Worker::new(context, compiler, &loaded, rx, worker_view, publisher);
+            let mut worker = Worker::new(context, drafter, compiler, &loaded, rx, worker_view, publisher);
             worker.run();
         })
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
@@ -345,12 +379,181 @@ fn check_tokenizer(model: &Model, tokenizer: &Tokenizer) -> Result<(), String> {
     Ok(())
 }
 
+// ---- the drafter ------------------------------------------------------------------------------
+
+/// What the draft context needs from one sequence of the model: the rows the model read that the
+/// draft context has not (they go in with the next draft, or once a batch's worth is waiting), and
+/// the model's hidden state at the sequence's last position, which the next row pairs with.
+#[derive(Default)]
+struct Lane {
+    /// Position of the first waiting row.
+    pos0: u32,
+    tokens: Vec<u32>,
+    /// One hidden state per waiting row: the model's, at the position before the row's token.
+    hidden: Vec<f32>,
+    /// The model's hidden state at the last position it read (zeros before the first token).
+    last: Vec<f32>,
+    /// The draft context failed for this sequence: no drafts until it starts over.
+    off: bool,
+}
+
+/// The MTP draft context and one lane per sequence of the model's context.
+struct Drafter {
+    context: Context,
+    n_embd: usize,
+    lanes: Vec<Lane>,
+}
+
+impl Drafter {
+    fn new(context: Context, n_embd: usize, sequences: usize) -> Self {
+        let lanes = (0..sequences).map(|_| Lane { last: vec![0.0; n_embd], ..Lane::default() }).collect();
+        Self { context, n_embd, lanes }
+    }
+
+    /// One draft row on the first sequence: compiles the head's kernels before the first request.
+    fn warm_up(&mut self, token: u32) -> Result<(), String> {
+        let row = vec![0.0f32; self.n_embd];
+        self.context.decode_rows(&[token], &row, self.n_embd, 0, 0, true)?;
+        self.context.seq_rm(0, -1, -1);
+        Ok(())
+    }
+
+    /// The model read `tokens` at `pos0..` on `seq`; `hidden` holds its hidden state for each.
+    fn note(&mut self, seq: u32, tokens: &[u32], pos0: u32, hidden: &[f32]) {
+        let n_embd = self.n_embd;
+        let full = {
+            let lane = &self.lanes[seq as usize];
+            !lane.off && lane.tokens.len() + tokens.len() > fit::BATCH as usize
+        };
+        if full {
+            self.flush(seq);
+        }
+        let lane = &mut self.lanes[seq as usize];
+        if lane.off {
+            return;
+        }
+        if lane.tokens.is_empty() {
+            lane.pos0 = pos0;
+        }
+        for (index, token) in tokens.iter().enumerate() {
+            lane.tokens.push(*token);
+            // The row pairs the token with the hidden state at the position before it.
+            if index == 0 {
+                lane.hidden.extend_from_slice(&lane.last);
+            } else {
+                lane.hidden.extend_from_slice(&hidden[(index - 1) * n_embd..index * n_embd]);
+            }
+        }
+        if let Some(last) = hidden.chunks_exact(n_embd).last() {
+            lane.last.copy_from_slice(last);
+        }
+    }
+
+    /// Put the waiting rows of `seq` into the draft context.
+    fn flush(&mut self, seq: u32) {
+        let lane = &mut self.lanes[seq as usize];
+        if lane.off || lane.tokens.is_empty() {
+            return;
+        }
+        if let Err(error) = self.context.decode_rows(&lane.tokens, &lane.hidden, self.n_embd, lane.pos0, seq, false) {
+            tracing::warn!(%error, "the draft context failed; this conversation goes on without drafts");
+            lane.off = true;
+        }
+        lane.tokens.clear();
+        lane.hidden.clear();
+    }
+
+    /// Guess the token after `token`, which the model reads next at `pos` on `seq`: the waiting
+    /// rows and the guess's own row go in one decode, and the guess's row is removed again (it
+    /// comes back with the model's rows once the model has read the token).
+    fn draft(&mut self, seq: u32, token: u32, pos: u32) -> Option<u32> {
+        if self.lanes[seq as usize].off {
+            return None;
+        }
+        if self.lanes[seq as usize].tokens.len() + 1 > fit::BATCH as usize {
+            self.flush(seq);
+        }
+        let n_embd = self.n_embd;
+        let lane = &mut self.lanes[seq as usize];
+        if lane.off {
+            return None;
+        }
+        let pos0 = if lane.tokens.is_empty() { pos } else { lane.pos0 };
+        lane.tokens.push(token);
+        lane.hidden.extend_from_slice(&lane.last);
+        let decoded = self.context.decode_rows(&lane.tokens, &lane.hidden, n_embd, pos0, seq, true);
+        lane.tokens.clear();
+        lane.hidden.clear();
+        if let Err(error) = decoded {
+            tracing::warn!(%error, "the draft context failed; this conversation goes on without drafts");
+            lane.off = true;
+            return None;
+        }
+        let guess = self
+            .context
+            .logits()
+            .iter()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index as u32);
+        self.context.seq_rm(seq, pos as i32, -1);
+        guess
+    }
+
+    /// The model removed its last position on `seq` (a rejected guess): forget its row.
+    fn unread_last(&mut self, seq: u32) {
+        let n_embd = self.n_embd;
+        let lane = &mut self.lanes[seq as usize];
+        if lane.off || lane.tokens.is_empty() {
+            lane.off = true;
+            return;
+        }
+        lane.tokens.pop();
+        let at = lane.hidden.len() - n_embd;
+        // The removed row carried the hidden state at the position now last.
+        lane.last.copy_from_slice(&lane.hidden[at..]);
+        lane.hidden.truncate(at);
+    }
+
+    /// The model went back to `len` positions on `seq`, where its hidden state was `last`.
+    fn rewind(&mut self, seq: u32, len: usize, last: Option<&[f32]>) {
+        let lane = &mut self.lanes[seq as usize];
+        let keep = (len as u32).saturating_sub(lane.pos0) as usize;
+        if !lane.tokens.is_empty() && keep < lane.tokens.len() {
+            lane.tokens.truncate(keep);
+            lane.hidden.truncate(keep * self.n_embd);
+        }
+        self.context.seq_rm(seq, len as i32, -1);
+        match last {
+            Some(last) if last.len() == self.n_embd => lane.last.copy_from_slice(last),
+            _ => lane.off = true,
+        }
+    }
+
+    /// The sequence starts over (empty).
+    fn clear(&mut self, seq: u32) {
+        self.context.seq_rm(seq, -1, -1);
+        let lane = &mut self.lanes[seq as usize];
+        lane.tokens.clear();
+        lane.hidden.clear();
+        lane.last.fill(0.0);
+        lane.off = false;
+    }
+
+    fn last(&self, seq: u32) -> Vec<f32> {
+        self.lanes[seq as usize].last.clone()
+    }
+}
+
 // ---- the worker ---------------------------------------------------------------------------------
 
 /// A copy of a sequence's recurrent state when it held `len` tokens.
 struct Checkpoint {
     len: usize,
     state: Vec<u8>,
+    /// The model's hidden state at the last of those tokens (what the next draft row pairs with).
+    hidden: Vec<f32>,
     last_used: Instant,
 }
 
@@ -395,6 +598,8 @@ struct Active {
     emitted: Vec<u32>,
     /// Reasoning tokens produced in the open reasoning block, while a budget applies.
     thinking: Option<u32>,
+    drafted: u32,
+    accepted: u32,
     reporter: crate::progress::Reporter,
 }
 
@@ -427,6 +632,10 @@ fn idle_generation(request: &Request) -> bool {
 
 struct Worker {
     context: Context,
+    drafter: Option<Drafter>,
+    n_embd: usize,
+    /// Hidden-state rows of the last batch the model read (for the drafter).
+    hidden: Vec<f32>,
     compiler: GrammarCompiler,
     rx: mpsc::Receiver<Command>,
     slots: Vec<Slot>,
@@ -450,12 +659,16 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(context: Context, compiler: GrammarCompiler, loaded: &Loaded, rx: mpsc::Receiver<Command>, view: Arc<Mutex<View>>, publisher: Publisher) -> Self {
+    fn new(context: Context, drafter: Option<Drafter>, compiler: GrammarCompiler, loaded: &Loaded, rx: mpsc::Receiver<Command>, view: Arc<Mutex<View>>, publisher: Publisher) -> Self {
+        let n_embd = drafter.as_ref().map_or(0, |drafter| drafter.n_embd);
         let slots = (0..loaded.resident)
             .map(|seq| Slot { seq: seq as u32, key: None, tokens: Vec::new(), checkpoints: Vec::new(), busy: None, last_used: Instant::now() })
             .collect();
         let worker = Self {
             context,
+            drafter,
+            n_embd,
+            hidden: Vec::new(),
             compiler,
             rx,
             slots,
@@ -682,6 +895,8 @@ impl Worker {
                 prefill_ms: 0.0,
                 decode_ms: 0.0,
                 slot: 0,
+                draft_total: 0,
+                draft_accepted: 0,
             }));
             return Placement::Admitted;
         }
@@ -816,6 +1031,9 @@ impl Worker {
     fn clear_slot(&mut self, index: usize) {
         let seq = self.slots[index].seq;
         self.context.seq_rm(seq, -1, -1);
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.clear(seq);
+        }
         let slot = &mut self.slots[index];
         slot.key = None;
         slot.tokens.clear();
@@ -853,6 +1071,9 @@ impl Worker {
             });
             match restored {
                 Some((position, len)) => {
+                    if let Some(drafter) = self.drafter.as_mut() {
+                        drafter.rewind(seq, len, Some(&self.slots[slot_index].checkpoints[position].hidden));
+                    }
                     let slot = &mut self.slots[slot_index];
                     slot.checkpoints[position].last_used = Instant::now();
                     // The rows after the rollback point will be rewritten: longer checkpoints are void.
@@ -862,6 +1083,9 @@ impl Worker {
                 }
                 None => {
                     self.context.seq_rm(seq, -1, -1);
+                    if let Some(drafter) = self.drafter.as_mut() {
+                        drafter.clear(seq);
+                    }
                     let slot = &mut self.slots[slot_index];
                     slot.tokens.clear();
                     slot.checkpoints.clear();
@@ -894,6 +1118,8 @@ impl Worker {
             generated: 0,
             emitted: Vec::new(),
             thinking,
+            drafted: 0,
+            accepted: 0,
             reporter: crate::progress::Reporter::default(),
         });
         let index = self.active.len() - 1;
@@ -921,7 +1147,6 @@ impl Worker {
 
     fn advance(&mut self, index: usize) -> Result<(), String> {
         let slot_index = self.active[index].slot;
-        let seq = self.slots[slot_index].seq;
         let start = match &self.active[index].phase {
             Phase::Prefill { next } => *next,
             Phase::Generate(_) => return self.decode_step(index),
@@ -932,8 +1157,7 @@ impl Worker {
             let reuse = self.active[index].request.checkpoints.iter().copied().filter(|&point| point > start && point < end).min();
             let stop = (start + PREFILL_CHUNK).min(end).min(reuse.unwrap_or(usize::MAX));
             let chunk = self.active[index].request.prompt[start..stop].to_vec();
-            self.context.decode(&chunk, start as u32, seq, false)?;
-            self.slots[slot_index].tokens.extend_from_slice(&chunk);
+            self.feed(slot_index, &chunk, Logits::None)?;
             if let Phase::Prefill { next } = &mut self.active[index].phase {
                 *next = stop;
             }
@@ -950,8 +1174,7 @@ impl Worker {
             return Ok(());
         }
         let last = self.active[index].request.prompt[end];
-        self.context.decode(&[last], end as u32, seq, true)?;
-        self.slots[slot_index].tokens.push(last);
+        self.feed(slot_index, &[last], Logits::Last)?;
         let Work::Generate { sampling, grammar, grammar_trigger, .. } = &self.active[index].request.work else { return Ok(()) };
         let grammar = match grammar {
             Some(spec) => Some(self.compiler.compile(spec, grammar_trigger.clone()).map_err(|error| format!("the grammar does not compile: {error}"))?),
@@ -959,15 +1182,56 @@ impl Worker {
         };
         let sampler = Sampler::new(sampling.clone(), &self.active[index].request.prompt);
         let mut generation = Box::new(Generation { sampler, grammar, pending: 0 });
-        generation.pending = self.sample(&mut generation)?;
+        generation.pending = self.sample(&mut generation, 0)?;
         self.active[index].phase = Phase::Generate(generation);
         Ok(())
     }
 
-    /// Sample the next token from the context's last logits and note it with the grammar.
-    fn sample(&mut self, generation: &mut Generation) -> Result<u32, String> {
+    /// Feed `tokens` to the slot's sequence after what it holds (one batch), and hand the model's
+    /// hidden states to the drafter.
+    fn feed(&mut self, slot_index: usize, tokens: &[u32], logits: Logits) -> Result<(), String> {
+        let seq = self.slots[slot_index].seq;
+        let pos0 = self.slots[slot_index].tokens.len() as u32;
+        self.context.decode_batch(tokens, pos0, seq, logits)?;
+        self.slots[slot_index].tokens.extend_from_slice(tokens);
+        if let Some(drafter) = self.drafter.as_mut() {
+            self.hidden.clear();
+            for row in 0..tokens.len() {
+                let hidden = self.context.hidden_ith(row, self.n_embd);
+                if hidden.len() != self.n_embd {
+                    self.hidden.clear();
+                    break;
+                }
+                self.hidden.extend_from_slice(hidden);
+            }
+            if self.hidden.len() == tokens.len() * self.n_embd {
+                drafter.note(seq, tokens, pos0, &self.hidden);
+            } else {
+                drafter.lanes[seq as usize].off = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the slot's last token (a rejected guess) from the model and the drafter.
+    fn unread_last(&mut self, slot_index: usize) -> Result<(), String> {
+        let seq = self.slots[slot_index].seq;
+        let pos = self.slots[slot_index].tokens.len().saturating_sub(1);
+        if !self.context.seq_rm(seq, pos as i32, -1) {
+            return Err("the model could not remove a rejected draft".into());
+        }
+        self.slots[slot_index].tokens.pop();
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.unread_last(seq);
+        }
+        Ok(())
+    }
+
+    /// Sample the next token from row `row` of the last batch's logits and note it with the
+    /// grammar.
+    fn sample(&mut self, generation: &mut Generation, row: usize) -> Result<u32, String> {
         self.logits.clear();
-        self.logits.extend_from_slice(self.context.logits());
+        self.logits.extend_from_slice(self.context.logits_ith(row));
         if self.logits.is_empty() {
             return Err("no logits after the decode".into());
         }
@@ -981,55 +1245,86 @@ impl Worker {
         Ok(token)
     }
 
-    /// Hand out the pending token, feed it, sample the next.
+    /// Hand out the pending token, feed it (with a drafted guess of the token after it, when the
+    /// request goes on), sample the next. A guess the model confirms is handed out in the same step.
     fn decode_step(&mut self, index: usize) -> Result<(), String> {
         let slot_index = self.active[index].slot;
         let seq = self.slots[slot_index].seq;
-        let Phase::Generate(generation) = &self.active[index].phase else { return Ok(()) };
-        let token = generation.pending;
-        let now = Instant::now();
-        let active = &mut self.active[index];
-        active.first_token.get_or_insert(now);
-        active.last_token = Some(now);
-        if self.stop_tokens.contains(&token) {
-            self.finish(index, Finish::Stop);
-            return Ok(());
-        }
-        let active = &mut self.active[index];
-        active.generated += 1;
-        let _ = active.request.events.send(Event::Token(token));
-        active.emitted.push(token);
-        let pos = self.slots[slot_index].tokens.len() as u32;
-        self.context.decode(&[token], pos, seq, true)?;
-        self.slots[slot_index].tokens.push(token);
-        self.report(index, progress_phase::DECODE);
-        let active = &mut self.active[index];
-        let max_tokens = match &active.request.work {
-            Work::Generate { max_tokens, .. } => *max_tokens,
-            Work::Prewarm => None,
-        };
-        if max_tokens.is_some_and(|max| active.generated >= max) {
-            self.finish(index, Finish::Length);
-            return Ok(());
-        }
-        // The reasoning budget.
-        if let (Some(used), Work::Generate { think_budget: Some(budget), .. }) = (active.thinking, &active.request.work) {
-            if active.emitted.ends_with(&budget.end) {
-                active.thinking = None;
-            } else if used + 1 >= budget.tokens {
-                return self.close_thinking(index);
-            } else {
-                active.thinking = Some(used + 1);
+        // An accepted guess: already read by the model, its logits in this row of the last batch.
+        let mut read_row: Option<usize> = None;
+        loop {
+            let Phase::Generate(generation) = &self.active[index].phase else { return Ok(()) };
+            let token = generation.pending;
+            let now = Instant::now();
+            let active = &mut self.active[index];
+            active.first_token.get_or_insert(now);
+            active.last_token = Some(now);
+            if self.stop_tokens.contains(&token) {
+                // An accepted guess that ends the answer leaves the sequence as plain decoding does.
+                if read_row.is_some() {
+                    self.unread_last(slot_index)?;
+                }
+                self.finish(index, Finish::Stop);
+                return Ok(());
             }
+            let active = &mut self.active[index];
+            active.generated += 1;
+            let _ = active.request.events.send(Event::Token(token));
+            active.emitted.push(token);
+            let max_tokens = match &active.request.work {
+                Work::Generate { max_tokens, .. } => *max_tokens,
+                Work::Prewarm => None,
+            };
+            let at_max = max_tokens.is_some_and(|max| active.generated >= max);
+            let at_budget = match (active.thinking, &active.request.work) {
+                (Some(used), Work::Generate { think_budget: Some(budget), .. }) => !active.emitted.ends_with(&budget.end) && used + 1 >= budget.tokens,
+                _ => false,
+            };
+            let (row, guess) = match read_row {
+                Some(row) => (row, None),
+                None => {
+                    // Guess only when the request goes on after this token.
+                    let pos = self.slots[slot_index].tokens.len() as u32;
+                    let guess = if at_max || at_budget { None } else { self.drafter.as_mut().and_then(|drafter| drafter.draft(seq, token, pos)) };
+                    match guess {
+                        Some(guess) => self.feed(slot_index, &[token, guess], Logits::All)?,
+                        None => self.feed(slot_index, &[token], Logits::Last)?,
+                    }
+                    (0, guess)
+                }
+            };
+            self.report(index, progress_phase::DECODE);
+            if at_max {
+                self.finish(index, Finish::Length);
+                return Ok(());
+            }
+            // The reasoning budget.
+            let active = &mut self.active[index];
+            if let (Some(used), Work::Generate { think_budget: Some(budget), .. }) = (active.thinking, &active.request.work) {
+                if active.emitted.ends_with(&budget.end) {
+                    active.thinking = None;
+                } else if at_budget {
+                    return self.close_thinking(index);
+                } else {
+                    active.thinking = Some(used + 1);
+                }
+            }
+            let Phase::Generate(mut generation) = std::mem::replace(&mut self.active[index].phase, Phase::Prefill { next: 0 }) else { return Ok(()) };
+            generation.sampler.push(token);
+            let next = self.sample(&mut generation, row);
+            self.active[index].phase = Phase::Generate(generation);
+            let next = next?;
+            if let Phase::Generate(generation) = &mut self.active[index].phase {
+                generation.pending = next;
+            }
+            let Some(guess) = guess else { return Ok(()) };
+            self.active[index].drafted += 1;
+            if next != guess {
+                return self.unread_last(slot_index);
+            }
+            self.active[index].accepted += 1;
+            read_row = Some(1);
         }
-        let Phase::Generate(mut generation) = std::mem::replace(&mut self.active[index].phase, Phase::Prefill { next: 0 }) else { return Ok(()) };
-        generation.sampler.push(token);
-        let next = self.sample(&mut generation);
-        self.active[index].phase = Phase::Generate(generation);
-        if let Phase::Generate(generation) = &mut self.active[index].phase {
-            generation.pending = next?;
-        }
-        Ok(())
     }
 
     /// The reasoning budget is reached: feed the closing tokens (handed out like generated ones, so
@@ -1038,7 +1333,6 @@ impl Worker {
         let Work::Generate { think_budget: Some(budget), .. } = &self.active[index].request.work else { return Ok(()) };
         let close = budget.close.clone();
         let slot_index = self.active[index].slot;
-        let seq = self.slots[slot_index].seq;
         tracing::info!(reasoning_tokens = self.active[index].thinking.unwrap_or(0) + 1, "reasoning budget reached; ending the reasoning block");
         let active = &mut self.active[index];
         active.thinking = None;
@@ -1047,9 +1341,7 @@ impl Worker {
         }
         active.emitted.extend_from_slice(&close);
         active.generated += close.len() as u32;
-        let pos = self.slots[slot_index].tokens.len() as u32;
-        self.context.decode(&close, pos, seq, true)?;
-        self.slots[slot_index].tokens.extend_from_slice(&close);
+        self.feed(slot_index, &close, Logits::Last)?;
         let Phase::Generate(mut generation) = std::mem::replace(&mut self.active[index].phase, Phase::Prefill { next: 0 }) else { return Ok(()) };
         for token in &close {
             generation.sampler.push(*token);
@@ -1058,7 +1350,7 @@ impl Worker {
         if let Some(grammar) = generation.grammar.as_mut() {
             grammar.engage_now();
         }
-        let next = self.sample(&mut generation);
+        let next = self.sample(&mut generation, close.len().saturating_sub(1));
         self.active[index].phase = Phase::Generate(generation);
         if let Phase::Generate(generation) = &mut self.active[index].phase {
             generation.pending = next?;
@@ -1073,12 +1365,14 @@ impl Worker {
         if self.checkpoints == 0 || len == 0 || slot.tokens.len() != len || slot.checkpoints.iter().any(|checkpoint| checkpoint.len == len) {
             return;
         }
-        let state = self.context.state(slot.seq, true);
+        let seq = slot.seq;
+        let state = self.context.state(seq, true);
         if state.is_empty() {
             return;
         }
+        let hidden = self.drafter.as_ref().map(|drafter| drafter.last(seq)).unwrap_or_default();
         let checkpoints = &mut self.slots[slot_index].checkpoints;
-        checkpoints.push(Checkpoint { len, state, last_used: Instant::now() });
+        checkpoints.push(Checkpoint { len, state, hidden, last_used: Instant::now() });
         while checkpoints.len() > self.checkpoints {
             let Some(oldest) = checkpoints.iter().enumerate().min_by_key(|(_, checkpoint)| checkpoint.last_used).map(|(position, _)| position) else { break };
             checkpoints.remove(oldest);
@@ -1113,6 +1407,8 @@ impl Worker {
             prefill_ms,
             decode_ms,
             slot: active.slot as u32,
+            draft_total: active.drafted,
+            draft_accepted: active.accepted,
         };
         let finished = match finish {
             Finish::Stop => "stop",

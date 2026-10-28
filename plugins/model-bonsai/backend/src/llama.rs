@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 unsafe extern "C" {
     fn bn_init(log_level: i32);
-    fn bn_model_load(path: *const c_char, n_gpu_layers: i32, error: *mut c_char, error_len: usize) -> *mut c_void;
+    fn bn_model_load(path: *const c_char, n_gpu_layers: i32, load_mtp: i32, error: *mut c_char, error_len: usize) -> *mut c_void;
     fn bn_model_free(model: *mut c_void);
     fn bn_model_meta(model: *const c_void, key: *const c_char, buf: *mut c_char, len: usize) -> i32;
     fn bn_model_size(model: *const c_void) -> u64;
     fn bn_model_n_params(model: *const c_void) -> u64;
     fn bn_model_n_ctx_train(model: *const c_void) -> i32;
+    fn bn_model_n_layer_nextn(model: *const c_void) -> i32;
+    fn bn_model_n_embd_out(model: *const c_void) -> i32;
     fn bn_vocab_n_tokens(model: *const c_void) -> i32;
     fn bn_vocab_is_eog(model: *const c_void, token: i32) -> i32;
     fn bn_tokenize(model: *const c_void, text: *const c_char, len: i32, out: *mut i32, cap: i32) -> i32;
@@ -29,13 +31,20 @@ unsafe extern "C" {
         kv_type: i32,
         flash: i32,
         threads: i32,
+        n_rs_seq: u32,
+        mtp: i32,
         error: *mut c_char,
         error_len: usize,
     ) -> *mut c_void;
     fn bn_context_free(ctx: *mut c_void);
     fn bn_n_ctx(ctx: *const c_void) -> u32;
-    fn bn_decode(ctx: *mut c_void, tokens: *const i32, n: i32, pos0: i32, seq: i32, last_logits: i32) -> i32;
+    fn bn_decode(ctx: *mut c_void, tokens: *const i32, n: i32, pos0: i32, seq: i32, logits: i32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn bn_decode_embd(ctx: *mut c_void, tokens: *const i32, embd: *const f32, n: i32, n_embd: i32, pos0: i32, seq: i32, last_logits: i32) -> i32;
     fn bn_logits_last(ctx: *mut c_void) -> *const f32;
+    fn bn_logits_ith(ctx: *mut c_void, i: i32) -> *const f32;
+    fn bn_set_embeddings_nextn(ctx: *mut c_void, value: i32, masked: i32);
+    fn bn_embeddings_nextn_ith(ctx: *mut c_void, i: i32) -> *const f32;
     fn bn_synchronize(ctx: *mut c_void);
     fn bn_seq_rm(ctx: *mut c_void, seq: i32, p0: i32, p1: i32) -> i32;
     fn bn_seq_cp(ctx: *mut c_void, from: i32, to: i32);
@@ -88,11 +97,12 @@ unsafe impl Send for Model {}
 unsafe impl Sync for Model {}
 
 impl Model {
+    /// Load a GGUF with its MTP draft layers, when it has them.
     pub fn load(path: &Path) -> Result<Arc<Model>, String> {
         let text = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "model path contains a NUL byte".to_owned())?;
         let mut error = vec![0u8; 512];
         // SAFETY: the path is NUL-terminated; the error buffer has the given length.
-        let ptr = unsafe { bn_model_load(text.as_ptr(), 999, error.as_mut_ptr().cast(), error.len()) };
+        let ptr = unsafe { bn_model_load(text.as_ptr(), 999, 1, error.as_mut_ptr().cast(), error.len()) };
         NonNull::new(ptr).map(|ptr| Arc::new(Model { ptr })).ok_or_else(|| error_text(&error))
     }
 
@@ -123,6 +133,18 @@ impl Model {
     pub fn n_ctx_train(&self) -> u32 {
         // SAFETY: a live model.
         u32::try_from(unsafe { bn_model_n_ctx_train(self.ptr.as_ptr()) }).unwrap_or(0)
+    }
+
+    /// MTP (NextN) draft layers loaded with the model.
+    pub fn n_layer_nextn(&self) -> u32 {
+        // SAFETY: a live model.
+        u32::try_from(unsafe { bn_model_n_layer_nextn(self.ptr.as_ptr()) }).unwrap_or(0)
+    }
+
+    /// Floats in one hidden-state row (what the MTP head reads from the target).
+    pub fn n_embd_out(&self) -> usize {
+        // SAFETY: a live model.
+        usize::try_from(unsafe { bn_model_n_embd_out(self.ptr.as_ptr()) }).unwrap_or(0)
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -187,6 +209,19 @@ pub struct ContextParams {
     /// Sequences (each holds its own recurrent state, allocated up front).
     pub n_seq_max: u32,
     pub kv_type: KvType,
+    /// Recurrent-state snapshots per sequence: the last this many tokens can be removed again (a
+    /// rejected draft) without a checkpoint.
+    pub n_rs_seq: u32,
+    /// The MTP draft context of the model (its NextN layer only).
+    pub mtp: bool,
+}
+
+/// Which rows of a decode keep their logits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Logits {
+    None,
+    Last,
+    All,
 }
 
 pub struct Context {
@@ -217,6 +252,8 @@ impl Context {
                 kv,
                 1,
                 crate::machine::engine_threads(),
+                params.n_rs_seq,
+                i32::from(params.mtp),
                 error.as_mut_ptr().cast(),
                 error.len(),
             )
@@ -238,23 +275,44 @@ impl Context {
     /// Feed `tokens` to sequence `seq` at positions `pos0..`, in calls of at most `n_batch`; the
     /// logits of the last token are kept when `last_logits`.
     pub fn decode(&mut self, tokens: &[u32], pos0: u32, seq: u32, last_logits: bool) -> Result<(), String> {
-        let ids: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
         let mut pos = pos0 as usize;
-        let chunks = ids.chunks(self.n_batch).count();
-        for (index, chunk) in ids.chunks(self.n_batch).enumerate() {
-            let logits = last_logits && index + 1 == chunks;
-            // SAFETY: `chunk` is valid for its length, which is at most n_batch.
-            let status = unsafe { bn_decode(self.ptr.as_ptr(), chunk.as_ptr(), chunk.len() as i32, pos as i32, seq as i32, i32::from(logits)) };
-            if status != 0 {
-                return Err(match status {
-                    1 => "the KV pool has no room for this batch".to_owned(),
-                    2 => "decoding was aborted".to_owned(),
-                    other => format!("llama_decode failed ({other})"),
-                });
-            }
+        let chunks = tokens.chunks(self.n_batch).count();
+        for (index, chunk) in tokens.chunks(self.n_batch).enumerate() {
+            let logits = if last_logits && index + 1 == chunks { Logits::Last } else { Logits::None };
+            self.decode_batch(chunk, pos as u32, seq, logits)?;
             pos += chunk.len();
         }
         Ok(())
+    }
+
+    /// One decode call of at most `n_batch` tokens, with the rows `logits` asks for.
+    pub fn decode_batch(&mut self, tokens: &[u32], pos0: u32, seq: u32, logits: Logits) -> Result<(), String> {
+        let ids: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
+        if ids.len() > self.n_batch {
+            return Err(format!("a batch of {} tokens is over the context's {}", ids.len(), self.n_batch));
+        }
+        let mode = match logits {
+            Logits::None => 0,
+            Logits::Last => 1,
+            Logits::All => 2,
+        };
+        // SAFETY: `ids` is valid for its length, which is at most n_batch.
+        let status = unsafe { bn_decode(self.ptr.as_ptr(), ids.as_ptr(), ids.len() as i32, pos0 as i32, seq as i32, mode) };
+        decode_status(status)
+    }
+
+    /// An MTP batch: row `i` is `tokens[i]` with the target's hidden state `rows[i]` (`n_embd`
+    /// floats each) at the position before it.
+    pub fn decode_rows(&mut self, tokens: &[u32], rows: &[f32], n_embd: usize, pos0: u32, seq: u32, last_logits: bool) -> Result<(), String> {
+        let ids: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
+        if ids.len() > self.n_batch || rows.len() != ids.len() * n_embd {
+            return Err(format!("an MTP batch of {} rows does not fit (n_batch {}, {} floats)", ids.len(), self.n_batch, rows.len()));
+        }
+        // SAFETY: `ids` holds n tokens and `rows` n × n_embd floats; n is at most n_batch.
+        let status = unsafe {
+            bn_decode_embd(self.ptr.as_ptr(), ids.as_ptr(), rows.as_ptr(), ids.len() as i32, n_embd as i32, pos0 as i32, seq as i32, i32::from(last_logits))
+        };
+        decode_status(status)
     }
 
     /// The logits of the last decoded token that kept them.
@@ -264,6 +322,32 @@ impl Context {
         unsafe {
             let ptr = bn_logits_last(self.ptr.as_ptr());
             if ptr.is_null() { &[] } else { std::slice::from_raw_parts(ptr, self.n_vocab) }
+        }
+    }
+
+    /// The logits of row `i` of the last batch (it asked for them).
+    pub fn logits_ith(&mut self, i: usize) -> &[f32] {
+        // SAFETY: as `logits`, for a row of the last batch.
+        unsafe {
+            let ptr = bn_logits_ith(self.ptr.as_ptr(), i as i32);
+            if ptr.is_null() { &[] } else { std::slice::from_raw_parts(ptr, self.n_vocab) }
+        }
+    }
+
+    /// Keep the hidden state the MTP head reads: for every row of each batch (`masked` false) or
+    /// only for rows with logits.
+    pub fn set_embeddings_nextn(&mut self, value: bool, masked: bool) {
+        // SAFETY: a live context.
+        unsafe { bn_set_embeddings_nextn(self.ptr.as_ptr(), i32::from(value), i32::from(masked)) }
+    }
+
+    /// The hidden state of row `i` of the last batch (`n_embd` floats), empty when there is none.
+    pub fn hidden_ith(&mut self, i: usize, n_embd: usize) -> &[f32] {
+        // SAFETY: the context owns n_embd floats per row of the last batch, valid until the next
+        // decode (the borrow of `self` enforces it).
+        unsafe {
+            let ptr = bn_embeddings_nextn_ith(self.ptr.as_ptr(), i as i32);
+            if ptr.is_null() { &[] } else { std::slice::from_raw_parts(ptr, n_embd) }
         }
     }
 
@@ -307,6 +391,15 @@ impl Context {
     pub fn set_state(&mut self, seq: u32, partial: bool, state: &[u8]) -> bool {
         // SAFETY: a live context; `state` is valid for its length.
         unsafe { bn_state_set(self.ptr.as_ptr(), state.as_ptr(), state.len() as u64, seq as i32, i32::from(partial)) != 0 }
+    }
+}
+
+fn decode_status(status: i32) -> Result<(), String> {
+    match status {
+        0 => Ok(()),
+        1 => Err("the KV pool has no room for this batch".to_owned()),
+        2 => Err("decoding was aborted".to_owned()),
+        other => Err(format!("llama_decode failed ({other})")),
     }
 }
 

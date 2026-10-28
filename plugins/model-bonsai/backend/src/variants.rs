@@ -1,5 +1,5 @@
 //! The model variants this plugin serves and their installation: PrismML's Ternary Bonsai 2 GGUF
-//! files on Hugging Face at a pinned revision, downloaded file by file with resume, each file
+//! files (alone, or with Qwen3.8's MTP draft layer added) on Hugging Face at a pinned revision, downloaded file by file with resume, each file
 //! verified against the hash Hugging Face publishes for it (SHA-256 `lfs.oid` for LFS files, the git
 //! blob SHA-1 `oid` for small files), recorded once per file. Installed variants are used offline.
 
@@ -42,6 +42,8 @@ pub struct Spec {
     pub template: &'static str,
     /// Small model for functional tests.
     pub test: bool,
+    /// The file carries an MTP draft layer.
+    pub drafts: bool,
     pub notes: &'static str,
 }
 
@@ -74,13 +76,41 @@ pub const BONSAI_MMPROJ: FileSpec = FileSpec {
     bytes: 629_246_976,
     git_oid: "",
     sha256: Some("6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"),
+    from: Some((BONSAI_REPO, BONSAI_REVISION)),
+};
+
+/// PrismML's PQ2_0 file, unchanged (all 851 tensors), with Qwen3.8-27B's MTP layer trained further
+/// on Bonsai 2's own output (Q8_0, 0.45 GB): the engine drafts with it (`fit::DRAFT_TOKENS`).
+const MTP_REPO: &str = "ProCreations/Ternary-Bonsai-2-27B-MTP";
+const MTP_REVISION: &str = "efffdea64c1f9e93cc7fa6bb24f72ae9d66ecf51";
+
+const BONSAI_PQ2_MTP: FileSpec = FileSpec {
+    path: "Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf",
+    bytes: 7_657_489_728,
+    git_oid: "",
+    sha256: Some("3cb3f0056d2e34ee44245a64396004a21f8492573d6ce1266ec4b7222c131dd4"),
     from: None,
 };
 
-/// The one variant: PQ2_0 (the owner's choice for this engine).
-pub const DEFAULT_VARIANT: &str = "bonsai2-27b-pq2";
+/// PQ2_0 with the MTP draft layer (the owner's choice for this engine).
+pub const DEFAULT_VARIANT: &str = "bonsai2-27b-pq2-mtp";
 
 pub const CATALOG: &[Spec] = &[
+    Spec {
+        id: "bonsai2-27b-pq2-mtp",
+        label: "Ternary Bonsai 2 27B (PQ2_0, MTP drafts)",
+        family: "qwen3.8",
+        quant: "pq2_0-mtp",
+        repo: MTP_REPO,
+        revision: MTP_REVISION,
+        files: &[QWEN38_TOKENIZER, BONSAI_PQ2_MTP],
+        weights: BONSAI_PQ2_MTP.path,
+        mmproj: Some(&BONSAI_MMPROJ),
+        template: "qwen3.8.jinja",
+        test: false,
+        drafts: true,
+        notes: "The PQ2_0 model with Qwen3.8's MTP layer (7.66 GB): it drafts the next token, the model checks it in the same step (lossless).",
+    },
     Spec {
         id: "bonsai2-27b-pq2",
         label: "Ternary Bonsai 2 27B (PQ2_0)",
@@ -93,6 +123,7 @@ pub const CATALOG: &[Spec] = &[
         mmproj: Some(&BONSAI_MMPROJ),
         template: "qwen3.8.jinja",
         test: false,
+        drafts: false,
         notes: "Ternary weights in 2-bit slots (2.13 bits per weight, 7.2 GB).",
     },
 ];

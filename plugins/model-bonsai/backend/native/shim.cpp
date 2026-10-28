@@ -3,10 +3,12 @@
 // thread at a time (the engine thread); the shim adds no locking.
 #include "ggml-backend.h"
 #include "llama.h"
+#include "llama-ext.h"  // staging API: the MTP head's hidden-state rows (llama_set_embeddings_nextn)
 
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -43,9 +45,11 @@ void bn_init(int32_t log_level) {
     llama_backend_init();
 }
 
-void * bn_model_load(const char * path, int32_t n_gpu_layers, char * error, size_t error_len) {
+// `load_mtp`: also load the file's MTP (NextN) draft layers, when it has them.
+void * bn_model_load(const char * path, int32_t n_gpu_layers, int32_t load_mtp, char * error, size_t error_len) {
     auto params = llama_model_default_params();
     params.n_gpu_layers = n_gpu_layers;
+    params.load_mtp = load_mtp != 0;
     llama_model * model = llama_model_load_from_file(path, params);
     if (!model) {
         set_error(error, error_len, std::string("llama.cpp could not load ") + path + " (see the plugin log)");
@@ -74,6 +78,16 @@ int32_t bn_model_n_ctx_train(const void * model) {
     return llama_model_n_ctx_train(static_cast<const llama_model *>(model));
 }
 
+// MTP (NextN) draft layers loaded with the model.
+int32_t bn_model_n_layer_nextn(const void * model) {
+    return llama_model_n_layer_nextn(static_cast<const llama_model *>(model));
+}
+
+// Width of one hidden-state row (what the MTP head reads from the target).
+int32_t bn_model_n_embd_out(const void * model) {
+    return llama_model_n_embd_out(static_cast<const llama_model *>(model));
+}
+
 int32_t bn_vocab_n_tokens(const void * model) {
     return llama_vocab_n_tokens(llama_model_get_vocab(static_cast<const llama_model *>(model)));
 }
@@ -88,10 +102,16 @@ int32_t bn_tokenize(const void * model, const char * text, int32_t len, int32_t 
     return llama_tokenize(llama_model_get_vocab(static_cast<const llama_model *>(model)), text, len, out, cap, false, true);
 }
 
-// `kv_type`: 0 f16, 1 q8_0. `flash`: 1 on.
+// `kv_type`: 0 f16, 1 q8_0. `flash`: 1 on. `n_rs_seq`: recurrent-state snapshots per sequence, so
+// the last tokens can be removed again (a rejected draft). `mtp`: 1 makes the MTP draft context
+// (only the model's NextN layer and its own small KV cache).
 void * bn_context_new(void * model, uint32_t n_ctx, uint32_t n_batch, uint32_t n_ubatch, uint32_t n_seq_max, int32_t kv_type,
-                      int32_t flash, int32_t threads, char * error, size_t error_len) {
+                      int32_t flash, int32_t threads, uint32_t n_rs_seq, int32_t mtp, char * error, size_t error_len) {
     auto params = llama_context_default_params();
+    params.n_rs_seq = n_rs_seq;
+    if (mtp) {
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
     params.n_ctx = n_ctx;
     params.n_batch = n_batch;
     params.n_ubatch = n_ubatch;
@@ -120,10 +140,30 @@ uint32_t bn_n_ctx(const void * ctx) {
     return llama_n_ctx(static_cast<const llama_context *>(ctx));
 }
 
-// Decode `n` tokens of one sequence at positions `pos0..`; logits only for the last token when
-// `last_logits`. Returns llama_decode's status (0 ok). `n` must not exceed the context's n_batch.
-int32_t bn_decode(void * ctx, const int32_t * tokens, int32_t n, int32_t pos0, int32_t seq, int32_t last_logits) {
+// Decode `n` tokens of one sequence at positions `pos0..`; `logits`: 0 none, 1 the last token's,
+// 2 every token's. Returns llama_decode's status (0 ok). `n` must not exceed the context's n_batch.
+int32_t bn_decode(void * ctx, const int32_t * tokens, int32_t n, int32_t pos0, int32_t seq, int32_t logits) {
     llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int32_t i = 0; i < n; i++) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = pos0 + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = seq;
+        batch.logits[i] = logits == 2 || (logits == 1 && i == n - 1);
+    }
+    batch.n_tokens = n;
+    int32_t status = llama_decode(static_cast<llama_context *>(ctx), batch);
+    llama_batch_free(batch);
+    return status;
+}
+
+// An MTP batch: each row is a token and the target's hidden state `embd` (n rows of `n_embd`
+// floats) at the position before it; logits only for the last row when `last_logits`.
+int32_t bn_decode_embd(void * ctx, const int32_t * tokens, const float * embd, int32_t n, int32_t n_embd, int32_t pos0, int32_t seq,
+                       int32_t last_logits) {
+    llama_batch batch = llama_batch_init(n, n_embd, 1);
+    // llama_batch_init allocates either tokens or rows; the MTP head reads both (freed by llama_batch_free).
+    batch.token = static_cast<llama_token *>(malloc(sizeof(llama_token) * n));
     for (int32_t i = 0; i < n; i++) {
         batch.token[i] = tokens[i];
         batch.pos[i] = pos0 + i;
@@ -131,6 +171,7 @@ int32_t bn_decode(void * ctx, const int32_t * tokens, int32_t n, int32_t pos0, i
         batch.seq_id[i][0] = seq;
         batch.logits[i] = last_logits && i == n - 1;
     }
+    memcpy(batch.embd, embd, sizeof(float) * (size_t) n * (size_t) n_embd);
     batch.n_tokens = n;
     int32_t status = llama_decode(static_cast<llama_context *>(ctx), batch);
     llama_batch_free(batch);
@@ -140,6 +181,22 @@ int32_t bn_decode(void * ctx, const int32_t * tokens, int32_t n, int32_t pos0, i
 // The logits of the last token that requested them (n_vocab floats).
 const float * bn_logits_last(void * ctx) {
     return llama_get_logits_ith(static_cast<llama_context *>(ctx), -1);
+}
+
+// The logits of row `i` of the last batch (it must have requested them).
+const float * bn_logits_ith(void * ctx, int32_t i) {
+    return llama_get_logits_ith(static_cast<llama_context *>(ctx), i);
+}
+
+// Keep the hidden state the MTP head reads: for every row of each batch (`masked` 0, the target),
+// or only for rows with logits (`masked` 1, the draft context).
+void bn_set_embeddings_nextn(void * ctx, int32_t value, int32_t masked) {
+    llama_set_embeddings_nextn(static_cast<llama_context *>(ctx), value != 0, masked != 0);
+}
+
+// The hidden state of row `i` of the last batch (n_embd_out floats), null when there is none.
+const float * bn_embeddings_nextn_ith(void * ctx, int32_t i) {
+    return llama_get_embeddings_nextn_ith(static_cast<llama_context *>(ctx), i);
 }
 
 void bn_synchronize(void * ctx) {
