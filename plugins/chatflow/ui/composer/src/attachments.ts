@@ -161,7 +161,9 @@ export async function makeThumb(file: Blob): Promise<string | undefined> {
 export type Incoming =
   | { type: 'file'; file: File; pasted: boolean }
   | { type: 'text'; text: string; name: string }
-  | { type: 'folder'; name: string; path: string };
+  | { type: 'folder'; name: string; path: string }
+  /** A local path whose kind the chat flow decides (a file or folder copied in Finder and pasted). */
+  | { type: 'path'; name: string; path: string };
 
 export interface AttachContext {
   put: (params: PutParams) => Promise<PutResult>;
@@ -195,7 +197,7 @@ export async function attachOne(item: Incoming, context: AttachContext): Promise
     }
     return { ...toAttachment(put), kind: 'file', pasted_text: true, lines: lineCount(item.text) };
   }
-  if (item.type === 'folder') {
+  if (item.type === 'folder' || item.type === 'path') {
     if (!item.path) throw new Error(`${item.name}: a folder can be attached only where its path is known (in the CortexCode app).`);
     return toAttachment(await context.put({ path: item.path, name: item.name, ...scope }));
   }
@@ -239,6 +241,19 @@ export function fromDataTransfer(transfer: DataTransfer, shell: AttachShell | nu
     return out;
   }
   for (const file of Array.from(transfer.files ?? [])) out.push({ type: 'file', file, pasted: false });
+  return out;
+}
+
+/** Local paths a paste carries as `file://` URLs (Finder's copy of files and folders), else none. */
+export function pastedPaths(transfer: DataTransfer): Incoming[] {
+  const list = transfer.getData('text/uri-list') || '';
+  const out: Incoming[] = [];
+  for (const line of list.split(/\r?\n/)) {
+    const url = line.trim();
+    if (!url.startsWith('file://') || !URL.canParse(url)) continue;
+    const path = decodeURIComponent(new URL(url).pathname);
+    if (path) out.push({ type: 'path', name: baseName(path), path });
+  }
   return out;
 }
 
