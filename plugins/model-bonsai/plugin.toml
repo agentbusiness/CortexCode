@@ -7,7 +7,7 @@
 id = "model-bonsai"
 name = "Model (Bonsai)"
 version = "0.1.4"
-description = "Ternary Bonsai 2 27B (PrismML's ternary Qwen3.8-27B, PQ2_0, 7.2 GB) in-process on PrismML's llama.cpp with Metal: the model engine for Macs with 24 GB of memory or less."
+description = "Ternary Bonsai 2 27B (PrismML's ternary Qwen3.8-27B, PQ2_0, 7.2 GB, with an MTP draft layer) in-process on PrismML's llama.cpp with Metal: the model engine for Macs with 24 GB of memory or less."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
@@ -23,7 +23,7 @@ hello_timeout_ms = 60000
 probe_timeout_ms = 600000
 
 [backend.config]
-variant = "bonsai2-27b-pq2"
+variant = "bonsai2-27b-pq2-mtp"
 
 # The machines this engine is the default for (the frame picks it when the person chose none):
 # 24 GiB is what a 24 GB Mac reports as its memory.

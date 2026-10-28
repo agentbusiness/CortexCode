@@ -41,7 +41,21 @@ loads them): one line for a single variant, a list with Select for several.
 
 | id | file | notes |
 |---|---|---|
-| `bonsai2-27b-pq2` | `prism-ml/Ternary-Bonsai-2-27B-gguf@b072e1d`, `…-PQ2_0.gguf`, 7.21 GB | ternary weights in 2-bit slots; the only variant (owner's choice) |
+| `bonsai2-27b-pq2-mtp` | `ProCreations/Ternary-Bonsai-2-27B-MTP@efffdea`, `…-PQ2_0-MTP-Q8_0.gguf`, 7.66 GB | the default (owner's choice): PrismML's PQ2_0 file unchanged plus Qwen3.8's MTP layer, trained further on Bonsai 2's output; the engine drafts with it |
+| `bonsai2-27b-pq2` | `prism-ml/Ternary-Bonsai-2-27B-gguf@b072e1d`, `…-PQ2_0.gguf`, 7.21 GB | ternary weights in 2-bit slots, no drafts |
+
+## Drafts (MTP)
+
+With the MTP variant, each generation step feeds the token being handed out together with the MTP
+head's guess of the token after it (`fit::DRAFT_TOKENS` = 1). The token sampled from the first row
+is the real next token; when it equals the guess, the second row gives the token after it, so the
+step yields two tokens; else the guess is removed through a recurrent-state snapshot (`n_rs_seq`).
+Sampling is unchanged (the grammar, penalties and seed see exactly the tokens plain decoding
+would), so the output is the same. A second context holds the MTP layer's own cache; every row the
+model reads is passed to it with the model's hidden state at the position before. One draft, not
+two or three: without the M5's tensor units, checking two tokens costs 1.42x one and three 1.91x
+(measured on the 27B with the tensor units off: code 24 -> 33 tok/s with one draft, 30 with two,
+28 with three; prose about even). `usage.draft_total` / `draft_accepted` report each request.
 
 PTQ1_0 (the same trits densely packed, 5.95 GB) gave the same greedy output 8-15% slower, and the
 MLX pack on rMLX had no prefix reuse, grammar or vision (`docs/BONSAI-ENGINE-PLAN.md` §11): neither
@@ -52,13 +66,13 @@ installed under `<models_dir>/<org>-<repo>/<revision>/` (default `$CORTEX_HOME/m
 file is downloaded from Hugging Face at the pinned revision (resumable `.part` files) and checked
 against the published digest; records in `<models_dir>/.cortexcode-verified.json` make later
 checks instant. Nothing is downloaded at startup for a variant that is not installed.
-`cc-model-bonsai install bonsai2-27b-pq2` installs without a frame.
+`cc-model-bonsai install bonsai2-27b-pq2-mtp` installs without a frame.
 
 ## Configuration (`[plugin.config]`)
 
 | key | default | meaning |
 |---|---|---|
-| `variant` | `bonsai2-27b-pq2` | catalog id |
+| `variant` | `bonsai2-27b-pq2-mtp` | catalog id |
 | `models_dir` | `$CORTEX_HOME/models` | where variants live |
 | `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total` | measured | operator limits and overrides |
 

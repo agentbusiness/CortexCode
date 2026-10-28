@@ -53,4 +53,6 @@ add_subdirectory(${LLAMA_ROOT}/tools/mtmd mtmd)
 
 add_library(bonsai_shim STATIC shim.cpp)
 target_link_libraries(bonsai_shim PUBLIC llama mtmd)
+# llama-ext.h (the MTP staging API) lives beside the library's sources.
+target_include_directories(bonsai_shim PRIVATE ${LLAMA_ROOT}/src)
 target_compile_features(bonsai_shim PRIVATE cxx_std_17)

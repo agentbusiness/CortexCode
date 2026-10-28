@@ -710,7 +710,7 @@ impl Runtime {
             ctx_native: u32::try_from(facts.geometry.native_context).unwrap_or(u32::MAX),
             slots: u32::try_from(facts.resident).unwrap_or(u32::MAX),
             kv_type: facts.plan.kv_type.name().into(),
-            speculative: String::new(),
+            speculative: if facts.draft_tokens > 0 { "mtp".into() } else { String::new() },
             backend: if cfg!(target_os = "macos") { "metal" } else { "cpu" }.into(),
             tensor_api: None,
             engine_revision: crate::llama::REVISION.into(),
@@ -735,7 +735,7 @@ impl Runtime {
                 },
                 "machine": loaded.machine,
                 "settings": {"batch": crate::fit::BATCH, "micro_batch": crate::fit::MICRO_BATCH},
-                "speculation": {"enabled": false, "mtp_layers": facts.geometry.mtp_layers},
+                "speculation": {"enabled": facts.draft_tokens > 0, "mtp_layers": facts.geometry.mtp_layers, "draft_tokens": facts.draft_tokens},
                 "input_modalities": ["text"],
                 "stop_token_ids": facts.stop_token_ids,
                 "stage": "generation with checkpoints and constraints; shared blocks, hibernation, images and the endpoint come next",
@@ -764,7 +764,7 @@ impl Runtime {
                     sha256: spec.weights().and_then(|file| file.sha256).map(str::to_owned),
                     verified: installed.then(|| variants::verified_by_record(spec, &self.paths.models_dir)),
                     bytes: Some(spec.total_bytes()),
-                    mtp: Some(false),
+                    mtp: Some(spec.drafts),
                 }
             })
             .collect();
@@ -860,8 +860,8 @@ fn usage_of(outcome: &Outcome) -> Usage {
         prefill_ms: outcome.prefill_ms,
         decode_ms: outcome.decode_ms,
         queue_ms: outcome.queue_ms,
-        draft_accepted: 0,
-        draft_total: 0,
+        draft_accepted: outcome.draft_accepted,
+        draft_total: outcome.draft_total,
         slot: Some(outcome.slot),
     }
 }

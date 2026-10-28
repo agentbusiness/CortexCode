@@ -16,6 +16,10 @@
 //! model. This engine is the light one: everything together stays under [`MAX_TOTAL_BYTES`] on
 //! every Mac, and the KV pool takes what the rest leaves under it. Every term comes from the GGUF
 //! header; what the load really took is reported beside the plan (`model.info.extra.fit.measured`).
+//!
+//! A file with an MTP draft layer adds three terms: one more copy of each sequence's recurrent
+//! state (the snapshot a rejected draft rolls back to), the draft layer's own KV for every pool
+//! token, and the draft context's compute buffers.
 
 use crate::llama::{KvType, Model};
 use serde::Serialize;
@@ -50,6 +54,13 @@ pub const BATCH: u32 = 1024;
 /// Tokens per compute pass: 256 prefills about as fast as 512 (measured on the 27B: 358 against 364
 /// tok/s; 342 at 1024) with a quarter of the 1024 compute buffers.
 pub const MICRO_BATCH: u32 = 256;
+/// Tokens the MTP head drafts per step. One: a GPU without the M5's tensor units checks two tokens
+/// at 1.42x the cost of one and three at 1.91x, so only the first draft pays (measured on the 27B
+/// with the tensor units off: code 24 -> 33 tok/s with one draft, 30 with two, 28 with three).
+pub const DRAFT_TOKENS: u32 = 1;
+/// Compute buffers of the MTP draft context (one layer at the plan's micro-batch, the head's
+/// logits for one row) and the target's hidden-state rows for a full batch, with headroom.
+pub const DRAFT_COMPUTE_RESERVE: u64 = GIB / 4;
 
 /// Memory geometry of a loaded GGUF (`qwen35`: Gated DeltaNet layers with full attention every
 /// `full_attention_interval` layers).
@@ -69,11 +80,20 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// Whether the file drafts with its own MTP layer.
+    pub fn drafts(&self) -> bool {
+        self.mtp_layers > 0
+    }
+}
+
+impl Geometry {
     pub fn read(model: &Model) -> Result<Geometry, String> {
         let arch = model.meta("general.architecture").ok_or("the GGUF names no architecture")?;
         let key = |name: &str| format!("{arch}.{name}");
         let need = |name: &str| model.meta_u64(&key(name)).ok_or_else(|| format!("the GGUF has no `{}`", key(name)));
-        let blocks = need("block_count")?;
+        // `block_count` includes the MTP layers, which sit after the trunk.
+        let mtp_layers = model.meta_u64(&key("nextn_predict_layers")).unwrap_or(0);
+        let blocks = need("block_count")?.saturating_sub(mtp_layers);
         // A plain transformer has no interval: every layer has attention.
         let interval = model.meta_u64(&key("full_attention_interval")).unwrap_or(1).max(1);
         let attention_layers = blocks / interval;
@@ -101,13 +121,14 @@ impl Geometry {
             value_length: need("attention.value_length")?,
             recurrent_bytes,
             native_context: u64::from(model.n_ctx_train()).max(need("context_length").unwrap_or(0)),
-            mtp_layers: model.meta_u64(&key("nextn_predict_layers")).unwrap_or(0),
+            mtp_layers,
         })
     }
 
-    /// Attention KV bytes per token at `kv` (q8_0: 34 bytes per 32 values).
+    /// Attention KV bytes per token at `kv` (q8_0: 34 bytes per 32 values), the MTP layer's
+    /// own cache included (an attention layer of the same shape).
     pub fn kv_bytes_per_token(&self, kv: KvType) -> u64 {
-        let values = self.attention_layers * self.kv_heads * (self.key_length + self.value_length);
+        let values = (self.attention_layers + self.mtp_layers) * self.kv_heads * (self.key_length + self.value_length);
         match kv {
             KvType::F16 => values * 2,
             KvType::Q8_0 => values * 34 / 32,
@@ -148,6 +169,10 @@ pub struct Plan {
     pub weights_bytes: u64,
     pub recurrent_bytes: u64,
     pub compute_reserve: u64,
+    /// Tokens drafted per step by the file's MTP layer (0: no drafting).
+    pub draft_tokens: u32,
+    /// The rollback snapshots and the draft context's compute buffers.
+    pub draft_bytes: u64,
     /// Bytes the plan reaches in all.
     pub total_bytes: u64,
 }
@@ -159,7 +184,9 @@ const SHAPES: &[(u64, u64)] = &[(3, 2), (2, 2), (1, 2)];
 
 fn plan_for(geometry: &Geometry, budget: u64, kv: KvType, resident: u64, checkpoints: u64) -> Option<Plan> {
     let sequences = resident + SEEDS;
-    let fixed = geometry.weights_bytes + COMPUTE_RESERVE + geometry.recurrent_bytes * (sequences + resident * checkpoints);
+    let draft_tokens = if geometry.drafts() { DRAFT_TOKENS } else { 0 };
+    let draft_bytes = if geometry.drafts() { geometry.recurrent_bytes * sequences * u64::from(DRAFT_TOKENS) + DRAFT_COMPUTE_RESERVE } else { 0 };
+    let fixed = geometry.weights_bytes + COMPUTE_RESERVE + geometry.recurrent_bytes * (sequences + resident * checkpoints) + draft_bytes;
     let room = budget.checked_sub(fixed)?;
     let per_token = geometry.kv_bytes_per_token(kv).max(1);
     let tokens = (room / per_token).min(POOL_TOKENS).min(geometry.native_context) / CONTEXT_GRANULARITY * CONTEXT_GRANULARITY;
@@ -174,6 +201,8 @@ fn plan_for(geometry: &Geometry, budget: u64, kv: KvType, resident: u64, checkpo
         weights_bytes: geometry.weights_bytes,
         recurrent_bytes: geometry.recurrent_bytes,
         compute_reserve: COMPUTE_RESERVE,
+        draft_tokens,
+        draft_bytes,
         total_bytes: fixed + tokens * per_token,
     })
 }
