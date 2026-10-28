@@ -25,7 +25,7 @@ use cc_protocol::contracts::chatflow::{
 use crate::{ideation, plan, spec};
 use cc_protocol::contracts::tools::topics as tools_topics;
 use cc_protocol::contracts::frame::{
-    JournalEntry, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, topics as frame_topics,
+    JournalEntry, ProjectListResult, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, methods as frame_methods, topics as frame_topics,
 };
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{Task, methods as memory_methods};
@@ -35,7 +35,7 @@ use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, codes, parse_params, t
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -68,12 +68,17 @@ pub fn hello() -> Hello {
         .map(|method| (*method).to_owned())
         .collect();
     // Background jobs wake the session that started them; changed skills rebuild the prefixes; a
-    // merge of the code folder (the source manager's start-up update) reloads the data set.
+    // merge of the code folder (the source manager's start-up update) reloads the data set. The
+    // plugins a new conversation's block is built from coming up, a project opened and a new
+    // project description each have that block prefilled again ([`Chatflow::warm_projects`]).
     hello.subscribes = vec![
         tools_topics::JOB_EVENT.to_owned(),
         SKILLS_CHANGED.to_owned(),
         frame_topics::SESSION_DELETED.to_owned(),
         SOURCE_CHANGED.to_owned(),
+        frame_topics::PLUGIN_STATE.to_owned(),
+        frame_topics::PROJECT_CHANGED.to_owned(),
+        cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED.to_owned(),
     ];
     hello
 }
@@ -112,6 +117,10 @@ struct Inner {
     /// Per session: the state key ([`crate::prewarm::state_key`]) of the prefix last sent to
     /// `model.prewarm`, so a session state is prefilled once however often it is asked for.
     warmed: Mutex<HashMap<String, String>>,
+    /// A pass prefilling every project's next-conversation block is running; `warm_again`: asked
+    /// for again meanwhile, so it runs once more when done.
+    warming: AtomicBool,
+    warm_again: AtomicBool,
     /// When a plugin's skills last changed (ms, 0: not since the start): a session's prefix built
     /// before it is rebuilt on its next turn.
     skills_changed_ms: AtomicU64,
@@ -205,6 +214,8 @@ impl Chatflow {
                 opened_projects: Mutex::new(HashSet::new()),
                 prewarms: Mutex::new(HashMap::new()),
                 warmed: Mutex::new(HashMap::new()),
+                warming: AtomicBool::new(false),
+                warm_again: AtomicBool::new(false),
                 skills_changed_ms: AtomicU64::new(0),
                 learner: std::sync::OnceLock::new(),
                 replay: Mutex::new(ReplayState::default()),
@@ -469,6 +480,41 @@ impl Chatflow {
     }
 
     // ---- chatflow.prewarm ---------------------------------------------------------------------
+
+    /// Prefill every project's next-conversation block in the background, so a new conversation's
+    /// first call reads only its message whether or not the chat window asked in time (at start
+    /// the window asks before the model is up, and that ask fails). Passes asked for while one
+    /// runs fold into one more; a project whose block cannot be built yet (the model or memory not
+    /// up) is skipped until the next pass.
+    fn warm_projects(&self, ctx: Ctx) {
+        self.inner.warm_again.store(true, Ordering::SeqCst);
+        if self.inner.warming.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        self.spawn(async move {
+            while this.inner.warm_again.swap(false, Ordering::SeqCst) && !this.inner.park.is_cancelled() {
+                let projects = match Host::new(ctx.clone()).get::<ProjectListResult>(frame_methods::PROJECT_LIST, json!({})).await {
+                    Ok(listed) => listed.projects,
+                    Err(error) => {
+                        tracing::debug!(%error, "no projects to prefill a new conversation for");
+                        Vec::new()
+                    }
+                };
+                for project in projects {
+                    match this.prewarm_project(ctx.clone(), &project.id).await {
+                        Ok(result) => tracing::debug!(project = %project.id, state = %result.state, "a new conversation's block"),
+                        Err(error) => tracing::debug!(project = %project.id, %error, "a new conversation's block is not prefilled yet"),
+                    }
+                }
+            }
+            this.inner.warming.store(false, Ordering::SeqCst);
+            // Asked for between the last check and the flag going down: run that pass too.
+            if this.inner.warm_again.load(Ordering::SeqCst) {
+                this.warm_projects(ctx);
+            }
+        });
+    }
 
     /// Prefill the session's prompt prefix (system message and conversation) in the background, so
     /// its next turn's first call reads only the new message ([`crate::prewarm`]); without a
@@ -1781,6 +1827,7 @@ impl Plugin for Chatflow {
             let paths = crate::replay::Paths::new(&data_dir(&ctx));
             let learner = this.inner.learner.get_or_init(|| crate::learn::Learner::start(Host::new(ctx.clone()), this.inner.data.clone(), this.inner.park.clone(), paths, replayer));
             learner.backlog();
+            this.warm_projects(ctx.clone());
             // Resume in the background: activation must not wait for a predecessor's lock.
             let task_ctx = ctx.clone();
             tokio::spawn(async move {
@@ -1804,6 +1851,23 @@ impl Plugin for Chatflow {
             if !matches!(&loaded, crate::data::Loaded::Activated(version) if *version == before) {
                 self.publish_data(&ctx, &loaded);
             }
+        }
+        let warm = match topic.as_str() {
+            // The block holds the tools guide, the model's window, what memory knows and the
+            // catalog of every plugin serving skills (language plugins come up last).
+            frame_topics::PLUGIN_STATE => {
+                let field = |name: &str| data.get(name).and_then(Value::as_str).unwrap_or("");
+                field("state") == "active"
+                    && (matches!(field("category"), "model" | "memory" | "tools") || cc_protocol::contracts::skills::listing_method(field("contract")).is_some())
+            }
+            frame_topics::PROJECT_CHANGED | SKILLS_CHANGED => true,
+            cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED => {
+                data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION)
+            }
+            _ => false,
+        };
+        if warm {
+            self.warm_projects(ctx.clone());
         }
         let this = self.clone();
         Box::pin(async move {

@@ -164,6 +164,11 @@ fn report(result: &serde_json::Value) -> Result<(), String> {
         println!("  {mark} {:<8} {}", step["step"].as_str().unwrap_or_default(), step["detail"].as_str().unwrap_or_default());
     }
     let plugin = result["plugin"].as_str().unwrap_or_default();
+    // A frame update is staged: the package stays in the incoming folder for the restart.
+    if result["waiting"].as_bool().unwrap_or(false) {
+        println!("{}", result["error"].as_str().unwrap_or("the package installs when the app restarts"));
+        return Ok(());
+    }
     if result["ok"].as_bool().unwrap_or(false) {
         let from = result["from_version"].as_str().unwrap_or_default();
         let to = result["to_version"].as_str().unwrap_or_default();

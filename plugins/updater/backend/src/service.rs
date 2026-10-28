@@ -33,7 +33,7 @@ use cc_protocol::{Ctx, RpcError, parse_params, to_value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -116,6 +116,9 @@ pub struct Updater {
     checking: AtomicBool,
     again: AtomicBool,
     wake: Notify,
+    /// Versions the frame keeps for its restart (a frame update is staged): (plugin, version).
+    /// Not downloaded again; the restart installs them, and this process ends with it.
+    at_restart: Mutex<BTreeSet<(String, String)>>,
 }
 
 fn now_ms() -> u64 {
@@ -136,6 +139,7 @@ impl Updater {
             checking: AtomicBool::new(false),
             again: AtomicBool::new(false),
             wake: Notify::new(),
+            at_restart: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -420,12 +424,19 @@ impl Updater {
             }
             let together = install_many(&ctx, packages.iter().map(|(_, package)| package.as_path()).collect()).await;
             match together {
-                Ok(()) => {}
+                Ok(Placed::Now) => {}
+                Ok(Placed::AtRestart) => {
+                    for (item, _) in &packages {
+                        outcomes.push(self.held_for_restart(&item.plugin, &item.release));
+                    }
+                }
                 Err(error) if packages.len() == 1 => outcomes.push(self.record(&packages[0].0.plugin, &packages[0].0.release, "failed", error)),
                 Err(_) => {
                     for (item, package) in &packages {
-                        if let Err(error) = install_many(&ctx, vec![package.as_path()]).await {
-                            outcomes.push(self.record(&item.plugin, &item.release, "failed", error));
+                        match install_many(&ctx, vec![package.as_path()]).await {
+                            Ok(Placed::Now) => {}
+                            Ok(Placed::AtRestart) => outcomes.push(self.held_for_restart(&item.plugin, &item.release)),
+                            Err(error) => outcomes.push(self.record(&item.plugin, &item.release, "failed", error)),
                         }
                     }
                 }
@@ -584,7 +595,14 @@ impl Updater {
                     .collect()
             })
             .unwrap_or_default();
-        let (auto, pending) = self.plan(items);
+        let (mut auto, pending) = self.plan(items);
+        let mut new = new;
+        {
+            let held = self.at_restart.lock().unwrap_or_else(|p| p.into_inner());
+            auto.retain(|plan| !held.contains(&(plan.id.clone(), plan.version.clone())));
+            let id_of = |entry: &PluginEntry| catalog.as_ref().and_then(|c| c.plugins.iter().find(|(_, e)| *e == entry).map(|(id, _)| id.clone()));
+            new.retain(|(entry, _)| id_of(entry).is_none_or(|id| !held.contains(&(id, entry.version.clone()))));
+        }
         self.with_status(|status| status.pending = pending);
         if auto.is_empty() && new.is_empty() {
             self.with_status(|status| status.waiting.clear());
@@ -623,6 +641,7 @@ impl Updater {
             match call::<PackageSwapResult>(ctx, frame_methods::PLUGINS_INSTALL, json!(params)).await {
                 Ok(result) if result.ok => drop(self.record(&id, &version, "installed", "")),
                 Ok(result) => drop(self.record(&id, &version, "failed", result.error.unwrap_or_default())),
+                Err(error) if error.code == RESTART_PENDING => drop(self.held_for_restart(&id, &version)),
                 Err(error) => drop(self.record(&id, &version, "failed", error.message)),
             }
         }
@@ -767,6 +786,12 @@ impl Updater {
         self.with_status(|status| status.failed.retain(|failed| failed.plugin != plan.id));
     }
 
+    /// The frame keeps the package for its restart (a frame update is staged).
+    fn held_for_restart(&self, plugin: &str, version: &str) -> Applied {
+        self.at_restart.lock().unwrap_or_else(|p| p.into_inner()).insert((plugin.to_owned(), version.to_owned()));
+        self.record(plugin, version, "at_restart", "Installs when the app restarts.")
+    }
+
     /// A version the frame refused (its check failed, the previous version keeps running): not
     /// tried again; the popup and Settings > Plugins say why.
     fn could_not_start(&self, plan: &Planned, error: String) {
@@ -784,12 +809,14 @@ impl Updater {
     async fn install_set(&self, ctx: &Ctx, set: Vec<(Planned, PathBuf)>) {
         let together = install_many(ctx, set.iter().map(|(_, package)| package.as_path()).collect()).await;
         match together {
-            Ok(()) => set.iter().for_each(|(plan, _)| self.installed(plan)),
+            Ok(Placed::Now) => set.iter().for_each(|(plan, _)| self.installed(plan)),
+            Ok(Placed::AtRestart) => set.iter().for_each(|(plan, _)| drop(self.held_for_restart(&plan.id, &plan.version))),
             Err(error) if set.len() == 1 => self.could_not_start(&set[0].0, error),
             Err(_) => {
                 for (plan, package) in &set {
                     match install_many(ctx, vec![package.as_path()]).await {
-                        Ok(()) => self.installed(plan),
+                        Ok(Placed::Now) => self.installed(plan),
+                        Ok(Placed::AtRestart) => drop(self.held_for_restart(&plan.id, &plan.version)),
                         Err(error) => self.could_not_start(plan, error),
                     }
                 }
@@ -935,14 +962,25 @@ fn is_own_build(version: &str) -> bool {
     version.split('+').nth(1).is_some_and(|tag| tag.starts_with("dev."))
 }
 
-async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<(), String> {
+/// The frame's answer when a frame update is staged: it keeps the packages for the restart.
+const RESTART_PENDING: &str = "restart_pending";
+
+/// Where an installed package runs.
+enum Placed {
+    Now,
+    /// The frame keeps it; the restart installs it before any plugin starts.
+    AtRestart,
+}
+
+async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<Placed, String> {
     let params = InstallManyParams {
         id: format!("update-{}", uuid::Uuid::new_v4().simple()),
         paths: packages.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
     };
     match call::<InstallManyResult>(ctx, frame_methods::PLUGINS_INSTALL_MANY, json!(params)).await {
-        Ok(result) if result.ok => Ok(()),
+        Ok(result) if result.ok => Ok(Placed::Now),
         Ok(result) => Err(result.error.unwrap_or_else(|| "the install was rolled back".into())),
+        Err(error) if error.code == RESTART_PENDING => Ok(Placed::AtRestart),
         Err(error) => Err(error.message),
     }
 }
