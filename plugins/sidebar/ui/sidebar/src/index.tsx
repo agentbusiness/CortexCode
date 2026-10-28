@@ -1,7 +1,9 @@
 /**
  * workbench.sidebar@1 — projects, and under each project its conversations and its agents with
  * their live state. Everything listed runs in parallel; selecting a row only changes what the
- * other regions show. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
+ * other regions show. The projects are the whole network's: this computer's, then the joined
+ * computers' (`mesh.projects`), each with its description; another computer's name is set in blue
+ * and its rows talk to that computer, where the project's sessions, files and memory live. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
  * action dropped in). A notification CortexCode showed only here — because its window was in front,
  * or because macOS did not show it — marks its session's row until the session is opened.
  */
@@ -9,13 +11,14 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Caret,
+  ComputerScope,
   ago,
   definePlugin,
   errorMessage,
-  useClient,
   useEvent,
   useHost,
   useNow,
+  runtimeFor,
   useProjects,
   useQuery,
   useSelection,
@@ -132,10 +135,62 @@ export function orderProjects(projects: readonly Project[], sessions: readonly S
   return [...projects].sort((a, b) => Number(active.has(b.id)) - Number(active.has(a.id)) || time(b) - time(a));
 }
 
+/** A project of the network as `mesh.projects` answers it (`node` empty: this computer). */
+interface NetworkProject {
+  id: string;
+  name: string;
+  description: string;
+  created_ms: number;
+  node: string;
+  computer: string;
+  reachable: boolean;
+}
+
+/** One project in the list: this computer's (`node` null) or a joined computer's. */
+interface ProjectRow {
+  key: string;
+  project: Project;
+  node: string | null;
+  computer: string | null;
+  description: string;
+  reachable: boolean;
+}
+
+/** This computer's projects in their order, then the joined computers' (newest first). */
+export function projectRows(own: readonly Project[], network: readonly NetworkProject[]): ProjectRow[] {
+  const described = new Map(network.filter((entry) => !entry.node).map((entry) => [entry.id, entry.description]));
+  const rows: ProjectRow[] = own.map((project) => ({ key: project.id, project, node: null, computer: null, description: described.get(project.id) ?? '', reachable: true }));
+  const remote = network.filter((entry) => entry.node).sort((a, b) => b.created_ms - a.created_ms);
+  for (const entry of remote) {
+    rows.push({
+      key: `${entry.node}:${entry.id}`,
+      project: { id: entry.id, name: entry.name, root: '', created_ms: entry.created_ms } as Project,
+      node: entry.node,
+      computer: entry.computer,
+      description: entry.description,
+      reachable: entry.reachable,
+    });
+  }
+  return rows;
+}
+
+/** The sidebar talks to this computer; each joined computer's project row to its own computer. */
+function SidebarRoot() {
+  return (
+    <ComputerScope node={null}>
+      <Sidebar />
+    </ComputerScope>
+  );
+}
+
 function Sidebar() {
-  const client = useClient();
   const host = useHost();
   const projects = useProjects();
+  const network = useQuery<NetworkProject[]>(
+    'mesh.projects',
+    async (c) => (await c.call<{ projects: NetworkProject[] }>('mesh.projects', {}))?.projects ?? [],
+    { topics: ['mesh.changed'] },
+  );
   // Every session once, for the order of the projects (a project with work going on is on top).
   const everything = useQuery<Session[]>(
     'frame.session.list',
@@ -161,13 +216,14 @@ function Sidebar() {
     restored.current = true;
   }, [projects.data, scrollTop]);
 
-  const newChat = async (projectId: string) => {
+  const newChat = async (row: ProjectRow) => {
+    const projectId = row.project.id;
     setError(null);
-    setBusy(`new:${projectId}`);
+    setBusy(`new:${row.key}`);
     try {
-      const session = await client.call<Session>('frame.session.create', { project_id: projectId, kind: 'chat', title: '' });
-      setCollapsed((current) => current.filter((id) => id !== projectId));
-      selection.select(projectId, session.id);
+      const session = await runtimeFor(row.node).client.call<Session>('frame.session.create', { project_id: projectId, kind: 'chat', title: '' });
+      setCollapsed((current) => current.filter((key) => key !== row.key));
+      selection.select(projectId, session.id, row.node);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -177,23 +233,23 @@ function Sidebar() {
 
   // Deleting: the frame deletes the conversation (and the ones started from it) or the project with
   // all of its conversations; each plugin drops its own data about them. The folder stays on disk.
-  const deleteSession = async (projectId: string, sessionId: string) => {
+  const deleteSession = async (row: ProjectRow, sessionId: string) => {
     setError(null);
     try {
-      await client.call('frame.session.delete', { id: sessionId });
-      if (selection.sessionId === sessionId) selection.select(projectId, null);
+      await runtimeFor(row.node).client.call('frame.session.delete', { id: sessionId });
+      if (selection.sessionId === sessionId) selection.select(row.project.id, null, row.node);
       await everything.refresh();
     } catch (cause) {
       setError(errorMessage(cause));
       throw cause;
     }
   };
-  const deleteProject = async (projectId: string) => {
+  const deleteProject = async (row: ProjectRow) => {
     setError(null);
     try {
-      await client.call('frame.project.delete', { id: projectId });
-      if (selection.projectId === projectId) selection.select(null, null);
-      await Promise.all([projects.refresh(), everything.refresh()]);
+      await runtimeFor(row.node).client.call('frame.project.delete', { id: row.project.id });
+      if (isSelected(row)) selection.select(null, null, null);
+      await Promise.all([projects.refresh(), everything.refresh(), network.refresh()]);
     } catch (cause) {
       setError(errorMessage(cause));
       throw cause;
@@ -204,19 +260,26 @@ function Sidebar() {
   useEvent('session.deleted', () => void everything.refresh());
 
   const [strip, setStrip] = useShared<boolean>('layout.sidebarCollapsed', false);
-  const list = useMemo(() => orderProjects(projects.data ?? [], everything.data ?? []), [projects.data, everything.data]);
+  const list = useMemo(
+    () => projectRows(orderProjects(projects.data ?? [], everything.data ?? []), network.data ?? []),
+    [projects.data, everything.data, network.data],
+  );
+  /** A row is selected when both the project and its computer are. */
+  function isSelected(row: ProjectRow): boolean {
+    return selection.projectId === row.project.id && (selection.node ?? null) === row.node;
+  }
   if (strip) {
     return (
       <Strip
-        projects={list}
+        rows={list.filter((row) => row.reachable)}
         notices={notices}
-        selectedProject={selection.projectId}
+        isSelected={isSelected}
         selectedSession={selection.sessionId}
-        onSelect={(projectId, sessionId) => selection.select(projectId, sessionId)}
-        onExpand={(projectId) => {
-          if (projectId) {
-            setCollapsed((current) => current.filter((id) => id !== projectId));
-            if (projectId !== selection.projectId) selection.select(projectId, null);
+        onSelect={(row, sessionId) => selection.select(row.project.id, sessionId, row.node)}
+        onExpand={(row) => {
+          if (row) {
+            setCollapsed((current) => current.filter((key) => key !== row.key));
+            if (!isSelected(row)) selection.select(row.project.id, null, row.node);
           }
           restored.current = false;
           setStrip(false);
@@ -237,22 +300,23 @@ function Sidebar() {
             <p className="empty-line cx-flush">No project yet. Open a folder: CortexCode indexes it into the code graph, and conversations and agents work inside it.</p>
           </div>
         )}
-        {list.map((project) => (
-          <ProjectBlock
-            key={project.id}
-            project={project}
-            notices={notices}
-            open={!collapsed.includes(project.id)}
-            onToggle={() => setCollapsed((current) => (current.includes(project.id) ? current.filter((id) => id !== project.id) : [...current, project.id]))}
-            selectedProject={selection.projectId}
-            selectedSession={selection.sessionId}
-            onSelect={(sessionId) => selection.select(project.id, sessionId)}
-            onNewChat={() => void newChat(project.id)}
-            creating={busy === `new:${project.id}`}
-            onDeleteSession={(sessionId) => deleteSession(project.id, sessionId)}
-            onDelete={() => deleteProject(project.id)}
-          />
-        ))}
+        {list.map((row) => row.reachable ? (
+          <ComputerScope key={row.key} node={row.node}>
+            <ProjectBlock
+              row={row}
+              notices={row.node ? NO_NOTICES : notices}
+              open={!collapsed.includes(row.key)}
+              onToggle={() => setCollapsed((current) => (current.includes(row.key) ? current.filter((key) => key !== row.key) : [...current, row.key]))}
+              selected={isSelected(row)}
+              selectedSession={isSelected(row) ? selection.sessionId : null}
+              onSelect={(sessionId) => selection.select(row.project.id, sessionId, row.node)}
+              onNewChat={() => void newChat(row)}
+              creating={busy === `new:${row.key}`}
+              onDeleteSession={(sessionId) => deleteSession(row, sessionId)}
+              onDelete={() => deleteProject(row)}
+            />
+          </ComputerScope>
+        ) : <AwayProject key={row.key} row={row} />)}
       </div>
       <div className="cx-sidebar-foot">
         <button type="button" className="detent cx-sidebar-fold" data-action="collapse-sidebar"
@@ -264,6 +328,35 @@ function Sidebar() {
   );
 }
 
+const NO_NOTICES = new Map<string, Notice>();
+
+/** A joined computer's project while that computer is away: greyed, nothing to open. */
+function AwayProject({ row }: { row: ProjectRow }) {
+  return (
+    <section className="cx-proj cx-proj-remote cx-proj-away" data-project={row.project.id} data-node={row.node ?? undefined}
+      title={`${row.computer} is not reachable now; its projects open again when it is back`}>
+      <div className="cx-proj-h">
+        <span className="cx-proj-toggle cx-proj-fold"><Caret dir="right" className="cx-caret" /></span>
+        <span className="cx-proj-toggle"><span className="cx-proj-name">{row.project.name}</span></span>
+      </div>
+      <ProjectAbout row={row} away />
+    </section>
+  );
+}
+
+/** Under the name: the computer it lives on (another one's), then its description. */
+function ProjectAbout({ row, away = false }: { row: ProjectRow; away?: boolean }) {
+  if (!row.computer && !row.description) return null;
+  const host = row.computer ? (away ? `${row.computer}, not reachable` : row.computer) : null;
+  return (
+    <p className="cx-proj-about" title={[host, row.description].filter(Boolean).join(' — ')}>
+      {host && <span className="cx-proj-host">{host}</span>}
+      {host && row.description && <span className="cx-proj-sep"> · </span>}
+      {row.description}
+    </p>
+  );
+}
+
 /**
  * The sidebar folded to a rail of marks: New chat at the top, then per project (a hairline apart)
  * one compact mark per conversation and agent: a short code from its own title (an agent's: @ and
@@ -271,22 +364,24 @@ function Sidebar() {
  * the state. A mark opens its conversation. Show, at the foot where the open sidebar has Fold,
  * opens the sidebar again.
  */
-function Strip({ projects, notices, selectedProject, selectedSession, onSelect, onExpand }: {
-  projects: Project[];
+function Strip({ rows, notices, isSelected, selectedSession, onSelect, onExpand }: {
+  rows: ProjectRow[];
   notices: Map<string, Notice>;
-  selectedProject: string | null;
+  isSelected: (row: ProjectRow) => boolean;
   selectedSession: string | null;
-  onSelect: (projectId: string, sessionId: string | null) => void;
-  onExpand: (projectId: string | null) => void;
+  onSelect: (row: ProjectRow, sessionId: string | null) => void;
+  onExpand: (row: ProjectRow | null) => void;
 }) {
   const host = useHost();
   return (
     <div className="cx-sidebar cx-strip" data-build={__CORTEX_BUILD__} data-mode="strip">
       <host.Slots name="sidebar.actions@1" className="cx-strip-action" props={{ compact: true }} />
       <div className="cx-strip-scroll">
-        {projects.map((project) => (
-          <StripProject key={project.id} project={project} notices={notices} selected={selectedProject === project.id} selectedSession={selectedSession}
-            onSelect={(sessionId) => onSelect(project.id, sessionId)} />
+        {rows.map((row) => (
+          <ComputerScope key={row.key} node={row.node}>
+            <StripProject project={row.project} remote={Boolean(row.node)} notices={row.node ? NO_NOTICES : notices} selected={isSelected(row)}
+              selectedSession={isSelected(row) ? selectedSession : null} onSelect={(sessionId) => onSelect(row, sessionId)} />
+          </ComputerScope>
         ))}
       </div>
       <div className="cx-sidebar-foot cx-strip-foot">
@@ -299,8 +394,9 @@ function Strip({ projects, notices, selectedProject, selectedSession, onSelect, 
   );
 }
 
-function StripProject({ project, notices, selected, selectedSession, onSelect }: {
+function StripProject({ project, remote, notices, selected, selectedSession, onSelect }: {
   project: Project;
+  remote: boolean;
   notices: Map<string, Notice>;
   selected: boolean;
   selectedSession: string | null;
@@ -316,7 +412,7 @@ function StripProject({ project, notices, selected, selectedSession, onSelect }:
   const chats = orderSessions(all.filter((session) => session.kind !== 'agent'));
   const agentRows = mergeAgents(agents.data ?? [], all.filter((session) => session.kind === 'agent'));
   return (
-    <section className={`cx-strip-project${selected ? ' on' : ''}`} data-strip-project-block={project.id} aria-label={project.name}>
+    <section className={`cx-strip-project${selected ? ' on' : ''}${remote ? ' cx-strip-remote' : ''}`} data-strip-project-block={project.id} aria-label={project.name}>
       {chats.map((session) => {
         const title = session.title.trim() || 'New conversation';
         const notice = selectedSession === session.id ? undefined : notices.get(session.id);
@@ -346,12 +442,12 @@ function StripProject({ project, notices, selected, selectedSession, onSelect }:
   );
 }
 
-function ProjectBlock({ project, notices, open, onToggle, selectedProject, selectedSession, onSelect, onNewChat, creating, onDeleteSession, onDelete }: {
-  project: Project;
+function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession, onSelect, onNewChat, creating, onDeleteSession, onDelete }: {
+  row: ProjectRow;
   notices: Map<string, Notice>;
   open: boolean;
   onToggle: () => void;
-  selectedProject: string | null;
+  selected: boolean;
   selectedSession: string | null;
   onSelect: (sessionId: string | null) => void;
   onNewChat: () => void;
@@ -359,6 +455,7 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
   onDeleteSession: (sessionId: string) => Promise<void>;
   onDelete: () => Promise<void>;
 }) {
+  const { project } = row;
   const sessions = useSessions(project.id);
   useEvent('session.deleted', (_topic, data) => {
     if ((data as { project_id?: string } | null)?.project_id === project.id) void sessions.refresh();
@@ -377,19 +474,20 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
   const records = agents.data ?? [];
   const running = all.filter((session) => session.status === 'running').length;
   const now = useNow(30_000, true);
-  const isSelected = selectedProject === project.id;
+  const isSelected = selected;
+  const where = row.computer ? `on ${row.computer}` : project.root;
 
   // An agent is one row: its record (status, task) joined with its session (live state), by name.
   const agentRows = mergeAgents(records, agentSessions);
 
   return (
-    <section className={`cx-proj${isSelected ? ' on' : ''}`} data-project={project.id}>
+    <section className={`cx-proj${isSelected ? ' on' : ''}${row.node ? ' cx-proj-remote' : ''}`} data-project={project.id} data-node={row.node ?? undefined}>
       <div className="cx-proj-h">
         <button type="button" className="cx-proj-toggle cx-proj-fold" aria-expanded={open} onClick={onToggle} aria-label={`${open ? 'Fold' : 'Unfold'} ${project.name}`} title={open ? 'Fold this project' : 'Unfold this project'}>
           <Caret dir={open ? 'down' : 'right'} className="cx-caret" />
         </button>
         <button type="button" className="cx-proj-toggle cx-proj-open" onClick={() => onSelect(null)} aria-pressed={isSelected && !selectedSession}
-          title={`${project.root} — show this project without a conversation`}>
+          title={`${where} — show this project without a conversation`}>
           <span className="cx-proj-name">{project.name}</span>
         </button>
         <span className="grow" />
@@ -397,11 +495,14 @@ function ProjectBlock({ project, notices, open, onToggle, selectedProject, selec
         <DeleteButton what="project" detail="its conversations, agents, code graph and caches go; the folder stays on disk"
           confirm={{
             title: `Delete ${project.name}?`,
-            body: `Its conversations, agents, code graph and caches are deleted from CortexCode. The folder stays on disk: ${project.root}`,
+            body: row.computer
+              ? `Its conversations, agents, code graph and caches are deleted from CortexCode on ${row.computer}. The folder stays on its disk.`
+              : `Its conversations, agents, code graph and caches are deleted from CortexCode. The folder stays on disk: ${project.root}`,
             action: 'Delete project',
           }}
           onDelete={onDelete} />
       </div>
+      <ProjectAbout row={row} />
       {open && (
         <>
           <ul className="lst cx-sessions" aria-label={`Conversations in ${project.name}`}>
@@ -606,4 +707,4 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
   return [...rows.values()].sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
 }
 
-export default definePlugin({ slot: 'workbench.sidebar@1', component: Sidebar });
+export default definePlugin({ slot: 'workbench.sidebar@1', component: SidebarRoot });

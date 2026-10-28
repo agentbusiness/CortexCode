@@ -2,8 +2,9 @@
 //! turn or an agent asks once (`mesh.place`), and from then on the frame routes that session's
 //! model calls (its `cache_key` is the session id) to the chosen computer until `mesh.place.end`.
 //!
-//! The order is fixed: this computer first, then the local network, then remote members; within
-//! a tier the higher variant wins (medium over small), then the faster one. Only a model of the
+//! The best free model wins, wherever it runs: the strongest first (of one family, the larger
+//! weights: more bits per weight or more parameters), then this computer, the local network,
+//! remote members, then the faster one. Only a model of the
 //! same family as this computer's counts. A model is taken only when it is free: running nothing
 //! (an agent must not slow another's tokens down) or, for a person's turn, nothing a person
 //! waits for (the engine gives a person's request every step over agent work). A person's turn
@@ -12,7 +13,7 @@
 use crate::borrow::Client;
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{Capacity, PlaceParams, Placement};
-use cc_protocol::contracts::model::{ModelInfo, Priority, SlotsResult};
+use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, Priority, SlotsResult};
 use cc_protocol::{RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -31,26 +32,27 @@ pub struct Placements {
     clients: Mutex<HashMap<String, Arc<Client>>>,
 }
 
-struct Candidate {
-    node: String,
+pub(crate) struct Candidate {
+    /// None: this computer.
+    pub(crate) node: Option<String>,
     name: String,
     model_id: String,
-    /// 1 local network, 2 remote.
+    /// 0 this computer, 1 local network, 2 remote.
     tier: u8,
-    variant: u8,
+    /// The model's files on disk: within one family, the larger the stronger.
+    pub(crate) weights: u64,
     tok_s: f64,
 }
 
-fn variant_rank(variant: &str) -> u8 {
-    match variant {
-        "medium" => 2,
-        "small" => 1,
-        _ => 0,
-    }
+/// Best first: the strongest model, then the nearest computer, then the faster one.
+pub(crate) fn best_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    b.weights.cmp(&a.weights).then(a.tier.cmp(&b.tier)).then(b.tok_s.partial_cmp(&a.tok_s).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 struct Local {
     family: String,
+    weights: u64,
+    tok_s: f64,
     busy: u32,
     busy_foreground: u32,
     queued: u32,
@@ -67,8 +69,11 @@ impl Mesh {
         }
         let info: ModelInfo = serde_json::from_value(ctx.call("model.info", json!({})).await.ok()?).ok()?;
         let slots: SlotsResult = serde_json::from_value(ctx.call("model.slots", json!({})).await.ok()?).ok()?;
+        let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
         Some(Local {
             family: info.family,
+            weights: info.file_bytes,
+            tok_s,
             busy: slots.busy,
             busy_foreground: slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(Priority::Foreground)).count() as u32,
             queued: slots.queued,
@@ -77,14 +82,14 @@ impl Mesh {
     }
 
     /// Reachable members with a model of `family` (any family when None) that no session of
-    /// ours is placed on, best first. Whether the model is free now is asked live ([`Self::is_free`]):
-    /// a card is up to 15 s old.
-    fn candidates(&self, family: Option<&str>) -> Vec<Candidate> {
+    /// ours is placed on. Whether the model is free now, and how strong it is, are asked live
+    /// ([`Self::free_weights`]): a card is up to 15 s old.
+    pub(crate) fn candidates(&self, family: Option<&str>) -> Vec<Candidate> {
         let me = self.me.hex();
         let cards = lock(&self.cards).clone();
         let conns = self.connections();
         let placed = lock(&self.placements.placed).clone();
-        let mut found: Vec<Candidate> = self
+        let found: Vec<Candidate> = self
             .members()
             .into_values()
             .filter(|member| member.node != me)
@@ -99,28 +104,41 @@ impl Mesh {
                     return None;
                 }
                 let (path, _) = Self::path_of(connection);
-                Some(Candidate { node: member.node.clone(), name: member.name.clone(), model_id: model.model_id.clone(), tier: if path == "lan" { 1 } else { 2 }, variant: variant_rank(&model.variant), tok_s: model.tok_s })
+                Some(Candidate { node: Some(member.node.clone()), name: member.name.clone(), model_id: model.model_id.clone(), tier: if path == "lan" { 1 } else { 2 }, weights: 0, tok_s: model.tok_s })
             })
             .collect();
-        found.sort_by(|a, b| a.tier.cmp(&b.tier).then(b.variant.cmp(&a.variant)).then(b.tok_s.partial_cmp(&a.tok_s).unwrap_or(std::cmp::Ordering::Equal)));
         found
     }
 
-    /// Whether a member's model runs nothing now (asked live; its card may be 15 s old).
-    async fn is_free(&self, node: &str) -> bool {
-        let fresh = self.call_member(node, "mesh.card", json!({}), None, CancellationToken::new()).await.ok();
-        fresh.as_ref().and_then(|card| card.get("model")).is_some_and(|model| model.get("slots_busy").and_then(Value::as_u64) == Some(0) && model.get("queued").and_then(Value::as_u64) == Some(0))
+    /// The size of a member's model when it runs nothing now (None: busy or not answering).
+    pub(crate) async fn free_weights(&self, node: &str) -> Option<u64> {
+        let fresh = self.call_member(node, "mesh.card", json!({}), None, CancellationToken::new()).await.ok()?;
+        let model = fresh.get("model")?;
+        if model.get("slots_busy").and_then(Value::as_u64) != Some(0) || model.get("queued").and_then(Value::as_u64) != Some(0) {
+            return None;
+        }
+        let info: ModelInfo = serde_json::from_value(self.call_member(node, "model.info", json!({}), None, CancellationToken::new()).await.ok()?).ok()?;
+        Some(info.file_bytes)
+    }
+
+    /// Free members' models of `family`, best first.
+    async fn free_candidates(&self, family: Option<&str>) -> Vec<Candidate> {
+        let mut free = Vec::new();
+        for mut candidate in self.candidates(family) {
+            let Some(node) = candidate.node.clone() else { continue };
+            if let Some(weights) = self.free_weights(&node).await {
+                candidate.weights = weights;
+                free.push(candidate);
+            }
+        }
+        free.sort_by(best_first);
+        free
     }
 
     /// How many members could take a session's model calls now.
     pub async fn capacity(&self) -> Capacity {
         let family = self.local_model().await.map(|local| local.family);
-        let mut names = Vec::new();
-        for candidate in self.candidates(family.as_deref()) {
-            if self.is_free(&candidate.node).await {
-                names.push(candidate.name);
-            }
-        }
+        let names: Vec<String> = self.free_candidates(family.as_deref()).await.into_iter().map(|candidate| candidate.name).collect();
         Capacity { free: names.len() as u32, names }
     }
 
@@ -141,6 +159,8 @@ impl Mesh {
                 self.place_end(&params.session_id).await;
             }
             let local = self.local_model().await;
+            let family = local.as_ref().map(|local| local.family.clone());
+            let mut options = self.free_candidates(family.as_deref()).await;
             if !params.remote_only
                 && let Some(local) = &local
             {
@@ -148,19 +168,19 @@ impl Mesh {
                 // agent: free only when nothing runs here at all.
                 let free = if params.wait { local.busy_foreground == 0 && local.queued_foreground == 0 } else { local.busy == 0 && local.queued == 0 };
                 if free {
-                    return Ok(Placement { node: None, name: self.name(), model_id: String::new(), tier: "local".to_owned() });
+                    options.push(Candidate { node: None, name: self.name(), model_id: String::new(), tier: 0, weights: local.weights, tok_s: local.tok_s });
+                    options.sort_by(best_first);
                 }
             }
-            let family = local.as_ref().map(|local| local.family.clone());
-            for candidate in self.candidates(family.as_deref()) {
-                if !self.is_free(&candidate.node).await {
-                    continue;
-                }
-                match self.bind(&params.session_id, &candidate.node).await {
+            for candidate in options {
+                let Some(node) = candidate.node else {
+                    return Ok(Placement { node: None, name: candidate.name, model_id: String::new(), tier: "local".to_owned() });
+                };
+                match self.bind(&params.session_id, &node).await {
                     Ok(()) => {
                         tracing::info!(session = %params.session_id, member = %candidate.name, "a session's model calls go to a member");
                         self.notify("placed");
-                        return Ok(Placement { node: Some(candidate.node), name: candidate.name, model_id: candidate.model_id, tier: if candidate.tier == 1 { "lan".to_owned() } else { "remote".to_owned() } });
+                        return Ok(Placement { node: Some(node), name: candidate.name, model_id: candidate.model_id, tier: if candidate.tier == 1 { "lan".to_owned() } else { "remote".to_owned() } });
                     }
                     Err(error) => tracing::debug!(member = %candidate.name, %error, "could not route a session to a member"),
                 }

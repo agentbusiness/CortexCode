@@ -58,6 +58,13 @@ pub mod methods {
     /// now (a free model of this computer's family). The chat flow tells its planner the number,
     /// nothing more.
     pub const CAPACITY: &str = "mesh.capacity";
+    /// `{}` -> [`super::ProjectsResult`]: every project of the network, this computer's and every
+    /// member's, with its description and computer. A project is worked on at its own computer.
+    pub const PROJECTS: &str = "mesh.projects";
+    /// [`super::NodeParams`] -> [`super::Link`]: a local address that leads to a member's frame
+    /// (each connection to it is carried over the mesh), and the token that frame takes. The
+    /// window talks to the computer of the project it shows through it.
+    pub const LINK: &str = "mesh.link";
 }
 
 pub mod topics {
@@ -134,7 +141,44 @@ pub struct Card {
     /// its code already is.
     #[serde(default)]
     pub repositories: Vec<String>,
+    /// The projects open here, worked on here from any computer.
+    #[serde(default)]
+    pub projects: Vec<ProjectCard>,
     pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectCard {
+    pub id: String,
+    pub name: String,
+    /// The project's description from its memory (empty until it is written).
+    #[serde(default)]
+    pub description: String,
+    pub created_ms: u64,
+}
+
+/// A project of the network and the computer it lives on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct NetworkProject {
+    #[serde(flatten)]
+    pub project: ProjectCard,
+    /// The computer (hex); empty: this one.
+    pub node: String,
+    pub computer: String,
+    /// The computer is connected now (always true for this one's).
+    pub reachable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectsResult {
+    pub projects: Vec<NetworkProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Link {
+    /// `http://127.0.0.1:<port>`: the member's frame, reached over the mesh.
+    pub url: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

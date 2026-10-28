@@ -1,9 +1,10 @@
 /**
- * The workbench's selection: which project and session the person is looking at. It lives in the
- * shared durable store, so every region (and every version of every region) agrees on it.
+ * The workbench's selection: which project and session the person is looking at, and the computer
+ * the project lives on (`projectNode`, null: this one; the regions then talk to that computer). It
+ * lives in the shared durable store, so every region (and every version of every region) agrees.
  */
 
-import { runtime, useQuery, useShared } from './runtime';
+import { ownRuntime, runtime, useQuery, useShared } from './runtime';
 import type { Client } from './rpc';
 
 /** Bring a right-pane view to the front and open the pane (see `showPane`). */
@@ -41,16 +42,20 @@ export function useSessions(projectId: string | null) {
 export interface Selection {
   projectId: string | null;
   sessionId: string | null;
+  /** The computer of the selected project (null: this one). */
+  node: string | null;
   project: Project | undefined;
   session: Session | undefined;
   /** The directory the selected session works in (an agent's clone, or the project root). */
   workspace: string | null;
-  select(projectId: string | null, sessionId: string | null): void;
+  /** `node`: the project's computer (null: this one); left out, the computer stays. */
+  select(projectId: string | null, sessionId: string | null, node?: string | null): void;
 }
 
 export function useSelection(): Selection {
   const [projectId, setProjectId] = useShared<string | null>('projectId', null);
   const [sessionId, setSessionId] = useShared<string | null>('sessionId', null);
+  const [node, setNode] = useShared<string | null>('projectNode', null);
   const projects = useProjects();
   const sessions = useSessions(projectId);
   const project = projects.data?.find((entry) => entry.id === projectId);
@@ -59,10 +64,12 @@ export function useSelection(): Selection {
   return {
     projectId,
     sessionId,
+    node,
     project,
     session,
     workspace,
-    select(nextProject, nextSession) {
+    select(nextProject, nextSession, nextNode) {
+      if (nextNode !== undefined) setNode(nextNode);
       setProjectId(nextProject);
       setSessionId(nextSession);
     },
@@ -111,9 +118,11 @@ export interface ChatFocus {
   check?: string | null;
 }
 
-/** Show a target: select, bring forward, scroll. */
+/** Show a target: select, bring forward, scroll. A target comes from this computer (a
+ * notification, the shell), so it is shown from this computer's frame. */
 export async function openTarget(target: Target): Promise<void> {
-  const { client, state } = runtime();
+  const { client, state } = ownRuntime();
+  if (target.project_id || target.session_id) state.set('workbench', 'projectNode', null);
   let projectId = target.project_id ?? null;
   let session: Session | null = null;
   if (target.session_id && (!projectId || target.path)) {

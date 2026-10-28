@@ -66,7 +66,8 @@ function importMapPlugin() {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob: https://avatars.githubusercontent.com",
     "font-src 'self'",
-    "connect-src 'self'",
+    // Another computer's frame is reached through a link the mesh opens on a local port.
+    "connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:*",
     "object-src 'none'",
     "base-uri 'none'",
     "frame-src 'none'",

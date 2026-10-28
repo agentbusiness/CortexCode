@@ -22,11 +22,11 @@ swap = "blue_green"
 provides = [
   "mesh.status", "mesh.pair.start", "mesh.pair.join", "mesh.pair.cancel", "mesh.members", "mesh.revoke",
   "mesh.leave", "mesh.name", "mesh.card", "mesh.peers", "mesh.call", "mesh.place", "mesh.place.end",
-  "mesh.capacity", "mesh.runner", "mesh.tree.files", "mesh.tree.apply",
+  "mesh.capacity", "mesh.runner", "mesh.tree.files", "mesh.tree.apply", "mesh.projects", "mesh.link",
 ]
-subscribes = ["model.", "session.changed"]
+subscribes = ["model.", "session.changed", "tools.timeline", "project.", "memory.knowledge.changed"]
 publishes = ["mesh.changed"]
-uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "model.info", "model.slots", "model.metrics", "agents.scheduler", "container.list"]
+uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "model.info", "model.slots", "model.metrics", "agents.scheduler", "container.list"]
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]

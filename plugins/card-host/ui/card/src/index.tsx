@@ -9,9 +9,20 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { definePlugin, useCodeTarget, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord, type VcsStatus } from '@cortex/sdk';
+import { ComputerScope, definePlugin, useCodeTarget, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord, type VcsStatus } from '@cortex/sdk';
 import { cardSections } from './sections';
 import './card.css';
+
+/** The card is the shown project's: it talks to that project's computer, though the band it sits
+ * in is this computer's. */
+function CardRoot() {
+  const [node] = useShared<string | null>('projectNode', null);
+  return (
+    <ComputerScope node={node}>
+      <Card />
+    </ComputerScope>
+  );
+}
 
 function Card() {
   const host = useHost();
@@ -102,7 +113,8 @@ function Card() {
           </div>
         </div>
       )}
-      {settings !== null && <host.Slot name="settings.host@1" className="cx-settings-layer" props={{ onClose: closeSettings }} />}
+      {/* Settings are this computer's, whichever computer's project is shown. */}
+      {settings !== null && <ComputerScope node={null}><host.Slot name="settings.host@1" className="cx-settings-layer" props={{ onClose: closeSettings }} /></ComputerScope>}
     </div>
   );
 }
@@ -142,4 +154,4 @@ function Gear() {
   );
 }
 
-export default definePlugin({ slot: 'workbench.band@1', component: Card });
+export default definePlugin({ slot: 'workbench.band@1', component: CardRoot });

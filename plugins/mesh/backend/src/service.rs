@@ -8,6 +8,7 @@ use cc_protocol::contracts::mesh::{
     CallParams, Card, Changed, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, RunnerParams,
     TreeApplyParams, TreeFilesParams, methods, topics,
 };
+use cc_protocol::contracts::model::ModelInfo;
 use cc_protocol::contracts::now_ms;
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use iroh::Endpoint;
@@ -40,8 +41,10 @@ pub const PROVIDES: &[&str] = &[
     methods::PLACE,
     methods::PLACE_END,
     methods::CAPACITY,
+    methods::PROJECTS,
+    methods::LINK,
 ];
-pub const SUBSCRIBES: &[&str] = &["model.", "session.changed", "tools.timeline"];
+pub const SUBSCRIBES: &[&str] = &["model.", "session.changed", "tools.timeline", "project.", "memory.knowledge.changed"];
 
 /// An invitation lives this long; it is used once.
 const PAIRING_WINDOW: Duration = Duration::from_secs(3600);
@@ -65,11 +68,6 @@ struct Pending {
     expires_ms: u64,
     invitation: String,
     attempts: u32,
-}
-
-struct ModelCardView {
-    free: u32,
-    tok_s: f64,
 }
 
 struct EventSub {
@@ -102,6 +100,7 @@ pub struct Mesh {
     event_subs: Mutex<Vec<EventSub>>,
     pub trees: crate::tree::Trees,
     pub placements: crate::place::Placements,
+    pub links: crate::projects::Links,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -147,6 +146,7 @@ impl Mesh {
             event_subs: Mutex::new(Vec::new()),
             trees: crate::tree::Trees::default(),
             placements: crate::place::Placements::default(),
+            links: crate::projects::Links::default(),
         }
     }
 
@@ -359,6 +359,11 @@ impl Mesh {
     pub fn card_received(&self, node: &str, card: Card) {
         lock(&self.cards).insert(node.to_owned(), card);
         self.notify("cards");
+    }
+
+    /// The card is built again on its next use.
+    pub fn forget_card(&self) {
+        *lock(&self.my_card) = None;
     }
 
     pub async fn my_card(&self) -> Card {
@@ -623,6 +628,12 @@ impl Mesh {
                 Ok(json!({}))
             }
             methods::CAPACITY => to_value(&self.capacity().await),
+            methods::PROJECTS => to_value(&self.projects().await),
+            methods::LINK => {
+                let mut params: NodeParams = parse_params(params)?;
+                params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
+                to_value(&self.link(&params.node).await?)
+            }
             other => Err(RpcError::unknown_method(other)),
         }
     }
@@ -638,8 +649,8 @@ impl Mesh {
     /// node has no model of its own serving (none installed, or disabled by the person) and a
     /// reachable member lends one with a free slot, that member's model serves here; when the
     /// member goes away, the borrow stops (and this node's own plugin, if it was set aside for
-    /// the borrow, serves again). A member whose model is the same family as the last one used
-    /// here is preferred, then the most free slots, then the fastest. Nothing to configure.
+    /// the borrow, serves again). The best model with a free slot is taken: the strongest (the
+    /// larger weights), then the nearest, then the fastest. Nothing to configure.
     /// (A node with a model of its own places single sessions instead: `place.rs`.)
     pub async fn auto_place(self: &std::sync::Arc<Self>) {
         let Some(ctx) = self.ctx.get().cloned() else { return };
@@ -662,21 +673,19 @@ impl Mesh {
         if own_model_active {
             return;
         }
-        let me = self.me.hex();
         let cards = lock(&self.cards).clone();
-        let conns = self.connections();
-        let mut candidates: Vec<(String, ModelCardView)> = self
-            .members()
-            .into_values()
-            .filter(|member| member.node != me && conns.contains_key(&member.node))
-            .filter_map(|member| cards.get(&member.node).and_then(|card| card.model.clone()).map(|model| (member.node.clone(), ModelCardView { free: model.slots.saturating_sub(model.slots_busy), tok_s: model.tok_s })))
-            .filter(|(_, model)| model.free > 0)
-            .collect();
-        if candidates.is_empty() {
-            return;
+        let mut candidates = Vec::new();
+        for mut candidate in self.candidates(None) {
+            let Some(node) = candidate.node.clone() else { continue };
+            let free = cards.get(&node).and_then(|card| card.model.as_ref()).is_some_and(|model| model.slots > model.slots_busy);
+            let info = self.call_member(&node, "model.info", json!({}), None, CancellationToken::new()).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());
+            if let (true, Some(info)) = (free, info) {
+                candidate.weights = info.file_bytes;
+                candidates.push(candidate);
+            }
         }
-        candidates.sort_by(|a, b| b.1.free.cmp(&a.1.free).then(b.1.tok_s.partial_cmp(&a.1.tok_s).unwrap_or(std::cmp::Ordering::Equal)));
-        let (node, _) = candidates.remove(0);
+        candidates.sort_by(crate::place::best_first);
+        let Some(node) = candidates.into_iter().next().and_then(|candidate| candidate.node) else { return };
         match self.start_borrow("model", &node).await {
             Ok(_) => tracing::info!(node = %&node[..node.len().min(10)], "no model of its own here: a member's model serves"),
             Err(error) => tracing::debug!(%error, "could not borrow a member's model"),
