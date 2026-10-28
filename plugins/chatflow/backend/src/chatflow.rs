@@ -769,26 +769,8 @@ impl Chatflow {
                     .environment(&host, &mut journal, &session, &run_id, &mode, Priority::Foreground, stops.clone(), stage.clone())
                     .await?;
                 ran = Some(env.clone());
-                // Where this turn's model calls run, decided by the host: this computer when its
-                // model is free for a person, else a joined computer's free model, else the first
-                // to free up (`mesh.place`; without the mesh plugin: here). A wait shows as a stage.
-                let placing = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "wait": true}));
-                tokio::pin!(placing);
-                let placed = tokio::select! {
-                    outcome = &mut placing => outcome,
-                    _ = tokio::time::sleep(Duration::from_millis(1500)) => {
-                        env.set_stage("wait");
-                        journal.set(status_seq, "stage", json!("wait")).await?;
-                        placing.await
-                    }
-                };
-                if let Ok(placement) = &placed
-                    && placement.get("node").and_then(Value::as_str).is_some()
-                {
-                    let name = placement.get("name").and_then(Value::as_str).unwrap_or_default();
-                    tracing::info!(session = %session_id, on = %name, "the turn's model calls run on a joined computer");
-                    journal.set(status_seq, "placed", json!(name)).await?;
-                }
+                // Where the turn's model calls run is decided per call (`llm::chat` claims the best
+                // free model in the network before each one); the run's end gives its place back.
                 let wake = journal.get(status_seq).is_some_and(|entry| str_field(&entry.data, "kind") == "wake");
                 if !wake {
                     return flow::run_turn(&env, &mut journal, status_seq).await;

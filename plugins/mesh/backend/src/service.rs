@@ -5,7 +5,7 @@ use crate::identity::Identity;
 use crate::members::{Entry, Log, log_path};
 use crate::pairing::JoinerRecord;
 use cc_protocol::contracts::mesh::{
-    CallParams, Card, Changed, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, RunnerParams,
+    CallParams, Card, Changed, ClaimParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, RunnerParams,
     TreeApplyParams, TreeFilesParams, methods, topics,
 };
 use cc_protocol::contracts::model::ModelInfo;
@@ -43,6 +43,8 @@ pub const PROVIDES: &[&str] = &[
     methods::CAPACITY,
     methods::PROJECTS,
     methods::LINK,
+    methods::CLAIM,
+    methods::RELEASE,
 ];
 pub const SUBSCRIBES: &[&str] = &["model.", "session.changed", "tools.timeline", "project.", "memory.knowledge.changed"];
 
@@ -101,6 +103,7 @@ pub struct Mesh {
     pub trees: crate::tree::Trees,
     pub placements: crate::place::Placements,
     pub links: crate::projects::Links,
+    pub claims: crate::claims::Claims,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -147,6 +150,7 @@ impl Mesh {
             trees: crate::tree::Trees::default(),
             placements: crate::place::Placements::default(),
             links: crate::projects::Links::default(),
+            claims: crate::claims::Claims::default(),
         }
     }
 
@@ -350,6 +354,7 @@ impl Mesh {
             drop(conns);
             lock(&self.event_subs).retain(|sub| sub.node != node);
             self.member_gone(node);
+            self.requester_gone(node);
             self.notify("peers");
         }
     }
@@ -624,11 +629,22 @@ impl Mesh {
             }
             methods::PLACE_END => {
                 let params: PlaceParams = parse_params(params)?;
+                self.claims_end(&params.session_id).await;
                 self.place_end(&params.session_id).await;
                 Ok(json!({}))
             }
             methods::CAPACITY => to_value(&self.capacity().await),
             methods::PROJECTS => to_value(&self.projects().await),
+            methods::CLAIM => {
+                let params: ClaimParams = parse_params(params)?;
+                self.start_granting();
+                to_value(&self.claim(params, cancel).await?)
+            }
+            methods::RELEASE => {
+                let params: ClaimParams = parse_params(params)?;
+                self.release(&params.session_id).await;
+                Ok(json!({}))
+            }
             methods::LINK => {
                 let mut params: NodeParams = parse_params(params)?;
                 params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;

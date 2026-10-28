@@ -8,6 +8,7 @@
 use crate::journal::{Journal, TextStream};
 use cc_protocol::contracts::chatflow::{LiveFields, topics as chatflow_topics};
 use cc_protocol::contracts::frame::kinds;
+use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{
     ChatDelta, ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, ToolSpec, methods as model_methods,
 };
@@ -68,6 +69,50 @@ pub struct Called {
 const CANCEL_GRACE: Duration = Duration::from_millis(300);
 /// Refusals (model plugin restarting or swapping) are retried this long.
 const REFUSED_WINDOW: Duration = Duration::from_secs(600);
+/// A claim that takes longer than this shows the turn's `wait` stage.
+const SHOW_WAIT: Duration = Duration::from_millis(1500);
+
+/// Before each model call: one use of the best free model in the network (`mesh.claim`; the frame
+/// then routes the call there). A run holds no model between its calls, and moves to a better
+/// one the moment it frees; a freed model goes to the oldest waiting run. A wait shows as the
+/// turn's `wait` stage. Without the mesh plugin the call runs here. Returns the computer's name.
+async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Priority, cancel: &CancellationToken) -> Result<Option<String>, RpcError> {
+    let params = json!({"kind": "model", "session_id": session, "foreground": priority == Priority::Foreground});
+    let Ok(mut call) = journal.host().ctx().call_stream(mesh_methods::CLAIM, params) else { return Ok(None) };
+    let status = journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::STATUS && entry.data.get("run_id").and_then(Value::as_str) == Some(run_id) && entry.data.get("state").and_then(Value::as_str) == Some("running"))
+        .last()
+        .map(|entry| (entry.seq, entry.data.get("stage").cloned().unwrap_or(Value::Null)));
+    let show = tokio::time::sleep(SHOW_WAIT);
+    tokio::pin!(show);
+    let mut shown = false;
+    loop {
+        tokio::select! {
+            item = call.next() => if item.is_none() { break },
+            _ = &mut show, if !shown => {
+                shown = true;
+                if let Some((seq, _)) = &status {
+                    journal.set(*seq, "stage", json!("wait")).await?;
+                }
+            }
+            _ = cancel.cancelled() => {
+                call.cancel();
+                return Err(RpcError::cancelled());
+            }
+        }
+    }
+    if shown && let Some((seq, stage)) = status {
+        journal.set(seq, "stage", stage).await?;
+    }
+    let placed = call.finish().await.ok();
+    Ok(placed.and_then(|placement| placement.get("name").and_then(Value::as_str).map(str::to_owned)))
+}
+
+/// After each model call (done, failed or cancelled): the model is free for the next run.
+async fn release(journal: &Journal, session: &str) {
+    let _ = journal.host().ctx().call(mesh_methods::RELEASE, json!({"kind": "model", "session_id": session})).await;
+}
 
 pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationToken) -> Result<Called, RpcError> {
     let mut thinking = thinking(&spec.effort);
@@ -84,7 +129,7 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
         sampling: spec.sampling,
         thinking,
         priority: spec.priority,
-        cache_key: Some(spec.cache_key),
+        cache_key: Some(spec.cache_key.clone()),
         stop: Vec::new(),
         max_tokens: None,
         idle_only: false,
@@ -93,11 +138,15 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
     dump(&spec.stage, &params);
     let started = Instant::now();
     let mut delay = Duration::from_millis(200);
+    let session = spec.cache_key.clone();
     loop {
         if cancel.is_cancelled() {
             return Err(RpcError::cancelled());
         }
-        match stream_once(journal, &params, &spec.stream, &spec.stage, cancel).await {
+        let computer = claim(journal, &session, &spec.stream.run_id, spec.priority, cancel).await?;
+        let outcome = stream_once(journal, &params, &spec.stream, &spec.stage, cancel).await;
+        release(journal, &session).await;
+        match outcome {
             Ok(mut called) => {
                 called.wall_ms = started.elapsed().as_millis() as u64;
                 let usage = &called.result.usage;
@@ -135,6 +184,7 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
                             "wall_ms": called.wall_ms,
                             "finish_reason": called.result.finish_reason,
                             "instance": journal.host().ctx().env.instance,
+                            "computer": computer,
                         }),
                     )
                     .await?;

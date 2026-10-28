@@ -65,6 +65,13 @@ pub mod methods {
     /// (each connection to it is carried over the mesh), and the token that frame takes. The
     /// window talks to the computer of the project it shows through it.
     pub const LINK: &str = "mesh.link";
+    /// [`super::ClaimParams`] -> [`super::Placement`]: a resource of the network for one use by a
+    /// session (`kind: model`: one model call). The best free one is taken; when none is free the
+    /// claim waits, and a freed resource goes to the oldest waiting run (a run's age is its first
+    /// claim, kept until `mesh.place.end`). The frame then routes the session's calls there.
+    pub const CLAIM: &str = "mesh.claim";
+    /// [`super::ClaimParams`] -> `{}`: the use is over; the resource is free for the next run.
+    pub const RELEASE: &str = "mesh.release";
 }
 
 pub mod topics {
@@ -387,6 +394,17 @@ pub struct PlaceParams {
     /// Only a member's model counts (this computer's agent queue is full).
     #[serde(default)]
     pub remote_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ClaimParams {
+    /// The resource's kind: `model`.
+    pub kind: String,
+    pub session_id: String,
+    /// A person waits for this use (a chat turn); on its own computer it does not wait for agent
+    /// work, which the engine puts behind it.
+    #[serde(default)]
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
