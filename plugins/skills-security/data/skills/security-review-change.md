@@ -5,7 +5,7 @@ Nothing changes in the project: the result is your reply. Fixing is separate wor
 ## 1. List the suspicious lines of the change
 
 ```bash
-export SA="$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py"
+export SA="$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py"
 python3 "$SA" scan --changed
 ```
 

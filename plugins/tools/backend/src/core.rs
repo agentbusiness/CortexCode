@@ -24,9 +24,6 @@ pub struct Config {
     pub shell_idle_s: u64,
     /// Explicit path of the `cx` binary.
     pub cx_path: Option<String>,
-    /// Explicit path of the `cortex-pack` binary (agents pack plugin folders into .ccplugin files
-    /// with it and install them with `cx plugin install`).
-    pub pack_path: Option<String>,
     /// Extra directories every command may write (beyond the workspace, CORTEX_HOME, temp dirs,
     /// package caches and the session venv), e.g. an IDE's build cache.
     pub sandbox_write_paths: Vec<String>,
@@ -46,7 +43,6 @@ impl Default for Config {
             bash: None,
             shell_idle_s: 1800,
             cx_path: None,
-            pack_path: None,
             sandbox_write_paths: Vec::new(),
             reference_wait: std::time::Duration::from_millis(5000),
         }
@@ -80,7 +76,6 @@ impl Config {
         }
         config.bash = value.get("bash").and_then(Value::as_str).map(str::to_owned);
         config.cx_path = value.get("cx_path").and_then(Value::as_str).map(str::to_owned);
-        config.pack_path = value.get("pack_path").and_then(Value::as_str).map(str::to_owned);
         config.sandbox_write_paths = value
             .get("sandbox_write_paths")
             .and_then(Value::as_array)
@@ -159,11 +154,6 @@ pub fn find_cx(configured: Option<&str>) -> Option<PathBuf> {
     find_program("cx", configured, "CORTEX_CX_BIN")
 }
 
-/// Locate `cortex-pack` the same way (`pack_path`, `CORTEX_PACK_BIN`, beside this executable).
-pub fn find_pack(configured: Option<&str>) -> Option<PathBuf> {
-    find_program("cortex-pack", configured, "CORTEX_PACK_BIN")
-}
-
 fn find_program(name: &str, configured: Option<&str>, env: &str) -> Option<PathBuf> {
     let explicit = configured.map(str::to_owned).or_else(|| std::env::var(env).ok().filter(|value| !value.is_empty()));
     if let Some(path) = explicit {
@@ -205,10 +195,8 @@ impl Core {
         if let Some(cx) = &cx {
             link_program(&bin_dir, "cx", cx);
         }
-        // Agents rewrite CortexCode itself: pack a plugin folder, then `cx plugin install` it.
-        if let Some(pack) = find_pack(config.pack_path.as_deref()) {
-            link_program(&bin_dir, "cortex-pack", &pack);
-        }
+        // CortexCode's code is not changed from its shells: the packer earlier versions put here goes.
+        let _ = std::fs::remove_file(bin_dir.join("cortex-pack"));
         let core = Arc::new(Core {
             home: home.to_path_buf(),
             data_dir: data_dir.to_path_buf(),

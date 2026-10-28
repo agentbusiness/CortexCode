@@ -22,8 +22,3 @@ build = ["npm", "run", "build"]
 dir = "ui/host"
 id = "settings-host.host"
 slot = "settings.host@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/settings-host"

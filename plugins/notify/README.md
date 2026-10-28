@@ -14,13 +14,12 @@ job ended, a plugin hot-swap failed or rolled back. One self-contained plugin fo
 ## How it works
 
 ```
-journal.<session> (status, tool_result needs_approval, approval and change pending, verification,
+journal.<session> (status, tool_result needs_approval, approval pending, verification,
                    agent_spawned, note purpose=merge)
 agents.changed (blocked) · plugin.swapped (ok=false / rolled_back) · tools.job (ended)
         │ structural trigger (field values only, no text interpretation)
         ▼
-names: frame.session.get, frame.project.get, memory.task.get, agents.list, tools.job.status,
-       frame.plugins.list (a change's plugins)
+names: frame.session.get, frame.project.get, memory.task.get, agents.list, tools.job.status
         ▼
 notification {kind, title, subtitle, body, key, target}
         ▼
@@ -40,11 +39,10 @@ delivery, decided at delivery time from the latest fresh focus report:
   `conflict`, `spawned`, `job`, `swap_failed`, `report`, `info`. Titles say the outcome and
   the task (or session, or agent); the subtitle is `project · agent`; the body is the reason
   (status detail, the approval text, failing checks with the last output line, the swap error, a
-  job's last output line, a code change's summary). The target says what activation opens
-  (`session` at an entry, `approval` with the call and its classes or a change's `proposal`,
-  `task`, `agent`, `job`, `plugins`). A pending approval or change offers Approve, which answers
-  it at once (`chatflow.approve`, or `source.decide` for a change).
-- **Dedup keys**: `run:<session>:<run>`, `approval:<session>:<call>`, `change:<proposal>`, `verify:<task>`,
+  job's last output line). The target says what activation opens (`session` at an entry,
+  `approval` with the call and its classes, `task`, `agent`, `job`, `plugins`). A pending
+  approval offers Approve, which answers it at once (`chatflow.approve`).
+- **Dedup keys**: `run:<session>:<run>`, `approval:<session>:<call>`, `verify:<task>`,
   `blocked:<project>:<agent>`, `conflict:<session>`, `spawned:<session>`, `job:<job>`,
   `swap:<category>:<version>`. A repeat within the window (default 10 min, sliding) updates the
   item; it is shown again only when its text changed, replacing the shown one where the delivery
@@ -121,6 +119,5 @@ cortex-pack build plugins/notify --install
   them yet.
 
 - **A service that keeps crashing** (`plugin.state` with `crashed` and three or more restarts in a
-  row): "<plugin> keeps stopping", with *Fix it* (a conversation on CortexCode's own source about
-  the service, started by the plugin manager's band) and *Open Plugins*; one per service, updated
-  while it goes on.
+  row): "<plugin> keeps stopping", with *Open Plugins* (Settings > Plugins, where the service has
+  Restart and Roll back); one per service, updated while it goes on.

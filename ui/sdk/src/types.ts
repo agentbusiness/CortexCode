@@ -93,9 +93,6 @@ export const kinds = {
   APPROVAL: 'approval',
   /** chatflow: the session's frozen prompt prefix (not drawn). */
   CONTEXT: 'context',
-  /** source: a code change waiting for the person (`data`: a {@link SourceProposal}; `state` and
-   * `outcome` are set as it is answered and built), answered with `source.decide`. */
-  CHANGE: 'change',
 } as const;
 
 // ─── chatflow / agents ──────────────────────────────────────────────────────
@@ -252,41 +249,12 @@ export interface PrStatus {
 
 // ─── source (`protocol/src/contracts/source.rs`) ────────────────────────────
 
-/** A code change to CortexCode itself, waiting for or answered by the person. */
-export interface SourceProposal {
-  id: string;
-  created_ms: number;
-  /** Plugin ids (`frame` / `shell` for parts that need a restart). */
-  plugins: string[];
-  summary: string;
-  why?: string;
-  risk?: string;
-  files: string[];
-  session_id?: string | null;
-  entry_seq?: number | null;
-  /** pending | building | installing | done | failed | rolled_back | declined */
-  state: string;
-  outcome?: string;
-  draft: string;
-  commit?: string | null;
-}
-
 /** One file of `source.diff`: its unified diff text. */
 export interface SourceFileDiff {
   path: string;
   /** added | modified | deleted | renamed */
   status: string;
   patch: string;
-}
-
-/** `source.progress` while a proposal builds. */
-export interface SourceProgress {
-  proposal: string;
-  plugin?: string;
-  /** started | output | done | failed */
-  state: string;
-  detail?: string;
-  ts_ms?: number;
 }
 
 // ─── tools ──────────────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Start CortexCode from this repository exactly as the macOS app starts: the app scripts/build-app.sh
-# builds into build/ (the frame, the UI, every plugin built and packed, cx, cortex-pack and the
-# source). Its first start installs the packed plugins into ~/.cortexcode, syncs the source into
-# ~/.cortexcode/code and puts cx and cortex-pack into ~/.cortexcode/bin, as the downloaded app does.
+# builds into build/ (the frame, the UI, every plugin built and packed with its data, and cx). Its
+# first start installs the packed plugins into ~/.cortexcode, makes the live folder
+# ~/.cortexcode/live from their data and puts cx into ~/.cortexcode/bin, as the downloaded app does.
 #
 # The start never waits for a build: when build/ holds an app, it starts at once and the build runs
 # beside it (`build-app.sh --live`, log in build/build.log). A changed plugin is swapped into the

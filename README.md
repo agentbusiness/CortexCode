@@ -99,8 +99,8 @@ terminal. Each skill is short, concrete and chosen only when it helps the task a
 **Research when you are online.** Optional deep research across papers, code, forums and the web,
 with cited notes that land in your project's knowledge. Fully off when you are offline.
 
-**A self-rewriting app.** CortexCode can check out its own source, build it, and hot-swap a
-plugin while it runs. A swap that fails rolls back on its own.
+**An app that learns.** CortexCode's skills, prompts and texts are live files it and you can edit
+while it runs; every edit is kept in a history you can revert, back up and share.
 
 **Plugins as packages.** Install, enable, disable, replace and roll back plugins from Settings. Each
 plugin talks to the rest only through a typed contract, so any part can be swapped for another that
@@ -144,7 +144,7 @@ released on its own, so a change to one plugin builds only that plugin:
 |---|---|
 | `scripts/release.sh` | **whatever changed since the last release**, in order: frame, plugins, app, npx (`--plan` says what, `--dry-run` builds without uploading) |
 | `scripts/release-plugin.sh <plugin> [version]` | one plugin (`--changed`: every plugin whose source changed) |
-| `scripts/release-frame.sh [version]` | the frame, cx, cortex-pack and the window code |
+| `scripts/release-frame.sh [version]` | the frame, cx and the window code |
 | `scripts/release-app.sh [version]` | the full app for new users (`.tar.gz`; `.dmg` with `RELEASE_DMG=yes`), from the released parts |
 | `scripts/release-npm.sh [version]` | the `npx cortexcode` launcher |
 

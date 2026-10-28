@@ -2,7 +2,7 @@
 //! shipped in the folder's `data/skills` in the skills format of the language and skills plugins
 //! (`cc_lang_kit::skills`). `memory.skills` lists them for the skill catalog and `memory.skill`
 //! serves one (`skill://memory/<name>`), so they leave with the plugin when another store replaces it.
-//! Both read the folder in use at the time: the live one in the plugin's folder of the code folder
+//! Both read the folder in use at the time: the live one in the plugin's folder of the live folder
 //! when it exists, else the packaged one; [`watch`] tells the other plugins when it changes.
 
 use cc_lang_kit::skills;
@@ -11,8 +11,8 @@ use cc_protocol::{Ctx, PluginEnv, RpcError, codes};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// `data/skills` beside the executable (the frame's store copies the asset there) or in the
-/// plugin folder above the build directory.
+/// `data/skills` in the package above the executable, or in the plugin folder above the build
+/// directory.
 fn packaged() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(skills::locate_dir).clone()

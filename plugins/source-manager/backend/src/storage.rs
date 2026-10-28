@@ -22,10 +22,10 @@ fn size(path: &Path) -> u64 {
     entries.flatten().map(|entry| size(&entry.path())).sum()
 }
 
-/// Sizes of the home's folders and the code folder (a walk; run off the async threads).
-pub fn measure(home: &Path, code: &Path) -> Storage {
+/// Sizes of the home's folders and the live folder (a walk; run off the async threads).
+pub fn measure(home: &Path, live: &Path) -> Storage {
     let item = |name: &str, path: &Path| StorageItem { name: name.into(), bytes: size(path), path: path.display().to_string() };
     let mut items: Vec<StorageItem> = ITEMS.iter().map(|(name, folder)| item(name, &home.join(folder))).collect();
-    items.insert(1, item("Code folder (with build outputs)", code));
+    items.insert(1, item("Live data (skills, prompts, texts)", live));
     Storage { home: home.display().to_string(), items }
 }

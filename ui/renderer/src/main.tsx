@@ -2,7 +2,11 @@ import { createRoot } from 'react-dom/client';
 import { createRuntime, installRuntime, openTarget, type ShellBridge, type StateDocument, type Target } from '@cortex/sdk';
 import { Workbench, applyTheme, type ThemePreference } from './workbench/Workbench';
 import { PluginRegistry } from './workbench/registry';
+import { markStateSettled } from './workbench/boot';
+import '@fontsource-variable/archivo';
+import '@fontsource-variable/source-serif-4/wght-italic.css';
 import './frame.css';
+import './splash.css';
 
 /** What the Electron preload exposes (`ui/shell/preload.cjs`). `loadState` reads the slot state an
  * earlier shell kept itself (before the frame kept it), for the one-time move into the frame. */
@@ -56,6 +60,8 @@ void runtime.state.attach({
   runtime.state.set('workbench', 'settings.open', null);
   runtime.state.set('workbench', 'overlay.open', false);
   runtime.state.set('workbench', 'layout.paneCollapsed', true);
+  // The layout is the person's own now: the splash may give the window to the workbench.
+  markStateSettled();
 });
 
 const registry = new PluginRegistry(runtime.client);

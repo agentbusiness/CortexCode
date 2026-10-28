@@ -84,9 +84,12 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 - The frame runs plugins only from installed packages (`~/.cortexcode/plugins/<id>/<version>/`),
   never from a plugin folder: a cargo or npm build alone does not reach the app. Deliver a changed
   plugin with `packer/target/release/cortex-pack build plugins/<name> --install` (a dev build; the
-  running app swaps to it live, backend and UI together, and the plugin's data folders are copied
-  into the code folder `~/.cortexcode/code/plugins/<name>/`, where plugins read prompts, texts and
-  scripts live); `cx plugin rollback <name>` undoes the swap.
+  running app swaps to it live, backend and UI together, and the source manager merges the
+  package's data folders (`[data] dirs`) into the live folder `~/.cortexcode/live/plugins/<name>/`,
+  where plugins read prompts, texts, skills and scripts); `cx plugin rollback <name>` undoes the
+  swap.
+- The app edits only its data (the live folder: prompts, texts, stages, schemas, skills), never
+  its code; packages carry no source.
 - One CortexCode runs at a time: the home lock refuses a second frame, and a frame stops the
   processes a dead predecessor left (`<home>/run/children.json`) before it starts its own.
 - When the model does the wrong thing, read its steps (the session's journal) before changing

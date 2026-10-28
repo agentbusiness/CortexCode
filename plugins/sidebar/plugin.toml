@@ -32,8 +32,3 @@ slot = "sidebar.actions@1"
 dir = "ui/sidebar"
 id = "sidebar.sidebar"
 slot = "workbench.sidebar@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/sidebar"

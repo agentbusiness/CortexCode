@@ -1,7 +1,7 @@
 {
   "name": "@cortex-ui/source-manager-settings-backup",
   "version": "0.1.0",
-  "description": "Settings > Backup & Sync: the GitHub repository CortexCode's changes are pushed to, back up now, restore.",
+  "description": "Settings > Backup & Sync: the GitHub repository the live data's changes (skills, prompts, texts) are pushed to, back up now, restore.",
   "type": "module",
   "license": "Apache-2.0",
   "cortex": {

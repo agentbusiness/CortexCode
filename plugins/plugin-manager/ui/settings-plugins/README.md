@@ -18,8 +18,8 @@ React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
 - **Workbench state read:** none
 - **Workbench state written:** none
 - **Own durable state (survives hot swaps):** none
-- **Frame methods called:** `frame.plugins.list`, `frame.plugins.rollback`, `frame.plugins.swap`, `source.status`
-- **Topics followed:** `plugin.state`, `plugin.swapped`, `plugin.unit`, `source.changed`
+- **Frame methods called:** `frame.plugins.list`, `frame.plugins.rollback`, `frame.plugins.swap`
+- **Topics followed:** `plugin.state`, `plugin.swapped`, `plugin.unit`
 
 Styles use the theme's tokens and primitives only (`ui/verify/tokens.mjs` checks). Nothing is
 imported from the renderer or from another plugin: the package builds alone (`ui/verify/standalone.mjs`).

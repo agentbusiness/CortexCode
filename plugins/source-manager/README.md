@@ -1,63 +1,54 @@
 # Source manager (`cc-source`, contract `source@1`)
 
-CortexCode's own source, live and editable, as one git repository in the code folder
-(`~/.cortexcode/code` by default; `[frame] code` in the frame config). Design: `docs/LIVE-EDITING.md`.
+Every plugin's data (prompts, texts, stages, schemas, skills), live and editable, as one git
+repository in the live folder (`~/.cortexcode/live` by default; `[frame] live` in the frame config).
+CortexCode's code is not here and is never edited by the app: it changes only with a new package.
+Design: `docs/LIVE-EDITING.md`.
 
-- **Created and updated from the shipped source.** At the first start the folder is made from the
-  source the app ships (`shipped_source`; in development, this repository). At every start what
-  changed in the app's source since the last start is merged in (`refs/cortexcode/bundled`),
-  keeping the user's changes; a conflict leaves the folder as it was and shows the files in
-  Settings > History.
-- **Releases.** The updater merges a released plugin's source (`plugins/<id>`) or the frame's
-  (everything outside `plugins/`) in the same way (`source.release.merge`), and asks
-  `source.release.status` whether the user changed a plugin away from the shipped source (then the
-  update asks first). A reset (`source.release.reset`, from Settings > Plugins > Reset all plugins)
-  puts one plugin's folder back to its released source, dropping the user's changes in it, committed
-  or not; the rest of the code folder, uncommitted edits included, stays.
-- **Data is live.** Every plugin reads its data (skills, guides, prompts, texts) from its folder in
-  the code folder (the frame passes `CORTEX_PLUGIN_SOURCE`). An edited data file is in use at once;
-  once it has settled it is committed, so History lists it and it can be reverted. The chat flow's
-  safety policy is the exception: it is code (`paths::PROTECTED`).
-- **Code needs approval.** Changed code is held in a draft commit and shown as a card with a
-  plain-English summary (written by the local model): in the conversation that made it, else under
-  "Waiting for you" in the top-right card. Approve: the change goes on the branch, every plugin it
-  affects is built and packed (`cortex-pack`) and installed into the running frame, which probes
-  the new version and rolls back a crash. A failed build takes the change back off the branch; the
-  draft stays.
-- **What can be built here.** A plugin's `[build] needs` (`rust`, `apple-clt`, `metal`, `node`)
-  is checked on this Mac; a plugin whose needs are missing is data-only (Settings > Plugins says what
-  is missing).
+- **Made from the installed packages.** A package carries its data folders (`[data] dirs` in its
+  plugin.toml, e.g. `data`, `backend/data`) at the same paths; the live folder holds them as
+  `plugins/<id>/<dir>/...`, the layout of CortexCode's repository. At every start, and whenever a
+  plugin is installed, rolled back or switched (`plugin.unit`), the installed packages' data is
+  merged in, keeping the user's edits; a conflict leaves the folder as it was and shows the files
+  in Settings > History.
+- **Releases.** The updater merges a release package's data the same way before it installs it
+  (`source.release.merge`), and asks `source.release.status` whether the user edited a plugin's
+  data (then the update asks first). A reset (`source.release.reset`, from Settings > Plugins >
+  Reset all plugins) puts one plugin's folder back to its package's data, dropping the user's edits
+  in it, committed or not; the rest of the live folder, uncommitted edits included, stays.
+- **Data is live.** Every plugin reads its data from its folder in the live folder (the frame
+  passes `CORTEX_PLUGIN_LIVE`; safe mode leaves it out, so the packaged copy serves). An edited
+  file is in use at once; once it has settled it is committed, so History lists it and it can be
+  reverted. The chat flow's safety policy (`prompts/policy.md`) is read from its package only.
 - **History, backup, sharing.** Every change can be reverted; the folder is pushed to a repository
   the user picked on GitHub (branch `cortexcode`) and restored from it on a new Mac; picked changes
   are sent to the official repository as a pull request after a privacy check. The GitHub connection
   is the vcs plugin's (`vcs.github.*`).
+- **The code folder of earlier versions** (`~/.cortexcode/code`, CortexCode's full source): at the
+  first start of this version the user's data edits in it are carried into the live folder (one
+  commit, "Carried over your edits from the code folder"), then it is removed. If that fails it
+  stays as it was.
 
 Git runs as a library (`git2`, libgit2 compiled in): no git program is needed on the user's Mac.
 
 | Path | What |
 |---|---|
 | `backend/` | Cargo workspace, binary `cc-source` (category `source`, contract `source@1`) |
-| `backend/data/summary.md` | instructions for the change summary (data: live-editable) |
-| `ui/card-waiting` | "Waiting for you" in the top-right card (`card.waiting@1`) |
 | `ui/settings-*` | Settings > History, Backup & Sync, Share, Storage |
 
 ## Configuration
 
 ```toml
 [plugin.source-manager.config]
-shipped_source = "."                                 # the source the code folder is made from
-packer = "packer/target/release/cortex-pack"          # builds and packs approved changes
 # official_repo = "agentbusiness/CortexCode"         # where improvements are shared
 ```
-
-Relative paths are relative to the frame config's folder.
 
 ## Methods (`source@1`)
 
 `source.status`, `source.update`, `source.history`, `source.revert`, `source.diff`,
-`source.proposals`, `source.propose`, `source.decide`, `source.backup.status|set|push|restore`,
-`source.share.candidates|send|status`, `source.storage`, `source.release.status|merge|reset`; topics `source.changed` and
-`source.progress`. The contract and its types are in `protocol/src/contracts/source.rs`.
+`source.backup.status|set|push|restore`, `source.share.candidates|send|status`, `source.storage`,
+`source.release.status|merge|reset`; topic `source.changed`. The contract and its types are in
+`protocol/src/contracts/source.rs`.
 
 ## Run
 
@@ -65,5 +56,5 @@ Relative paths are relative to the frame config's folder.
 packer/target/release/cortex-pack build plugins/source-manager --install
 ```
 
-The probe creates a code folder from a small shipped source in a temporary folder, commits a data
-edit, merges an update of the shipped source and reverts the edit.
+The probe creates a live folder from a small package in a temporary folder, commits an edit,
+merges a newer package keeping the edit, and reverts the edit.

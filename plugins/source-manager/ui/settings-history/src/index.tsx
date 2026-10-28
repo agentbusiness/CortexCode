@@ -1,8 +1,8 @@
 /**
- * settings.history@1 — every change to CortexCode's own source, newest first (`source.history`):
- * when, where it came from in a plain word, its summary, the plugins it touched, data or code;
- * Revert (after a short confirm) and Show the change per change. At the top, whether CortexCode's
- * source is up to date with the installed version (or which files conflict), with Update now.
+ * settings.history@1 — every change to CortexCode's live data (skills, prompts, texts), newest
+ * first (`source.history`): when, where it came from in a plain word, its summary, the plugins it
+ * touched; Revert (after a short confirm) and Show the change per change. At the top, whether the
+ * live data is up to date with the installed version (or which files conflict), with Update now.
  */
 
 import { useState } from 'react';
@@ -27,7 +27,6 @@ interface Change {
   origin: string;
   summary: string;
   plugins: string[];
-  kind: string;
   files?: string[];
   reverted_by?: string | null;
   shared?: string | null;
@@ -42,26 +41,16 @@ interface Status {
 interface UpdateResult {
   state: string;
   conflicts?: string[];
-  rebuilt?: string[];
 }
 
-interface RevertResult {
-  commit: string;
-  rebuilt?: string[];
-  next_start?: string[];
-}
-
-// `edit` is any data edit (the user's or the model's): the code folder cannot tell them apart.
+// `edit` is any data edit (the user's or the model's): the live folder cannot tell them apart.
 const ORIGIN: Record<string, string> = {
   edit: 'Edit',
-  approved: 'Approved change',
   update: 'Update',
   restore: 'Restored',
   revert: 'Reverted',
   shipped: 'Shipped',
 };
-
-const KIND: Record<string, string> = { data: 'data', code: 'code', mixed: 'data and code' };
 
 interface Units { units?: Array<{ id: string; name?: string }> }
 
@@ -82,14 +71,8 @@ function diffFiles(files: readonly SourceFileDiff[]): FileDiff[] {
   });
 }
 
-/** `Rebuilt: a, b. At the next start: c.` */
-function aftermath(rebuilt: readonly string[] = [], nextStart: readonly string[] = [], name: (id: string) => string): string {
-  return [rebuilt.length ? `Rebuilt ${rebuilt.map(name).join(', ')}.` : '', nextStart.length ? `${nextStart.map(name).join(', ')} take${nextStart.length === 1 ? 's' : ''} effect at the next start.` : ''].filter(Boolean).join(' ');
-}
-
 function UpdateState() {
   const client = useClient();
-  const name = usePluginNames();
   const status = useQuery<Status>('source.status', (c) => c.call<Status>('source.status', {}), { topics: ['source.changed'] });
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -100,7 +83,7 @@ function UpdateState() {
     setResult(null);
     try {
       const done = await client.call<UpdateResult>('source.update', {});
-      setResult(done.state === 'merged' ? `Updated. ${aftermath(done.rebuilt, [], name)}`.trim()
+      setResult(done.state === 'merged' ? 'Updated.'
         : done.state === 'up_to_date' ? 'Already up to date.'
         : done.state === 'conflicts' ? 'The update could not be merged: some files conflict.'
         : 'There is no installed version to update from.');
@@ -146,8 +129,8 @@ function ChangeRow({ change, name }: { change: Change; name: (id: string) => str
     setBusy(true);
     setError(null);
     try {
-      const done = await client.call<RevertResult>('source.revert', { commit: change.commit });
-      setResult(`Reverted. ${aftermath(done.rebuilt, done.next_start, name)}`.trim());
+      await client.call('source.revert', { commit: change.commit });
+      setResult('Reverted.');
       setConfirming(false);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -163,7 +146,6 @@ function ChangeRow({ change, name }: { change: Change; name: (id: string) => str
         <div className="r">
           <span className="ap faint">{clock(change.ms)}</span>
           <span className="ap origin">{ORIGIN[change.origin] ?? change.origin}</span>
-          <span className="ap faint">{KIND[change.kind] ?? change.kind}</span>
           {change.plugins.length > 0 && <span className="ap faint">{change.plugins.map(name).join(', ')}</span>}
           {change.reverted_by && <span className="ap hot">reverted</span>}
           {change.shared && <span className="ap faint">shared</span>}
@@ -199,7 +181,7 @@ function HistoryPanel() {
   return (
     <div className="cx-settings-panel-body" data-build={__CORTEX_BUILD__} data-panel="history">
       <h3 className="cx-settings-title">History</h3>
-      <p className="cx-settings-line">Every change to CortexCode's skills, guides, prompts and code, newest first. Revert puts the change back as it was before.</p>
+      <p className="cx-settings-line">Every change to CortexCode's live data (its skills, prompts and texts), newest first. Revert puts the change back as it was before.</p>
       <UpdateState />
       <h3 className="cx-settings-title">Changes</h3>
       {history.error && !history.data && <ServiceProblem service="source manager" state={history} className="inline-error" />}

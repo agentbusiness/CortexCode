@@ -1,7 +1,7 @@
 {
   "name": "@cortex-ui/source-manager-settings-history",
   "version": "0.1.0",
-  "description": "Settings > History: every change to CortexCode's skills, guides, prompts and code, with revert and the update state.",
+  "description": "Settings > History: every change to CortexCode's live data (skills, prompts, texts), with revert and the update state.",
   "type": "module",
   "license": "Apache-2.0",
   "cortex": {

@@ -50,9 +50,22 @@ function frameAddress() {
   return null;
 }
 
-/** A page on the design's ground while the frame is not reachable. */
+/** The mark (docs/brand/final/cortexcode.svg), drawn on the waiting page before the frame serves any. */
+const MARK = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="76" height="76"><rect width="64" height="64" fill="#14171A"/><path d="M17 16 7 32l10 16M47 16l10 16-10 16" fill="none" stroke="#E9EBEC" stroke-width="3.5" stroke-linecap="square"/><path d="M23 23H41V41H23Z M23 23 41 41 M41 23 23 41" fill="none" stroke="#6E9BB5" stroke-width="1.6"/><rect x="19.5" y="19.5" width="7" height="7" fill="#E9EBEC"/><rect x="37.5" y="19.5" width="7" height="7" fill="#E9EBEC"/><rect x="19.5" y="37.5" width="7" height="7" fill="#E9EBEC"/><rect x="37.5" y="37.5" width="7" height="7" fill="#E2603F"/></svg>';
+
+/** The start-up splash's look (ui/renderer/src/splash.css) while the frame is not reachable: the
+ * mark, the word mark and the step, with the bar at its start. */
 function waitingPage(/** @type {string} */ text) {
-  const html = `<!doctype html><meta charset="utf-8"><title>CortexCode</title><body style="margin:0;background:#14171A;color:#A8AFB3;font:400 15px/1.5 Georgia,serif;display:flex;align-items:center;justify-content:center;height:100vh"><p>${text}</p></body>`;
+  const html = `<!doctype html><meta charset="utf-8"><title>CortexCode</title><style>
+body{margin:0;height:100vh;background:#14171A;color:#E9EBEC;display:flex;flex-direction:column;align-items:center;justify-content:center;-webkit-app-region:drag;user-select:none;cursor:default}
+.w{display:flex;align-items:baseline;gap:10px;margin-top:22px}
+.w b{font:700 13px "Helvetica Neue",Arial,sans-serif;letter-spacing:.26em;text-transform:uppercase}
+.w svg{width:9px;height:9px;color:#E2603F;align-self:center}
+.w i{font:italic 15.5px "Iowan Old Style",Georgia,serif;color:#A8AFB3}
+.b{margin-top:44px;width:264px;height:2px;background:#262B2F}
+.b span{display:block;height:100%;width:4%;background:#E2603F}
+p{margin:14px 0 0;font:italic 13px/18px "Iowan Old Style",Georgia,serif;color:#828A8F}
+</style><body>${MARK}<div class="w"><b>CortexCode</b><svg viewBox="0 0 9 9"><path d="M4.5 0v9M0 4.5h9" stroke="currentColor" stroke-width="1.1"/></svg><i>IronGraph</i></div><div class="b"><span></span></div><p>${text}</p></body>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
@@ -102,7 +115,7 @@ async function start() {
 
   let address = frameAddress();
   if (!address) {
-    await window.loadURL(waitingPage('Waiting for the CortexCode frame…'));
+    await window.loadURL(waitingPage('Starting CortexCode'));
     while (!address) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       address = frameAddress();

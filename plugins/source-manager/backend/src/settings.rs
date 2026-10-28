@@ -1,8 +1,8 @@
-//! Persistent state, kept in the app's main store (`source.settings`, `source.proposals`; see
-//! `Service::load_stored`): the backup repository, the shared pull requests, the last update's
-//! outcome and the proposals. The JSON files they were kept in before are read once and removed.
+//! Persistent state, kept in the app's main store (`source.settings`; see `Service::load_stored`):
+//! the backup repository, the shared pull requests and the last update's outcome. The JSON file it
+//! was kept in before is read once and removed.
 
-use cc_protocol::contracts::source::{Proposal, Shared};
+use cc_protocol::contracts::source::Shared;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -27,9 +27,5 @@ pub struct Settings {
     pub conflicts: Vec<String>,
 }
 
-/// The files the settings and proposals were kept in before the store (read once, then removed).
+/// The file the settings were kept in before the store (read once, then removed).
 pub const SETTINGS: &str = "settings.json";
-pub const PROPOSALS: &str = "proposals.json";
-
-/// The proposals, oldest first.
-pub type ProposalList = Vec<Proposal>;

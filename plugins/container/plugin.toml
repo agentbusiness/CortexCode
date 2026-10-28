@@ -32,13 +32,3 @@ stop_wait_ms = 3000                  # after a timeout/cancel: wait this long fo
 devcontainer_cli_version = "0.75.0"  # @devcontainers/cli installed into $CORTEX_HOME/toolchains/devcontainers-cli/<version>
 # devcontainer_cli = "/path/to/devcontainer"   # use this Dev Containers CLI instead of installing one
 # node = "/opt/homebrew/bin/node"              # node for the Dev Containers CLI; default: on PATH, then Homebrew's
-
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/container"

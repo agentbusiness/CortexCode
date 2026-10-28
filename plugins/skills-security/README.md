@@ -21,7 +21,7 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `plugin.toml` | identity, build commands and outputs, `data/` as a backend asset, the UI package, source location |
 | `backend/` | Cargo workspace (depends on `cc-lang-kit` by path), binary `cc-skills-security`: category `skills-security`, contract `skills@1`, served by `cc_lang_kit::run_skills_plugin` |
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary of when to read it, a blank line, the Markdown body) |
-| `data/scripts/secaudit.py` | the audit tool (Python 3.8+, standard library only), run by the model through `run` from the code folder: `$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py` |
+| `data/scripts/secaudit.py` | the audit tool (Python 3.8+, standard library only), run by the model through `run` from the live folder: `$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py` |
 | `data/scripts/classes-*.json` | the attack classes and the code shapes the tool searches for |
 | `ui/` | npm workspace with one package, `ui/security` (`skills-security.pane` on `pane.security@1`): the Security tab of the right pane |
 

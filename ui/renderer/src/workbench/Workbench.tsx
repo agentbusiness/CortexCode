@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { Cross, Divider, HostContext, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
 import { SlotHost } from './SlotHost';
+import { Splash } from './Splash';
 import { WorkbenchContext, importPlugin, linkStyle, type WorkbenchServices } from './context';
 import type { PluginRegistry } from './registry';
 import type { SwapRecord } from './engine';
@@ -115,6 +116,8 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
             )}
           </div>
         </div>
+        {/* Over the window until it is drawn as the person left it. */}
+        <Splash registry={registry} themeReady={ready} />
       </HostContext.Provider>
     </WorkbenchContext.Provider>
   );

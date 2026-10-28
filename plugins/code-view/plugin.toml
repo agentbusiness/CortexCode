@@ -37,8 +37,3 @@ slot = "code.toolbar@1"
 dir = "ui/tree"
 id = "code-view.tree"
 slot = "code.tree@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/code-view"

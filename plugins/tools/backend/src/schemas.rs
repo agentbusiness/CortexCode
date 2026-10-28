@@ -226,7 +226,7 @@ Find code:\n\
 - From a result, by its name:\n  its code, what it takes and returns: symbol://<name>\n  exactly where it is used, from the code graph, not a search: graph://used-by/<name>\n  exactly what it uses: graph://uses/<name>\n  what is around it in its file: outline://<path>\n  what a change to it reaches (callers, tests): graph://impact/<name>\n  how two relate (the shortest chain between them): graph://path/<name>/<name>\n\
 - Before you change what a function takes or returns, read graph://used-by/<name>: every call listed there changes with it.\n\
 \n\
-`cx` (on PATH, through run) reaches background agents, their tasks, the board, the code graph, the browser and CortexCode's own plugins; `cx tools` lists its commands, and `cx research deep <topic>` runs a cited research job. To change CortexCode itself: edit a plugin folder, `cortex-pack build <folder>`, then `cx plugin install <file>` (live at once; `cx plugin rollback <id>` undoes it).\n"
+`cx` (on PATH, through run) reaches background agents, their tasks, the board, the code graph, the browser and CortexCode's own plugins; `cx tools` lists its commands, and `cx research deep <topic>` runs a cited research job. To change how CortexCode itself works, edit its skills, prompts and texts in `$CORTEX_HOME/live/plugins/<id>/` (`data/` or `backend/data/`): an edit is live at once.\n"
     )
 }
 

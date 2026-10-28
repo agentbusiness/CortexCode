@@ -100,8 +100,8 @@ pub struct Frame {
     /// Calls on the projects, sessions and slot state that came before the records were loaded
     /// from the store, in arrival order; None once loaded ([`Frame::records_ready`]).
     records_waiting: Mutex<Option<Vec<(Arc<Peer>, IncomingRequest)>>>,
-    /// The code folder (`[frame] code`, default `<home>/code`).
-    pub code: PathBuf,
+    /// The live folder (`[frame] live`, default `<home>/live`).
+    pub live: PathBuf,
     /// Safe mode: plugins are not pointed at their live data.
     pub safe: bool,
     pub machine: Machine,
@@ -145,13 +145,13 @@ pub struct FrameParts {
     pub state: StateStore,
     pub memory: Arc<crate::store::MemoryLink>,
     pub units: Units,
-    pub code: PathBuf,
+    pub live: PathBuf,
     pub safe: bool,
 }
 
 impl Frame {
     pub fn new(parts: FrameParts) -> Arc<Frame> {
-        let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, code, safe } = parts;
+        let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, live, safe } = parts;
         let disabled = units.disabled();
         let ui_plugins = UiPlugins::new(units.ui_sources(), disabled.clone());
         let sup = Supervisor::new(&units.backends(), &disabled);
@@ -178,7 +178,7 @@ impl Frame {
             command_access: crate::access::CommandAccess::default(),
             socket,
             headless,
-            code,
+            live,
             safe,
             machine,
             journal,

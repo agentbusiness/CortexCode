@@ -186,14 +186,6 @@ uncommitted() {
   done
 }
 
-# Copy the source outside plugins/ (the frame's part) into <dir>.
-copy_frame_source() {
-  mkdir -p "$1"
-  (cd "$repo" && git ls-files -co --exclude-standard -z -- . ':(exclude)plugins/**' | while IFS= read -r -d '' file; do
-    if [ -f "$file" ]; then printf '%s\0' "$file"; fi
-  done) | (cd "$repo" && rsync -a --from0 --files-from=- ./ "$1/")
-}
-
 # ----- files -----------------------------------------------------------------------------------
 
 sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }

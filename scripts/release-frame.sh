@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Release the frame: the frame, cx, cortex-pack, the window code (shell and renderer) and the
-# frame's source (everything outside plugins/), plus Electron when its version changed, in a GitHub
-# release `frame-v<version>`, named in the catalog. The app downloads it, and it runs after
-# "Restart to update". Plugins are released on their own (scripts/release-plugin.sh).
+# Release the frame: the frame, cx and the window code (shell and renderer), plus Electron when its
+# version changed, in a GitHub release `frame-v<version>`, named in the catalog. The app downloads
+# it, and it runs after "Restart to update". Plugins are released on their own (scripts/release-plugin.sh).
 #
 #   scripts/release-frame.sh [version] [--dry-run]
 #
@@ -78,8 +77,7 @@ for platform in $RELEASE_PLATFORMS; do
       done
       cp "$repo/frame/target/release/cortex-frame" "$stage/CortexCode"
       cp "$repo/cli/target/release/cx" "$stage/bin/cx"
-      cp "$repo/packer/target/release/cortex-pack" "$stage/bin/cortex-pack"
-      for binary in "$stage/CortexCode" "$stage/bin/cx" "$stage/bin/cortex-pack"; do
+      for binary in "$stage/CortexCode" "$stage/bin/cx"; do
         codesign --force --sign - "$binary" >/dev/null 2>&1
       done
       ;;
@@ -88,7 +86,6 @@ for platform in $RELEASE_PLATFORMS; do
       in_docker "$platform" "$work/$platform/built" frame
       cp "$work/$platform/built/bin/CortexCode" "$stage/CortexCode"
       cp "$work/$platform/built/bin/cx" "$stage/bin/cx"
-      cp "$work/$platform/built/bin/cortex-pack" "$stage/bin/cortex-pack"
       ;;
     *) die "unknown platform $platform" ;;
   esac
@@ -97,7 +94,6 @@ for platform in $RELEASE_PLATFORMS; do
   rsync -a "$repo/ui/shell/" "$stage/ui/shell/"
   rsync -a "$repo/ui/renderer/dist/" "$stage/ui/renderer/dist/"
   rsync -a "$repo/ui/node_modules/ws/" "$stage/ui/node_modules/ws/"
-  copy_frame_source "$stage/source"
   frame_file="$out/frame-$version-$platform.tar.gz"
   tar_dir "$stage" "$frame_file"
   uploads+=("$frame_file")

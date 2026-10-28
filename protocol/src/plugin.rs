@@ -6,9 +6,10 @@
 //! - `CORTEX_PLUGIN_INSTANCE`: the instance id the frame assigned to this process
 //! - `CORTEX_HOME`: the CortexCode home directory (default `~/.cortexcode`)
 //! - `CORTEX_PLUGIN_DATA`: this plugin's private data directory (stable across versions)
-//! - `CORTEX_CODE`: the code folder, CortexCode's own source as one git repository
-//! - `CORTEX_PLUGIN_SOURCE`: this plugin's folder in the code folder (`<code>/plugins/<id>`), where
-//!   its live data is read from when present; unset in safe mode (packaged data only)
+//! - `CORTEX_LIVE`: the live folder, every plugin's data (prompts, texts, skills) as one git
+//!   repository, edited in place
+//! - `CORTEX_PLUGIN_LIVE`: this plugin's folder in the live folder (`<live>/plugins/<id>`), where
+//!   its data is read from when present; unset in safe mode (packaged data only)
 
 use crate::conn::{BoxFuture, Connection, Handler, IncomingRequest, ItemSink};
 use crate::contracts::lifecycle::{
@@ -30,18 +31,18 @@ pub struct PluginEnv {
     pub instance: String,
     pub home: PathBuf,
     pub data_dir: PathBuf,
-    /// The code folder (see the module doc).
-    pub code_dir: Option<PathBuf>,
-    /// The plugin's folder in the code folder (see the module doc). It may not exist yet: the code
+    /// The live folder (see the module doc).
+    pub live_root: Option<PathBuf>,
+    /// The plugin's folder in the live folder (see the module doc). It may not exist yet: the live
     /// folder is created after the first start, so readers check it on every read.
-    pub source_dir: Option<PathBuf>,
+    pub live_dir: Option<PathBuf>,
 }
 
 impl PluginEnv {
-    /// `<source_dir>/<relative>` when that exists, else `packaged`: live data first, the
+    /// `<live_dir>/<relative>` when that exists, else `packaged`: live data first, the
     /// package's copy otherwise (and always in safe mode).
     pub fn live_or(&self, relative: &str, packaged: PathBuf) -> PathBuf {
-        match &self.source_dir {
+        match &self.live_dir {
             Some(dir) if dir.join(relative).is_dir() => dir.join(relative),
             _ => packaged,
         }
@@ -58,8 +59,8 @@ impl PluginEnv {
             instance: var("CORTEX_PLUGIN_INSTANCE")?,
             home: PathBuf::from(var("CORTEX_HOME")?),
             data_dir: PathBuf::from(var("CORTEX_PLUGIN_DATA")?),
-            code_dir: std::env::var_os("CORTEX_CODE").filter(|value| !value.is_empty()).map(PathBuf::from),
-            source_dir: std::env::var_os("CORTEX_PLUGIN_SOURCE").filter(|value| !value.is_empty()).map(PathBuf::from),
+            live_root: std::env::var_os("CORTEX_LIVE").filter(|value| !value.is_empty()).map(PathBuf::from),
+            live_dir: std::env::var_os("CORTEX_PLUGIN_LIVE").filter(|value| !value.is_empty()).map(PathBuf::from),
         })
     }
 }

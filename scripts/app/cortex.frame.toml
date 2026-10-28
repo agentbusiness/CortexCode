@@ -1,7 +1,7 @@
 # The configuration of a released frame (`<home>/frame/<version>/cortex.toml`, from
 # scripts/release-frame.sh), read by the frame beside it. As scripts/app/cortex.toml, without the
-# app's packages and shipped source: a released frame's plugins and source come by updates
-# (`plugins/updater`), never from the frame folder. The schema is documented in cortex.toml.
+# app's packages: a released frame's plugins come by updates (`plugins/updater`), never from the
+# frame folder. The schema is documented in cortex.toml.
 
 [frame]
 home = "~/.cortexcode"
@@ -9,11 +9,6 @@ port = 0
 ui = true
 ui_dir = "ui"
 
-# cx and cortex-pack, copied into <home>/bin for the model's shells.
+# cx, copied into <home>/bin for the model's shells.
 [plugin.tools.config]
 cx_path = "bin/cx"
-pack_path = "bin/cortex-pack"
-
-# Approved code changes are built with this packer.
-[plugin.source-manager.config]
-packer = "bin/cortex-pack"

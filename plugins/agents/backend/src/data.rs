@@ -3,7 +3,7 @@
 //! hand-backs, board posts). Same layering and rules as the chat flow's data set:
 //! 1. the shipped files compiled into the binary;
 //! 2. a shipped data directory named by the plugin config (`data_dir`);
-//! 3. the live data: `backend/data` in the plugin's folder of the code folder, where the app and
+//! 3. the live data: `backend/data` in the plugin's folder of the live folder, where the app and
 //!    the user edit it (absent in safe mode; it may appear while the plugin runs).
 //!
 //! A set that fails validation is rejected and the previous one stays active (`agents.data`

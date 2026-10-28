@@ -138,7 +138,7 @@ pub trait LanguagePack: Send + Sync + 'static {
     /// runtime: cheap file checks only). `files`: the files the answer covers, relative to `root`
     /// (the requested files the server took, and every file with diagnostics).
     fn annotate_diagnostics(&self, _env: &PackEnv, _root: &Path, _files: &[String], _diagnostics: &mut Vec<Diagnostic>) {}
-    /// Where the packaged skills are (default: `data/skills` beside the executable, see
+    /// Where the packaged skills are (default: the packaged `data/skills`, see
     /// [`skills`]); None: the plugin ships no skills, live or packaged.
     fn skills_dir(&self) -> Option<PathBuf> {
         skills::locate_dir()

@@ -1,6 +1,6 @@
 # cc-agents model-facing configuration. Loaded at startup and reloaded on change; a set that does
-# not validate is rejected and the previous one stays active. The copy in the code folder
-# (~/.cortexcode/code/plugins/agents/backend/data/) is the live one: an edit there is in use
+# not validate is rejected and the previous one stays active. The copy in the live folder
+# (~/.cortexcode/live/plugins/agents/backend/data/) is the live one: an edit there is in use
 # within a second.
 
 label = "agents-data 1"

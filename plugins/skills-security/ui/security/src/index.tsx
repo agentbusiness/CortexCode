@@ -33,7 +33,7 @@ type Mode = 'ask' | 'auto';
 const ACTIVE: SecurityStatus[] = ['open', 'fixing', 'accepted'];
 const CLOSED: SecurityStatus[] = ['fixed', 'verified', 'gone'];
 const AUDIT_TEXT = 'security audit of this codebase';
-const RESOLVE = 'python3 "$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py" resolve';
+const RESOLVE = 'python3 "$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py" resolve';
 
 export function severityOf(finding: Pick<SecurityFinding, 'verdict' | 'severity_overall'>): Severity {
   if (finding.verdict === 'needs_validation') return 'lead';

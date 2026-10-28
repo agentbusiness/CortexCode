@@ -1,4 +1,0 @@
-{
-  "extends": "@cortex/sdk/tsconfig.plugin.json",
-  "include": ["src"]
-}

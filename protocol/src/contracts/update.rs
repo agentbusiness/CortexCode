@@ -21,7 +21,7 @@ pub mod methods {
     /// `{}` -> [`super::ResetPlan`]. What a reset of every plugin to its official release would do.
     pub const RESET_PLAN: &str = "update.reset_plan";
     /// `{}` -> [`super::ResetResult`]. Put every plugin back to its official release: the user's
-    /// changes to it in the code folder are dropped and the release package installed. Refused
+    /// edits to its data in the live folder are dropped and the release package installed. Refused
     /// while a run is going.
     pub const RESET: &str = "update.reset";
 }
@@ -35,7 +35,7 @@ pub mod topics {
 pub mod choices {
     /// Use the newer version: the user's changes to the plugin are dropped and the package installed.
     pub const USE: &str = "use";
-    /// Merge the release into the user's version (built here when the user changed its code).
+    /// Merge the release's data into the user's edited version.
     pub const MERGE: &str = "merge";
     /// Keep the user's version; ask again at the next release of the plugin.
     pub const KEEP: &str = "keep";
@@ -145,7 +145,7 @@ pub struct Applied {
     pub plugin: String,
     pub version: String,
     pub ms: u64,
-    /// installed | built (the user's change merged and built here) | kept | failed
+    /// installed | kept | failed
     pub outcome: String,
     #[serde(default)]
     pub detail: String,
@@ -164,7 +164,7 @@ pub struct DecideParams {
 pub mod reset_actions {
     /// Drop the user's changes and install the release package.
     pub const INSTALL: &str = "install";
-    /// The release package runs already; only the user's changes in the code folder go.
+    /// The release package runs already; only the user's edits in the live folder go.
     pub const SOURCE: &str = "source";
     /// Already the release, unchanged.
     pub const NONE: &str = "none";
@@ -207,7 +207,7 @@ pub struct ResetItem {
     /// One of [`reset_sources`] (empty when there is none).
     #[serde(default)]
     pub from: String,
-    /// The user's changed files in the code folder.
+    /// The user's changed files in the live folder.
     #[serde(default)]
     pub files: Vec<String>,
     /// One of [`reset_actions`].

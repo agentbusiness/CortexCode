@@ -27,8 +27,3 @@ slot = "workbench.band@1"
 dir = "ui/project"
 id = "card-host.project"
 slot = "card.header@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/card-host"

@@ -173,9 +173,6 @@ function Chat() {
       if (!sessionId) return;
       await client.call('chatflow.approve', { session_id: sessionId, seq, approve });
     },
-    decide: async (id, approve) => {
-      await client.call('source.decide', { id, approve });
-    },
     openFile: (path) => {
       if (workspace) openInCode({ root: workspace, path });
     },

@@ -9,7 +9,7 @@
 //
 // What it checks before every task:
 // - every active plugin that serves skills (a `data/skills` folder beside its executable, or the
-//   live one in the app's code folder, `<home>/code/plugins/<plugin>/data/skills`, which wins when
+//   live one in the app's live folder, `<home>/live/plugins/<plugin>/data/skills`, which wins when
 //   it exists) serves the files of `plugins/<plugin>/data/skills` byte for byte: a fallback to an
 //   older build (the frame's last known good), a stale install or a learned edit would test other
 //   skills;
@@ -48,7 +48,7 @@ export function differingFiles(a, b) {
 
 /**
  * Check the slate through `call(method, params)` (a frame client's request); `codeDir` is the
- * app's code folder (`<home>/code`). Returns `{ ok, problems: [text], skills: [{plugin, dir}], rules: n }`.
+ * app's live folder (`<home>/live`). Returns `{ ok, problems: [text], skills: [{plugin, dir}], rules: n }`.
  */
 export async function checkCleanSlate(call, { repoRoot = REPO_ROOT, codeDir = null } = {}) {
   const problems = [];

@@ -14,14 +14,13 @@ platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One skills plugin per body of know-how: the `skills` family, category `skills-<id>`, contract
-# `skills@1`. `data/` (the skills and the secaudit tool) ships beside the executable.
+# `skills@1`. `data/` (the skills and the secaudit tool) is the plugin's data (`[data]`).
 [backend]
 category = "skills-security"
 contract = "skills@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-skills-security"
-assets = ["data"]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
@@ -35,12 +34,7 @@ dir = "ui/security"
 id = "skills-security.pane"
 slot = "pane.security@1"
 
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/skills-security"
+# The plugin's data (skills): packed at the same path; the app reads and edits it live in
+# the live folder (<home>/live/plugins/skills-security/data).
+[data]
+dirs = ["data"]

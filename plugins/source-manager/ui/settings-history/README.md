@@ -1,6 +1,6 @@
 # @cortex-ui/source-manager-settings-history
 
-Settings > History: every change to CortexCode's skills, guides, prompts and code, with revert and the update state.
+Settings > History: every change to CortexCode's live data (skills, prompts, texts), with revert and the update state.
 
 - **Plugin id:** `source-manager.settings-history`
 - **Slot:** `settings.history@1`

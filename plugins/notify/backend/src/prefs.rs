@@ -22,7 +22,7 @@ pub struct KindInfo {
 pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: kinds::DONE, label: "Run finished", description: "A conversation turn or an agent run finished.", default: true },
     KindInfo { kind: kinds::FAILED, label: "Run failed", description: "A run stopped with an error, with the reason.", default: true },
-    KindInfo { kind: kinds::APPROVAL, label: "Approval needed", description: "A command (ask mode) or a change to CortexCode waits for your approval.", default: true },
+    KindInfo { kind: kinds::APPROVAL, label: "Approval needed", description: "A command (ask mode) waits for your approval.", default: true },
     KindInfo { kind: kinds::BLOCKED, label: "Agent blocked", description: "An agent cannot continue without you.", default: true },
     KindInfo { kind: kinds::VERIFIED, label: "Contract verified", description: "A task's contract checks passed.", default: true },
     KindInfo { kind: kinds::VERIFY_FAILED, label: "Contract failed", description: "A task's contract checks failed, with the failing checks.", default: true },

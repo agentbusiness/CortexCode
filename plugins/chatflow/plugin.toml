@@ -36,12 +36,7 @@ dir = "ui/composer"
 id = "chatflow.composer"
 slot = "chat.composer@1"
 
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/chatflow"
+# The plugin's data (prompts, texts, stages and schemas): packed at the same path; the app reads
+# and edits it live in the live folder (<home>/live/plugins/chatflow/backend/data).
+[data]
+dirs = ["backend/data"]

@@ -1,37 +1,30 @@
-//! The code folder as one git repository, through git as a library (no git program needed).
+//! The live folder as one git repository, through git as a library (no git program needed). It
+//! holds every installed plugin's data at its path in CortexCode's repository
+//! (`plugins/<id>/data/...`, `plugins/<id>/backend/data/...`) and nothing else.
 //!
-//! - `refs/heads/main` is the code folder's branch: the shipped source plus the user's changes.
-//! - `refs/cortexcode/shipped` is the shipped source the folder was last updated from. A shipped
-//!   commit is a root commit with fixed metadata, so the same source gives the same commit on
-//!   every Mac, and an update or a restore merges three trees with an explicit base (the shipped
-//!   tree the changes were made on), never by shared history.
-//! - `refs/cortexcode/drafts/<id>` holds a proposed code change until the user answers.
-//! - `refs/cortexcode/bundled` is the app's own source as last merged. The shipped source also
-//!   moves by releases (one plugin's source, or the frame's), so a start merges only what changed
-//!   in the app's source since then: a plugin a release updated keeps its release.
+//! - `refs/heads/main` is the live folder's branch: the packages' data plus the user's edits.
+//! - `refs/cortexcode/shipped` is the packages' data the folder was last updated from. A shipped
+//!   commit is a root commit with fixed metadata, so the same data gives the same commit on every
+//!   Mac, and an update or a restore merges three trees with an explicit base (the shipped tree the
+//!   edits were made on), never by shared history.
 //!
 //! Every commit carries trailers the history reads back: `Origin:` (shipped | update | edit |
-//! approved | revert | restore), `Plugins:`, `Shipped-Tree:` (shipped and update commits) and
-//! `Reverts:`.
+//! revert | restore), `Plugins:`, `Shipped-Tree:` (shipped and update commits) and `Reverts:`.
 
+use crate::packages::Package;
 use crate::paths;
 use cc_protocol::contracts::source::{Change, FileDiff};
 use git2::{
-    Cred, Delta, DiffFormat, FetchOptions, FileMode, Index, Oid, PushOptions, RemoteCallbacks, Repository,
-    RepositoryInitOptions, Signature, Status, StatusOptions, Time, Tree, build::CheckoutBuilder,
+    Cred, Delta, DiffFormat, FetchOptions, FileMode, Index, ObjectType, Oid, PushOptions, RemoteCallbacks, Repository,
+    RepositoryInitOptions, Signature, Status, StatusOptions, Time, Tree, TreeWalkMode, TreeWalkResult, build::CheckoutBuilder,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 pub const MAIN: &str = "refs/heads/main";
 pub const SHIPPED: &str = "refs/cortexcode/shipped";
-pub const DRAFTS: &str = "refs/cortexcode/drafts/";
 pub const BACKUP: &str = "refs/cortexcode/backup";
 pub const UPSTREAM: &str = "refs/cortexcode/upstream";
-pub const BUNDLED: &str = "refs/cortexcode/bundled";
-
-/// Folders never taken from the shipped source (build outputs, installs).
-const SKIPPED_DIRS: &[&str] = &["target", "node_modules", "dist", ".git"];
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -39,13 +32,13 @@ fn err(error: git2::Error) -> String {
     error.message().to_owned()
 }
 
-/// Whether `dir` is a code folder this plugin manages (it has a shipped commit).
+/// Whether `dir` is a live folder this plugin manages (it has a shipped commit).
 pub fn is_managed(dir: &Path) -> bool {
     Repository::open(dir).ok().is_some_and(|repo| repo.find_reference(SHIPPED).is_ok())
 }
 
 pub fn open(dir: &Path) -> Result<Repository> {
-    Repository::open(dir).map_err(|e| format!("cannot open the code folder {}: {}", dir.display(), e.message()))
+    Repository::open(dir).map_err(|e| format!("cannot open the live folder {}: {}", dir.display(), e.message()))
 }
 
 fn signature(at_ms: u64) -> Result<Signature<'static>> {
@@ -85,60 +78,36 @@ pub fn parse_message(text: &str) -> (String, HashMap<String, String>) {
     (summary, trailers)
 }
 
-// ----- the shipped source -----
+// ----- the packages' data -----
 
-/// The files of the shipped source, relative paths: what git tracks or would track when it is a
-/// git work tree (ignored files left out), every file but build outputs otherwise.
-fn shipped_files(source: &Path) -> Result<Vec<String>> {
-    let mut files: Vec<String> = Vec::new();
-    if let Ok(repo) = Repository::open(source)
-        && !repo.is_bare()
-        && repo.workdir().is_some_and(|work| same_dir(work, source))
-    {
-        let index = repo.index().map_err(err)?;
-        files.extend(index.iter().map(|entry| String::from_utf8_lossy(&entry.path).into_owned()));
-        let mut options = StatusOptions::new();
-        options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false).exclude_submodules(true);
-        for entry in repo.statuses(Some(&mut options)).map_err(err)?.iter() {
-            if entry.status().contains(Status::WT_NEW)
-                && let Ok(path) = entry.path()
-            {
-                files.push(path.to_owned());
+/// Every regular file under `root/dir`, as (path relative to `root`, full path).
+fn files_under(root: &Path, dir: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    let mut stack = vec![root.join(dir)];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                let relative = path.strip_prefix(root).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+                out.push((relative, path));
             }
-        }
-    } else {
-        walk(source, source, &mut files)?;
-    }
-    // Regular files only (a tracked file deleted from the work tree is not part of the source).
-    files.retain(|file| std::fs::symlink_metadata(source.join(file)).is_ok_and(|meta| meta.is_file()));
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() {
-            if !SKIPPED_DIRS.contains(&name.as_str()) {
-                walk(root, &entry.path(), out)?;
-            }
-        } else if kind.is_file()
-            && let Ok(relative) = entry.path().strip_prefix(root)
-        {
-            out.push(relative.to_string_lossy().into_owned());
         }
     }
     Ok(())
+}
+
+/// One package's data files, relative to the plugin folder (`data/skills/x.md`).
+fn package_files(package: &Package) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for dir in &package.dirs {
+        files_under(&package.dir, dir.trim_end_matches('/'), &mut files)?;
+    }
+    files.sort();
+    files.dedup_by(|a, b| a.0 == b.0);
+    Ok(files)
 }
 
 enum Node {
@@ -157,14 +126,13 @@ fn write_tree(repo: &Repository, dir: &BTreeMap<String, Node>) -> Result<Oid> {
     builder.write().map_err(err)
 }
 
-/// Write the shipped source's files into `repo` as a tree.
-pub fn shipped_tree(repo: &Repository, source: &Path) -> Result<Oid> {
+/// Write `files` (relative path, file on disk) into `repo` as a tree.
+fn tree_of(repo: &Repository, files: &[(String, PathBuf)]) -> Result<Oid> {
     use std::os::unix::fs::PermissionsExt;
     let mut root: BTreeMap<String, Node> = BTreeMap::new();
-    for file in shipped_files(source)? {
-        let path = source.join(&file);
-        let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let executable = std::fs::metadata(&path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0);
+    for (file, path) in files {
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let executable = std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0);
         let mode = i32::from(if executable { FileMode::BlobExecutable } else { FileMode::Blob });
         let oid = repo.blob(&bytes).map_err(err)?;
         let parts: Vec<&str> = file.split('/').collect();
@@ -179,25 +147,39 @@ pub fn shipped_tree(repo: &Repository, source: &Path) -> Result<Oid> {
     write_tree(repo, &root)
 }
 
+/// The data of every package as one tree, each plugin's under `plugins/<id>/`.
+pub fn shipped_tree(repo: &Repository, packages: &[Package]) -> Result<Oid> {
+    let mut files = Vec::new();
+    for package in packages {
+        files.extend(package_files(package)?.into_iter().map(|(file, path)| (format!("plugins/{}/{file}", package.id), path)));
+    }
+    tree_of(repo, &files)
+}
+
+/// One package's data as the tree of its plugin folder; None when it has no data.
+fn plugin_tree(repo: &Repository, package: &Package) -> Result<Option<Oid>> {
+    let files = package_files(package)?;
+    if files.is_empty() { Ok(None) } else { tree_of(repo, &files).map(Some) }
+}
+
 /// The shipped commit for `tree`: a root commit with fixed metadata (the same on every Mac).
 fn shipped_commit(repo: &Repository, tree: Oid) -> Result<Oid> {
     let tree = repo.find_tree(tree).map_err(err)?;
     let sig = signature(0)?;
-    let text = message("CortexCode source", &[("Origin", "shipped".into()), ("Shipped-Tree", tree.id().to_string())]);
+    let text = message("CortexCode data", &[("Origin", "shipped".into()), ("Shipped-Tree", tree.id().to_string())]);
     repo.commit(None, &sig, &sig, &text, &tree, &[]).map_err(err)
 }
 
-/// Create the code folder from the shipped source.
-pub fn populate(dir: &Path, source: &Path) -> Result<()> {
+/// Create the live folder from the packages' data.
+pub fn populate(dir: &Path, packages: &[Package]) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let mut options = RepositoryInitOptions::new();
     options.initial_head("main");
     let repo = Repository::init_opts(dir, &options).map_err(err)?;
-    let tree = shipped_tree(&repo, source)?;
+    let tree = shipped_tree(&repo, packages)?;
     let commit = shipped_commit(&repo, tree)?;
-    repo.reference(MAIN, commit, true, "shipped source").map_err(err)?;
-    repo.reference(SHIPPED, commit, true, "shipped source").map_err(err)?;
-    repo.reference(BUNDLED, commit, true, "app source").map_err(err)?;
+    repo.reference(MAIN, commit, true, "shipped data").map_err(err)?;
+    repo.reference(SHIPPED, commit, true, "shipped data").map_err(err)?;
     repo.set_head(MAIN).map_err(err)?;
     repo.checkout_head(Some(CheckoutBuilder::new().force())).map_err(err)?;
     Ok(())
@@ -207,94 +189,57 @@ pub struct Updated {
     /// up_to_date | merged | conflicts
     pub state: &'static str,
     pub conflicts: Vec<String>,
-    /// Code files where the result differs from the new shipped source (the user's own code
-    /// changes, which must be rebuilt on the new base).
-    pub own_code: Vec<String>,
 }
 
-/// Merge the app's own source (`source`) into the code folder: what changed in it since the
-/// last start comes in.
-pub fn update(repo: &Repository, source: &Path) -> Result<Updated> {
-    let bundle = shipped_tree(repo, source)?;
-    let shipped = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
-    let previous = repo.find_reference(BUNDLED).and_then(|r| r.peel_to_tree()).map(|tree| tree.id()).unwrap_or(shipped.id());
-    if previous == bundle {
-        set_bundled(repo, bundle)?;
-        return Ok(Updated { state: "up_to_date", conflicts: Vec::new(), own_code: Vec::new() });
-    }
-    let new_shipped = if previous == shipped.id() {
-        bundle
-    } else {
-        let previous = repo.find_tree(previous).map_err(err)?;
-        let bundle_tree = repo.find_tree(bundle).map_err(err)?;
-        let mut index = repo.merge_trees(&previous, &shipped, &bundle_tree, None).map_err(err)?;
-        if index.has_conflicts() { bundle } else { index.write_tree_to(repo).map_err(err)? }
-    };
-    let updated = merge_shipped(repo, new_shipped, "Updated to the shipped source")?;
-    if updated.state != "conflicts" {
-        set_bundled(repo, bundle)?;
-    }
-    Ok(updated)
+/// Bring the live folder to the installed packages' data, keeping the user's edits.
+pub fn update(repo: &Repository, packages: &[Package]) -> Result<Updated> {
+    let tree = shipped_tree(repo, packages)?;
+    merge_shipped(repo, tree, "Updated to the installed plugins")
 }
 
-fn set_bundled(repo: &Repository, tree: Oid) -> Result<()> {
-    let commit = shipped_commit(repo, tree)?;
-    repo.reference(BUNDLED, commit, true, "app source").map_err(err)?;
-    Ok(())
+/// The shipped tree with `plugins/<id>` replaced by the package's data.
+fn released_tree(repo: &Repository, base: &Tree, package: &Package) -> Result<Oid> {
+    let plugin = plugin_tree(repo, package)?;
+    with_plugin(repo, base, &package.id, plugin)
 }
 
-/// The part of the source a release brings.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Scope {
-    /// One plugin's folder, `plugins/<id>`.
-    Plugin(String),
-    /// Everything outside `plugins/`.
-    Frame,
-}
-
-/// The shipped tree with `scope` replaced by the files of `source`.
-fn released_tree(repo: &Repository, base: &Tree, scope: &Scope, source: &Path) -> Result<Oid> {
-    let released = shipped_tree(repo, source)?;
-    match scope {
-        Scope::Plugin(id) => with_plugin(repo, base, id, released),
-        Scope::Frame => {
-            let released = repo.find_tree(released).map_err(err)?;
-            let mut root = repo.treebuilder(Some(&released)).map_err(err)?;
-            if root.get("plugins").map_err(err)?.is_some() {
-                root.remove("plugins").map_err(err)?;
-            }
-            if let Some(entry) = base.get_name("plugins") {
-                root.insert("plugins", entry.id(), entry.filemode()).map_err(err)?;
-            }
-            root.write().map_err(err)
-        }
-    }
-}
-
-/// `root` with `plugins/<id>` replaced by the tree `plugin`.
-fn with_plugin(repo: &Repository, root: &Tree, id: &str, plugin: Oid) -> Result<Oid> {
+/// `root` with `plugins/<id>` replaced by the tree `plugin` (removed when None).
+fn with_plugin(repo: &Repository, root: &Tree, id: &str, plugin: Option<Oid>) -> Result<Oid> {
     let tree_mode = i32::from(FileMode::Tree);
     let plugins = match root.get_name("plugins") {
         Some(entry) => Some(repo.find_tree(entry.id()).map_err(err)?),
         None => None,
     };
     let mut builder = repo.treebuilder(plugins.as_ref()).map_err(err)?;
-    builder.insert(id, plugin, tree_mode).map_err(err)?;
+    match plugin {
+        Some(plugin) => {
+            builder.insert(id, plugin, tree_mode).map_err(err)?;
+        }
+        None if builder.get(id).map_err(err)?.is_some() => builder.remove(id).map_err(err)?,
+        None => {}
+    }
     let plugins = builder.write().map_err(err)?;
     let mut out = repo.treebuilder(Some(root)).map_err(err)?;
-    out.insert("plugins", plugins, tree_mode).map_err(err)?;
+    if builder.is_empty() {
+        if out.get("plugins").map_err(err)?.is_some() {
+            out.remove("plugins").map_err(err)?;
+        }
+    } else {
+        out.insert("plugins", plugins, tree_mode).map_err(err)?;
+    }
     out.write().map_err(err)
 }
 
-/// Put one plugin's folder back to its released source (`source`: exactly the plugin's files).
-/// The user's changes in it, committed or not, are dropped; the rest of the code folder, including
-/// uncommitted edits elsewhere, stays. Returns `reset` with the files put back, or `up_to_date`.
-pub fn reset_plugin(repo: &Repository, id: &str, source: &Path, version: &str) -> Result<(&'static str, Vec<String>)> {
+/// Put one plugin's folder back to its package's data. The user's edits in it, committed or not,
+/// are dropped; the rest of the live folder, including uncommitted edits elsewhere, stays. Returns
+/// `reset` with the files put back, or `up_to_date`.
+pub fn reset_plugin(repo: &Repository, package: &Package, version: &str) -> Result<(&'static str, Vec<String>)> {
+    let id = package.id.as_str();
     let prefix = format!("plugins/{id}/");
     let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
-    let new_shipped_id = released_tree(repo, &base, &Scope::Plugin(id.to_owned()), source)?;
+    let new_shipped_id = released_tree(repo, &base, package)?;
     let new_shipped = repo.find_tree(new_shipped_id).map_err(err)?;
-    let released = new_shipped.get_path(Path::new(&format!("plugins/{id}"))).map_err(err)?.id();
+    let released = new_shipped.get_path(Path::new(&format!("plugins/{id}"))).ok().map(|entry| entry.id());
     let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let head_tree = head.tree().map_err(err)?;
     let result = repo.find_tree(with_plugin(repo, &head_tree, id, released)?).map_err(err)?;
@@ -304,7 +249,7 @@ pub fn reset_plugin(repo: &Repository, id: &str, source: &Path, version: &str) -
     if files.is_empty() && uncommitted.is_empty() && base.id() == new_shipped_id {
         return Ok(("up_to_date", Vec::new()));
     }
-    let work = repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
+    let work = repo.workdir().ok_or("the live folder has no work tree")?.to_path_buf();
     for file in &uncommitted {
         if result.get_path(Path::new(file)).is_err() {
             let _ = std::fs::remove_file(work.join(file));
@@ -331,18 +276,14 @@ pub fn reset_plugin(repo: &Repository, id: &str, source: &Path, version: &str) -
     Ok(("reset", files))
 }
 
-/// Merge a released source into the code folder, keeping the user's changes.
-pub fn release(repo: &Repository, scope: &Scope, source: &Path, version: &str) -> Result<Updated> {
+/// Merge one package's data into the live folder, keeping the user's edits.
+pub fn release(repo: &Repository, package: &Package, version: &str) -> Result<Updated> {
     let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
-    let new_tree = released_tree(repo, &base, scope, source)?;
-    let summary = match scope {
-        Scope::Plugin(id) => format!("Updated {id} to its release {version}"),
-        Scope::Frame => format!("Updated the frame to its release {version}"),
-    };
-    merge_shipped(repo, new_tree, &summary)
+    let new_tree = released_tree(repo, &base, package)?;
+    merge_shipped(repo, new_tree, &format!("Updated {} to {version}", package.id))
 }
 
-/// The files of `prefix` (`plugins/<id>/`) the user changed away from the shipped source,
+/// The files of `prefix` (`plugins/<id>/`) the user changed away from the packages' data,
 /// committed or not.
 pub fn edited(repo: &Repository, prefix: &str) -> Result<Vec<String>> {
     let shipped = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
@@ -354,12 +295,12 @@ pub fn edited(repo: &Repository, prefix: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
-/// Merge a new shipped tree into the code folder: three trees, the current shipped tree as base.
+/// Merge a new shipped tree into the live folder: three trees, the current shipped tree as base.
 fn merge_shipped(repo: &Repository, new_tree_id: Oid, summary: &str) -> Result<Updated> {
     let base = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let base_tree = base.tree().map_err(err)?;
     if base_tree.id() == new_tree_id {
-        return Ok(Updated { state: "up_to_date", conflicts: Vec::new(), own_code: Vec::new() });
+        return Ok(Updated { state: "up_to_date", conflicts: Vec::new() });
     }
     let new_tree = repo.find_tree(new_tree_id).map_err(err)?;
     let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
@@ -369,14 +310,14 @@ fn merge_shipped(repo: &Repository, new_tree_id: Oid, summary: &str) -> Result<U
     } else {
         let mut index = repo.merge_trees(&base_tree, &head_tree, &new_tree, None).map_err(err)?;
         if index.has_conflicts() {
-            return Ok(Updated { state: "conflicts", conflicts: conflict_paths(&index), own_code: Vec::new() });
+            return Ok(Updated { state: "conflicts", conflicts: conflict_paths(&index) });
         }
         index.write_tree_to(repo).map_err(err)?
     };
     let result_tree = repo.find_tree(result).map_err(err)?;
     let blocked = checkout(repo, &result_tree, false)?;
     if !blocked.is_empty() {
-        return Ok(Updated { state: "conflicts", conflicts: blocked, own_code: Vec::new() });
+        return Ok(Updated { state: "conflicts", conflicts: blocked });
     }
     let shipped = shipped_commit(repo, new_tree_id)?;
     let shipped_parent = repo.find_commit(shipped).map_err(err)?;
@@ -386,8 +327,7 @@ fn merge_shipped(repo: &Repository, new_tree_id: Oid, summary: &str) -> Result<U
     repo.reference(MAIN, merged, true, "update").map_err(err)?;
     repo.reference(SHIPPED, shipped, true, "update").map_err(err)?;
     set_index(repo, &result_tree)?;
-    let own_code = changed_files(repo, Some(&new_tree), Some(&result_tree))?.into_iter().filter(|file| !paths::is_data(file)).collect();
-    Ok(Updated { state: "merged", conflicts: Vec::new(), own_code })
+    Ok(Updated { state: "merged", conflicts: Vec::new() })
 }
 
 fn conflict_paths(index: &Index) -> Vec<String> {
@@ -449,7 +389,7 @@ pub fn changed_paths(repo: &Repository) -> Result<Vec<String>> {
 
 /// Stage `files` as they are in the work tree (a missing file is a deletion) into `index`.
 fn stage(repo: &Repository, index: &mut Index, files: &[String]) -> Result<()> {
-    let work = repo.workdir().ok_or("the code folder has no work tree")?;
+    let work = repo.workdir().ok_or("the live folder has no work tree")?;
     for file in files {
         if work.join(file).exists() {
             index.add_path(Path::new(file)).map_err(err)?;
@@ -469,152 +409,6 @@ pub fn commit_files(repo: &Repository, files: &[String], text: &str) -> Result<O
     let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let sig = signature(now_ms())?;
     repo.commit(Some(MAIN), &sig, &sig, text, &tree, &[&head]).map_err(err)
-}
-
-/// A draft commit of `files` (from the work tree) on top of the branch, kept under
-/// `refs/cortexcode/drafts/<id>`; the branch and the index are left as they are.
-pub fn draft(repo: &Repository, id: &str, files: &[String], text: &str) -> Result<Oid> {
-    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
-    let mut index = Index::new().map_err(err)?;
-    index.read_tree(&head.tree().map_err(err)?).map_err(err)?;
-    let work = repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
-    for file in files {
-        let path = work.join(file);
-        if path.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let oid = repo.blob(&bytes).map_err(err)?;
-            let mode = file_mode(&path);
-            let entry = git2::IndexEntry {
-                ctime: git2::IndexTime::new(0, 0),
-                mtime: git2::IndexTime::new(0, 0),
-                dev: 0,
-                ino: 0,
-                mode,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: oid,
-                flags: 0,
-                flags_extended: 0,
-                path: file.as_bytes().to_vec(),
-            };
-            index.add(&entry).map_err(err)?;
-        } else {
-            let _ = index.remove_path(Path::new(file));
-        }
-    }
-    let tree = repo.find_tree(index.write_tree_to(repo).map_err(err)?).map_err(err)?;
-    let sig = signature(now_ms())?;
-    let oid = repo.commit(None, &sig, &sig, text, &tree, &[&head]).map_err(err)?;
-    repo.reference(&format!("{DRAFTS}{id}"), oid, true, "draft").map_err(err)?;
-    Ok(oid)
-}
-
-/// Give the reviewed draft its final message without sampling the mutable work tree again.
-pub fn describe_draft(repo: &Repository, id: &str, draft: Oid, text: &str) -> Result<Oid> {
-    let draft = repo.find_commit(draft).map_err(err)?;
-    let oid = draft.amend(None, None, None, None, Some(text), None).map_err(err)?;
-    repo.reference(&format!("{DRAFTS}{id}"), oid, true, "draft description").map_err(err)?;
-    Ok(oid)
-}
-
-/// Materialize every file of one commit, including shared path dependencies, into a new folder.
-/// No work-tree paths or symlinks are reused, so edits made during a build cannot change it.
-pub fn export_commit(repo: &Repository, commit: Oid, destination: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fn export(repo: &Repository, tree: &Tree<'_>, dir: &Path) -> Result<()> {
-        for entry in tree {
-            let name = entry.name().map_err(err)?;
-            if name == "." || name == ".." || name.contains('/') || name == ".git" {
-                return Err(format!("unsupported approved source path: {name}"));
-            }
-            let path = dir.join(name);
-            match entry.filemode() {
-                0o040000 => {
-                    std::fs::create_dir(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-                    export(repo, &repo.find_tree(entry.id()).map_err(err)?, &path)?;
-                }
-                mode @ (0o100644 | 0o100755) => {
-                    let blob = repo.find_blob(entry.id()).map_err(err)?;
-                    std::fs::write(&path, blob.content()).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 }))
-                        .map_err(|e| format!("cannot set permissions on {}: {e}", path.display()))?;
-                }
-                _ => return Err(format!("{} is a symlink or submodule; approved builds require self-contained source", path.display())),
-            }
-        }
-        Ok(())
-    }
-    // create_dir deliberately refuses an existing directory instead of trusting its contents.
-    std::fs::create_dir(destination).map_err(|e| format!("cannot create {}: {e}", destination.display()))?;
-    let tree = repo.find_commit(commit).and_then(|commit| commit.tree()).map_err(err)?;
-    export(repo, &tree, destination)
-}
-
-fn file_mode(path: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    let executable = std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0);
-    u32::try_from(i32::from(if executable { FileMode::BlobExecutable } else { FileMode::Blob })).unwrap_or(0o100644)
-}
-
-/// Whether the work tree still holds exactly what `draft` holds for `files`.
-pub fn work_matches(repo: &Repository, draft: Oid, files: &[String]) -> Result<bool> {
-    let tree = repo.find_commit(draft).and_then(|c| c.tree()).map_err(err)?;
-    let work = repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
-    for file in files {
-        let on_disk = std::fs::read(work.join(file)).ok();
-        let in_draft = match tree.get_path(Path::new(file)) {
-            Ok(entry) => Some(repo.find_blob(entry.id()).map_err(err)?.content().to_vec()),
-            Err(_) => None,
-        };
-        if on_disk != in_draft {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Put a draft on the branch: a fast-forward when the branch has not moved, else its change applied
-/// on top. The work tree already holds the change; the index is brought to the new tree.
-pub fn apply_draft(repo: &Repository, draft: Oid) -> Result<Oid> {
-    let draft = repo.find_commit(draft).map_err(err)?;
-    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
-    let oid = if draft.parent_id(0).ok() == Some(head.id()) {
-        draft.id()
-    } else {
-        let mut index = repo.cherrypick_commit(&draft, &head, 0, None).map_err(err)?;
-        if index.has_conflicts() {
-            return Err(format!("the change no longer applies: {} changed since", conflict_paths(&index).join(", ")));
-        }
-        let tree = repo.find_tree(index.write_tree_to(repo).map_err(err)?).map_err(err)?;
-        let sig = signature(now_ms())?;
-        repo.commit(None, &sig, &sig, draft.message().unwrap_or_default(), &tree, &[&head]).map_err(err)?
-    };
-    repo.reference(MAIN, oid, true, "approved").map_err(err)?;
-    let tree = repo.find_commit(oid).and_then(|c| c.tree()).map_err(err)?;
-    set_index(repo, &tree)?;
-    Ok(oid)
-}
-
-/// Put `files` back as the branch has them (a file the branch does not have is removed).
-pub fn discard(repo: &Repository, files: &[String]) -> Result<()> {
-    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).and_then(|c| c.tree()).map_err(err)?;
-    let work = repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
-    let mut builder = CheckoutBuilder::new();
-    builder.force();
-    let mut any = false;
-    for file in files {
-        if head.get_path(Path::new(file)).is_ok() {
-            builder.path(file);
-            any = true;
-        } else {
-            let _ = std::fs::remove_file(work.join(file));
-        }
-    }
-    if any {
-        repo.checkout_tree(head.as_object(), Some(&mut builder)).map_err(err)?;
-    }
-    Ok(())
 }
 
 // ----- history -----
@@ -637,16 +431,15 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<Change>> {
     let mut reverted: HashMap<String, String> = HashMap::new();
     let mut commit = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
     loop {
-        // A root commit is the shipped source itself: the starting point, not a change.
+        // A root commit is the shipped data itself: the starting point, not a change.
         let Ok(parent) = commit.parent(0) else { break };
         let (summary, trailers) = parse_message(commit.message().unwrap_or_default());
         let origin = trailers.get("Origin").cloned().unwrap_or_else(|| "edit".into());
         let parent_tree = parent.tree().ok();
         let tree = commit.tree().map_err(err)?;
         // What the commit changed against its first parent. An update or restore lists no files of
-        // its own (they can be many), but its kind still says what came in.
+        // its own (they can be many).
         let changed = changed_files(repo, parent_tree.as_ref(), Some(&tree))?;
-        let kind = kind_of(&changed);
         let files = if matches!(origin.as_str(), "update" | "restore") { Vec::new() } else { changed };
         let id = commit.id().to_string();
         if let Some(target) = trailers.get("Reverts") {
@@ -663,7 +456,6 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<Change>> {
             origin,
             summary,
             plugins,
-            kind: kind.into(),
             files,
             shared: None,
         });
@@ -675,28 +467,17 @@ pub fn history(repo: &Repository, limit: usize) -> Result<Vec<Change>> {
     Ok(changes)
 }
 
-/// The plugins (and app parts) `files` touch.
+/// The plugins `files` touch.
 pub fn plugins_of(files: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for file in files {
-        let name = paths::plugin_of(file).map(str::to_owned).or_else(|| paths::app_part(file).map(str::to_owned)).or_else(|| paths::shared_of(file).map(|s| s.trim_end_matches('/').to_owned()));
-        if let Some(name) = name
-            && !out.contains(&name)
+        if let Some(id) = paths::plugin_of(file)
+            && !out.iter().any(|known| known == id)
         {
-            out.push(name);
+            out.push(id.to_owned());
         }
     }
     out
-}
-
-pub fn kind_of(files: &[String]) -> &'static str {
-    let data = files.iter().filter(|file| paths::is_data(file)).count();
-    match (data, files.len()) {
-        (_, 0) => "data",
-        (d, n) if d == n => "data",
-        (0, _) => "code",
-        _ => "mixed",
-    }
 }
 
 /// Revert one change of the branch with a new commit; returns it and the files it changed.
@@ -704,7 +485,7 @@ pub fn revert(repo: &Repository, commit: &str) -> Result<(Oid, Vec<String>)> {
     let target = repo.find_commit(Oid::from_str(commit).map_err(err)?).map_err(err)?;
     let (summary, trailers) = parse_message(target.message().unwrap_or_default());
     if target.parent_count() == 0 {
-        return Err("the shipped source itself cannot be reverted".into());
+        return Err("the shipped data itself cannot be reverted".into());
     }
     let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let mainline = if target.parent_count() > 1 { 1 } else { 0 };
@@ -761,7 +542,7 @@ pub fn diff_trees(repo: &Repository, old: Option<&Tree>, new: Option<&Tree>) -> 
 /// A commit's change (against its first parent).
 pub fn diff_commit(repo: &Repository, commit: Oid) -> Result<Vec<FileDiff>> {
     let commit = repo.find_commit(commit).map_err(err)?;
-    let parent = commit.parent(0).map_err(|_| "the shipped source is the starting point, not a change; there is nothing to show against".to_owned())?;
+    let parent = commit.parent(0).map_err(|_| "the shipped data is the starting point, not a change; there is nothing to show against".to_owned())?;
     diff_trees(repo, Some(&parent.tree().map_err(err)?), Some(&commit.tree().map_err(err)?))
 }
 
@@ -814,18 +595,17 @@ fn shipped_base(repo: &Repository, tip: Oid) -> Result<Oid> {
         if let Some(tree) = trailers.get("Shipped-Tree") {
             return Oid::from_str(tree).map_err(err);
         }
-        commit = commit.parent(0).map_err(|_| "the backup does not say which shipped source it was made on".to_owned())?;
+        commit = commit.parent(0).map_err(|_| "the backup does not say which plugin data it was made on".to_owned())?;
     }
 }
 
-/// Replace the branch with a fetched backup, carried onto the shipped source this Mac has.
-/// Returns the new commit and the code files that differ from the shipped source.
-pub fn restore(repo: &Repository, backup: Oid) -> Result<(Oid, Vec<String>)> {
+/// Replace the branch with a fetched backup, carried onto the packages' data this Mac has.
+pub fn restore(repo: &Repository, backup: Oid) -> Result<Oid> {
     let backup_commit = repo.find_commit(backup).map_err(err)?;
     let backup_tree = backup_commit.tree().map_err(err)?;
     let current = repo.find_reference(SHIPPED).and_then(|r| r.peel_to_commit()).map_err(err)?;
     let current_tree = current.tree().map_err(err)?;
-    let base = repo.find_tree(shipped_base(repo, backup)?).map_err(|_| "the backup was made on a shipped source this Mac never had".to_owned())?;
+    let base = repo.find_tree(shipped_base(repo, backup)?).map_err(|_| "the backup was made on plugin data this Mac never had".to_owned())?;
     let result = if base.id() == current_tree.id() {
         backup_tree.id()
     } else {
@@ -842,8 +622,7 @@ pub fn restore(repo: &Repository, backup: Oid) -> Result<(Oid, Vec<String>)> {
     let oid = repo.commit(None, &sig, &sig, &text, &tree, &[&backup_commit, &current]).map_err(err)?;
     repo.reference(MAIN, oid, true, "restore").map_err(err)?;
     set_index(repo, &tree)?;
-    let own = changed_files(repo, Some(&current_tree), Some(&tree))?.into_iter().filter(|file| !paths::is_data(file)).collect();
-    Ok((oid, own))
+    Ok(oid)
 }
 
 /// Commits `commits` (in order) re-applied onto `onto` as a chain; returns the tip. Each new commit
@@ -856,7 +635,7 @@ pub fn replay(repo: &Repository, onto: Oid, commits: &[Oid], extra: &str) -> Res
         let mut index = repo.cherrypick_commit(&commit, &tip, mainline, None).map_err(err)?;
         let (summary, _) = parse_message(commit.message().unwrap_or_default());
         if index.has_conflicts() {
-            return Err(format!("“{summary}” does not apply to the official source: {} changed there", conflict_paths(&index).join(", ")));
+            return Err(format!("“{summary}” does not apply to the official repository: {} changed there", conflict_paths(&index).join(", ")));
         }
         let tree = repo.find_tree(index.write_tree_to(repo).map_err(err)?).map_err(err)?;
         let sig = signature(now_ms())?;
@@ -870,4 +649,68 @@ pub fn replay(repo: &Repository, onto: Oid, commits: &[Oid], extra: &str) -> Res
 /// The shipped commit.
 pub fn shipped(repo: &Repository) -> Option<String> {
     repo.find_reference(SHIPPED).and_then(|r| r.peel_to_commit()).ok().map(|c| c.id().to_string())
+}
+
+// ----- the code folder this folder replaced -----
+
+/// Carry the user's data edits from the code folder (`old`: CortexCode's full source, managed by
+/// an earlier version of this plugin) into the live folder: every data file whose content in the
+/// old work tree differs from the old shipped source, where the live folder does not already have
+/// that content. Only plugins the live folder holds. Returns the files written (not committed).
+pub fn carry_over(old: &Path, repo: &Repository) -> Result<Vec<String>> {
+    let old_repo = open(old)?;
+    let base = old_repo.find_reference(SHIPPED).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let old_work = old_repo.workdir().ok_or("the code folder has no work tree")?.to_path_buf();
+    let work = repo.workdir().ok_or("the live folder has no work tree")?.to_path_buf();
+    let head = repo.find_reference(MAIN).and_then(|r| r.peel_to_tree()).map_err(err)?;
+    let blob = |repo: &Repository, tree: &Tree, file: &str| -> Option<Vec<u8>> {
+        let entry = tree.get_path(Path::new(file)).ok()?;
+        repo.find_blob(entry.id()).ok().map(|blob| blob.content().to_vec())
+    };
+    // The data files the old shipped source had, and the ones its work tree has now.
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    base.walk(TreeWalkMode::PreOrder, |dir, entry| {
+        if entry.kind() == Some(ObjectType::Blob)
+            && let Ok(name) = entry.name()
+        {
+            files.insert(format!("{dir}{name}"));
+        }
+        TreeWalkResult::Ok
+    })
+    .map_err(err)?;
+    if let Ok(plugins) = std::fs::read_dir(old_work.join("plugins")) {
+        for plugin in plugins.flatten() {
+            let id = plugin.file_name().to_string_lossy().into_owned();
+            let mut found = Vec::new();
+            for dir in ["data", "backend/data"] {
+                files_under(&old_work, &format!("plugins/{id}/{dir}"), &mut found)?;
+            }
+            files.extend(found.into_iter().map(|(file, _)| file));
+        }
+    }
+    let mut carried = Vec::new();
+    for file in files.into_iter().filter(|file| paths::is_data(file)) {
+        let Some(id) = paths::plugin_of(&file) else { continue };
+        if head.get_path(Path::new(&format!("plugins/{id}"))).is_err() {
+            continue;
+        }
+        let user = std::fs::read(old_work.join(&file)).ok();
+        if user == blob(&old_repo, &base, &file) || user == blob(repo, &head, &file) {
+            continue;
+        }
+        let target = work.join(&file);
+        match &user {
+            Some(bytes) => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                std::fs::write(&target, bytes).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(&target);
+            }
+        }
+        carried.push(file);
+    }
+    Ok(carried)
 }

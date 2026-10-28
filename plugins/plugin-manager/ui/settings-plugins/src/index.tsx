@@ -4,14 +4,13 @@
  * to the version its last install replaced (frame.plugins.rollback {plugin}). Under each plugin, its
  * parts: the backend service (state, pid, version, known good, restarts) with Restart
  * (frame.plugins.swap: the same version, blue/green), showing the swap's steps and timings; its UI
- * packages (slot, version, hash) with Reload; its shell modules. Under a plugin's name, what can
- * be edited in it on this Mac (source.status `plugins`: data always, code when every tool its build
- * needs is present). Live from plugin.state, plugin.swapped, plugin.unit and source.changed. At the
- * top, Reset all plugins (ResetAll.tsx): every plugin back to its official release, after asking.
+ * packages (slot, version, hash) with Reload; its shell modules. Live from plugin.state,
+ * plugin.swapped and plugin.unit. At the top, Reset all plugins (ResetAll.tsx): every plugin back
+ * to its official release, after asking.
  */
 
 import { Fragment, useState, type ReactNode } from 'react';
-import { definePlugin, duration, errorMessage, setShared, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
+import { definePlugin, duration, errorMessage, useClient, useHost, useQuery, useUiPlugins, type PluginInfo } from '@cortex/sdk';
 import { ResetAll, version } from './ResetAll';
 import './plugins.css';
 
@@ -22,8 +21,6 @@ type Info = PluginInfo & { build?: string; known_good?: boolean; transport?: str
  * installed plugin claims (served by the app over the WebSocket), which cannot be toggled. */
 interface Unit { id: string; name?: string; version?: string; enabled: boolean; ui?: string[]; shell?: string[]; category?: string | null; previous_version?: string | null; served?: boolean }
 interface PackageSwap { ok: boolean; plugin: string; from_version?: string; to_version?: string; error?: string | null; steps: SwapStep[] }
-/** What can be edited in a plugin on this Mac (source.status `plugins`). */
-interface PluginEditing { id: string; data_editable: boolean; code_editable: boolean; missing: string[] }
 interface UpdateStatus { pending?: { plugin: string; version: string; files?: string[] }[]; failed?: { plugin: string; version: string; error?: string }[] }
 
 /** Where a package version came from, by its build tag: `+dev.` a build of yours, `+b` the app's
@@ -32,12 +29,6 @@ function origin(full: string | undefined): string {
   if (!full) return '';
   const tag = full.split('+')[1] ?? '';
   return tag.startsWith('dev.') ? 'your build' : tag.startsWith('b') ? "the app's build" : 'release';
-}
-
-/** `Data: editable · Code: needs Rust, Apple's command line tools`. */
-function editingLine(editing: PluginEditing): string {
-  const code = editing.code_editable ? 'editable' : editing.missing.length ? `needs ${editing.missing.join(', ')}` : 'not editable';
-  return `Data: ${editing.data_editable ? 'editable' : 'not editable'} · Code: ${code}`;
 }
 
 /** A full-width row under a part: a swap's or rollback's outcome and its steps. */
@@ -62,8 +53,6 @@ function PluginsPanel() {
     const result = await c.call<Info[] | { plugins: Info[]; units?: Unit[] }>('frame.plugins.list', {});
     return Array.isArray(result) ? { plugins: result, units: null } : { plugins: result?.plugins ?? [], units: result?.units ?? null };
   }, { topics: ['plugin.state', 'plugin.swapped', 'plugin.unit'] });
-  const source = useQuery<{ plugins: PluginEditing[] }>('source.status', (c) => c.call('source.status', {}), { topics: ['source.changed'] });
-  const editing = new Map((source.data?.plugins ?? []).map((plugin) => [plugin.id, plugin]));
   // What the updater knows per plugin: a newer version waiting for an answer, or one that could not start.
   const updates = useQuery<UpdateStatus>('update.status:plugins', (c) => c.call<UpdateStatus>('update.status', {}), { topics: ['update.changed'] });
   const pendingOf = new Map((updates.data?.pending ?? []).map((pending) => [pending.plugin, pending]));
@@ -160,14 +149,6 @@ function PluginsPanel() {
                   <button className="detent" type="button" disabled={busy !== null} data-action="restart" onClick={() => void restart(service.category)}>{busy === service.category ? 'Restarting…' : 'Restart'}</button>
                 </div>
               ) : null}
-              {process && service.state !== 'active' ? (
-                <div className="cx-plugin-acts">
-                  <button className="detent warn" type="button" data-action="fix-in-chat" title="Start a conversation on CortexCode's own source about this service"
-                    onClick={() => setShared('plugins.fix', { plugin: unit.id, category: service.category, version: service.version, ts: Date.now(), reason: service.state === 'crashed' ? `stops right after it starts: ${service.restarts ?? 0} exits in a row, and CortexCode keeps restarting it` : `is ${service.state} and does not serve` })}>
-                    Fix it in a chat
-                  </button>
-                </div>
-              ) : null}
             </td>
           </tr>
           {outcome && (typeof outcome === 'string'
@@ -198,7 +179,6 @@ function PluginsPanel() {
                 <tr className="cx-unit" data-vertical={name} data-enabled={off ? 'false' : 'true'}>
                   <td>
                     <span className="cx-plugin-cat">{unit.name || name}</span>
-                    {editing.has(name) && <span className="cx-editing" data-editing={name}>{editingLine(editing.get(name)!)}</span>}
                   </td>
                   <td>
                     <span className="ap faint num" title={unit.version || undefined}>{unit.version ? version(unit.version) : '—'}</span>

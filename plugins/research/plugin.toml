@@ -46,13 +46,3 @@ model_max_tokens = 2048
 model_priority = "agent"           # foreground | agent | background
 # user_agent = "CortexCode-research/0.1 (local research assistant; macOS)"
 # Endpoints (mirrors, tests): arxiv_api, semantic_scholar_api, github_api, reddit, hackernews_api, duckduckgo_html
-
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/research"

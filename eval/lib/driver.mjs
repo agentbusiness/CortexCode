@@ -176,7 +176,7 @@ export class CortexSystem {
     // Every task starts from a clean slate: the shipped skills, no learned state (cleanslate.mjs);
     // what earlier benchmark tasks taught is withdrawn first.
     await withdrawBenchmarkLessons((method, params) => this.client.request(method, params));
-    this.slate = await requireCleanSlate((method, params) => this.client.request(method, params), { codeDir: path.join(this.frame.home, 'code') });
+    this.slate = await requireCleanSlate((method, params) => this.client.request(method, params), { codeDir: path.join(this.frame.home, 'live') });
     const project = await this.client.request('frame.project.open', { root: workspace });
     const session = await this.client.request('frame.session.create', { project_id: project.id, kind: 'chat', title });
     return { project, session };

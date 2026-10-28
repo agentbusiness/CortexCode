@@ -51,10 +51,10 @@ impl Home {
     pub fn plugins(&self) -> PathBuf {
         self.root.join("plugins")
     }
-    /// The default code folder: CortexCode's own source as one git repository (the source
-    /// manager creates and keeps it; plugins read their live data from it).
-    pub fn code(&self) -> PathBuf {
-        self.root.join("code")
+    /// The default live folder: every plugin's data as one git repository (the source manager
+    /// creates and keeps it; plugins read their data from it).
+    pub fn live(&self) -> PathBuf {
+        self.root.join("live")
     }
 
     /// Create the directories the frame writes to. `run/` is private to the user.

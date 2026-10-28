@@ -62,8 +62,6 @@ pub struct ExecSpec {
     pub version: String,
     /// The git commit the package was built from.
     pub commit: Option<String>,
-    /// The plugin's folder inside the code folder (`[source] subdir`), when it has source.
-    pub source_subdir: Option<String>,
 }
 
 // ----- instances -----
@@ -466,7 +464,7 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
         .env("CORTEX_PLUGIN_INSTANCE", &id)
         .env("CORTEX_HOME", &frame.home.root)
         .env("CORTEX_PLUGIN_DATA", &data_dir)
-        .env("CORTEX_CODE", &frame.code)
+        .env("CORTEX_LIVE", &frame.live)
         .current_dir(&frame.config.base)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -474,12 +472,10 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
         // Own process group: a terminal Ctrl-C reaches only the frame, which then stops plugins in order.
         .process_group(0)
         .kill_on_drop(true);
-    // Live data: the plugin's folder in the code folder (it may not exist yet; plugins check on
+    // Live data: the plugin's folder in the live folder (it may not exist yet; plugins check on
     // each read). Safe mode leaves it out, so plugins read their packaged data only.
-    if !frame.safe
-        && let Some(subdir) = &spec.source_subdir
-    {
-        command.env("CORTEX_PLUGIN_SOURCE", frame.code.join(subdir));
+    if !frame.safe {
+        command.env("CORTEX_PLUGIN_LIVE", frame.live.join("plugins").join(&spec.plugin));
     }
     let mut child = command.spawn().map_err(|e| format!("cannot start {}: {e}", spec.exec.display()))?;
     let pid = child.id().unwrap_or(0);

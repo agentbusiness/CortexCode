@@ -1,18 +1,19 @@
-//! `source@1`: CortexCode's own source, live and editable (see `docs/LIVE-EDITING.md`).
+//! `source@1`: the live folder, every plugin's data (prompts, texts, stages, schemas, skills),
+//! live and editable (see `docs/LIVE-EDITING.md`).
 //!
-//! The full source (every plugin, the shared libraries, the frame) is one git repository in the
-//! code folder (`<home>/code` by default). Plugins read their data (skills, guides, prompts, texts)
-//! from there live. Edits to data are committed as they happen; edits to code become a proposal the
-//! user approves (a plain-English summary), and an approved proposal is built, packed and
-//! hot-swapped. The same repository is updated from the shipped source (a merge), backed up to the
-//! user's own GitHub repository and shared with the official project by pull request.
+//! The data of every installed plugin is one git repository in the live folder (`<home>/live` by
+//! default), laid out as in CortexCode's repository (`plugins/<id>/data/...`). Plugins read their
+//! data from there; an edit is in use at once and committed as it settles. The folder follows the
+//! installed packages (a merge that keeps the user's edits), is backed up to the user's own GitHub
+//! repository and shared with the official project by pull request. CortexCode's code is never
+//! edited here: it changes only with a new package.
 
 use serde::{Deserialize, Serialize};
 
 pub mod methods {
     /// `{}` -> [`super::Status`].
     pub const STATUS: &str = "source.status";
-    /// `{}` -> [`super::UpdateResult`]. Merge the shipped source into the code folder.
+    /// `{}` -> [`super::UpdateResult`]. Merge the installed packages' data into the live folder.
     pub const UPDATE: &str = "source.update";
     /// [`super::HistoryParams`] -> [`super::History`].
     pub const HISTORY: &str = "source.history";
@@ -20,20 +21,13 @@ pub mod methods {
     pub const REVERT: &str = "source.revert";
     /// [`super::DiffParams`] -> [`super::Diff`].
     pub const DIFF: &str = "source.diff";
-    /// `{}` -> [`super::Proposals`].
-    pub const PROPOSALS: &str = "source.proposals";
-    /// [`super::ProposeParams`] -> [`super::Proposal`]. A proposal from the code folder's
-    /// uncommitted code changes (the summary is written by the model when not given).
-    pub const PROPOSE: &str = "source.propose";
-    /// [`super::DecideParams`] -> [`super::Proposal`]. Approve (build, pack, hot-swap) or decline.
-    pub const DECIDE: &str = "source.decide";
     /// `{}` -> [`super::Backup`].
     pub const BACKUP_STATUS: &str = "source.backup.status";
     /// [`super::BackupSetParams`] -> [`super::Backup`].
     pub const BACKUP_SET: &str = "source.backup.set";
-    /// `{}` -> [`super::Backup`]. Push the code folder to the backup repository.
+    /// `{}` -> [`super::Backup`]. Push the live folder to the backup repository.
     pub const BACKUP_PUSH: &str = "source.backup.push";
-    /// [`super::RestoreParams`] -> [`super::RestoreResult`]. Replace the code folder's changes with
+    /// [`super::RestoreParams`] -> [`super::RestoreResult`]. Replace the live folder's changes with
     /// the backup's.
     pub const BACKUP_RESTORE: &str = "source.backup.restore";
     /// `{}` -> [`super::ShareCandidates`]. The user's changes not shared yet, each with the
@@ -46,15 +40,14 @@ pub mod methods {
     /// `{}` -> [`super::Storage`].
     pub const STORAGE: &str = "source.storage";
     /// [`super::ReleaseStatusParams`] -> [`super::ReleaseStatus`]. Whether the user changed a
-    /// plugin away from the shipped source (an update of it then asks first).
+    /// plugin's data away from its package (an update of it then asks first).
     pub const RELEASE_STATUS: &str = "source.release.status";
-    /// [`super::ReleaseMergeParams`] -> [`super::UpdateResult`]. Merge a released source (one
-    /// plugin's, or the frame's: everything outside `plugins/`) into the code folder, keeping the
-    /// user's changes; the user's own code on the new base is built again.
+    /// [`super::ReleaseMergeParams`] -> [`super::UpdateResult`]. Merge a package's data into the
+    /// plugin's folder of the live folder, keeping the user's edits.
     pub const RELEASE_MERGE: &str = "source.release.merge";
     /// [`super::ReleaseResetParams`] -> [`super::ReleaseResetResult`]. Put one plugin's folder back
-    /// to its released source: the user's changes in it (committed or not) are dropped, the rest
-    /// of the code folder stays.
+    /// to its package's data: the user's edits in it (committed or not) are dropped, the rest of
+    /// the live folder stays.
     pub const RELEASE_RESET: &str = "source.release.reset";
 }
 
@@ -66,22 +59,19 @@ pub struct ReleaseStatusParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReleaseStatus {
     pub plugin: String,
-    /// The code folder is managed (false for a developer checkout: nothing is merged there).
+    /// The live folder is managed (false for a developer checkout: nothing is merged there).
     pub managed: bool,
-    /// The user changed the plugin's files (committed or not) away from the shipped source.
+    /// The user changed the plugin's data (committed or not) away from its package.
     pub edited: bool,
-    /// The changed files, relative to the code folder.
+    /// The changed files, relative to the live folder.
     #[serde(default)]
     pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReleaseMergeParams {
-    /// `plugin` (one plugin's folder, `plugins/<plugin>`) or `frame` (everything outside `plugins/`).
-    pub scope: String,
-    #[serde(default)]
     pub plugin: String,
-    /// The released source: a folder holding exactly the files of that scope.
+    /// The unpacked package (its `manifest.json` names the data folders).
     pub dir: String,
     /// The release version, for the history.
     #[serde(default)]
@@ -91,7 +81,7 @@ pub struct ReleaseMergeParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReleaseResetParams {
     pub plugin: String,
-    /// The released source: a folder holding exactly the plugin's files.
+    /// The unpacked package (its `manifest.json` names the data folders).
     pub dir: String,
     /// The release version, for the history.
     #[serde(default)]
@@ -102,43 +92,24 @@ pub struct ReleaseResetParams {
 pub struct ReleaseResetResult {
     /// reset | up_to_date | unmanaged
     pub state: String,
-    /// The files put back (relative to the code folder).
+    /// The files put back (relative to the live folder).
     #[serde(default)]
     pub files: Vec<String>,
 }
 
 pub mod topics {
-    /// `{}`: status, history, proposals or backup changed (refetch).
+    /// `{}`: status, history or backup changed, or the live data moved (refetch, read again).
     pub const CHANGED: &str = "source.changed";
-    /// [`super::Progress`] while a proposal builds.
-    pub const PROGRESS: &str = "source.progress";
-}
-
-/// The journal entry kind of a code-change card in a session (`data`: a [`Proposal`]).
-pub const CHANGE_ENTRY: &str = "change";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Progress {
-    pub proposal: String,
-    /// The plugin being built, or empty for the whole proposal.
-    #[serde(default)]
-    pub plugin: String,
-    /// started | output | done | failed
-    pub state: String,
-    #[serde(default)]
-    pub detail: String,
-    #[serde(default)]
-    pub ts_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Status {
-    /// The code folder.
-    pub code_dir: String,
+    /// The live folder.
+    pub live_dir: String,
     /// Managed by this plugin (populated, committed, updated). False for a developer checkout
-    /// configured as the code folder: then nothing is committed or merged automatically.
+    /// configured as the live folder: then nothing is committed or merged automatically.
     pub managed: bool,
-    /// The shipped source the code folder was last updated from (its commit in the code folder).
+    /// The packages' data the live folder was last updated from (its commit in the live folder).
     #[serde(default)]
     pub shipped: Option<String>,
     /// up_to_date | conflicts | no_source
@@ -146,38 +117,6 @@ pub struct Status {
     /// Files in conflict when the last update could not merge.
     #[serde(default)]
     pub conflicts: Vec<String>,
-    pub plugins: Vec<PluginEditing>,
-    pub tools: Vec<Toolchain>,
-    /// Proposals waiting for an answer.
-    pub pending: usize,
-}
-
-/// What can be edited in one plugin on this Mac.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PluginEditing {
-    pub id: String,
-    pub name: String,
-    /// Always true: data (skills, guides, prompts, texts) needs no tools.
-    pub data_editable: bool,
-    /// Every tool its build needs is present.
-    pub code_editable: bool,
-    /// What its build needs (`[build] needs` in its plugin.toml).
-    pub needs: Vec<String>,
-    /// Plain names of what is missing ("Rust", "Apple's command line tools", ...).
-    pub missing: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Toolchain {
-    /// rust | apple-clt | metal | node
-    pub name: String,
-    /// Plain name for the user.
-    pub label: String,
-    pub found: bool,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,9 +125,6 @@ pub struct UpdateResult {
     pub state: String,
     #[serde(default)]
     pub conflicts: Vec<String>,
-    /// Plugins rebuilt because the user's own code changes sit on the new base.
-    #[serde(default)]
-    pub rebuilt: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -202,18 +138,16 @@ pub struct History {
     pub changes: Vec<Change>,
 }
 
-/// One change in the code folder (a commit), newest first.
+/// One change in the live folder (a commit), newest first.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Change {
     pub commit: String,
     pub ms: u64,
-    /// edit | approved | update | restore | revert | shipped
+    /// edit | update | restore | revert | shipped
     pub origin: String,
     /// Plain-English summary.
     pub summary: String,
     pub plugins: Vec<String>,
-    /// data | code | mixed
-    pub kind: String,
     #[serde(default)]
     pub files: Vec<String>,
     /// The commit that reverted this one, when it was reverted.
@@ -232,22 +166,12 @@ pub struct RevertParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RevertResult {
     pub commit: String,
-    /// Plugins rebuilt and hot-swapped because code was reverted.
-    #[serde(default)]
-    pub rebuilt: Vec<String>,
-    /// Parts that take effect at the next start (the frame, the app shell).
-    #[serde(default)]
-    pub next_start: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DiffParams {
-    /// A proposal's changes.
-    #[serde(default)]
-    pub proposal: Option<String>,
-    /// A commit's changes.
-    #[serde(default)]
-    pub commit: Option<String>,
+    /// The commit whose changes to show.
+    pub commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,63 +189,6 @@ pub struct FileDiff {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Proposals {
-    pub proposals: Vec<Proposal>,
-}
-
-/// A code change waiting for, or answered by, the user.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Proposal {
-    pub id: String,
-    pub created_ms: u64,
-    /// The plugins whose code changes (plugin ids; `frame` / `shell` for parts that need a restart).
-    pub plugins: Vec<String>,
-    /// Plain-English: what changes.
-    pub summary: String,
-    /// Plain-English: why.
-    #[serde(default)]
-    pub why: String,
-    /// Plain-English: what else it can affect.
-    #[serde(default)]
-    pub risk: String,
-    pub files: Vec<String>,
-    /// The session the card is in, when the change was made in a conversation.
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// The card's journal entry in that session.
-    #[serde(default)]
-    pub entry_seq: Option<u64>,
-    /// pending | building | done | failed | rolled_back | declined
-    pub state: String,
-    /// What happened, in plain words (the build failure, the rollback, what needs a restart).
-    #[serde(default)]
-    pub outcome: String,
-    /// The draft commit holding the change.
-    pub draft: String,
-    /// The commit on the code folder's branch once approved.
-    #[serde(default)]
-    pub commit: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ProposeParams {
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub why: Option<String>,
-    #[serde(default)]
-    pub risk: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DecideParams {
-    pub id: String,
-    pub approve: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Backup {
     /// `owner/name` of the backup repository, when one is set.
     #[serde(default)]
@@ -332,7 +199,7 @@ pub struct Backup {
     pub last_push_ms: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
-    /// The branch the code folder is pushed to.
+    /// The branch the live folder is pushed to.
     pub branch: String,
 }
 
@@ -355,11 +222,6 @@ pub struct RestoreParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RestoreResult {
     pub commit: String,
-    #[serde(default)]
-    pub rebuilt: Vec<String>,
-    /// Plugins whose restored code could not be built on this Mac (missing tools).
-    #[serde(default)]
-    pub not_built: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

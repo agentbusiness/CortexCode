@@ -11,7 +11,7 @@ use crate::native::NativeDelivery;
 use crate::native::helper::NativeActivation;
 use crate::prefs::{self, Prefs, kind_info};
 use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, methods as chatflow_methods};
-use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, PluginListResult, Project, Session, SessionKind, kinds as entry_kinds, methods as frame_methods};
+use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, Project, Session, SessionKind, kinds as entry_kinds, methods as frame_methods};
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::methods as memory_methods;
 use cc_protocol::contracts::notify::{
@@ -19,7 +19,7 @@ use cc_protocol::contracts::notify::{
     HistoryParams, HistoryResult, Notification, Posted, PostedEvent, PrefsResult, PrefsSetParams, StatusResult, delivery, kinds,
     methods, topics,
 };
-use cc_protocol::contracts::{agents, now_ms, source, tools};
+use cc_protocol::contracts::{agents, now_ms, tools};
 use cc_protocol::{BoxFuture, Ctx, RpcError, codes, parse_params, to_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -676,19 +676,15 @@ impl Notifier {
             session_id: n.session_id.clone(),
             via: params.via.clone(),
         };
-        // The pending approval's Approve action answers it right away (chatflow.approve; a code
-        // change: source.decide); the UI still gets the activation and shows the answered card.
-        if params.action.as_deref() == Some(derive::APPROVE_ACTION) && n.kind == kinds::APPROVAL {
-            if let Some(proposal) = n.target.get("proposal").and_then(Value::as_str) {
-                match self.call(source::methods::DECIDE, json!({"id": proposal, "approve": true})).await {
-                    Ok(_) => tracing::info!(proposal, "change approved from the notification"),
-                    Err(error) => tracing::warn!(%error, proposal, "the notification's Approve did not reach the source manager"),
-                }
-            } else if let (Some(session_id), Some(seq)) = (n.target.get("session_id").and_then(Value::as_str), n.target.get("approval_seq").and_then(Value::as_u64)) {
-                match self.call(chatflow_methods::APPROVE, json!({"session_id": session_id, "seq": seq, "approve": true})).await {
-                    Ok(_) => tracing::info!(session_id, seq, "approved from the notification"),
-                    Err(error) => tracing::warn!(%error, session_id, seq, "the notification's Approve did not reach the chat flow"),
-                }
+        // The pending approval's Approve action answers it right away (chatflow.approve); the UI
+        // still gets the activation and shows the answered card.
+        if params.action.as_deref() == Some(derive::APPROVE_ACTION)
+            && n.kind == kinds::APPROVAL
+            && let (Some(session_id), Some(seq)) = (n.target.get("session_id").and_then(Value::as_str), n.target.get("approval_seq").and_then(Value::as_u64))
+        {
+            match self.call(chatflow_methods::APPROVE, json!({"session_id": session_id, "seq": seq, "approve": true})).await {
+                Ok(_) => tracing::info!(session_id, seq, "approved from the notification"),
+                Err(error) => tracing::warn!(%error, session_id, seq, "the notification's Approve did not reach the chat flow"),
             }
         }
         self.publish(topics::ACTIVATE, to_value(&activate)?);
@@ -914,14 +910,6 @@ impl Notifier {
                 {
                     task_id = list.agents.into_iter().find(|record| record.name == *agent).and_then(|record| record.task_id);
                 }
-            }
-            Trigger::Change { plugins, .. } => {
-                // The plugins by name; one not listed (the frame, the app shell) keeps its id.
-                let units = self.call(frame_methods::PLUGINS_LIST, json!({})).await.and_then(parse_params::<PluginListResult>).map(|list| list.units).unwrap_or_default();
-                ctx.plugin_names = plugins
-                    .iter()
-                    .map(|id| units.iter().find(|unit| unit.id == *id && !unit.name.trim().is_empty()).map_or_else(|| id.clone(), |unit| unit.name.clone()))
-                    .collect();
             }
             Trigger::Job { job_id, .. } => {
                 if let Ok(status) = self.call(tools::methods::JOB_STATUS, json!({"job_id": job_id})).await.and_then(parse_params::<tools::JobStatus>) {

@@ -5,7 +5,7 @@ The finding came from a security audit and sits in the project's graph with its 
 ## 1. Read the finding
 
 ```bash
-export SA="$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py"
+export SA="$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py"
 python3 "$SA" show <id>
 ```
 
