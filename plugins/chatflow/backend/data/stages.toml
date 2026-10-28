@@ -1,6 +1,6 @@
 # cc-chatflow model-facing configuration. Loaded at startup and reloaded on change; a set that
-# does not validate is rejected and the previous one stays active. The copy in the code folder
-# (~/.cortexcode/code/plugins/chatflow/backend/data/) is the live one: an edit there is in use
+# does not validate is rejected and the previous one stays active. The copy in the live folder
+# (~/.cortexcode/live/plugins/chatflow/backend/data/) is the live one: an edit there is in use
 # within a second (except prompts/policy.md, which only a new build changes).
 #
 # Constrained stages (with a schema) run without thinking: the engine applies the grammar to the

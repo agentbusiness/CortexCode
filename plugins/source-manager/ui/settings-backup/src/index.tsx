@@ -1,6 +1,6 @@
 /**
- * settings.backup@1 — Backup & Sync: the user's GitHub repository CortexCode's own changes are
- * pushed to (picked from `vcs.github.repos`, or a new private one from `vcs.github.repo.create`),
+ * settings.backup@1 — Backup & Sync: the user's GitHub repository the live data's changes
+ * (skills, prompts, texts) are pushed to (picked from `vcs.github.repos`, or a new private one from `vcs.github.repo.create`),
  * Back up now (`source.backup.push`), when the last backup was and its last error, the "Back up
  * after each change" switch (`source.backup.set {auto}`), and Restore from backup
  * (`source.backup.restore`, after a confirm). Needs GitHub connected; otherwise one line points to
@@ -18,12 +18,6 @@ interface Backup {
   last_push_ms?: number | null;
   last_error?: string | null;
   branch: string;
-}
-
-interface RestoreResult {
-  commit: string;
-  rebuilt?: string[];
-  not_built?: string[];
 }
 
 interface GithubStatus {
@@ -116,13 +110,9 @@ function BackupPanel() {
     }
   };
   const restore = () => act('restore', async () => {
-    const done = await client.call<RestoreResult>('source.backup.restore', {});
+    await client.call('source.backup.restore', {});
     setRestoring(false);
-    setRestored([
-      'Restored from the backup.',
-      done.rebuilt?.length ? `Rebuilt ${done.rebuilt.join(', ')}.` : '',
-      done.not_built?.length ? `Not built on this Mac (tools missing): ${done.not_built.join(', ')}.` : '',
-    ].filter(Boolean).join(' '));
+    setRestored('Restored from the backup.');
   });
 
   const b = backup.data;
@@ -130,7 +120,7 @@ function BackupPanel() {
   return (
     <div className="cx-settings-panel-body" data-build={__CORTEX_BUILD__} data-panel="backup">
       <h3 className="cx-settings-title">Backup & Sync</h3>
-      <p className="cx-settings-line">CortexCode's changes to itself (learned skills, guides, prompts and code) are kept in a GitHub repository of yours, so another Mac can restore them.</p>
+      <p className="cx-settings-line">The changes to CortexCode's live data (learned skills, prompts and texts) are kept in a GitHub repository of yours, so another Mac can restore them.</p>
       {github.data && !connected && (
         <p className="cx-settings-line" data-github="disconnected">
           Connect GitHub first: <button type="button" className="cx-file-link" onClick={() => setShared('settings.open', 'github')}>Settings › GitHub</button>
@@ -154,7 +144,7 @@ function BackupPanel() {
           <div className="row" data-setting="auto">
             <div className="grow">
               <div className="nm">Back up after each change</div>
-              <div className="cx-backup-note">Push to the repository whenever CortexCode changes itself.</div>
+              <div className="cx-backup-note">Push to the repository whenever the live data changes.</div>
             </div>
             <button type="button" className="sw" aria-pressed={b.auto} aria-label="Back up after each change" disabled={!b.repo || busy !== null}
               onClick={() => void act('auto', async () => { await client.call<Backup>('source.backup.set', { auto: !b.auto }); })} />

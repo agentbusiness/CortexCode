@@ -15,7 +15,6 @@ use crate::prefs::Prefs;
 use cc_protocol::contracts::chatflow::kinds as chatflow_kinds;
 use cc_protocol::contracts::frame::{JournalPatch, SwapResult, kinds as entry_kinds};
 use cc_protocol::contracts::notify::{Notification, kinds};
-use cc_protocol::contracts::source::CHANGE_ENTRY;
 use serde_json::{Value, json};
 
 /// Something that may deserve a notification.
@@ -27,9 +26,6 @@ pub enum Trigger {
     /// answerable with `chatflow.approve`), or a `tool_result` that needed approval (`needs_approval`,
     /// or `error_kind: "approval_required"` in auto mode, where the call was refused).
     Approval { session_id: String, seq: u64, call_id: String, command: Option<String>, classes: Vec<String>, output: String, tool: Option<String>, pending: bool },
-    /// A code change waiting for the person: a `change` entry (`data`: a source proposal) with
-    /// `state: "pending"`, answerable with `source.decide`.
-    Change { session_id: String, seq: u64, id: String, plugins: Vec<String>, summary: String },
     /// A `verification` entry.
     Verification { session_id: String, seq: u64, task_id: String, ok: bool, checks: Vec<Check>, merged: Option<String>, agent: Option<String> },
     /// An `agent_spawned` entry.
@@ -42,7 +38,7 @@ pub enum Trigger {
     /// `plugin.swapped` with `ok: false` or `rolled_back: true`.
     Swap { result: SwapResult },
     /// `plugin.state` saying a service crashed again and again (a crash loop): the frame keeps
-    /// restarting it, and the person should know and be able to hand it to a conversation.
+    /// restarting it, and the person should know and be able to restart or roll it back.
     Crash { plugin_id: String, category: String, version: String, restarts: u64 },
     /// `tools.job` with a final state (exited, killed).
     Job { job_id: String, session_id: Option<String>, state: String, exit_code: Option<i32> },
@@ -62,7 +58,6 @@ impl Trigger {
         match self {
             Trigger::Status { session_id, .. }
             | Trigger::Approval { session_id, .. }
-            | Trigger::Change { session_id, .. }
             | Trigger::Verification { session_id, .. }
             | Trigger::Spawned { session_id, .. }
             | Trigger::Conflict { session_id, .. } => Some(session_id),
@@ -84,7 +79,6 @@ impl Trigger {
         match self {
             Trigger::Status { session_id, seq, .. }
             | Trigger::Approval { session_id, seq, .. }
-            | Trigger::Change { session_id, seq, .. }
             | Trigger::Verification { session_id, seq, .. }
             | Trigger::Spawned { session_id, seq, .. }
             | Trigger::Conflict { session_id, seq, .. } => format!("journal:{session_id}#{seq}"),
@@ -109,7 +103,7 @@ pub fn from_journal_patch(data: &Value) -> Option<Trigger> {
     }
     // Only these entry kinds can matter; skip the rest before copying a possibly large entry.
     let kind = data.pointer("/entry/kind").and_then(Value::as_str)?;
-    if ![entry_kinds::STATUS, entry_kinds::TOOL_RESULT, entry_kinds::VERIFICATION, entry_kinds::AGENT_SPAWNED, entry_kinds::NOTE, chatflow_kinds::APPROVAL, CHANGE_ENTRY]
+    if ![entry_kinds::STATUS, entry_kinds::TOOL_RESULT, entry_kinds::VERIFICATION, entry_kinds::AGENT_SPAWNED, entry_kinds::NOTE, chatflow_kinds::APPROVAL]
         .contains(&kind)
     {
         return None;
@@ -117,7 +111,7 @@ pub fn from_journal_patch(data: &Value) -> Option<Trigger> {
     if kind == entry_kinds::TOOL_RESULT && !needed_approval(data.pointer("/entry/data")?) {
         return None;
     }
-    if (kind == chatflow_kinds::APPROVAL || kind == CHANGE_ENTRY) && data.pointer("/entry/data/state").and_then(Value::as_str) != Some("pending") {
+    if kind == chatflow_kinds::APPROVAL && data.pointer("/entry/data/state").and_then(Value::as_str) != Some("pending") {
         return None;
     }
     if kind == entry_kinds::NOTE && data.pointer("/entry/data/purpose").and_then(Value::as_str) != Some("merge") {
@@ -170,13 +164,6 @@ pub fn from_journal_patch(data: &Value) -> Option<Trigger> {
             output: str_of(d, "question").unwrap_or_default(),
             tool: str_of(d, "tool"),
             pending: true,
-        }),
-        CHANGE_ENTRY => Some(Trigger::Change {
-            session_id,
-            seq,
-            id: str_of(d, "id")?,
-            plugins: strings(d.get("plugins")),
-            summary: str_of(d, "summary").unwrap_or_default(),
         }),
         entry_kinds::VERIFICATION => {
             let report = d.get("report")?;
@@ -297,8 +284,6 @@ pub struct Context {
     /// Agent name of an agent session.
     pub agent: Option<String>,
     pub task_title: Option<String>,
-    /// For a code change: the plugins it changes, by name (the id when a name is not known).
-    pub plugin_names: Vec<String>,
     /// For jobs: when it started and its output tail (from `tools.job.status`).
     pub job_started_ms: Option<u64>,
     pub job_output_tail: Option<String>,
@@ -382,8 +367,7 @@ pub fn notification(trigger: &Trigger, ctx: &Context, prefs: &Prefs) -> Option<N
     Some(n)
 }
 
-/// The action a pending approval's notification offers; it answers with `chatflow.approve` (a
-/// code change: `source.decide`).
+/// The action a pending approval's notification offers; it answers with `chatflow.approve`.
 pub const APPROVE_ACTION: &str = "Approve";
 
 /// Every target names `kind`, `project_id`, `session_id` and `seq` (when the notification is about
@@ -480,17 +464,6 @@ fn compose(trigger: &Trigger, ctx: &Context, prefs: &Prefs) -> Option<Notificati
             if *pending {
                 n.actions = vec![APPROVE_ACTION.to_owned()];
             }
-            n
-        }
-        Trigger::Change { session_id, seq, id, plugins, summary } => {
-            let names = if ctx.plugin_names.is_empty() { plugins.join(", ") } else { ctx.plugin_names.join(", ") };
-            let title = if names.is_empty() { "Approval needed: a code change".to_owned() } else { format!("Approval needed: change to {names}") };
-            let body = if summary.trim().is_empty() { "A code change needs your approval.".to_owned() } else { summary.trim().to_owned() };
-            let mut target = session_target("approval", ctx, session_id, Some(*seq));
-            // source.decide answers this proposal (the notification's Approve action does).
-            target["proposal"] = json!(id);
-            let mut n = base(kinds::APPROVAL, title, body, format!("change:{id}"), ctx, Some(session_id), target);
-            n.actions = vec![APPROVE_ACTION.to_owned()];
             n
         }
         Trigger::Verification { session_id, seq, task_id, ok, checks, merged, agent } => {
@@ -603,13 +576,13 @@ fn compose(trigger: &Trigger, ctx: &Context, prefs: &Prefs) -> Option<Notificati
             kind: kinds::FAILED.into(),
             title: format!("{plugin_id} keeps stopping"),
             body: format!(
-                "The {category} service stopped {restarts} times in a row right after starting; CortexCode keeps restarting it. Fix it hands the problem to a conversation on CortexCode's own source."
+                "The {category} service stopped {restarts} times in a row right after starting; CortexCode keeps restarting it. Settings > Plugins has Restart and Roll back."
             ),
             key: Some(format!("crash:{category}")),
             project_id: None,
             session_id: None,
-            target: json!({"open": "fix_plugin", "plugin": plugin_id, "category": category, "version": version, "restarts": restarts}),
-            actions: vec!["Fix it".into(), "Open Plugins".into()],
+            target: json!({"open": "plugins", "plugin": plugin_id, "category": category, "version": version, "restarts": restarts}),
+            actions: vec!["Open Plugins".into()],
             subtitle: Some(format!("{plugin_id} {}", version.split('+').next().unwrap_or(version))),
         },
         Trigger::Job { job_id, session_id, state, exit_code } => {

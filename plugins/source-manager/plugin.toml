@@ -7,13 +7,11 @@
 id = "source-manager"
 name = "Source manager"
 version = "0.1.1"
-description = "CortexCode's own source as one git repository in the code folder: live data edits, code changes approved and hot-swapped, history and revert, backup to GitHub and sharing improvements."
+description = "Every plugin's data (prompts, texts, skills) as one git repository in the live folder: live edits committed as they settle, kept in step with the installed packages, history and revert, backup to GitHub and sharing improvements."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
-# The logic plugin (a Cargo workspace of its own; depends on the protocol crate by path). Its own
-# data (backend/data: the change-summary instructions) is compiled in and read live from the code
-# folder like any plugin's data.
+# The logic plugin (a Cargo workspace of its own; depends on the protocol crate by path).
 [backend]
 category = "source"
 contract = "source@1"
@@ -26,12 +24,6 @@ exec = "backend/target/release/cc-source"
 [ui]
 dir = "ui"
 build = ["npm", "run", "build"]
-
-# "Waiting for you" in the card: code changes that need an answer.
-[[ui.package]]
-dir = "ui/card-waiting"
-id = "source-manager.card-waiting"
-slot = "card.waiting@1"
 
 # Settings > History: every change, revert, the update state.
 [[ui.package]]
@@ -56,14 +48,3 @@ slot = "settings.share@1"
 dir = "ui/settings-storage"
 id = "source-manager.settings-storage"
 slot = "settings.storage@1"
-
-
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager itself and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/source-manager"

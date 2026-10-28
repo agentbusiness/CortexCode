@@ -1,7 +1,7 @@
 //! Building and packing a plugin folder.
 
 use cc_protocol::contracts::frame::package::{
-    BuildInfo, CcPluginManifest, FORMAT, PACKAGE_MANIFEST, PLUGIN_TOML, PackedBackend, PackedShell, PackedSource, PackedUi, PluginToml,
+    BuildInfo, CcPluginManifest, FORMAT, PACKAGE_MANIFEST, PLUGIN_TOML, PackedBackend, PackedShell, PackedUi, PluginToml,
     safe_relative,
 };
 use std::collections::BTreeMap;
@@ -13,8 +13,6 @@ use std::process::Command;
 pub struct Options {
     pub dir: PathBuf,
     pub out: Option<PathBuf>,
-    /// Include the plugin's source (`source/`).
-    pub source: bool,
     /// Run the build commands first.
     pub run_build: bool,
     /// Keep plugin.toml's version as it is (a release); otherwise the package is a dev build,
@@ -127,7 +125,7 @@ fn add_file(entries: &mut BTreeMap<String, Entry>, name: &str, from: PathBuf, ex
 
 /// The plugin's source files: what git tracks or would track in the folder (honouring
 /// .gitignore), or, outside a git repository, every file but build outputs and installs.
-pub(crate) fn source_files(dir: &Path) -> Result<Vec<String>, String> {
+fn source_files(dir: &Path) -> Result<Vec<String>, String> {
     if let Some(listing) = output("git", &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."], dir) {
         let mut files: Vec<String> = listing.split('\0').filter(|f| !f.is_empty()).map(str::to_owned).collect();
         // A tracked file deleted in the working tree is not part of the source any more.
@@ -263,24 +261,22 @@ pub fn build(options: &Options) -> Result<Packed, String> {
         shell.push(PackedShell { id: module.id.clone(), dir: packed, serves: module.serves.clone() });
     }
 
-    // The source, for self-rewrite.
-    let source = match &toml.source {
-        Some(spec) => {
-            let included = if options.source {
-                for file in source_files(&dir)? {
-                    let from = dir.join(&file);
-                    let mode = std::fs::metadata(&from).map_err(|e| e.to_string())?.permissions().mode();
-                    add_file(&mut entries, &format!("source/{file}"), from, mode & 0o100 != 0)?;
-                }
-                Some("source".to_owned())
-            } else {
-                None
-            };
-            Some(PackedSource { repo: spec.repo.clone(), subdir: spec.subdir.clone(), url: spec.url.clone(), dir: included })
+    // The data folders, at their own paths: the source files in them (build caches stay out).
+    let data = toml.data.as_ref().map(|data| data.dirs.clone()).unwrap_or_default();
+    if !data.is_empty() {
+        let files = source_files(&dir)?;
+        for data_dir in &data {
+            if !dir.join(data_dir).is_dir() {
+                return Err(format!("[data] dir {} does not exist", dir.join(data_dir).display()));
+            }
+            let prefix = format!("{}/", data_dir.trim_end_matches('/'));
+            for file in files.iter().filter(|file| file.starts_with(&prefix)) {
+                let from = dir.join(file);
+                let mode = std::fs::metadata(&from).map_err(|e| e.to_string())?.permissions().mode();
+                add_file(&mut entries, file, from, mode & 0o100 != 0)?;
+            }
         }
-        None if options.source => return Err("plugin.toml has no [source]; pack with --no-source or add one".into()),
-        None => None,
-    };
+    }
 
     let git_commit = output("git", &["rev-parse", "HEAD"], &dir).map(|head| {
         let dirty = output("git", &["status", "--porcelain", "--", "."], &dir).is_some_and(|s| !s.is_empty());
@@ -292,7 +288,7 @@ pub fn build(options: &Options) -> Result<Packed, String> {
         backend,
         ui,
         shell,
-        source,
+        data,
         build: BuildInfo {
             target: target.clone(),
             packer: format!("cortex-pack {}", env!("CARGO_PKG_VERSION")),

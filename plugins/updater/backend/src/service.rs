@@ -3,8 +3,8 @@
 //! The latest version of a plugin is its official release from the catalog; when no catalog can be
 //! read, it is the package the app itself came with (`frame.plugins.bundled`).
 //! - A plugin the user did not change goes to the latest by itself when no run is going: its
-//!   source goes into the code folder first (plugins read their live data there), then the package
-//!   is installed and swapped in (`frame.plugins.install_many`: all or none).
+//!   data goes into the live folder first (plugins read their data there), then the package is
+//!   installed and swapped in (`frame.plugins.install_many`: all or none).
 //! - A plugin the user changed waits for their answer (the popup): use the newer version and drop
 //!   the changes, or keep theirs until the next version.
 //! - A version that cannot start (the frame's check refused it and the previous one keeps running)
@@ -453,9 +453,9 @@ impl Updater {
                     }
                 }
             };
-            // The source first: the plugin's folder in the code folder back to the package's.
-            self.step(&[&id], "installing", None, format!("Resetting the source of {id}"));
-            if let Err(error) = self.reset_source(&ctx, &id, &version, &package, &work).await {
+            // The data first: the plugin's folder in the live folder back to the package's.
+            self.step(&[&id], "installing", None, format!("Resetting the data of {id}"));
+            if let Err(error) = self.reset_data(&ctx, &id, &version, &package, &work).await {
                 outcomes.push(self.record(&id, &version, "failed", error));
                 continue;
             }
@@ -504,20 +504,16 @@ impl Updater {
         Ok(ResetResult { plugins: outcomes })
     }
 
-    /// The package's source over the plugin's folder in the code folder.
-    async fn reset_source(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<(), String> {
+    /// The package's data over the plugin's folder in the live folder.
+    async fn reset_data(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<(), String> {
         let unpacked = work.join("unpacked").join(id);
         fetch::untar(package, &unpacked).await?;
-        let source = unpacked.join("source");
-        if !source.is_dir() {
-            return Err("the release package carries no source; the plugin's folder in the code folder was left as it is".into());
-        }
-        let params = ReleaseResetParams { plugin: id.to_owned(), dir: source.to_string_lossy().into_owned(), version: version.to_owned() };
+        let params = ReleaseResetParams { plugin: id.to_owned(), dir: unpacked.to_string_lossy().into_owned(), version: version.to_owned() };
         match call::<ReleaseResetResult>(ctx, source_methods::RELEASE_RESET, json!(params)).await {
             Ok(_) => Ok(()),
             // Without the source manager the package still installs (its packaged data serves).
             Err(error) => {
-                tracing::warn!(plugin = id, error = %error.message, "the plugin's source was not reset in the code folder");
+                tracing::warn!(plugin = id, error = %error.message, "the plugin's data was not reset in the live folder");
                 Ok(())
             }
         }
@@ -701,7 +697,7 @@ impl Updater {
                 }
             };
             self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
-            if let Err(error) = self.merge_source(ctx, &id, &version, &package, &work).await {
+            if let Err(error) = self.merge_data(ctx, &id, &version, &package, &work).await {
                 self.record(&id, &version, "failed", error);
                 continue;
             }
@@ -791,7 +787,7 @@ impl Updater {
         (auto, pending)
     }
 
-    /// Get the package, put its source in, install: every planned plugin.
+    /// Get the package, put its data in, install: every planned plugin.
     async fn apply(&self, ctx: &Ctx, client: &reqwest::Client, planned: Vec<Planned>) {
         let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
         let mut set: Vec<(Planned, PathBuf)> = Vec::new();
@@ -814,23 +810,16 @@ impl Updater {
                     }
                 }
             };
-            // The source first: the plugin reads its live data from the code folder.
-            let source = if plan.drop_changes {
+            // The data first: the plugin reads its data from the live folder.
+            let data = if plan.drop_changes {
                 self.step(&[&id], "installing", None, format!("Dropping your changes to {id}"));
-                self.reset_source(ctx, &id, &version, &package, &work).await.map(|()| Merged::Install)
+                self.reset_data(ctx, &id, &version, &package, &work).await
             } else {
                 self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
-                self.merge_source(ctx, &id, &version, &package, &work).await
+                self.merge_data(ctx, &id, &version, &package, &work).await
             };
-            match source {
-                Ok(Merged::Install) => set.push((plan, package)),
-                Ok(Merged::Built) => {
-                    self.with_saved(|saved| {
-                        saved.approved.remove(&id);
-                        saved.merged.remove(&id);
-                    });
-                    self.record(&id, &version, "built", "Your change and the newer version are merged and built here.");
-                }
+            match data {
+                Ok(()) => set.push((plan, package)),
                 Err(error) => {
                     // A clash asks no more for this version; the user sees why.
                     self.with_saved(|saved| {
@@ -898,27 +887,23 @@ impl Updater {
         }
     }
 
-    /// Merge the package's source into the code folder, keeping the user's changes.
-    async fn merge_source(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<Merged, String> {
+    /// Merge the package's data into the live folder, keeping the user's edits.
+    async fn merge_data(&self, ctx: &Ctx, id: &str, version: &str, package: &Path, work: &Path) -> Result<(), String> {
         let unpacked = work.join("unpacked").join(id);
         fetch::untar(package, &unpacked).await?;
-        let source = unpacked.join("source");
-        if !source.is_dir() {
-            return Ok(Merged::Install);
-        }
-        let params = ReleaseMergeParams { scope: "plugin".into(), plugin: id.to_owned(), dir: source.to_string_lossy().into_owned(), version: version.to_owned() };
+        let params = ReleaseMergeParams { plugin: id.to_owned(), dir: unpacked.to_string_lossy().into_owned(), version: version.to_owned() };
         let merged = match call::<UpdateResult>(ctx, source_methods::RELEASE_MERGE, json!(params)).await {
             Ok(merged) => merged,
             // Without the source manager the package still installs (its packaged data serves).
             Err(error) => {
-                tracing::warn!(plugin = id, error = %error.message, "the package's source was not merged into the code folder");
-                return Ok(Merged::Install);
+                tracing::warn!(plugin = id, error = %error.message, "the package's data was not merged into the live folder");
+                return Ok(());
             }
         };
         if merged.state == "conflicts" {
             return Err(format!("Your change and the newer version clash in {}; both stay as they were (Settings > History).", merged.conflicts.join(", ")));
         }
-        Ok(if merged.rebuilt.iter().any(|built| built == id) { Merged::Built } else { Merged::Install })
+        Ok(())
     }
 
     /// Stage a newer frame for the next start.
@@ -958,21 +943,6 @@ impl Updater {
                 electron_archive,
             };
             call::<FrameStatus>(ctx, frame_methods::UPDATE_STAGE, json!(params)).await.map_err(|e| e.message)?;
-            // The frame's source into the code folder (everything outside plugins/).
-            let unpacked = work.join("frame");
-            fetch::untar(&frame_archive, &unpacked).await?;
-            let source = unpacked.join("source");
-            if source.is_dir() {
-                let params = ReleaseMergeParams {
-                    scope: "frame".into(),
-                    plugin: String::new(),
-                    dir: source.to_string_lossy().into_owned(),
-                    version: frame.version.clone(),
-                };
-                if let Err(error) = call::<UpdateResult>(ctx, source_methods::RELEASE_MERGE, json!(params)).await {
-                    tracing::warn!(error = %error.message, "the frame's source was not merged into the code folder");
-                }
-            }
             Ok::<(), String>(())
         }
         .await;
@@ -1015,13 +985,6 @@ enum Package {
     Release(Asset),
     /// The app's own package file.
     App(PathBuf),
-}
-
-enum Merged {
-    /// Install the release package.
-    Install,
-    /// The user's change was merged and built here (installed already).
-    Built,
 }
 
 fn names(set: &[(Planned, PathBuf)]) -> String {

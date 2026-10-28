@@ -32,8 +32,3 @@ slot = "workbench.rightPane@1"
 dir = "ui/settings-appearance"
 id = "workbench.settings-appearance"
 slot = "settings.appearance@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/workbench"

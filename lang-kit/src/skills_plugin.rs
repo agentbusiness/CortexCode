@@ -168,7 +168,7 @@ impl Plugin for SkillsPlugin {
     }
 }
 
-/// Serve the skills of `skills_dir` (None: `data/skills` beside the executable, see
+/// Serve the skills of `skills_dir` (None: the packaged `data/skills`, see
 /// [`skills::locate_dir`]), or the live ones that replace them ([`skills::current_dir`]), as
 /// `skills-<id>` until the frame shuts the plugin down; returns the
 /// process exit code. `version` is the plugin build's (its crate's `CARGO_PKG_VERSION`).

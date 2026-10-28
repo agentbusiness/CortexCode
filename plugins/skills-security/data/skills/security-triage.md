@@ -12,7 +12,7 @@ Find the code:
 - A CVE or GHSA id: its record, live from the OSV database (or the NVD), with severity, affected versions, fixed versions and the weakness's mitigations:
 
 ```bash
-export SA="$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py"
+export SA="$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py"
 python3 "$SA" cve CVE-2021-23337
 ```
 

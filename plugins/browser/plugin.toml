@@ -28,8 +28,3 @@ slot = "pane.browser@1"
 dir = "shell"
 id = "browser.shell-module"
 serves = "browser"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/browser"

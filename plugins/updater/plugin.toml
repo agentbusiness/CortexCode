@@ -39,10 +39,3 @@ build = ["npm", "run", "build"]
 dir = "ui/band"
 id = "updater.band"
 slot = "workbench.band@1"
-
-[build]
-needs = ["rust", "node"]
-
-[source]
-repo = "cortexcode"
-subdir = "plugins/updater"

@@ -39,9 +39,9 @@ fn free_memory() -> u64 {
 }
 
 /// SHA-256 over a plugin's live data folders (relative paths and contents), empty when it has none.
-fn data_hash(code_dir: Option<&Path>, plugin_id: &str) -> String {
-    let Some(code) = code_dir else { return String::new() };
-    let plugin = code.join("plugins").join(plugin_id);
+fn data_hash(live_root: Option<&Path>, plugin_id: &str) -> String {
+    let Some(live) = live_root else { return String::new() };
+    let plugin = live.join("plugins").join(plugin_id);
     let mut files: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
     for dir in [plugin.join("data"), plugin.join("backend").join("data")] {
         if !dir.is_dir() {
@@ -106,7 +106,7 @@ pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
 pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
     let machine: Machine = get(ctx, "frame.machine", json!({})).await.unwrap_or_default();
     let plugins: Vec<PluginInfo> = get::<Value>(ctx, "frame.plugins.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("plugins").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
-    let code_dir = ctx.env.code_dir.clone();
+    let live_root = ctx.env.live_root.clone();
     let plugin_cards: Vec<PluginCard> = plugins
         .iter()
         .filter(|plugin| !plugin.instance.starts_with("ws-"))
@@ -116,7 +116,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
             // The installed package's version (with its build), not the plugin's bare semver: two
             // nodes lend hands to each other only on the very same build.
             version: if plugin.build.is_empty() { plugin.version.clone() } else { plugin.build.clone() },
-            data_hash: data_hash(code_dir.as_deref(), if plugin.plugin.is_empty() { &plugin.plugin_id } else { &plugin.plugin }),
+            data_hash: data_hash(live_root.as_deref(), if plugin.plugin.is_empty() { &plugin.plugin_id } else { &plugin.plugin }),
             active: plugin.state == "active",
         })
         .collect();

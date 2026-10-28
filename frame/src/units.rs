@@ -134,7 +134,6 @@ pub fn exec_spec(version: &Installed, over: &PluginOverride) -> Option<ExecSpec>
         config: merge_config(&packed.config, &over.config),
         version: version.version().to_owned(),
         commit: version.manifest.build.git_commit.clone(),
-        source_subdir: version.manifest.source.as_ref().map(|source| source.subdir.clone()).filter(|subdir| !subdir.is_empty()),
     })
 }
 
@@ -1274,8 +1273,8 @@ pub fn watch_incoming(frame: &Arc<Frame>) {
 const BUNDLED: &str = ".bundled";
 
 /// Queue the app's prebuilt packages (`<packages>/<id>@<version>.ccplugin`) in `.incoming/` when
-/// this home has not installed that version from the app yet. A plugin the user rebuilt from the
-/// code folder keeps its own version until the app brings a new one. Returns what was queued.
+/// this home has not installed that version from the app yet. A plugin installed from a dev build
+/// keeps its own version until the app brings a new one. Returns what was queued.
 pub fn queue_bundled(root: &Path, packages: &Path) -> Vec<(String, String)> {
     let mut queued = Vec::new();
     let Ok(entries) = std::fs::read_dir(packages) else {

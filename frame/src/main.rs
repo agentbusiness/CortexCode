@@ -55,7 +55,7 @@ struct Cli {
     /// CortexCode home (overrides CORTEX_HOME and the config's `[frame] home`).
     #[arg(long)]
     home: Option<PathBuf>,
-    /// Safe mode: plugins use their packaged data only, never the live data in the code folder
+    /// Safe mode: plugins use their packaged data only, never the live data in the live folder
     /// (for when an edit to a skill, guide or prompt broke the app).
     #[arg(long)]
     safe: bool,
@@ -200,11 +200,11 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
 
     let want_ui = config.ui && !cli.headless;
-    let code = config.code.clone().unwrap_or_else(|| home.code());
+    let live = config.live.clone().unwrap_or_else(|| home.live());
     if cli.safe {
         tracing::warn!("safe mode: plugins read their packaged data only");
     }
-    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, code, safe: cli.safe });
+    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, live, safe: cli.safe });
     frame.port.store(port, Ordering::SeqCst);
     // The machine does not idle-sleep while the frame runs (window open or not); shutdown releases it.
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {

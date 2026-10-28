@@ -22,8 +22,3 @@ build = ["npm", "run", "build"]
 dir = "ui/theme"
 id = "theme-cortex.theme"
 slot = "theme@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/theme-cortex"

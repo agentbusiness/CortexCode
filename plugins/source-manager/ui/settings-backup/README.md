@@ -1,6 +1,6 @@
 # @cortex-ui/source-manager-settings-backup
 
-Settings > Backup & Sync: the GitHub repository CortexCode's changes are pushed to, back up now, restore.
+Settings > Backup & Sync: the GitHub repository the live data's changes (skills, prompts, texts) are pushed to, back up now, restore.
 
 - **Plugin id:** `source-manager.settings-backup`
 - **Slot:** `settings.backup@1`

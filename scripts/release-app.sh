@@ -66,14 +66,11 @@ for platform in $RELEASE_PLATFORMS; do
   step "downloading the frame and Electron for $platform"
   frame_file="$(fetch_asset "$frame_asset" "$base/downloads")" || exit 1
   electron_file="$(fetch_asset "$electron_asset" "$base/downloads")" || exit 1
-  mkdir -p "$base/frame" "$base/electron" "$base/packages" "$base/plugin-sources"
+  mkdir -p "$base/frame" "$base/electron" "$base/packages"
   tar -xzf "$frame_file" -C "$base/frame"
   tar -xzf "$electron_file" -C "$base/electron"
 
-  # Every plugin for this platform, named <id>@<package version>.ccplugin as the frame expects,
-  # and its source into source/plugins/<id>.
-  source_dir="$base/frame/source"
-  mkdir -p "$source_dir/plugins"
+  # Every plugin for this platform, named <id>@<package version>.ccplugin as the frame expects.
   for id in $(jq -r '.plugins | keys[]' "$catalog"); do
     entry="$(jq -c --arg id "$id" '.plugins[$id]' "$catalog")"
     if ! jq -e --arg os "$os" '(.platforms // []) as $p | ($p | length) == 0 or ($p | index($os) != null)' <<<"$entry" >/dev/null; then
@@ -84,13 +81,6 @@ for platform in $RELEASE_PLATFORMS; do
     package="$(fetch_asset "$asset" "$base/downloads")" || exit 1
     package_version="$(tar -xzOf "$package" manifest.json | jq -r .plugin.version)"
     cp "$package" "$base/packages/$id@$package_version.ccplugin"
-    rm -rf "${base:?}/plugin-sources/$id"
-    mkdir -p "$base/plugin-sources/$id"
-    tar -xzf "$package" -C "$base/plugin-sources/$id"
-    if [ -d "$base/plugin-sources/$id/source" ]; then
-      rm -rf "${source_dir:?}/plugins/$id"
-      mv "$base/plugin-sources/$id/source" "$source_dir/plugins/$id"
-    fi
   done
   step "$(find "$base/packages" -name '*.ccplugin' | wc -l | tr -d ' ') plugins for $platform"
 
@@ -107,7 +97,6 @@ for platform in $RELEASE_PLATFORMS; do
       ditto "$base/frame/ui" "$res/ui"
       ditto "$base/electron" "$res/ui/node_modules/electron"
       ditto "$base/packages" "$res/packages"
-      ditto "$source_dir" "$res/source"
       sed -e "s/@VERSION@/$version/" -e "s/@BUILD@/$frame_version/" "$repo/scripts/app/Info.plist" > "$app/Contents/Info.plist"
       codesign --force --sign - "$app/Contents/MacOS/CortexCode" >/dev/null 2>&1
       archive="$out/CortexCode-$version-darwin-arm64.tar.gz"
@@ -137,7 +126,6 @@ for platform in $RELEASE_PLATFORMS; do
       cp -a "$base/frame/ui/." "$folder/ui/"
       cp -a "$base/electron" "$folder/ui/node_modules/electron"
       cp -a "$base/packages" "$folder/packages"
-      cp -a "$source_dir" "$folder/source"
       archive="$out/cortexcode-$version-$platform.tar.gz"
       tar_dir "$base/bundle" "$archive"
       leak_scan "$archive"

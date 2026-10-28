@@ -45,14 +45,3 @@ slot = "card.model@1"
 dir = "ui/settings-model"
 id = "model-bonsai.settings-model"
 slot = "settings.model@1"
-
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is). CMake builds the vendored llama.cpp; its Metal kernels are
-# compiled at run time, so no Xcode Metal compiler is needed.
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/model-bonsai"

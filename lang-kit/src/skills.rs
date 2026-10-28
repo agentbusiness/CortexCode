@@ -33,12 +33,12 @@
 //! imports = ["sqlite3", "psycopg2", "database/sql"]
 //! ```
 //!
-//! The plugin folder ships `data/` as a backend asset (`[backend] assets = ["data"]`): the frame's
-//! store copies it beside the executable it runs, and a packed `.ccplugin` holds it beside the
-//! packed executable. Run from the build directory (`backend/target/release/`), the folder's own
-//! `data/` is three levels up. That packaged copy serves until the plugin's folder in the code
-//! folder has its own `data/skills` (the live skills, see [`current_dir`]); [`watch`] tells the
-//! other plugins when the skills in use change.
+//! The plugin folder declares `data/` as its data (`[data] dirs = ["data"]`): a packed `.ccplugin`
+//! holds it at `data/`, one level above the packed executable (`backend/`). Run from the build
+//! directory (`backend/target/release/`), the folder's own `data/` is three levels up. That
+//! packaged copy serves until the plugin's folder in the live folder has its own `data/skills` (the
+//! live skills, see [`current_dir`]); [`watch`] tells the other plugins when the skills in use
+//! change.
 
 use cc_protocol::contracts::lang::Applies;
 use cc_protocol::{Ctx, PluginEnv, RpcError};
@@ -70,7 +70,7 @@ pub struct Skill {
     pub unit_done: Option<String>,
 }
 
-/// The live skills, relative to the plugin's folder in the code folder.
+/// The live skills, relative to the plugin's folder in the live folder.
 pub const LIVE_DIR: &str = "data/skills";
 
 /// Published when the skills in use changed (`{"category"}`).
@@ -92,7 +92,7 @@ pub fn locate_from(start: &Path) -> Option<PathBuf> {
 
 /// The skills folder to read now: the live one ([`LIVE_DIR`] in the plugin's folder of the code
 /// folder) when it exists, else `packaged`; None when the plugin ships no skills. Resolved on every
-/// read, since the code folder may appear after the plugin started.
+/// read, since the live folder may appear after the plugin started.
 pub fn current_dir(env: &PluginEnv, packaged: Option<&Path>) -> Option<PathBuf> {
     packaged.map(|packaged| env.live_or(LIVE_DIR, packaged.to_path_buf()))
 }

@@ -1,26 +1,28 @@
-//! The plugin's shared state: where the code folder and the shipped source are, the persistent
-//! settings and proposals, and one queue for git work on the code folder.
+//! The plugin's shared state: where the live folder is, the persistent settings, the plugins'
+//! names, and one queue for git work on the live folder.
 
-use crate::code;
-use crate::settings::{self, ProposalList, Settings};
-use cc_protocol::contracts::source::{Proposal, topics};
+use crate::live;
+use crate::settings::{self, Settings};
+use cc_protocol::contracts::source::topics;
 use cc_protocol::{Ctx, RpcError};
 use git2::Repository;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 pub struct Service {
-    /// The backup repository, shared pull requests and the last update's outcome; and the
-    /// proposals. Kept in the app's main store (see [`cc_protocol::stored`]).
+    /// The backup repository, shared pull requests and the last update's outcome. Kept in the
+    /// app's main store (see [`cc_protocol::stored`]).
     pub stored_settings: cc_protocol::stored::Stored<Settings>,
-    pub stored_proposals: cc_protocol::stored::Stored<ProposalList>,
     pub data_dir: PathBuf,
     pub home: PathBuf,
-    /// The code folder (`CORTEX_CODE`).
-    pub code_dir: PathBuf,
+    /// The live folder (`CORTEX_LIVE`).
+    pub live_dir: PathBuf,
     config: RwLock<Value>,
-    /// Serializes git work on the code folder (one writer at a time) and settings changes.
+    /// Plugin names by id, from the last listing of the installed plugins (commit summaries).
+    names: RwLock<BTreeMap<String, String>>,
+    /// Serializes git work on the live folder (one writer at a time) and settings changes.
     git: tokio::sync::Mutex<()>,
     state: Mutex<()>,
 }
@@ -30,21 +32,20 @@ pub fn rpc(message: impl Into<String>) -> RpcError {
 }
 
 impl Service {
-    pub fn new(data_dir: PathBuf, home: PathBuf, code_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, home: PathBuf, live_dir: PathBuf) -> Self {
         Self {
             stored_settings: cc_protocol::stored::Stored::new("source.settings"),
-            stored_proposals: cc_protocol::stored::Stored::new("source.proposals"),
             data_dir,
             home,
-            code_dir,
+            live_dir,
             config: RwLock::new(Value::Null),
+            names: RwLock::new(BTreeMap::new()),
             git: tokio::sync::Mutex::new(()),
             state: Mutex::new(()),
         }
     }
 
-    /// The plugin's `[plugin.config]`: `shipped_source` (the source the app ships, a folder),
-    /// `packer` (path of `cortex-pack`), `official_repo` (`owner/name` improvements are shared with).
+    /// The plugin's `[plugin.config]`: `official_repo` (`owner/name` improvements are shared with).
     pub fn configure(&self, config: Value) {
         if let Ok(mut current) = self.config.write() {
             *current = config;
@@ -56,32 +57,38 @@ impl Service {
         config.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
     }
 
-    /// A configured path, relative to the plugin's working directory (the frame config's folder).
-    pub fn config_path(&self, key: &str) -> Option<PathBuf> {
-        let value = self.config_str(key)?;
-        let path = expand_tilde(&value);
-        Some(if path.is_absolute() { path } else { std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path) })
-    }
-
-    pub fn shipped_source(&self) -> Option<PathBuf> {
-        self.config_path("shipped_source").filter(|path| path.is_dir())
-    }
-
     pub fn official_repo(&self) -> String {
         self.config_str("official_repo").unwrap_or_else(|| "agentbusiness/CortexCode".into())
     }
 
-    /// Whether this plugin manages the code folder (creates, commits, merges). A developer checkout
-    /// configured as the code folder is read, never written.
+    /// Whether this plugin manages the live folder (creates, commits, merges). A developer checkout
+    /// configured as the live folder is read, never written.
     pub fn managed(&self) -> bool {
-        !self.code_dir.exists() || code::is_managed(&self.code_dir)
+        !self.live_dir.exists() || live::is_managed(&self.live_dir)
     }
 
-    /// Run `work` on the code folder's repository, one at a time, off the async threads.
+    /// The code folder of earlier versions (CortexCode's full source), which the live folder
+    /// replaces.
+    pub fn old_code_dir(&self) -> PathBuf {
+        self.home.join("code")
+    }
+
+    pub fn remember_names(&self, names: impl IntoIterator<Item = (String, String)>) {
+        if let Ok(mut known) = self.names.write() {
+            known.extend(names);
+        }
+    }
+
+    /// The plugin's name, or its id when it is not known.
+    pub fn name_of(&self, id: &str) -> String {
+        self.names.read().ok().and_then(|names| names.get(id).cloned()).filter(|name| !name.is_empty()).unwrap_or_else(|| id.to_owned())
+    }
+
+    /// Run `work` on the live folder's repository, one at a time, off the async threads.
     pub async fn git<T: Send + 'static>(&self, work: impl FnOnce(&Repository) -> Result<T, String> + Send + 'static) -> Result<T, RpcError> {
         let _turn = self.git.lock().await;
-        let dir = self.code_dir.clone();
-        tokio::task::spawn_blocking(move || code::open(&dir).and_then(|repo| work(&repo)))
+        let dir = self.live_dir.clone();
+        tokio::task::spawn_blocking(move || live::open(&dir).and_then(|repo| work(&repo)))
             .await
             .map_err(|error| rpc(format!("the git task failed: {error}")))?
             .map_err(rpc)
@@ -90,15 +97,14 @@ impl Service {
     /// Run `work` while holding the git queue, without opening the repository (creating it).
     pub async fn git_raw<T: Send + 'static>(&self, work: impl FnOnce(&Path) -> Result<T, String> + Send + 'static) -> Result<T, RpcError> {
         let _turn = self.git.lock().await;
-        let dir = self.code_dir.clone();
+        let dir = self.live_dir.clone();
         tokio::task::spawn_blocking(move || work(&dir)).await.map_err(|error| rpc(format!("the git task failed: {error}")))?.map_err(rpc)
     }
 
-    /// Read the settings and proposals from the store (or once from the JSON files they were kept
-    /// in), when the plugin starts serving.
+    /// Read the settings from the store (or once from the JSON file they were kept in), when the
+    /// plugin starts serving.
     pub async fn load_stored(&self, ctx: &Ctx) -> Result<(), RpcError> {
-        self.stored_settings.load(ctx, Some(self.data_dir.join(settings::SETTINGS))).await?;
-        self.stored_proposals.load(ctx, Some(self.data_dir.join(settings::PROPOSALS))).await
+        self.stored_settings.load(ctx, Some(self.data_dir.join(settings::SETTINGS))).await
     }
 
     pub fn settings(&self) -> Result<Settings, RpcError> {
@@ -113,58 +119,8 @@ impl Service {
         }))
     }
 
-    pub fn proposals(&self) -> Result<ProposalList, RpcError> {
-        Ok(self.stored_proposals.get())
-    }
-
-    /// Change one proposal and save the list.
-    pub fn update_proposal(&self, id: &str, change: impl FnOnce(&mut Proposal)) -> Result<Proposal, RpcError> {
-        let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.stored_proposals.get().iter().any(|p| p.id == id) {
-            return Err(RpcError::invalid_params(format!("no proposal `{id}`")));
-        }
-        Ok(self.stored_proposals.update(|list| {
-            let proposal = list.iter_mut().find(|p| p.id == id).expect("checked above");
-            change(proposal);
-            proposal.clone()
-        }))
-    }
-
-    /// Claim one approval using the existing state gate; two decisions must not build/revert
-    /// overlapping source commits while the first change is still being activated.
-    pub fn start_build(&self, id: &str) -> Result<(Proposal, bool), RpcError> {
-        let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let proposals = self.stored_proposals.get();
-        let proposal = proposals.iter().find(|p| p.id == id).ok_or_else(|| RpcError::invalid_params(format!("no proposal `{id}`")))?;
-        if proposal.state != "pending" { return Ok((proposal.clone(), false)); }
-        if proposals.iter().any(|p| matches!(p.state.as_str(), "building" | "installing")) {
-            return Err(RpcError::invalid_params("Another approved change is still building or installing. Finish it before approving this change."));
-        }
-        let proposal = self.stored_proposals.update(|proposals| {
-            let proposal = proposals.iter_mut().find(|p| p.id == id).expect("checked above");
-            proposal.state = "building".into();
-            proposal.outcome.clear();
-            proposal.commit = None;
-            proposal.clone()
-        });
-        Ok((proposal, true))
-    }
-
-    pub fn add_proposal(&self, proposal: Proposal) -> Result<(), RpcError> {
-        let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.stored_proposals.update(|list| list.push(proposal));
-        Ok(())
-    }
-
-    /// Tell listeners (the settings panels, the card) to refetch.
+    /// Tell listeners (the settings panels, plugins reading live data) to refetch.
     pub fn changed(&self, ctx: &Ctx) {
         ctx.publish(topics::CHANGED, serde_json::json!({}));
-    }
-}
-
-pub fn expand_tilde(value: &str) -> PathBuf {
-    match value.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest)).unwrap_or_else(|| PathBuf::from(value)),
-        None => PathBuf::from(value),
     }
 }

@@ -2,7 +2,7 @@
 //! newest one at start, and the restart onto it.
 //!
 //! - A frame release unpacks into `<home>/frame/<version>/` (the frame `CortexCode`, `cortex.toml`,
-//!   `bin/`, `ui/`, `source/`), Electron into `<home>/electron/<version>/`, linked into the frame's
+//!   `bin/`, `ui/`), Electron into `<home>/electron/<version>/`, linked into the frame's
 //!   `ui/node_modules/electron`. `.ready` marks a completely unpacked version.
 //! - The frame inside the app is never changed: it is the safe copy. At every start it hands over
 //!   (`exec`, same process and arguments) to the newest staged frame newer than itself. A staged

@@ -5,18 +5,18 @@ Updates from the official releases (`docs/RELEASES.md`).
 - **The catalog.** Every hour (and 30 s after the start) the updater downloads `catalog.json` from
   the release tagged `catalog` of the official repository. Nothing else decides; every downloaded
   file is checked against the size and SHA-256 the catalog gives.
-- **Plugins the user did not change** (their folder in the code folder matches the shipped source,
-  `source.release.status`) install by themselves when no run is going (`chatflow.running`): the
-  release's source is merged into the code folder first (`source.release.merge`, plugins read their
-  live data there), then the package is installed (`frame.plugins.install_many`: all of them or
+- **Plugins the user did not change** (their folder in the live folder matches their package's
+  data, `source.release.status`) install by themselves when no run is going (`chatflow.running`):
+  the package's data is merged into the live folder first (`source.release.merge`, plugins read
+  their data there), then the package is installed (`frame.plugins.install_many`: all of them or
   none; one by one when the set fails). A plugin new to this machine is installed on its own.
 - **No catalog** (none published yet, offline): the packages the app itself came with stand in
   (`frame.plugins.bundled`), so every plugin still goes to the latest build by itself.
 - **Plugins the user changed** ask first: the popup at the bottom right (`updater.band`), in plain
-  words. *Use the newer version* drops the user's changes to the plugin's folder
+  words. *Use the newer version* drops the user's edits to the plugin's data
   (`source.release.reset`) and installs the package. *Keep my version* stays until the plugin's
-  next version. (`update.decide` also takes `merge`: the release merged into the user's version,
-  built here when they changed its code; a clash changes nothing and says which files.)
+  next version. (`update.decide` also takes `merge`: the release's data merged into the user's
+  edits; a clash changes nothing and says which files.)
 - **A version that cannot start** (the frame's check refused it; the previous version keeps
   running) is recorded (`failed`), not tried again until a newer version comes, and shown with its
   reason in the popup until seen (`update.dismiss`) and in Settings > Plugins.
@@ -24,11 +24,10 @@ Updates from the official releases (`docs/RELEASES.md`).
   Settings > Plugins names them, and the reset replaces them.
 - **The frame.** A newer frame (with its window code, and Electron when that changed) is downloaded
   and staged (`frame.update.stage`); the band says *Restart to update* (`frame.update.restart`).
-  The frame's source (everything outside `plugins/`) is merged into the code folder.
 - A plugin built with a newer frame than the one running (`min_frame`) waits for the frame update.
 - **Reset all plugins** (Settings > Plugins, after a confirmation that lists what it does to each
-  plugin): every installed plugin back to its official release. The user's changes to the plugin's
-  folder in the code folder are dropped (`source.release.reset`), then the release package is
+  plugin): every installed plugin back to its official release. The user's edits to the plugin's
+  data in the live folder are dropped (`source.release.reset`), then the release package is
   installed (`frame.plugins.install_many`); a plugin already running the release only loses the
   changes. When the official releases cannot be read (no catalog published, offline), the packages
   the app itself carries stand in (`frame.plugins.bundled`): the reset then goes back to the build

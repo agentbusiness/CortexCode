@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build CortexCode.app: the frame, the Electron UI, every plugin built and packed, cx and
-# cortex-pack, the full source and the app's configuration.
+# Build CortexCode.app: the frame, the Electron UI, every plugin built and packed (with its data),
+# cx and the app's configuration. No source code goes into the app.
 #
 #   scripts/build-app.sh [out-dir] [--live]     # default dist/  ->  <out-dir>/CortexCode.app
 #
@@ -15,9 +15,9 @@
 #
 # Contents/MacOS/CortexCode          the frame; it reads Contents/Resources/cortex.toml
 # Contents/Resources/cortex.toml     every path inside the bundle (scripts/app/cortex.toml)
-# Contents/Resources/packages/       <id>@<version>.ccplugin for every plugin, installed at start
-# Contents/Resources/source/         the full source, synced into ~/.cortexcode/code at start
-# Contents/Resources/bin/            cx and cortex-pack, copied into ~/.cortexcode/bin at start
+# Contents/Resources/packages/       <id>@<version>.ccplugin for every plugin, installed at start;
+#                                    their data folders make ~/.cortexcode/live
+# Contents/Resources/bin/            cx, copied into ~/.cortexcode/bin at start
 # Contents/Resources/ui/             the Electron shell, the renderer and Electron (as CortexCode.app)
 set -euo pipefail
 
@@ -51,7 +51,8 @@ place() {
 # stamp covers every source file (tracked or not, ignored ones left out) by path, size and mtime,
 # and HEAD; it is written only when a build ran through.
 stamp_of() {
-  { git rev-parse HEAD 2>/dev/null; git ls-files -co --exclude-standard -z | xargs -0 stat -f '%N %z %m' 2>/dev/null; } | shasum -a 256 | cut -c1-16
+  # A tracked file deleted from the work tree has nothing to stat: it is left out, not an error.
+  { git rev-parse HEAD 2>/dev/null; git ls-files -co --exclude-standard -z | xargs -0 stat -f '%N %z %m' 2>/dev/null || true; } | shasum -a 256 | cut -c1-16
 }
 stamp="$(stamp_of)"
 if [ -x "$contents/MacOS/CortexCode" ] && [ "$(cat "$out/.stamp" 2>/dev/null)" = "$stamp" ]; then
@@ -70,7 +71,7 @@ sources() {
 
 mkdir -p "$contents/MacOS" "$res/packages" "$res/bin" "$res/ui/node_modules"
 
-# --- the frame, cx and cortex-pack -------------------------------------------------------------
+# --- the frame, cx and cortex-pack (which packs the plugins here) ------------------------------
 for crate in frame cli packer; do
   step "building $crate"
   (cd "$crate" && cargo build --release --quiet)
@@ -123,18 +124,10 @@ for file in "$res/packages"/*.ccplugin; do
   [ $keep = 1 ] || rm -f "$file"
 done
 
-# --- cx and cortex-pack ------------------------------------------------------------------------
+# --- cx ----------------------------------------------------------------------------------------
 place cli/target/release/cx "$res/bin/cx"
-place packer/target/release/cortex-pack "$res/bin/cortex-pack"
-
-# --- the full source ---------------------------------------------------------------------------
-step "copying the source"
-rm -rf "$res/.source-next" "$res/.source-old"
-mkdir -p "$res/.source-next"
-sources . | rsync -a --from0 --files-from=- ./ "$res/.source-next/"
-[ ! -d "$res/source" ] || mv "$res/source" "$res/.source-old"
-mv "$res/.source-next" "$res/source"
-rm -rf "$res/.source-old"
+# Earlier builds also carried the packer and the full source.
+rm -rf "$res/bin/cortex-pack" "$res/source" "$res/.source-next" "$res/.source-old"
 
 # --- the UI: shell, renderer, its runtime packages and Electron ---------------------------------
 mkdir -p "$res/ui/renderer"

@@ -68,7 +68,7 @@ pub fn hello() -> Hello {
         .map(|method| (*method).to_owned())
         .collect();
     // Background jobs wake the session that started them; changed skills rebuild the prefixes; a
-    // merge of the code folder (the source manager's start-up update) reloads the data set. The
+    // merge of the live folder (the source manager's start-up update) reloads the data set. The
     // plugins a new conversation's block is built from coming up, a project opened and a new
     // project description each have that block prefilled again ([`Chatflow::warm_projects`]).
     hello.subscribes = vec![
@@ -87,7 +87,7 @@ pub fn hello() -> Hello {
 /// prefixes built before it is stale.
 const SKILLS_CHANGED: &str = cc_protocol::contracts::skills::topics::CHANGED;
 
-/// Published by the source manager when the code folder changed, among others once its start-up
+/// Published by the source manager when the live folder changed, among others once its start-up
 /// merge is done: this plugin starts beside it and may have read its live data before the merge
 /// (seen: the new prompts' data set rejected for a key the merge was about to bring).
 const SOURCE_CHANGED: &str = cc_protocol::contracts::source::topics::CHANGED;
@@ -224,7 +224,7 @@ impl Chatflow {
     }
 
     /// The directory layers of the data set: `data_dir` from the plugin config (shipped files),
-    /// then the live data in the plugin's folder of the code folder (taken once it exists).
+    /// then the live data in the plugin's folder of the live folder (taken once it exists).
     fn data_layers(ctx: &Ctx) -> Vec<(String, PathBuf)> {
         let mut layers = Vec::new();
         if let Some(dir) = ctx.config().get("data_dir").and_then(Value::as_str) {
@@ -234,8 +234,8 @@ impl Chatflow {
             };
             layers.push(("shipped".to_owned(), dir));
         }
-        if let Some(source) = &ctx.env.source_dir {
-            layers.push((crate::data::LIVE.to_owned(), source.join("backend").join("data")));
+        if let Some(live) = &ctx.env.live_dir {
+            layers.push((crate::data::LIVE.to_owned(), live.join("backend").join("data")));
         }
         layers
     }

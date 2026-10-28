@@ -6,7 +6,7 @@
 //! property order is the `required` order). Three layers, later ones winning per file:
 //! 1. the shipped files compiled into the binary (always valid; the frame runs a copy of the binary);
 //! 2. a shipped data directory named by the plugin config (`data_dir`);
-//! 3. the live data: `backend/data` in the plugin's folder of the code folder, where the app and
+//! 3. the live data: `backend/data` in the plugin's folder of the live folder, where the app and
 //!    the user edit it (absent in safe mode; it may appear while the plugin runs). It never gives
 //!    the [`PROTECTED`] files.
 //!

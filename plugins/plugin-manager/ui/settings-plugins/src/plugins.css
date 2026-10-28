@@ -13,7 +13,6 @@
 #cc .cx-plugins .cx-on{color:var(--counter);}
 #cc .cx-plugins .cx-off{color:var(--rubric);}
 #cc .cx-plugins .cx-plugin-cat{display:block;}
-#cc .cx-plugins .cx-editing{display:block;margin-top:4px;font-size:12.5px;line-height:1.4;color:var(--ink-3);}
 #cc .cx-plugins .cx-sub{display:block;margin:4px 0 0;padding:0;line-height:1.4;}
 #cc .cx-plugin-acts{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-end;}
 #cc .cx-plugins tr.cx-has-swap td{border-bottom:0;}

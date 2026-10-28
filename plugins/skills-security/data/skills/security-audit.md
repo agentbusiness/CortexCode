@@ -5,7 +5,7 @@ Read-only work: project files never change. The secaudit tool keeps the audit's 
 ## The loop
 
 ```bash
-export SA="$CORTEX_HOME/code/plugins/skills-security/data/scripts/secaudit.py"
+export SA="$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py"
 python3 "$SA" next
 ```
 

@@ -31,9 +31,9 @@ struct RawFrame {
     #[serde(default)]
     ui: bool,
     ui_dir: Option<String>,
-    /// The code folder: CortexCode's own source, where plugins read their live data
-    /// (default `<home>/code`).
-    code: Option<String>,
+    /// The live folder: every plugin's data (prompts, texts, skills), where plugins read it live
+    /// (default `<home>/live`).
+    live: Option<String>,
     /// The app's prebuilt plugin packages (`<id>@<version>.ccplugin`), installed at start.
     packages: Option<String>,
 }
@@ -76,8 +76,8 @@ pub struct Config {
     pub port: u16,
     pub ui: bool,
     pub ui_dir: PathBuf,
-    /// `[frame] code`, resolved against the config's directory (`None` = `<home>/code`).
-    pub code: Option<PathBuf>,
+    /// `[frame] live`, resolved against the config's directory (`None` = `<home>/live`).
+    pub live: Option<PathBuf>,
     /// `[frame] packages`: the app's prebuilt plugin packages, resolved against the config's directory.
     pub packages: Option<PathBuf>,
     /// Overrides by plugin id.
@@ -120,7 +120,7 @@ impl Config {
             port: raw.frame.port,
             ui: raw.frame.ui,
             ui_dir: resolve(&base, raw.frame.ui_dir.as_deref().unwrap_or("ui")),
-            code: raw.frame.code.as_deref().map(|code| resolve(&base, code)),
+            live: raw.frame.live.as_deref().map(|live| resolve(&base, live)),
             packages: raw.frame.packages.as_deref().map(|packages| resolve(&base, packages)),
             overrides,
             base,

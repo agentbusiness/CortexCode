@@ -68,11 +68,14 @@ export function SlotHost({ name, props, className, pluginId }: { name: string; p
   const instances = engine.instances();
   const active = engine.active;
   const rejected = [...engine.rejected].join(' ');
+  // Settled: a plugin is mounted, it failed, or none will come (the start-up splash waits for it).
+  const settled = Boolean(active) || Boolean(engine.broken) || (registryLoaded && (!desired || rejected !== ''));
   return (
     <div
       ref={container}
       className={`cx-slot${className ? ` ${className}` : ''}`}
       data-slot={name}
+      data-settled={settled ? 'true' : 'false'}
       data-plugin-id={active?.plugin.id ?? ''}
       data-plugin-version={active?.plugin.version ?? ''}
       data-plugin-hash={active?.plugin.hash ?? ''}

@@ -14,7 +14,7 @@ platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 # One language plugin per language: the `lang` family, category `lang-<id>`, contract `lang@1`.
-# `data/` (the skills) ships beside the executable. `[plugin.config] server_path` overrides the
+# `data/` (the skills) is the plugin's data (`[data]`). `[plugin.config] server_path` overrides the
 # typescript-language-server executable.
 [backend]
 category = "lang-typescript"
@@ -22,14 +22,8 @@ contract = "lang@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-lang-typescript"
-assets = ["data"]
 
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/lang-typescript"
+# The plugin's data (skills): packed at the same path; the app reads and edits it live in
+# the live folder (<home>/live/plugins/lang-typescript/data).
+[data]
+dirs = ["data"]

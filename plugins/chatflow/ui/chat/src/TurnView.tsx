@@ -2,7 +2,6 @@ import { createContext, memo, useState, type ReactNode } from 'react';
 import { clock, duration, kinds, useQuery, useSelection, type Json, type JournalEntry, type Task } from '@cortex/sdk';
 import { Activity, activityItems, isScaffolding } from './Activity';
 import { Attachments } from './Attachments';
-import { ChangeCard } from './Change';
 import { Edits, type ChangedNote, type EditedFile } from './Edits';
 import { DECISION, IDEATION, KNOWLEDGE, PLAN, SPEC } from './ideation';
 import { DecisionCard, IdeasCard, OptionsCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
@@ -28,8 +27,6 @@ export function holds(step: Step, seq: number | null): boolean {
 export interface TurnActions extends IdeationActions {
   /** Answer an ask-mode approval (`chatflow.approve`); resolves when the flow took the answer. */
   approve: (seq: number, approve: boolean) => Promise<void>;
-  /** Answer a code change to CortexCode (`source.decide`); resolves when the source manager took it. */
-  decide: (id: string, approve: boolean) => Promise<void>;
   openFile: (path: string) => void;
   openLink: (url: string) => void;
   /** Put the files a turn edited back as they were before it, from the edit tool's own results
@@ -297,8 +294,6 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
       return <Verification entry={entry} />;
     case kinds.APPROVAL:
       return <Approval entry={entry} onAnswer={actions.approve} />;
-    case kinds.CHANGE:
-      return <ChangeCard entry={entry} onDecide={actions.decide} />;
     case kinds.NOTE:
       // Bookkeeping notes without text (a stage closed) are not drawn; notes written for the model
       // (a skill's text, referenced projects) are one line, opened on demand. A task's start is

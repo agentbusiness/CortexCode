@@ -27,8 +27,3 @@ slot = "workbench.band@1"
 dir = "ui/settings-plugins"
 id = "plugin-manager.settings-plugins"
 slot = "settings.plugins@1"
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/plugin-manager"

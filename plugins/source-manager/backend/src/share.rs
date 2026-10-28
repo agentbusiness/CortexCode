@@ -3,7 +3,7 @@
 //! for the user's private details (paths of their Mac, their projects, anything that looks like a
 //! secret) and the findings are shown with the change.
 
-use crate::code;
+use crate::live;
 use crate::service::{Service, rpc};
 use cc_protocol::contracts::frame::{Project, methods as frame_methods};
 use cc_protocol::contracts::source::{Change, Finding, ShareCandidate, ShareCandidates, ShareParams, Shared, SharedList};
@@ -18,8 +18,8 @@ use std::sync::Arc;
 const UPSTREAM_BRANCH: &str = "main";
 /// Marks of credentials (prefixes and headers of well-known token formats).
 const SECRET_MARKS: &[&str] = &["ghp_", "gho_", "ghs_", "github_pat_", "sk-", "AKIA", "-----BEGIN", "xoxb-", "xoxp-", "AIza"];
-/// The changes the user made (not the shipped source, its updates or restores).
-const OWN: &[&str] = &["edit", "approved"];
+/// The changes the user made (not the packages' data, its updates or restores).
+const OWN: &[&str] = &["edit"];
 
 fn shorten(line: &str) -> String {
     let line = line.trim();
@@ -27,21 +27,21 @@ fn shorten(line: &str) -> String {
 }
 
 /// What the privacy check looks for: this Mac's home folder and the user's projects (by folder and
-/// by name), except the code folder itself.
+/// by name), except the live folder itself.
 struct Private {
     home: Option<String>,
     projects: Vec<String>,
 }
 
-async fn private(ctx: &Ctx, code_dir: &Path) -> Private {
+async fn private(ctx: &Ctx, live_dir: &Path) -> Private {
     let projects: Vec<Project> = match ctx.call(frame_methods::PROJECT_LIST, json!({})).await {
         Ok(value) => value.get("projects").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let code = code_dir.canonicalize().ok();
+    let live = live_dir.canonicalize().ok();
     let mut words = Vec::new();
     for project in projects {
-        if Path::new(&project.root).canonicalize().ok() == code {
+        if Path::new(&project.root).canonicalize().ok() == live {
             continue;
         }
         words.push(project.root.clone());
@@ -88,7 +88,7 @@ fn findings(diffs: &[cc_protocol::contracts::source::FileDiff], private: &Privat
 /// The user's changes not shared yet (and not reverted), oldest first.
 async fn own_changes(service: &Arc<Service>) -> Result<Vec<Change>, RpcError> {
     let shared: Vec<String> = service.settings()?.shared.into_iter().flat_map(|s| s.commits).collect();
-    let history = service.git(|repo| code::history(repo, 500)).await?;
+    let history = service.git(|repo| live::history(repo, 500)).await?;
     let mut out: Vec<Change> = history
         .into_iter()
         .filter(|c| OWN.contains(&c.origin.as_str()) && c.reverted_by.is_none() && !shared.contains(&c.commit))
@@ -98,11 +98,11 @@ async fn own_changes(service: &Arc<Service>) -> Result<Vec<Change>, RpcError> {
 }
 
 pub async fn candidates(service: &Arc<Service>, ctx: &Ctx) -> Result<ShareCandidates, RpcError> {
-    let private = private(ctx, &service.code_dir).await;
+    let private = private(ctx, &service.live_dir).await;
     let mut changes = Vec::new();
     for change in own_changes(service).await? {
         let oid = Oid::from_str(&change.commit).map_err(|e| rpc(e.message()))?;
-        let diffs = service.git(move |repo| code::diff_commit(repo, oid)).await?;
+        let diffs = service.git(move |repo| live::diff_commit(repo, oid)).await?;
         changes.push(ShareCandidate {
             findings: findings(&diffs, &private),
             commit: change.commit,
@@ -137,12 +137,12 @@ pub async fn send(service: &Arc<Service>, ctx: &Ctx, params: ShareParams) -> Res
     let (login, token, push_branch) = (credential.login.clone(), credential.token.clone(), branch.clone());
     service
         .git(move |repo| {
-            code::fetch(repo, &upstream_url, Some((&login, &token)), &format!("+refs/heads/{UPSTREAM_BRANCH}:{}", code::UPSTREAM))
+            live::fetch(repo, &upstream_url, Some((&login, &token)), &format!("+refs/heads/{UPSTREAM_BRANCH}:{}", live::UPSTREAM))
                 .map_err(|e| format!("cannot read the official repository: {e}"))?;
-            let onto = repo.find_reference(code::UPSTREAM).and_then(|r| r.peel_to_commit()).map_err(|e| e.message().to_owned())?.id();
-            let tip = code::replay(repo, onto, &commits, &sign_off)?;
+            let onto = repo.find_reference(live::UPSTREAM).and_then(|r| r.peel_to_commit()).map_err(|e| e.message().to_owned())?.id();
+            let tip = live::replay(repo, onto, &commits, &sign_off)?;
             repo.reference(&local_ref, tip, true, "share").map_err(|e| e.message().to_owned())?;
-            code::push(repo, &fork_url, &login, &token, &format!("{local_ref}:refs/heads/{push_branch}"))
+            live::push(repo, &fork_url, &login, &token, &format!("{local_ref}:refs/heads/{push_branch}"))
         })
         .await?;
     let title = match picked.as_slice() {

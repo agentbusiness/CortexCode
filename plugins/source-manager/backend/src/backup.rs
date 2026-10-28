@@ -1,16 +1,16 @@
-//! Backup & Sync: the code folder's branch pushed to a repository the user picked on GitHub (branch
+//! Backup & Sync: the live folder's branch pushed to a repository the user picked on GitHub (branch
 //! `cortexcode`), and restored from it on a new Mac. The GitHub connection (vcs plugin) supplies the
 //! credentials; nothing is stored here but the repository's name.
 
+use crate::live;
 use crate::service::{Service, rpc};
-use crate::{code, paths, proposals};
 use cc_protocol::contracts::source::{Backup, BackupSetParams, RestoreParams, RestoreResult};
 use cc_protocol::contracts::vcs::{Credential, methods as vcs_methods};
 use cc_protocol::{Ctx, RpcError};
 use serde_json::json;
 use std::sync::Arc;
 
-/// The branch the code folder is pushed to.
+/// The branch the live folder is pushed to.
 pub const BRANCH: &str = "cortexcode";
 
 pub fn status(service: &Service) -> Result<Backup, RpcError> {
@@ -59,9 +59,9 @@ pub async fn push(service: &Arc<Service>, ctx: &Ctx) -> Result<Backup, RpcError>
     let repo = service.settings()?.backup_repo.ok_or_else(|| RpcError::invalid_params("choose a backup repository first"))?;
     let outcome = match credential(ctx).await {
         Ok(credential) => {
-            let refspec = format!("+{}:refs/heads/{BRANCH}", code::MAIN);
+            let refspec = format!("+{}:refs/heads/{BRANCH}", live::MAIN);
             let target = url(&repo);
-            service.git(move |git| code::push(git, &target, &credential.login, &credential.token, &refspec)).await
+            service.git(move |git| live::push(git, &target, &credential.login, &credential.token, &refspec)).await
         }
         Err(error) => Err(error),
     };
@@ -88,8 +88,7 @@ pub async fn after_change(service: &Arc<Service>, ctx: &Ctx) {
     }
 }
 
-/// Replace the code folder's changes with the backup's, carried onto this Mac's shipped source, and
-/// rebuild the plugins whose code the backup changes.
+/// Replace the live folder's changes with the backup's, carried onto this Mac's packages' data.
 pub async fn restore(service: &Arc<Service>, ctx: &Ctx, params: RestoreParams) -> Result<RestoreResult, RpcError> {
     let repo = match params.repo.filter(|r| !r.trim().is_empty()) {
         Some(repo) => repo,
@@ -97,17 +96,15 @@ pub async fn restore(service: &Arc<Service>, ctx: &Ctx, params: RestoreParams) -
     };
     let credential = credential(ctx).await.ok();
     let source = url(&repo);
-    let refspec = format!("+refs/heads/{BRANCH}:{}", code::BACKUP);
-    let (commit, own) = service
+    let refspec = format!("+refs/heads/{BRANCH}:{}", live::BACKUP);
+    let commit = service
         .git(move |git| {
-            code::fetch(git, &source, credential.as_ref().map(|c| (c.login.as_str(), c.token.as_str())), &refspec)
+            live::fetch(git, &source, credential.as_ref().map(|c| (c.login.as_str(), c.token.as_str())), &refspec)
                 .map_err(|e| format!("cannot read the backup from {repo}: {e}"))?;
-            let backup = git.find_reference(code::BACKUP).and_then(|r| r.peel_to_commit()).map_err(|e| e.message().to_owned())?;
-            code::restore(git, backup.id())
+            let backup = git.find_reference(live::BACKUP).and_then(|r| r.peel_to_commit()).map_err(|e| e.message().to_owned())?;
+            live::restore(git, backup.id())
         })
         .await?;
-    let (plugins, _) = paths::affected(&service.code_dir, &own);
-    let (rebuilt, not_built) = proposals::rebuild(service, ctx, &plugins).await;
     service.changed(ctx);
-    Ok(RestoreResult { commit: commit.to_string(), rebuilt, not_built })
+    Ok(RestoreResult { commit: commit.to_string() })
 }

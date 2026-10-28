@@ -227,7 +227,7 @@ impl Agents {
     }
 
     /// Data layers: `data_dir` from the plugin config, then the live data in the plugin's folder of
-    /// the code folder (taken once it exists).
+    /// the live folder (taken once it exists).
     fn data_layers(ctx: &Ctx) -> Vec<(String, std::path::PathBuf)> {
         let mut layers = Vec::new();
         if let Some(dir) = ctx.config().get("data_dir").and_then(Value::as_str) {
@@ -237,8 +237,8 @@ impl Agents {
             };
             layers.push(("shipped".to_owned(), dir));
         }
-        if let Some(source) = &ctx.env.source_dir {
-            layers.push((crate::data::LIVE.to_owned(), source.join("backend").join("data")));
+        if let Some(live) = &ctx.env.live_dir {
+            layers.push((crate::data::LIVE.to_owned(), live.join("backend").join("data")));
         }
         layers
     }

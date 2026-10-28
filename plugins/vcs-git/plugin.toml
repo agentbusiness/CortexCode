@@ -39,13 +39,3 @@ slot = "card.git@1"
 dir = "ui/settings-github"
 id = "vcs-git.settings-github"
 slot = "settings.github@1"
-
-# What building this plugin's code needs on a Mac: code editing is offered only when all of it
-# is present (data editing always is).
-[build]
-needs = ["rust", "apple-clt"]
-
-# Where the source lives, for the source manager (self-rewrite) and for `cortex-pack --source`.
-[source]
-repo = "cortexcode"
-subdir = "plugins/vcs-git"

@@ -858,7 +858,7 @@ pub struct Machine {
 /// has a backend), `ui/` (one or more npm packages, when it has UI), shell modules, `verify/` and
 /// `README.md`. `cortex-pack` compiles it into a `.ccplugin`: a gzip-compressed tar holding
 /// `manifest.json` ([`CcPluginManifest`]), the backend executable with its assets, every UI
-/// package's built `dist/`, the shell modules and, optionally, the plugin's source. The frame runs
+/// package's built `dist/`, the shell modules and the plugin's data folders. The frame runs
 /// plugins only from installed packages, one folder per version.
 pub mod package {
     use serde::{Deserialize, Serialize};
@@ -888,19 +888,13 @@ pub mod package {
         /// Code that runs in the Electron shell's main process.
         #[serde(default)]
         pub shell: Vec<ShellSpec>,
-        /// Where the plugin's source lives (the source manager; `cortex-pack` with source).
+        /// The plugin's data (prompts, texts, skills): packed at the same paths and kept live,
+        /// editable, in the home's live folder.
         #[serde(default)]
-        pub source: Option<SourceSpec>,
-        /// What building the plugin's code needs on the Mac (the source manager offers code
-        /// editing only when all of it is present).
-        #[serde(default)]
-        pub build: Option<BuildSpec>,
+        pub data: Option<DataSpec>,
         /// Free-form: the plugin's settings keys (documentation).
         #[serde(default)]
         pub settings: Option<Value>,
-        /// Free-form: data files the plugin compiles in (documentation).
-        #[serde(default)]
-        pub data: Option<Value>,
         /// Verification commands by name, run from the plugin folder.
         #[serde(default)]
         pub verify: Option<Value>,
@@ -1037,29 +1031,14 @@ pub mod package {
         pub serves: Option<String>,
     }
 
+    /// `[data]`: the folders of the plugin that hold its data, relative to the plugin folder
+    /// (`data`, `backend/data`). The package carries them at the same paths; the frame points the
+    /// plugin at its folder in the live folder (`<home>/live/plugins/<id>`), where they are edited.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(deny_unknown_fields)]
-    pub struct SourceSpec {
-        /// The repository's name in the source manager's component manifest.
-        pub repo: String,
-        /// The plugin folder inside that repository (`""` when the repository is the plugin).
+    pub struct DataSpec {
         #[serde(default)]
-        pub subdir: String,
-        /// The repository URL, when it differs from the component manifest's.
-        #[serde(default)]
-        pub url: Option<String>,
-    }
-
-    /// Tools a plugin's build needs: `rust` (cargo), `apple-clt` (Apple's command line tools: the
-    /// linker and SDK), `metal` (Apple's Metal compiler, from Xcode), `node` (node and npm).
-    pub const BUILD_NEEDS: &[&str] = &["rust", "apple-clt", "metal", "node"];
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(deny_unknown_fields)]
-    pub struct BuildSpec {
-        /// Names from [`BUILD_NEEDS`].
-        #[serde(default)]
-        pub needs: Vec<String>,
+        pub dirs: Vec<String>,
     }
 
     /// Structural check of a path inside a plugin folder or package: relative, no `..`, not empty.
@@ -1151,10 +1130,10 @@ pub mod package {
                 }
                 ids.push(&shell.id);
             }
-            if let Some(build) = &self.build {
-                for need in &build.needs {
-                    if !BUILD_NEEDS.contains(&need.as_str()) {
-                        return Err(format!("[build] need `{need}` must be one of {}", BUILD_NEEDS.join(", ")));
+            if let Some(data) = &self.data {
+                for dir in &data.dirs {
+                    if !safe_relative(dir) {
+                        return Err(format!("[data] dir `{dir}` must be a relative path inside the plugin"));
                     }
                 }
             }
@@ -1179,8 +1158,9 @@ pub mod package {
         pub ui: Vec<PackedUi>,
         #[serde(default)]
         pub shell: Vec<PackedShell>,
-        #[serde(default)]
-        pub source: Option<PackedSource>,
+        /// The plugin's data folders (`[data] dirs`), packed at these same paths.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub data: Vec<String>,
         pub build: BuildInfo,
     }
 
@@ -1226,18 +1206,6 @@ pub mod package {
         pub dir: String,
         #[serde(default)]
         pub serves: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct PackedSource {
-        pub repo: String,
-        #[serde(default)]
-        pub subdir: String,
-        #[serde(default)]
-        pub url: Option<String>,
-        /// Where the plugin folder's source is in the package (`source/`), when it was included.
-        #[serde(default)]
-        pub dir: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
