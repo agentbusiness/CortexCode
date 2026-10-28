@@ -1,6 +1,6 @@
 //! Resources of the network, claimed for one use (`docs/MESH-IMPLEMENTATION-PLAN.md` §13). Today
 //! one kind, `model`: every model call of a session claims the best free model in the network
-//! (`mesh.claim`) and gives it back when the call ends (`mesh.release`), so a run holds no model
+//! tagged for the call's work (`mesh.claim {tag}`) and gives it back when the call ends (`mesh.release`), so a run holds no model
 //! between its calls (a build, a test) and moves to a better model the moment one frees.
 //!
 //! Each computer decides who uses its own model next ([`Lending`]): one run's call at a time
@@ -9,6 +9,9 @@
 //! A run's age is its first claim, kept until `mesh.place.end`, so a run that was building is still
 //! old when it calls again. A claim that finds nothing free waits at every model it could use
 //! (here, and `mesh.model.claim` on each member); the first grant wins, the others are withdrawn.
+//! A claim whose tag no model has yet waits for one: it looks again whenever the models change
+//! (a model plugin here starts or swaps, a member connects, goes or sends its card), keeping its
+//! age, so the oldest run of that tag is first when a tagged model comes up.
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
@@ -53,6 +56,8 @@ struct Waiter {
 pub struct Claims {
     pub lending: Mutex<Lending>,
     freed: Notify,
+    /// The models of the network changed: claims waiting for a tag no model has look again.
+    models_changed: Notify,
     /// session -> when its run first claimed (its age), until `mesh.place.end`.
     ages: Mutex<HashMap<String, u64>>,
     /// session -> the computer whose model its current call holds (empty: this one).
@@ -191,6 +196,11 @@ impl Mesh {
         }
     }
 
+    /// The models of the network may have changed: waiting claims look again.
+    pub fn models_changed(&self) {
+        self.claims.models_changed.notify_waiters();
+    }
+
     // --- the claiming side: a session's model call -----------------------------------------------
 
     /// The weights' size of a model (asked once per model id).
@@ -211,9 +221,9 @@ impl Mesh {
         info.file_bytes
     }
 
-    /// Every model the session could use, best first: the strongest, then the one its prompt is
-    /// cached on, then this computer, the local network, remote, then the faster.
-    async fn model_options(&self, session: &str) -> Vec<ModelOption> {
+    /// Every model tagged for `tag` the session could use, best first: the strongest, then the one
+    /// its prompt is cached on, then this computer, the local network, remote, then the faster.
+    async fn model_options(&self, session: &str, tag: &str) -> Vec<ModelOption> {
         let mut options = Vec::new();
         let mut family = None;
         if let Some(ctx) = self.ctx.get()
@@ -222,7 +232,9 @@ impl Mesh {
         {
             let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
             lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
-            options.push(ModelOption { node: String::new(), name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s });
+            if info.tags.iter().any(|own| own == tag) {
+                options.push(ModelOption { node: String::new(), name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s });
+            }
             family = Some(info.family);
         }
         let me = self.me.hex();
@@ -231,7 +243,7 @@ impl Mesh {
         for member in self.members().into_values().filter(|member| member.node != me) {
             let Some(connection) = conns.get(&member.node) else { continue };
             let Some(model) = cards.get(&member.node).and_then(|card| card.model.clone()) else { continue };
-            if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) {
+            if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) || !model.tags.iter().any(|own| own == tag) {
                 continue;
             }
             let tier = if Self::path_of(connection).0 == "lan" { 1 } else { 2 };
@@ -249,12 +261,13 @@ impl Mesh {
         options
     }
 
-    /// Ask one computer's model for one use (`wait`: until it is this run's turn).
-    async fn ask(&self, node: &str, session: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
+    /// Ask one computer's model for one use for `tag`'s work (`wait`: until it is this run's turn).
+    #[allow(clippy::too_many_arguments)]
+    async fn ask(&self, node: &str, session: &str, tag: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
         if node.is_empty() {
             return self.lend("", session, since, foreground, wait, cancel).await;
         }
-        let params = json!({"session_id": session, "since_ms": since, "wait": wait});
+        let params = json!({"session_id": session, "tag": tag, "since_ms": since, "wait": wait});
         let answer = self.call_member(node, "mesh.model.claim", params, None, cancel).await;
         answer.ok().and_then(|value| value.get("granted").and_then(Value::as_bool)).unwrap_or(false)
     }
@@ -282,14 +295,27 @@ impl Mesh {
         // A run's age starts with its first waiting claim; a claim that does not wait (a prompt
         // warm-up) is no run and leaves none behind.
         let since = if params.wait { *lock(&self.claims.ages).entry(session.clone()).or_insert_with(now_ms) } else { lock(&self.claims.ages).get(&session).copied().unwrap_or_else(now_ms) };
-        let options = self.model_options(&session).await;
-        if options.is_empty() {
-            // No model anywhere: the call goes to this computer's model plugin, which says so.
-            return Ok(Placement { node: None, name: self.name(), model_id: String::new(), tier: String::new() });
-        }
+        // No model with the tag anywhere yet: the claim waits for one (a claim that does not wait
+        // hears `busy`).
+        let options = loop {
+            let changed = self.claims.models_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let options = self.model_options(&session, &params.tag).await;
+            if !options.is_empty() {
+                break options;
+            }
+            if !params.wait {
+                return Ok(Placement { node: None, name: String::new(), model_id: String::new(), tier: "busy".to_owned() });
+            }
+            tokio::select! {
+                _ = changed => {}
+                _ = cancel.cancelled() => return Err(RpcError::new(codes::CANCELLED, "cancelled while waiting for a model tagged for this work")),
+            }
+        };
         let mut chosen = None;
         for (index, option) in options.iter().enumerate() {
-            if self.ask(&option.node, &session, since, params.foreground, false, CancellationToken::new()).await {
+            if self.ask(&option.node, &session, &params.tag, since, params.foreground, false, CancellationToken::new()).await {
                 chosen = Some(index);
                 break;
             }
@@ -304,8 +330,9 @@ impl Mesh {
                 let mesh = self.clone();
                 let node = option.node.clone();
                 let session = session.clone();
+                let tag = params.tag.clone();
                 let stop = stop.clone();
-                Box::pin(async move { if mesh.ask(&node, &session, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
+                Box::pin(async move { if mesh.ask(&node, &session, &tag, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
             });
             let outcome = select_ok(waits).await;
             stop.cancel();

@@ -135,18 +135,6 @@ with the session's shell and sandbox (the copy added as a writable grant), and g
 command ends; the result says so and that files the command changed were not kept. Alone in the
 tree, a check runs in the tree.
 
-## Borrowed hands
-
-When the mesh plugin names a member that runs a session's commands (`mesh.runner`, asked once per
-session at its first `run`; `tools.runner.set` overrides), the model's `run` goes to that member
-through `mesh.call` and the member's own `tools.run`, in the member's copy of the tree
-(`exec.rs` `run_remote`): the output comes back with the member's paths shown as this tree's,
-and the result says where it ran. Files the member's command changed arrive through
-`tools.timeline.apply` (written here as one step attributed to the member, `node:<id>`), the
-same method the mesh uses to keep a member's copy in step with this tree. Host checks, background
-jobs, commands let past the sandbox and the probe always run here; a member that stops answering
-sends the session's commands back here.
-
 A host `tools.read` of `diagnostics://` may pass `wait_ms` (0: what the servers have now, nothing
 started or waited for, marked partial; the chat flow's reads) and `shown` (at most that many listed
 per server, errors first, the rest counted). A server that cannot answer is a line of the result.

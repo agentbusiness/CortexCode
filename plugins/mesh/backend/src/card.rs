@@ -115,7 +115,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
             id: if plugin.plugin.is_empty() { plugin.plugin_id.clone() } else { plugin.plugin.clone() },
             category: plugin.category.clone(),
             // The installed package's version (with its build), not the plugin's bare semver: two
-            // nodes lend hands to each other only on the very same build.
+            // nodes tell exactly which build each one runs.
             version: if plugin.build.is_empty() { plugin.version.clone() } else { plugin.build.clone() },
             data_hash: data_hash(live_root.as_deref(), if plugin.plugin.is_empty() { &plugin.plugin_id } else { &plugin.plugin }),
             active: plugin.state == "active",
@@ -138,6 +138,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
                 model_id: info.model_id,
                 variant: info.variant,
                 family: info.family,
+                tags: info.tags,
                 ctx_total: info.ctx_total,
                 slots: info.slots,
                 slots_busy: slots.as_ref().map(|slots| slots.busy).unwrap_or(0),

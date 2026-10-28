@@ -61,7 +61,7 @@ impl Mesh {
     /// Start serving `category` here from the member `node`, for every session.
     pub async fn start_borrow(self: &Arc<Self>, category: &str, node: &str) -> Result<Vec<String>, RpcError> {
         let member = self.member(node).ok_or_else(|| RpcError::not_found("no such member"))?;
-        if !crate::net::lendable(&format!("{category}.x")) && !crate::net::lendable("tools.run") {
+        if !crate::net::lendable(&format!("{category}.x")) {
             return Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{category}` is not something members lend")));
         }
         let provides = self.member_provides(node, category).await?;

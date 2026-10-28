@@ -2,10 +2,12 @@
 //!
 //! A node is one installation with one Ed25519 key; the key is its address. A *cortex* is one
 //! person's set of nodes: a signed membership log every member holds. Members connect to each other
-//! (direct on a LAN, hole-punched or relayed elsewhere) and exchange capability cards. A session
-//! stays at home; every member lends its model and its hands (`tools.run`, `lang-*`, `container`)
-//! to every other, always through the frame's own contracts, forwarded. Nothing to configure: one
-//! invitation joins a computer, Remove takes it out; what runs where is decided from the cards.
+//! (direct on a LAN, hole-punched or relayed elsewhere) and exchange capability cards. A project
+//! lives on its own computer, and every member's window can work in it there (`mesh.link`). Every
+//! member lends its model to every other, through the frame's own `model` contract, forwarded; a
+//! request names the work it is for (a tag, `coding`), and only a model tagged for that work takes
+//! it. Nothing to configure: one invitation joins a computer, Remove takes it out; what runs where
+//! is decided from the cards.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,30 +35,21 @@ pub mod methods {
     /// `{}` -> [`super::PeersResult`]: every member's card and reachability.
     pub const PEERS: &str = "mesh.peers";
     /// [`super::CallParams`] -> the called method's result (stream items pass through): one call on
-    /// a member's frame (what members lend: model and hands methods).
+    /// a member's frame (what members lend: its model's methods).
     pub const CALL: &str = "mesh.call";
     /// [`super::NameParams`] -> `{}`: this node's name as the others see it.
     pub const NAME: &str = "mesh.name";
-    /// [`super::RunnerParams`] -> [`super::Runner`]: which member, if any, runs a session's
-    /// commands (the tools plugin asks once per session; the answer carries the member's copy of
-    /// the tree, made and kept in step by the mesh). `node` absent: the commands run here.
-    pub const RUNNER: &str = "mesh.runner";
-    /// [`super::TreeFilesParams`]: this node's tree as items `{path, mode, data}` (base64), the
-    /// files git tracks or would track; a member copying the tree asks for it.
-    pub const TREE_FILES: &str = "mesh.tree.files";
-    /// [`super::TreeApplyParams`] -> `{}`: files to write into a copy of a tree kept here, or
-    /// into the tree itself when a member's command changed them.
-    pub const TREE_APPLY: &str = "mesh.tree.apply";
     /// [`super::PlaceParams`] -> [`super::Placement`]: a session's model calls go to a joined
-    /// computer with a free model of the same family, when there is one; else they stay here.
+    /// computer with a free model of the same family and tag, when there is one; else they stay
+    /// here.
     /// Automatic: the agents plugin asks for every agent it starts, the chat flow for a session
     /// whose turn starts while this computer's model is busy.
     pub const PLACE: &str = "mesh.place";
     /// [`super::PlaceParams`] -> `{}`: the session's model calls stay here again (its run ended).
     pub const PLACE_END: &str = "mesh.place.end";
-    /// `{}` -> [`super::Capacity`]: how many joined computers could take a session's model calls
-    /// now (a free model of this computer's family). The chat flow tells its planner the number,
-    /// nothing more.
+    /// [`super::CapacityParams`] -> [`super::Capacity`]: how many joined computers could take a
+    /// session's model calls now (a free model of this computer's family and the tag). The chat
+    /// flow tells its planner the number, nothing more.
     pub const CAPACITY: &str = "mesh.capacity";
     /// `{}` -> [`super::ProjectsResult`]: every project of the network, this computer's and every
     /// member's, with its description and computer. A project is worked on at its own computer.
@@ -66,7 +59,8 @@ pub mod methods {
     /// window talks to the computer of the project it shows through it.
     pub const LINK: &str = "mesh.link";
     /// [`super::ClaimParams`] -> [`super::Placement`]: a resource of the network for one use by a
-    /// session (`kind: model`: one model call). The best free one is taken; when none is free the
+    /// session (`kind: model`: one model call, on a model tagged for the request's `tag`). The best
+    /// free one is taken; when none is free the
     /// claim waits, and a freed resource goes to the oldest waiting run (a run's age is its first
     /// claim, kept until `mesh.place.end`). The frame then routes the session's calls there.
     pub const CLAIM: &str = "mesh.claim";
@@ -195,6 +189,9 @@ pub struct ModelCard {
     /// `medium` | `small` | the engine's own variant name.
     pub variant: String,
     pub family: String,
+    /// The work the model is for ([`crate::contracts::model::tags`]).
+    #[serde(default = "crate::contracts::model::default_tags")]
+    pub tags: Vec<String>,
     pub ctx_total: u32,
     pub slots: u32,
     pub slots_busy: u32,
@@ -334,59 +331,11 @@ pub struct Changed {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct RunnerParams {
-    pub workspace: String,
-    pub session_id: String,
-    /// The project's id at home (what a member names the copy by).
-    #[serde(default)]
-    pub project_id: String,
-}
-
-/// Where a session's commands run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Runner {
-    /// The member (hex); absent: here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    pub name: String,
-    /// The member's copy of the tree (its absolute path there), ready to run in.
-    #[serde(default)]
-    pub remote_workspace: String,
-    /// Why no member runs them, when none does (for the person, in the card).
-    #[serde(default)]
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TreeFilesParams {
-    pub workspace: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TreeFile {
-    pub path: String,
-    #[serde(default)]
-    pub mode: u32,
-    /// Base64 of the content; absent: the file is deleted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TreeApplyParams {
-    /// The tree at the receiver: a copy's key (`copy:<home project id>`) or a workspace path.
-    pub target: String,
-    pub files: Vec<TreeFile>,
-    /// Who made the change, for the receiver's step log (`session:<id>`, `node:<id>`).
-    #[serde(default)]
-    pub actor: String,
-    #[serde(default)]
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PlaceParams {
     pub session_id: String,
+    /// The work the session is for: only a model with this tag takes it.
+    #[serde(default = "crate::contracts::model::default_tag")]
+    pub tag: String,
     /// Wait until a model is free (a person's turn); false: answer at once (an agent takes what
     /// is free now, else it stays queued here).
     #[serde(default)]
@@ -401,6 +350,9 @@ pub struct ClaimParams {
     /// The resource's kind: `model`.
     pub kind: String,
     pub session_id: String,
+    /// The work the call is for: only a model with this tag takes it.
+    #[serde(default = "crate::contracts::model::default_tag")]
+    pub tag: String,
     /// A person waits for this use (a chat turn); on its own computer it does not wait for agent
     /// work, which the engine puts behind it.
     #[serde(default)]
@@ -416,8 +368,15 @@ fn claim_waits() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CapacityParams {
+    /// The work the sessions would be for: only models with this tag count.
+    #[serde(default = "crate::contracts::model::default_tag")]
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Capacity {
-    /// Members with a free model of this computer's family, reachable now.
+    /// Members with a free model of this computer's family and the tag, reachable now.
     pub free: u32,
     #[serde(default)]
     pub names: Vec<String>,

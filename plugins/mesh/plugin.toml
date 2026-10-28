@@ -22,9 +22,9 @@ swap = "blue_green"
 provides = [
   "mesh.status", "mesh.pair.start", "mesh.pair.join", "mesh.pair.cancel", "mesh.members", "mesh.revoke",
   "mesh.leave", "mesh.name", "mesh.card", "mesh.peers", "mesh.call", "mesh.place", "mesh.place.end",
-  "mesh.capacity", "mesh.runner", "mesh.tree.files", "mesh.tree.apply", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release",
+  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release",
 ]
-subscribes = ["model.", "session.changed", "tools.timeline", "project.", "memory.knowledge.changed"]
+subscribes = ["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"]
 publishes = ["mesh.changed"]
 uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "model.info", "model.slots", "model.metrics", "agents.scheduler", "container.list"]
 

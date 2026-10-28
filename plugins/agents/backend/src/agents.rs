@@ -713,7 +713,7 @@ impl Agents {
     /// name), else here (None). `remote_only`: this computer's queue is full, so here is not an
     /// option now.
     async fn place_agent(&self, host: &Host, session_id: &str, remote_only: bool) -> Option<String> {
-        let placement = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "wait": false, "remote_only": remote_only})).await.ok()?;
+        let placement = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "tag": cc_protocol::contracts::model::tags::CODING, "wait": false, "remote_only": remote_only})).await.ok()?;
         placement.get("node").and_then(Value::as_str)?;
         Some(placement.get("name").and_then(Value::as_str).unwrap_or_default().to_owned())
     }

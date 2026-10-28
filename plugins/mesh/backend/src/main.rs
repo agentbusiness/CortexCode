@@ -40,7 +40,6 @@ impl Plugin for MeshPlugin {
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         let mesh = self.mesh(&ctx);
         Box::pin(async move {
-            mesh.load_copies();
             if mesh.endpoint.get().is_none()
                 && let Err(error) = mesh.start_net().await
             {
@@ -53,8 +52,10 @@ impl Plugin for MeshPlugin {
     fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
         let mesh = self.mesh(&ctx);
         Box::pin(async move {
-            if topic == cc_protocol::contracts::tools::topics::TIMELINE {
-                mesh.timeline_event(&data).await;
+            if topic == cc_protocol::contracts::frame::topics::PLUGIN_STATE || topic == cc_protocol::contracts::frame::topics::PLUGIN_SWAPPED {
+                // A model plugin here may have started, stopped or swapped.
+                mesh.forget_card();
+                mesh.models_changed();
             } else if topic.starts_with("project.")
                 || (topic == cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED && data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION))
             {

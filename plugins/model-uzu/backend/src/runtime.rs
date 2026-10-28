@@ -1055,6 +1055,7 @@ impl Runtime {
             variant: loaded.variant.clone(),
             path: loaded.dir.display().to_string(),
             family: spec.family.to_owned(),
+            tags: spec.tags.iter().map(|tag| (*tag).to_owned()).collect(),
             quant: spec.quant.to_owned(),
             file_bytes: spec.total_bytes(),
             ctx_total: u32::try_from(loaded.plan.ctx_total).unwrap_or(u32::MAX),

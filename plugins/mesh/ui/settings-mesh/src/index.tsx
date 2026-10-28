@@ -10,7 +10,7 @@ import { definePlugin, errorMessage, useClient, useHost, useNow, useQuery } from
 import './mesh.css';
 
 interface Member { node: string; name: string; added_ms: number; by: string }
-interface ModelCard { model_id: string; variant: string; family: string; slots: number; slots_busy: number; queued: number; tok_s: number }
+interface ModelCard { model_id: string; variant: string; family: string; tags?: string[]; slots: number; slots_busy: number; queued: number; tok_s: number }
 interface Card { chip: string; memory_bytes: number; free_memory_bytes: number; on_mains: boolean; user_active: boolean; model?: ModelCard | null; languages: { id: string; version: string }[]; docker: boolean; agents_running: number }
 interface Peer { member: Member; card?: Card | null; reachable: boolean; path: string; rtt_ms: number; serving: string[] }
 interface PairCode { code: string; expires_ms: number; invitation: string }
@@ -147,7 +147,7 @@ function MeshPanel() {
                   <span className="v">{[card.chip, `${gb(card.memory_bytes)}, ${gb(card.free_memory_bytes)} free`, card.on_mains ? 'on mains' : 'on battery', card.docker ? 'Docker' : '', card.user_active ? 'in use' : ''].filter(Boolean).join(' · ')}</span>
                   <span />
                   <span className="ap">Model</span>
-                  <span className="v" title={card.model?.model_id}>{card.model ? [card.model.variant || card.model.model_id, card.model.slots_busy > 0 || card.model.queued > 0 ? 'busy' : 'free', card.model.tok_s ? `${card.model.tok_s.toFixed(1)} tok/s` : ''].filter(Boolean).join(' · ') : 'none'}</span>
+                  <span className="v" title={card.model?.model_id}>{card.model ? [card.model.variant || card.model.model_id, (card.model.tags ?? []).join(', '), card.model.slots_busy > 0 || card.model.queued > 0 ? 'busy' : 'free', card.model.tok_s ? `${card.model.tok_s.toFixed(1)} tok/s` : ''].filter(Boolean).join(' · ') : 'none'}</span>
                   <span />
                   {card.languages.length > 0 && <>
                     <span className="ap">Languages</span>
