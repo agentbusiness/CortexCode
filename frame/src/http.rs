@@ -290,10 +290,38 @@ async fn serve_window(state: &AppState, file: &str) -> Response {
 }
 
 /// What `/ui/` shows while no plugin provides the window (the workbench plugin is installing or
-/// disabled): it asks again every two seconds.
-const WAITING_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"2\">\
-<title>CortexCode</title><style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0d0f12;color:#9aa3ad;\
-font:14px -apple-system,system-ui,sans-serif}</style></head><body>Waiting for the window (the Workbench plugin)</body></html>";
+/// disabled). Every second it shows the updater's round (`update.status`: one row per plugin, with
+/// its download's percent) as a bar, and loads the window as soon as `/ui/` serves it.
+const WAITING_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>CortexCode</title><style>
+body{margin:0;height:100vh;display:grid;place-items:center;background:#0d0f12;color:#9aa3ad;font:14px -apple-system,system-ui,sans-serif}
+main{width:min(420px,80vw);text-align:center}
+#bar{height:4px;margin:16px 0 10px;border-radius:2px;background:#22262d;overflow:hidden;visibility:hidden}
+#fill{height:100%;width:0;background:#5b9dff;transition:width .4s}
+#detail{min-height:1.4em;font-size:12px;color:#6b737d}
+</style></head><body><main><div id="title">Waiting for the window (the Workbench plugin)</div>
+<div id="bar"><div id="fill"></div></div><div id="detail"></div></main><script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const finished = { done: 100, at_restart: 100, failed: 100, installing: 100 };
+async function tick() {
+  const page = await fetch(location.href, { method: 'HEAD', cache: 'no-store' }).catch(() => null);
+  if (page && page.status !== 503) return location.reload();
+  const answer = await fetch('/api/rpc?token=' + encodeURIComponent(token), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method: 'update.status', params: {} }),
+  }).then((r) => r.json()).catch(() => null);
+  const status = answer && answer.ok ? answer.result : null;
+  const round = status && status.state !== 'idle' ? status.round || [] : [];
+  document.getElementById('bar').style.visibility = round.length ? 'visible' : 'hidden';
+  if (round.length) {
+    const percent = round.reduce((sum, row) => sum + (finished[row.state] ?? row.percent ?? 0), 0) / round.length;
+    const ready = round.filter((row) => finished[row.state] !== undefined).length;
+    document.getElementById('title').textContent = `Updating the plugins (${ready} of ${round.length})`;
+    document.getElementById('fill').style.width = percent.toFixed(1) + '%';
+  }
+  document.getElementById('detail').textContent = (status && status.detail) || '';
+}
+setInterval(tick, 1000);
+tick();
+</script></body></html>"#;
 
 async fn ui_plugin_file(State(state): State<AppState>, UrlPath((id, hash, file)): UrlPath<(String, String, String)>) -> Response {
     let Some(path) = state.frame.ui_plugins.resolve(&id, &hash, &file) else {
