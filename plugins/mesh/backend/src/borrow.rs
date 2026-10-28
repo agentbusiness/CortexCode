@@ -121,6 +121,8 @@ impl Mesh {
             contract: contract.to_owned(),
             provides,
             subscribes: Vec::new(),
+            // A borrowed category serves this machine's chats, not the model's shell commands.
+            commands: Vec::new(),
             scope: scope.to_owned(),
             instance: String::new(),
             pid: std::process::id(),

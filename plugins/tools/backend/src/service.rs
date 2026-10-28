@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// The methods a command in the model's shells may call (`cx`): its session's background jobs.
+pub const COMMANDS: &[&str] = &[methods::JOB_LIST, methods::JOB_STATUS, methods::JOB_KILL];
+
 pub const PROVIDES: &[&str] = &[
     methods::SCHEMAS,
     methods::EXECUTE,
@@ -370,7 +373,12 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             // each one's command and memory: those come as extra fields of each entry.
             let running_only = params.get("running").and_then(Value::as_bool).unwrap_or(false);
             let project = params.get("project_id").and_then(Value::as_str).map(str::to_owned);
-            let params: JobListParams = if params.is_null() { JobListParams::default() } else { parse_params(params)? };
+            let command_session = params.get("_command_session").and_then(Value::as_str).map(str::to_owned);
+            let mut params: JobListParams = if params.is_null() { JobListParams::default() } else { parse_params(params)? };
+            // A command in the model's shells sees its own session's jobs only.
+            if command_session.is_some() {
+                params.session_id = command_session;
+            }
             let metas: Vec<_> = core
                 .jobs
                 .list(params.session_id.as_deref())

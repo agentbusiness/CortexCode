@@ -7,7 +7,7 @@
 //! Every package belongs to the plugin that ships it (its owner). The packages of a disabled plugin
 //! are not served.
 
-use cc_protocol::contracts::frame::UiPlugin;
+use cc_protocol::contracts::frame::{UiPlugin, WINDOW_SLOT};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +68,16 @@ impl UiPlugins {
         };
         plugins.rescan();
         plugins
+    }
+
+    /// The window: the served package on [`WINDOW_SLOT`] (the newest, when more than one).
+    pub fn window(&self) -> Option<UiEntry> {
+        let current = self.current.read().ok()?;
+        current
+            .values()
+            .filter(|entry| entry.plugin.slot == WINDOW_SLOT)
+            .max_by_key(|entry| cc_protocol::version::Version::parse(&entry.plugin.version))
+            .cloned()
     }
 
     pub fn list(&self) -> Vec<UiPlugin> {
@@ -230,7 +240,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()
 }
 
 /// A relative path with only normal components (no `..`, no root, no empty).
-fn safe_relative(value: &str) -> Option<PathBuf> {
+pub fn safe_relative(value: &str) -> Option<PathBuf> {
     let path = Path::new(value);
     let mut out = PathBuf::new();
     for component in path.components() {

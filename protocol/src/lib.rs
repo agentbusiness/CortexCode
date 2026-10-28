@@ -5,18 +5,25 @@
 //! responses, events and cancellations. Category contracts live in [`contracts`]; the shared
 //! hashline anchor definition lives in [`hashline`].
 
-pub mod checks;
 pub mod codec;
 pub mod conn;
 pub mod contracts;
 pub mod envelope;
-pub mod hashline;
-pub mod host;
 pub mod plugin;
-pub mod release;
 pub mod sha256;
-pub mod stored;
 pub mod version;
+
+// Shared helpers, features like the plugin contracts (see `contracts`).
+#[cfg(feature = "checks")]
+pub mod checks;
+#[cfg(feature = "hashline")]
+pub mod hashline;
+#[cfg(feature = "host")]
+pub mod host;
+#[cfg(feature = "release")]
+pub mod release;
+#[cfg(feature = "stored")]
+pub mod stored;
 
 pub use conn::{BoxFuture, CallStream, Connection, Handler, IncomingRequest, ItemSink, NoHandler, Responder};
 pub use envelope::{Message, RpcError, codes, parse_params, to_value};

@@ -24,7 +24,3 @@ port = 0
 ui = true
 ui_dir = "ui"
 packages = "packages"
-
-# cx, copied into <home>/bin for the model's shells.
-[plugin.tools.config]
-cx_path = "bin/cx"

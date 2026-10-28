@@ -211,7 +211,7 @@ pub mod topics {
     /// Data: the new [`super::UiPlugin`] (new hash) when a UI plugin is added or rebuilt, or
     /// `{"id": "<id>", "removed": true}` when it disappeared.
     pub const UI_PLUGIN_CHANGED: &str = "ui_plugin.changed";
-    /// The renderer was rebuilt: open workbenches reload. Data: `{"build": "<digest>"}`.
+    /// The window (the `window@1` package) changed: open workbenches reload. Data: `{"build": "<hash>"}`.
     pub const UI_RENDERER_CHANGED: &str = "ui.renderer.changed";
     /// A plugin (vertical unit) was enabled, disabled, installed or rolled back.
     /// Data: the new [`super::PluginUnit`].
@@ -770,6 +770,10 @@ pub struct UiPlugin {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub plugin: String,
 }
+
+/// The slot of the window: the UI package (its `entry` is an HTML page) the frame serves at `/ui/`,
+/// which loads every other UI package into its slot. A plugin provides it (the workbench).
+pub const WINDOW_SLOT: &str = "window@1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct UiPluginListResult {

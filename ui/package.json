@@ -2,7 +2,7 @@
   "name": "cortexcode-ui",
   "private": true,
   "version": "0.1.4",
-  "description": "CortexCode workbench: the Electron shell, the renderer and its UI plugins",
+  "description": "CortexCode window shell: the Electron shell the frame starts, the UI SDK and the build of every UI package",
   "type": "module",
   "main": "shell/main.js",
   "scripts": {

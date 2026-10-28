@@ -17,6 +17,8 @@ const PROVIDES = [
   'browser.type', 'browser.press', 'browser.metrics', 'browser.cdp', 'browser.select',
   'browser.back', 'browser.forward', 'browser.reload',
 ];
+// What a command in the model's shells may call (`cx browser ...`): all but the raw `browser.cdp`.
+const COMMANDS = PROVIDES.filter((method) => method !== 'browser.cdp');
 
 /**
  * The shell-extension interface this module needs (documented with the shell).
@@ -42,7 +44,7 @@ export async function load(api) {
     log: api.log,
   });
   link = api.serve(
-    { plugin_id: 'cortex-ui-browser', version: api.version, category: 'browser', contract: 'browser@1', provides: PROVIDES, subscribes: [], swap: 'blue_green' },
+    { plugin_id: 'cortex-ui-browser', version: api.version, category: 'browser', contract: 'browser@1', provides: PROVIDES, commands: COMMANDS, subscribes: [], swap: 'blue_green' },
     (method, params) => service.handle(method, params),
   );
   const offBounds = api.ipc.on('cortex:browser-bounds', (bounds) => service.setPane(/** @type {any} */ (bounds)));

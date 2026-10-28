@@ -70,7 +70,12 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   `plugins/memory-irongraph`), so a plugin can be replaced by another that implements the same
   contract.
 - A caller that needs something the contract lacks gets a new named method in the contract and in
-  the owning plugin. A plugin's own inspection methods (`memory.query`) serve its own tests and
+  the owning plugin.
+- Each plugin contract is a feature of `cc-protocol`: a crate names the contracts it uses in its
+  `Cargo.toml` (`features = ["vcs"]`), so a contract change rebuilds and releases only those
+  plugins. Only the frame's interface (`frame`, `lifecycle`, `records`) is in every build.
+- A method a command in the model's shells may call (`cx`) is in its plugin's hello (`commands`);
+  the frame keeps no list of plugin methods. A plugin's own inspection methods (`memory.query`) serve its own tests and
   verify scripts, never other plugins.
 - Know-how about a store's query language and schema is a skill of the plugin that owns the store
   (`plugins/memory-irongraph/data/skills/irongraph-queries.md`, `skill://memory/...`), never of a
@@ -100,6 +105,10 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
 
 - Everything is built on the owner's Mac (Linux in Docker on it), never on GitHub; files go to the
   repository's GitHub releases and the catalog (release `catalog`) names what is current.
+- The frame is a small core: the frame binary, its Electron shell (`ui/shell`) and the frame's
+  interface in `protocol/`. New work goes into plugins (the window is the workbench plugin's, cx
+  the tools plugin's); a frame change is the exception. `scripts/release/digest.mjs` says what each
+  part is built from.
   Guide: `README.md` "Releasing"; design: `docs/RELEASES.md`.
 - `scripts/release.sh` releases whatever changed since the last release (content digests against
   the catalog): the frame, each changed plugin, the app when the frame moved, the npx launcher when

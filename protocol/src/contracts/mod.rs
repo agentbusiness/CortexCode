@@ -4,24 +4,46 @@
 //! hello; the frame routes every method named `<category>.<verb>` to the active plugin of that
 //! category. Contracts evolve additively within a major version: new optional fields (with
 //! `#[serde(default)]`) and new methods only. Renaming or removing anything requires a new major.
+//!
+//! The frame's interface (`frame`, `lifecycle`, `records`) is in every build. Each plugin contract
+//! is a feature of this crate that a crate names when it uses the contract (`features = ["vcs"]`),
+//! so a plugin builds with, and is released for, only the contracts it uses.
 
-pub mod agents;
-pub mod browser;
-pub mod chatflow;
-pub mod container;
 pub mod frame;
-pub mod lang;
-pub mod skills;
 pub mod lifecycle;
+pub mod records;
+
+#[cfg(feature = "agents")]
+pub mod agents;
+#[cfg(feature = "browser")]
+pub mod browser;
+#[cfg(feature = "chatflow")]
+pub mod chatflow;
+#[cfg(feature = "container")]
+pub mod container;
+#[cfg(feature = "lang")]
+pub mod lang;
+#[cfg(feature = "memory")]
 pub mod memory;
+#[cfg(feature = "mesh")]
 pub mod mesh;
+#[cfg(feature = "model")]
 pub mod model;
+#[cfg(feature = "notify")]
 pub mod notify;
+#[cfg(feature = "research")]
 pub mod research;
+#[cfg(feature = "skills")]
+pub mod skills;
+#[cfg(feature = "source")]
 pub mod source;
+#[cfg(feature = "terminal")]
 pub mod terminal;
+#[cfg(feature = "tools")]
 pub mod tools;
+#[cfg(feature = "update")]
 pub mod update;
+#[cfg(feature = "vcs")]
 pub mod vcs;
 
 /// Every category this frame knows, with the contract major it speaks.

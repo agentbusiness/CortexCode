@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ui/renderer/public/cortexcode.svg" alt="CortexCode" width="96" />
+  <img src="plugins/workbench/ui/window/public/cortexcode.svg" alt="CortexCode" width="96" />
 </p>
 
 <h1 align="center">CortexCode</h1>
@@ -126,7 +126,8 @@ npx cortexcode
 ```
 
 The first run downloads the app for your machine from this repository's releases, checks it
-against the checksum in the release catalog and starts it; later runs start it at once. On Linux you
+against the checksum in the release catalog and starts it; later runs start the installed app at
+once, and the app updates itself. On Linux you
 can also unpack the `.tar.gz` from [Releases](https://github.com/agentbusiness/CortexCode/releases/latest)
 and run `cortexcode/CortexCode`. The macOS app is not signed by Apple yet, so it is not offered as a
 `.dmg` download; `npx cortexcode` installs it.
@@ -138,13 +139,17 @@ waits for *Restart to update*.
 ## Releasing
 
 Everything is built on a Mac with Apple silicon; Linux builds run in Docker on it. Each plugin is
-released on its own, so a change to one plugin builds only that plugin:
+released on its own, so a change to one plugin builds only that plugin. The frame is a small core:
+the frame and its Electron shell. The window is the workbench plugin's and cx the tools plugin's.
+Each plugin contract is a feature of `cc-protocol` that a crate names when it uses it, so a contract
+change releases the plugins that use it, not the frame. `scripts/release/digest.mjs` says what each
+part is built from.
 
 | Script | What it releases |
 |---|---|
 | `scripts/release.sh` | **whatever changed since the last release**, in order: frame, plugins, app, npx (`--plan` says what, `--dry-run` builds without uploading) |
 | `scripts/release-plugin.sh <plugin> [version]` | one plugin (`--changed`: every plugin whose source changed) |
-| `scripts/release-frame.sh [version]` | the frame, cx and the window code |
+| `scripts/release-frame.sh [version]` | the frame and its Electron shell |
 | `scripts/release-app.sh [version]` | the full app for new users (`.tar.gz`; `.dmg` with `RELEASE_DMG=yes`), from the released parts |
 | `scripts/release-npm.sh [version]` | the `npx cortexcode` launcher |
 

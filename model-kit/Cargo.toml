@@ -10,7 +10,7 @@ description = "Engine-neutral model parsing, repetition, progress and chat templ
 [workspace]
 
 [dependencies]
-cc-protocol = { path = "../protocol" }
+cc-protocol = { path = "../protocol", features = ["model"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 minijinja = { version = "3.0.4", features = ["json", "preserve_order", "loop_controls", "serde"] }
 minijinja-contrib = { version = "3.0.4", features = ["pycompat"] }

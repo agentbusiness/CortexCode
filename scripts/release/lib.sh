@@ -25,12 +25,9 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pack="$repo/packer/target/release/cortex-pack"
 artifacts="$repo/artifacts"
 release_name="${release_name:-release}"
-# Shared code every plugin builds with (the plugin digest covers it, as in scripts/build-app.sh).
-shared_sources=(protocol model-kit lang-kit ui/sdk rust-toolchain.toml)
-# What the frame release is built from (the frame digest covers it).
-frame_sources=(frame cli packer protocol ui scripts/app rust-toolchain.toml)
-# The npx launcher.
-npm_sources=(npm/cortexcode)
+# What each part is built from, and its digest: scripts/release/digest.mjs (also used by
+# scripts/build-app.sh).
+digest_tool="$repo/scripts/release/digest.mjs"
 # Names that must never be in a released file: RELEASE_FORBIDDEN (load_env), kept out of the
 # repository so the list itself is never released.
 forbidden=""
@@ -93,7 +90,7 @@ need_mac() {
 
 need_tools() {
   local tool
-  for tool in git curl jq shasum tar cargo npm "$@"; do
+  for tool in git curl jq shasum tar cargo npm node "$@"; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is needed"
   done
 }
@@ -146,27 +143,15 @@ stamp_json_version() {
 
 # ----- sources and digests ---------------------------------------------------------------------
 
-# The source files git tracks or would track under the given paths, that exist (NUL-separated).
-sources() {
-  (cd "$repo" && git ls-files -co --exclude-standard -z -- "$@") | while IFS= read -r -d '' file; do
-    if [ -f "$repo/$file" ]; then printf '%s\0' "$file"; fi
-  done
-}
+# plugin_digest <plugin dir>, frame_digest, interface_digest, npm_digest: the digest of what each
+# is built from (scripts/release/digest.mjs says what counts).
+plugin_digest() { node "$digest_tool" plugin "$1"; }
+frame_digest() { node "$digest_tool" frame; }
+interface_digest() { node "$digest_tool" interface; }
+npm_digest() { node "$digest_tool" npm; }
 
-# The digest of a plugin's source and the shared code it builds with (as scripts/build-app.sh).
-plugin_digest() {
-  (cd "$repo" && sources "$1" "${shared_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
-}
-
-# The digest of what the frame release is built from.
-frame_digest() {
-  (cd "$repo" && sources "${frame_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
-}
-
-# The digest of the npx launcher's source.
-npm_digest() {
-  (cd "$repo" && sources "${npm_sources[@]}" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
-}
+# part_paths <part> [dir]: the paths a part is built from (for uncommitted changes), one per line.
+part_paths() { node "$digest_tool" paths "$@"; }
 
 # Files under <paths> with uncommitted changes other than version lines (the release scripts write
 # those), one per line.
@@ -289,14 +274,30 @@ asset_json() {
 
 catalog_url() { printf 'https://github.com/%s/releases/download/catalog/catalog.json' "$RELEASE_REPO"; }
 
-# fetch_catalog <out>: the published catalog (an empty one before the first release).
+# fetch_catalog <out>: the published catalog (an empty one before the first release). With a token
+# it is read through the API: the download link is cached and lags a catalog published minutes ago,
+# and a part released right after another would publish that stale copy over the other's entry.
 fetch_catalog() {
-  local out="$1" code
+  local out="$1" code asset
   if [ -n "${RELEASE_CATALOG:-}" ] && [ -f "$RELEASE_CATALOG" ]; then
     cp "$RELEASE_CATALOG" "$out"
     return
   fi
-  code="$(curl -sSL -o "$out" -w '%{http_code}' "$(catalog_url)")"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    code="$(curl -sSL -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$RELEASE_REPO/releases/tags/catalog")"
+    case "$code" in
+      200) asset="$(jq -r '.assets[] | select(.name == "catalog.json") | .url' "$out")"
+           if [ -n "$asset" ]; then
+             code="$(curl -sSL -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$asset")"
+           else
+             code=404
+           fi ;;
+      404) ;;
+      *) die "cannot read the catalog release ($code)" ;;
+    esac
+  else
+    code="$(curl -sSL -o "$out" -w '%{http_code}' "$(catalog_url)")"
+  fi
   case "$code" in
     200) jq -e '.format == "cortexcode-catalog/1"' "$out" >/dev/null || die "the published catalog is not a catalog" ;;
     404) step "no catalog published yet: starting one"

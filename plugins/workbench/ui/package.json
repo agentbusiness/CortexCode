@@ -10,6 +10,7 @@
   "workspaces": [
     "band-connection",
     "right-pane",
-    "settings-appearance"
+    "settings-appearance",
+    "window"
   ]
 }
