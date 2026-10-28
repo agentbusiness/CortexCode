@@ -8,6 +8,7 @@ import {
   fromDataTransfer,
   humanSize,
   isLongPaste,
+  pastedPaths,
   type AttachContext,
   type Attachment,
   type Incoming,
@@ -55,8 +56,8 @@ export function targetLabel(target: Target): string {
  * steers it — injected at its next step — or waits as a follow-up for after it; a running agent
  * can be addressed the same way. Enter sends, as in any text field; every action is a button.
  *
- * Attachments: paste an image (a screenshot straight from the clipboard), drop files or folders on
- * the composer, or pick them with Attach; each becomes a chip (a preview for images) that can be
+ * Attachments: paste an image (a screenshot straight from the clipboard) or files and folders copied
+ * in Finder, drop them on the composer, or pick them with Attach (files or a folder); each becomes a chip (a preview for images) that can be
  * removed before sending (its × button, or Backspace in an empty field removes the last one).
  * Pasted text over the paste-as-file limit becomes a text-file chip ("Pasted text · N lines"): the
  * model reads its path and a head/tail preview instead of the whole text; View shows it, Inline
@@ -161,6 +162,13 @@ export function Composer({
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const data = event.clipboardData;
     const files = data ? Array.from(data.files ?? []) : [];
+    // Files or folders copied in Finder come as file URLs; they are attached by their paths.
+    const paths = files.length === 0 && data ? pastedPaths(data) : [];
+    if (paths.length > 0) {
+      event.preventDefault();
+      add(paths);
+      return;
+    }
     if (files.length === 0) {
       // A long text (a log) goes as a file: the model reads its head and tail, and the rest with its tools.
       const text = data?.getData('text/plain') ?? '';
@@ -330,6 +338,11 @@ export function Composer({
     }
   };
 
+  const attachItems: MenuItem[] = [
+    { key: 'files', label: 'Files or images', note: 'One or more files from this machine', onSelect: () => picker.current?.click() },
+    { key: 'folder', label: 'Folder', note: 'The model gets its path and its top-level listing', onSelect: () => void pickFolder() },
+  ];
+
   const items: MenuItem[] = options.map((option) => ({
     key: targetKey(option),
     label: targetLabel(option),
@@ -462,12 +475,15 @@ export function Composer({
           <button type="button" aria-pressed={mode === 'auto'} onClick={() => onMode('auto')}
             title="Never ask: every local change can be undone">Auto</button>
         </div>
-        <div className="seg-set cx-attach" role="group" aria-label="Attach">
-          <button type="button" disabled={disabled} onClick={() => picker.current?.click()}
-            title="Attach files or images (or paste a screenshot, or drop files and folders here)">Attach</button>
-          <button type="button" disabled={disabled || !attach.shell} onClick={() => void pickFolder()}
-            title={attach.shell ? 'Attach a folder: the model gets its path and its top-level listing' : 'Folders can be attached in the CortexCode app'}>Folder</button>
-        </div>
+        {attach.shell ? (
+          <Menu label="Attach" items={attachItems} disabled={disabled} className="cx-attach"
+            title="Attach files, images or a folder (or paste from the clipboard, or drop them here)" />
+        ) : (
+          <div className="seg-set cx-attach" role="group" aria-label="Attach">
+            <button type="button" disabled={disabled} onClick={() => picker.current?.click()}
+              title="Attach files or images (or paste from the clipboard, or drop them here)">Attach</button>
+          </div>
+        )}
         {target.type === 'turn' && onSpecMarked && (
           <div className="seg-set cx-spec-mark" role="group" aria-label="Spec">
             <button type="button" aria-pressed={specMarked} onClick={() => onSpecMarked(!specMarked)}
