@@ -1,13 +1,14 @@
 /**
  * settings.model@1 — the engine (which installed model plugin serves the model, see engine.tsx)
  * with, inside the serving engine's card, the weights it loads (model.variants: installed or not,
- * with their notes): one line when it offers one, a list with Select when it offers several. Choosing one calls model.select, shows the reload as it runs and its measured time, and
+ * with their notes): one line when it offers one, a list with Select or Download when it offers
+ * several. Choosing one calls model.select, shows the reload as it runs and its measured time, and
  * reads model.info again afterwards. Below, what is loaded (model.info: id, quantization, context,
  * slots, KV type, speculative decoding, the Metal tensor path).
  */
 
 import { useState, type ReactNode } from 'react';
-import { bytes, definePlugin, duration, errorMessage, plural, useClient, useModelState, useNow, useQuery, ServiceProblem } from '@cortex/sdk';
+import { bytes, definePlugin, duration, errorMessage, installLine, plural, useClient, useModelState, useNow, useQuery, ServiceProblem } from '@cortex/sdk';
 import { EngineChoice } from './engine';
 import './model.css';
 
@@ -58,8 +59,14 @@ function ModelPanel() {
       {variants.loading && !variants.data && !variants.error && <p className="hint" data-variants="loading">Reading the weights this engine offers…</p>}
       {variants.error && !variants.data && <ServiceProblem service="model" state={variants} className="inline-error" />}
       {variants.data && variants.data.length === 0 && <p className="inline-error" data-variants="none">The engine lists no weights (model.variants returned an empty list).</p>}
-      {(state.phase === 'loading' || state.phase === 'starting') && <p className="hint" data-model-phase={state.phase}>The model is loading: fitting {state.variant ?? 'it'} into memory.</p>}
-      {state.phase === 'failed' && <p className="inline-error">The model failed to load: {state.reason}</p>}
+      {installLine(state.install) && state.install && (
+        <div className="cx-model-install" data-install-phase={state.install.phase}>
+          <progress max={state.install.total || 1} value={state.install.bytes} />
+          <p className="hint">{installLine(state.install)}{state.install.file ? ` · ${state.install.file}` : ''}</p>
+        </div>
+      )}
+      {(state.phase === 'loading' || state.phase === 'starting') && !state.install && <p className="hint" data-model-phase={state.phase}>The model is loading: fitting {state.variant ?? 'it'} into memory.</p>}
+      {state.phase === 'failed' && !state.install && <p className="inline-error">The model failed to load: {state.reason}</p>}
       {only ? (
         <div data-variant={only.id} data-status={statusOf(only)}>
           <div className="cx-weight"><span className="ap faint">weights</span><span>{only.label}</span>{facts(only)}</div>
@@ -74,9 +81,9 @@ function ModelPanel() {
                 <div className="r">
                   {facts(variant)}
                   <span className="grow" />
-                  <button className="detent" type="button" data-action="select-variant" disabled={variant.active || !variant.installed || switching !== null} onClick={() => void select(variant.id)}
-                    title={variant.installed ? `Load ${variant.label} (reloads the weights)` : 'Not installed on this Mac'}>
-                    {switching?.id === variant.id ? `Loading… ${duration(now - switching.started)}` : 'Select'}
+                  <button className="detent" type="button" data-action={variant.installed ? 'select-variant' : 'download-variant'} disabled={variant.active || switching !== null || state.install !== null} onClick={() => void select(variant.id)}
+                    title={variant.installed ? `Load ${variant.label} (reloads the weights)` : `Download ${variant.label}${variant.bytes ? ` (${bytes(variant.bytes)})` : ''}, then load it`}>
+                    {switching?.id === variant.id ? (state.install ? 'Downloading…' : `Loading… ${duration(now - switching.started)}`) : variant.installed ? 'Select' : 'Download'}
                   </button>
                 </div>
                 {variant.notes && <p className="cx-settings-line">{variant.notes}</p>}

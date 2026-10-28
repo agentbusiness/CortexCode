@@ -73,9 +73,14 @@ export function relativePath(root: string, path: string): string {
 
 /**
  * What to say when a service's call failed: that the service is not running (the frame answered
- * `unavailable`), or what it said. `ServiceProblem` (parts) adds the way to the plugins panel.
+ * `unavailable`), with why its last start failed when the frame says, or what it said.
+ * `ServiceProblem` (parts) adds the way to the plugins panel.
  */
 export function serviceProblem(service: string, state: { error?: string | undefined; errorCode?: string | undefined }): string {
-  if (state.errorCode === 'unavailable') return `No ${service} service is running.`;
+  if (state.errorCode === 'unavailable') {
+    // The frame's reply carries the slot's state: `… (restarting in 30000 ms; last attempt failed: <why>)`.
+    const why = state.error?.match(/\((?:restarting in \d+ ms; last attempt )?failed: ([\s\S]*)\)$/)?.[1];
+    return why ? `No ${service} service is running; its last start failed: ${why}` : `No ${service} service is running.`;
+  }
   return `The ${service} service failed: ${state.error ?? 'no reason given'}`;
 }
