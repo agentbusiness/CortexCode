@@ -279,7 +279,9 @@ impl Mesh {
         }
         // A use still held (a call that never gave it back) is over now.
         self.release(&session).await;
-        let since = *lock(&self.claims.ages).entry(session.clone()).or_insert_with(now_ms);
+        // A run's age starts with its first waiting claim; a claim that does not wait (a prompt
+        // warm-up) is no run and leaves none behind.
+        let since = if params.wait { *lock(&self.claims.ages).entry(session.clone()).or_insert_with(now_ms) } else { lock(&self.claims.ages).get(&session).copied().unwrap_or_else(now_ms) };
         let options = self.model_options(&session).await;
         if options.is_empty() {
             // No model anywhere: the call goes to this computer's model plugin, which says so.
@@ -291,6 +293,9 @@ impl Mesh {
                 chosen = Some(index);
                 break;
             }
+        }
+        if chosen.is_none() && !params.wait {
+            return Ok(Placement { node: None, name: String::new(), model_id: String::new(), tier: "busy".to_owned() });
         }
         if chosen.is_none() {
             // Nothing free: wait at every model; the first grant wins.

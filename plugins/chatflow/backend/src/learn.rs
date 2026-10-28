@@ -609,7 +609,7 @@ async fn distill(host: &Host, data: &Dataset, card: &str, anchors: &[String], ca
         "cache_key": CACHE_KEY,
         "max_tokens": 400,
     });
-    let value = host.call_with(model_methods::CHAT, params, crate::host::Effect::Idempotent, Some(cancel)).await?;
+    let value = crate::llm::on_best_model(host, CACHE_KEY, Some(cancel), host.call_with(model_methods::CHAT, params, crate::host::Effect::Idempotent, Some(cancel))).await?;
     let result: ChatResult = cc_protocol::parse_params(value)?;
     let Ok(learned) = schemas::parse_json::<Learned>(&result.content) else { return Ok(None) };
     let lesson = learned.lesson.split_whitespace().collect::<Vec<_>>().join(" ");

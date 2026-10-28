@@ -405,6 +405,14 @@ pub struct ClaimParams {
     /// work, which the engine puts behind it.
     #[serde(default)]
     pub foreground: bool,
+    /// Wait until a model is free (the default). false: only a model free now (a prompt warm-up
+    /// that is pointless on a busy model); the answer's `tier` is `busy` when none is.
+    #[serde(default = "claim_waits")]
+    pub wait: bool,
+}
+
+fn claim_waits() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
