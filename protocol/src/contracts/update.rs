@@ -70,6 +70,29 @@ pub struct Status {
     /// Newer versions that could not start (the previous version keeps running), one per plugin.
     #[serde(default)]
     pub failed: Vec<Failed>,
+    /// The updates of the current (or last) round, all together: one row per plugin, and one for
+    /// the frame (`plugin` "frame").
+    #[serde(default)]
+    pub round: Vec<RoundItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RoundItem {
+    pub plugin: String,
+    #[serde(default)]
+    pub name: String,
+    pub version: String,
+    /// queued | downloading | installing | done | at_restart | failed
+    pub state: String,
+    /// The download's progress, 0 to 100.
+    #[serde(default)]
+    pub percent: Option<u64>,
+    /// Why it failed, in plain words.
+    #[serde(default)]
+    pub error: String,
+    /// When it finished (0 while it is going).
+    #[serde(default)]
+    pub ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
