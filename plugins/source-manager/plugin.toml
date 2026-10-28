@@ -6,7 +6,7 @@
 [plugin]
 id = "source-manager"
 name = "Source manager"
-version = "0.1.1"
+version = "0.1.2"
 description = "Every plugin's data (prompts, texts, skills) as one git repository in the live folder: live edits committed as they settle, kept in step with the installed packages, history and revert, backup to GitHub and sharing improvements."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-engineering"
 name = "Engineering skills"
-version = "0.1.1"
+version = "0.1.2"
 description = "Engineering know-how for the model, independent of any language: research, ideation, specs, plans for agents, long-horizon work, design of new software, unfamiliar codebases, debugging and tests that pin bugs, refactoring, git and GitHub with diff review, performance and security."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

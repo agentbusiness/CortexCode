@@ -7,7 +7,7 @@
 [plugin]
 id = "workbench"
 name = "Workbench"
-version = "0.1.1"
+version = "0.1.2"
 description = "The workbench's right pane host, the brand band's connection problem mark, and Settings > Appearance (the ground)."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
