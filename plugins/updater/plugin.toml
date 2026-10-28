@@ -7,7 +7,7 @@
 [plugin]
 id = "updater"
 name = "Updates"
-version = "0.1.2"
+version = "0.1.3"
 description = "Updates from the official releases: plugins the user did not change install by themselves when no run is going, a changed plugin asks first, a newer frame waits for Restart to update."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

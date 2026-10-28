@@ -7,7 +7,7 @@
 [plugin]
 id = "terminal"
 name = "Terminal"
-version = "0.1.1"
+version = "0.1.2"
 description = "PTY terminals running the user's login shell, with output events, resize and VT-parsed screen snapshots; the Terminal tab of the right pane."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
