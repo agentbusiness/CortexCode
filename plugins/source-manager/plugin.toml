@@ -6,7 +6,7 @@
 [plugin]
 id = "source-manager"
 name = "Source manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "CortexCode's own source as one git repository in the code folder: live data edits, code changes approved and hot-swapped, history and revert, backup to GitHub and sharing improvements."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

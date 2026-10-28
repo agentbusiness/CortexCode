@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-python"
 name = "Python"
-version = "0.1.0"
+version = "0.1.1"
 description = "Everything CortexCode knows about Python: the code graph's facts of .py files and pyproject.toml, basedpyright diagnostics, definition, references and hover, pytest / ruff / basedpyright verifiers and Python skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

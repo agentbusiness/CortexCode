@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-web"
 name = "Web (HTML, CSS)"
-version = "0.1.0"
+version = "0.1.1"
 description = "Everything CortexCode knows about HTML and CSS (SCSS, Less): the code graph's facts of pages and stylesheets, vscode-html-language-server and vscode-css-language-server diagnostics, definition, references and hover, the project's html-validate / stylelint as verifiers and web skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

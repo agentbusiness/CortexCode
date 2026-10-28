@@ -7,7 +7,7 @@
 [plugin]
 id = "sidebar"
 name = "Sidebar"
-version = "0.1.0"
+version = "0.1.1"
 description = "Projects with their conversations and agents, live; the Open project and New chat actions."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
