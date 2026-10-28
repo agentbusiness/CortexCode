@@ -2,3 +2,5 @@
 #cc .cx-model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--ink-2);}
 #cc .cx-cs-row .ap.cx-model-name{flex:0 1 auto;}
 #cc .cx-model-num{font-size:11.5px;color:var(--ink);}
+#cc .cx-model-install{display:flex;flex-direction:column;gap:4px;margin-top:6px;}
+#cc .cx-model-install progress{width:100%;height:4px;accent-color:var(--counter);}

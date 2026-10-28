@@ -247,7 +247,9 @@ impl Runtime {
             Phase::Ready(loaded) => json!({"state": "ready", "variant": loaded.variant}),
             Phase::Failed(error) => json!({"state": "failed", "error": error}),
         };
-        if !matches!(phase, Phase::Installing(_)) {
+        // Every progress tick is a `model.install` event; the state changes only on entering it.
+        let entering = !matches!(phase, Phase::Installing(_)) || !matches!(&*self.phase.borrow(), Phase::Installing(_));
+        if entering {
             self.publish("model.state", state);
         }
         self.phase.send_replace(phase);
@@ -262,7 +264,10 @@ impl Runtime {
     pub async fn start(self: &Arc<Self>) {
         let _switch = self.switch.lock().await;
         let variant = self.configured_variant();
-        match self.load(&variant, false).await {
+        // A first start has no model on this Mac: it is downloaded now, its progress shown as
+        // `model.install` events (the card and the model settings show them), instead of a load
+        // that fails and leaves the app without a model.
+        match self.load(&variant, true).await {
             Ok(loaded) => self.set_phase(Phase::Ready(loaded)),
             Err(error) => {
                 tracing::error!(%error, "model load failed");
@@ -277,6 +282,22 @@ impl Runtime {
         loop {
             match &*rx.borrow_and_update() {
                 Phase::Ready(loaded) => return Ok(loaded.clone()),
+                Phase::Failed(error) => return Err(unavailable(format!("the model failed to load: {error}"))),
+                _ => {}
+            }
+            if rx.changed().await.is_err() {
+                return Err(unavailable("the model runtime stopped"));
+            }
+        }
+    }
+
+    /// The download under way, if the model is being installed (no model to serve yet).
+    pub async fn installing_or_ready(&self) -> Result<Result<Arc<Loaded>, Progress>, RpcError> {
+        let mut rx = self.phase.subscribe();
+        loop {
+            match &*rx.borrow_and_update() {
+                Phase::Ready(loaded) => return Ok(Ok(loaded.clone())),
+                Phase::Installing(progress) => return Ok(Err(progress.clone())),
                 Phase::Failed(error) => return Err(unavailable(format!("the model failed to load: {error}"))),
                 _ => {}
             }
@@ -301,13 +322,17 @@ impl Runtime {
                 if progress.phase == "download" || progress.phase == "verify" {
                     // Downloads before a switch (and optional vision installs) leave the
                     // current engine serving. Progress has its own `model.install` event.
-                    runtime.phase.send_if_modified(|phase| {
+                    let entered = runtime.phase.send_if_modified(|phase| {
                         if matches!(phase, Phase::Ready(_)) {
                             return false;
                         }
-                        *phase = Phase::Installing(progress);
-                        true
+                        let entering = !matches!(phase, Phase::Installing(_));
+                        *phase = Phase::Installing(progress.clone());
+                        entering
                     });
+                    if entered {
+                        runtime.publish("model.state", json!({"state": "installing", "variant": progress.variant}));
+                    }
                 }
             }
         }
@@ -750,7 +775,22 @@ impl Runtime {
     /// when not installed). A failed load brings the previous variant back.
     pub async fn select(self: &Arc<Self>, variant: &str) -> Result<SelectResult, RpcError> {
         let _switch = self.switch.lock().await;
-        let previous = self.ready().await?;
+        let Some(previous) = self.current() else {
+            // No model is loaded (none was installed, or it failed): download and load this one.
+            let started = Instant::now();
+            return match self.load(variant, true).await {
+                Ok(loaded) => {
+                    let info = self.info(&loaded);
+                    self.set_phase(Phase::Ready(loaded));
+                    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    Ok(SelectResult { variant: variant.to_owned(), previous: String::new(), changed: true, reload_ms: load_ms, unload_ms: 0.0, load_ms, info })
+                }
+                Err(error) => {
+                    self.set_phase(Phase::Failed(error.clone()));
+                    Err(RpcError::internal(format!("cannot load `{variant}`: {error}")))
+                }
+            };
+        };
         if previous.variant == variant {
             return Ok(SelectResult {
                 variant: variant.to_owned(),

@@ -145,6 +145,16 @@ fn check(name: &str, started: Instant, outcome: Result<String, String>) -> Probe
 async fn probe(runtime: Arc<Runtime>) -> ProbeReport {
     let mut checks = Vec::new();
     let started = Instant::now();
+    // A model being downloaded (a first start) is the plugin working, not failing: the check says
+    // how far it is, and the generation check follows once it has loaded.
+    match runtime.installing_or_ready().await {
+        Ok(Err(progress)) => {
+            let gb = |bytes: u64| bytes as f64 / 1e9;
+            checks.push(check("model downloading", started, Ok(format!("{}: {:.1} of {:.1} GB", progress.variant, gb(progress.bytes), gb(progress.total)))));
+            return ProbeReport::from_checks(checks);
+        }
+        Ok(Ok(_)) | Err(_) => {}
+    }
     let loaded = runtime.ready().await;
     checks.push(check(
         "model loaded",
