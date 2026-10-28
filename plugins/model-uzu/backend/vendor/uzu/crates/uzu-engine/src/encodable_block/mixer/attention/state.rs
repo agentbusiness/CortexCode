@@ -1,15 +1,13 @@
-use std::any::Any;
-
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Context, DeviceCapabilities,
-        Kernels, SparseBuffer,
+        Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Context,
         gpu_types::{kv_cache_update::Copy, ring::RingParams},
-        kernel::KVCacheUpdateKernel,
+        kernel::{AttentionKernel, KVFormat},
     },
-    data_type::DataType,
-    encodable_block::mixer::{MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode, attention::Attention},
-    utils::size_for_shape::size_for_shape,
+    encodable_block::mixer::{
+        MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
+        attention::{Attention, kv_storage::KVStorage},
+    },
 };
 
 pub const ATTENTION_SUFFIX_CAPACITY: u32 = 1024; // TODO: remove hardcoded suffix capacity
@@ -162,13 +160,8 @@ impl KVCacheState {
 }
 
 pub struct AttentionState<B: Backend> {
-    pub element_dim: u32,
-    pub data_type: DataType,
     cache: KVCacheState,
-    pub is_sparse: bool,
-    pub keys: Box<dyn Buffer<Backend = B>>,
-    pub values: Box<dyn Buffer<Backend = B>>,
-    pub kv_cache_update: <B::Kernels as Kernels>::KVCacheUpdateKernel,
+    pub kv: KVStorage<B>,
 }
 
 impl<B: Backend> AttentionState<B> {
@@ -188,8 +181,6 @@ impl<B: Backend> AttentionState<B> {
             );
         }
 
-        let data_type = attention.data_type;
-
         let max_prefix_elements = attention.ring_capacity.unwrap_or_else(|| {
             max_context_length
                 .or(attention.max_rope_length)
@@ -198,31 +189,23 @@ impl<B: Backend> AttentionState<B> {
 
         let cache = attention.ring_capacity.map_or_else(KVCacheState::full, KVCacheState::ring);
 
-        let max_elements = max_prefix_elements + ATTENTION_SUFFIX_CAPACITY;
-        let element_dim = attention.num_kv_heads.unwrap() * attention.head_dim;
-        let kv_buffer_bytes = size_for_shape(&[max_elements, element_dim], data_type);
-
-        let is_sparse = context.device_capabilities().contains(DeviceCapabilities::SPARSE_BUFFERS);
-
-        let (keys, values): (Box<dyn Buffer<Backend = B>>, Box<dyn Buffer<Backend = B>>) = if is_sparse {
-            (
-                Box::new(context.create_sparse_buffer(kv_buffer_bytes)?),
-                Box::new(context.create_sparse_buffer(kv_buffer_bytes)?),
-            )
+        let format = if attention.kernel.supports_int8() {
+            KVFormat::INT8
         } else {
-            (Box::new(context.create_buffer(kv_buffer_bytes)?), Box::new(context.create_buffer(kv_buffer_bytes)?))
+            KVFormat::BF16
         };
-
-        let kv_cache_update = <B::Kernels as Kernels>::KVCacheUpdateKernel::new(context, data_type)?;
+        let kv = KVStorage::create_empty(
+            format,
+            attention.num_kv_heads.unwrap(),
+            attention.head_dim,
+            max_prefix_elements + ATTENTION_SUFFIX_CAPACITY,
+            attention.data_type,
+            context,
+        )?;
 
         Ok(Self {
-            element_dim,
-            data_type,
             cache,
-            is_sparse,
-            keys,
-            values,
-            kv_cache_update,
+            kv,
         })
     }
 }
@@ -235,18 +218,7 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
     ) -> Result<(), B::Error> {
         assert!(suffix_length <= ATTENTION_SUFFIX_CAPACITY, "suffix exceeds capacity");
 
-        if self.is_sparse {
-            let elements_required = self.cache.required_prefix_len(context_length) + suffix_length;
-            let bytes_required = size_for_shape(&[elements_required, self.element_dim], self.data_type);
-
-            let keys = (self.keys.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
-            let values = (self.values.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
-
-            keys.map(bytes_required)?;
-            values.map(bytes_required)?;
-        }
-
-        Ok(())
+        self.kv.prepare(self.cache.required_prefix_len(context_length) + suffix_length)
     }
 
     fn encode_accept(
@@ -257,17 +229,17 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
         let copies = self.cache.accept(accepted_indices);
 
         if !copies.is_empty() {
-            self.kv_cache_update.encode(
-                self.keys.as_mut(),
-                self.values.as_mut(),
-                &copies,
-                copies.len() as u32,
-                self.element_dim,
-                command_buffer,
-            );
+            self.kv.encode_accept(&copies, command_buffer);
         }
 
         Ok(())
+    }
+
+    fn kv_bytes_per_token(&self) -> u64 {
+        // CortexCode patch P5: int8 is laid out by blocks of keys, so measure one whole block.
+        let block = crate::backends::common::gpu_types::kv_layout::TILE_KEYS;
+        let (_, buffers) = self.kv.row_buffers(block);
+        buffers.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>() / u64::from(block)
     }
 
     fn encode_snapshot(
@@ -275,7 +247,8 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
         mode: SnapshotMode,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<MixerSnapshot<B>, MixerSnapshotError<B>> {
-        // CortexCode patch P1. Scalars: [kind (0 full, 1 ring), length, offset, capacity, rows copied].
+        // CortexCode patch P1. Scalars: [kind (0 full, 1 ring), length, offset, capacity, rows copied,
+        // KV format (0 bf16, 1 int8)].
         let (kind, length, offset, capacity) = match self.cache {
             KVCacheState::Full {
                 length,
@@ -293,17 +266,18 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
             // Full: rows [0, length); ring: its `length` (<= capacity) occupied slots.
             _ => length,
         };
-        let bytes = size_for_shape(&[rows, self.element_dim], self.data_type);
+        let (format, sources) = self.kv.row_buffers(rows);
         let mut buffers = Vec::new();
-        if bytes > 0 {
-            for source in [&self.keys, &self.values] {
-                let mut copy = command_buffer.context().create_buffer(bytes).map_err(MixerSnapshotError::Backend)?;
-                command_buffer.encode_copy((&**source).subrange(..bytes), (&mut copy).subrange_mut(..bytes));
+        if rows > 0 {
+            for (source, bytes) in sources {
+                let mut copy =
+                    command_buffer.context().create_buffer(bytes.max(1)).map_err(MixerSnapshotError::Backend)?;
+                command_buffer.encode_copy(source.subrange(..bytes), (&mut copy).subrange_mut(..bytes));
                 buffers.push(copy);
             }
         }
         Ok(MixerSnapshot {
-            scalars: Box::new([kind, u64::from(length), u64::from(offset), u64::from(capacity), u64::from(rows)]),
+            scalars: Box::new([kind, u64::from(length), u64::from(offset), u64::from(capacity), u64::from(rows), format]),
             buffers: buffers.into_boxed_slice(),
         })
     }
@@ -313,8 +287,10 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
         snapshot: &MixerSnapshot<B>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<(), MixerSnapshotError<B>> {
-        let [kind, length, offset, capacity, rows] = *snapshot.scalars else {
-            return Err(MixerSnapshotError::Mismatch("attention snapshot has the wrong number of scalars".into()));
+        // A snapshot of another KV format (or of a build before int8 KV, which had five scalars)
+        // does not restore: the conversation starts cold.
+        let [kind, length, offset, capacity, rows, format] = *snapshot.scalars else {
+            return Err(MixerSnapshotError::Mismatch("attention snapshot is of another KV layout".into()));
         };
         let (length, offset, capacity, rows) = (length as u32, offset as u32, capacity as u32, rows as u32);
         let cache = match (kind, &self.cache) {
@@ -331,23 +307,24 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
             },
             _ => return Err(MixerSnapshotError::Mismatch("attention cache kind or capacity differs".into())),
         };
-        let bytes = size_for_shape(&[rows, self.element_dim], self.data_type);
-        if bytes > self.keys.size() {
-            return Err(MixerSnapshotError::Mismatch(format!("{rows} rows exceed this cache")));
-        }
         if rows > 0 {
-            if snapshot.buffers.len() != 2 || snapshot.buffers.iter().any(|buffer| buffer.size() < bytes) {
-                return Err(MixerSnapshotError::Mismatch("attention snapshot buffers are missing or short".into()));
+            if self.kv.row_buffers(rows).0 != format {
+                return Err(MixerSnapshotError::Mismatch("attention snapshot is of another KV format".into()));
             }
-            if self.is_sparse {
-                let keys = (self.keys.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
-                keys.map(bytes).map_err(MixerSnapshotError::Backend)?;
-                let values = (self.values.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
-                values.map(bytes).map_err(MixerSnapshotError::Backend)?;
+            self.kv.prepare(rows).map_err(MixerSnapshotError::Backend)?;
+            let (_, targets) = self.kv.row_buffers_mut(rows);
+            if targets.len() != snapshot.buffers.len() {
+                return Err(MixerSnapshotError::Mismatch("attention snapshot buffers are missing".into()));
             }
-            command_buffer.encode_copy((&snapshot.buffers[0]).subrange(..bytes), self.keys.as_mut().subrange_mut(..bytes));
-            command_buffer
-                .encode_copy((&snapshot.buffers[1]).subrange(..bytes), self.values.as_mut().subrange_mut(..bytes));
+            for ((target, bytes), source) in targets.into_iter().zip(snapshot.buffers.iter()) {
+                if bytes > target.size() {
+                    return Err(MixerSnapshotError::Mismatch(format!("{rows} rows exceed this cache")));
+                }
+                if source.size() < bytes {
+                    return Err(MixerSnapshotError::Mismatch("attention snapshot buffers are short".into()));
+                }
+                command_buffer.encode_copy(source.subrange(..bytes), target.subrange_mut(..bytes));
+            }
         } else if kind == 1 && length > 0 {
             return Err(MixerSnapshotError::Mismatch("a ring cache cannot be restored without its rows".into()));
         }

@@ -202,7 +202,8 @@ impl<B: Backend> LanguageModel<B> {
         command_buffer.encode_copy(&embedded, &mut out);
         drop(embedded);
         drop(constant);
-        command_buffer.end_encoding().submit().wait_until_completed().map_err(|error| error.to_string())?;
+        futures::executor::block_on(command_buffer.end_encoding().submit().wait_until_completed())
+            .map_err(|error| error.to_string())?;
         Ok((&out).as_slice::<u16>().to_vec())
     }
 }

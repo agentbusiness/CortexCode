@@ -72,7 +72,8 @@ impl<B: Backend> RHTLinearWrapper<B> {
             parameter_tree,
             context,
         )?;
-        let activation_quantization = inner_linear.prepare_a8(context);
+        let activation_quantization =
+            inner_linear.prepare_a8_matmul(context).map_err(RHTLinearWrapperError::BackendError)?;
         Self::build_self_contained(
             input_data_type,
             LinearInputPreparation {
@@ -113,7 +114,9 @@ impl<B: Backend> RHTLinearWrapper<B> {
         )?;
         let input_preparation = LinearInputPreparation {
             rht_signs,
-            activation_quantization: inner_linear.prepare_a8(context),
+            activation_quantization: inner_linear
+                .prepare_a8_matmul(context)
+                .map_err(RHTLinearWrapperError::BackendError)?,
         };
         if input_preparation.activation_quantization.is_some() && !allow_prequantized_activation {
             let wrapper = Self::build_self_contained(input_data_type, input_preparation, inner_linear, context)?;

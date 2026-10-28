@@ -8,7 +8,7 @@ use crate::{
         Backend, Context,
         capture_matcher::{CAPTURE_MATCHER, CaptureError, CaptureMatcherSpan},
     },
-    config::model::AnyModelConfig,
+    config::{model::AnyModelConfig, token_mixer::AnyTokenMixerConfig},
     encodable_block::sampling::SamplingMethod,
 };
 
@@ -31,8 +31,8 @@ pub enum EngineNewError<B: Backend> {
 }
 
 impl<B: Backend> Engine<B> {
-    pub fn new() -> Result<Arc<Self>, EngineNewError<B>> {
-        let context = <B::Context as Context>::new().map_err(EngineNewError::Backend)?;
+    pub async fn new() -> Result<Arc<Self>, EngineNewError<B>> {
+        let context = <B::Context as Context>::new().await.map_err(EngineNewError::Backend)?;
         let capture_span = CAPTURE_MATCHER.capture::<B>(&context, "")?;
 
         Ok(Arc::new(Self {
@@ -82,6 +82,19 @@ pub fn resolve_model_sampling_method(model_path: &Path) -> Result<Option<Samplin
         AnyModelConfig::LanguageModelConfig(config) => Some(config.generation_config.default_sampling_method()),
         AnyModelConfig::ClassifierModelConfig(_) => None,
     })
+}
+
+pub fn resolve_model_context_length(model_path: &Path) -> Result<Option<u32>, ResolveModelTypeError> {
+    let transformer = match read_model_config(model_path)? {
+        AnyModelConfig::LanguageModelConfig(config) => config.decoder_config.transformer_config,
+        AnyModelConfig::ClassifierModelConfig(_) => return Ok(None),
+    };
+    Ok(transformer
+        .layer_configs
+        .iter()
+        .filter(|layer| matches!(layer.mixer_config, AnyTokenMixerConfig::AttentionConfig(_)))
+        .filter_map(|layer| layer.rope_config.as_ref().map(|rope| *rope.max_sequence_length()))
+        .min())
 }
 
 fn read_model_config(model_path: &Path) -> Result<AnyModelConfig, ResolveModelTypeError> {

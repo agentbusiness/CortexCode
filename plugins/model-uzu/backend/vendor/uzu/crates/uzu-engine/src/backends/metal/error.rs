@@ -1,5 +1,3 @@
-use std::sync::mpsc::RecvError;
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,12 +18,16 @@ pub enum MetalError {
     CannotCreateBuffer,
     #[error("Cannot create heap")]
     CannotCreateHeap,
+    #[error("Cannot resolve counter heap")]
+    CannotResolveCounterHeap,
+    #[error("Timestamp {0} was not written by the GPU")]
+    UnwrittenTimestamp(usize),
     #[error("Cannot create command buffer")]
     CannotCreateCommandBuffer,
     #[error("Cannot create argument table: {0}")]
     CannotCreateArgumentTable(String),
-    #[error("Error waiting for command buffer: {0}")]
-    CommandBufferWait(RecvError),
+    #[error("Error waiting for command buffer")]
+    CommandBufferWait,
     #[error("Command buffer execution failed: {0}")]
     CommandBufferExecution(String),
     #[error("Cannot create function: {0}")]

@@ -487,10 +487,16 @@ impl Runtime {
         })?;
         let dir = spec.local_dir(&self.paths.models_dir);
         let cache = VerifyCache::new(&self.paths.models_dir);
-        if variants::installed(spec, &dir) || download {
+        let was_installed = variants::installed(spec, &dir);
+        if was_installed || download {
             // Downloads only what is missing; verifies every file (records make this instant).
             let progress = self.install_progress();
             variants::install(spec, &self.paths.models_dir, &cache, &progress).await?;
+            // A model downloaded now brings its vision tower in the same step (a first start
+            // downloaded the model alone, and nothing fetched the tower later).
+            if !was_installed {
+                self.install_vision_or_warn(spec).await;
+            }
         } else {
             return Err(format!(
                 "variant `{variant}` is not installed in {} (select it with model.select to download it, or run `cc-model-uzu install {variant}`)",
@@ -530,6 +536,10 @@ impl Runtime {
             vision_idle_unload: Duration::from_secs(vision_support.idle_unload_s),
             memory_budget: Arc::new(std::sync::atomic::AtomicU64::new(plan.budget.usable())),
             bytes_per_token: plan.bytes_per_token,
+            refit: {
+                let runtime = self.clone();
+                Arc::new(move |kv_bytes_per_token| runtime.fit(&Geometry { kv_bytes_per_token, ..geometry }))
+            },
         };
         let template = ChatTemplate::new(
             template::template_source(spec.template).ok_or_else(|| format!("template {} is not shipped", spec.template))?,
@@ -540,6 +550,9 @@ impl Runtime {
         let handle = tokio::task::spawn_blocking(move || engine::start(config, publisher, costs))
             .await
             .map_err(|error| format!("engine start task failed: {error}"))??;
+        // The engine sized its pool by the KV format uzu chose at load; report that plan.
+        let geometry = Geometry { kv_bytes_per_token: handle.loaded.kv_bytes_per_token, ..geometry };
+        let plan = handle.loaded.plan.clone();
         let think_end: Vec<u64> = handle
             .tokenizer
             .encode("</think>", false)
@@ -594,6 +607,15 @@ impl Runtime {
             verify_cache: VerifyCache::new(&self.paths.models_dir).path().to_path_buf(),
             config: std::sync::Mutex::new(None),
         })
+    }
+
+    /// [`Self::install_vision`], where a failure (e.g. offline) leaves the model text-only and does
+    /// not stop the caller; `model.install` and `model.info` say why.
+    async fn install_vision_or_warn(self: &Arc<Self>, spec: &'static Spec) {
+        if let Err(error) = self.install_vision(spec).await {
+            tracing::warn!(%error, variant = spec.id, "the vision tower could not be installed; images stay unavailable");
+            self.publish("model.install", json!({"variant": spec.id, "phase": "failed", "file": "vision", "detail": error}));
+        }
     }
 
     /// Install the variant's vision tower when it has one, vision is enabled and it is missing.
@@ -1125,13 +1147,9 @@ impl Runtime {
                 }
             };
         };
-        // The variant's vision tower is installed with it (its own small download). A failure (e.g.
-        // offline) leaves the model text-only and does not stop the switch; `model.info` says why.
-        if let Some(spec) = variants::find(variant)
-            && let Err(error) = self.install_vision(spec).await
-        {
-            tracing::warn!(%error, variant, "the vision tower could not be installed; images stay unavailable");
-            self.publish("model.install", json!({"variant": variant, "phase": "failed", "file": "vision", "detail": error}));
+        // The variant's vision tower is installed with it (its own small download).
+        if let Some(spec) = variants::find(variant) {
+            self.install_vision_or_warn(spec).await;
         }
         if previous.variant == variant {
             return Ok(SelectResult {

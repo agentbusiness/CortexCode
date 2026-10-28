@@ -3,7 +3,7 @@ use std::{mem::size_of_val, time::Duration};
 use bytemuck::{AnyBitPattern, NoUninit};
 
 use crate::{
-    backends::common::{Backend, BufferMut, BufferRef},
+    backends::common::{Backend, BufferMut, BufferRef, TimestampSpan},
     data_type::DataType,
     utils::size_for_shape::size_for_shape,
 };
@@ -17,7 +17,7 @@ pub trait CommandBuffer {
     type Completed: CommandBufferCompleted<CommandBuffer = Self>;
 }
 
-pub trait CommandBufferEncoding {
+pub trait CommandBufferEncoding: Send {
     type CommandBuffer: CommandBuffer<Encoding = Self>;
 
     fn context(&self) -> &<<Self::CommandBuffer as CommandBuffer>::Backend as Backend>::Context;
@@ -84,6 +84,8 @@ pub trait CommandBufferEncoding {
         name: &str,
     );
 
+    fn with_timestamps(self) -> Self;
+
     fn end_encoding(self) -> <Self::CommandBuffer as CommandBuffer>::Executable;
 }
 
@@ -98,14 +100,18 @@ pub trait CommandBufferPending: Send {
 
     fn wait_until_completed(
         self
-    ) -> Result<
-        <Self::CommandBuffer as CommandBuffer>::Completed,
-        <<Self::CommandBuffer as CommandBuffer>::Backend as Backend>::Error,
-    >;
+    ) -> impl Future<
+        Output = Result<
+            <Self::CommandBuffer as CommandBuffer>::Completed,
+            <<Self::CommandBuffer as CommandBuffer>::Backend as Backend>::Error,
+        >,
+    > + Send;
 }
 
 pub trait CommandBufferCompleted: Send {
     type CommandBuffer: CommandBuffer<Completed = Self>;
 
     fn gpu_execution_time(&self) -> Duration;
+
+    fn timestamps(&self) -> &[TimestampSpan];
 }
