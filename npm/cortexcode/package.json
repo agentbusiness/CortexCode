@@ -1,6 +1,6 @@
 {
   "name": "cortexcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CortexCode, a local coding agent: npx cortexcode downloads the app for this machine from the official releases and starts it.",
   "type": "module",
   "bin": {
