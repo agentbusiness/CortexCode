@@ -19,7 +19,13 @@ interface Network { id: string; founder: string; founded_ms: number; members: nu
 interface Status { node: string; name: string; members: number; reachable: number; network?: Network | null; pairing?: PairCode | null; serving: [string, string][]; placed: Placed[] }
 
 function gb(bytes: number): string {
-  return `${Math.round(bytes / (1024 * 1024 * 1024))} GB`;
+  const value = bytes / (1024 * 1024 * 1024);
+  return `${value < 10 ? value.toFixed(1).replace(/\.0$/, '') : Math.round(value)} GB`;
+}
+
+/** A toolchain's version number out of its tool's own line ("Apple clangd version 21.0.0 (…)" -> 21.0.0). */
+function shortVersion(version: string): string {
+  return /\d+(?:\.\d+)+/.exec(version)?.[0] ?? '';
 }
 
 function where(path: string): string {
@@ -80,37 +86,47 @@ function MeshPanel() {
 
   return (
     <section className="cx-mesh" data-build={__CORTEX_BUILD__}>
-      <div className="cx-mesh-row">
+      <div className="cx-mesh-grid">
         <span className="ap">This computer</span>
         <span className="t">{data.name}</span>
+        <span />
+
+        <span className="ap">Network</span>
         {data.network ? (
           <>
-            <span className="ap faint">on the network started by {data.network.founder} on {new Date(data.network.founded_ms).toLocaleDateString()} · {data.reachable} of {others.length} other{others.length === 1 ? '' : 's'} reachable</span>
-            <span className="grow" />
+            <span className="v">started by {data.network.founder} on {new Date(data.network.founded_ms).toLocaleDateString()} · {data.reachable} of {others.length} other{others.length === 1 ? '' : 's'} reachable</span>
             <button type="button" className="detent tiny warn" data-action="leave" disabled={busy !== null} onClick={() => void run('leave', async () => { await client.call('mesh.leave', {}); return 'Left the network'; })}>Leave the network</button>
           </>
         ) : (
-          <span className="ap faint">on no network</span>
+          <>
+            <span className="v faint">none yet: make an invitation, or join with one</span>
+            <span />
+          </>
         )}
-      </div>
 
-      <div className="cx-mesh-row">
         <span className="ap">Add a computer</span>
-        <button type="button" className="detent tiny send" data-action="pair" disabled={busy !== null} onClick={invite}>{pairing ? (copied ? 'Copy the invitation again' : 'Copy the invitation') : 'Make an invitation'}</button>
-        {pairing && <span className="ap faint">good for {minutesLeft} min, one computer</span>}
-        {pairing && <button type="button" className="detent tiny" disabled={busy !== null} onClick={() => void run('cancel', async () => { await client.call('mesh.pair.cancel', {}); setCopied(false); })}>Withdraw</button>}
-        {!pairing && <span className="cx-mesh-note">Paste it on the other computer, here in its Settings → Mesh, or `cx mesh join '…'` with it.</span>}
-      </div>
-      {pairing && <div className="cx-mesh-inv" data-testid="invitation">{pairing.invitation}</div>}
+        <span className="cx-mesh-cell">
+          <button type="button" className="detent tiny send" data-action="pair" disabled={busy !== null} onClick={invite}>{pairing ? (copied ? 'Copy the invitation again' : 'Copy the invitation') : 'Make an invitation'}</button>
+          {pairing && <span className="v faint">good for {minutesLeft} min, one computer</span>}
+        </span>
+        {pairing ? <button type="button" className="detent tiny" disabled={busy !== null} onClick={() => void run('cancel', async () => { await client.call('mesh.pair.cancel', {}); setCopied(false); })}>Withdraw</button> : <span />}
+        <span />
+        {pairing ? (
+          <div className="cx-mesh-inv" data-testid="invitation">{pairing.invitation}</div>
+        ) : (
+          <span className="cx-mesh-note">Paste it on the other computer: in its Settings → Mesh, or with <code>cx mesh join '…'</code>.</span>
+        )}
+        <span />
 
-      <div className="cx-mesh-row">
         <span className="ap">Join</span>
-        <label className="field cx-mesh-field"><input value={token} placeholder="paste an invitation from another computer" aria-label="Invitation" onChange={(event) => setToken(event.target.value)} /></label>
-        <button type="button" className="detent tiny send" data-action="join" disabled={busy !== null || !token.trim()} onClick={() => void run('join', async () => {
-          const member = await client.call<Member>('mesh.pair.join', { code: token.trim() });
-          setToken('');
-          return `Joined as ${member.name}`;
-        })}>{busy === 'join' ? 'Joining…' : 'Join'}</button>
+        <span className="cx-mesh-cell cx-mesh-join">
+          <label className="field cx-mesh-field"><input value={token} placeholder="paste an invitation from another computer" aria-label="Invitation" onChange={(event) => setToken(event.target.value)} /></label>
+          <button type="button" className="detent tiny send" data-action="join" disabled={busy !== null || !token.trim()} onClick={() => void run('join', async () => {
+            const member = await client.call<Member>('mesh.pair.join', { code: token.trim() });
+            setToken('');
+            return `Joined as ${member.name}`;
+          })}>{busy === 'join' ? 'Joining…' : 'Join'}</button>
+        </span>
       </div>
 
       {others.length > 0 && (
@@ -120,23 +136,30 @@ function MeshPanel() {
             const card = peer.card;
             const placedHere = data.placed.filter((placed) => placed.node === member.node).length;
             return (
-              <li key={member.node} data-node={member.node}>
-                <div className="cx-mesh-row">
+              <li key={member.node} data-node={member.node} className="cx-mesh-grid">
+                <span className="cx-mesh-name">
                   <span className="t">{member.name}</span>
                   <span className={`ap ${peer.reachable ? 'live' : 'faint'}`}>{peer.reachable ? `${where(peer.path)}${peer.rtt_ms ? ` · ${peer.rtt_ms} ms` : ''}` : 'not reachable now'}</span>
-                  <span className="grow" />
-                  <button type="button" className="detent tiny warn" data-action="revoke" disabled={busy !== null} onClick={() => void run('revoke', async () => { await client.call('mesh.revoke', { node: member.node }); return `${member.name} removed`; })}>Remove</button>
-                </div>
-                {card && (
-                  <div className="cx-mesh-card">
-                    {card.chip} · {gb(card.memory_bytes)}, {gb(card.free_memory_bytes)} free · {card.on_mains ? 'mains' : 'battery'}{card.user_active ? ' · someone is working there' : ''}
-                    {card.model ? <> · model {card.model.model_id} ({card.model.variant}){card.model.slots_busy > 0 || card.model.queued > 0 ? ', busy' : ', free'}{card.model.tok_s ? `, ${card.model.tok_s.toFixed(1)} tok/s` : ''}</> : ' · no model'}
-                    {card.languages.length > 0 && <> · {card.languages.map((language) => language.version ? `${language.id} ${language.version}` : language.id).join(', ')}</>}
-                    {card.docker && ' · Docker'}
-                    {peer.serving.length > 0 && <> · its {peer.serving.join(', ')} serves this computer</>}
-                    {placedHere > 0 && <> · running {placedHere} session{placedHere === 1 ? '' : 's'} from here</>}
-                  </div>
-                )}
+                </span>
+                <button type="button" className="detent tiny warn" data-action="revoke" disabled={busy !== null} onClick={() => void run('revoke', async () => { await client.call('mesh.revoke', { node: member.node }); return `${member.name} removed`; })}>Remove</button>
+                {card && <>
+                  <span className="ap">Computer</span>
+                  <span className="v">{[card.chip, `${gb(card.memory_bytes)}, ${gb(card.free_memory_bytes)} free`, card.on_mains ? 'on mains' : 'on battery', card.docker ? 'Docker' : '', card.user_active ? 'in use' : ''].filter(Boolean).join(' · ')}</span>
+                  <span />
+                  <span className="ap">Model</span>
+                  <span className="v" title={card.model?.model_id}>{card.model ? [card.model.variant || card.model.model_id, card.model.slots_busy > 0 || card.model.queued > 0 ? 'busy' : 'free', card.model.tok_s ? `${card.model.tok_s.toFixed(1)} tok/s` : ''].filter(Boolean).join(' · ') : 'none'}</span>
+                  <span />
+                  {card.languages.length > 0 && <>
+                    <span className="ap">Languages</span>
+                    <span className="v">{card.languages.map((language) => [language.id, shortVersion(language.version)].filter(Boolean).join(' ')).join(', ')}</span>
+                    <span />
+                  </>}
+                  {(peer.serving.length > 0 || placedHere > 0) && <>
+                    <span className="ap">For here</span>
+                    <span className="v">{[peer.serving.length > 0 ? `its ${peer.serving.join(', ')} serves this computer` : '', placedHere > 0 ? `runs ${placedHere} session${placedHere === 1 ? '' : 's'} from here` : ''].filter(Boolean).join(' · ')}</span>
+                    <span />
+                  </>}
+                </>}
               </li>
             );
           })}
