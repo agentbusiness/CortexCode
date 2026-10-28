@@ -1,7 +1,7 @@
 {
   "name": "@cortex-ui/updater-band",
   "version": "0.1.0",
-  "description": "Updates in the brand band: progress, Restart to update, and the popup that asks about a plugin the user changed.",
+  "description": "Updates: Restart to update in the band; the round of updates and the question about a changed plugin at the bottom right.",
   "type": "module",
   "license": "Apache-2.0",
   "cortex": {

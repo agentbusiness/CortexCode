@@ -25,8 +25,8 @@ use cc_protocol::contracts::source::{
     ReleaseMergeParams, ReleaseResetParams, ReleaseResetResult, ReleaseStatus, ReleaseStatusParams, UpdateResult, methods as source_methods,
 };
 use cc_protocol::contracts::update::{
-    Applied, DecideParams, DismissParams, Failed, FrameUpdate, Pending, ResetItem, ResetPlan, ResetResult, Status, choices, methods, reset_actions,
-    reset_sources, topics,
+    Applied, DecideParams, DismissParams, Failed, FrameUpdate, Pending, ResetItem, ResetPlan, ResetResult, RoundItem, Status, choices, methods,
+    reset_actions, reset_sources, topics,
 };
 use cc_protocol::release::{self, Asset, Catalog, PluginEntry};
 use cc_protocol::{Ctx, RpcError, parse_params, to_value};
@@ -49,6 +49,8 @@ const WAITING_CHECK: Duration = Duration::from_secs(60);
 const RECENT: usize = 20;
 /// What the updater remembers between starts.
 const SAVED: &str = "updater.json";
+/// The frame's row in the round.
+const FRAME: &str = "frame";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -119,6 +121,8 @@ pub struct Updater {
     /// Versions the frame keeps for its restart (a frame update is staged): (plugin, version).
     /// Not downloaded again; the restart installs them, and this process ends with it.
     at_restart: Mutex<BTreeSet<(String, String)>>,
+    /// The current check or reset has put plugins in the round (the next one starts a new list).
+    round_open: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -140,6 +144,7 @@ impl Updater {
             again: AtomicBool::new(false),
             wake: Notify::new(),
             at_restart: Mutex::new(BTreeSet::new()),
+            round_open: AtomicBool::new(false),
         })
     }
 
@@ -206,7 +211,52 @@ impl Updater {
             saved.recent.clone()
         });
         self.with_status(|status| status.recent = recent);
+        let state = match outcome {
+            "failed" => "failed",
+            "at_restart" => "at_restart",
+            _ => "done",
+        };
+        self.finish(plugin, version, state, if state == "failed" { &applied.detail } else { "" });
         applied
+    }
+
+    // ----- the round: every update of a check or a reset, shown together -----
+
+    /// Put plugins in the round as queued. The first of a check or a reset drops the last round's list.
+    fn enter_round(&self, rows: impl IntoIterator<Item = (String, String, String)>) {
+        let fresh = !self.round_open.swap(true, Ordering::SeqCst);
+        self.with_status(|status| {
+            if fresh {
+                status.round.clear();
+            }
+            for (plugin, name, version) in rows {
+                status.round.retain(|row| row.plugin != plugin);
+                status.round.push(RoundItem { plugin, name, version, state: "queued".into(), ..RoundItem::default() });
+            }
+        });
+    }
+
+    /// Where plugins of the round stand; the status line says it in words.
+    fn step(&self, plugins: &[&str], state: &str, percent: Option<u64>, detail: String) {
+        self.with_status(|status| {
+            status.state = state.into();
+            status.detail = detail;
+            for row in status.round.iter_mut().filter(|row| plugins.contains(&row.plugin.as_str())) {
+                row.state = state.into();
+                row.percent = percent;
+            }
+        });
+    }
+
+    fn finish(&self, plugin: &str, version: &str, state: &str, error: &str) {
+        self.with_status(|status| {
+            if let Some(row) = status.round.iter_mut().find(|row| row.plugin == plugin && row.version == version) {
+                row.state = state.into();
+                row.percent = None;
+                row.error = error.into();
+                row.ms = now_ms();
+            }
+        });
     }
 
     // ----- methods -----
@@ -369,6 +419,13 @@ impl Updater {
     async fn reset_all(&self) -> Result<ResetResult, RpcError> {
         let (ctx, client, catalog, _, bundled, platform, running_frame) = self.reset_sources(true).await?;
         let items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
+        self.round_open.store(false, Ordering::SeqCst);
+        self.enter_round(
+            items
+                .iter()
+                .filter(|(item, package)| package.is_some() && item.action != reset_actions::NONE)
+                .map(|(item, _)| (item.plugin.clone(), item.name.clone(), item.release.clone())),
+        );
         let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
         let mut outcomes = Vec::new();
         let mut packages: Vec<(ResetItem, PathBuf)> = Vec::new();
@@ -382,9 +439,9 @@ impl Updater {
                 Package::App(path) => path,
                 Package::Release(asset) => {
                     let Some(client) = &client else { continue };
-                    self.state("downloading", format!("Downloading {id} {version}"));
+                    self.step(&[&id], "downloading", Some(0), format!("Downloading {id} {version}"));
                     match fetch::asset(client, &asset, &work.join("downloads"), |percent| {
-                        self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))
+                        self.step(&[&id], "downloading", Some(percent), format!("Downloading {id} {version} ({percent}%)"))
                     })
                     .await
                     {
@@ -397,7 +454,7 @@ impl Updater {
                 }
             };
             // The source first: the plugin's folder in the code folder back to the package's.
-            self.state("installing", format!("Resetting the source of {id}"));
+            self.step(&[&id], "installing", None, format!("Resetting the source of {id}"));
             if let Err(error) = self.reset_source(&ctx, &id, &version, &package, &work).await {
                 outcomes.push(self.record(&id, &version, "failed", error));
                 continue;
@@ -416,7 +473,8 @@ impl Updater {
         }
         if !packages.is_empty() {
             let names = packages.iter().map(|(item, _)| format!("{} {}", item.plugin, item.release)).collect::<Vec<_>>().join(", ");
-            self.state("installing", format!("Installing {names}"));
+            let ids: Vec<&str> = packages.iter().map(|(item, _)| item.plugin.as_str()).collect();
+            self.step(&ids, "installing", None, format!("Installing {names}"));
             // Recorded before the install: when the set holds this plugin, its own process is
             // replaced mid-call and the outcome would otherwise be lost.
             for (item, _) in &packages {
@@ -561,6 +619,7 @@ impl Updater {
     async fn check_catalog(self: &Arc<Self>, ctx: &Ctx, config: &Config) -> Result<(), String> {
         let platform = release::platform().unwrap_or("");
         let client = fetch::client()?;
+        self.round_open.store(false, Ordering::SeqCst);
         let catalog = self.lookup_catalog(&client, &config.catalog_url).await;
         let running_frame = ctx.frame_version().unwrap_or_default();
         let mut errors = Vec::new();
@@ -611,6 +670,11 @@ impl Updater {
             self.with_status(|status| status.waiting = ids);
         } else {
             self.with_status(|status| status.waiting.clear());
+            let new_rows = new.iter().filter_map(|(entry, _)| {
+                let id = catalog.as_ref()?.plugins.iter().find(|(_, e)| *e == entry)?.0.clone();
+                Some((id, entry.name.clone(), entry.version.clone()))
+            });
+            self.enter_round(auto.iter().map(|plan| (plan.id.clone(), plan.name.clone(), plan.version.clone())).chain(new_rows));
             self.apply(ctx, &client, auto).await;
             self.install_new(ctx, &client, new, &catalog).await;
         }
@@ -624,19 +688,23 @@ impl Updater {
         for (entry, asset) in new {
             let Some(id) = catalog.plugins.iter().find(|(_, e)| **e == entry).map(|(id, _)| id.clone()) else { continue };
             let version = entry.version.clone();
-            self.state("downloading", format!("Downloading {id} {version}"));
-            let package = match fetch::asset(client, &asset, &work.join("downloads"), |percent| self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))).await {
+            self.step(&[&id], "downloading", Some(0), format!("Downloading {id} {version}"));
+            let package = match fetch::asset(client, &asset, &work.join("downloads"), |percent| {
+                self.step(&[&id], "downloading", Some(percent), format!("Downloading {id} {version} ({percent}%)"))
+            })
+            .await
+            {
                 Ok(package) => package,
                 Err(error) => {
                     self.record(&id, &version, "failed", error);
                     continue;
                 }
             };
+            self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
             if let Err(error) = self.merge_source(ctx, &id, &version, &package, &work).await {
                 self.record(&id, &version, "failed", error);
                 continue;
             }
-            self.state("installing", format!("Installing {id} {version}"));
             let params = InstallParams { path: package.to_string_lossy().into_owned() };
             match call::<PackageSwapResult>(ctx, frame_methods::PLUGINS_INSTALL, json!(params)).await {
                 Ok(result) if result.ok => drop(self.record(&id, &version, "installed", "")),
@@ -732,8 +800,12 @@ impl Updater {
             let package = match &plan.package {
                 Package::App(path) => path.clone(),
                 Package::Release(asset) => {
-                    self.state("downloading", format!("Downloading {id} {version}"));
-                    match fetch::asset(client, asset, &work.join("downloads"), |percent| self.state("downloading", format!("Downloading {id} {version} ({percent}%)"))).await {
+                    self.step(&[&id], "downloading", Some(0), format!("Downloading {id} {version}"));
+                    match fetch::asset(client, asset, &work.join("downloads"), |percent| {
+                        self.step(&[&id], "downloading", Some(percent), format!("Downloading {id} {version} ({percent}%)"))
+                    })
+                    .await
+                    {
                         Ok(package) => package,
                         Err(error) => {
                             self.record(&id, &version, "failed", error);
@@ -744,9 +816,10 @@ impl Updater {
             };
             // The source first: the plugin reads its live data from the code folder.
             let source = if plan.drop_changes {
-                self.state("installing", format!("Dropping your changes to {id}"));
+                self.step(&[&id], "installing", None, format!("Dropping your changes to {id}"));
                 self.reset_source(ctx, &id, &version, &package, &work).await.map(|()| Merged::Install)
             } else {
+                self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
                 self.merge_source(ctx, &id, &version, &package, &work).await
             };
             match source {
@@ -770,7 +843,8 @@ impl Updater {
             }
         }
         if !set.is_empty() {
-            self.state("installing", format!("Installing {}", names(&set)));
+            let ids: Vec<&str> = set.iter().map(|(plan, _)| plan.id.as_str()).collect();
+            self.step(&ids, "installing", None, format!("Installing {}", names(&set)));
             self.install_set(ctx, set).await;
         }
         let _ = tokio::fs::remove_dir_all(&work).await;
@@ -862,19 +936,21 @@ impl Updater {
         }
         let files = frame.files.get(platform).ok_or_else(|| format!("the frame {} has no release for this machine", frame.version))?;
         let work = self.data_dir.join("work").join(uuid::Uuid::new_v4().simple().to_string());
+        self.enter_round([(FRAME.to_owned(), "CortexCode".to_owned(), frame.version.clone())]);
         let outcome = async {
             let what = format!("the frame {}", frame.version);
-            let frame_archive = fetch::asset(client, &files.frame, &work, |percent| self.state("downloading", format!("Downloading {what} ({percent}%)"))).await?;
+            let frame_archive =
+                fetch::asset(client, &files.frame, &work, |percent| self.step(&[FRAME], "downloading", Some(percent), format!("Downloading {what} ({percent}%)"))).await?;
             let electron_archive = if staged.electron.contains(&frame.electron) {
                 String::new()
             } else {
                 let electron = fetch::asset(client, &files.electron, &work, |percent| {
-                    self.state("downloading", format!("Downloading Electron {} ({percent}%)", frame.electron))
+                    self.step(&[FRAME], "downloading", Some(percent), format!("Downloading Electron {} ({percent}%)", frame.electron))
                 })
                 .await?;
                 electron.to_string_lossy().into_owned()
             };
-            self.state("installing", format!("Preparing {what}"));
+            self.step(&[FRAME], "installing", None, format!("Preparing {what}"));
             let params = UpdateStageParams {
                 version: frame.version.clone(),
                 frame_archive: frame_archive.to_string_lossy().into_owned(),
@@ -901,7 +977,11 @@ impl Updater {
         }
         .await;
         let _ = tokio::fs::remove_dir_all(&work).await;
+        if let Err(error) = &outcome {
+            self.finish(FRAME, &frame.version, "failed", error);
+        }
         outcome?;
+        self.finish(FRAME, &frame.version, "at_restart", "");
         self.with_status(|status| status.restart = restart);
         Ok(())
     }

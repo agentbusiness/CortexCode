@@ -1,18 +1,20 @@
 /**
- * workbench.band@1 — updates. In the band: what is downloading or installing, "Restart to update"
- * when a newer frame is staged, and for a minute after an update the plugin and its new version.
- * At the bottom right, one popup at a time: a plugin the user changed that has a newer version,
+ * workbench.band@1 — updates. In the band only "Restart to update" when a newer frame is staged.
+ * At the bottom right: the round, every update of a check together, one row per plugin with where
+ * it stands; it leaves by itself a few seconds after the last one is done (a failure stays until
+ * hidden). Below it, one question at a time: a plugin the user changed that has a newer version,
  * until answered (use the newer version and drop the changes, or keep theirs; Settings > History
  * shows the changes), and a newer version that could not start (the previous one keeps running),
  * until seen.
  */
 
-import { definePlugin, errorMessage, setShared, useClient, useNow, useQuery, useShared } from '@cortex/sdk';
-import { useState, type ReactNode } from 'react';
+import { definePlugin, errorMessage, setShared, useClient, useQuery, useShared } from '@cortex/sdk';
+import { useEffect, useState } from 'react';
 
 interface Pending { plugin: string; name?: string; version: string; from?: string; installed?: string; files?: string[] }
 interface Applied { plugin: string; version: string; ms: number; outcome: string; detail?: string }
 interface Failed { plugin: string; name?: string; version: string; error?: string; ms: number; seen?: boolean }
+interface RoundItem { plugin: string; name?: string; version: string; state: string; percent?: number | null; error?: string; ms: number }
 
 /** The version without its build tag. */
 const short = (version: string) => version.split('+')[0] || version;
@@ -26,10 +28,62 @@ interface Status {
   waiting?: string[];
   recent?: Applied[];
   failed?: Failed[];
+  round?: RoundItem[];
 }
 
-/** How long a finished update stays in the band. */
-const SHOWN_MS = 60_000;
+/** How long the round stays after its last update is done. */
+const SHOWN_MS = 8_000;
+const GOING = ['queued', 'downloading', 'installing'];
+
+/** Where one row stands, in a word. */
+function where(row: RoundItem) {
+  switch (row.state) {
+    case 'queued': return <span className="ap faint">next</span>;
+    case 'downloading': return <span className="ap num">{row.percent ?? 0}%</span>;
+    case 'installing': return <span className="ap live">installing</span>;
+    case 'at_restart': return <span className="ap">at restart</span>;
+    case 'failed': return <span className="ap live">not updated</span>;
+    default: return <span className="ap faint">done</span>;
+  }
+}
+
+/** The round: every update of a check together. */
+function Round({ rows, onHide }: { rows: RoundItem[]; onHide: () => void }) {
+  const going = rows.filter((row) => GOING.includes(row.state)).length;
+  const failed = rows.filter((row) => row.state === 'failed').length;
+  const title = going
+    ? `Updating · ${rows.length - going} of ${rows.length} done`
+    : failed
+      ? `${failed} of ${rows.length} not updated`
+      : rows.every((row) => row.state === 'at_restart')
+        ? 'Ready at the next restart'
+        : `${rows.length} updated`;
+  return (
+    <div className="sheet" role="status" aria-live="polite" style={{ width: '100%' }}>
+      <div className="sheet-h">
+        <span className="ap grow">{title}</span>
+        <button className="detent" type="button" onClick={onHide}>Hide</button>
+      </div>
+      <ul style={{ listStyle: 'none', margin: 0, padding: '4px 14px 8px', maxHeight: '40vh', overflowY: 'auto' }}>
+        {rows.map((row) => (
+          <li key={row.plugin} title={row.error || undefined} style={{ padding: '7px 0', borderTop: '1px solid var(--rule)' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 9 }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 14 }}>{row.name || row.plugin}</span>
+              <span className="ap faint num">{short(row.version)}</span>
+              <span style={{ minWidth: 72, textAlign: 'right' }}>{where(row)}</span>
+            </div>
+            {row.state === 'downloading' && (
+              <div style={{ height: 1, marginTop: 6, background: 'var(--rule-2)' }}>
+                <div style={{ height: 1, width: `${row.percent ?? 0}%`, background: 'var(--counter)', transition: 'width .3s linear' }} />
+              </div>
+            )}
+            {row.state === 'failed' && row.error && <div className="cx-attn" style={{ fontSize: 13, marginTop: 4 }}>{row.error}</div>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 function Updates() {
   const client = useClient();
@@ -38,10 +92,22 @@ function Updates() {
   const [, setOverlay] = useShared<boolean>('overlay.open', false);
   const [busy, setBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
-  const latest = status.data?.recent?.[0];
-  const now = useNow(5_000, !!latest && Date.now() - latest.ms < SHOWN_MS);
+  const [hidden, setHidden] = useState<string | null>(null);
+  const [, redraw] = useState(0);
   const data = status.data;
+  const rows = data?.round ?? [];
+  const signature = rows.map((row) => `${row.plugin}@${row.version}`).join(' ');
+  const going = rows.some((row) => GOING.includes(row.state));
+  const stays = going || rows.some((row) => row.state === 'failed');
+  const last = Math.max(0, ...rows.map((row) => row.ms));
+  // Drawn once more when the shown time is over, so the round leaves.
+  useEffect(() => {
+    if (stays || !last) return;
+    const timer = setTimeout(() => redraw((n) => n + 1), Math.max(0, last + SHOWN_MS - Date.now()) + 50);
+    return () => clearTimeout(timer);
+  }, [stays, last]);
   if (!data) return null;
+  const showRound = rows.length > 0 && hidden !== signature && (stays || Date.now() - last < SHOWN_MS);
 
   const act = async (key: string, method: string, params: object) => {
     setBusy(key);
@@ -56,24 +122,13 @@ function Updates() {
     }
   };
 
-  let band: ReactNode = null;
-  if (data.restart) {
-    band = (
-      <button className="detent cx-status cx-attn" type="button" disabled={busy === 'restart'}
-        title={`CortexCode ${data.restart.staged} is ready (running ${data.restart.running}). Restarting stops every run and the window, then starts again.`}
-        onClick={() => void act('restart', 'update.restart', {})}>
-        Restart to update
-      </button>
-    );
-  } else if (data.state === 'downloading' || data.state === 'installing') {
-    band = <span className="cx-status" title={data.detail}>{data.detail}</span>;
-  } else if (latest && now - latest.ms < SHOWN_MS && (latest.outcome === 'installed' || latest.outcome === 'built')) {
-    band = <span className="cx-status" title={latest.detail || undefined}>{latest.plugin} updated to {latest.version}</span>;
-  } else if (latest && now - latest.ms < SHOWN_MS && latest.outcome === 'reset') {
-    band = <span className="cx-status" title={latest.detail || undefined}>{latest.plugin} reset to {latest.version}</span>;
-  } else if (latest && now - latest.ms < SHOWN_MS && latest.outcome === 'failed') {
-    band = <span className="cx-status cx-attn" title={latest.detail}>{latest.plugin} {latest.version} not updated</span>;
-  }
+  const band = data.restart ? (
+    <button className="detent cx-status cx-attn" type="button" disabled={busy === 'restart'}
+      title={`CortexCode ${data.restart.staged} is ready (running ${data.restart.running}). Restarting stops every run and the window, then starts again.`}
+      onClick={() => void act('restart', 'update.restart', {})}>
+      Restart to update
+    </button>
+  ) : null;
 
   const ask = data.pending?.[0];
   const broke = (data.failed ?? []).find((failed) => !failed.seen);
@@ -82,9 +137,11 @@ function Updates() {
   return (
     <>
       {band}
+      {(showRound || ask || broke) && (
+      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {showRound && <Round rows={rows} onHide={() => setHidden(signature)} />}
       {ask ? (
-        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title"
-          style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))' }}>
+        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title" style={{ width: '100%' }}>
           <div className="sheet-h">
             <span className="lbl grow" id="updater-ask-title">{ask.name || ask.plugin}: a newer version is ready</span>
           </div>
@@ -110,8 +167,7 @@ function Updates() {
           </div>
         </div>
       ) : broke ? (
-        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-failed-title"
-          style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))' }}>
+        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-failed-title" style={{ width: '100%' }}>
           <div className="sheet-h">
             <span className="lbl grow" id="updater-failed-title">{broke.name || broke.plugin}: the newer version could not start</span>
           </div>
@@ -134,6 +190,8 @@ function Updates() {
           </div>
         </div>
       ) : null}
+      </div>
+      )}
     </>
   );
 }
