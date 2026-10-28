@@ -7,7 +7,8 @@
 //! ```
 //!
 //! `build` reads `plugin.toml`, runs the backend's build (`cargo build --release` in `backend/`)
-//! and the UI's (`npm ci` when the npm root has no install, then `npm run build`), checks that every
+//! and the UI's (`npm ci` when the npm root has no install or its lock file changed since, then
+//! `npm run build`), checks that every
 //! declared output exists, and writes a gzip-compressed tar holding `manifest.json`, the backend
 //! executable with its assets (`backend/`), every UI package's built bundle (`ui/<name>/`), the
 //! shell modules (`shell/<id>/`), `plugin.toml` and the plugin's data folders (`[data] dirs`, at

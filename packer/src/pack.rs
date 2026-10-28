@@ -225,8 +225,17 @@ pub fn build(options: &Options) -> Result<Packed, String> {
     if let Some(spec) = &toml.ui {
         let root = dir.join(&spec.dir);
         if options.run_build {
-            if !root.join("node_modules/.package-lock.json").is_file() {
+            // Install when there is none, or when the lock file changed since the last install: an
+            // install kept from before (a release build volume) would build against old packages.
+            let lock = std::fs::read(root.join("package-lock.json")).ok();
+            let installed_from = root.join("node_modules/.cortex-pack-lock.json");
+            let current = root.join("node_modules/.package-lock.json").is_file()
+                && lock.as_ref().is_none_or(|lock| std::fs::read(&installed_from).ok().as_ref() == Some(lock));
+            if !current {
                 run(&root, &["npm".into(), "ci".into(), "--prefer-offline".into(), "--no-audit".into(), "--no-fund".into()], "UI install")?;
+                if let Some(lock) = &lock {
+                    std::fs::write(&installed_from, lock).map_err(|e| format!("{}: {e}", installed_from.display()))?;
+                }
             }
             if !spec.build.is_empty() {
                 run(&root, &spec.build, "UI build")?;

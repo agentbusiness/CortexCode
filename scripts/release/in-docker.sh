@@ -10,9 +10,13 @@ set -euo pipefail
 rsync -a --delete --exclude target --exclude node_modules --exclude dist /src/ /work/
 cd /work
 
-# The UI core and SDK (plugin UI packages build against them); installed once per volume.
+# The UI core and SDK (plugin UI packages build against them); installed again when the lock file
+# changed since the volume's install (cortex-pack does the same for plugin UIs).
 ui_core() {
-  (cd ui && { [ -f node_modules/.package-lock.json ] || npm ci --no-audit --no-fund; } && npm run build --silent)
+  (cd ui && {
+    { [ -f node_modules/.package-lock.json ] && cmp -s package-lock.json node_modules/.cortex-pack-lock.json; } ||
+      { npm ci --no-audit --no-fund && cp package-lock.json node_modules/.cortex-pack-lock.json; }
+  } && npm run build --silent)
 }
 
 case "${1:-}" in
