@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-data"
 name = "Data and query skills"
-version = "0.1.2"
+version = "0.1.3"
 description = "Data and query know-how for the model: SQL (correctness, dialects, application code, performance, migrations), Cypher (Neo4j), regular expressions, data formats, jq and dataframes."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
