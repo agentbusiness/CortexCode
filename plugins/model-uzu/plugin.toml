@@ -7,7 +7,7 @@
 [plugin]
 id = "model-uzu"
 name = "Model (uzu)"
-version = "0.1.5"
+version = "0.1.6"
 description = "Qwen3.8-27B (Mirai M, 4-bit) in-process on uzu's Metal engine: lossless speculative decoding, grammar-constrained tool calls, per-conversation KV cache, hibernate, and a local OpenAI-compatible endpoint."
 license = "UNLICENSED"
 platforms = ["macos"]
