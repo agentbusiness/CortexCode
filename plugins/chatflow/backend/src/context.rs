@@ -424,6 +424,27 @@ fn describe_inputs(data: &Dataset, root: &Path, languages: &[String]) -> String 
     data.text("describe_inputs", &[("listing", &listing.join("\n")), ("languages", &languages.join(", ")), ("documents", documents.trim())])
 }
 
+/// Projects whose description is being written now: one writer per project.
+static DESCRIBING: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Start writing the project's description in the background when it is due: never on a turn's
+/// path, where a greeting would wait for it. The prefix being built keeps the stored one (none on
+/// a project's first conversation); the written item's `memory.knowledge.changed` has the next
+/// conversation's block prefilled again.
+fn describe_in_background(host: &Host, data: &Dataset, project_id: &str, root: &Path, languages: &[String]) {
+    let first = DESCRIBING.lock().map(|mut describing| describing.insert(project_id.to_owned())).unwrap_or(false);
+    if !first {
+        return;
+    }
+    let (host, data, project_id, root, languages) = (host.clone(), data.clone(), project_id.to_owned(), root.to_owned(), languages.to_vec());
+    tokio::spawn(async move {
+        ensure_description(&host, &data, &project_id, &root, &languages).await;
+        if let Ok(mut describing) = DESCRIBING.lock() {
+            describing.remove(&project_id);
+        }
+    });
+}
+
 /// The project's description (a `description` knowledge item): written by the model when the
 /// project has none, or when the documents it was written from changed. A failure leaves the
 /// project without one (logged): sessions still work.
@@ -448,7 +469,7 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
         "tools": [],
         "sampling": data.sampling("DESCRIBE", false),
         "thinking": crate::llm::thinking("none"),
-        "priority": "foreground",
+        "priority": "background",
         "max_tokens": 700,
     });
     match host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params).await {
@@ -491,7 +512,7 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
     let (map_text, map_files) = (String::new(), 0);
     let contract = if root.is_empty() { String::new() } else { contract_section(data, Path::new(&root)) };
     if !root.is_empty() && data.limits.brief_tokens > 0 {
-        ensure_description(host, data, project_id, Path::new(&root), &project.languages).await;
+        describe_in_background(host, data, project_id, Path::new(&root), &project.languages);
     }
     // What the project knows (docs/PROJECT-KNOWLEDGE-PLAN.md P4): accepted decisions, the user's
     // facts, the concepts that bind most code, open questions, within `limits.brief_tokens`, as the

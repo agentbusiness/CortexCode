@@ -19,6 +19,10 @@
 //! - Packages dropped into `<home>/plugins/.incoming/` are installed at startup and whenever one
 //!   appears; while the frame runs, the outcome is written beside it as `<file>.result.json` for
 //!   the packer that waits for it.
+//! - While a frame update is staged, no package is swapped in: dropped-in packages stay in
+//!   `.incoming/`, and `install` / `install_many` put theirs there, answering `restart_pending`.
+//!   The restart installs them before any plugin starts. A swap racing the restart was killed
+//!   mid-handover, and its rollback was refused by the shutdown.
 //! - Alternatives: several plugins may serve one category (two model engines). One serves it;
 //!   the others are on standby (installed, not started, their UI packages not served). The one
 //!   that serves is the person's choice (`frame.plugins.switch`, kept as the chosen plugin's
@@ -244,6 +248,7 @@ impl Units {
                 Err(error) => tracing::error!(archive = %archive.display(), %error, "a waiting package was not installed"),
             }
             let _ = std::fs::remove_file(&archive);
+            let _ = std::fs::remove_file(result_path(&archive));
         }
         units.sort();
         units.choose_serving();
@@ -629,13 +634,49 @@ fn check_same_category(unit: &Unit, installed: &Installed) -> Result<(), String>
 
 /// Write the outcome beside the archive and remove the archive.
 fn finish_incoming(archive: &Path, result: &serde_json::Value) {
+    answer_incoming(archive, result);
+    let _ = std::fs::remove_file(archive);
+}
+
+/// `<file>.result.json` beside a dropped-in package, for the packer that waits for it.
+fn result_path(archive: &Path) -> PathBuf {
     let mut name = archive.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".result.json");
-    let path = archive.with_file_name(name);
+    archive.with_file_name(name)
+}
+
+fn answer_incoming(archive: &Path, result: &serde_json::Value) {
     if let Ok(bytes) = serde_json::to_vec_pretty(result) {
-        let _ = write_atomic(&path, &bytes);
+        let _ = write_atomic(&result_path(archive), &bytes);
     }
-    let _ = std::fs::remove_file(archive);
+}
+
+/// The error code of an install held for the restart (the updater reads it).
+const RESTART_PENDING: &str = "restart_pending";
+
+fn held_message(version: &str) -> String {
+    format!("CortexCode {version} is staged: the package installs when the app restarts (Restart to update).")
+}
+
+/// A staged frame waits for the restart: put `archives` in `.incoming/`, where that start installs
+/// them, and answer that they wait.
+fn hold_for_restart(frame: &Frame, archives: &[PathBuf]) -> Option<RpcError> {
+    let version = crate::update::restart_pending(&frame.home.root)?;
+    let incoming = frame.units.root.join(INCOMING);
+    for archive in archives {
+        let Some(name) = archive.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let name = if name.ends_with(".ccplugin") { name } else { format!("{name}.ccplugin") };
+        let staging = incoming.join(format!(".{name}.{}", std::process::id()));
+        let placed = std::fs::create_dir_all(&incoming)
+            .and_then(|()| std::fs::copy(archive, &staging))
+            .and_then(|_| std::fs::rename(&staging, incoming.join(&name)));
+        if let Err(error) = placed {
+            let _ = std::fs::remove_file(&staging);
+            return Some(RpcError::internal(format!("CortexCode {version} is staged, and {name} could not be kept for the restart: {error}")));
+        }
+        tracing::info!(package = %name, %version, "a frame update is staged; the package installs at the restart");
+    }
+    Some(RpcError::new(RESTART_PENDING, held_message(&version)))
 }
 
 fn step(list: &mut Vec<SwapStep>, name: &str, ok: bool, started: Instant, detail: impl Into<String>) {
@@ -780,6 +821,9 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
         return read_batch(&frame.units.batch_dir, &params.id)?.result.ok_or_else(|| RpcError::internal("the previous install has no final result; restart the frame to recover it"));
     }
     if params.paths.is_empty() { return Err(RpcError::invalid_params("give the built plugin packages")); }
+    if let Some(held) = hold_for_restart(frame, &params.paths.iter().map(PathBuf::from).collect::<Vec<_>>()) {
+        return Err(held);
+    }
     let mut prepared = Vec::new();
     let mut previous = BTreeMap::new();
     let mut targets = BTreeMap::new();
@@ -899,6 +943,9 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
     let archive = PathBuf::from(path);
     if !archive.is_absolute() {
         return Err(RpcError::invalid_params(format!("`{path}` must be an absolute path")));
+    }
+    if let Some(held) = hold_for_restart(frame, std::slice::from_ref(&archive)) {
+        return Err(held);
     }
     let _op = frame.units.op.lock().await;
     let mut steps = Vec::new();
@@ -1191,10 +1238,22 @@ pub fn watch_incoming(frame: &Arc<Frame>) {
     let frame = frame.clone();
     tokio::spawn(async move {
         let _watcher = watcher;
+        // Packages answered as waiting for the restart (by file and time: a packer may drop the
+        // same name again, and its result file is written in this folder too).
+        let mut held: BTreeSet<(PathBuf, std::time::SystemTime)> = BTreeSet::new();
         loop {
+            let staged = crate::update::restart_pending(&frame.home.root);
             for archive in frame.units.incoming() {
                 if frame.is_shutting_down() {
                     return;
+                }
+                if let Some(version) = &staged {
+                    let modified = std::fs::metadata(&archive).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                    if held.insert((archive.clone(), modified)) {
+                        tracing::info!(archive = %archive.display(), %version, "a frame update is staged; the package installs at the restart");
+                        answer_incoming(&archive, &serde_json::json!({"ok": false, "waiting": true, "error": held_message(version)}));
+                    }
+                    continue;
                 }
                 tracing::info!(archive = %archive.display(), "installing a dropped-in package");
                 let result = match install(&frame, &archive.display().to_string()).await {

@@ -35,6 +35,8 @@ const MAX_ATTEMPTS: u32 = 2;
 const KEEP: usize = 2;
 
 static RESTART: AtomicBool = AtomicBool::new(false);
+/// This frame never hands over (`--config`, `CORTEX_NO_HANDOVER=1`): its staged frames do not run.
+static NO_HANDOVER: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HandoverState {
@@ -99,6 +101,7 @@ fn newest(root: &Path, state: &HandoverState) -> Option<(Version, PathBuf)> {
 /// Skipped with an explicit `--config` or `CORTEX_NO_HANDOVER=1`.
 pub fn handover(explicit_config: bool, root: &Path) {
     if explicit_config || std::env::var(NO_HANDOVER_ENV).is_ok_and(|value| value == "1") {
+        NO_HANDOVER.store(true, Ordering::Relaxed);
         return;
     }
     let mut state = read_state(root);
@@ -143,6 +146,15 @@ pub fn mark_good(root: &Path) {
         state.good.push(name);
     }
     write_state(root, &state);
+}
+
+/// The staged frame the next start runs, if any. Plugin packages wait for that start
+/// (`units::install`): swapped into this frame, they would race the restart.
+pub fn restart_pending(root: &Path) -> Option<String> {
+    if NO_HANDOVER.load(Ordering::Relaxed) {
+        return None;
+    }
+    newest(root, &read_state(root)).map(|(version, _)| version.to_string())
 }
 
 /// The running version and the newest staged one.
