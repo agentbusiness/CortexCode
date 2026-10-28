@@ -202,7 +202,7 @@ impl Mesh {
 
     /// Route one session's model calls to a member: the client serving `model` for sessions
     /// (one per member, opened on first use), then the frame's session route.
-    async fn bind(self: &Arc<Self>, session_id: &str, node: &str) -> Result<(), RpcError> {
+    pub(crate) async fn bind(self: &Arc<Self>, session_id: &str, node: &str) -> Result<(), RpcError> {
         let client = lock(&self.placements.clients).get(node).cloned();
         let client = match client {
             Some(client) if !client.stop.is_cancelled() => client,

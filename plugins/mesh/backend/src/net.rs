@@ -11,8 +11,9 @@
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
 //! (the membership log), `mesh.provides {category}` (the methods a category's plugin serves here),
 //! `mesh.events {prefixes}` (a stream of the frame's events with those prefixes, as items),
-//! `mesh.window.ticket` (this frame's token) and `mesh.window` (the rest of the stream is one
-//! connection of the member's window to this frame: [`crate::projects`]).
+//! `mesh.window.ticket` (this frame's token), `mesh.window` (the rest of the stream is one
+//! connection of the member's window to this frame: [`crate::projects`]), `mesh.model.claim |
+//! release` (one use of this computer's model for a member's run: [`crate::claims`]).
 //!
 //! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
 
@@ -143,6 +144,41 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let category = params.get("category").and_then(Value::as_str).unwrap_or("").to_owned();
             let provides = mesh.provides(&category).await;
             let message = answer(Ok(json!({"category": category, "provides": provides})));
+            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
+        "mesh.model.claim" => {
+            // A member's run asks for this computer's model for one call; with `wait` the answer
+            // comes when it is that run's turn. A `Cancel` or a closed stream withdraws it.
+            let session = params.get("session_id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let since = params.get("since_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
+            let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            mesh.start_granting();
+            let withdrawn = CancellationToken::new();
+            let watcher = {
+                let withdrawn = withdrawn.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match read_message(&mut recv).await {
+                            Ok(Some(Message::Cancel { .. })) | Ok(None) | Err(_) => {
+                                withdrawn.cancel();
+                                break;
+                            }
+                            Ok(Some(_)) => {}
+                        }
+                    }
+                })
+            };
+            let granted = mesh.lend(&node, &session, since, false, wait, withdrawn.clone()).await;
+            watcher.abort();
+            let message = answer(Ok(json!({"granted": granted})));
+            if write_message(&mut send, &message).await.is_err() && granted {
+                mesh.give_back(&node, &session);
+            }
+        }
+        "mesh.model.release" => {
+            let session = params.get("session_id").and_then(Value::as_str).unwrap_or("");
+            mesh.give_back(&node, session);
+            let message = answer(Ok(json!({})));
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.window.ticket" => {

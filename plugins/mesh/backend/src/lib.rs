@@ -4,6 +4,7 @@
 
 pub mod borrow;
 pub mod card;
+pub mod claims;
 pub mod identity;
 pub mod members;
 pub mod net;
