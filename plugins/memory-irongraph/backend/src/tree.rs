@@ -54,6 +54,10 @@ pub struct TreeStatus {
     pub plugin_problems: Vec<String>,
 }
 
+/// The way nodes are written (their ids, [`model::symbol_sids`]); a graph stored with another is
+/// written again once.
+const MODEL_VERSION: u64 = 2;
+
 /// What one sync did (also the `memory.indexed` payload source).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SyncReport {
@@ -111,11 +115,55 @@ pub struct CodeTree {
     pub files_done: Arc<AtomicU64>,
 }
 
-/// Files of a tree: everything the ignore rules keep but CORTEX.md (rules, never code facts).
-/// Package-manager install directories (`node_modules`), virtualenvs (marked by `pyvenv.cfg`) and
-/// build output (marked by `CACHEDIR.TAG`, which cargo writes into `target/`) are skipped:
-/// structural markers.
+/// Directory names that hold other projects' code copied in (`cargo vendor`, `go mod vendor`, the
+/// C/C++ convention): not this project's code.
+const VENDOR_DIRS: &[&str] = &["vendor", "third_party", "third-party"];
+
+/// Vendored code of a tree: the [`VENDOR_DIRS`], the git submodules (`.gitmodules`) and what
+/// `.gitattributes` marks `linguist-vendored`. It is not indexed: its definitions would outnumber
+/// the project's own, in search and in the graph (seen: 87% of a project's symbols).
+pub struct Vendored {
+    submodules: HashSet<String>,
+    marked: ignore::gitignore::Gitignore,
+}
+
+impl Vendored {
+    pub fn of(root: &Path) -> Self {
+        let submodules = std::fs::read_to_string(root.join(".gitmodules"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("path"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|path| path.trim().trim_end_matches('/').to_owned())
+            .filter(|path| !path.is_empty())
+            .collect();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        for line in std::fs::read_to_string(root.join(".gitattributes")).unwrap_or_default().lines() {
+            let mut parts = line.split_whitespace();
+            let Some(pattern) = parts.next().filter(|pattern| !pattern.starts_with('#')) else { continue };
+            if parts.any(|attribute| attribute == "linguist-vendored" || attribute == "linguist-vendored=true") {
+                let _ = builder.add_line(None, pattern);
+            }
+        }
+        Self { submodules, marked: builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()) }
+    }
+
+    /// Whether `rel` (repository-relative, `/`-separated) is vendored or lies inside vendored code.
+    pub fn contains(&self, rel: &str, is_dir: bool) -> bool {
+        let segments: Vec<&str> = rel.split('/').filter(|segment| !segment.is_empty()).collect();
+        let dirs = if is_dir { segments.len() } else { segments.len().saturating_sub(1) };
+        (1..=dirs).any(|end| VENDOR_DIRS.contains(&segments[end - 1]) || self.submodules.contains(&segments[..end].join("/")))
+            || self.marked.matched_path_or_any_parents(rel, is_dir).is_ignore()
+    }
+}
+
+/// Files of a tree: everything the ignore rules keep but CORTEX.md (rules, never code facts) and
+/// vendored code ([`Vendored`]). Package-manager install directories (`node_modules`), virtualenvs
+/// (marked by `pyvenv.cfg`) and build output (marked by `CACHEDIR.TAG`, which cargo writes into
+/// `target/`) are skipped: structural markers.
 pub fn scan(root: &Path) -> Vec<String> {
+    let vendored = Arc::new(Vendored::of(root));
+    let top = root.to_path_buf();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
@@ -123,7 +171,7 @@ pub fn scan(root: &Path) -> Vec<String> {
         .git_global(true)
         .require_git(false)
         .parents(true)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().is_some_and(|t| t.is_dir()) {
                 if name == ".git" || name == "node_modules" {
@@ -131,6 +179,12 @@ pub fn scan(root: &Path) -> Vec<String> {
                 }
                 let path = entry.path();
                 if path.join("CACHEDIR.TAG").is_file() || path.join("pyvenv.cfg").is_file() {
+                    return false;
+                }
+                if let Ok(rel) = path.strip_prefix(&top)
+                    && !rel.as_os_str().is_empty()
+                    && vendored.contains(&rel.to_string_lossy().replace('\\', "/"), true)
+                {
                     return false;
                 }
             }
@@ -280,6 +334,28 @@ impl StoredFile {
         };
         self.content_hash == facts.content_hash && self.language == facts.language && self.extractor.as_deref() == extractor && self.extractor_version.as_deref() == version
     }
+
+    /// What differs between the stored file and `facts` (for the log).
+    fn differs(&self, facts: &FileFacts) -> String {
+        let (extractor, version) = match &facts.origin {
+            Origin::Plugin { category, version } => (Some(category.as_str()), Some(version.as_str())),
+            _ => (None, None),
+        };
+        let mut out = Vec::new();
+        if self.content_hash != facts.content_hash {
+            out.push(format!("content {} -> {}", self.content_hash, facts.content_hash));
+        }
+        if self.language != facts.language {
+            out.push(format!("language {} -> {}", self.language, facts.language));
+        }
+        if self.extractor.as_deref() != extractor {
+            out.push(format!("extractor {:?} -> {:?}", self.extractor, extractor));
+        }
+        if self.extractor_version.as_deref() != version {
+            out.push(format!("version {:?} -> {:?}", self.extractor_version, version));
+        }
+        out.join(", ")
+    }
 }
 
 /// A file no plugin can extract now whose unchanged content the last index extracted keeps that
@@ -410,32 +486,83 @@ impl CodeTree {
         let parse_ms = started.elapsed().as_millis() as u64;
         // What the graph already holds.
         let existing = self
-            .run(&format!("{} MATCH (f:File) RETURN f.path, f.content_hash, f.language, f.extractor, f.extractor_version", layer::OBSERVED_READ), Map::new())
+            .run(&format!("{} MATCH (f:File) RETURN f.path, f.content_hash, f.language, f.extractor, f.extractor_version, f.edge_hash", layer::OBSERVED_READ), Map::new())
             .await?;
         let mut stored: HashMap<String, StoredFile> = HashMap::new();
+        let mut stored_edges: HashMap<String, String> = HashMap::new();
         for row in &existing.rows {
             let text = |i: usize| row.get(i).and_then(|v| v.as_str()).map(str::to_owned);
             if let (Some(path), Some(content_hash)) = (text(0), text(1)) {
+                if let Some(edge_hash) = text(5) {
+                    stored_edges.insert(path.clone(), edge_hash);
+                }
                 stored.insert(path, StoredFile { content_hash, language: text(2).unwrap_or_default(), extractor: text(3), extractor_version: text(4) });
             }
         }
-        // Rebuild outgoing edges on reconciliation/cold passes, including a previous process
-        // that stopped after writing File metadata but before writing its edges.
-        // A graph from before parameters moved onto their definitions has every node written again.
+        // No file read back while the graph still holds edges: the read missed what is there (seen
+        // right after an open). Every edge is written again below, so the old ones go first;
+        // otherwise each would be there twice.
+        if stored.is_empty() {
+            let edges = self.run(&format!("{} MATCH (:Code)-[r]->(:Code) RETURN count(r)", layer::OBSERVED_READ), Map::new()).await?;
+            let count = edges.column(0).find_map(Value::as_u64).unwrap_or(0);
+            if count > 0 {
+                tracing::warn!(project = %self.ig_name, edges = count, "no file read back but edges are stored; removing them before the index writes them again");
+                self.run(&format!("{} MATCH (:Code)-[r]->(:Code) DELETE r", layer::OBSERVED_WRITE), Map::new()).await?;
+            }
+        }
+        // Rebuild outgoing edges on reconciliation passes, and on a cold pass after a process that
+        // stopped inside a sync (it may have written File metadata but not its edges: the marker
+        // file says so). A graph from before parameters moved onto their definitions has every node
+        // written again.
         let params_as_nodes = !self.run(&format!("{} MATCH (p:Param) RETURN p.sid LIMIT 1", layer::OBSERVED_READ), Map::new()).await?.rows.is_empty();
-        let repairing = self.sync_pending.load(Ordering::Acquire) || params_as_nodes;
+        // A graph an earlier way of writing nodes wrote (the ids changed since) is written again.
+        let repo = self.run(&format!("{} MATCH (r:Repo) RETURN r.structure_hash, r.model_version", layer::OBSERVED_READ), Map::new()).await?;
+        let stored_version = repo.rows.first().and_then(|row| row.get(1)).and_then(Value::as_u64);
+        let older_model = !stored.is_empty() && stored_version != Some(MODEL_VERSION);
+        let repairing = self.sync_pending.load(Ordering::Acquire) || self.pending_marker().exists() || params_as_nodes || older_model;
         self.invalidate_write_caches().await;
+        if repairing {
+            // A node written twice (a write that created instead of merging) takes every edge to it
+            // twice: the copies go, and the files are written again below, one node each.
+            let doubled = self
+                .run(&format!("{} MATCH (n:Code) WITH n.sid AS sid, count(n) AS copies WHERE copies > 1 RETURN sid", layer::OBSERVED_READ), Map::new())
+                .await?;
+            let sids: Vec<String> = doubled.column(0).filter_map(Value::as_str).map(str::to_owned).collect();
+            if !sids.is_empty() {
+                tracing::warn!(project = %self.ig_name, sids = sids.len(), "removing nodes stored more than once before the repair writes them again");
+                for chunk in sids.chunks(BATCH_ROWS) {
+                    self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+                }
+                stored.retain(|path, _| !sids.iter().any(|sid| *sid == crate::model::file_sid(path)));
+            }
+        }
+        if !repairing {
+            // What the last complete sync wrote: only differences are written again.
+            *self.edge_hashes.lock().await = stored_edges;
+            if let Some(hash) = repo.column(0).find_map(Value::as_str) {
+                *self.structure_hash.lock().await = hash.to_owned();
+            }
+        }
         self.sync_pending.store(true, Ordering::Release);
         let on_disk: HashSet<String> = parsed.iter().map(|(f, _)| f.path.clone()).collect();
         let mut model = self.model.read().await.clone();
         let deleted: Vec<String> = stored.keys().chain(model.files.keys()).filter(|p| !on_disk.contains(*p)).cloned().collect::<BTreeSet<_>>().into_iter().collect();
         let mut changed: Vec<(FileFacts, String)> = Vec::new();
+        let total = parsed.len();
+        // Why stored files count as changed, for a pass that finds most of them changed.
+        let mut why: Vec<String> = Vec::new();
         {
             model.files.clear();
             for (facts, text) in parsed {
                 let previous = stored.get(&facts.path);
                 let facts = keep_extracted(facts, previous);
                 let unchanged = matches!(facts.origin, Origin::Kept { .. }) || (!repairing && previous.is_some_and(|p| p.same_as(&facts)));
+                if !unchanged && !repairing && why.len() < 5 {
+                    why.push(match previous {
+                        Some(previous) => format!("{}: {}", facts.path, previous.differs(&facts)),
+                        None => format!("{}: not stored", facts.path),
+                    });
+                }
                 // The line store may have been cleaned independently; keep it complete.
                 if unchanged {
                     self.lines.put(&facts.content_hash, &text).map_err(|e| RpcError::internal(format!("line store: {e}")))?;
@@ -445,8 +572,14 @@ impl CodeTree {
                 }
             }
         }
+        let history_started = Instant::now();
+        if !repairing && total > 20 && changed.len() * 2 > total {
+            tracing::warn!(project = %self.ig_name, changed = changed.len(), files = total, stored = stored.len(), examples = %why.join("; "), "most files count as changed");
+        }
         (model.commits, model.history) = self.read_history().await;
+        let history_ms = history_started.elapsed().as_millis() as u64;
         let mut report = self.sync_prepared(changed, deleted, model).await?;
+        let upkeep_started = Instant::now();
         if let Err(error) = self.drop_code().await {
             tracing::warn!(%error, "removing stored definition code failed");
         }
@@ -456,9 +589,11 @@ impl CodeTree {
         if params_as_nodes && let Err(error) = self.drop_unread_properties().await {
             tracing::warn!(%error, "removing properties earlier versions stored failed");
         }
+        let upkeep_ms = upkeep_started.elapsed().as_millis() as u64;
         *self.coverage_key.lock().await = Some(snapshot.key.clone());
         report.parse_ms += parse_ms;
         report.total_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(project = %self.ig_name, parse_ms = report.parse_ms, history_ms, resolve_ms = report.resolve_ms, write_ms = report.write_ms, upkeep_ms, repairing, "index phases");
         Ok(report)
     }
 
@@ -599,12 +734,23 @@ impl CodeTree {
         *self.coverage_key.lock().await = None;
     }
 
+    /// Present while a sync writes: a process that stops inside one leaves it, and the next cold
+    /// pass rebuilds every file's edges instead of trusting the stored edge hashes.
+    fn pending_marker(&self) -> PathBuf {
+        self.lines.dir().join("sync-pending")
+    }
+
     async fn sync_prepared(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>, model: Model) -> Result<SyncReport, RpcError> {
         // Leave this set on error or cancellation: the next refresh reconciles all persisted work.
         self.sync_pending.store(true, Ordering::Release);
+        let marker = self.pending_marker();
+        if let Err(error) = std::fs::create_dir_all(self.lines.dir()).and_then(|()| std::fs::write(&marker, b"")) {
+            tracing::warn!(%error, "the sync marker could not be written");
+        }
         let result = self.write_sync(changed, deleted, model).await;
         if result.is_ok() {
             self.sync_pending.store(false, Ordering::Release);
+            let _ = std::fs::remove_file(&marker);
         } else {
             self.invalidate_write_caches().await;
         }
@@ -864,6 +1010,7 @@ impl CodeTree {
             for node in &mut repo_nodes {
                 if node.kind == "repo" {
                     node.props.insert("structure_hash".into(), json!(structure_key));
+                    node.props.insert("model_version".into(), json!(MODEL_VERSION));
                     node.props.insert("root".into(), json!(self.root.to_string_lossy()));
                 }
             }
@@ -954,8 +1101,8 @@ impl CodeTree {
         let own: Vec<&str> = if first { model.files.keys().map(String::as_str).collect() } else { changed_paths.iter().map(String::as_str).collect() };
         for path in own {
             if let Some(file) = model.files.get(path) {
-                for symbol in &file.symbols {
-                    consider(model::symbol_sid(model::sid_prefix(file), &file.path, &symbol.qname), symbol);
+                for (symbol, sid) in file.symbols.iter().zip(model::symbol_sids(file)) {
+                    consider(sid, symbol);
                 }
             }
         }
@@ -1206,6 +1353,9 @@ fn read_history(root: &Path) -> Option<History> {
 
 /// Whether a repository-relative path is kept by the tree's ignore rules.
 pub fn included(root: &Path, rel: &str) -> bool {
+    if Vendored::of(root).contains(rel, false) {
+        return false;
+    }
     let mut current = root.to_path_buf();
     let segments: Vec<&str> = rel.split('/').collect();
     for seg in &segments[..segments.len().saturating_sub(1)] {

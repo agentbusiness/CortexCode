@@ -1235,8 +1235,10 @@ pub fn queue_bundled(root: &Path, packages: &Path) -> Vec<(String, String)> {
             continue;
         }
         // An update installed a newer release than the app carries: the app's older one stays out.
+        // The same version is already current when the development start installed it into the
+        // running frame: unpacking it again would only hold this start up.
         let current = std::fs::read_to_string(root.join(id).join(CURRENT)).map(|text| text.trim().to_owned()).unwrap_or_default();
-        if cc_protocol::version::is_newer(&current, version) {
+        if current == version || cc_protocol::version::is_newer(&current, version) {
             if let Err(error) = write_record(&root.join(id), BUNDLED, Some(version)) {
                 tracing::warn!(plugin = %id, %error, "cannot record the app version passed over");
             }

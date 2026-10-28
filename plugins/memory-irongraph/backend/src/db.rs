@@ -32,6 +32,8 @@ pub struct Graph {
     /// (project UUID, index name) pairs already declared by this process: repeated declarations
     /// skip the statement entirely.
     declared: Mutex<HashSet<(String, String)>>,
+    /// Project names whose relationship scope this process has set (`ensure_project`).
+    scoped: Mutex<HashSet<String>>,
 }
 
 /// A decoded query result: plain JSON values (typed envelopes unwrapped).
@@ -71,13 +73,15 @@ impl Graph {
             .with_embedding_cache_dir(&paths.cache_dir)
             .with_embedding_policy(if embeddings { EmbeddingPolicy::Automatic } else { EmbeddingPolicy::Disabled });
         let db = EmbeddedDatabase::open_async(options).await.map_err(ig_error)?;
-        Ok(Arc::new(Self { db, projects: Mutex::new(HashMap::new()), declared: Mutex::new(HashSet::new()) }))
+        Ok(Arc::new(Self { db, projects: Mutex::new(HashMap::new()), declared: Mutex::new(HashSet::new()), scoped: Mutex::new(HashSet::new()) }))
     }
 
-    pub async fn close(self: Arc<Self>) -> Result<(), RpcError> {
+    /// Close the database when this is its last holder, so the next open needs no repair (an
+    /// unclosed one costs a scan of the whole file). False when another holder keeps it open.
+    pub fn close(self: Arc<Self>) -> Result<bool, RpcError> {
         match Arc::try_unwrap(self) {
-            Ok(graph) => graph.db.close_async().await.map_err(ig_error),
-            Err(shared) => shared.db.flush_async().await.map_err(ig_error),
+            Ok(graph) => graph.db.close().map(|()| true).map_err(ig_error),
+            Err(_) => Ok(false),
         }
     }
 
@@ -85,15 +89,25 @@ impl Graph {
         self.db.flush_async().await.map_err(ig_error)
     }
 
-    /// The UUID of project `name`, creating it when missing.
+    /// The UUID of project `name`, creating it when missing. Its relationships stay out of the
+    /// automatic semantic index: every search here binds nodes, and edges outnumber them several
+    /// times over. Repeating the setting is a no-op; an older project drops its edge vectors.
     pub async fn ensure_project(&self, name: &str) -> Result<String, RpcError> {
-        if let Some(id) = self.projects.lock().await.get(name) {
-            return Ok(id.clone());
+        let known = self.projects.lock().await.get(name).cloned();
+        let id = match known {
+            Some(id) => id,
+            None => {
+                validate_project_name(name)?;
+                self.db.query_async(Query::new(format!("CREATE PROJECT IF NOT EXISTS {name}"))).await.map_err(ig_error)?;
+                self.refresh_projects().await?;
+                self.projects.lock().await.get(name).cloned().ok_or_else(|| RpcError::internal(format!("project {name} missing after creation")))?
+            }
+        };
+        if !self.scoped.lock().await.contains(name) {
+            self.db.query_async(Query::new(format!("USE {name} ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE"))).await.map_err(ig_error)?;
+            self.scoped.lock().await.insert(name.to_owned());
         }
-        validate_project_name(name)?;
-        self.db.query_async(Query::new(format!("CREATE PROJECT IF NOT EXISTS {name}"))).await.map_err(ig_error)?;
-        self.refresh_projects().await?;
-        self.projects.lock().await.get(name).cloned().ok_or_else(|| RpcError::internal(format!("project {name} missing after creation")))
+        Ok(id)
     }
 
     /// The UUID of an existing project, if any.
@@ -103,6 +117,12 @@ impl Graph {
         }
         self.refresh_projects().await?;
         Ok(self.projects.lock().await.get(name).cloned())
+    }
+
+    /// The names of every IronGraph project in the database.
+    pub async fn project_names(&self) -> Result<Vec<String>, RpcError> {
+        self.refresh_projects().await?;
+        Ok(self.projects.lock().await.keys().cloned().collect())
     }
 
     async fn refresh_projects(&self) -> Result<(), RpcError> {
@@ -126,6 +146,7 @@ impl Graph {
         }
         self.db.query_async(Query::new(format!("DROP PROJECT {name} CASCADE"))).await.map_err(ig_error)?;
         self.projects.lock().await.remove(name);
+        self.scoped.lock().await.remove(name);
         Ok(())
     }
 

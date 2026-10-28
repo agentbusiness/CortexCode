@@ -33,9 +33,14 @@ impl<'a> Heard<'a> {
     }
 }
 
-/// The qualified name in `sid` of a definition in `file` (`<prefix>:<path>#<qname>`).
+/// The qualified name in `sid` of a definition in `file` (`<prefix>:<path>#<qname>`, and
+/// `@<kind>` when kinds share the name, see [`model::symbol_sids`]).
 fn qname_in<'s>(sid: &'s str, file: &FileFacts) -> Option<&'s str> {
-    sid.strip_prefix(model::sid_prefix(file))?.strip_prefix(':')?.strip_prefix(file.path.as_str())?.strip_prefix('#')
+    let qname = sid.strip_prefix(model::sid_prefix(file))?.strip_prefix(':')?.strip_prefix(file.path.as_str())?.strip_prefix('#')?;
+    Some(match qname.rsplit_once('@') {
+        Some((name, kind)) if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => name,
+        _ => qname,
+    })
 }
 
 /// The words other files say about definitions, by target sid, and the targets each file's words

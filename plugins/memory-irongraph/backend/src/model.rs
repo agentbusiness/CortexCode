@@ -257,6 +257,40 @@ pub fn symbol_sid(prefix: &str, path: &str, qname: &str) -> String {
     format!("{prefix}:{path}#{qname}")
 }
 
+/// The ids of a file's definitions, in symbol order. Definitions of different kinds that share a
+/// qualified name (a Rust field and its getter, a C typedef and its struct, a function and a macro)
+/// would share [`symbol_sid`], and an edge to that id would attach to each of them: the first by
+/// kind ([`kind_rank`]) keeps the plain id, the others take their kind (`#<qname>@<kind>`; `~` is
+/// part of C++ destructor names).
+pub fn symbol_sids(file: &FileFacts) -> Vec<String> {
+    let mut primary: HashMap<&str, &str> = HashMap::new();
+    for symbol in &file.symbols {
+        let kind = symbol.kind.as_str();
+        primary
+            .entry(symbol.qname.as_str())
+            .and_modify(|kept| {
+                if (kind_rank(kind), kind) < (kind_rank(kept), *kept) {
+                    *kept = kind;
+                }
+            })
+            .or_insert(kind);
+    }
+    let prefix = sid_prefix(file);
+    file.symbols
+        .iter()
+        .map(|symbol| {
+            let plain = symbol_sid(prefix, &file.path, &symbol.qname);
+            if primary.get(symbol.qname.as_str()) == Some(&symbol.kind.as_str()) { plain } else { format!("{plain}@{}", symbol.kind) }
+        })
+        .collect()
+}
+
+/// Which kind keeps the plain id when kinds share a name: what is called and what is named as a type
+/// first, the rest by name.
+fn kind_rank(kind: &str) -> usize {
+    ["function", "method", "class", "struct", "enum", "trait", "interface", "type"].iter().position(|k| *k == kind).unwrap_or(usize::MAX)
+}
+
 /// The symbol-id prefix of a file's definitions.
 pub fn sid_prefix(file: &FileFacts) -> &str {
     if file.sid_prefix.is_empty() { &file.language } else { &file.sid_prefix }
@@ -284,6 +318,8 @@ pub struct SymRef<'a> {
 /// Lookup indexes over a model, rebuilt per change (cheap: hash maps over names).
 pub struct Index<'a> {
     model: &'a Model,
+    /// Each file's definition ids ([`symbol_sids`]), by path.
+    sids: HashMap<&'a str, Vec<String>>,
     by_name: HashMap<&'a str, Vec<SymRef<'a>>>,
     /// Owner type name -> member symbols (`Type::m`, `Class.m`).
     members: HashMap<(&'a str, &'a str), Vec<SymRef<'a>>>,
@@ -325,8 +361,8 @@ impl Model {
 
     pub fn sid_of(&self, r: SymRef) -> Option<String> {
         let file = self.files.get(r.file)?;
-        let symbol = file.symbols.get(r.index)?;
-        Some(symbol_sid(sid_prefix(file), &file.path, &symbol.qname))
+        file.symbols.get(r.index)?;
+        symbol_sids(file).into_iter().nth(r.index)
     }
 }
 
@@ -345,6 +381,11 @@ fn owner_of<'a>(file: &'a FileFacts, symbol: &'a SymbolFact) -> Option<&'a str> 
 }
 
 impl<'a> Index<'a> {
+    /// The id of a definition ([`symbol_sids`]).
+    pub fn sid_of(&self, r: SymRef) -> Option<String> {
+        self.sids.get(r.file).and_then(|sids| sids.get(r.index)).cloned()
+    }
+
     pub fn build(model: &'a Model) -> Self {
         let mut by_name: HashMap<&'a str, Vec<SymRef<'a>>> = HashMap::new();
         let mut members: HashMap<(&'a str, &'a str), Vec<SymRef<'a>>> = HashMap::new();
@@ -425,7 +466,8 @@ impl<'a> Index<'a> {
         for dir in go_packages.keys() {
             go_dirs.entry(dir.rsplit('/').next().unwrap_or(dir).to_owned()).or_default().push(dir.clone());
         }
-        Index { model, by_name, members, py_modules, rust_crates, rust_modules, rust_module_files, deps, ts_aliases, go_packages, go_dirs, go_module, java_packages, c_files, routes, channels, ext_by_name }
+        let sids = model.files.iter().map(|(path, file)| (path.as_str(), symbol_sids(file))).collect();
+        Index { model, sids, by_name, members, py_modules, rust_crates, rust_modules, rust_module_files, deps, ts_aliases, go_packages, go_dirs, go_module, java_packages, c_files, routes, channels, ext_by_name }
     }
 }
 
@@ -1465,8 +1507,7 @@ pub fn file_nodes(file: &FileFacts) -> Vec<NodeRow> {
         props.insert("text".into(), json!(text));
     }
     rows.push(NodeRow { sid: file_sid(&file.path), kind: "file".into(), file: file.path.clone(), props });
-    for symbol in &file.symbols {
-        let sid = symbol_sid(sid_prefix(file), &file.path, &symbol.qname);
+    for (symbol, sid) in file.symbols.iter().zip(symbol_sids(file)) {
         let mut p = Map::new();
         p.insert("sid".into(), json!(sid));
         p.insert("kind".into(), json!(symbol.kind));
@@ -1600,10 +1641,11 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
     let mut edges: Vec<EdgeRow> = Vec::new();
     let path = file.path.as_str();
     let fsid = file_sid(path);
-    let sid_of = |i: usize| symbol_sid(sid_prefix(file), path, &file.symbols[i].qname);
+    let sids = symbol_sids(file);
+    let sid_of = |i: usize| sids[i].clone();
     let target_sid = |t: &Target| -> Option<String> {
         match t {
-            Target::Sym(r) => index.model.sid_of(*r),
+            Target::Sym(r) => index.sid_of(*r),
             Target::External(sid) => Some(sid.clone()),
         }
     };
@@ -1679,7 +1721,7 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
         for base in bases {
             if let Some(found) = index.members.get(&(base.as_str(), symbol.name.as_str())) {
                 for r in found {
-                    if let Some(to) = index.model.sid_of(*r) {
+                    if let Some(to) = index.sid_of(*r) {
                         edges.push(EdgeRow { rel: "OVERRIDES", from: sid_of(i), to, props: Map::new() });
                     }
                 }
@@ -1835,7 +1877,7 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
             let function = function.split('.').next().unwrap_or(function).trim();
             for target in index.py_modules.get(module.trim()).cloned().unwrap_or_default() {
                 for r in index.defined_in(target, function, 0) {
-                    if let Some(to) = index.model.sid_of(r) {
+                    if let Some(to) = index.sid_of(r) {
                         edges.push(EdgeRow { rel: "RUNS", from: csid.clone(), to, props: Map::new() });
                     }
                 }
@@ -1855,7 +1897,7 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
     for request in &file.requests {
         let from = request.from.map(sid_of).unwrap_or_else(|| fsid.clone());
         for route in match_routes(index, &request.method, &request.url) {
-            if let Some(to) = index.model.sid_of(route) {
+            if let Some(to) = index.sid_of(route) {
                 edges.push(EdgeRow {
                     rel: "REQUESTS",
                     from: from.clone(),
@@ -1869,7 +1911,7 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
     for call in &file.ipc_calls {
         let from = call.from.map(sid_of).unwrap_or_else(|| fsid.clone());
         for channel in index.channels.get(call.channel.as_str()).cloned().unwrap_or_default() {
-            if let Some(to) = index.model.sid_of(channel) {
+            if let Some(to) = index.sid_of(channel) {
                 edges.push(EdgeRow {
                     rel: "INVOKES",
                     from: from.clone(),
@@ -1879,7 +1921,8 @@ pub fn file_edges(index: &Index, file: &FileFacts) -> Vec<EdgeRow> {
             }
         }
     }
-    edges.sort_by(|a, b| (a.rel, &a.from, &a.to).cmp(&(b.rel, &b.from, &b.to)));
+    // Ordered by the properties too, so identical edges are next to each other for the dedup.
+    edges.sort_by_cached_key(|edge| (edge.rel, edge.from.clone(), edge.to.clone(), serde_json::to_string(&edge.props).unwrap_or_default()));
     edges.dedup_by(|a, b| a.rel == b.rel && a.from == b.from && a.to == b.to && a.props == b.props);
     edges
 }

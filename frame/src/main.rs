@@ -182,7 +182,7 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     let (outbox, outgoing) = store::Outbox::new();
     store::spawn_writer(memory.clone(), outgoing);
     let journal = journal::Journal::open(home.journal()).map_err(|e| format!("journal: {e}"))?;
-    let state = state::StateStore::open(outbox);
+    let state = state::StateStore::open(outbox, home.state().join("records.json"));
     // The app's prebuilt plugins: a version this home has not taken from the app yet is installed.
     let bundled = config.packages.as_deref().map(|packages| units::queue_bundled(&home.plugins(), packages)).unwrap_or_default();
     let units = units::Units::load(&home.plugins(), &home.state(), config.overrides.clone(), machine.memory_bytes).map_err(|e| format!("plugins: {e}"))?;

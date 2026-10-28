@@ -1197,27 +1197,13 @@ pub async fn start_all(frame: Arc<Frame>) {
         let hello_limit = Duration::from_millis(cfg.hello_timeout_ms);
         tokio::spawn(ensure_running(frame.clone(), slot.clone(), target, Duration::ZERO));
         if slot.category == crate::store::MEMORY {
-            // The frame's records come from the memory plugin's store: loaded before the plugins
-            // that use them start (and before the UI opens).
+            // The frame's records come from the memory plugin's store. They load beside the other
+            // plugins and the UI, which start now; calls on the records wait until they are in.
             let load_frame = frame.clone();
-            let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui)| load_frame.state.load(projects, sessions, ui)) });
-            match tokio::time::timeout(Duration::from_secs(180), loaded).await {
-                Ok(Ok(Ok(()))) => {
-                    tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store");
-                    // Journals an earlier version kept in the store's streams move into the frame's
-                    // files once; nothing else reads them.
-                    let ids: Vec<String> = frame.state.sessions(None).into_iter().map(|session| session.id).collect();
-                    match tokio::time::timeout(Duration::from_secs(180), frame.journal.migrate_streams(&frame.memory, &ids)).await {
-                        Ok((0, 0)) => {}
-                        Ok((moved, failed)) => tracing::info!(moved, failed, "session journals moved from the store's streams into files"),
-                        Err(_) => tracing::warn!("moving the session journals out of the store's streams did not finish within 180 s; the rest moves at the next start"),
-                    }
-                }
-                Ok(Ok(Err(error))) => tracing::error!(%error.message, "the store's records could not be read"),
-                Ok(Err(error)) => tracing::error!(%error, "reading the store's records failed"),
-                Err(_) => tracing::error!("the memory plugin did not answer within 180 s: starting without its records"),
-            }
-            continue;
+            tokio::spawn(async move {
+                load_records(&load_frame).await;
+                load_frame.records_ready();
+            });
         }
         // Wait until this plugin's process said hello (or failed) before starting the next one.
         let deadline = Instant::now() + hello_limit + Duration::from_secs(1);
@@ -1233,6 +1219,28 @@ pub async fn start_all(frame: Arc<Frame>) {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+/// Load the projects, sessions and slot state from the memory plugin's store.
+async fn load_records(frame: &Arc<Frame>) {
+    let load_frame = frame.clone();
+    let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui)| load_frame.state.load(projects, sessions, ui)) });
+    match tokio::time::timeout(Duration::from_secs(180), loaded).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store");
+            // Journals an earlier version kept in the store's streams move into the frame's
+            // files once; nothing else reads them.
+            let ids: Vec<String> = frame.state.sessions(None).into_iter().map(|session| session.id).collect();
+            match tokio::time::timeout(Duration::from_secs(180), frame.journal.migrate_streams(&frame.memory, &ids)).await {
+                Ok((0, 0)) => {}
+                Ok((moved, failed)) => tracing::info!(moved, failed, "session journals moved from the store's streams into files"),
+                Err(_) => tracing::warn!("moving the session journals out of the store's streams did not finish within 180 s; the rest moves at the next start"),
+            }
+        }
+        Ok(Ok(Err(error))) => tracing::error!(%error.message, "the store's records could not be read"),
+        Ok(Err(error)) => tracing::error!(%error, "reading the store's records failed"),
+        Err(_) => tracing::error!("the memory plugin did not answer within 180 s: starting without its records"),
     }
 }
 

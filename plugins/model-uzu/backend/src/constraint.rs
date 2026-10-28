@@ -367,6 +367,13 @@ pub fn tool_choice(value: Option<&Value>, tools: &[ToolSpec]) -> Result<ToolChoi
     }
 }
 
+/// A Lark grammar for `tool_choice: "none"` with tools listed: any text, never the `<tool_call>`
+/// token (a text lexeme cannot produce a special token), so the tools can stay in the prompt (and
+/// its cached system block match the other calls') while the answer stays an answer.
+pub fn no_tool_call_grammar() -> String {
+    "start: /(?s:.*)/\n".to_owned()
+}
+
 /// A Lark grammar forcing one native Qwen3.8 tool call (of `name`, or of any of `tools`): the exact
 /// markup the template teaches, parameter names from each tool's schema, and each value free text
 /// up to the first `\n</parameter>` (a lazy lexeme: it ends at the first closing tag).

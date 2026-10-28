@@ -14,7 +14,7 @@ use crate::host::Host;
 use crate::journal::{Journal, extra_kinds};
 use crate::prompts::{PrefixParts, system_prompt};
 use cc_protocol::RpcError;
-use cc_protocol::contracts::lang::Applies;
+use cc_protocol::contracts::lang::{Applies, LanguageInfo};
 use cc_protocol::contracts::memory::{
     FilesResult, KnowledgeBriefResult, ProjectStatus, RuleListResult, StyleListResult, methods as memory_methods,
 };
@@ -47,6 +47,18 @@ pub struct Prefix {
     /// `skill://<plugin>/<name>` -> the command listing the skill's units of work, and the one
     /// saying when a unit is done (`{unit}`); a skill whose work agents may share.
     pub skill_units: BTreeMap<String, (String, Option<String>)>,
+    /// The project's language guides (`always` skills of language plugins), each with the
+    /// languages it is for: not in the system message; [`crate::guides`] brings one into the
+    /// conversation when the work first touches a file of its languages.
+    pub guides: Vec<Guide>,
+}
+
+/// A language guide and the languages whose files bring it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Guide {
+    /// `skill://<plugin>/<name>`.
+    pub uri: String,
+    pub languages: Vec<LanguageInfo>,
 }
 
 impl Prefix {
@@ -95,6 +107,7 @@ impl Prefix {
                 })
                 .unwrap_or_default(),
             skill_lines: strings("skill_lines"),
+            guides: data.get("guides").cloned().and_then(|guides| serde_json::from_value(guides).ok()).unwrap_or_default(),
         })
     }
 }
@@ -183,12 +196,14 @@ impl ProjectFacts {
 /// project shows one of the conditions its plugin declares for it (`data/skills/applies.toml`). A
 /// project the graph knows no language of yet is offered every skill; the prefix is rebuilt once the
 /// graph names its languages.
-/// Skills the project gets: the choosable ones as catalog lines, and the always-loaded ones
-/// (`always` in their plugin's applies.toml) as (category, name), which go into the system message.
+/// Skills the project gets: the choosable ones as catalog lines, the always-loaded ones
+/// (`always` in their plugin's applies.toml) of general plugins as (category, name), which go into
+/// the system message, and those of language plugins as guides, which come with the work.
 #[derive(Debug, Default)]
 struct ProjectSkills {
     lines: Vec<String>,
     always: Vec<(String, String)>,
+    guides: Vec<Guide>,
     /// `skill://<plugin>/<name>` -> the command that says whether that skill's work is finished.
     done: BTreeMap<String, String>,
     /// `skill://<plugin>/<name>` -> the command listing its units, and the one unit's done command.
@@ -199,6 +214,7 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
     let Ok(listed) = host.get::<Value>("frame.plugins.list", json!({})).await else { return ProjectSkills::default() };
     let mut lines = Vec::new();
     let mut always = Vec::new();
+    let mut guides = Vec::new();
     let mut done = BTreeMap::new();
     let mut units = BTreeMap::new();
     for entry in listed.get("plugins").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -209,6 +225,8 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
             continue;
         }
         let category = field("category");
+        // The languages of a language plugin (its guides come with files of them).
+        let mut plugin_languages: Option<Vec<LanguageInfo>> = None;
         let skills = if contract != cc_protocol::contracts::lang::CONTRACT {
             // General know-how (skills plugins, the memory plugin's own): each skill's own
             // conditions decide.
@@ -221,6 +239,7 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
             if !project.languages.is_empty() && !description.languages.iter().any(|language| project.languages.contains(&language.name)) {
                 continue;
             }
+            plugin_languages = Some(description.languages);
             description.skills
         };
         for skill in skills {
@@ -234,7 +253,10 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
                 units.insert(format!("skill://{category}/{}", skill.name), (command.clone(), skill.unit_done.clone()));
             }
             if skill.applies.always {
-                always.push((category.clone(), skill.name));
+                match &plugin_languages {
+                    Some(languages) => guides.push(Guide { uri: format!("skill://{category}/{}", skill.name), languages: languages.clone() }),
+                    None => always.push((category.clone(), skill.name)),
+                }
             } else {
                 lines.push(format!("skill://{category}/{}  {}", skill.name, skill.summary));
             }
@@ -242,11 +264,12 @@ async fn project_skills(host: &Host, project_id: &str, project: &mut ProjectFact
     }
     lines.sort();
     always.sort();
-    ProjectSkills { lines, always, done, units }
+    guides.sort_by(|a, b| a.uri.cmp(&b.uri));
+    ProjectSkills { lines, always, guides, done, units }
 }
 
 /// A skill file's guide: the body after line 1 (the catalog summary) and the blank line.
-fn guide_body(text: &str) -> &str {
+pub fn guide_body(text: &str) -> &str {
     let text = text.trim();
     text.split_once("\n\n").map(|(_, body)| body.trim()).unwrap_or(text)
 }
@@ -319,6 +342,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
                 "skill_lines": prefix.skill_lines,
                 "skill_done": prefix.skill_done,
                 "skill_units": prefix.skill_units.iter().map(|(uri, (units, unit_done))| (uri.clone(), json!({"units": units, "unit_done": unit_done}))).collect::<serde_json::Map<String, Value>>(),
+                "guides": prefix.guides,
                 "role": role,
                 "languages": languages,
             }),
@@ -478,16 +502,16 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, m
     } else {
         host.get::<KnowledgeBriefResult>(memory_methods::KNOWLEDGE_BRIEF, json!({"project_id": project_id, "budget_tokens": data.limits.brief_tokens})).await.unwrap_or_default()
     };
-    let ProjectSkills { lines: skills, always, done: skill_done, units: skill_units } = project_skills(host, project_id, &mut project).await;
+    let ProjectSkills { lines: skills, always, guides, done: skill_done, units: skill_units } = project_skills(host, project_id, &mut project).await;
     let mut system = system_prompt(data, role, &PrefixParts { project_root: &root, tools_guide: &schemas.guide, rules: &rules, style: &style, brief: &brief.text, contract: &contract, repo_map: &map_text });
-    // The project's language guides: every session in the project (chat and agents) works with
-    // them, so they sit in the byte-stable, cached system message, not in a choice.
-    let guides = always_section(host, data, &always).await;
-    if !guides.is_empty() {
-        system = format!("{system}\n\n{guides}");
+    // General always-loaded skills sit in the byte-stable, cached system message. The language
+    // guides do not: every call (a greeting's too) would read them; they come with the work.
+    let always_text = always_section(host, data, &always).await;
+    if !always_text.is_empty() {
+        system = format!("{system}\n\n{always_text}");
     }
     let catalog: Vec<String> = skills.iter().filter_map(|line| line.split_whitespace().next()).map(str::to_owned).collect();
-    let prefix = Prefix { role: role.to_owned(), system, tools: schemas.tools, ctx_window, skills: catalog, skill_lines: skills, skill_done, skill_units };
+    let prefix = Prefix { role: role.to_owned(), system, tools: schemas.tools, ctx_window, skills: catalog, skill_lines: skills, skill_done, skill_units, guides };
     let facts = BuiltFacts { versions: json!(schemas.versions), repo_map_files: map_files, rules: rules.len(), style: style.len(), brief_items: brief.ids.len() };
     Ok((prefix, facts))
 }

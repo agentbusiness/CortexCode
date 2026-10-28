@@ -74,6 +74,9 @@ pub struct Memory {
     forgotten: std::sync::Mutex<HashSet<String>>,
     /// The background opens started, by project id.
     background: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Roots of projects the start brought back: the frame is asked to open them, so a frame that
+    /// loaded its records already shows them too.
+    restored: std::sync::Mutex<Vec<String>>,
 }
 
 /// A tree listed in [`Memory::opening_trees`] while its open runs (removed however it ends).
@@ -244,6 +247,7 @@ impl Memory {
             opening_trees: std::sync::Mutex::new(HashMap::new()),
             forgotten: std::sync::Mutex::new(HashSet::new()),
             background: std::sync::Mutex::new(HashMap::new()),
+            restored: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -314,6 +318,17 @@ impl Memory {
     /// Open every project the frame knows (at start).
     pub async fn open_frame_projects(self: &Arc<Self>) {
         let Some(ctx) = self.ctx.get().cloned() else { return };
+        // The graph is open (the start's project check ran) before the frame is asked anything.
+        if let Err(error) = self.graph().await {
+            tracing::warn!(%error, "the database did not open; the frame's projects are not opened");
+            return;
+        }
+        let restored: Vec<String> = self.restored.lock().map(|mut roots| std::mem::take(&mut *roots)).unwrap_or_default();
+        for root in restored {
+            if let Err(error) = ctx.call(cc_protocol::contracts::frame::methods::PROJECT_OPEN, json!({"root": root})).await {
+                tracing::warn!(%root, %error, "asking the frame to show a brought-back project failed");
+            }
+        }
         match ctx.call(cc_protocol::contracts::frame::methods::PROJECT_LIST, json!({})).await {
             Ok(listed) => {
                 for project in listed.get("projects").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -364,6 +379,9 @@ impl Memory {
                         Ok(graph) => {
                             let ms = started.elapsed().as_millis() as u64;
                             tracing::info!(dir = %paths.data_dir.display(), models = %paths.model_dir.display(), cache = %paths.cache_dir.display(), ms, "irongraph open");
+                            if let Err(error) = self.startup_cleanup(&graph).await {
+                                tracing::warn!(%error, "the start's project check failed");
+                            }
                             self.engine.update(true, |s| {
                                 s.state = "ready".into();
                                 s.open_ms = Some(ms);
@@ -386,6 +404,63 @@ impl Memory {
             })
             .await
             .cloned()
+    }
+
+    /// Before anything is served: a registered project the app has no record of (the record went
+    /// while its memory stayed, as when the store's records were lost) is brought back, record and
+    /// settings link, so it shows in the app again with its code graph, tasks and knowledge. A
+    /// project's memory is dropped only when the app deletes the project (`memory.app.project.delete`
+    /// and the `project.deleted` event), never because a record seems to be missing at a start.
+    /// Workspace and probe graphs live only as long as the process that made them: any found now
+    /// are left over and dropped. Reference projects are not the app's projects and stay as they are.
+    async fn startup_cleanup(&self, graph: &Arc<Graph>) -> Result<(), RpcError> {
+        let main = graph.ensure_project(MAIN_PROJECT).await?;
+        let app = crate::app::AppStore::open(graph.clone(), main.clone()).await?;
+        let known: HashSet<String> = app.projects().await?.into_iter().map(|project| project.id).collect();
+        let entries = graph
+            .run(&main, &format!("{} MATCH (p:ProjectEntry) RETURN p.id, p.name, p.root, p.reference, p.updated_ms", layer::WORKSPACE_READ), Map::new())
+            .await?;
+        tracing::info!(records = known.len(), entries = entries.rows.len(), "the start's project check");
+        let mut registered = HashSet::new();
+        for row in &entries.rows {
+            let text = |index: usize| row.get(index).and_then(Value::as_str).unwrap_or("").to_owned();
+            let (id, name, root) = (text(0), text(1), text(2));
+            registered.insert(project_ig_name(&id));
+            let reference = row.get(3).and_then(Value::as_bool).unwrap_or(false);
+            if id.is_empty() || root.is_empty() || reference || known.contains(&id) {
+                continue;
+            }
+            if !Path::new(&root).is_dir() {
+                // Its folder is gone: nothing to show; its memory stays until the folder is back.
+                tracing::warn!(project = %id, root = %root, "a project the app has no record of, whose folder is gone; kept, not shown");
+                continue;
+            }
+            let shown = Path::new(&root).file_name().map(|name| name.to_string_lossy().into_owned()).filter(|name| !name.is_empty()).unwrap_or(name);
+            let created_ms = row.get(4).and_then(Value::as_u64).unwrap_or_else(cc_protocol::contracts::now_ms);
+            app.put_project(&cc_protocol::contracts::frame::Project { id: id.clone(), root: root.clone(), name: shown.clone(), created_ms }).await?;
+            tracing::info!(project = %id, name = %shown, root = %root, "brought back a project the app had no record of");
+            if let Ok(mut roots) = self.restored.lock() {
+                roots.push(root);
+            }
+        }
+        for name in graph.project_names().await? {
+            if name.starts_with("cc_w_") || name.starts_with("cc_probe_") {
+                graph.drop_project(&name).await?;
+                let _ = std::fs::remove_dir_all(self.data.join("linestore").join(&name));
+                tracing::info!(graph = %name, "dropped a left-over workspace graph");
+            } else if name.starts_with("cc_p_") && !registered.contains(&name) {
+                // No entry names its root: it cannot be opened or shown, and it is kept, not guessed at.
+                tracing::warn!(graph = %name, "a project graph no registry entry names; kept");
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the database over for closing: called once the runtime has stopped, when nothing
+    /// else can hold it.
+    pub fn into_graph(self) -> Option<Arc<Graph>> {
+        let Memory { graph, .. } = self;
+        graph.into_inner()
     }
 
     async fn global(&self) -> Result<Arc<WorkStore>, RpcError> {
@@ -762,6 +837,18 @@ impl Memory {
             }
         };
         tracing::info!(project = project_id, files = report.files_changed, ms = report.total_ms, statements = report.statements, "indexed");
+        // Persist what the index wrote now, not at the next exit: an exit that cannot close the
+        // database then has little to repair at the next open.
+        if report.files_changed + report.files_deleted > 0 {
+            let flushed = graph.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                match flushed.flush().await {
+                    Ok(()) => tracing::info!(ms = started.elapsed().as_millis() as u64, "irongraph flushed after an index"),
+                    Err(error) => tracing::warn!(%error, "irongraph flush after an index failed"),
+                }
+            });
+        }
         // CORTEX.md rules: the project's file (not a reference's: its rules are not this work's),
         // and the global one in CORTEX_HOME.
         if !entry.reference {
@@ -1287,6 +1374,10 @@ impl Memory {
             methods::APP_PROJECT_DELETE => {
                 let p: AppProjectDeleteParams = parse_params(params)?;
                 self.app().await?.delete_project(&p.id).await?;
+                // The frame's write-through reaches this plugin even when it was not serving at the
+                // delete (the `project.deleted` event does not wait for it): the project's memory
+                // goes with its record, so a later start never finds it and brings it back.
+                self.forget_project(&p.id).await?;
                 Ok(json!({}))
             }
             methods::APP_SESSIONS => to_value(&AppSessionsResult { sessions: self.app().await?.sessions().await? }),

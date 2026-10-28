@@ -97,6 +97,9 @@ pub struct Frame {
     pub socket: PathBuf,
     pub port: AtomicU16,
     pub headless: bool,
+    /// Calls on the projects, sessions and slot state that came before the records were loaded
+    /// from the store, in arrival order; None once loaded ([`Frame::records_ready`]).
+    records_waiting: Mutex<Option<Vec<(Arc<Peer>, IncomingRequest)>>>,
     /// The code folder (`[frame] code`, default `<home>/code`).
     pub code: PathBuf,
     /// Safe mode: plugins are not pointed at their live data.
@@ -161,6 +164,7 @@ impl Frame {
             renderer_build: Mutex::new(renderer_build(&config.ui_dir)),
             power: KeepAwake::new(),
             port: AtomicU16::new(0),
+            records_waiting: Mutex::new(Some(Vec::new())),
             shutting_down: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             peers: RwLock::new(HashMap::new()),
@@ -273,8 +277,24 @@ impl Frame {
         if category == crate::store::MEMORY {
             self.memory.set(route.conn.clone());
         }
+        let instance = route.instance.clone();
+        let conn = route.conn.clone();
         if let Ok(mut routes) = self.routes.write() {
             routes.insert(category.to_owned(), route);
+        }
+        // A plugin that starts now did not hear of the projects deleted before: told again (its
+        // cleanup is the same each time, so one that heard already loses nothing).
+        let subscribed = self.peers.read().ok().is_some_and(|peers| {
+            peers.values().any(|peer| {
+                peer.instance.get().is_some_and(|i| i.id == instance) && peer.subscriptions().iter().any(|prefix| topics::PROJECT_DELETED.starts_with(prefix.as_str()))
+            })
+        });
+        if subscribed {
+            for deleted in self.state.deleted_projects() {
+                if let Ok(data) = to_value(&deleted) {
+                    conn.publish(topics::PROJECT_DELETED, data);
+                }
+            }
         }
     }
 
@@ -792,6 +812,36 @@ impl Frame {
         }
     }
 
+    /// The methods that read or change the projects, sessions, journals and slot state.
+    fn is_record_method(method: &str) -> bool {
+        matches!(
+            method,
+            methods::PROJECT_OPEN
+                | methods::PROJECT_LIST
+                | methods::PROJECT_GET
+                | methods::PROJECT_DELETE
+                | methods::SESSION_CREATE
+                | methods::SESSION_LIST
+                | methods::SESSION_GET
+                | methods::SESSION_UPDATE
+                | methods::SESSION_DELETE
+                | methods::JOURNAL_READ
+                | methods::JOURNAL_APPEND
+                | methods::JOURNAL_PATCH
+                | methods::UI_STATE_GET
+                | methods::UI_STATE_PUT
+        )
+    }
+
+    /// The records are loaded from the store (or will not be): the calls that waited for them are
+    /// served in the order they came, under the same lock, so no later call overtakes them.
+    pub fn records_ready(self: &Arc<Self>) {
+        let mut waiting = self.records_waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (peer, request) in waiting.take().unwrap_or_default() {
+            tokio::spawn(serve(self.clone(), peer, request));
+        }
+    }
+
     fn is_long_running(method: &str) -> bool {
         matches!(
             method,
@@ -960,73 +1010,15 @@ impl Handler for PeerHandler {
                 request.responder.err(RpcError::new(codes::CONTRACT_VIOLATION, "send frame.hello first"));
             });
         }
-        if method == methods::JOURNAL_APPEND || method == methods::JOURNAL_PATCH {
-            let IncomingRequest { method, params, responder, .. } = request;
-            let applied = frame.journal_mutation(&method, params);
-            return Box::pin(async move {
-                match applied {
-                    Ok((result, durable)) => responder.respond(durable.wait().await.map(|()| result)),
-                    Err(error) => responder.err(error),
-                }
-            });
-        }
-        if method.starts_with("frame.") && Frame::is_long_running(&method) {
-            return Box::pin(async move {
-                let IncomingRequest { method, params, responder, cancel, .. } = request;
-                // Detached: a caller that cancels or disconnects gets `cancelled`, but a swap always
-                // runs to completion (dropping it half-way could orphan a staged instance).
-                let work = tokio::spawn(frame.serve_long(method, params));
-                tokio::select! {
-                    joined = work => {
-                        responder.respond(joined.unwrap_or_else(|error| Err(RpcError::internal(format!("frame task failed: {error}")))));
-                    }
-                    _ = cancel.cancelled() => responder.err(RpcError::cancelled()),
-                }
-            });
-        }
-        if method.starts_with("frame.") {
-            let IncomingRequest { method, params, responder, .. } = request;
-            let outcome = frame.serve_now(&peer, &method, params);
-            let rejected = method == methods::HELLO
-                && outcome
-                    .as_ref()
-                    .is_ok_and(|ack| ack.get("accepted") == Some(&Value::Bool(false)));
-            let persist = matches!(
-                method.as_str(),
-                methods::PROJECT_OPEN
-                    | methods::PROJECT_DELETE
-                    | methods::SESSION_CREATE
-                    | methods::SESSION_UPDATE
-                    | methods::SESSION_DELETE
-                    | methods::UI_STATE_PUT
-            );
-            if persist && outcome.is_ok() {
-                return Box::pin(async move {
-                    match frame.state.flush().await {
-                        Ok(()) => responder.respond(outcome),
-                        Err(error) => responder.err(error),
-                    }
-                });
+        // Until the records are loaded, calls that read or change them wait in arrival order.
+        if Frame::is_record_method(&method) {
+            let mut waiting = frame.records_waiting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(queue) = waiting.as_mut() {
+                queue.push((peer, request));
+                return Box::pin(async {});
             }
-            responder.respond(outcome);
-            if rejected
-                && peer.kind == PeerKind::Plugin
-                && let Some(conn) = peer.conn()
-            {
-                // A process the frame cannot admit is disconnected (the reply is flushed first).
-                conn.close();
-            }
-            return Box::pin(async {});
         }
-        let category = category_of(&method).to_owned();
-        if contract_of(&category).is_none() {
-            return Box::pin(async move {
-                request.responder.err(RpcError::unknown_method(&method));
-            });
-        }
-        let IncomingRequest { method, params, responder, cancel, .. } = request;
-        let first = frame.dispatch(&category, &method, params.clone());
-        Box::pin(forward(frame, category, method, params, first, responder, cancel))
+        serve(frame, peer, request)
     }
 
     fn event(&self, topic: String, data: Value) -> BoxFuture<'static, ()> {
@@ -1045,6 +1037,79 @@ impl Handler for PeerHandler {
     fn closed(&self) {
         self.frame.detach(&self.peer);
     }
+}
+
+/// Serve one admitted call. The state changes of frame methods are applied before this returns,
+/// so calls served one after another apply in that order; the returned future sends the answer.
+fn serve(frame: Arc<Frame>, peer: Arc<Peer>, request: IncomingRequest) -> BoxFuture<'static, ()> {
+    let method = request.method.clone();
+    if method == methods::JOURNAL_APPEND || method == methods::JOURNAL_PATCH {
+        let IncomingRequest { method, params, responder, .. } = request;
+        let applied = frame.journal_mutation(&method, params);
+        return Box::pin(async move {
+            match applied {
+                Ok((result, durable)) => responder.respond(durable.wait().await.map(|()| result)),
+                Err(error) => responder.err(error),
+            }
+        });
+    }
+    if method.starts_with("frame.") && Frame::is_long_running(&method) {
+        return Box::pin(async move {
+            let IncomingRequest { method, params, responder, cancel, .. } = request;
+            // Detached: a caller that cancels or disconnects gets `cancelled`, but a swap always
+            // runs to completion (dropping it half-way could orphan a staged instance).
+            let work = tokio::spawn(frame.serve_long(method, params));
+            tokio::select! {
+                joined = work => {
+                    responder.respond(joined.unwrap_or_else(|error| Err(RpcError::internal(format!("frame task failed: {error}")))));
+                }
+                _ = cancel.cancelled() => responder.err(RpcError::cancelled()),
+            }
+        });
+    }
+    if method.starts_with("frame.") {
+        let IncomingRequest { method, params, responder, .. } = request;
+        let outcome = frame.serve_now(&peer, &method, params);
+        let rejected = method == methods::HELLO
+            && outcome
+                .as_ref()
+                .is_ok_and(|ack| ack.get("accepted") == Some(&Value::Bool(false)));
+        let persist = matches!(
+            method.as_str(),
+            methods::PROJECT_OPEN
+                | methods::PROJECT_DELETE
+                | methods::SESSION_CREATE
+                | methods::SESSION_UPDATE
+                | methods::SESSION_DELETE
+                | methods::UI_STATE_PUT
+        );
+        if persist && outcome.is_ok() {
+            return Box::pin(async move {
+                match frame.state.flush().await {
+                    Ok(()) => responder.respond(outcome),
+                    Err(error) => responder.err(error),
+                }
+            });
+        }
+        responder.respond(outcome);
+        if rejected
+            && peer.kind == PeerKind::Plugin
+            && let Some(conn) = peer.conn()
+        {
+            // A process the frame cannot admit is disconnected (the reply is flushed first).
+            conn.close();
+        }
+        return Box::pin(async {});
+    }
+    let category = category_of(&method).to_owned();
+    if contract_of(&category).is_none() {
+        return Box::pin(async move {
+            request.responder.err(RpcError::unknown_method(&method));
+        });
+    }
+    let IncomingRequest { method, params, responder, cancel, .. } = request;
+    let first = frame.dispatch(&category, &method, params.clone());
+    Box::pin(forward(frame, category, method, params, first, responder, cancel))
 }
 
 /// Relay one forwarded call. A `draining` answer (an old instance that already began draining when
