@@ -250,6 +250,7 @@ impl Units {
             let _ = std::fs::remove_file(&archive);
             let _ = std::fs::remove_file(result_path(&archive));
         }
+        units.take_known_categories();
         units.sort();
         units.choose_serving();
         units.persist()?;
@@ -260,6 +261,31 @@ impl Units {
             tracing::warn!(%error, "cannot remove the old plugins.json");
         }
         Ok(units)
+    }
+
+    /// A plugin whose current version serves a category this frame no longer knows could not run:
+    /// at startup it takes its newest installed version that serves a known one (an update an older
+    /// frame refused is already unpacked).
+    fn take_known_categories(&self) {
+        let known = |installed: &Installed| {
+            installed.manifest.backend.as_ref().is_none_or(|backend| cc_protocol::contracts::contract_of(&backend.category).is_some())
+        };
+        for unit in self.all() {
+            if known(&unit.current()) {
+                continue;
+            }
+            let newest = crate::package::versions(&self.root, &unit.id)
+                .into_iter()
+                .filter_map(|version| crate::package::load(&self.root, &unit.id, &version).ok())
+                .filter(|installed| known(installed))
+                .max_by(|a, b| if cc_protocol::version::is_newer(a.version(), b.version()) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less });
+            if let Some(newest) = newest {
+                tracing::info!(plugin = %unit.id, from = %unit.current().version(), to = %newest.version(), "the plugin's category is gone from this frame; it runs its newest version that serves a known one");
+                let mut state = unit.lock();
+                let old = std::mem::replace(&mut state.current, Arc::new(newest));
+                state.previous = Some(old);
+            }
+        }
     }
 
     /// Decide, at startup, which plugin serves each category.
@@ -689,43 +715,21 @@ fn held_message(version: &str) -> String {
 /// them, and answer that they wait.
 fn hold_for_restart(frame: &Frame, archives: &[PathBuf]) -> Option<RpcError> {
     let version = crate::update::restart_pending(&frame.home.root)?;
+    let incoming = frame.units.root.join(INCOMING);
     for archive in archives {
-        if let Err(error) = keep_for_start(frame, archive) {
-            return Some(RpcError::internal(format!("CortexCode {version} is staged, and {error}")));
+        let Some(name) = archive.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let name = if name.ends_with(".ccplugin") { name } else { format!("{name}.ccplugin") };
+        let staging = incoming.join(format!(".{name}.{}", std::process::id()));
+        let placed = std::fs::create_dir_all(&incoming)
+            .and_then(|()| std::fs::copy(archive, &staging))
+            .and_then(|_| std::fs::rename(&staging, incoming.join(&name)));
+        if let Err(error) = placed {
+            let _ = std::fs::remove_file(&staging);
+            return Some(RpcError::internal(format!("CortexCode {version} is staged, and {name} could not be kept for the restart: {error}")));
         }
-        tracing::info!(package = %archive.display(), %version, "a frame update is staged; the package installs at the restart");
+        tracing::info!(package = %name, %version, "a frame update is staged; the package installs at the restart");
     }
     Some(RpcError::new(RESTART_PENDING, held_message(&version)))
-}
-
-/// Put `archive` in `.incoming/`, where the next start installs it.
-fn keep_for_start(frame: &Frame, archive: &Path) -> Result<(), String> {
-    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = if name.ends_with(".ccplugin") { name } else { format!("{name}.ccplugin") };
-    let incoming = frame.units.root.join(INCOMING);
-    let staging = incoming.join(format!(".{name}.{}", std::process::id()));
-    let placed = std::fs::create_dir_all(&incoming)
-        .and_then(|()| std::fs::copy(archive, &staging))
-        .and_then(|_| std::fs::rename(&staging, incoming.join(&name)));
-    placed.map_err(|error| {
-        let _ = std::fs::remove_file(&staging);
-        format!("{name} could not be kept for the restart: {error}")
-    })
-}
-
-/// A package that moves its plugin to another category (one this frame no longer knows gave way)
-/// cannot be swapped in while running, since backends are swapped within a category: it waits in
-/// `.incoming/` and installs at the next start.
-fn hold_category_change(frame: &Frame, unit: &Unit, installed: &Installed, archive: &Path) -> Option<RpcError> {
-    let packed = installed.manifest.backend.as_ref().map(|b| b.category.clone());
-    if unit.category() == packed {
-        return None;
-    }
-    if let Err(error) = keep_for_start(frame, archive) {
-        return Some(RpcError::internal(error));
-    }
-    tracing::info!(plugin = %unit.id, version = %installed.version(), "the package moves the plugin to another category; it installs at the restart");
-    Some(RpcError::new(RESTART_PENDING, format!("{} {} installs when the app restarts: it serves a new category.", unit.id, installed.version())))
 }
 
 fn step(list: &mut Vec<SwapStep>, name: &str, ok: bool, started: Instant, detail: impl Into<String>) {
@@ -876,10 +880,8 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
     let mut prepared = Vec::new();
     let mut previous = BTreeMap::new();
     let mut targets = BTreeMap::new();
-    let archives: Vec<PathBuf> = params.paths.iter().map(PathBuf::from).collect();
-    let mut moves_category = None;
     // Validate and unpack everything before replacing any running version.
-    for archive in archives.clone() {
+    for archive in params.paths.iter().map(PathBuf::from) {
         if !archive.is_absolute() { return Err(RpcError::invalid_params("package paths must be absolute")); }
         let copy = frame.clone();
         let installed = tokio::task::spawn_blocking(move || {
@@ -889,23 +891,11 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
         if targets.contains_key(&id) { return Err(RpcError::invalid_params(format!("duplicate plugin `{id}` in install"))); }
         let unit = frame.units.get(&id).ok_or_else(|| RpcError::invalid_params(format!("{id} has no installed version to restore; install this new plugin separately")))?;
         check_same_category(&unit, &installed).map_err(RpcError::invalid_params)?;
-        if moves_category.is_none() && unit.category() != installed.manifest.backend.as_ref().map(|b| b.category.clone()) {
-            moves_category = Some(format!("{id} {}", installed.version()));
-        }
         let state = unit.lock();
         previous.insert(id.clone(), InstalledRecord { current: state.current.version().to_owned(), previous: state.previous.as_ref().map(|p| p.version().to_owned()), known_good: state.known_good.clone() });
         targets.insert(id, installed.version().to_owned());
         drop(state);
         prepared.push(Arc::new(installed));
-    }
-    // A package that moves its plugin to another category installs at the next start, and the
-    // rest of the batch with it, so the batch lands together.
-    if let Some(moved) = moves_category {
-        for archive in &archives {
-            keep_for_start(frame, archive).map_err(RpcError::internal)?;
-        }
-        tracing::info!(package = %moved, "the package moves its plugin to another category; the batch installs at the restart");
-        return Err(RpcError::new(RESTART_PENDING, format!("{moved} serves a new category: the update installs when the app restarts.")));
     }
     // The successor can wait for this operation after activation; no work remains in its parent.
     prepared.sort_by_key(|installed| installed.manifest.backend.as_ref().is_some_and(|b| b.category == "source"));
@@ -922,7 +912,11 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
         attempted.push(installed.id().to_owned());
         let from_version = unit.current().version().to_owned();
         let mut steps = Vec::new();
-        let outcome = switch(frame, &unit, installed.clone(), "install", &mut steps).await;
+        let outcome = if moves_category(&unit, installed) {
+            move_category(frame, &unit, installed.clone(), &mut steps).await
+        } else {
+            switch(frame, &unit, installed.clone(), "install", &mut steps).await
+        };
         match finish(frame, &unit, from_version, steps, outcome) {
             Ok(swapped) => {
                 let persistence_error = swapped.steps.iter().find(|step| step.step == "persist" && !step.ok).map(|step| step.detail.clone());
@@ -1014,7 +1008,6 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
     let started = Instant::now();
     let installed = {
         let frame = frame.clone();
-        let archive = archive.clone();
         tokio::task::spawn_blocking(move || {
             crate::package::install_archive(&frame.units.root, &archive, &|id, version| frame.units.in_use(id, version))
         })
@@ -1028,11 +1021,12 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
     let (unit, from_version, outcome) = match frame.units.get(&id) {
         Some(unit) => {
             check_same_category(&unit, &installed).map_err(RpcError::invalid_params)?;
-            if let Some(held) = hold_category_change(frame, &unit, &installed, &archive) {
-                return Err(held);
-            }
             let from_version = unit.current().version().to_owned();
-            let outcome = switch(frame, &unit, installed.clone(), "install", &mut steps).await;
+            let outcome = if moves_category(&unit, &installed) {
+                move_category(frame, &unit, installed.clone(), &mut steps).await
+            } else {
+                switch(frame, &unit, installed.clone(), "install", &mut steps).await
+            };
             (unit, from_version, outcome)
         }
         None => {
@@ -1108,6 +1102,40 @@ async fn start_new(frame: &Arc<Frame>, unit: &Arc<Unit>, steps: &mut Vec<SwapSte
     let changes = frame.refresh_ui().await;
     step(steps, "ui", true, started, format!("{} UI package(s) served", changes.len()));
     Ok(backend_swap)
+}
+
+/// Whether `installed` moves `unit` to another category (allowed by `check_same_category` only when
+/// this frame no longer knows the old one).
+fn moves_category(unit: &Unit, installed: &Installed) -> bool {
+    unit.category() != installed.manifest.backend.as_ref().map(|backend| backend.category.clone())
+}
+
+/// A plugin whose category this frame no longer knows runs nothing (its hello is refused): its
+/// old slot stops, the new version becomes current and starts in the category its package serves,
+/// as a new plugin does.
+async fn move_category(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>, steps: &mut Vec<SwapStep>) -> Outcome {
+    if let Some(old) = unit.category()
+        && let Some(slot) = frame.sup.slot(&old).filter(|slot| slot.plugin() == unit.id)
+    {
+        steps.extend(supervisor::disable(frame, &slot).await);
+    }
+    {
+        let mut state = unit.lock();
+        let old = std::mem::replace(&mut state.current, to.clone());
+        if old.version() != to.version() {
+            state.previous = Some(old);
+        }
+    }
+    if let Some(backend) = backend_config(&to, &frame.units.override_of(&unit.id))
+        && frame.sup.slot(&backend.category).is_none()
+    {
+        frame.sup.add_slot(supervisor::Slot::new(&backend, false)).map_err(|error| (error, None))?;
+        if let Ok(mut serving) = frame.units.serving.lock() {
+            serving.insert(backend.category.clone(), (unit.id.clone(), "only"));
+        }
+    }
+    steps.push(SwapStep { step: "category".into(), ok: true, ms: 0, detail: format!("{} serves `{}` now", unit.id, unit.category().unwrap_or_default()) });
+    start_new(frame, unit, steps).await
 }
 
 /// Swap `unit` to `to`: the backend first (the swap engine probes it and keeps the old version on

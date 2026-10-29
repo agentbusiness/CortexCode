@@ -105,6 +105,14 @@ pub fn acquire_lock(home: &Home) -> std::io::Result<LockOutcome> {
     Err(error)
 }
 
+/// Whether a live frame holds the home's lock now (the lock is tested, not kept).
+pub fn lock_held(home: &Home) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(home.lock_file()) else { return false };
+    // SAFETY: flock on a valid, owned file descriptor; closing the file releases a lock taken here.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
 pub fn read_frame_info(path: &Path) -> Option<FrameInfo> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
