@@ -319,9 +319,9 @@ function Sidebar() {
         ) : <AwayProject key={row.key} row={row} />)}
       </div>
       <div className="cx-sidebar-foot">
-        <button type="button" className="detent cx-sidebar-fold" data-action="collapse-sidebar"
+        <button type="button" className="detent cx-sidebar-fold" data-action="collapse-sidebar" aria-label="Fold the sidebar"
           title="Fold the sidebar to a strip of marks; the conversation takes the width" onClick={() => setStrip(true)}>
-          <Caret dir="left" /> Fold
+          <Caret dir="left" />
         </button>
       </div>
     </div>

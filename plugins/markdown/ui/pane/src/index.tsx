@@ -1,6 +1,8 @@
 /**
  * pane.markdown@1 — a Markdown file of the workspace, rendered as reading (the design's `.prose`).
- * Links to other Markdown files open here; web links open in the browser pane.
+ * Links to other Markdown files open here; web links open in the browser pane. With none open, every
+ * Markdown file of the project (memory.files, the index; the top folder while there is none), by
+ * folder; Documents goes back to that list.
  */
 
 import Markdown, { type Components } from 'react-markdown';
@@ -39,7 +41,7 @@ export function resolveRelative(from: string, link: string): string {
 
 function MarkdownPane() {
   const client = useClient();
-  const { workspace } = useSelection();
+  const { workspace, projectId } = useSelection();
   const [open] = useShared<OpenFile | null>('markdown.open', null);
   const file = open && open.root === workspace ? open : null;
   const content = useQuery<string>(
@@ -47,12 +49,28 @@ function MarkdownPane() {
     async (c) => decodeRead(await c.call<ReadResult>('tools.read', { workspace: file!.root, target: file!.path }), file!.path).text,
     { topics: ['tools.files_changed'], when: (_topic, data) => Boolean(file && ((data as { paths?: string[] } | null)?.paths ?? []).includes(file.path)) },
   );
+  // Every Markdown file of the project, from the index; the workspace's top folder while the
+  // project has no index yet.
+  const indexed = useQuery<string[]>(
+    projectId && workspace ? `memory.files:${projectId}:${workspace}` : null,
+    async (c) => (await c.call<{ paths: string[] }>('memory.files', { project_id: projectId, workspace }))?.paths ?? [],
+    { topics: ['memory.indexed'] },
+  );
   const listing = useQuery<FileEntry[]>(
-    workspace ? `tools.files:${workspace}:` : null,
+    workspace && indexed.error ? `tools.files:${workspace}:` : null,
     async (c) => (await c.call<{ entries: FileEntry[] }>('tools.files', { workspace }))?.entries ?? [],
     { topics: ['tools.files_changed'] },
   );
-  const documents = (listing.data ?? []).filter((entry) => !entry.is_dir && /\.(md|markdown)$/i.test(entry.path)).map((entry) => entry.path.replace(/^\.\//, ''));
+  const isDoc = (path: string) => /\.(md|markdown)$/i.test(path);
+  const documents = indexed.data
+    ? indexed.data.filter(isDoc)
+    : (listing.data ?? []).filter((entry) => !entry.is_dir && isDoc(entry.path)).map((entry) => entry.path.replace(/^\.\//, ''));
+  const folders = new Map<string, string[]>();
+  for (const path of documents) {
+    const folder = dirname(path);
+    folders.set(folder, [...(folders.get(folder) ?? []), path]);
+  }
+  const close = () => setShared('markdown.open', null);
 
   if (!workspace) return <div className="cx-md"><p className="empty-line">Open a project to read its documents.</p></div>;
   const components: Components = {
@@ -75,7 +93,8 @@ function MarkdownPane() {
   return (
     <div className="cx-md" data-build={__CORTEX_BUILD__} data-path={file?.path ?? ''}>
       <div className="bar">
-        <span className="ap faint cx-md-path">{file ? file.path : 'No document open'}</span>
+        {file && <button className="detent" type="button" data-action="documents" onClick={close} title="Back to every Markdown file of the project">‹ Documents</button>}
+        <span className="ap faint cx-md-path">{file ? file.path : `${documents.length} document${documents.length === 1 ? '' : 's'}`}</span>
         <div className="grow" />
         {file && (
           <button className="detent" type="button" onClick={() => openInCode({ root: file.root, path: file.path })}>Edit</button>
@@ -84,17 +103,21 @@ function MarkdownPane() {
       <div className="cx-md-scroll">
         {!file && (
           <>
-            <p className="hint">Documents in this folder:</p>
-            {documents.length === 0 && <p className="empty-line">No Markdown files at the top of {workspace}.</p>}
-            <ul className="lst">
-              {documents.map((path) => (
-                <li key={path}>
-                  <button type="button" onClick={() => setShared('markdown.open', { root: workspace, path })}>
-                    <div className="t">{path}</div>
-                  </button>
-                </li>
-              ))}
-            </ul>
+            {documents.length === 0 && <p className="empty-line">{indexed.loading || listing.loading ? 'Looking for Markdown files…' : 'No Markdown files in this project.'}</p>}
+            {[...folders.entries()].map(([folder, paths]) => (
+              <section key={folder} className="cx-md-folder">
+                <div className="ap faint">{folder || 'top folder'}</div>
+                <ul className="lst">
+                  {paths.map((path) => (
+                    <li key={path}>
+                      <button type="button" onClick={() => setShared('markdown.open', { root: workspace, path })}>
+                        <div className="t">{path.slice(folder ? folder.length + 1 : 0)}</div>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
           </>
         )}
         {file && content.error && !content.data && <p className="inline-error">Could not read {file.path}: {content.error}</p>}

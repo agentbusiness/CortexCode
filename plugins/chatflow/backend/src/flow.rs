@@ -492,11 +492,10 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 } else {
                     Vec::new()
                 };
-                // What the message does to the spec: structural (marked, long) or the router's word.
+                // What the message does to the spec: the router's word, or structural (long).
                 let message = entries.iter().rev().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == env.run_id);
-                let marked = message.and_then(|entry| entry.data.get("spec")).and_then(Value::as_bool) == Some(true);
                 let chars = message.map(|entry| str_field(&entry.data, "text").chars().count()).unwrap_or(0);
-                let spec_action = spec::action(&decision.spec, has_spec, marked, chars, &env.data.limits);
+                let spec_action = spec::action(&decision.spec, has_spec, chars, &env.data.limits);
                 let settles = decision.settles == "yes";
                 let teaches = decision.teaches == "yes";
                 journal

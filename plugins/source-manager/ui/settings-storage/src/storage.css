@@ -1,5 +1,5 @@
 /* settings.storage@1 — the home as a settings .row, the parts as a .tbl (both from the theme). */
-#cc .cx-storage{max-width:none;width:100%;}
+#cc .cx-storage{width:100%;}
 #cc .cx-storage td{vertical-align:top;}
 #cc .cx-storage td:nth-child(2){white-space:nowrap;text-align:right;}
 #cc .cx-storage td:last-child{text-align:right;}

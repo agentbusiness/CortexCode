@@ -2,10 +2,23 @@
 #cc .cx-composer-plugin{flex:none;}
 #cc .cx-composer-plugin .composer{margin-top:12px;}
 #cc .cx-send-error{margin:8px 0 0;}
+/* one box: the field, then its controls inside it (+ and mode left, Stop and Send right) */
+#cc .cx-composer .cx-box{border:1px solid var(--rule-2);}
+#cc .cx-composer .cx-box:focus-within{border-color:var(--rubric);}
+#cc .cx-composer .cx-box .write{border:0;padding-bottom:4px;}
+#cc .cx-composer .cx-tools{margin:0;padding:0 8px 8px;}
+#cc .cx-composer .cx-plus{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;padding:0;
+  border:1px solid var(--rule-2);background:transparent;color:var(--ink-2);font:400 17px/1 Archivo,sans-serif;cursor:pointer;}
+#cc .cx-composer .cx-plus:hover{color:var(--ink);border-color:var(--ink-3);}
+#cc .cx-composer .cx-plus:disabled{color:var(--ink-3);border-color:var(--rule);cursor:default;}
+#cc .cx-composer .cx-mode{border-color:transparent;}
+#cc .cx-composer .cx-tools .detent.send{height:24px;padding:0 14px;background:var(--rubric);border-color:var(--rubric);color:var(--ground);}
+#cc .cx-composer .cx-tools .detent.send:hover{background:var(--rubric-lift);border-color:var(--rubric-lift);color:var(--ground);}
+#cc .cx-composer .cx-tools .detent.send:disabled{background:transparent;border-color:var(--rule);color:var(--ink-3);}
 #cc .cx-composer .cx-target{max-width:260px;}
 #cc .cx-composer .cx-target .v{overflow:hidden;text-overflow:ellipsis;}
 /* attachments: chips above the field (the design's `.attached` / `.chip`), a preview for images */
-#cc .cx-composer[data-dragging="true"] .write{border-color:var(--rubric);}
+#cc .cx-composer[data-dragging="true"] .cx-box{border-color:var(--rubric);}
 #cc .cx-composer .cx-attached{list-style:none;margin:0 0 8px;padding:0;}
 #cc .cx-composer .cx-chip{max-width:280px;text-transform:none;letter-spacing:.02em;font-size:11px;}
 #cc .cx-composer .cx-chip:has(.cx-thumb){height:auto;padding:4px 8px 4px 4px;}

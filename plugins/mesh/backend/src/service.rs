@@ -5,7 +5,7 @@ use crate::identity::Identity;
 use crate::members::{Entry, Log, log_path};
 use crate::pairing::JoinerRecord;
 use cc_protocol::contracts::mesh::{
-    CallParams, CapacityParams, Card, Changed, ClaimParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
+    CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
     topics,
 };
 use cc_protocol::contracts::model::ModelInfo;
@@ -35,6 +35,7 @@ pub const PROVIDES: &[&str] = &[
     methods::PEERS,
     methods::CALL,
     methods::NAME,
+    methods::LEND,
     methods::PLACE,
     methods::PLACE_END,
     methods::CAPACITY,
@@ -379,12 +380,20 @@ impl Mesh {
             if let (Some(ctx), Some(model)) = (self.ctx.get(), card.model.as_mut()) {
                 crate::card::refresh_load(ctx, model).await;
             }
+            if !self.lends() {
+                card.model = None;
+            }
             return card;
         }
         let card = match self.ctx.get() {
             Some(ctx) => crate::card::build(ctx, &self.me.hex(), &self.name(), &self.home).await,
             None => Card { node: self.me.hex(), name: self.name(), software: "cortexcode".to_owned(), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
         };
+        let mut card = card;
+        // A model this computer does not lend is not shown to the members.
+        if !self.lends() {
+            card.model = None;
+        }
         *lock(&self.my_card) = Some(card.clone());
         card
     }
@@ -414,7 +423,7 @@ impl Mesh {
             .get("plugins")
             .and_then(Value::as_array)
             .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some(category) && plugin.get("state").and_then(Value::as_str) == Some("active")));
-        if !active {
+        if !active || !self.lends() {
             return Vec::new();
         }
         if category != "model" {
@@ -486,7 +495,13 @@ impl Mesh {
             pairing,
             serving,
             placed: self.placed(),
+            lend: self.lends(),
         }
+    }
+
+    /// Members may use this computer's model (off while `<home>/mesh/no-lend` exists).
+    pub fn lends(&self) -> bool {
+        !self.home.join("mesh").join("no-lend").exists()
     }
 
     fn peers(&self) -> PeersResult {
@@ -583,6 +598,19 @@ impl Mesh {
                 self.notify("members");
                 Ok(json!({}))
             }
+            methods::LEND => {
+                let params: LendParams = parse_params(params)?;
+                let marker = self.home.join("mesh").join("no-lend");
+                let written = if params.lend {
+                    std::fs::remove_file(&marker).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) })
+                } else {
+                    std::fs::create_dir_all(self.home.join("mesh")).and_then(|_| std::fs::write(&marker, ""))
+                };
+                written.map_err(|error| RpcError::internal(format!("cannot record the lending choice: {error}")))?;
+                *lock(&self.my_card) = None;
+                self.notify("members");
+                to_value(&self.status())
+            }
             methods::CALL => {
                 let mut params: CallParams = parse_params(params)?;
                 params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
@@ -638,10 +666,8 @@ impl Mesh {
     }
 
     /// Automatic placement of the model (`docs/MESH-IMPLEMENTATION-PLAN.md` §6, §8): when this
-    /// node has no model of its own serving (none installed, or disabled by the person) and a
-    /// reachable member lends one with a free slot, that member's model serves here; when the
-    /// member goes away, the borrow stops (and this node's own plugin, if it was set aside for
-    /// the borrow, serves again). The best model with a free slot is taken: the strongest (the
+    /// node has no model plugin installed and a reachable member lends one with a free slot, that
+    /// member's model serves here; when the member goes away, the borrow stops. The best model with a free slot is taken: the strongest (the
     /// larger weights), then the nearest, then the fastest. Nothing to configure.
     /// (A node with a model of its own places single sessions instead: `place.rs`.)
     pub async fn auto_place(self: &std::sync::Arc<Self>) {
@@ -655,14 +681,15 @@ impl Mesh {
             }
             return;
         }
-        // Only a node without a model of its own borrows one as a whole; a node with a model keeps
-        // it and sends single sessions to free members (`place.rs`).
+        // Only a node without a model plugin of its own borrows one as a whole; a node with one
+        // keeps it, even while it downloads or loads, and sends single sessions to free members
+        // (`place.rs`).
         let listed: Value = ctx.call("frame.plugins.list", json!({})).await.unwrap_or(Value::Null);
-        let own_model_active = listed
+        let own_model = listed
             .get("plugins")
             .and_then(Value::as_array)
-            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some("model") && plugin.get("state").and_then(Value::as_str) == Some("active")));
-        if own_model_active {
+            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some("model") && plugin.get("transport").and_then(Value::as_str) != Some("websocket")));
+        if own_model {
             return;
         }
         let cards = lock(&self.cards).clone();

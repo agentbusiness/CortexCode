@@ -162,6 +162,7 @@ export function ResetAll() {
         )}
         {plan?.offline && <span className="cx-settings-line cx-reset-offline" title={plan.offline}>No official release can be read; the app's own build is the reference.</span>}
       </div>
+      <CheckUpdates />
       <button className="detent warn" type="button" data-action="reset-all" disabled={open || state !== 'differs'} onClick={start}
         title={state === 'differs' ? 'Every plugin back to the build it should run, your changes dropped' : 'Nothing to reset'}>Reset all plugins…</button>
     </div>
@@ -234,6 +235,40 @@ export function ResetAll() {
         </div>,
         root,
       )}
+    </>
+  );
+}
+
+interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { status: string }[]; restart?: unknown | null }
+
+/** Look at the catalog now (update.check): what applies by itself installs, as the updater's popup
+ * shows; here one line says what the check found. */
+function CheckUpdates() {
+  const client = useClient();
+  const [checking, setChecking] = useState(false);
+  const [found, setFound] = useState<string | null>(null);
+  const check = async () => {
+    setChecking(true);
+    setFound(null);
+    try {
+      const status = await client.call<CheckStatus>('update.check', {});
+      const busy = (status.round ?? []).filter((item) => item.status !== 'done' && item.status !== 'failed').length;
+      setFound(status.error ? `The check failed: ${status.error}`
+        : busy > 0 ? `${busy === 1 ? '1 update' : `${busy} updates`} installing`
+        : (status.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
+        : (status.pending?.length ?? 0) > 0 ? 'Updates wait for your answer'
+        : status.restart ? 'Restart to finish the update'
+        : 'Everything is up to date');
+    } catch (cause) {
+      setFound(errorMessage(cause));
+    } finally {
+      setChecking(false);
+    }
+  };
+  return (
+    <>
+      {found && <span className="ap faint" data-update-check={found}>{found}</span>}
+      <button className="detent" type="button" data-action="check-updates" disabled={checking} onClick={() => void check()}>{checking ? 'Checking…' : 'Check for updates'}</button>
     </>
   );
 }

@@ -67,13 +67,8 @@ function IndexSection() {
           ) : <span className="ap faint">…</span>}
           <span className="grow" />
           {data ? (
-            <button className="cx-icon" type="button" disabled={busy} title="Refresh the index" aria-label="Refresh the index" data-action="refresh"
-              onClick={() => void run('memory.refresh', { project_id: projectId }, 'Index refreshed')}>
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true" className={busy ? 'spin' : undefined}>
-                <path d="M13 8a5 5 0 1 1-1.5-3.6" strokeLinecap="round" />
-                <path d="M11.8 1.8v2.9H8.9" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
+            <button className="detent tiny" type="button" disabled={busy} title="Read changed files into the index again" data-action="refresh"
+              onClick={() => void run('memory.refresh', { project_id: projectId }, 'Index refreshed')}>{busy ? 'Indexing…' : 'Refresh'}</button>
           ) : (
             <button className="detent tiny" type="button" disabled={busy || !project} onClick={() => void run('memory.project.open', { root: project!.root, project_id: projectId }, `Indexing ${project!.name}`)}>Index</button>
           )}

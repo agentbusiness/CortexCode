@@ -684,10 +684,6 @@ impl Chatflow {
             return Ok(TurnResult { run_id, queued_as_steer: true });
         };
         let mut message = json!({"text": params.text, "run_id": run_id});
-        if params.spec {
-            // The user marked the message as the session's spec (the composer's Spec toggle).
-            message["spec"] = json!(true);
-        }
         if !params.mentions.is_empty() {
             message["mentions"] = json!(params.mentions);
         }

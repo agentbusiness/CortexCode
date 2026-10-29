@@ -2,8 +2,8 @@
 //! checklist) and the decision log (decisions the discussion settled, proposed by the model and
 //! accepted by the user). See docs/IDEATION-WORKFLOW.md, parts 1 and 5.
 //!
-//! - A message becomes the spec when the user marked it or by the router's judgement (`spec` new /
-//!   amend); by length (`limits.spec_min_chars`, off by default) only when that limit is set. Its requirements come from one constrained SPEC call; a later message that
+//! - A message becomes the spec by the router's judgement (`spec` new / amend), read from what the
+//!   message asks for; by length (`limits.spec_min_chars`, off by default) only when that limit is set. Its requirements come from one constrained SPEC call; a later message that
 //!   changes them is one constrained SPEC_EDIT call (added, dropped and changed ids).
 //! - Every change is a new `spec` journal entry (a version); the newest is the spec. The user edits
 //!   it through `chatflow.spec.update` (a version `by: user`). A version's number is its place in
@@ -260,12 +260,9 @@ pub fn live_text(ds: &Dataset, entries: &[JournalEntry], key: &str) -> String {
     }
 }
 
-/// What a message does to the spec: `new`, `amend` or `none`. Structural first (the user marked
-/// it; a long message while there is no spec), then the router's judgement.
-pub fn action(judged: &str, has_spec: bool, marked: bool, text_chars: usize, limits: &Limits) -> &'static str {
-    if marked {
-        return "new";
-    }
+/// What a message does to the spec: `new`, `amend` or `none`. The router's judgement, else
+/// structural (a long message while there is no spec).
+pub fn action(judged: &str, has_spec: bool, text_chars: usize, limits: &Limits) -> &'static str {
     match judged {
         "amend" if has_spec => "amend",
         "new" => "new",

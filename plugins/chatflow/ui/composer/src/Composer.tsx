@@ -54,10 +54,11 @@ export function targetLabel(target: Target): string {
 /**
  * Where text is written and sent. While a run is going, what is sent
  * steers it — injected at its next step — or waits as a follow-up for after it; a running agent
- * can be addressed the same way. Enter sends, as in any text field; every action is a button.
+ * can be addressed the same way. Enter sends, as in any text field; the controls sit inside the
+ * field's box: + and the mode (Auto, Ask) on the left, Stop and Send on the right.
  *
  * Attachments: paste an image (a screenshot straight from the clipboard) or files and folders copied
- * in Finder, drop them on the composer, or pick them with Attach (files or a folder); each becomes a chip (a preview for images) that can be
+ * in Finder, drop them on the composer, or pick them with + (files and folders in one dialog); each becomes a chip (a preview for images) that can be
  * removed before sending (its × button, or Backspace in an empty field removes the last one).
  * Pasted text over the paste-as-file limit becomes a text-file chip ("Pasted text · N lines"): the
  * model reads its path and a head/tail preview instead of the whole text; View shows it, Inline
@@ -84,8 +85,6 @@ export function Composer({
   onAttachments,
   attach,
   pasteAsFile = PASTE_AS_FILE,
-  specMarked = false,
-  onSpecMarked,
   mentions,
 }: {
   draft: string;
@@ -108,9 +107,6 @@ export function Composer({
   attach: AttachContext;
   /** When pasted text goes as a file instead of message text. */
   pasteAsFile?: PasteAsFile;
-  /** The next new turn's message is marked as the session's spec (the Spec toggle). */
-  specMarked?: boolean;
-  onSpecMarked?: (marked: boolean) => void;
   /** `@` mentions of other projects (no completion without it). */
   mentions?: MentionSource;
 }) {
@@ -198,9 +194,14 @@ export function Composer({
     add(fromDataTransfer(event.dataTransfer, attach.shell));
   };
 
-  const pickFolder = async () => {
-    const path = await attach.shell?.pickFolder('Attach a folder');
-    if (path) add([{ type: 'folder', name: baseName(path), path }]);
+  /** The + button: files and folders in one dialog (a shell without it opens the file picker). */
+  const pick = async () => {
+    if (!attach.shell?.pickPaths) {
+      picker.current?.click();
+      return;
+    }
+    const paths = await attach.shell.pickPaths('Attach files or folders');
+    add(paths.map((path) => ({ type: 'path', name: baseName(path), path })));
   };
 
   const remove = (index: number) => onAttachments((current) => current.filter((_, at) => at !== index));
@@ -338,9 +339,9 @@ export function Composer({
     }
   };
 
-  const attachItems: MenuItem[] = [
-    { key: 'files', label: 'Files or images', note: 'One or more files from this machine', onSelect: () => picker.current?.click() },
-    { key: 'folder', label: 'Folder', note: 'The model gets its path and its top-level listing', onSelect: () => void pickFolder() },
+  const modeItems: MenuItem[] = [
+    { key: 'auto', label: 'Auto', note: 'Never ask: every local change can be undone', selected: mode === 'auto', onSelect: () => onMode('auto') },
+    { key: 'ask', label: 'Ask', note: 'Ask before anything that leaves this machine or cannot be undone', selected: mode === 'ask', onSelect: () => onMode('ask') },
   ];
 
   const items: MenuItem[] = options.map((option) => ({
@@ -413,96 +414,81 @@ export function Composer({
           {info && <p className="hint cx-mentions-info">{info}</p>}
         </div>
       )}
-      <textarea
-        ref={area}
-        className="write"
-        rows={1}
-        value={draft}
-        disabled={disabled}
-        placeholder={placeholder}
-        aria-label="Message"
-        onChange={(event) => {
-          setCaret(event.target.selectionStart ?? event.target.value.length);
-          setActive(0);
-          onDraft(event.target.value);
-        }}
-        onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? draft.length)}
-        onPaste={onPaste}
-        aria-autocomplete={mentions ? 'list' : undefined}
-        aria-expanded={mentions ? open : undefined}
-        aria-controls={open ? 'cx-mentions' : undefined}
-        onKeyDown={(event) => {
-          // The mention completion takes the keys it uses while it is open.
-          if (open && completing && !event.nativeEvent.isComposing) {
-            if (event.key === 'Escape') {
+      <div className="cx-box">
+        <textarea
+          ref={area}
+          className="write"
+          rows={1}
+          value={draft}
+          disabled={disabled}
+          placeholder={placeholder}
+          aria-label="Message"
+          onChange={(event) => {
+            setCaret(event.target.selectionStart ?? event.target.value.length);
+            setActive(0);
+            onDraft(event.target.value);
+          }}
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? draft.length)}
+          onPaste={onPaste}
+          aria-autocomplete={mentions ? 'list' : undefined}
+          aria-expanded={mentions ? open : undefined}
+          aria-controls={open ? 'cx-mentions' : undefined}
+          onKeyDown={(event) => {
+            // The mention completion takes the keys it uses while it is open.
+            if (open && completing && !event.nativeEvent.isComposing) {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                setDismissed(completing.from);
+                return;
+              }
+              if (choices.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                event.preventDefault();
+                setActive((highlighted + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);
+                return;
+              }
+              if (choices.length > 0 && (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey))) {
+                event.preventDefault();
+                take(choices[highlighted]!);
+                return;
+              }
+            }
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
-              setDismissed(completing.from);
+              void send();
               return;
             }
-            if (choices.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+            // Backspace in an empty field takes back the last attachment.
+            if (event.key === 'Backspace' && draft === '' && attachments.length > 0) {
               event.preventDefault();
-              setActive((highlighted + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length);
-              return;
+              remove(attachments.length - 1);
             }
-            if (choices.length > 0 && (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey))) {
-              event.preventDefault();
-              take(choices[highlighted]!);
-              return;
-            }
-          }
-          if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            void send();
-            return;
-          }
-          // Backspace in an empty field takes back the last attachment.
-          if (event.key === 'Backspace' && draft === '' && attachments.length > 0) {
-            event.preventDefault();
-            remove(attachments.length - 1);
-          }
-        }}
-      />
-      <input ref={picker} type="file" multiple hidden aria-hidden="true" tabIndex={-1} className="cx-attach-input"
-        onChange={(event) => {
-          const files = Array.from(event.currentTarget.files ?? []);
-          event.currentTarget.value = '';
-          add(files.map((file) => ({ type: 'file', file, pasted: false })));
-        }} />
-      <div className="tools" role="group" aria-label="Chat tools">
-        <div className="seg-set" role="group" aria-label="Mode">
-          <button type="button" aria-pressed={mode === 'ask'} onClick={() => onMode('ask')}
-            title="Ask before anything that leaves this machine or cannot be undone">Ask</button>
-          <button type="button" aria-pressed={mode === 'auto'} onClick={() => onMode('auto')}
-            title="Never ask: every local change can be undone">Auto</button>
-        </div>
-        {attach.shell ? (
-          <Menu label="Attach" items={attachItems} disabled={disabled} className="cx-attach"
-            title="Attach files, images or a folder (or paste from the clipboard, or drop them here)" />
-        ) : (
-          <div className="seg-set cx-attach" role="group" aria-label="Attach">
-            <button type="button" disabled={disabled} onClick={() => picker.current?.click()}
-              title="Attach files or images (or paste from the clipboard, or drop them here)">Attach</button>
-          </div>
-        )}
-        {target.type === 'turn' && onSpecMarked && (
-          <div className="seg-set cx-spec-mark" role="group" aria-label="Spec">
-            <button type="button" aria-pressed={specMarked} onClick={() => onSpecMarked(!specMarked)}
-              title="Keep this message as the conversation's spec: its requirements become a checklist the work is held to">Spec</button>
-          </div>
-        )}
-        {options.length > 1 && (
-          <Menu label="To" value={targetLabel(target)} items={items} title="Where this message goes" className="cx-target" />
-        )}
-        <div className="grow" />
-        {running && !agentSession && (
-          <button className="detent warn" type="button" onClick={onStop} disabled={stopping}>
-            {stopping ? 'Stopping…' : 'Stop'}
+          }}
+        />
+        <input ref={picker} type="file" multiple hidden aria-hidden="true" tabIndex={-1} className="cx-attach-input"
+          onChange={(event) => {
+            const files = Array.from(event.currentTarget.files ?? []);
+            event.currentTarget.value = '';
+            add(files.map((file) => ({ type: 'file', file, pasted: false })));
+          }} />
+        <div className="tools cx-tools" role="group" aria-label="Chat tools">
+          <button type="button" className="cx-plus" disabled={disabled} onClick={() => void pick()} aria-label="Attach"
+            title="Attach files, images or folders (or paste from the clipboard, or drop them here)">+</button>
+          <Menu label={mode === 'auto' ? 'Auto' : 'Ask'} items={modeItems} className="cx-mode"
+            title="Ask before anything that leaves this machine or cannot be undone, or never ask" />
+          {options.length > 1 && (
+            <Menu label="To" value={targetLabel(target)} items={items} title="Where this message goes" className="cx-target" />
+          )}
+          <div className="grow" />
+          {running && !agentSession && (
+            <button className="detent warn" type="button" onClick={onStop} disabled={stopping}>
+              {stopping ? 'Stopping…' : 'Stop'}
+            </button>
+          )}
+          <button className="detent send" type="button" disabled={!canSend} onClick={() => void send()}
+            title={ready ? undefined : 'Waiting for attachments'}>
+            {sending ? 'Sending…' : target.type === 'turn' ? 'Send' : target.kind === 'steer' ? 'Steer' : 'Queue'}
           </button>
-        )}
-        <button className="detent send" type="button" disabled={!canSend} onClick={() => void send()}
-          title={ready ? undefined : 'Waiting for attachments'}>
-          {sending ? 'Sending…' : target.type === 'turn' ? 'Send' : target.kind === 'steer' ? 'Steer' : 'Queue'}
-        </button>
+        </div>
       </div>
     </div>
   );

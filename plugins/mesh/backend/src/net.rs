@@ -149,7 +149,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let since = params.get("since_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
             let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
             let tag = params.get("tag").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(cc_protocol::contracts::model::default_tag);
-            if !mesh.local_serves(&tag).await {
+            if !mesh.lends() || !mesh.local_serves(&tag).await {
                 let message = answer(Ok(json!({"granted": false})));
                 write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                 return Ok(());
@@ -222,7 +222,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             drop(rx);
         }
         _ => {
-            if !lendable(&method) {
+            if !lendable(&method) || !mesh.lends() {
                 let message = answer(Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{method}` is not lent to this member"))));
                 write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                 return Ok(());

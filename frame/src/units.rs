@@ -267,6 +267,12 @@ impl Units {
         let mut serving = BTreeMap::new();
         for category in categories {
             if let Some((unit, why)) = self.pick(&category) {
+                // The engine made for this machine serves even when something set it aside (a
+                // mesh borrow that ended with the app): every machine runs its own.
+                if why == "machine" && !unit.enabled() {
+                    tracing::info!(%category, plugin = %unit.id, "enabling the plugin made for this machine");
+                    unit.lock().enabled = true;
+                }
                 if why != "only" {
                     tracing::info!(%category, plugin = %unit.id, chosen_by = why, memory_gb = self.memory_bytes / (1 << 30), "category with alternatives");
                 }
@@ -278,12 +284,15 @@ impl Units {
         }
     }
 
-    /// The plugin that should serve `category`: the person's choice, else the one whose declared
-    /// machine range holds this machine, else the first enabled one.
+    /// The plugin that should serve `category`: one whose declared machine range excludes this
+    /// machine never serves while another fits; among the rest, the person's choice, else the one
+    /// whose range holds this machine, else the first enabled one.
     fn pick(&self, category: &str) -> Option<(Arc<Unit>, &'static str)> {
-        let units = self.units_of(category);
+        let all = self.units_of(category);
+        let units = self.for_machine(&all);
         if units.len() <= 1 {
-            return units.into_iter().next().map(|unit| (unit, "only"));
+            let why = if all.len() > 1 { "machine" } else { "only" };
+            return units.into_iter().next().map(|unit| (unit, why));
         }
         let chosen = self.providers.lock().ok().and_then(|providers| providers.get(category).cloned());
         if let Some(unit) = chosen.and_then(|id| units.iter().find(|unit| unit.id == id).cloned()) {
@@ -298,6 +307,18 @@ impl Units {
     /// Whether this machine is inside the unit's declared range (None: it declares none).
     fn fits_machine(&self, unit: &Unit) -> Option<bool> {
         unit.current().manifest.backend.as_ref()?.machine.as_ref().map(|fit| fit.holds(self.memory_bytes))
+    }
+
+    /// The units that may serve on this machine: those whose range does not exclude it (all of
+    /// them when none fits).
+    fn for_machine(&self, units: &[Arc<Unit>]) -> Vec<Arc<Unit>> {
+        let fitting: Vec<Arc<Unit>> = units.iter().filter(|unit| self.fits_machine(unit) != Some(false)).cloned().collect();
+        if fitting.is_empty() { units.to_vec() } else { fitting }
+    }
+
+    /// Whether `plugin` may serve `category` on this machine.
+    pub fn made_for_machine(&self, category: &str, plugin: &str) -> bool {
+        self.for_machine(&self.units_of(category)).iter().any(|unit| unit.id == plugin)
     }
 
     /// Every unit whose backend serves `category`, in start order.
@@ -367,8 +388,9 @@ impl Units {
             .ok()
             .and_then(|serving| serving.get(category).map(|(plugin, why)| (plugin.clone(), (*why).to_owned())))
             .unwrap_or_default();
+        // Only the engines made for this machine are offered.
         let providers = self
-            .units_of(category)
+            .for_machine(&self.units_of(category))
             .iter()
             .map(|unit| {
                 let current = unit.current();
@@ -1007,7 +1029,22 @@ async fn start_new(frame: &Arc<Frame>, unit: &Arc<Unit>, steps: &mut Vec<SwapSte
     let mut backend_swap = None;
     if let Some(category) = unit.category().filter(|_| frame.units.is_standby(unit)) {
         let serving = frame.units.serving_of(&category).unwrap_or_default();
-        steps.push(SwapStep { step: "standby".into(), ok: true, ms: 0, detail: format!("`{category}` is served by {serving}; switch to {} with frame.plugins.switch", unit.id) });
+        // The engine made for this machine arrived after one that is not: it takes over now.
+        if !frame.units.made_for_machine(&category, &serving) && frame.units.made_for_machine(&category, &unit.id) {
+            if !unit.enabled() {
+                unit.lock().enabled = true;
+            }
+            let ok = match switch_locked(frame, &category, unit).await {
+                Ok(result) => result.ok,
+                Err(error) => {
+                    tracing::warn!(%category, plugin = %unit.id, error = %error.message, "the plugin made for this machine did not take over");
+                    false
+                }
+            };
+            steps.push(SwapStep { step: "machine".into(), ok, ms: 0, detail: format!("`{category}` moves from {serving} to {}, made for this machine", unit.id) });
+            return Ok(None);
+        }
+        steps.push(SwapStep { step: "standby".into(), ok: true, ms: 0, detail: format!("`{category}` is served by {serving}; it is not made for this machine") });
         return Ok(None);
     }
     if let Some(category) = unit.category() {
@@ -1162,9 +1199,18 @@ pub async fn switch_provider(frame: &Arc<Frame>, category: &str, plugin: &str) -
     if unit.category().as_deref() != Some(category) {
         return Err(RpcError::invalid_params(format!("plugin `{plugin}` does not serve `{category}`")));
     }
+    if !frame.units.made_for_machine(category, plugin) {
+        return Err(RpcError::invalid_params(format!("plugin `{plugin}` is not made for this machine's memory")));
+    }
     if !unit.enabled() {
         return Err(RpcError::invalid_params(format!("plugin `{plugin}` is disabled; enable it before switching to it")));
     }
+    switch_locked(frame, category, &unit).await
+}
+
+/// The switch itself, under the units lock the caller holds.
+async fn switch_locked(frame: &Arc<Frame>, category: &str, unit: &Arc<Unit>) -> Result<SwitchResult, RpcError> {
+    let plugin = unit.id.as_str();
     let slot = frame.sup.slot(category).ok_or_else(|| RpcError::not_found(format!("`{category}` has no slot")))?;
     let from = slot.plugin();
     let unchanged = |ok: bool, error: Option<String>| SwitchResult {

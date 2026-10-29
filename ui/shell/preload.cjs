@@ -1,8 +1,8 @@
 // The renderer's only door into the shell. The workbench runs with no Node integration and with
 // context isolation; this exposes these calls and nothing else:
 //   setBrowserBounds      - where the browser pane is (the browser shell module lays the page there)
-//   pickFolder / pickFile - the native dialogs (Open project, a folder to attach; a plugin
-//                           executable to swap in)
+//   pickFolder / pickFile - the native dialogs (Open project; a plugin executable to swap in)
+//   pickPaths             - one dialog for files and folders together (attachments)
 //   pathForFile           - the local path of a dropped or picked File (empty when it has none)
 //   saveAttachment        - write pasted bytes where the chat flow's attachment store takes them in
 //   reveal                - show a project file in Finder
@@ -28,6 +28,10 @@ contextBridge.exposeInMainWorld('cortexShell', {
   /** @param {string} [title] */
   pickFolder(title) {
     return ipcRenderer.invoke('cortex:pick-folder', typeof title === 'string' ? title : '');
+  },
+  /** @param {string} [title] */
+  pickPaths(title) {
+    return ipcRenderer.invoke('cortex:pick-paths', typeof title === 'string' ? title : '');
   },
   /** @param {File} file */
   pathForFile(file) {

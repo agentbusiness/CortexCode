@@ -116,6 +116,9 @@ export interface ShellBridge {
   reveal(path: string): Promise<string>;
   /** Where the browser pane is (the browser shell module lays the page over it). */
   setBrowserBounds(bounds: BrowserBounds): void;
+  /** One dialog for files and folders together (attachments): the chosen paths. Absent in older
+   * shells. */
+  pickPaths?(title?: string): Promise<string[]>;
   /** The local path of a dropped or picked File ('' when it has none). Absent in older shells. */
   pathForFile?(file: File): string;
   /** Write pasted bytes where the chat flow's attachment store takes them in

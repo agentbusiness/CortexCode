@@ -3,8 +3,7 @@
  * starts a turn (`chatflow.turn`, creating the conversation first when there is none); while a
  * run goes it steers it (`chatflow.steer`, taken in at the next step) or queues a follow-up; a
  * running agent can be addressed the same way (`agents.steer`). Mode (ask / auto) and Stop are
- * buttons; drafts are kept per conversation in durable state. Spec marks a new turn's message as
- * the conversation's spec (`spec: true` on `chatflow.turn`).
+ * buttons; drafts are kept per conversation in durable state.
  *
  * Attachments (pasted screenshots, dropped or picked files and folders) are made with
  * `chatflow.attachment.put` as they are added — bytes go to the chat flow's content-addressed store
@@ -70,8 +69,6 @@ function ComposerPlugin() {
   // When pasted text goes as a file (a setting; the chat flow's defaults otherwise).
   const [pasteAsFile] = useShared<PasteAsFile>('composer.pasteAsFile', PASTE_AS_FILE);
   const [modes, setModes] = useSlotState<Record<string, 'ask' | 'auto'>>('modes', {});
-  // Drafts marked as the session's spec (sent as `spec: true` with `chatflow.turn`).
-  const [specMarks, setSpecMarks] = useSlotState<Record<string, boolean>>('specMarks', {});
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const draftKey = sessionId ?? (projectId ? `new:${projectId}` : 'none');
@@ -154,14 +151,7 @@ function ComposerPlugin() {
         selection.select(projectId, id);
       }
       setShared('chat.stick', Date.now());
-      // Older peers never see the field when the message is not marked.
-      const marked = specMarks[draftKey] ? { spec: true } : {};
-      await client.call('chatflow.turn', { session_id: id, text, mode, ...carry, ...marked, ...mentioned });
-      if (specMarks[draftKey]) setSpecMarks((current) => {
-        const next = { ...current };
-        delete next[draftKey];
-        return next;
-      });
+      await client.call('chatflow.turn', { session_id: id, text, mode, ...carry, ...mentioned });
     } catch (cause) {
       setError(errorMessage(cause));
       throw cause;
@@ -227,8 +217,6 @@ function ComposerPlugin() {
         })}
         attach={attach}
         pasteAsFile={{ ...PASTE_AS_FILE, ...pasteAsFile }}
-        specMarked={specMarks[draftKey] === true}
-        onSpecMarked={(marked) => setSpecMarks((current) => ({ ...current, [draftKey]: marked }))}
         mentions={mentions}
         placeholder={agentName ? `Steer @${agentName}…` : running ? 'Steer the run, or queue a follow-up…' : `Ask about ${project.name}, or ask for a change…`}
       />

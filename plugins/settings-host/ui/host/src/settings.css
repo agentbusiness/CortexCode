@@ -8,5 +8,7 @@
 #cc .cx-settings:focus{outline:none;}
 /* The shared look of settings panels' titles, lines and paths. */
 #cc .cx-settings-title{font-family:var(--font-reading);font-size:19px;font-weight:500;margin:12px 0 8px;color:var(--ink);letter-spacing:-.008em;}
-#cc .cx-settings-line{font-size:15px;color:var(--ink-2);margin:0 0 8px;max-width:62ch;}
+#cc .cx-settings-line{font-size:15px;color:var(--ink-2);margin:0 0 8px;}
+/* Settings pages use the panel's whole width: the theme's reading-width caps do not apply here. */
+#cc .cx-settings-panel .tbl,#cc .cx-settings-panel .settings-widget{max-width:none;}
 #cc .cx-path{font-family:var(--font-mono);font-size:12px;overflow-wrap:anywhere;}

@@ -276,7 +276,7 @@ pub struct Limits {
     #[serde(default = "skills_in_prefix")]
     pub skills_in_prefix: bool,
     /// A message whose text is longer than this (characters) becomes the spec when none exists;
-    /// 0 = only when marked or asked for.
+    /// 0 = only by the router's judgement.
     #[serde(default = "spec_min_chars")]
     pub spec_min_chars: usize,
     /// Spec text pinned whole at most (characters).

@@ -4,8 +4,8 @@
 //! items, the result and cancellation; the member's events of that category come back over an
 //! events stream and are published here. Two shapes:
 //!
-//! - a whole category (`start_borrow`): this node has no model of its own, so a member's serves
-//!   every session here; the local plugin, if any, is set aside for the borrow;
+//! - a whole category (`start_borrow`): this node has no model plugin installed, so a member's
+//!   serves every session here (a node's own model is never set aside);
 //! - one session (`place.rs`): the client says hello with scope `sessions`, and only the sessions
 //!   the frame routes to it (`frame.route.set`) reach the member; this node's own model keeps
 //!   serving everything else.
@@ -27,8 +27,6 @@ pub struct Borrow {
     pub category: String,
     pub node: String,
     pub provides: Vec<String>,
-    /// This node's own plugin of the category, disabled for the borrow and enabled again after.
-    pub local_plugin: Option<String>,
     stop: CancellationToken,
 }
 
@@ -69,29 +67,21 @@ impl Mesh {
             return Err(RpcError::new(codes::UNAVAILABLE, format!("{} has no plugin serving `{category}` now", member.name)));
         }
         self.stop_borrow(category);
-        // The frame lets a client take a category over only while the category's own plugin is
-        // disabled; disabling it also unloads a local model, which is the point of borrowing one.
+        // Every machine runs its own model: a whole category is borrowed only where no plugin of
+        // it is installed (the frame lets a client take a category over only then).
         let ctx = self.ctx()?;
         let listed: Value = ctx.call("frame.plugins.list", json!({})).await.unwrap_or(Value::Null);
-        let local_plugin = listed
+        let own = listed
             .get("plugins")
             .and_then(Value::as_array)
-            .and_then(|plugins| plugins.iter().find(|plugin| plugin.get("category").and_then(Value::as_str) == Some(category) && plugin.get("transport").and_then(Value::as_str) != Some("websocket")))
-            .and_then(|plugin| plugin.get("plugin").and_then(Value::as_str).filter(|unit| !unit.is_empty()).map(str::to_owned));
-        let local_was_active = listed
-            .get("plugins")
-            .and_then(Value::as_array)
-            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some(category) && plugin.get("state").and_then(Value::as_str) != Some("disabled") && plugin.get("transport").and_then(Value::as_str) != Some("websocket")));
-        if let Some(unit) = &local_plugin
-            && local_was_active
-        {
-            ctx.call("frame.plugins.disable", json!({"plugin": unit})).await.map_err(|error| RpcError::new(codes::UNAVAILABLE, format!("cannot set this node's own `{category}` plugin aside: {}", error.message)))?;
+            .is_some_and(|plugins| plugins.iter().any(|plugin| plugin.get("category").and_then(Value::as_str) == Some(category) && plugin.get("transport").and_then(Value::as_str) != Some("websocket")));
+        if own {
+            return Err(RpcError::new(codes::UNAVAILABLE, format!("this machine has its own `{category}` plugin; single sessions go to members instead")));
         }
-        let local_plugin = local_plugin.filter(|_| local_was_active);
         let category_owned = category.to_owned();
         let mesh = self.clone();
         let client = self.open_client(category, node, provides.clone(), "", true, move || mesh.borrow_ended(&category_owned)).await?;
-        let borrow = Borrow { category: category.to_owned(), node: node.to_owned(), provides: provides.clone(), local_plugin, stop: client.stop };
+        let borrow = Borrow { category: category.to_owned(), node: node.to_owned(), provides: provides.clone(), stop: client.stop };
         self.borrows.lock().unwrap_or_else(|p| p.into_inner()).insert(category.to_owned(), borrow);
         self.notify("serving");
         Ok(provides)
@@ -265,14 +255,6 @@ impl Mesh {
         match removed {
             Some(borrow) => {
                 borrow.stop();
-                // This node's own plugin serves the category again.
-                if let (Some(unit), Some(ctx)) = (borrow.local_plugin.clone(), self.ctx.get().cloned()) {
-                    tokio::spawn(async move {
-                        if let Err(error) = ctx.call("frame.plugins.enable", json!({"plugin": unit})).await {
-                            tracing::warn!(%error, "the node's own plugin could not be enabled again");
-                        }
-                    });
-                }
                 self.notify("serving");
                 true
             }

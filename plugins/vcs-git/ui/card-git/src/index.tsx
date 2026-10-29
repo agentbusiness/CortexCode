@@ -107,7 +107,7 @@ function GitSection() {
           </button>
           <Menu
             variant="detent"
-            label="…"
+            label="Actions"
             title="Git actions"
             className="tiny cx-git-menu"
             disabled={busy}

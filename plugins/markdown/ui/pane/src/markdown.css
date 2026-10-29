@@ -15,3 +15,6 @@
 #cc .cx-md-doc blockquote{margin:0 0 1em;padding-left:12px;border-left:1px solid var(--rubric);color:var(--ink-2);font-style:italic;}
 #cc .cx-md-doc hr{border:0;border-top:1px solid var(--rule-2);margin:1.6em 0;}
 #cc .cx-md .lst button{padding-left:0;}
+#cc .cx-md>.bar [data-action="documents"]{margin-right:4px;flex:0 0 auto;}
+#cc .cx-md-folder{margin:0 0 18px;}
+#cc .cx-md-folder>.ap{display:block;margin:0 0 4px;}

@@ -18,11 +18,14 @@
     "README.md"
   ],
   "peerDependencies": {
+    "@cortex/sdk": "^0.1.0",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "@cortex/sdk": "^0.1.0"
+    "react-dom": "^19.2.0"
   },
   "dependencies": {
+    "@codemirror/language": "6.13.1",
+    "@codemirror/language-data": "6.5.2",
+    "@lezer/highlight": "1.2.5",
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1"
   },
