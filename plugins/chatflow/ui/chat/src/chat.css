@@ -42,12 +42,13 @@
 #cc .cx-single{margin:8px 0;}
 #cc .cx-single .stream-row:disabled{cursor:default;}
 
-#cc .cx-checks{list-style:none;margin:4px 0 0;padding:0;grid-column:2;}
-#cc .cx-checks li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-checks{list-style:none;margin:4px 0 0;padding:0;grid-column:2;min-width:0;}
+#cc .cx-checks li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);min-width:0;}
 #cc .cx-checks li.bad .ap:first-child{color:var(--rubric);}
 #cc .cx-checks li.ok .ap:first-child{color:var(--counter);}
 #cc .cx-check-name{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
-#cc .cx-checks pre{flex-basis:100%;margin:4px 0 0;}
+/* A failing check's log wraps inside the feed and scrolls in its own box, never past the feed. */
+#cc .cx-checks pre{flex-basis:100%;min-width:0;margin:4px 0 0;max-height:24em;overflow:auto;overflow-wrap:anywhere;}
 
 #cc .cx-flush-notes{margin:8px 0 0;}
 #cc .run-open .run-output{font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;}
