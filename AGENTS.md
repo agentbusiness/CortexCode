@@ -81,6 +81,23 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   (`plugins/memory-irongraph/data/skills/irongraph-queries.md`, `skill://memory/...`), never of a
   skills plugin, so it leaves with the store.
 
+## The shared standard (CortexCode and CortexTerm)
+
+CortexTerm (`../CortexTerm`, an AI-native terminal) is a separate app with its own frame and plugins,
+built to the same standard as CortexCode. The standard is:
+
+- the plugin package: `plugin.toml` (`ccplugin/1`), `.ccplugin`, hello and lifecycle;
+- CPP/1 and routing by method prefix;
+- the wire shape of every contract both apps have (`model@1`, `mesh@1`, `notify@1`, `skills@1`,
+  `terminal@1`, `chatflow@1`);
+- the mesh: ALPNs, pairing, membership log, card, claims, lending, `mesh.link`, `mesh.session.start`;
+- model and resource sharing: model tags (`coding`, `office`), one model per machine, the yield
+  handshake.
+
+**Any change to the plugin architecture, the mesh, or model and resource sharing is made in both
+CortexCode and CortexTerm**, in the same piece of work, and listed in both repositories' docs with the
+version it lands in. A change to anything outside the standard stays in its own app.
+
 ## Checking a change
 
 - No tests, test harnesses or benchmarks in this repository: no unit tests (`#[cfg(test)]`,
