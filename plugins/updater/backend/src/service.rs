@@ -88,9 +88,12 @@ struct Saved {
     /// Plugin -> the version the user chose to use with their changes merged in, not dropped.
     #[serde(default)]
     merged: BTreeMap<String, String>,
-    /// Plugin -> the version that could not start (not tried again).
+    /// Plugin -> the version that could not start (not tried again under the same frame).
     #[serde(default)]
     failed: BTreeMap<String, Failed>,
+    /// Plugin -> the frame version that refused its failed version: another frame tries it again.
+    #[serde(default)]
+    failed_under: BTreeMap<String, String>,
     #[serde(default)]
     recent: Vec<Applied>,
 }
@@ -123,6 +126,13 @@ pub struct Updater {
     at_restart: Mutex<BTreeSet<(String, String)>>,
     /// The current check or reset has put plugins in the round (the next one starts a new list).
     round_open: AtomicBool,
+}
+
+impl Updater {
+    /// The version of the frame this updater runs under ("" before its first connection).
+    fn running_frame(&self) -> String {
+        self.ctx.get().and_then(|ctx| ctx.frame_version()).unwrap_or_default()
+    }
 }
 
 fn now_ms() -> u64 {
@@ -746,18 +756,21 @@ impl Updater {
     /// Split what differs from the latest: what applies now, and what asks the user. A build of
     /// the user's own, a version the user keeps, and one that could not start are left alone.
     fn plan(&self, items: Vec<(ResetItem, Option<Package>)>) -> (Vec<Planned>, Vec<Pending>) {
-        // A failure is over when a newer version came, or when that version runs after all (the
-        // frame installs the app's packages at start by itself).
+        // A failure is over when a newer version came, when that version runs after all (the
+        // frame installs the app's packages at start by itself), or when another frame runs (a
+        // newer frame may take what this one refused).
+        let frame = self.running_frame();
         let stale: Vec<String> = {
             let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner());
             saved
                 .failed
                 .iter()
                 .filter(|(plugin, failed)| {
-                    items
-                        .iter()
-                        .find(|(item, _)| item.plugin == **plugin)
-                        .is_none_or(|(item, _)| item.release != failed.version || same_version(&item.installed, &failed.version))
+                    saved.failed_under.get(*plugin) != Some(&frame)
+                        || items
+                            .iter()
+                            .find(|(item, _)| item.plugin == **plugin)
+                            .is_none_or(|(item, _)| item.release != failed.version || same_version(&item.installed, &failed.version))
                 })
                 .map(|(plugin, _)| plugin.clone())
                 .collect()
@@ -765,6 +778,7 @@ impl Updater {
         if !stale.is_empty() {
             let all = self.with_saved(|saved| {
                 saved.failed.retain(|plugin, _| !stale.contains(plugin));
+                saved.failed_under.retain(|plugin, _| saved.failed.contains_key(plugin));
                 saved.failed.values().cloned().collect::<Vec<_>>()
             });
             self.with_status(|status| status.failed = all);
@@ -869,9 +883,11 @@ impl Updater {
     /// tried again; the popup and Settings > Plugins say why.
     fn could_not_start(&self, plan: &Planned, error: String) {
         let failed = Failed { plugin: plan.id.clone(), name: plan.name.clone(), version: plan.version.clone(), error: error.clone(), ms: now_ms(), seen: false };
+        let frame = self.running_frame();
         let all = self.with_saved(|saved| {
             saved.approved.remove(&plan.id);
             saved.failed.insert(plan.id.clone(), failed);
+            saved.failed_under.insert(plan.id.clone(), frame);
             saved.failed.values().cloned().collect::<Vec<_>>()
         });
         self.record(&plan.id, &plan.version, "failed", error);

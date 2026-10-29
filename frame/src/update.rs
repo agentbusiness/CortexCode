@@ -104,6 +104,11 @@ pub fn handover(explicit_config: bool, root: &Path) {
         NO_HANDOVER.store(true, Ordering::Relaxed);
         return;
     }
+    // A start while the app runs is refused by the home lock: it is no try of the staged frame
+    // (counted, two such starts would mark a good frame bad).
+    if crate::home::lock_held(&crate::home::Home::new(root.to_path_buf())) {
+        return;
+    }
     let mut state = read_state(root);
     let Some((version, dir)) = newest(root, &state) else { return };
     let target = dir.join(FRAME_EXE);
@@ -132,6 +137,15 @@ pub fn handover(explicit_config: bool, root: &Path) {
     let origin = std::env::var_os(ORIGIN_ENV).or_else(|| exe.map(PathBuf::into_os_string)).unwrap_or_default();
     let error = std::process::Command::new(&target).args(std::env::args_os().skip(1)).env(ORIGIN_ENV, origin).exec();
     eprintln!("cortex-frame: cannot start the frame {}: {error}; running {FRAME_VERSION}", target.display());
+}
+
+/// This start was refused (another frame runs): take back the try the hand-over counted for it.
+pub fn not_a_try(root: &Path) {
+    let mut state = read_state(root);
+    if state.trying == FRAME_VERSION && state.attempts > 0 {
+        state.attempts -= 1;
+        write_state(root, &state);
+    }
 }
 
 /// The plugins started: this frame version is good (a staged one is not tried as new again).

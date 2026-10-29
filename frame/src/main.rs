@@ -101,6 +101,8 @@ fn main() -> ExitCode {
                 ),
                 None => eprintln!("cortex-frame: a frame is already running for {}; refusing to start", home.root.display()),
             }
+            // A start refused here is no try of this frame (an older app's hand-over counted it).
+            update::not_a_try(&home.root);
             return ExitCode::from(3);
         }
         Err(error) => {
