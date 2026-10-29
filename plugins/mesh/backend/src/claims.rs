@@ -78,6 +78,8 @@ struct ModelOption {
     tier: u8,
     weights: u64,
     tok_s: f64,
+    /// Tokens one conversation may hold on it (0: not known).
+    window: u32,
 }
 
 impl Mesh {
@@ -223,7 +225,10 @@ impl Mesh {
 
     /// Every model tagged for `tag` the session could use, best first: the strongest, then the one
     /// its prompt is cached on, then this computer, the local network, remote, then the faster.
-    async fn model_options(&self, session: &str, tag: &str) -> Vec<ModelOption> {
+    /// A prompt of `tokens` goes only to a model whose conversation holds it (seen: an agent's
+    /// 80k prompt sent to a member whose load holds 64k, and the run failed); when none does, to
+    /// the largest.
+    async fn model_options(&self, session: &str, tag: &str, tokens: u32) -> Vec<ModelOption> {
         let mut options = Vec::new();
         let mut family = None;
         if let Some(ctx) = self.ctx.get()
@@ -233,7 +238,8 @@ impl Mesh {
             let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
             lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
             if info.tags.iter().any(|own| own == tag) {
-                options.push(ModelOption { node: String::new(), name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s });
+                let window = if info.ctx_native == 0 { info.ctx_total } else { info.ctx_total.min(info.ctx_native) };
+                options.push(ModelOption { node: String::new(), name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window });
             }
             family = Some(info.family);
         }
@@ -248,7 +254,16 @@ impl Mesh {
             }
             let tier = if Self::path_of(connection).0 == "lan" { 1 } else { 2 };
             let weights = self.weights_of(&member.node, &model.model_id).await;
-            options.push(ModelOption { node: member.node.clone(), name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s });
+            options.push(ModelOption { node: member.node.clone(), name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
+        }
+        if tokens > 0 && options.iter().any(|option| option.window > 0) {
+            let holds = |option: &ModelOption| option.window == 0 || option.window >= tokens;
+            if options.iter().any(holds) {
+                options.retain(holds);
+            } else {
+                let largest = options.iter().map(|option| option.window).max().unwrap_or(0);
+                options.retain(|option| option.window == largest);
+            }
         }
         let last = lock(&self.claims.last).get(session).cloned();
         options.sort_by(|a, b| {
@@ -301,7 +316,7 @@ impl Mesh {
             let changed = self.claims.models_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let options = self.model_options(&session, &params.tag).await;
+            let options = self.model_options(&session, &params.tag, params.tokens).await;
             if !options.is_empty() {
                 break options;
             }

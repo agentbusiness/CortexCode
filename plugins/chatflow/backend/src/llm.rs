@@ -10,7 +10,7 @@ use cc_protocol::contracts::chatflow::{LiveFields, topics as chatflow_topics};
 use cc_protocol::contracts::frame::kinds;
 use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{
-    ChatDelta, ChatMessage, ChatParams, ChatResult, Priority, Sampling, Thinking, ToolSpec, methods as model_methods,
+    ChatDelta, ChatMessage, ChatParams, ChatResult, CountResult, Priority, Sampling, Thinking, ToolSpec, methods as model_methods,
 };
 use cc_protocol::{RpcError, codes, parse_params};
 use serde_json::{Value, json};
@@ -76,8 +76,8 @@ const SHOW_WAIT: Duration = Duration::from_millis(1500);
 /// then routes the call there). A run holds no model between its calls, and moves to a better
 /// one the moment it frees; a freed model goes to the oldest waiting run. A wait shows as the
 /// turn's `wait` stage. Without the mesh plugin the call runs here. Returns the computer's name.
-async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Priority, cancel: &CancellationToken) -> Result<Option<String>, RpcError> {
-    let params = json!({"kind": "model", "tag": cc_protocol::contracts::model::tags::CODING, "session_id": session, "foreground": priority == Priority::Foreground});
+async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Priority, tokens: u32, cancel: &CancellationToken) -> Result<Option<String>, RpcError> {
+    let params = json!({"kind": "model", "tag": cc_protocol::contracts::model::tags::CODING, "session_id": session, "foreground": priority == Priority::Foreground, "tokens": tokens});
     let Ok(mut call) = journal.host().ctx().call_stream(mesh_methods::CLAIM, params) else { return Ok(None) };
     let status = journal
         .entries()
@@ -176,11 +176,13 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
     let started = Instant::now();
     let mut delay = Duration::from_millis(200);
     let session = spec.cache_key.clone();
+    // The prompt's size, so the call goes only to a model whose conversation holds it (0: unknown).
+    let tokens = journal.host().get::<CountResult>(model_methods::COUNT, json!({"messages": params["messages"], "tools": params["tools"]})).await.map_or(0, |counted| counted.tokens);
     loop {
         if cancel.is_cancelled() {
             return Err(RpcError::cancelled());
         }
-        let computer = claim(journal, &session, &spec.stream.run_id, spec.priority, cancel).await?;
+        let computer = claim(journal, &session, &spec.stream.run_id, spec.priority, tokens, cancel).await?;
         let outcome = stream_once(journal, &params, &spec.stream, &spec.stage, cancel).await;
         release(journal, &session).await;
         match outcome {
@@ -227,8 +229,10 @@ pub async fn chat(journal: &mut Journal, spec: CallSpec, cancel: &CancellationTo
                     .await?;
                 return Ok(called);
             }
-            // Nothing was generated: the model plugin refused the call (restart, swap, busy).
-            Err(error) if crate::host::refused(&error) && started.elapsed() < REFUSED_WINDOW => {
+            // Nothing usable was generated: the model plugin refused the call (restart, swap, busy)
+            // or its connection closed (a member's model gone mid-call; the next claim places the
+            // call elsewhere). Its partial text is marked interrupted.
+            Err(error) if (crate::host::refused(&error) || crate::host::interrupted(&error)) && started.elapsed() < REFUSED_WINDOW => {
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = cancel.cancelled() => return Err(RpcError::cancelled()),

@@ -829,6 +829,13 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 called
             }
             Err(error) if error.code == codes::CANCELLED => continue,
+            // The model cannot run the request at all (a prompt larger than its conversation holds,
+            // an image it cannot read): nothing the model wrote is wrong, so it is not asked to
+            // write again (seen: "tool call arguments must be valid JSON" for an oversized prompt).
+            Err(error) if error.code == codes::INVALID_PARAMS => {
+                journal.note(&env.run_id, "model_error", &error.message, false).await?;
+                return Ok(outcome("failed", error.message, turns, tool_calls, &changed, None));
+            }
             // The engine could not use the generation (e.g. tool-call arguments that are not JSON):
             // the model writes it again with the reason; the same failure repeating stops the run.
             Err(error) if !host::refused(&error) && !host::interrupted(&error) => {
