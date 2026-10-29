@@ -7,7 +7,7 @@
 [plugin]
 id = "code-view"
 name = "Code view"
-version = "0.1.4"
+version = "0.1.5"
 description = "The right pane's code view: toolbar, CodeMirror editor with the inline unified diff, attributions and per-hunk accept/reject, and the file tree."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

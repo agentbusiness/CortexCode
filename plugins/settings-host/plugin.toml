@@ -7,7 +7,7 @@
 [plugin]
 id = "settings-host"
 name = "Settings host"
-version = "0.1.4"
+version = "0.1.5"
 description = "The settings window (every settings.<name>@1 panel)."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
