@@ -378,6 +378,10 @@ pub struct ClaimParams {
     /// that is pointless on a busy model); the answer's `tier` is `busy` when none is.
     #[serde(default = "claim_waits")]
     pub wait: bool,
+    /// The prompt's size in tokens: only a model whose conversation holds it takes the call (0:
+    /// unknown, any model).
+    #[serde(default)]
+    pub tokens: u32,
 }
 
 fn claim_waits() -> bool {
