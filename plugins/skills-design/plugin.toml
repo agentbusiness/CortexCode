@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-design"
 name = "Frontend design skills"
-version = "0.1.3"
+version = "0.1.4"
 description = "Frontend design know-how for the model: one UI design guide (direction, colour, typography, layout, motion, interaction and accessibility, anti-patterns) and checking the rendered result in a browser."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

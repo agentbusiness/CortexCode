@@ -7,7 +7,7 @@
 [plugin]
 id = "agents"
 name = "Agents"
-version = "0.1.7"
+version = "0.1.8"
 description = "Delegation of a goal into a task tree with contracts, named agents in copy-on-write workspaces, the scheduler, contract verification, the project board and the merge steward; the board pane and the agents, tasks and board card sections."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

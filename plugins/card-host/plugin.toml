@@ -7,7 +7,7 @@
 [plugin]
 id = "card-host"
 name = "Card host"
-version = "0.1.4"
+version = "0.1.5"
 description = "The card at the right of the brand band: a toggle with a live summary and Open pane, the card it opens with every card section, its project header, and the settings window host."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
