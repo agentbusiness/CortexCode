@@ -10,7 +10,7 @@
  */
 
 import { definePlugin, errorMessage, useClient, useQuery, useShared } from '@cortex/sdk';
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 interface Pending { plugin: string; name?: string; version: string; from?: string; installed?: string; files?: string[] }
 interface Applied { plugin: string; version: string; ms: number; outcome: string; detail?: string }
@@ -48,8 +48,32 @@ function where(row: RoundItem) {
   }
 }
 
+/** How far the fade at a cut edge of the list reaches. */
+const FADE_PX = 28;
+
 /** The round: every update of a check together. */
 function Round({ rows, onHide }: { rows: RoundItem[]; onHide: () => void }) {
+  // The scrollbar is hidden, so a cut edge fades out to say more rows are there.
+  const list = useRef<HTMLUListElement>(null);
+  const [cut, setCut] = useState({ top: false, bottom: false });
+  const measure = () => {
+    const el = list.current;
+    if (!el) return;
+    const top = el.scrollTop > 1;
+    const bottom = el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+    setCut((was) => (was.top === top && was.bottom === bottom ? was : { top, bottom }));
+  };
+  useLayoutEffect(measure);
+  useEffect(() => {
+    const el = list.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  const mask = cut.top || cut.bottom
+    ? `linear-gradient(to bottom, ${cut.top ? 'transparent' : '#000'} 0, #000 ${FADE_PX}px, #000 calc(100% - ${FADE_PX}px), ${cut.bottom ? 'transparent' : '#000'} 100%)`
+    : undefined;
   const going = rows.filter((row) => GOING.includes(row.state)).length;
   const failed = rows.filter((row) => row.state === 'failed').length;
   const title = going
@@ -60,12 +84,13 @@ function Round({ rows, onHide }: { rows: RoundItem[]; onHide: () => void }) {
         ? 'Ready at the next restart'
         : `${rows.length} updated`;
   return (
-    <div className="sheet" role="status" aria-live="polite" style={{ width: '100%' }}>
+    <div className="sheet" role="status" aria-live="polite" style={{ width: '100%', minHeight: 0 }}>
       <div className="sheet-h">
         <span className="ap grow">{title}</span>
         <button className="detent" type="button" onClick={onHide}>Hide</button>
       </div>
-      <ul style={{ listStyle: 'none', margin: 0, padding: '4px 14px 8px', maxHeight: '40vh', overflowY: 'auto' }}>
+      <ul ref={list} onScroll={measure}
+        style={{ listStyle: 'none', margin: 0, padding: '4px 14px 8px', maxHeight: '40vh', minHeight: 0, overflowY: 'auto', maskImage: mask, WebkitMaskImage: mask }}>
         {rows.map((row) => (
           <li key={row.plugin} title={row.error || undefined} style={{ padding: '7px 0', borderTop: '1px solid var(--rule)' }}>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 9 }}>
@@ -139,10 +164,10 @@ function Updates() {
     <>
       {band}
       {(showRound || ask || broke) && (
-      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 89, width: 'min(400px, calc(100% - 32px))', maxHeight: 'calc(100vh - 32px)', display: 'flex', flexDirection: 'column', gap: 8 }}>
       {showRound && <Round rows={rows} onHide={() => setHidden(signature)} />}
       {ask ? (
-        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title" style={{ width: '100%' }}>
+        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-ask-title" style={{ width: '100%', minHeight: 0 }}>
           <div className="sheet-h">
             <span className="lbl grow" id="updater-ask-title">{ask.name || ask.plugin}: a newer version is ready</span>
           </div>
@@ -168,7 +193,7 @@ function Updates() {
           </div>
         </div>
       ) : broke ? (
-        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-failed-title" style={{ width: '100%' }}>
+        <div className="sheet" role="dialog" aria-modal="false" aria-labelledby="updater-failed-title" style={{ width: '100%', minHeight: 0 }}>
           <div className="sheet-h">
             <span className="lbl grow" id="updater-failed-title">{broke.name || broke.plugin}: the newer version could not start</span>
           </div>

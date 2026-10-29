@@ -279,11 +279,14 @@ impl EngineHandle {
         self.view.lock().map(|view| view.clone()).unwrap_or_default()
     }
 
-    /// Stop the engine thread and release the model (blocks until it has).
+    /// Stop the engine thread and the vision thread and release the model (blocks until both have).
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
         if let Some(thread) = self.thread.lock().ok().and_then(|mut thread| thread.take()) {
             let _ = thread.join();
+        }
+        if let Some(vision) = &self.vision {
+            vision.shutdown();
         }
     }
 }
