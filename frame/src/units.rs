@@ -1422,9 +1422,11 @@ pub fn bundled(packages: Option<&Path>) -> cc_protocol::contracts::frame::Bundle
 }
 
 /// Record the app versions that installed (a failed install is queued again at the next start).
+/// Installed means current: a refused install has unpacked its folder all the same.
 pub fn mark_bundled(root: &Path, queued: &[(String, String)]) {
     for (id, version) in queued {
-        if crate::package::versions(root, id).iter().any(|installed| installed == version)
+        let current = std::fs::read_to_string(root.join(id).join(CURRENT)).map(|text| text.trim().to_owned()).unwrap_or_default();
+        if current == *version
             && let Err(error) = write_record(&root.join(id), BUNDLED, Some(version))
         {
             tracing::warn!(plugin = %id, %error, "cannot record the app version installed");
