@@ -10,18 +10,15 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 - MANAGE: the user wants background agents or their tasks changed: stopped, cancelled, restarted, retried, told something, taken over, or their work planned again.
 - STATUS: a question about the background agents, their tasks or the project board.
 - IMPLEMENT: a plan is open (shown above) and the user says to carry it out.
-- IDEATE: the user asks for options or approaches to choose from on an open design question (an architecture, an API, an algorithm, a strategy). Not for a question with one answer: that is LOOKUP.
-- PLAN: the user asks for a plan to review before anything changes, or asks to change the open plan. Not for a plain request to build or fix: that is DO, and DO plans by itself.
+- PLAN: the user asks for a plan to review before anything changes ("make it a plan", "sum it up as a plan"), or asks to change the open plan. Not for a plain request to build or fix: that is DO, and DO plans by itself.
 - DELEGATE: the user asks for the work to run in background agents. Not for one feature or one fix: that is DO.
 - DO: a change, a fix, new code or a command to run in this repository, now. Big or small.
-- LOOKUP: a question about this repository, answered by reading it, or a review or security audit of its code. Nothing is changed.
+- LOOKUP: a question about this repository, answered by reading it: how something works, what is wrong, which way to build something, or a review or security audit of its code. Nothing is changed.
 - ANSWER: a general question or conversation that needs nothing from this repository.
-4. `queries` (IDEATE only): two or three code searches for the part of the software the question is about, a few words each: its subject, not the request ("report cache", "export column order").
-5. `skills`: skills from the Skills list whose summary matches the work in `work`. Usually none: sharing only the language or the topic is not a match. A skill used in the previous turn applies again when the user continues that work.
-6. `effort`: how hard the work is to think through: none, low, medium, high or xhigh.
-7. `spec`: new when the message describes something to build whose behaviours in `asks` (rules, cases, errors, limits) the finished work must all meet, such as a feature written out with its inputs, outputs and error cases; amend when a spec exists (shown at the start) and the message adds, drops or changes requirements; none for a question, a single fix, a pasted log, or a list of unrelated small changes.
-8. `settles`: yes when the message settles a choice the conversation was weighing (the user picks an option, agrees to a proposal, sets a convention); no otherwise.
-9. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
-10. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
+4. `skills`: skills from the Skills list whose summary matches the work in `work`. Usually none: sharing only the language or the topic is not a match. A skill used in the previous turn applies again when the user continues that work.
+5. `effort`: how hard the work is to think through: none, low, medium, high or xhigh.
+6. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
+7. `drops`: yes when the message sets aside the direction the user gave earlier in this conversation (a new direction, "forget what came before", "now do code instead"); no when it continues it or adds to it.
+8. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
 
-Examples: "stop the agents, they are stuck" is MANAGE. "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is IDEATE.
+Examples: "stop the agents, they are stuck" is MANAGE. "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is LOOKUP. "ok, make it a plan" is PLAN.

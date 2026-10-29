@@ -11,7 +11,6 @@
 
 use crate::data::Dataset;
 use crate::schemas::{Decision, PlanOutput};
-use crate::spec::Spec;
 use cc_protocol::contracts::chatflow::{PlanEditParams, kinds as chatflow_kinds, plan_status};
 use cc_protocol::contracts::frame::JournalEntry;
 use serde::{Deserialize, Serialize};
@@ -42,6 +41,10 @@ pub struct PlanTask {
     pub title: String,
     #[serde(default)]
     pub brief: String,
+    /// What the conversation already established that the task needs (a file and line with what
+    /// is there, a conclusion), so its agent does not find it again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known: Vec<String>,
     /// The request's rules this task makes true (a behaviour, a value, an error, a limit), each to
     /// get its own test in the project.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,11 +257,10 @@ fn clean(items: &[String]) -> Vec<String> {
     out
 }
 
-/// What a PLAN decision may name: the spec's requirement ids, and the session's skill catalog with
-/// the cap of skills per task (`limits.skills_per_turn`).
+/// What a PLAN decision may name: the session's skill catalog with the cap of skills per task
+/// (`limits.skills_per_turn`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Known<'a> {
-    pub requirements: &'a [String],
     pub skills: &'a [String],
     pub skills_max: usize,
 }
@@ -266,7 +268,7 @@ pub struct Known<'a> {
 /// The document and task graph from a PLAN decision. Tasks without a title or brief are left
 /// out (the numbers the model wrote are mapped to the kept ones); a dependency on a later task,
 /// itself or a number that does not exist is dropped, so the graph is acyclic in the order
-/// written; at most `max_tasks`; `covers` keeps known requirement ids, `skills` catalog skills.
+/// written; at most `max_tasks`; `skills` keeps catalog skills.
 /// Tasks that touch exactly the same files and symbols stay separate small tasks: each later such
 /// task waits for the latest earlier one, so they never run at the same time.
 /// A task that touches nothing joins the task before it (its brief, dependencies, checks,
@@ -298,7 +300,7 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
                 first.brief = format!("{}\n{}", first.brief.trim_end(), task.brief.trim());
             }
             first.depends_on.extend(task.depends_on);
-            for (into, from) in [(&mut first.rules, task.rules), (&mut first.checks, task.checks), (&mut first.covers, task.covers), (&mut first.skills, task.skills)] {
+            for (into, from) in [(&mut first.known, task.known), (&mut first.rules, task.rules), (&mut first.checks, task.checks), (&mut first.covers, task.covers), (&mut first.skills, task.skills)] {
                 for item in from {
                     if !into.contains(&item) {
                         into.push(item);
@@ -360,11 +362,12 @@ pub fn from_output(output: &PlanOutput, max_tasks: usize, known: Known) -> (Plan
             n,
             title: if title.is_empty() { brief.lines().next().unwrap_or("").to_owned() } else { title.to_owned() },
             brief: brief.to_owned(),
+            known: clean(&task.known),
             rules: clean(&task.rules),
             depends_on,
             touches: clean(&task.touches),
             checks: clean(&task.checks),
-            covers: clean(&task.covers).into_iter().filter(|id| known.requirements.contains(id)).collect(),
+            covers: Vec::new(),
             skills: crate::skillsel::chosen(&task.skills, known.skills, known.skills_max),
             task_id: None,
         });
@@ -416,6 +419,8 @@ pub fn user_edit(current: &Plan, edit: &PlanEditParams) -> Result<Plan, String> 
                 n,
                 title: title.to_owned(),
                 brief: task.brief.trim().to_owned(),
+                // Not in the editor: kept from the task it was.
+                known: task.n.and_then(|n| current.tasks.iter().find(|before| before.n == n)).map(|before| before.known.clone()).unwrap_or_default(),
                 rules: clean(&task.rules),
                 depends_on,
                 touches: clean(&task.touches),
@@ -560,43 +565,23 @@ pub fn in_place(ds: &Dataset, entry: &JournalEntry, newest: &HashMap<String, u64
     Some(if carried_out { render_compact(ds, &plan) } else { render_with(ds, &plan, placed_heading(ds, &plan)) })
 }
 
-/// A plan task as the foreground loop gets it: only the task's own brief and the text of the spec
-/// requirements it serves (the whole work is framed once, in one sentence, by the step message).
-/// A task as its step states it: its brief, then the requirements it serves, in the user's own
-/// words. The only task of a plan is the whole work, so it carries every live
-/// requirement; a task among several carries the ones it covers.
-pub fn task_focus(ds: &Dataset, task: &PlanTask, spec: Option<&Spec>, whole: bool) -> String {
+/// A plan task as its step states it: its brief, then the rules it makes true, in the user's own
+/// words (the whole work is framed once, in one sentence, by the step message).
+pub fn task_focus(ds: &Dataset, task: &PlanTask) -> String {
     let mut text = task.brief.trim().to_owned();
+    // What the conversation already found: given, so the task starts from it instead of reading
+    // the same files again (seen: an agent spent ten steps re-reading what its lead had read).
+    if !task.known.is_empty() {
+        let items: Vec<String> = task.known.iter().map(|item| ds.text("list_item", &[("text", item)])).collect();
+        text.push_str(&ds.text("plan_task_known", &[("items", &items.join("\n"))]));
+    }
     // The rules, each with its own test: a test written for the code (seen: tests that passed on
     // wrong code) checks less than one written for each thing the request says must hold.
     if !task.rules.is_empty() {
         let items: Vec<String> = task.rules.iter().map(|rule| ds.text("list_item", &[("text", rule)])).collect();
         text.push_str(&ds.text("plan_task_rules", &[("items", &items.join("\n"))]));
     }
-    if let Some(spec) = spec {
-        let item = |requirement: &crate::spec::Requirement| ds.text("list_item", &[("text", &format!("{}: {}", requirement.id, requirement.text))]);
-        let served: Vec<String> = if whole {
-            spec.live().map(item).collect()
-        } else {
-            task.covers.iter().filter_map(|id| spec.requirements.iter().find(|requirement| &requirement.id == id)).map(item).collect()
-        };
-        if !served.is_empty() {
-            text.push_str(&ds.text("plan_task_requirements", &[("items", &served.join("\n"))]));
-        }
-        text.push_str(&examples_block(ds, spec));
-    }
     text
-}
-
-/// The request's own examples, right before the work: the check, with its values in view (seen: a
-/// task invented 20 cases with values it worked out, several wrong, then spent hours bending
-/// correct code to them). Empty when the request gave none.
-fn examples_block(ds: &Dataset, spec: &Spec) -> String {
-    if spec.examples.is_empty() {
-        return String::new();
-    }
-    let items: Vec<String> = spec.examples.iter().map(|example| ds.text("list_item", &[("text", example)])).collect();
-    ds.text("plan_task_examples", &[("items", &items.join("\n"))])
 }
 
 /// A plan being carried out by the conversation's own loop, as the model sees it in place: the
@@ -617,30 +602,29 @@ pub fn render_compact(ds: &Dataset, plan: &Plan) -> String {
     text
 }
 
-/// The brief of a plan task as an agent (or the foreground loop) gets it: the task's own brief,
-/// the plan's goal and approach, and the text of the spec requirements it serves.
-pub fn task_brief(ds: &Dataset, plan: &Plan, task: &PlanTask, spec: Option<&Spec>) -> String {
-    let mut text = task.brief.clone();
+/// The brief of a plan task as an agent (or the foreground loop) gets it: the task's own brief and
+/// rules, and the plan's goal and approach.
+pub fn task_brief(ds: &Dataset, plan: &Plan, task: &PlanTask) -> String {
+    let mut text = task_focus(ds, task);
     text.push_str(&ds.text("plan_task_context", &[("plan_id", &plan.plan_id), ("goal", &plan.doc.goal), ("approach", &plan.doc.approach)]));
-    if let Some(spec) = spec {
-        let served: Vec<String> = task
-            .covers
-            .iter()
-            .filter_map(|id| spec.requirements.iter().find(|requirement| &requirement.id == id))
-            .map(|requirement| ds.text("list_item", &[("text", &format!("{}: {}", requirement.id, requirement.text))]))
-            .collect();
-        if !served.is_empty() {
-            text.push_str(&ds.text("plan_task_requirements", &[("items", &served.join("\n"))]));
-        }
-        text.push_str(&examples_block(ds, spec));
-    }
+    text.push_str(&write_step(ds, task));
     text
+}
+
+/// A brief's last line: the step to take next is to write the change (seen: agents whose brief
+/// ended on the plan's context read for thirty minutes and wrote nothing).
+pub fn write_step(ds: &Dataset, task: &PlanTask) -> String {
+    if task.touches.is_empty() {
+        ds.text("plan_task_write", &[])
+    } else {
+        ds.text("plan_task_write_files", &[("files", &task.touches.join(", "))])
+    }
 }
 
 /// A plan task's brief for its agent (a memory task): [`task_brief`] and the skills the task chose,
 /// never the planning decision's own.
-pub fn agent_brief(ds: &Dataset, plan: &Plan, task: &PlanTask, spec: Option<&Spec>) -> String {
-    let mut text = task_brief(ds, plan, task, spec);
+pub fn agent_brief(ds: &Dataset, plan: &Plan, task: &PlanTask) -> String {
+    let mut text = task_brief(ds, plan, task);
     if !task.skills.is_empty() {
         text.push_str(&ds.text("delegate_skills", &[("uris", &task.skills.join("\n"))]));
     }
@@ -649,9 +633,9 @@ pub fn agent_brief(ds: &Dataset, plan: &Plan, task: &PlanTask, spec: Option<&Spe
 
 /// The DO decision the foreground loop carries out for a plan of at most one task: its brief,
 /// files, checks and the task's own skills (the planning decision's skills stay with the plan).
-pub fn foreground_decision(ds: &Dataset, plan: &Plan, spec: Option<&Spec>, effort: &str) -> Decision {
+pub fn foreground_decision(ds: &Dataset, plan: &Plan, effort: &str) -> Decision {
     let task = plan.tasks.first().cloned().unwrap_or_default();
-    let brief = if plan.tasks.is_empty() { plan.doc.goal.clone() } else { task_brief(ds, plan, &task, spec) };
+    let brief = if plan.tasks.is_empty() { plan.doc.goal.clone() } else { task_brief(ds, plan, &task) };
     Decision {
         missing: String::new(),
         route: "DO".into(),

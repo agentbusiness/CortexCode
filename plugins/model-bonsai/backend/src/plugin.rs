@@ -6,7 +6,7 @@ use cc_protocol::contracts::model::{
     ChatMessage, ChatParams, CompleteParams, HoldParams, PrewarmParams, Priority, Sampling, SelectParams, Thinking, TokenizeParams, methods,
 };
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, parse_params, to_value};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -78,7 +78,11 @@ impl ModelPlugin {
                 });
                 let runtime = Runtime::new(paths, config, publisher);
                 let starter = runtime.clone();
-                tokio::spawn(async move { starter.start().await });
+                let asker = ctx.clone();
+                tokio::spawn(async move {
+                    ask_yield(&asker).await;
+                    starter.start().await
+                });
                 Ok::<_, RpcError>(runtime)
             })
             .await
@@ -225,10 +229,31 @@ async fn probe(runtime: Arc<Runtime>) -> ProbeReport {
     ProbeReport::from_checks(checks)
 }
 
+/// How long a load waits for another app on this machine to unload its model.
+const YIELD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One model per machine: before the weights load, every other app on this machine holding a
+/// model not tagged `coding` (CortexTerm's Gemma) is asked to unload it (`mesh.model.yield`,
+/// mesh@1). Best effort: no mesh plugin, or no answer within a few seconds, and the load goes on.
+async fn ask_yield(ctx: &Ctx) {
+    let asked = tokio::time::timeout(YIELD_WAIT, ctx.call("mesh.model.yield", json!({"to_tag": cc_protocol::contracts::model::tags::CODING}))).await;
+    if let Ok(Ok(answer)) = asked
+        && answer.get("asked").and_then(Value::as_array).is_some_and(|asked| !asked.is_empty())
+    {
+        tracing::info!(%answer, "asked the other apps on this machine to unload their model");
+    }
+}
+
 impl Plugin for ModelPlugin {
     fn handle(&self, ctx: Ctx, call: Call) -> BoxFuture<'static, Result<Value, RpcError>> {
         let runtime = self.runtime(&ctx);
-        Box::pin(async move { dispatch(runtime.await?, call).await })
+        Box::pin(async move {
+            // A switch loads other weights: the other apps' models go first.
+            if call.method == methods::SELECT {
+                ask_yield(&ctx).await;
+            }
+            dispatch(runtime.await?, call).await
+        })
     }
 
     fn probe(&self, ctx: Ctx) -> BoxFuture<'static, Result<ProbeReport, RpcError>> {

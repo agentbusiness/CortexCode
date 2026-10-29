@@ -19,20 +19,8 @@
         "STATUS",
         "MANAGE",
         "PLAN",
-        "IDEATE",
         "IMPLEMENT"
       ]
-    },
-    "queries": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "x-when": {
-        "route": [
-          "IDEATE"
-        ]
-      }
     },
     "skills": {
       "type": "array",
@@ -61,20 +49,13 @@
         "xhigh"
       ]
     },
-    "spec": {
-      "enum": [
-        "none",
-        "new",
-        "amend"
-      ]
-    },
-    "settles": {
+    "teaches": {
       "enum": [
         "no",
         "yes"
       ]
     },
-    "teaches": {
+    "drops": {
       "enum": [
         "no",
         "yes"
@@ -91,12 +72,10 @@
     "work",
     "asks",
     "route",
-    "queries",
     "skills",
     "effort",
-    "spec",
-    "settles",
     "teaches",
+    "drops",
     "files"
   ],
   "additionalProperties": false

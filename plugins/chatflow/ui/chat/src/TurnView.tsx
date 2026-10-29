@@ -3,8 +3,8 @@ import { clock, duration, kinds, useQuery, useSelection, type Json, type Journal
 import { Activity, activityItems, isScaffolding } from './Activity';
 import { Attachments } from './Attachments';
 import { Edits, type ChangedNote, type EditedFile } from './Edits';
-import { DECISION, IDEATION, KNOWLEDGE, PLAN, SPEC } from './ideation';
-import { DecisionCard, IdeasCard, OptionsCard, PlanCard, SpecChange, type IdeationActions } from './IdeationCards';
+import { KNOWLEDGE, PLAN } from './plan';
+import { PlanCard, type PlanActions } from './PlanCard';
 import { MarkdownBlock } from './Markdown';
 import { routeText, str, type Block, type Step, type Turn } from './transcript';
 
@@ -24,7 +24,7 @@ export function holds(step: Step, seq: number | null): boolean {
   return seq !== null && (step.call.seq === seq || step.result?.seq === seq);
 }
 
-export interface TurnActions extends IdeationActions {
+export interface TurnActions extends PlanActions {
   /** Answer an ask-mode approval (`chatflow.approve`); resolves when the flow took the answer. */
   approve: (seq: number, approve: boolean) => Promise<void>;
   openFile: (path: string) => void;
@@ -300,16 +300,8 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
       // the header of its section (TurnView), not a note.
       if (!str(data.text) || str(data.purpose) === 'task_start') return null;
       return <p className="cx-note" data-seq={entry.seq}>{str(data.text)}</p>;
-    case SPEC:
-      return <SpecChange entry={entry} />;
     case PLAN:
       return <PlanCard entry={entry} actions={actions} />;
-    case DECISION:
-      // A decision made by choosing an option is shown by the options card.
-      if (typeof data.ideation_seq === 'number') return null;
-      return <DecisionCard entry={entry} actions={actions} />;
-    case IDEATION:
-      return str(data.phase) === 'options' ? <OptionsCard entry={entry} actions={actions} /> : <IdeasCard entry={entry} />;
     // Knowledge is kept at once; the run's learned line counts it.
     case KNOWLEDGE:
       return null;
@@ -402,7 +394,7 @@ export function taskState(task: Task | undefined): string {
  * A task the turn made (`task_link`): its title and, from the task record, its state (pending,
  * in progress, done, failed), live as the loop works it. Opens the task on the board.
  */
-function TaskLinkRow({ taskId, title, number, actions }: { taskId: string; title: string; number?: number; actions: IdeationActions }) {
+function TaskLinkRow({ taskId, title, number, actions }: { taskId: string; title: string; number?: number; actions: PlanActions }) {
   const { projectId } = useSelection();
   const tasks = useQuery<Task[]>(projectId ? `memory.task.list:${projectId}` : null, async (c) => (await c.call<{ tasks: Task[] }>('memory.task.list', { project_id: projectId }))?.tasks ?? [], { topics: ['memory.task.changed', 'agents.changed'] });
   const task = tasks.data?.find((item) => item.id === taskId);

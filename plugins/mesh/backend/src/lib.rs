@@ -7,6 +7,7 @@ pub mod borrow;
 pub mod card;
 pub mod claims;
 pub mod identity;
+pub mod local;
 pub mod members;
 pub mod net;
 pub mod pairing;
@@ -14,3 +15,6 @@ pub mod place;
 pub mod projects;
 pub mod service;
 pub mod words;
+
+/// The app this mesh plugin belongs to, as its card and its local file name it.
+pub const SOFTWARE: &str = "cortexcode";

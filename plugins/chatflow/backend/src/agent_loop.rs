@@ -135,8 +135,6 @@ pub enum LoopKind {
     Foreground,
     /// A question (the router's LOOKUP or ANSWER): explore with the tools and answer.
     Question,
-    /// IDEATE's discovery: explore with the tools and report what the question depends on.
-    Discover,
     /// A named background agent working a task.
     Agent { name: String },
 }
@@ -161,8 +159,6 @@ pub struct StepSpec {
     pub goal: String,
     /// The titles of the tasks after this one, done later (named so the model leaves them).
     pub later: Vec<String>,
-    /// The requirements this task serves (label, text), as its step lists them.
-    pub requirements: Vec<(String, String)>,
 }
 
 /// The stage text that tells the loop its step: the step, what the earlier steps did, and that
@@ -814,9 +810,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         _ => None,
     };
     let (stage, live) = match &spec.kind {
-        // With a spec, the closing summary states coverage per open requirement (the self-review).
-        // No per-requirement review in the closing summary (it made the model narrate instead of
-        // verify); the spec keeps tracking requirements for the conversation.
         // A planned change: the loop is told its step (the plan itself is in the conversation).
         LoopKind::Foreground => ("DO", spec.step.as_ref().map(|step| step_live(&env.data, step)).unwrap_or_default()),
         // A turn continued because a skill's tool reports open work (`flow::work_open`): the
@@ -824,7 +817,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // "reply when you know the answer" does not win over it (seen: the model answered with a
         // progress report at "Current stage: ASK" while the tool had 168 lines open).
         LoopKind::Question => ("ASK", if crate::flow::work_open_round(&entries, &env.run_id) { env.data.text("work_open_stage", &[]) } else { String::new() }),
-        LoopKind::Discover => ("DISCOVER", String::new()),
         LoopKind::Agent { name } => ("TASK", format!("{}{}", agent_team.as_ref().map(|team| team.live(&env.data)).unwrap_or_default(), env.data.text("agent_live", &[("name", name)]))),
     };
     env.set_stage("act");
@@ -869,9 +861,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             deliver_board(journal, env, name, agent_team.as_ref()).await?;
         }
         // The guide of a language the work just reached its first file of, before the next step.
-        if !matches!(spec.kind, LoopKind::Discover) {
-            crate::guides::deliver(env, journal).await?;
-        }
+        crate::guides::deliver(env, journal).await?;
         // A prewarm still running ends here: the call continues from what it prefilled.
         drop(prewarm.take());
         // Every `settle_steps` steps the in-place rewrites apply up to the newest entry (outdated

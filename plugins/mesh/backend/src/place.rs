@@ -69,6 +69,10 @@ impl Mesh {
             return None;
         }
         let info: ModelInfo = serde_json::from_value(ctx.call("model.info", json!({})).await.ok()?).ok()?;
+        // Another app's model on this machine, borrowed by this one's model plugin: not local.
+        if info.borrowed() {
+            return None;
+        }
         let slots: SlotsResult = serde_json::from_value(ctx.call("model.slots", json!({})).await.ok()?).ok()?;
         let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
         Some(Local {

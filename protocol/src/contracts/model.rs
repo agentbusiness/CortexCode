@@ -13,6 +13,9 @@ use serde_json::Value;
 pub mod tags {
     /// Writing and changing code: the chat flow, its agents and their background calls.
     pub const CODING: &str = "coding";
+    /// Everyday machine and office work (CortexTerm's terminal flow, other office apps): Gemma by default.
+    /// Apps that accept it also accept a `coding` model, so one model per machine serves them all.
+    pub const OFFICE: &str = "office";
 }
 
 pub fn default_tag() -> String {
@@ -45,6 +48,11 @@ pub mod methods {
     pub const VARIANTS: &str = "model.variants";
     /// Switch the active variant (reloads weights).
     pub const SELECT: &str = "model.select";
+    /// [`super::YieldParams`] -> [`super::YieldResult`]: another app on this machine needs a
+    /// model tagged `to_tag` that this one is not: take no new work, let what runs finish, unload
+    /// (one model per machine). The mesh forwards it from a local member; a plugin that does not
+    /// serve it answers unknown_method and nothing happens.
+    pub const YIELD: &str = "model.yield";
 }
 
 pub mod topics {
@@ -210,6 +218,12 @@ pub mod modalities {
 }
 
 impl ModelInfo {
+    /// The model is another app's, borrowed on this machine (`extra.source` is `borrowed`): it is
+    /// not this computer's to lend, and the mesh's card does not show it.
+    pub fn borrowed(&self) -> bool {
+        self.extra.get("source").and_then(Value::as_str) == Some("borrowed")
+    }
+
     /// Whether the model takes image content parts: the typed [`ModelInfo::vision`] says so, or
     /// (for plugins that only fill `extra`) `extra.input_modalities` lists `image`. Absent means
     /// text only.
@@ -572,6 +586,20 @@ pub struct Variant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VariantsResult {
     pub variants: Vec<Variant>,
+}
+
+/// Params of `model.yield` (and of the mesh's `mesh.model.yield`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct YieldParams {
+    /// The tag the asking app needs (`coding`).
+    pub to_tag: String,
+}
+
+/// Result of `model.yield`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct YieldResult {
+    /// A loaded model was unloaded.
+    pub yielded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

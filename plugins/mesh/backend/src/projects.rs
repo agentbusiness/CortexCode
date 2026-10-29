@@ -29,7 +29,8 @@ impl Mesh {
         let mut projects: Vec<NetworkProject> = mine.projects.into_iter().map(|project| NetworkProject { project, node: String::new(), computer: self.name(), reachable: true }).collect();
         let cards = lock(&self.cards).clone();
         let conns = self.connections();
-        for member in self.members().into_values().filter(|member| member.node != me) {
+        // Another app on this machine is not a computer of the network: its projects are its own.
+        for member in self.members().into_values().filter(|member| member.node != me && !self.local_only(&member.node)) {
             let Some(card) = cards.get(&member.node) else { continue };
             for project in &card.projects {
                 projects.push(NetworkProject { project: project.clone(), node: member.node.clone(), computer: member.name.clone(), reachable: conns.contains_key(&member.node) });

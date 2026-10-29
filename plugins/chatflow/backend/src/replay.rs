@@ -18,11 +18,12 @@
 //!   worse (`hurt`, and the withdrawal rule applies), anything else is no observed effect. The
 //!   lesson gets a `replay://` evidence either way, so it is not replayed again; a user's turn
 //!   cancels a replay, which then decides nothing and is tried again later. Results go to
-//!   `replays/results.jsonl` for the night report.
+//!   `replays/results.jsonl` for the night report; the replay's projects and sessions are then
+//!   deleted.
 
 use crate::host::Host;
 use cc_protocol::RpcError;
-use cc_protocol::contracts::frame::{JournalEntry, SessionCreateParams, SessionKind, kinds, methods as frame_methods};
+use cc_protocol::contracts::frame::{JournalEntry, ProjectListResult, SessionCreateParams, SessionKind, kinds, methods as frame_methods};
 use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, knowledge, methods as memory_methods};
 use cc_protocol::BoxFuture;
 use serde_json::{Value, json};
@@ -316,6 +317,15 @@ async fn run_arm(host: &Host, paths: &Paths, replayer: &dyn Replayer, c: &Candid
     Ok((session.id, state))
 }
 
+/// Forget the replays' projects, with their sessions and journals: a finished replay leaves only
+/// its result (and older replays left by a stopped app go too).
+async fn forget(host: &Host, paths: &Paths) {
+    let Ok(listed) = host.get::<ProjectListResult>(frame_methods::PROJECT_LIST, json!({})).await else { return };
+    for project in listed.projects.into_iter().filter(|project| paths.is_replay(&project.root)) {
+        let _ = host.call(frame_methods::PROJECT_DELETE, json!({"id": project.id})).await;
+    }
+}
+
 /// Replay one candidate (see the module's doc). Returns whether one was replayed to a decision,
 /// and the kind it was (for taking turns).
 pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, last_dom: Option<bool>) -> Option<bool> {
@@ -336,6 +346,7 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
     for arm in ["with", "without"] {
         let _ = std::fs::remove_dir_all(paths.replays.join(format!("{stamp}-{arm}")));
     }
+    forget(host, paths).await;
     let ((with_session, with_state), (without_session, without_state)) = match (with, without) {
         (Ok(with), Ok(without)) if with.1 != "cancelled" && without.1 != "cancelled" => (with, without),
         (with, without) => {

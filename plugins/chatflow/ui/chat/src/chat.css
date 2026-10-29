@@ -89,33 +89,43 @@
 #cc .cx-chat .cx-pasted summary{cursor:pointer;}
 #cc .cx-chat .cx-pasted pre{margin:4px 0 0;max-height:240px;overflow:auto;white-space:pre;}
 
-/* the spec (pinned at the top), proposed decisions and plans: the design's notices */
-#cc .cx-chat .cx-spec,#cc .cx-chat .cx-plan,#cc .cx-chat .cx-decision{margin:12px 0;}
-#cc .cx-chat .cx-spec-text summary{cursor:pointer;}
-#cc .cx-chat .cx-spec-text .prose{white-space:pre-wrap;max-height:240px;overflow:auto;margin:4px 0 0;}
-#cc .cx-chat .cx-requirements,#cc .cx-chat .cx-plan-tasks{list-style:none;margin:8px 0 0;padding:0;grid-column:2;}
-#cc .cx-chat .cx-requirements li{display:flex;align-items:baseline;gap:8px;padding:4px 0;border-top:1px solid var(--rule);}
-#cc .cx-chat .cx-requirements li[data-status="dropped"] .cx-req-text{text-decoration:line-through;color:var(--ink-3);}
-#cc .cx-chat .cx-requirements li[data-status="met"] .ap:first-child{color:var(--counter);}
-#cc .cx-chat .cx-requirements .cx-req-text,#cc .cx-chat .cx-requirements input{flex:1;min-width:0;}
-#cc .cx-chat .cx-spec-field{display:flex;flex-direction:column;gap:4px;margin-top:8px;grid-column:2;}
-#cc .cx-chat .cx-spec-field textarea{font:inherit;resize:vertical;}
-#cc .cx-chat .cx-decisions{margin:8px 0 0;padding-left:1.2em;grid-column:2;}
-#cc .cx-chat .cx-decided{color:var(--ink);margin:4px 0 0;}
+/* The plan: its goal and its points, one by one; everything but the kindmark in the content column. */
+#cc .cx-chat .cx-plan{margin:12px 0;}
+#cc .cx-chat .cx-plan > :not(.kindmark){grid-column:2;}
 #cc .cx-chat .cx-plan-goal{font-size:16px;color:var(--ink);margin:4px 0 0;}
-#cc .cx-chat .cx-plan-steps,#cc .cx-chat .cx-plan-risks{margin:8px 0 0;padding-left:1.4em;grid-column:2;}
-#cc .cx-chat .cx-plan-tasks>li{padding:10px 0;border-top:1px solid var(--rule);font-size:14.5px;line-height:1.45;color:var(--ink);}
+#cc .cx-chat .cx-plan-steps,#cc .cx-chat .cx-plan-risks{margin:8px 0 0;padding-left:1.4em;}
+#cc .cx-chat .cx-plan-points{list-style:none;margin:8px 0 0;padding:0;}
+#cc .cx-chat .cx-plan-points>li{display:grid;grid-template-columns:1.8em minmax(0,1fr);align-items:baseline;padding:8px 0;border-top:1px solid var(--rule);font-size:14.5px;line-height:1.45;color:var(--ink);}
+#cc .cx-chat .cx-plan-points .cx-plan-n{margin:0;color:var(--ink-3);}
+#cc .cx-chat .cx-plan-points>li[data-state="done"]{color:var(--ink-3);}
+#cc .cx-chat .cx-plan-points>li[data-state="done"] .cx-plan-n{color:var(--counter);}
+#cc .cx-chat .cx-plan-points>li[data-state="failed"] .cx-plan-n{color:var(--rubric);}
+#cc .cx-chat .cx-plan-points>li[data-state="current"] .cx-task-title,#cc .cx-chat .cx-plan-points>li[data-state="current"] .cx-plan-n{color:var(--accent,#e8873a);}
+#cc .cx-chat .cx-plan-step-summary{display:block;font-size:13.5px;color:var(--ink-2);margin-top:2px;}
 #cc .cx-chat .cx-task-title{display:block;font-size:15.5px;font-weight:600;color:var(--ink);}
-#cc .cx-chat .cx-task-brief{margin:4px 0;font-size:14.5px;color:var(--ink-2);}
-/* What a task touches, checks and covers: a label column, the values in their own case. */
-#cc .cx-chat .cx-task-meta{display:grid;grid-template-columns:max-content 1fr;gap:3px 12px;align-items:baseline;margin:8px 0 0;font-size:13px;color:var(--ink-2);}
+#cc .cx-chat .cx-task-brief{margin:2px 0 0;font-size:14.5px;color:var(--ink-2);white-space:pre-wrap;}
+/* What a point touches and checks (under Details): a label column, the values in their own case. */
+#cc .cx-chat .cx-plan-point-meta{margin-top:8px;}
+#cc .cx-chat .cx-plan-point-meta .cx-task-title{font-size:14px;}
+#cc .cx-chat .cx-task-meta{display:grid;grid-template-columns:max-content 1fr;gap:3px 12px;align-items:baseline;margin:4px 0 0;font-size:13px;color:var(--ink-2);}
 #cc .cx-chat .cx-task-meta dd{margin:0;min-width:0;overflow-wrap:anywhere;}
 #cc .cx-chat .cx-task-meta code{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
 #cc .cx-chat .cx-task-meta code+code::before{content:", ";font-family:inherit;color:var(--ink-3);}
 #cc .cx-chat .cx-task-progress{display:flex;align-items:center;gap:8px;margin-top:4px;}
-#cc .cx-chat .cx-plan-diff{grid-column:2;margin-top:8px;}
+#cc .cx-chat .cx-plan-diff{margin-top:8px;}
 #cc .cx-chat .cx-plan-diff summary{cursor:pointer;}
 #cc .cx-chat .cx-plan-diff ul{margin:4px 0 0;padding-left:1.2em;}
+/* The plan's editor: the goal, then each point's title and text. */
+#cc .cx-chat .cx-plan-edit-goal{font:inherit;width:100%;box-sizing:border-box;margin-top:8px;}
+#cc .cx-chat .cx-plan-edit-points .cx-plan-point{display:flex;flex-direction:column;gap:6px;}
+#cc .cx-chat .cx-plan-edit-points textarea,#cc .cx-chat .cx-plan-edit-points input{font:inherit;width:100%;box-sizing:border-box;}
+#cc .cx-chat .cx-plan-edit-points textarea{resize:vertical;}
+#cc .cx-chat .cx-plan-edit-head{display:flex;gap:6px;align-items:center;}
+#cc .cx-chat .cx-plan-edit-head input{flex:1;min-width:0;}
+#cc .cx-chat .cx-faint-line{color:var(--ink-3);font-size:13.5px;margin:6px 0 0;}
+/* Secondary sentences: the reading face, smaller and quieter; never the uppercase label type. */
+#cc .cx-chat .cx-aside{font-size:13.5px;line-height:1.45;color:var(--ink-2);}
+#cc .cx-chat .cx-aside .ap{margin-right:4px;}
 
 /* A note written for the model (a skill's text): kept as written when opened. */
 #cc .cx-host-note-text { white-space: pre-wrap; font-style: normal; font-size: 13px; }
@@ -181,14 +191,6 @@
 #cc .cx-edits-view{margin-top:8px;}
 #cc .cx-working-decision{font-style:italic;}
 
-/* A plan carried out by the conversation's loop: each task's state (the running one in the run's orange). */
-.cx-plan-tasks > li[data-state="done"] { color: var(--fg-muted, #9a9a9a); }
-.cx-plan-tasks > li[data-state="done"]::marker { content: "\2713  "; }
-.cx-plan-tasks > li[data-state="failed"]::marker { content: "\2717  "; color: var(--danger, #d9534f); }
-.cx-plan-tasks > li[data-state="current"] { color: var(--accent, #e8873a); font-weight: 600; }
-.cx-plan-step-summary { display: block; font-weight: 400; font-size: 0.9em; opacity: 0.8; margin-top: 0.1em; }
-
-
 /* A task the turn made: its state at the row's end (the running one in the run's orange). */
 .cx-task-link[data-state="in_progress"] .cx-task-state, .cx-task-link[data-state="in_progress"] .dot { color: var(--accent, #e8873a); }
 .cx-task-link[data-state="in_progress"] .dot { background: var(--accent, #e8873a); }
@@ -202,11 +204,6 @@
 .cx-task-run-body { margin-left: 1.1em; padding-left: 0.8em; border-left: 2px solid var(--line, #333); }
 .cx-task-run[data-state="in_progress"] .cx-task-run-body { border-left-color: var(--accent, #e8873a); }
 
-/* The plan card is one line (tasks and the goal, cut to a line); the rest opens on a click. */
-#cc .cx-chat .cx-plan .cx-plan-details{grid-column:2;min-width:0;}
-#cc .cx-chat .cx-plan .cx-plan-line{display:flex;gap:10px;align-items:baseline;cursor:pointer;min-width:0;}
-#cc .cx-chat .cx-plan .cx-plan-line .cx-plan-goal{font-size:14px;color:var(--ink-2);margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;}
-
 #cc .cx-test-results{margin:8px 0 4px;padding:8px 12px;border-left:2px solid var(--counter);}
 #cc .cx-test-results[data-failed="true"]{border-left-color:var(--rubric);}
 #cc .cx-test-results-head{display:flex;gap:10px;align-items:baseline;font-variant-numeric:tabular-nums;}
@@ -215,62 +212,6 @@
 #cc .cx-test-failed{color:var(--rubric);}
 #cc .cx-test-passed summary{cursor:pointer;margin-top:6px;}
 
-
-/* Plan editing and comments (the plan card's Edit and Comment). */
-#cc .cx-chat .cx-plan-edit-tasks li{display:flex;flex-direction:column;gap:6px;}
-#cc .cx-chat .cx-plan-edit-tasks textarea,#cc .cx-chat .cx-plan-edit-tasks input{font:inherit;width:100%;box-sizing:border-box;}
-#cc .cx-chat .cx-plan-edit-tasks textarea{resize:vertical;}
-#cc .cx-chat .cx-plan-edit-head{display:flex;gap:6px;align-items:center;}
-#cc .cx-chat .cx-plan-edit-head input{flex:1;min-width:0;}
-#cc .cx-chat .cx-plan-edit-after{display:flex;flex-wrap:wrap;gap:4px;align-items:center;}
-#cc .cx-chat .cx-plan-edit-after .detent[data-on="true"]{border-color:var(--accent,#e8873a);color:var(--ink);}
-#cc .cx-chat .cx-plan-edit-after .detent[data-on="false"]{opacity:.6;}
-#cc .cx-chat .cx-plan-rules{margin:6px 0 0;padding-left:1.2em;}
-#cc .cx-chat .cx-plan-rules li{margin:2px 0;}
-#cc .cx-chat .cx-plan-comments{list-style:none;margin:6px 0 0;padding:0;grid-column:2;}
-#cc .cx-chat .cx-plan-comments li{display:flex;gap:8px;align-items:center;font-size:14.5px;line-height:1.45;padding:4px 8px;margin-top:4px;border-left:2px solid var(--accent,#e8873a);background:var(--paper-2,rgba(127,127,127,.06));}
-#cc .cx-chat .cx-plan-comment-text{flex:1;min-width:0;white-space:pre-wrap;}
-#cc .cx-chat .cx-plan-comment-box{display:flex;gap:6px;align-items:center;margin-top:6px;grid-column:2;flex-wrap:wrap;}
-#cc .cx-chat .cx-plan-comment-box input{flex:1;min-width:12em;font:inherit;}
-#cc .cx-chat .cx-plan-comment-add{margin-top:8px;}
-
-/* Ideation: the ideas weighed (folded) and the options card. */
-#cc .cx-chat .cx-ideas{margin:8px 0;}
-#cc .cx-chat .cx-ideas summary{cursor:pointer;}
-#cc .cx-chat .cx-ideas-list{margin:6px 0 0;padding-left:1.4em;font-size:14.5px;line-height:1.45;}
-#cc .cx-chat .cx-ideas-list li{padding:6px 0;}
-#cc .cx-chat .cx-idea-name,#cc .cx-chat .cx-option-name{font-weight:600;color:var(--ink);}
-#cc .cx-chat .cx-idea-principle{color:var(--ink-3);font-style:italic;}
-#cc .cx-chat .cx-idea-mechanism,#cc .cx-chat .cx-option-mechanism{margin:4px 0 0;font-size:14.5px;line-height:1.45;color:var(--ink);}
-/* Labels are the apparatus type; what they label stays in its own case and the reading face. */
-#cc .cx-chat .cx-labelled .ap{margin-right:8px;}
-#cc .cx-chat .cx-faint-line{color:var(--ink-3);font-size:13.5px;}
-/* Secondary sentences: the reading face, smaller and quieter; never the uppercase label type. */
-#cc .cx-chat .cx-aside{font-size:13.5px;line-height:1.45;color:var(--ink-2);}
-#cc .cx-chat .cx-aside .ap{margin-right:4px;}
-#cc .cx-chat .cx-decision .cx-decided{font-size:15px;line-height:1.5;}
-#cc .cx-chat .cx-findings{list-style:none;margin:8px 0 0;padding:0;font-size:13px;line-height:1.4;}
-#cc .cx-chat .cx-findings li{display:grid;grid-template-columns:5.5em 1fr;gap:10px;align-items:baseline;margin-top:3px;}
-#cc .cx-chat .cx-finding-body{min-width:0;overflow-wrap:anywhere;color:var(--ink-2);}
-#cc .cx-chat .cx-findings code{font-family:var(--font-mono);font-size:12px;color:var(--ink);margin-right:8px;}
-#cc .cx-chat .cx-options{margin:12px 0;}
-#cc .cx-chat .cx-criteria{grid-column:2;margin-top:6px;font-size:13.5px;line-height:1.4;color:var(--ink-2);}
-#cc .cx-chat .cx-criteria ul{margin:4px 0 0;padding-left:1.2em;}
-#cc .cx-chat .cx-option-list{list-style:none;margin:10px 0 0;padding:0;grid-column:2;}
-#cc .cx-chat .cx-option-list > li{padding:12px 0;border-top:1px solid var(--rule);}
-#cc .cx-chat .cx-option-list > li[data-recommended="true"]{border-left:2px solid var(--rubric);padding-left:10px;}
-#cc .cx-chat .cx-options[data-chosen]:not([data-chosen=""]) .cx-option-list > li[data-chosen="false"]{opacity:.55;}
-#cc .cx-chat .cx-options .cx-option-list > li[data-chosen="true"]{border-left:2px solid var(--counter);padding-left:10px;}
-#cc .cx-chat .cx-option-head{display:flex;gap:10px;align-items:center;}
-#cc .cx-chat .cx-option-head .cx-option-name{flex:1;min-width:0;font-size:15.5px;}
-#cc .cx-chat .cx-option-badge{color:var(--rubric);}
-/* An option's why, history, cost, risk and test: a label column beside plain sentences. */
-#cc .cx-chat .cx-option-meta{grid-column:2;display:grid;grid-template-columns:7.5em 1fr;gap:5px 12px;align-items:baseline;margin:10px 0 0;font-size:13.5px;line-height:1.45;color:var(--ink-2);}
-#cc .cx-chat .cx-option-meta dt{line-height:1.45;}
-#cc .cx-chat .cx-option-meta dd{margin:0;min-width:0;overflow-wrap:anywhere;}
-#cc .cx-chat .cx-recommend{margin-top:12px;color:var(--ink);}
-#cc .cx-chat .cx-recommend dt{white-space:nowrap;}
-#cc .cx-chat .cx-options .cx-plan-diff li .ap{margin-right:6px;}
 
 /* A fenced block in an answer: the code view's editor in miniature (header, line numbers, highlight). */
 #cc .cx-answer .cx-codeblock{

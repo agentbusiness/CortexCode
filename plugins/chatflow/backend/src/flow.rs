@@ -7,14 +7,10 @@
 //! 3. DECIDE writes `missing` first, then MORE (another round of reads), ANSWER, DO or DELEGATE.
 //! 4. The result: a streamed reply, the coding agent loop, or a delegation to background agents.
 //!
-//! Around them, the ideation parts (docs/IDEATION-WORKFLOW.md):
-//! - right after ROUTE, a message that makes or changes the spec runs SPEC or SPEC_EDIT
-//!   ([`crate::spec`]);
-//! - DECIDE (or ROUTE) PLAN runs PLAN, or PLAN_EDIT while a plan is open: a plan document and a
-//!   task graph, nothing changed ([`crate::plan`]); ROUTE IMPLEMENT (or the plan card's Implement)
-//!   hands the open plan to the foreground loop (one task) or to memory tasks and agents (several);
-//! - after the answer, a message the router judged to settle something runs DECISIONS, whose
-//!   proposals the user accepts or rejects.
+//! Around them, the plan: the conversation is a plain chat; DECIDE (or ROUTE) PLAN runs PLAN, or
+//! PLAN_EDIT while a plan is open: the plan's points, nothing changed ([`crate::plan`]); ROUTE
+//! IMPLEMENT (or the plan card's Implement) hands the open plan to the foreground loop (one task)
+//! or to memory tasks and agents (several).
 //!
 //! The turn is a state machine over the journal: each stage is derived from the run's entries, so a
 //! resumed run (after a hot-swap or crash) continues at the stage it reached.
@@ -26,13 +22,13 @@ use crate::llm;
 use crate::prompts;
 use crate::reads::{self, ReadReq, Wanted};
 use crate::skillsel;
-use crate::schemas::{self, Decision, KnowledgeProposed, PlanOutput, Proposed, RouterDecision, Shape, SpecEdit, SpecExtract, parse_json};
-use crate::{ideation, plan, spec};
+use crate::schemas::{self, Decision, KnowledgeProposed, PlanOutput, RouterDecision, Shape, parse_json};
+use crate::{plan, proposal};
 use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, plan_status};
 use cc_protocol::contracts::agents::{DelegateResult, methods as agents_methods};
 use cc_protocol::contracts::frame::{JournalEntry, kinds};
 use cc_protocol::contracts::lang::LanguageInfo;
-use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeSearchResult, Task, methods as memory_methods};
+use cc_protocol::contracts::memory::{KnowledgeItem, KnowledgeListResult, KnowledgeSearchResult, Task, methods as memory_methods};
 use cc_protocol::contracts::tools::methods as tools_methods;
 use cc_protocol::contracts::model::ChatMessage;
 use cc_protocol::contracts::now_ms;
@@ -77,28 +73,17 @@ enum Stage {
     /// A question: the model explores with its tools and answers (no fixed reads).
     Explore,
     Delegate { decision_seq: u64 },
-    /// The message makes (`amend` false) or changes the spec, right after the route.
-    Spec { amend: bool },
     /// PLAN, or PLAN_EDIT while a plan is open, after a decision to plan. `auto`: the plan of a DO
     /// decision, written before the work and carried out at once by the Act stage, step by step.
     Plan { decision_seq: u64, auto: bool },
     /// IMPLEMENT: the open plan goes to the task machinery.
     Implement { route_seq: u64 },
-    /// IDEATE: the host grounds the question (a code-graph search for it, the files it names,
-    /// what the project knows, earlier notes), before the ideas are written.
-    IdeateReads { route_seq: u64 },
-    /// IDEATE: the model finds out what the question depends on with its tools (docs, the code,
-    /// how it behaves now); its findings are the last message before IDEAS.
-    IdeateDiscover,
-    /// IDEATE: one idea per principle, then the host looks each up ([`crate::ideation`]).
-    Ideas,
-    /// IDEATE: the critique, the options and a recommendation: the turn's answer.
-    Options,
-    /// After the answer, when the router judged that the message settles something.
-    Decisions { route_seq: u64 },
-    /// After the answer (and the decisions), when the router judged that the message states
+    /// After the answer, when the router judged that the message states
     /// something durable about the project's world (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
     Knowledge { route_seq: u64 },
+    /// The message sets aside the direction the user gave earlier: the conversation's decisions
+    /// in the project's knowledge are withdrawn, before anything of the turn reads them.
+    SetAside { route_seq: u64 },
     Done,
 }
 
@@ -194,10 +179,6 @@ fn reply_finished(run: &[&JournalEntry], seq: u64) -> bool {
     })
 }
 
-fn spec_done(run: &[&JournalEntry]) -> bool {
-    run.iter().any(|entry| entry.kind == chatflow_kinds::SPEC || (entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "spec_done"))
-}
-
 fn plan_written(run: &[&JournalEntry], seq: u64) -> bool {
     run.iter().any(|entry| entry.seq > seq && entry.kind == chatflow_kinds::PLAN)
 }
@@ -210,18 +191,14 @@ fn derive(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize) -> S
     let Some(route) = run.iter().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route") else {
         return derive_work(entries, run_id, read_rounds_limit);
     };
-    // The skills ROUTE chose, then the spec: everything after the route sees them.
+    // The skills ROUTE chose: everything after the route sees them.
     if !skillsel::of_decision(route).is_empty() && !skillsel::injected(run.iter().copied(), route.seq) {
         return Stage::Skills { route_seq: route.seq };
     }
-    let action = str_field(&route.data, "spec_action");
-    if matches!(action, "new" | "amend") && !spec_done(&run) {
-        return Stage::Spec { amend: action == "amend" };
+    if route.data.get("drops").and_then(Value::as_bool) == Some(true) && !note_after(&run, route.seq, "set_aside") {
+        return Stage::SetAside { route_seq: route.seq };
     }
     let stage = derive_work(entries, run_id, read_rounds_limit);
-    if stage == Stage::Done && route.data.get("settles").and_then(Value::as_bool) == Some(true) && !note_after(&run, route.seq, "decisions_done") {
-        return Stage::Decisions { route_seq: route.seq };
-    }
     if stage == Stage::Done && route.data.get("teaches").and_then(Value::as_bool) == Some(true) && !note_after(&run, route.seq, "knowledge_done") {
         return Stage::Knowledge { route_seq: route.seq };
     }
@@ -269,13 +246,6 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
             // A plan card's Revise names its plan: the comments are the change, PLAN_EDIT writes it.
             "PLAN" if !str_field(&last.data, "plan_id").is_empty() && plan_written(&run, last.seq) => Stage::Done,
             "PLAN" if !str_field(&last.data, "plan_id").is_empty() => Stage::Plan { decision_seq: last.seq, auto: false },
-            "IDEATE" => match ideation::phase_after(&run, last.seq).as_deref() {
-                Some(ideation::PHASE_OPTIONS) => Stage::Done,
-                Some(_) => Stage::Options,
-                None if ideation::discovered(&run, last.seq) => Stage::Ideas,
-                None if ideation::grounded(&run, last.seq) => Stage::IdeateDiscover,
-                None => Stage::IdeateReads { route_seq: last.seq },
-            },
             // A change: plan first, from the conversation and the repository map in the prefix (no
             // discovery before it); each task then reads what it needs.
             "DO" => Stage::Commit { route_seq: last.seq },
@@ -452,13 +422,9 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             Stage::Route => {
                 set_stage(env, journal, status_seq, "route").await?;
                 let (mut route_shape, catalog, skills_live) = route_shape(env, &entries)?;
-                // IMPLEMENT needs an open plan, amending needs a spec: otherwise the grammar has neither.
-                let has_spec = spec::current(&entries).is_some();
+                // IMPLEMENT needs an open plan: otherwise the grammar has none.
                 if plan::open(&entries).is_none() {
                     route_shape = route_shape.without("route", "IMPLEMENT");
-                }
-                if !has_spec {
-                    route_shape = route_shape.without("spec", "amend");
                 }
                 let routed = decide_json::<RouterDecision>(env, journal, "ROUTE", &route_shape, &skills_live).await;
                 let (decision, raw) = match routed {
@@ -482,9 +448,8 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             queries: vec![],
                             focus: vec![],
                             skills: vec![],
-                            spec: String::new(),
-                            settles: String::new(),
                             teaches: String::new(),
+                            drops: String::new(),
                         };
                         (fallback, format!("router failed: {error}"))
                     }
@@ -498,16 +463,12 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 } else {
                     Vec::new()
                 };
-                // What the message does to the spec: the router's word, or structural (long).
-                let message = entries.iter().rev().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == env.run_id);
-                let chars = message.map(|entry| str_field(&entry.data, "text").chars().count()).unwrap_or(0);
-                let spec_action = spec::action(&decision.spec, has_spec, chars, &env.data.limits);
-                let settles = decision.settles == "yes";
                 let teaches = decision.teaches == "yes";
+                let drops = decision.drops == "yes";
                 journal
                     .append(
                         kinds::ROUTE,
-                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "spec_action": spec_action, "settles": settles, "teaches": teaches}),
+                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "teaches": teaches, "drops": drops}),
                     )
                     .await
                     .map(|_| ())
@@ -600,10 +561,6 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 if !skills_text.is_empty() {
                     live = if live.is_empty() { skills_text } else { format!("{skills_text}\n{live}") };
                 }
-                let spec_live = spec::live_text(&env.data, &entries, "spec_live");
-                if !spec_live.is_empty() {
-                    live = if live.is_empty() { spec_live } else { format!("{live}\n{spec_live}") };
-                }
                 // `checks` is a pick of the project's own check commands (none: no checks).
                 let candidates = crate::verifiers::candidates(env, &run_files(&entries, &env.run_id)).await;
                 let shape = shape.filled(schemas::VERIFIERS_PLACEHOLDER, &crate::verifiers::commands(&candidates), None);
@@ -658,7 +615,6 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let mut planned = step.and_then(|n| plan::for_run(&entries, &env.run_id).map(|(seq, plan)| (seq, plan, n)));
                 let (task, step_spec) = match planned.as_mut() {
                     Some((plan_seq, plan, n)) => {
-                        let current_spec = spec::current(&entries).map(|(_, spec)| spec);
                         // The plan's checks stand only after the same baseline the foreground
                         // path runs (CHECKS drops a check that cannot judge the work, e.g. a
                         // test runner with no tests in this workspace); run once per run, then
@@ -681,14 +637,14 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         }
                         // What the baseline revised (new commands) joins the last task.
                         let last_checks: Vec<String> = stood.iter().filter(|check| !plan.tasks.iter().any(|task| task.checks.contains(check))).cloned().collect();
-                        materialize_plan_tasks(env, journal, *plan_seq, plan, current_spec.as_ref(), &last_checks).await?;
+                        materialize_plan_tasks(env, journal, *plan_seq, plan, &last_checks).await?;
                         let planned_task = plan.tasks.get(*n as usize - 1).cloned().unwrap_or_default();
                         let task_id = planned_task.task_id.clone().ok_or_else(|| RpcError::internal("the plan's task was not made"))?;
                         let task: Task = env
                             .host
                             .get::<Task>(memory_methods::TASK_UPDATE, json!({"id": task_id, "status": "in_progress", "session_id": env.session_id, "freeze": true}))
                             .await?;
-                        let text = env.data.text("do_task_text", &[("title", &planned_task.title), ("brief", &plan::task_focus(&env.data, &planned_task, current_spec.as_ref(), plan.tasks.len() == 1))]);
+                        let text = env.data.text("do_task_text", &[("title", &planned_task.title), ("brief", &plan::task_focus(&env.data, &planned_task))]);
                         let later: Vec<String> = plan.tasks.iter().filter(|task| task.n > *n).map(|task| task.title.clone()).collect();
                         let goal = plan.doc.goal.clone();
                         // Where this task's work starts in the transcript (the chat nests what
@@ -758,17 +714,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 reads::run(journal, &env.run_id, &env.scope, files, &mut fresh, &any, env.data.limits.reads_per_round).await?;
                             }
                         }
-                        let requirements: Vec<(String, String)> = current_spec
-                            .as_ref()
-                            .map(|spec| {
-                                if plan.tasks.len() == 1 {
-                                    spec.live().map(|requirement| (requirement.id.clone(), requirement.text.clone())).collect()
-                                } else {
-                                    planned_task.covers.iter().filter_map(|id| spec.requirements.iter().find(|requirement| &requirement.id == id)).map(|requirement| (requirement.id.clone(), requirement.text.clone())).collect()
-                                }
-                            })
-                            .unwrap_or_default();
-                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later, requirements }))
+                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later }))
                     }
                     None => (foreground_task(env, journal, &decision).await?, None),
                 };
@@ -990,10 +936,6 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         .map(|_| ()),
                 }
             }
-            Stage::Spec { amend } => {
-                set_stage(env, journal, status_seq, "spec").await?;
-                run_spec(env, journal, &entries, amend).await
-            }
             Stage::Plan { auto, .. } => {
                 set_stage(env, journal, status_seq, "plan").await?;
                 run_plan(env, journal, auto).await?;
@@ -1006,49 +948,11 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 set_stage(env, journal, status_seq, "implement").await?;
                 implement(env, journal, route_seq).await
             }
-            Stage::IdeateReads { route_seq } => {
-                set_stage(env, journal, status_seq, "read").await?;
-                let Some(entry) = journal.get(route_seq).cloned() else { return Err(RpcError::internal("route entry vanished")) };
-                let planned = round_reads(&env.scope, &env.session_id, &entry, "IDEATE", &env.data.limits, &[]);
-                let any = env.stops.any();
-                reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await?;
-                knowledge_note(env, journal).await?;
-                // Notes on the topic the router named, else on the work sentence.
-                let queries = detail_list(&entry, "queries");
-                let work = entry.data.get("detail").map(|detail| str_field(detail, "work").to_owned()).unwrap_or_default();
-                let about = if queries.is_empty() { work } else { queries.join("; ") };
-                ideation::notes_note(env, journal, &about).await?;
-                journal.note(&env.run_id, ideation::GROUNDED, "", false).await.map(|_| ())
-            }
-            Stage::IdeateDiscover => {
-                set_stage(env, journal, status_seq, "explore").await?;
-                let spec = LoopSpec { kind: LoopKind::Discover, effort: effort.clone(), task: None, step: None };
-                match agent_loop::run(env, journal, &spec).await {
-                    Ok(outcome) if outcome.outcome == "parked" || outcome.outcome == "cancelled" => {
-                        return Ok(TurnEnd { state: outcome.outcome.clone(), detail: outcome.summary.clone(), route: route_name, agent: Some(outcome) });
-                    }
-                    // A loop that ended without findings (context full, repeating) still leaves the
-                    // reads it made: the ideas are written from those.
-                    Ok(_) => journal.note(&env.run_id, ideation::DISCOVERED, "", false).await.map(|_| ()),
-                    Err(error) => Err(error),
-                }
-            }
-            Stage::Ideas => {
-                set_stage(env, journal, status_seq, "ideas").await?;
-                ideation::run_ideas(env, journal).await
-            }
-            Stage::Options => {
-                set_stage(env, journal, status_seq, "options").await?;
-                ideation::run_options(env, journal).await
-            }
-            Stage::Decisions { .. } => {
-                set_stage(env, journal, status_seq, "decisions").await?;
-                propose_decisions(env, journal).await
-            }
             Stage::Knowledge { route_seq } => {
                 set_stage(env, journal, status_seq, "knowledge").await?;
                 propose_knowledge(env, journal, route_seq).await
             }
+            Stage::SetAside { route_seq } => set_aside(env, journal, route_seq).await,
         };
         match outcome {
             Ok(()) => {}
@@ -1224,48 +1128,6 @@ fn joined(parts: &[String]) -> String {
     parts.iter().map(|part| part.trim()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
-/// SPEC (the message becomes the spec) or SPEC_EDIT (it changes the requirements). The spec helps
-/// the work but is not the work: a decision that cannot be read leaves the message as the spec
-/// without a checklist, or the spec as it was, and the turn goes on.
-async fn run_spec(env: &RunEnv, journal: &mut Journal, entries: &[JournalEntry], amend: bool) -> Result<(), RpcError> {
-    let current = spec::current(entries);
-    if amend && let Some((_, current)) = current {
-        let shape = stage_shape(env, "SPEC_EDIT")?.filled(schemas::REQUIREMENTS_PLACEHOLDER, &current.live_ids(), None);
-        let text = match decide_json::<SpecEdit>(env, journal, "SPEC_EDIT", &shape, "").await {
-            // The edit applies to the spec as it is now: the user may have edited it meanwhile.
-            Ok((edit, _)) => match spec::edited(&env.data, &newest_spec(journal).await?.unwrap_or(current), &edit) {
-                Some(next) => return spec::append(journal, &next, Some(&env.run_id)).await.map(|_| ()),
-                None => env.data.text("spec_unchanged", &[]),
-            },
-            Err(error) if error.code == codes::CANCELLED => return Err(error),
-            Err(error) => env.data.text("spec_failed", &[("error", &error.message)]),
-        };
-        return journal.note(&env.run_id, "spec_done", &text, false).await.map(|_| ());
-    }
-    let Some(message) = entries.iter().rev().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == env.run_id) else {
-        return journal.note(&env.run_id, "spec_done", "", false).await.map(|_| ());
-    };
-    let text = spec::source_text(&env.data, &env.data.limits, &message.data);
-    let shape = stage_shape(env, "SPEC")?;
-    let (extract, failed) = match decide_json::<SpecExtract>(env, journal, "SPEC", &shape, "").await {
-        Ok((extract, _)) => (extract, None),
-        Err(error) if error.code == codes::CANCELLED => return Err(error),
-        Err(error) => (SpecExtract::default(), Some(error.message)),
-    };
-    let previous = newest_spec(journal).await?;
-    let mut made = spec::created(&env.data, previous.as_ref(), spec::accepted(&journal.entries_vec()), text, &extract, message.seq);
-    if let Some(error) = failed {
-        made.changes = env.data.text("spec_failed", &[("error", &error)]);
-    }
-    spec::append(journal, &made, Some(&env.run_id)).await.map(|_| ())
-}
-
-/// The current spec as the journal holds it now (after the stage's model call).
-async fn newest_spec(journal: &mut Journal) -> Result<Option<spec::Spec>, RpcError> {
-    journal.sync().await?;
-    Ok(spec::current(&journal.entries_vec()).map(|(_, spec)| spec))
-}
-
 /// How a plan is written: asked for by the user (PLAN, or PLAN_EDIT of the open plan), made for
 /// a DO decision (`Auto`: carried out at once), or made again after one of its tasks ended badly
 /// (`Replan`: the done tasks stay, the rest is written anew).
@@ -1296,7 +1158,6 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // PLAN_EDIT is worded for a user's change to the open plan; a replan writes a fresh plan with
     // the replan text (what ended badly, which tasks stay).
     let stage = if matches!(mode, PlanMode::Asked) && previous.is_some() { "PLAN_EDIT" } else { "PLAN" };
-    let requirement_ids = spec::current(&entries).map(|(_, spec)| spec.live_ids()).unwrap_or_default();
     let max = env.data.limits.plan_max_tasks;
     let previous_skills = skillsel::previous_turn(&entries, &env.run_id);
     let catalog = skillsel::ordered_catalog(&env.prefix.skills, &previous_skills);
@@ -1308,7 +1169,6 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let open_labels: Vec<String> = open_work.iter().map(crate::manage::OpenWork::label).collect();
     let shape = stage_shape(env, stage)?
         .filled(schemas::OPEN_WORK_PLACEHOLDER, &open_labels, None)
-        .filled(schemas::REQUIREMENTS_PLACEHOLDER, &requirement_ids, None)
         .filled(schemas::TASKS_PLACEHOLDER, &plan::task_numbers(max), None)
         .filled(schemas::VERIFIERS_PLACEHOLDER, &crate::verifiers::commands(&candidates), None)
         .with_catalog(&catalog, skills_max);
@@ -1345,9 +1205,9 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let parallel = if free > 0 && !auto { env.data.text("plan_parallel", &[("count", &free.to_string())]) } else { String::new() };
     // Each task's `skills` choose from the catalog, shown last.
     let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
-    let live = joined(&[open_live, edit, parallel, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    let live = joined(&[open_live, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
-    let (doc, tasks) = plan::from_output(&output, max, plan::Known { requirements: &requirement_ids, skills: &catalog, skills_max });
+    let (doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
@@ -1437,15 +1297,14 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
     stop_replaced_work(env, journal, plan_seq, &current).await?;
     current.replaces.clear();
-    let current_spec = spec::current(&entries).map(|(_, spec)| spec);
     if current.tasks.len() <= 1 {
-        let decision = plan::foreground_decision(&env.data, &current, current_spec.as_ref(), &env.data.effort.default);
+        let decision = plan::foreground_decision(&env.data, &current, &env.data.effort.default);
         return journal
             .append(kinds::ROUTE, json!({"route": "DO", "stage": "implement", "detail": decision, "plan_id": current.plan_id, "run_id": env.run_id}))
             .await
             .map(|_| ());
     }
-    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref(), true).await {
+    match implement_by_agents(env, journal, plan_seq, &mut current, true).await {
         Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
         Err(error) if error.code == codes::CANCELLED => Err(error),
         Err(error) => {
@@ -1459,7 +1318,7 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
 /// entry as it is made, so a resumed run never makes a task twice. `last_checks` join the last
 /// task's contract (a foreground plan: the decision's own checks, verified when the work ends).
 /// Returns the root task's id.
-async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, current_spec: Option<&spec::Spec>, last_checks: &[String]) -> Result<String, RpcError> {
+async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, last_checks: &[String]) -> Result<String, RpcError> {
     let root = match current.root_task.clone() {
         Some(root) => root,
         None => {
@@ -1529,7 +1388,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                     "project_id": env.scope.project_id,
                     "parent_id": root,
                     "title": task.title,
-                    "brief": plan::agent_brief(&env.data, current, &task, current_spec),
+                    "brief": plan::agent_brief(&env.data, current, &task),
                     "plan": "",
                     "contract": contract::contract_from(&checks),
                     "depends_on": depends,
@@ -1548,7 +1407,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
 
 /// `baseline`: run the plan's checks first (a skill's units check work that is not there yet, so
 /// theirs fail by design and are never a baseline).
-async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, current_spec: Option<&spec::Spec>, baseline: bool) -> Result<String, RpcError> {
+async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, baseline: bool) -> Result<String, RpcError> {
     // The plan's checks on the code before any task: what fails already becomes the last task.
     if baseline && current.tasks.iter().all(|task| task.task_id.is_none()) {
         let mut checks: Vec<String> = Vec::new();
@@ -1559,7 +1418,7 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
         }
         crate::checks::record_baseline(env, journal, &checks).await?;
     }
-    materialize_plan_tasks(env, journal, plan_seq, current, current_spec, &[]).await?;
+    materialize_plan_tasks(env, journal, plan_seq, current, &[]).await?;
     let spawned: HashSet<String> = journal.entries().filter(|entry| entry.kind == kinds::AGENT_SPAWNED).map(|entry| str_field(&entry.data, "task_id").to_owned()).collect();
     let mut text = env.data.text("implement_started", &[("plan_id", &current.plan_id), ("version", &current.version.to_string()), ("count", &current.tasks.len().to_string())]);
     let mut started = Vec::new();
@@ -1614,9 +1473,8 @@ async fn parallel_implementation(env: &RunEnv, journal: &mut Journal) -> Result<
     if current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || agent_capacity(env).await == 0 {
         return Ok(());
     }
-    let current_spec = spec::current(&entries).map(|(_, spec)| spec);
     journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
-    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref(), true).await {
+    match implement_by_agents(env, journal, plan_seq, &mut current, true).await {
         Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
         Err(error) if error.code == codes::CANCELLED => Err(error),
         // The agents could not take it: the Act stage does it here, task by task, as without the mesh.
@@ -1682,7 +1540,7 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
     };
     let plan_seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
-    match implement_by_agents(env, journal, plan_seq, &mut made, None, false).await {
+    match implement_by_agents(env, journal, plan_seq, &mut made, false).await {
         Ok(text) => {
             journal.note(&env.run_id, "implement_done", &text, true).await?;
             Ok(true)
@@ -1696,24 +1554,37 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
     }
 }
 
-/// DECISIONS: what the latest exchange settled, proposed for the user to accept (at most
-/// `limits.decisions_per_turn`). A decision that cannot be read proposes nothing.
-async fn propose_decisions(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
-    let shape = stage_shape(env, "DECISIONS")?;
-    let proposed = match decide_json::<Proposed>(env, journal, "DECISIONS", &shape, "").await {
-        Ok((proposed, _)) => proposed.decisions,
-        Err(error) if error.code == codes::CANCELLED => return Err(error),
-        Err(error) => {
-            tracing::warn!(%error, "the DECISIONS output could not be read");
-            Vec::new()
+/// The user set aside the direction given earlier in this conversation: the decisions this
+/// conversation recorded (their evidence is one of its journal entries) are withdrawn from the
+/// project's knowledge, so neither the knowledge note nor a later session's brief shows them, and
+/// one host note says which no longer hold (this session's prompt prefix still lists them; seen:
+/// "no new code" decisions from an earlier turn, shown right before the plan, made the plan of a
+/// later "start coding" a document and a run). Memory being away withdraws nothing; the note still
+/// closes the stage.
+async fn set_aside(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Result<(), RpcError> {
+    let own = format!("journal://{}/", env.session_id);
+    let listed = env
+        .host
+        .get::<KnowledgeListResult>(memory_methods::KNOWLEDGE_LIST, json!({"project_id": env.scope.project_id, "kind": "decision"}))
+        .await
+        .map(|result| result.items)
+        .unwrap_or_default();
+    let mut withdrawn: Vec<String> = Vec::new();
+    for item in listed.iter().filter(|item| item.evidence.iter().any(|uri| uri.starts_with(&own))) {
+        let done = env
+            .host
+            .call(memory_methods::KNOWLEDGE_WITHDRAW, json!({"project_id": env.scope.project_id, "id": item.id, "reason": env.data.text("set_aside_reason", &[]), "by": "user"}))
+            .await;
+        match done {
+            Ok(_) => withdrawn.push(env.data.text("list_item", &[("text", item.text.trim())])),
+            Err(error) => tracing::warn!(%error, id = %item.id, "a set-aside decision could not be withdrawn"),
         }
-    };
-    let known: Vec<String> = spec::decisions(&journal.entries_vec()).into_iter().map(|decided| decided.decided).collect();
-    let fresh = proposed.iter().filter(|decision| !decision.decided.trim().is_empty() && !known.contains(&decision.decided.trim().to_owned()));
-    for decision in fresh.take(env.data.limits.decisions_per_turn) {
-        journal.append(chatflow_kinds::DECISION, spec::proposed_entry(&decision.decided, &decision.because, &decision.rejected, &env.run_id)).await?;
     }
-    journal.note(&env.run_id, "decisions_done", "", false).await.map(|_| ())
+    let (text, shown) = if withdrawn.is_empty() { (String::new(), false) } else { (env.data.text("set_aside", &[("items", &withdrawn.join("\n"))]), true) };
+    journal
+        .append(kinds::NOTE, json!({"text": text, "purpose": "set_aside", "run_id": env.run_id, "host_message": shown, "decision_seq": route_seq}))
+        .await
+        .map(|_| ())
 }
 
 /// One knowledge item as a host note shows it: `<kind>[ <state>] (<source>[, as of <date>]): <text>
@@ -1838,7 +1709,7 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
     let key = |name: &str| name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let mut known: Vec<String> = entries
         .iter()
-        .filter(|entry| entry.kind == chatflow_kinds::KNOWLEDGE && str_field(&entry.data, "state") != spec::REJECTED)
+        .filter(|entry| entry.kind == chatflow_kinds::KNOWLEDGE && str_field(&entry.data, "state") != proposal::REJECTED)
         .map(|entry| key(str_field(&entry.data, "name")))
         .collect();
     let mut count = 0;
@@ -1860,7 +1731,7 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
         let seq = journal
             .append(
                 chatflow_kinds::KNOWLEDGE,
-                json!({"kind": kind, "name": name, "text": text, "item_state": state, "binds": bound, "state": spec::ACCEPTED, "run_id": env.run_id}),
+                json!({"kind": kind, "name": name, "text": text, "item_state": state, "binds": bound, "state": proposal::ACCEPTED, "run_id": env.run_id}),
             )
             .await?;
         let rel = if kind == "concept" { "implemented_by" } else { "about" };

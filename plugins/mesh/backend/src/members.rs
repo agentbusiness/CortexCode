@@ -88,7 +88,7 @@ impl Log {
         for entry in &self.entries {
             match entry.kind.as_str() {
                 "add" => {
-                    members.insert(entry.node.clone(), Member { node: entry.node.clone(), name: entry.name.clone(), added_ms: entry.ts_ms, by: entry.by.clone(), addrs: entry.addrs.clone() });
+                    members.insert(entry.node.clone(), Member { node: entry.node.clone(), name: entry.name.clone(), added_ms: entry.ts_ms, by: entry.by.clone(), addrs: entry.addrs.clone(), local: false });
                 }
                 "rename" => {
                     if let Some(member) = members.get_mut(&entry.node) {

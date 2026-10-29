@@ -83,9 +83,7 @@ async fn decide(env: &RunEnv, journal: &mut Journal, live: &str, current: &Contr
         }
     }
     let candidates = crate::verifiers::candidates_text(&env.data, &candidates);
-    // The spec's open requirements: checks show them where a command can.
-    let requirements = crate::spec::live_text(&env.data, &entries, "spec_live");
-    let live = [live.to_owned(), requirements, candidates].into_iter().filter(|part| !part.trim().is_empty()).collect::<Vec<_>>().join("\n");
+    let live = [live.to_owned(), candidates].into_iter().filter(|part| !part.trim().is_empty()).collect::<Vec<_>>().join("\n");
     let live = live.as_str();
     let shape = env.data.shape("CHECKS").cloned().ok_or_else(|| RpcError::internal("the data set has no CHECKS schema"))?;
     let shape = shape.filled(crate::schemas::VERIFIERS_PLACEHOLDER, &offered, None);
