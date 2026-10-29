@@ -4,7 +4,9 @@
  * prerequisites, which its tooltip names). Only the tasks that are work are listed, flat: a task
  * with sub-tasks is just their summary and is left out, and so is a task a replan cancelled. A line opens the task on the board (brief,
  * plan, contract, last verification). A failed task whose agent is still blocked on it has Retry,
- * which puts that agent back on it (`agents.restart`). No tasks: nothing.
+ * which puts that agent back on it (`agents.restart`); every other open task has Cancel, which
+ * cancels it with the tasks waiting for it and stops their agents (`agents.cancel`), and Stop all
+ * does that for every open task. No tasks: nothing.
  */
 
 import { useState } from 'react';
@@ -33,7 +35,7 @@ function TasksSection() {
   const tasks = useQuery<Task[]>(projectId ? `memory.task.list:${projectId}` : null, async (c) => (await c.call<{ tasks: Task[] }>('memory.task.list', { project_id: projectId }))?.tasks ?? [], { topics: ['memory.task.changed', 'agents.changed'] });
   const agents = useQuery<AgentRecord[]>(projectId ? `agents.list:${projectId}` : null, async (c) => (await c.call<{ agents: AgentRecord[] }>('agents.list', { project_id: projectId }))?.agents ?? [], { topics: ['agents.changed'] });
   const client = useClient();
-  const [retrying, setRetrying] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const list = tasks.data ?? [];
   const problem = tasks.error && !tasks.data;
@@ -48,22 +50,38 @@ function TasksSection() {
   // moved on would restart its other task.
   const retryable = (task: Task) => task.status === 'failed' && (agents.data ?? []).some((agent) =>
     agent.name === task.assignee && agent.task_id === task.id && agent.session_id && (agent.status === 'blocked' || agent.status === 'stopped'));
-  const retry = async (task: Task) => {
-    setRetrying(task.id);
+  const act = async (key: string, run: () => Promise<unknown>) => {
+    setBusy(key);
     setError(null);
     try {
-      await client.call('agents.restart', { project_id: projectId, agent: task.assignee });
+      await run();
       await Promise.all([tasks.refresh(), agents.refresh()]);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
-      setRetrying(null);
+      setBusy(null);
     }
   };
+  const retry = (task: Task) => act(`retry:${task.id}`, () => client.call('agents.restart', { project_id: projectId, agent: task.assignee }));
+  const cancel = (task: Task) => act(`cancel:${task.id}`, () => client.call('agents.cancel', { project_id: projectId, task_id: task.id }));
+  const cancellable = (task: Task) => ['pending', 'in_progress', 'verifying', 'failed', 'indeterminate'].includes(task.status) && !retryable(task);
+  const openRows = rows.filter((row) => cancellable(row.task) || retryable(row.task));
+  const stopAll = () => act('stop-all', async () => {
+    // Each cancel takes what waits for it along; a task already cancelled that way is skipped.
+    for (const row of openRows) {
+      await client.call('agents.cancel', { project_id: projectId, task_id: row.task.id });
+    }
+  });
   return (
     <section className="cx-cs" data-section="tasks" data-build={__CORTEX_BUILD__}>
       <div className="cx-cs-l">
         <span className="ap">Tasks</span>
+        {openRows.length > 1 && (
+          <button className="detent tiny" type="button" data-action="stop-all" disabled={busy !== null}
+            title="Cancel every open task and stop its agent; what they changed stays in the files" onClick={() => void stopAll()}>
+            {busy === 'stop-all' ? 'Stopping…' : 'Stop all'}
+          </button>
+        )}
       </div>
       <div className="cx-cs-b">
         {problem && <ServiceProblem service="memory" state={tasks} className="hint" />}
@@ -80,14 +98,23 @@ function TasksSection() {
               <span className={`ap ${state === 'failed' ? 'live' : state === 'blocked' ? 'hot' : state === 'done' ? 'faint' : state === 'pending' ? 'faint' : 'origin'}`} data-state={state}>{state.replace(/_/g, ' ')}</span>
             </button>
           );
-          if (!retryable(row.task)) return line;
+          const retrying = retryable(row.task);
+          if (!retrying && !cancellable(row.task)) return line;
+          const key = `${retrying ? 'retry' : 'cancel'}:${row.task.id}`;
           return (
             <div key={row.task.id} className="cx-cs-row cx-task-retry">
               {line}
-              <button className="detent tiny" type="button" data-action="retry-task" disabled={retrying !== null}
-                title={`Put @${row.task.assignee} back on this task`} onClick={() => void retry(row.task)}>
-                {retrying === row.task.id ? 'Retrying…' : 'Retry'}
-              </button>
+              {retrying ? (
+                <button className="detent tiny" type="button" data-action="retry-task" disabled={busy !== null}
+                  title={`Put @${row.task.assignee} back on this task`} onClick={() => void retry(row.task)}>
+                  {busy === key ? 'Retrying…' : 'Retry'}
+                </button>
+              ) : (
+                <button className="detent tiny" type="button" data-action="cancel-task" disabled={busy !== null}
+                  title="Cancel this task and the tasks waiting for it; its agent stops, what it changed stays" onClick={() => void cancel(row.task)}>
+                  {busy === key ? 'Cancelling…' : 'Cancel'}
+                </button>
+              )}
             </div>
           );
         })}

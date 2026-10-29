@@ -7,6 +7,9 @@
 //!   foreground call's own size: its wait for a model slot, its prefill time per uncached token
 //!   against the same measure in windows with no agent running (a long cold prompt is slow alone
 //!   too), and its time per output token.
+//! - **Pool guard.** The model's KV pool is shared: past what it holds, agents push each other out
+//!   to disk and each is restored before its next step. When restores take more than
+//!   `pool_restore_share` of a window, the limit steps down the same way.
 //! - **Throughput search.** Otherwise, once the limit has been in force for a settle period and
 //!   agents were actually waiting for a place (the limit was binding), the window's aggregate
 //!   agent decode throughput is recorded for that limit. The limit then moves to the neighbour
@@ -36,6 +39,8 @@ pub struct Settings {
     pub foreground_tpot_ms: f64,
     pub gain: f64,
     pub probe_after_ms: u64,
+    /// Longest share of a window the model may spend restoring spilled conversations (0: no guard).
+    pub pool_restore_share: f64,
 }
 
 /// What one window of live metrics showed.
@@ -55,7 +60,14 @@ pub struct Window {
     /// Agents in flight and agents waiting for a place.
     pub running: u32,
     pub queued: u32,
+    /// Spilled conversations the model restored in the window, and the share of the window that
+    /// took.
+    pub restores: u32,
+    pub restore_share: f64,
 }
+
+/// Fewest restores in a window for the pool guard to act: one is an idle conversation coming back.
+const MIN_RESTORES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Adjustment {
@@ -157,7 +169,8 @@ impl Controller {
         let slow_prefill = window.foreground_prefill_ms_per_token > 0.0
             && self.alone_prefill_ms_per_token.is_some_and(|alone| window.foreground_prefill_ms_per_token > alone * s.foreground_prefill_slowdown);
         let slow_tokens = window.foreground_calls > 0 && window.foreground_tpot_ms > s.foreground_tpot_ms;
-        if waited || slow_prefill || slow_tokens {
+        let churn = s.pool_restore_share > 0.0 && window.restores >= MIN_RESTORES && window.restore_share > s.pool_restore_share;
+        if waited || slow_prefill || slow_tokens || churn {
             let first_violation = self.last_violation.is_none_or(|at| now.saturating_sub(at) >= s.settle_ms);
             self.last_violation = Some(now);
             if self.limit > s.min.max(1) && (first_violation || now.saturating_sub(self.changed_at) >= s.settle_ms) {
@@ -172,8 +185,15 @@ impl Controller {
                         s.foreground_prefill_slowdown,
                         self.alone_prefill_ms_per_token.unwrap_or_default()
                     )
-                } else {
+                } else if slow_tokens {
                     format!("foreground time per token {:.1} ms > target {:.1} ms", window.foreground_tpot_ms, s.foreground_tpot_ms)
+                } else {
+                    format!(
+                        "{} restores from disk took {:.0}% of the window > {:.0}%: the pool holds fewer agents",
+                        window.restores,
+                        window.restore_share * 100.0,
+                        s.pool_restore_share * 100.0
+                    )
                 };
                 // Throughput measured above the new ceiling no longer applies.
                 self.samples.retain(|level, _| *level <= to);
@@ -188,7 +208,7 @@ impl Controller {
         {
             self.ceiling = None;
             if self.limit < self.start {
-                let reason = format!("foreground within target for {} s", s.probe_after_ms / 1000);
+                let reason = format!("foreground and pool within target for {} s", s.probe_after_ms / 1000);
                 return self.change(now, self.start, reason);
             }
         }

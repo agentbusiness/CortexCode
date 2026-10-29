@@ -457,7 +457,7 @@ impl Memory {
             }
             let shown = Path::new(&root).file_name().map(|name| name.to_string_lossy().into_owned()).filter(|name| !name.is_empty()).unwrap_or(name);
             let created_ms = row.get(4).and_then(Value::as_u64).unwrap_or_else(cc_protocol::contracts::now_ms);
-            app.put_project(&cc_protocol::contracts::frame::Project { id: id.clone(), root: root.clone(), name: shown.clone(), created_ms }).await?;
+            app.put_project(&cc_protocol::contracts::frame::Project { id: id.clone(), root: root.clone(), name: shown.clone(), created_ms, flows: cc_protocol::contracts::frame::flows::default_flows() }).await?;
             tracing::info!(project = %id, name = %shown, root = %root, "brought back a project the app had no record of");
             if let Ok(mut roots) = self.restored.lock() {
                 roots.push(root);

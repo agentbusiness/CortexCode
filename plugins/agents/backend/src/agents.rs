@@ -14,16 +14,16 @@ use crate::plan;
 use crate::data::{Data, Dataset, Loaded};
 use crate::schemas::{self, Plan, PlannedTask, Review, parse_json};
 use cc_protocol::contracts::agents::{
-    AgentRefParams, AgentSteerParams, DelegateParams, DelegateResult, ListParams, ListResult, MergeOutcome, MergeParams,
-    ProposeParams, ProposeResult, SchedulerState, SpawnParams, VerifyParams, VerifyReport, methods, topics,
+    AgentRefParams, AgentSteerParams, CancelParams, HandoffParams, CancelResult, DelegateParams, DelegateResult, ListParams, ListResult, MergeOutcome,
+    MergeParams, ProposeParams, ProposeResult, SchedulerState, SpawnParams, Supervise, VerifyParams, VerifyReport, events, methods, topics,
 };
-use cc_protocol::contracts::chatflow::{AgentRunResult, methods as chatflow_methods};
-use cc_protocol::contracts::frame::{JournalEntry, Project, SessionCreateParams, SessionKind, kinds};
+use cc_protocol::contracts::chatflow::{AgentRunResult, verbs as chatflow_verbs};
+use cc_protocol::contracts::frame::{JournalEntry, Project, ProjectListResult, SessionCreateParams, SessionKind, flows, kinds, methods as frame_methods};
 use cc_protocol::contracts::lang::{self, Description, verifiers::{self, Candidate}};
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{
-    AgentListResult, AgentRecord, Contract, ContractCheck, ImpactResult, SearchResult, SymbolMatches, Task, TaskListResult,
-    methods as memory_methods,
+    AgentListResult, AgentRecord, BoardMessage, Contract, ContractCheck, ImpactResult, SearchResult, SymbolMatches, Task, TaskListResult,
+    methods as memory_methods, topics as memory_topics,
 };
 use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{ChatMessage, ModelInfo, Priority, methods as model_methods};
@@ -56,10 +56,12 @@ pub fn hello() -> Hello {
     hello.provides = [
         methods::DELEGATE,
         methods::SPAWN,
+        methods::HANDOFF,
         methods::LIST,
         methods::STEER,
         methods::STOP,
         methods::RESTART,
+        methods::CANCEL,
         methods::VERIFY,
         methods::MERGE,
         methods::SCHEDULER,
@@ -68,8 +70,14 @@ pub fn hello() -> Hello {
     .iter()
     .map(|method| (*method).to_owned())
     .collect();
-    // Live model-call metrics for the concurrency controller.
-    hello.subscribes = vec![chatflow_topics::USAGE.to_owned()];
+    // What a session's shell may call through `cx`: the session controls the agents it started.
+    hello.commands = [methods::HANDOFF, methods::LIST, methods::STEER, methods::STOP, methods::RESTART, methods::CANCEL, methods::SCHEDULER]
+        .iter()
+        .map(|method| (*method).to_owned())
+        .collect();
+    // Live model-call metrics for the concurrency controller; board posts (an agent's need for its
+    // lead wakes the session that delegated the work).
+    hello.subscribes = vec![chatflow_topics::USAGE.to_owned(), memory_topics::BOARD_POSTED.to_owned()];
     hello
 }
 
@@ -100,15 +108,43 @@ struct UsageSample {
 #[derive(Debug, Default)]
 struct ModelLoad {
     slots: u32,
+    /// Conversations of the working context the shared pool holds.
+    room: u32,
     busy: u32,
     queued: u32,
     hibernated: u32,
+    /// The model's restores of spilled conversations so far, sampled each tick: (ms, count, total
+    /// restore ms).
+    restores: VecDeque<(u64, u32, f64)>,
 }
 
 impl ModelLoad {
     fn to_json(&self) -> Value {
-        json!({"slots": self.slots, "busy": self.busy, "queued": self.queued, "hibernated": self.hibernated})
+        json!({"slots": self.slots, "room": self.room, "busy": self.busy, "queued": self.queued, "hibernated": self.hibernated})
     }
+
+    /// Restores in the last `window_ms` and the share of it they took.
+    fn restores_in(&self, window_ms: u64) -> (u32, f64) {
+        let (Some(first), Some(last)) = (self.restores.front(), self.restores.back()) else { return (0, 0.0) };
+        // A reload of the model restarts its counters.
+        if last.1 < first.1 {
+            return (0, 0.0);
+        }
+        (last.1 - first.1, (last.2 - first.2).max(0.0) / window_ms.max(1) as f64)
+    }
+}
+
+/// Conversations of `working` tokens the model's shared pool holds. Each resident conversation's
+/// fixed state (recurrent state, checkpoints) also takes pool room: `ctx_total / slots`, since
+/// `slots` counts conversations that hold no context yet.
+fn pool_room(info: &ModelInfo, working: u64) -> u32 {
+    if info.slots == 0 || info.ctx_total == 0 {
+        return 0;
+    }
+    let pool = u64::from(info.ctx_total);
+    let state = pool / u64::from(info.slots);
+    let working = if info.ctx_native == 0 { working } else { working.min(u64::from(info.ctx_native)) };
+    u32::try_from(pool / (working + state).max(1)).unwrap_or(u32::MAX).max(1)
 }
 
 fn settings_of(config: &crate::data::SchedulerConfig) -> ControlSettings {
@@ -121,6 +157,7 @@ fn settings_of(config: &crate::data::SchedulerConfig) -> ControlSettings {
         foreground_tpot_ms: config.foreground_tpot_ms,
         gain: config.gain,
         probe_after_ms: config.probe_after_ms,
+        pool_restore_share: config.pool_restore_share,
     }
 }
 
@@ -152,6 +189,8 @@ fn window_of(usage: &VecDeque<UsageSample>, window_ms: u64, running: u32, queued
         foreground_tpot_ms: if tpot.is_empty() { 0.0 } else { tpot.iter().sum::<f64>() / tpot.len() as f64 },
         running,
         queued,
+        restores: 0,
+        restore_share: 0.0,
     }
 }
 
@@ -165,6 +204,8 @@ fn window_json(window: &Window) -> Value {
         "foreground_tpot_ms": window.foreground_tpot_ms,
         "running": window.running,
         "queued": window.queued,
+        "restores": window.restores,
+        "restore_share": window.restore_share,
     })
 }
 
@@ -320,6 +361,77 @@ async fn board(host: &Host, project_id: &str, kind: &str, author: &str, text: &s
 
 async fn update_task(host: &Host, fields: Value) -> Result<(), RpcError> {
     host.call(memory_methods::TASK_UPDATE, fields).await.map(|_| ())
+}
+
+/// The session that delegated an agent's work (its own session's parent).
+/// The role of an agent doing work handed to it from another session ([`methods::HANDOFF`]).
+const HANDOFF_ROLE: &str = "handoff";
+
+/// A handed-off piece of work ended: its result goes back to the asking session as a note the
+/// asker's model reads (`host_message`), with the work's session to look at.
+async fn handoff_ended(host: &Host, record: &AgentRecord, task: &Task, outcome: &str, summary: &str) {
+    if record.role != HANDOFF_ROLE {
+        return;
+    }
+    let Some(asker) = lead_session(host, record).await else { return };
+    let flow = match &record.session_id {
+        Some(session_id) => host.session_get(session_id).await.map(|session| session.flow).unwrap_or_default(),
+        None => String::new(),
+    };
+    let project = host.project_get(&record.project_id).await.map(|project| project.name).unwrap_or_default();
+    let summary = summary.trim();
+    let text = format!("The {flow} work handed to {project} ({}) {outcome}.{}", task.title, if summary.is_empty() { String::new() } else { format!("\n{summary}") });
+    let _ = host
+        .journal_append(&asker, kinds::NOTE, json!({"text": text, "purpose": "handoff_result", "host_message": true, "agent": record.name, "task_id": task.id, "session_id": record.session_id, "outcome": outcome}))
+        .await;
+}
+
+/// A chat flow method for a session: every chat flow call goes to the session's own flow
+/// (`chatflow-coding.steer`).
+async fn flow_method(host: &Host, session_id: &str, verb: &str) -> String {
+    let flow = host.session_get(session_id).await.map(|session| session.flow).unwrap_or_else(|_| flows::default_flow());
+    flows::method(&flow, verb)
+}
+
+async fn lead_session(host: &Host, record: &AgentRecord) -> Option<String> {
+    let session_id = record.session_id.as_deref()?;
+    host.session_get(session_id).await.ok().and_then(|session| session.parent)
+}
+
+/// A progress line in the delegating session's journal: shown on its card, not a model message.
+async fn progress(host: &Host, lead: Option<&str>, text: &str, record: &AgentRecord) {
+    if let Some(lead) = lead {
+        let _ = host
+            .journal_append(lead, kinds::NOTE, json!({"text": text, "purpose": "agent_progress", "host_message": false, "agent": record.name, "task_id": record.task_id}))
+            .await;
+    }
+}
+
+/// A supervision event about `agent`'s work on `task` (the session is set when it is sent).
+fn event_of(project_id: &str, event: &str, agent: &str, task: Option<&Task>, text: &str) -> Supervise {
+    Supervise {
+        id: format!("sup-{}", uuid::Uuid::new_v4().simple()),
+        session_id: String::new(),
+        project_id: project_id.to_owned(),
+        event: event.to_owned(),
+        agent: agent.to_owned(),
+        task_id: task.map(|task| task.id.clone()).unwrap_or_default(),
+        title: task.map(|task| task.title.clone()).unwrap_or_default(),
+        text: text.to_owned(),
+        failed_tests: None,
+    }
+}
+
+/// Tell the delegating session that its work needs a decision ([`topics::SUPERVISE`]).
+fn supervise(ctx: &Ctx, lead: Option<&str>, mut event: Supervise) {
+    let Some(lead) = lead else { return };
+    event.session_id = lead.to_owned();
+    ctx.publish(topics::SUPERVISE, serde_json::to_value(&event).unwrap_or_default());
+}
+
+/// A task that will not run again.
+fn finished(status: &str) -> bool {
+    matches!(status, "done" | "cancelled")
 }
 
 impl Agents {
@@ -505,6 +617,7 @@ impl Agents {
                     role: None,
                     from_session: Some(params.from_session.clone()),
                     mode: params.mode.clone(),
+                    flow: None,
                 })
                 .await?;
             agents.push(record);
@@ -517,6 +630,39 @@ impl Agents {
     }
 
     // ---- spawning and running ---------------------------------------------------------------
+
+    /// Hand a piece of work to a flow in a project: a task there with the asker's brief, and an
+    /// agent of that flow on it whose session is the asking session's child. The asker keeps
+    /// going; the result comes back to it as a note ([`Self::steward`], [`handoff_ended`]).
+    async fn handoff(&self, ctx: Ctx, params: HandoffParams) -> Result<AgentRecord, RpcError> {
+        let host = Host::new(ctx.clone());
+        let asker = host.session_get(&params.from_session).await?;
+        let project = match params.project.as_deref().map(str::trim).filter(|project| !project.is_empty()) {
+            None => host.project_get(&asker.project_id).await?,
+            Some(wanted) => {
+                let listed: ProjectListResult = host.get(frame_methods::PROJECT_LIST, json!({})).await?;
+                let names: Vec<String> = listed.projects.iter().map(|project| project.name.clone()).collect();
+                listed
+                    .projects
+                    .into_iter()
+                    .find(|project| project.id == wanted || project.name.eq_ignore_ascii_case(wanted))
+                    .ok_or_else(|| RpcError::not_found(format!("no project named {wanted}; the projects are: {}", names.join(", "))))?
+            }
+        };
+        let flow = params.flow.as_deref().map(str::trim).filter(|flow| !flow.is_empty()).map_or_else(|| asker.flow.clone(), str::to_owned);
+        if !project.flows.contains(&flow) {
+            return Err(RpcError::invalid_params(format!("the project {} does not take the {flow} flow; it takes: {}", project.name, project.flows.join(", "))));
+        }
+        let brief = params.brief.trim();
+        if brief.is_empty() {
+            return Err(RpcError::invalid_params("say what to do: the brief is empty"));
+        }
+        let title = params.title.as_deref().map(str::trim).filter(|title| !title.is_empty()).map_or_else(|| brief.lines().next().unwrap_or(brief).chars().take(80).collect(), str::to_owned);
+        // No checks are named for a hand-off: none means no contract (the work is judged by its
+        // result, which goes back to the asker).
+        let task: Task = host.get(memory_methods::TASK_CREATE, json!({"project_id": project.id, "title": title, "brief": brief, "contract": Contract::default()})).await?;
+        self.spawn(ctx, SpawnParams { project_id: project.id.clone(), task_id: task.id, name: None, role: Some(HANDOFF_ROLE.to_owned()), from_session: Some(asker.id), mode: params.mode, flow: Some(flow) }).await
+    }
 
     async fn spawn(&self, ctx: Ctx, params: SpawnParams) -> Result<AgentRecord, RpcError> {
         if !MODES.contains(&params.mode.as_str()) {
@@ -546,6 +692,7 @@ impl Agents {
                 parent: params.from_session.clone(),
                 workspace: Some(workspace_path.clone()),
                 task_id: Some(task.id.clone()),
+                flow: params.flow.clone(),
             })
             .await?;
         let record = upsert(&ctx, &host, AgentRecord {
@@ -577,21 +724,29 @@ impl Agents {
         Ok(record)
     }
 
-    /// Create the controller once the model's slots are known (initial limit: the data set's
-    /// `start`, or slots minus one).
+    /// Create the controller once the model's pool is known (initial limit: the data set's
+    /// `start`, or the conversations of the working context the pool holds, minus one for the
+    /// foreground).
     async fn ensure_controller(&self, host: &Host) {
         if lock(&self.inner.controller).is_some() {
             return;
         }
-        let slots = host.get::<ModelInfo>(model_methods::INFO, json!({})).await.map(|info| info.slots).unwrap_or(0);
+        let info = host.get::<ModelInfo>(model_methods::INFO, json!({})).await.ok();
         let config = self.inner.data.get().scheduler.clone();
-        if slots == 0 && config.start == 0 {
+        let slots = info.as_ref().map_or(0, |info| info.slots);
+        let room = info.as_ref().map_or(0, |info| pool_room(info, config.working_context_tokens));
+        if room == 0 && config.start == 0 {
             // The model is not answering yet: keep the queue's own limit (one) and ask again later.
             return;
         }
-        let start = if config.start > 0 { config.start } else { slots.saturating_sub(1).max(1) };
+        let start = if config.start > 0 { config.start } else { room.saturating_sub(1).max(1) };
+        tracing::info!(slots, room, start, working = config.working_context_tokens, "agents start limit");
         let controller = Controller::new(settings_of(&config), start);
-        lock(&self.inner.model).slots = slots;
+        {
+            let mut model = lock(&self.inner.model);
+            model.slots = slots;
+            model.room = room;
+        }
         let limit = controller.limit;
         let mut slot = lock(&self.inner.controller);
         if slot.is_none() {
@@ -611,6 +766,14 @@ impl Agents {
             model.queued = slots.get("queued").and_then(Value::as_u64).unwrap_or(0) as u32;
             model.busy = slots.get("slots").and_then(Value::as_array).map(|all| all.iter().filter(|slot| slot.get("busy").and_then(Value::as_bool) == Some(true)).count() as u32).unwrap_or(0);
             model.hibernated = slots.get("hibernated").and_then(Value::as_array).map(|keys| keys.len() as u32).unwrap_or(0);
+            let cost = slots.pointer("/metrics/hibernation");
+            let restores = cost.and_then(|cost| cost.get("restores")).and_then(Value::as_u64).unwrap_or(0) as u32;
+            let mean = cost.and_then(|cost| cost.get("restore_ms_mean")).and_then(Value::as_f64).unwrap_or(0.0);
+            let now = now_ms();
+            model.restores.push_back((now, restores, f64::from(restores) * mean));
+            while model.restores.front().is_some_and(|(at, _, _)| now.saturating_sub(*at) > config.window_ms) {
+                model.restores.pop_front();
+            }
         }
         let now = now_ms();
         let window = {
@@ -619,7 +782,9 @@ impl Agents {
                 usage.pop_front();
             }
             let scheduler = lock(&self.inner.scheduler);
-            window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32)
+            let mut window = window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32);
+            (window.restores, window.restore_share) = lock(&self.inner.model).restores_in(config.window_ms);
+            window
         };
         let adjustment = {
             let mut controller = lock(&self.inner.controller);
@@ -714,7 +879,9 @@ impl Agents {
     /// name), else here (None). `remote_only`: this computer's queue is full, so here is not an
     /// option now.
     async fn place_agent(&self, host: &Host, session_id: &str, remote_only: bool) -> Option<String> {
-        let placement = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "tag": cc_protocol::contracts::model::tags::CODING, "wait": false, "remote_only": remote_only})).await.ok()?;
+        // The session's flow is the tag of the models it may use.
+        let tag = host.session_get(session_id).await.map(|session| session.flow).unwrap_or_else(|_| flows::default_flow());
+        let placement = host.call(mesh_methods::PLACE, json!({"session_id": session_id, "tag": tag, "wait": false, "remote_only": remote_only})).await.ok()?;
         placement.get("node").and_then(Value::as_str)?;
         Some(placement.get("name").and_then(Value::as_str).unwrap_or_default().to_owned())
     }
@@ -769,12 +936,18 @@ impl Agents {
                             record.status = "blocked".into();
                             record.tasks_failed += 1;
                             let task_id = record.task_id.clone();
-                            let _ = upsert(&ctx, &host, record).await;
+                            let record = upsert(&ctx, &host, record).await.ok();
+                            let mut failed = None;
                             if let Some(task_id) = task_id {
                                 let _ = update_task(&host, json!({"id": task_id, "status": "failed", "result": error.to_string()})).await;
+                                failed = task(&host, &task_id).await.ok();
                             }
                             let text = this.inner.data.get().text("board_error", &[("error", &error.to_string())]);
                             board(&host, &key.project_id, "blocker", &key.name, &text, &[]).await;
+                            if let Some(record) = &record {
+                                let lead = lead_session(&host, record).await;
+                                supervise(&ctx, lead.as_deref(), event_of(&key.project_id, events::BLOCKED, &key.name, failed.as_ref(), &text));
+                            }
                         }
                     }
                 }
@@ -829,13 +1002,16 @@ impl Agents {
                 let mut record = record;
                 record.status = "blocked".into();
                 record.tasks_failed += 1;
-                upsert(&ctx, &host, record).await?;
+                let record = upsert(&ctx, &host, record).await?;
                 // Checks the host cannot decide leave the task INDETERMINATE (for a person to
                 // judge), not failed.
                 let status = if task.status == "indeterminate" { "indeterminate" } else { "failed" };
                 update_task(&host, json!({"id": task.id, "status": status, "result": result.summary})).await?;
                 let text = if result.summary.trim().is_empty() { self.inner.data.get().text("board_run_ended", &[("outcome", other)]) } else { result.summary.clone() };
                 board(&host, &key.project_id, "blocker", &key.name, &text, std::slice::from_ref(&task.id)).await;
+                handoff_ended(&host, &record, &task, &format!("ended without finishing ({other})"), &result.summary).await;
+                let lead = lead_session(&host, &record).await;
+                supervise(&ctx, lead.as_deref(), event_of(&key.project_id, events::BLOCKED, &key.name, Some(&task), &text));
                 Ok(())
             }
         }
@@ -873,22 +1049,35 @@ impl Agents {
             return Err(RpcError::cancelled());
         }
         let mut updated = fresh;
-        if report.ok {
+        if report.ok || no_worse_and_awaited(host, &session_id, task, &report).await {
             update_task(host, json!({"id": task.id, "status": "done", "result": format!("verified in the project: {}", result.summary)})).await?;
             updated.status = "done".into();
             updated.tasks_done += 1;
-            upsert(ctx, host, updated).await?;
-            let post = self.inner.data.get().text("board_done", &[("title", &task.title), ("summary", result.summary.trim())]);
+            let updated = upsert(ctx, host, updated).await?;
+            let data = self.inner.data.get();
+            let changed = if result.changed_files.is_empty() { String::new() } else { data.text("board_changed", &[("files", &result.changed_files.join(", "))]) };
+            let post = data.text("board_done", &[("title", &task.title), ("summary", result.summary.trim()), ("changed", &changed)]);
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
+            handoff_ended(host, &updated, task, "is done", &result.summary).await;
+            let lead = lead_session(host, &updated).await;
+            progress(host, lead.as_deref(), &data.text("progress_done", &[("agent", &record.name), ("title", &task.title)]), &updated).await;
             let _ = host.call(memory_methods::REFRESH, json!({"project_id": project.id})).await;
             Ok(Stewarded::Verified)
         } else {
             update_task(host, json!({"id": task.id, "status": "failed", "result": "the contract fails in the project"})).await?;
             updated.status = "blocked".into();
             updated.tasks_failed += 1;
-            upsert(ctx, host, updated).await?;
+            let updated = upsert(ctx, host, updated).await?;
             let post = self.inner.data.get().text("board_failing", &[("title", &task.title)]);
             board(host, &project.id, "blocker", &record.name, &post, std::slice::from_ref(&task.id)).await;
+            let failing: Vec<String> = report.checks.iter().filter(|check| !check.ok).map(|check| check.name.clone()).collect();
+            let tests = report.checks.iter().filter_map(|check| check.failed_tests.clone()).reduce(|mut all, more| {
+                all.extend(more);
+                all
+            });
+            let text = format!("{post} Failing: {}.", failing.join(", "));
+            let lead = lead_session(host, &updated).await;
+            supervise(ctx, lead.as_deref(), Supervise { failed_tests: tests, ..event_of(&project.id, events::BLOCKED, &record.name, Some(task), &text) });
             Ok(Stewarded::Failed)
         }
     }
@@ -923,6 +1112,7 @@ impl Agents {
                         role: None,
                         from_session: from.clone(),
                         mode: mode.to_owned(),
+                        flow: None,
                     }) => spawned,
                 };
                 if let Err(error) = spawned {
@@ -935,6 +1125,8 @@ impl Agents {
             if let Some(from) = &from {
                 let _ = host.journal_append(from, kinds::NOTE, json!({"text": "Every delegated task is merged and verified.", "purpose": "delegation_done", "task_id": parent_id})).await;
             }
+            let root = task(host, &parent_id).await.ok();
+            supervise(ctx, from.as_deref(), event_of(&finished.project_id, events::TREE_DONE, "", root.as_ref(), ""));
         }
     }
 
@@ -1007,24 +1199,148 @@ impl Agents {
         let host = Host::new(ctx);
         let record = agent(&host, &params.project_id, &params.agent).await?;
         let session_id = record.session_id.ok_or_else(|| RpcError::invalid_params("the agent has no session"))?;
-        host.call(chatflow_methods::STEER, forwarded_steer(&session_id, &params)).await
+        host.call(&flow_method(&host, &session_id, chatflow_verbs::STEER).await, forwarded_steer(&session_id, &params)).await
     }
 
+    /// Stop an agent: its run ends, its task is cancelled with the tasks waiting for it (they would
+    /// never start), and what it already changed stays in the files.
     async fn stop(&self, ctx: Ctx, params: AgentRefParams) -> Result<Value, RpcError> {
         let host = Host::new(ctx.clone());
+        let record = agent(&host, &params.project_id, &params.agent).await?;
         let key = AgentKey { project_id: params.project_id.clone(), name: params.agent.clone() };
-        let mut record = agent(&host, &params.project_id, &params.agent).await?;
-        self.cancel_agent(&key);
         let was_queued = lock(&self.inner.scheduler).dequeue(&key);
-        record.status = "stopped".into();
-        let record = upsert(&ctx, &host, record).await?;
-        if let Some(task_id) = &record.task_id {
-            update_task(&host, json!({"id": task_id, "status": "cancelled"})).await?;
+        let mut result = CancelResult::default();
+        match &record.task_id {
+            Some(task_id) => {
+                let first = task(&host, task_id).await?;
+                self.cancel_tree(&ctx, &host, &first, &mut result).await?;
+            }
+            None => {
+                self.halt(&ctx, &host, record).await?;
+            }
         }
+        Ok(json!({"stopped": true, "was_queued": was_queued, "cancelled": result.tasks, "agents": result.agents}))
+    }
+
+    /// Cancel a task with its subtasks and the tasks waiting for it; their agents stop.
+    async fn cancel(&self, ctx: Ctx, params: CancelParams) -> Result<CancelResult, RpcError> {
+        let host = Host::new(ctx.clone());
+        let first = task(&host, &params.task_id).await?;
+        if first.project_id != params.project_id {
+            return Err(RpcError::invalid_params("the task belongs to another project"));
+        }
+        let mut result = CancelResult::default();
+        self.cancel_tree(&ctx, &host, &first, &mut result).await?;
+        Ok(result)
+    }
+
+    /// End an agent's run (its scheduler place, its model call) and record it stopped.
+    async fn halt(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord) -> Result<AgentRecord, RpcError> {
+        let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
+        self.cancel_agent(&key);
+        lock(&self.inner.scheduler).dequeue(&key);
+        if record.status != "done" {
+            record.status = "stopped".into();
+        }
+        let record = upsert(ctx, host, record).await?;
         if let Some(session_id) = &record.session_id {
-            host.call(chatflow_methods::CANCEL, json!({"session_id": session_id})).await?;
+            host.call(&flow_method(host, session_id, chatflow_verbs::CANCEL).await, json!({"session_id": session_id})).await?;
         }
-        Ok(json!({"stopped": true, "was_queued": was_queued}))
+        Ok(record)
+    }
+
+    /// `first` and everything that hangs on it: its subtasks and, in its tree, the unfinished tasks
+    /// that depend on a cancelled one. Done tasks stay done.
+    async fn cancel_tree(&self, ctx: &Ctx, host: &Host, first: &Task, result: &mut CancelResult) -> Result<(), RpcError> {
+        let data = self.inner.data.get();
+        let mut stack = vec![first.clone()];
+        let mut seen = BTreeSet::new();
+        let mut lead = None;
+        let mut parents = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.id.clone()) || finished(&current.status) {
+                continue;
+            }
+            if let Some(name) = &current.assignee
+                && let Ok(record) = agent(host, &current.project_id, name).await
+                && record.task_id.as_deref() == Some(current.id.as_str())
+                && record.status != "done"
+            {
+                if lead.is_none() {
+                    lead = lead_session(host, &record).await;
+                }
+                let record = self.halt(ctx, host, record).await?;
+                let stopped = data.text("progress_cancelled_agent", &[("agent", &record.name)]);
+                result.agents.push(record.name.clone());
+                progress(host, lead.as_deref(), &data.text("progress_cancelled", &[("title", &current.title), ("agent", &stopped)]), &record).await;
+            }
+            update_task(host, json!({"id": current.id, "status": "cancelled"})).await?;
+            parents.extend(current.parent_id.clone());
+            let author = current.assignee.clone().unwrap_or_else(|| "lead".into());
+            board(host, &current.project_id, "status", &author, &data.text("board_cancelled", &[("title", &current.title)]), std::slice::from_ref(&current.id)).await;
+            result.tasks.push(current.id.clone());
+            if let Ok(children) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": current.project_id, "parent_id": current.id})).await {
+                stack.extend(children.tasks);
+            }
+            if let Some(parent) = &current.parent_id
+                && let Ok(siblings) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": current.project_id, "parent_id": parent})).await
+            {
+                stack.extend(siblings.tasks.into_iter().filter(|task| task.depends_on.contains(&current.id)));
+            }
+        }
+        // A tree whose every task has finished, some of them cancelled, is cancelled itself (its
+        // summary would otherwise wait for ever).
+        for parent in parents {
+            let Ok(children) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": first.project_id, "parent_id": parent})).await else { continue };
+            if children.tasks.iter().all(|task| finished(&task.status))
+                && let Ok(root) = task(host, &parent).await
+                && !finished(&root.status)
+            {
+                update_task(host, json!({"id": parent, "status": "cancelled"})).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tasks cancelled only because they waited for `task` (never claimed) are pending again.
+    async fn reopen_dependents(&self, host: &Host, task: &Task) {
+        let Some(parent) = &task.parent_id else { return };
+        let Ok(siblings) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": task.project_id, "parent_id": parent})).await else { return };
+        let mut reopened = vec![task.id.clone()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for sibling in &siblings.tasks {
+                if sibling.status == "cancelled"
+                    && sibling.assignee.is_none()
+                    && !reopened.contains(&sibling.id)
+                    && sibling.depends_on.iter().any(|dependency| reopened.contains(dependency))
+                {
+                    let _ = update_task(host, json!({"id": sibling.id, "status": "pending"})).await;
+                    reopened.push(sibling.id.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// A board post: an agent's need addressed to its lead tells the session that delegated it.
+    async fn board_posted(&self, ctx: Ctx, data: Value) -> Result<(), RpcError> {
+        let Some(message) = data.get("message").cloned().and_then(|message| serde_json::from_value::<BoardMessage>(message).ok()) else {
+            return Ok(());
+        };
+        if message.kind != "need" || message.to.as_deref() != Some("lead") {
+            return Ok(());
+        }
+        let host = Host::new(ctx.clone());
+        let Ok(record) = agent(&host, &message.project_id, &message.author).await else { return Ok(()) };
+        let current = match &record.task_id {
+            Some(task_id) => task(&host, task_id).await.ok(),
+            None => None,
+        };
+        let lead = lead_session(&host, &record).await;
+        supervise(&ctx, lead.as_deref(), event_of(&message.project_id, events::NEED, &record.name, current.as_ref(), &message.text));
+        Ok(())
     }
 
     /// A blocked or stopped agent back on its task, in its own session. A run cut off by an error
@@ -1056,8 +1372,12 @@ impl Agents {
         let record = upsert(&ctx, &host, record).await?;
         let task = task(&host, &task_id).await?;
         update_task(&host, json!({"id": task.id, "status": "in_progress"})).await?;
+        // The tasks its stop cancelled because they waited for it wait again.
+        self.reopen_dependents(&host, &task).await;
         let text = self.inner.data.get().text("board_restart", &[("title", &task.title)]);
         board(&host, &record.project_id, "status", &record.name, &text, std::slice::from_ref(&task.id)).await;
+        let lead = lead_session(&host, &record).await;
+        progress(&host, lead.as_deref(), &self.inner.data.get().text("progress_restarted", &[("agent", &record.name), ("title", &task.title)]), &record).await;
         self.enqueue(ctx, key).await;
         Ok(record)
     }
@@ -1067,7 +1387,9 @@ impl Agents {
         let scheduler = lock(&self.inner.scheduler);
         let window = {
             let usage = lock(&self.inner.usage);
-            window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32)
+            let mut window = window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32);
+            (window.restores, window.restore_share) = lock(&self.inner.model).restores_in(config.window_ms);
+            window
         };
         let controller = lock(&self.inner.controller);
         let adjustments: Vec<Value> = lock(&self.inner.adjustments).iter().cloned().collect();
@@ -1258,13 +1580,14 @@ fn pick_name(taken: &BTreeSet<&str>) -> String {
 /// so repeating it is safe).
 async fn call_agent_run(host: &Host, session_id: &str, task_id: &str, effort: &str, mode: &str, cancel: &CancellationToken) -> Result<AgentRunResult, RpcError> {
     let params = json!({"session_id": session_id, "task_id": task_id, "mode": mode, "options": {"effort": effort}});
+    let method = flow_method(host, session_id, chatflow_verbs::AGENT_RUN).await;
     let mut delay = Duration::from_millis(250);
     loop {
         host.check_cancelled()?;
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(RpcError::cancelled()),
-            outcome = host.call_with(chatflow_methods::AGENT_RUN, params.clone(), host::Effect::Idempotent, Some(cancel)) => outcome,
+            outcome = host.call_with(&method, params.clone(), host::Effect::Idempotent, Some(cancel)) => outcome,
         };
         match outcome {
             Ok(value) => return parse_params(value),
@@ -1297,6 +1620,34 @@ fn frozen_intact(task: &Task) -> Result<(), RpcError> {
 
 fn checks_text(data: &Dataset, contract: &Contract) -> String {
     contract.checks.iter().map(|check| data.text("review_check", &[("command", &check.spec)])).collect()
+}
+
+/// Whether the work made nothing worse than its run's baseline (the agent session's `baseline`
+/// notes: every failed check fails only tests named as failing for the same command before, both
+/// known) while a later task of its plan still waits for it: then it is done, and what failed
+/// before is the waiting task's work (the plan's last task fixes it). The worker's loop judges
+/// the same way.
+async fn no_worse_and_awaited(host: &Host, session_id: &str, task: &Task, report: &VerifyReport) -> bool {
+    let failed: Vec<_> = report.checks.iter().filter(|check| !check.ok).collect();
+    if failed.is_empty() || session_id.is_empty() {
+        return false;
+    }
+    let Ok(entries) = host.journal_read(session_id, 1).await else { return false };
+    let no_worse = failed.iter().all(|check| {
+        let (Some(now), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) else { return false };
+        let before = entries
+            .iter()
+            .filter(|entry| entry.kind == kinds::NOTE && entry.data.get("purpose").and_then(Value::as_str) == Some("baseline"))
+            .filter_map(|note| note.data.get("failed_tests")?.get(&spec.spec)?.as_array().cloned())
+            .last();
+        before.is_some_and(|before| now.iter().all(|name| before.iter().any(|known| known.as_str() == Some(name.as_str()))))
+    });
+    if !no_worse {
+        return false;
+    }
+    let Some(parent) = &task.parent_id else { return false };
+    let Ok(list) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": task.project_id, "parent_id": parent})).await else { return false };
+    list.tasks.iter().any(|other| other.id != task.id && other.depends_on.contains(&task.id) && !matches!(other.status.as_str(), "done" | "cancelled" | "failed"))
 }
 
 async fn record_verification(host: &Host, task: &Task, report: &VerifyReport, sessions: &[&str]) {
@@ -1447,6 +1798,7 @@ impl Plugin for Agents {
             match call.method.as_str() {
                 methods::DELEGATE => to_value(&this.delegate(ctx, parse_params(params)?).await?),
                 methods::SPAWN => to_value(&this.spawn(ctx, parse_params(params)?).await?),
+                methods::HANDOFF => to_value(&this.handoff(ctx, parse_params(params)?).await?),
                 methods::LIST => {
                     let params: ListParams = parse_params(params)?;
                     to_value(&ListResult { agents: agents_of(&Host::new(ctx), &params.project_id).await? })
@@ -1454,6 +1806,7 @@ impl Plugin for Agents {
                 methods::STEER => this.steer(ctx, parse_params(params)?).await,
                 methods::STOP => this.stop(ctx, parse_params(params)?).await,
                 methods::RESTART => to_value(&this.restart(ctx, parse_params(params)?).await?),
+                methods::CANCEL => to_value(&this.cancel(ctx, parse_params(params)?).await?),
                 methods::VERIFY => to_value(&this.verify(ctx, parse_params(params)?).await?),
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),
                 methods::SCHEDULER => to_value(&this.scheduler_state()),
@@ -1481,7 +1834,15 @@ impl Plugin for Agents {
         })
     }
 
-    fn event(&self, _ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+    fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        if topic == memory_topics::BOARD_POSTED {
+            let this = self.clone();
+            return Box::pin(async move {
+                if let Err(error) = this.board_posted(ctx, data).await {
+                    tracing::warn!(%error, "could not pass a board need to its lead");
+                }
+            });
+        }
         if topic == chatflow_topics::USAGE
             && let Ok(sample) = serde_json::from_value::<UsageSample>(data)
         {

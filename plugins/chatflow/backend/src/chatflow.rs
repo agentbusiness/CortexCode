@@ -20,10 +20,11 @@ use crate::schemas;
 use cc_protocol::contracts::chatflow::{
     KnowledgeAnswerParams,
     AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, DecisionAnswerParams, FlowState, IdeationChooseParams, PlanCommentParams, PlanEditParams, PlanRefParams, PlanUpdateParams,
-    PrewarmParams, PrewarmResult, SessionParams, SpecUpdateParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, methods, plan_status,
+    PrewarmParams, PrewarmResult, SessionParams, SpecUpdateParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, plan_status, verbs,
 };
 use crate::{ideation, plan, spec};
 use cc_protocol::contracts::tools::topics as tools_topics;
+use cc_protocol::contracts::agents::{Supervise, events as agent_events, topics as agents_topics};
 use cc_protocol::contracts::frame::{
     JournalEntry, ProjectListResult, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, methods as frame_methods, topics as frame_topics,
 };
@@ -41,31 +42,35 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+/// This plugin's way of working: its category is `chatflow-coding`, and the models it asks for are
+/// tagged `coding` (the same word).
+pub const FLOW: &str = cc_protocol::contracts::frame::flows::CODING;
+
 pub fn hello() -> Hello {
-    let mut hello = Hello::new("cc-chatflow", env!("CARGO_PKG_VERSION"), "chatflow", "chatflow@1");
+    let mut hello = Hello::new("cc-chatflow", env!("CARGO_PKG_VERSION"), &cc_protocol::contracts::frame::flows::category(FLOW), "chatflow@1");
     hello.provides = [
-        methods::TURN,
-        methods::STEER,
-        methods::CANCEL,
-        methods::STATE,
-        methods::RUNNING,
-        methods::AGENT_RUN,
-        methods::APPROVE,
-        methods::ATTACHMENT_PUT,
-        methods::SPEC_UPDATE,
-        methods::SPEC_SAVE,
-        methods::PLAN_UPDATE,
-        methods::PLAN_IMPLEMENT,
-        methods::PLAN_EDIT,
-        methods::PLAN_COMMENT,
-        methods::PLAN_REVISE,
-        methods::IDEATION_CHOOSE,
-        methods::DECISION_ANSWER,
-        methods::KNOWLEDGE_ANSWER,
-        methods::PREWARM,
+        verbs::TURN,
+        verbs::STEER,
+        verbs::CANCEL,
+        verbs::STATE,
+        verbs::RUNNING,
+        verbs::AGENT_RUN,
+        verbs::APPROVE,
+        verbs::ATTACHMENT_PUT,
+        verbs::SPEC_UPDATE,
+        verbs::SPEC_SAVE,
+        verbs::PLAN_UPDATE,
+        verbs::PLAN_IMPLEMENT,
+        verbs::PLAN_EDIT,
+        verbs::PLAN_COMMENT,
+        verbs::PLAN_REVISE,
+        verbs::IDEATION_CHOOSE,
+        verbs::DECISION_ANSWER,
+        verbs::KNOWLEDGE_ANSWER,
+        verbs::PREWARM,
     ]
         .iter()
-        .map(|method| (*method).to_owned())
+        .map(|verb| cc_protocol::contracts::frame::flows::method(FLOW, verb))
         .collect();
     // Background jobs wake the session that started them; changed skills rebuild the prefixes; a
     // merge of the live folder (the source manager's start-up update) reloads the data set. The
@@ -73,6 +78,7 @@ pub fn hello() -> Hello {
     // project description each have that block prefilled again ([`Chatflow::warm_projects`]).
     hello.subscribes = vec![
         tools_topics::JOB_EVENT.to_owned(),
+        agents_topics::SUPERVISE.to_owned(),
         SKILLS_CHANGED.to_owned(),
         frame_topics::SESSION_DELETED.to_owned(),
         SOURCE_CHANGED.to_owned(),
@@ -329,6 +335,22 @@ fn data_dir(ctx: &Ctx) -> PathBuf {
 }
 
 /// Whether the last status of a journal says a run is in progress.
+/// The text of the newest supervision note no MANAGE decided yet (written after the last
+/// `managed` note), if any.
+fn unanswered_supervision(journal: &Journal) -> Option<String> {
+    let decided = journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "managed")
+        .map(|entry| entry.seq)
+        .max()
+        .unwrap_or(0);
+    journal
+        .entries()
+        .filter(|entry| entry.seq > decided && entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "supervise")
+        .last()
+        .map(|entry| str_field(&entry.data, "text").to_owned())
+}
+
 fn running_status(journal: &Journal) -> Option<JournalEntry> {
     journal.last_status().filter(|entry| str_field(&entry.data, "state") == "running").cloned()
 }
@@ -501,7 +523,7 @@ impl Chatflow {
                         Vec::new()
                     }
                 };
-                for project in projects {
+                for project in projects.into_iter().filter(|project| project.flows.iter().any(|flow| flow == FLOW)) {
                     match this.prewarm_project(ctx.clone(), &project.id).await {
                         Ok(result) => tracing::debug!(project = %project.id, state = %result.state, "a new conversation's block"),
                         Err(error) => tracing::debug!(project = %project.id, %error, "a new conversation's block is not prefilled yet"),
@@ -833,6 +855,31 @@ impl Chatflow {
             }
             // Messages that arrived too late for this run, then queued follow-ups, each start a turn.
             let next = journal.pending_steers("steer").into_iter().chain(journal.pending_steers("followup")).next();
+            // Delegated work that needed a decision while this turn ran (an agent blocked, a need
+            // for the lead): the session decides it now, before it rests.
+            // Only after a turn that ended well: a MANAGE that failed would otherwise start again.
+            if next.is_none()
+                && state == "done"
+                && let Some(work) = unanswered_supervision(&journal)
+            {
+                run_id = new_run_id();
+                if let Ok(mut current) = stage.lock() {
+                    *current = "manage".into();
+                }
+                status_seq = journal
+                    .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "manage", "mode": mode, "kind": "turn", "data_version": self.inner.data.get().version()}))
+                    .await?;
+                let detail = json!({"work": work, "route": "MANAGE", "effort": self.inner.data.get().effort.default, "by": "host"});
+                journal
+                    .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false}))
+                    .await?;
+                if let Ok(mut runs) = self.inner.runs.lock()
+                    && let Some(handle) = runs.get_mut(session_id)
+                {
+                    handle.run_id = run_id.clone();
+                }
+                continue;
+            }
             let Some(next) = next else {
                 let _ = host.session_status(session_id, session_status).await;
                 // The next turn's prefix is known now: prefill it while the user reads the answer
@@ -1392,6 +1439,61 @@ impl Chatflow {
         Ok(())
     }
 
+    /// Delegated work needs its session's decision (an agent blocked, a need for the lead, the
+    /// tree done): the session hears it (once, whichever instance hears the event) and, when
+    /// nothing runs in it, wakes to decide with MANAGE (no router call). A running turn reads the
+    /// note at its next step.
+    async fn supervise_event(&self, ctx: Ctx, event: Supervise) -> Result<(), RpcError> {
+        let host = Host::new(ctx.clone());
+        let session_id = event.session_id.clone();
+        let mut journal = Journal::load(host.clone(), &session_id).await?;
+        if journal.entries().any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "supervise_id") == event.id) {
+            return Ok(());
+        }
+        let set = self.inner.data.get();
+        let vars = [("agent", event.agent.as_str()), ("title", event.title.as_str()), ("text", event.text.trim())];
+        let text = match event.event.as_str() {
+            agent_events::NEED => set.text("supervise_need", &vars),
+            agent_events::TREE_DONE => set.text("supervise_tree_done", &vars),
+            _ => set.text("supervise_blocked", &vars),
+        };
+        let running = self.active(&session_id).is_some() || running_status(&journal).is_some();
+        journal
+            .append(kinds::NOTE, json!({"text": text, "purpose": "supervise", "host_message": true, "supervise_id": event.id, "supervise": event}))
+            .await?;
+        if running {
+            return Ok(());
+        }
+        let session = host.session_get(&session_id).await?;
+        if session.kind != SessionKind::Chat {
+            return Ok(());
+        }
+        // The session's own mode: a wake never acts with more freedom than the user gave it.
+        let mode = journal
+            .entries()
+            .filter(|entry| entry.kind == kinds::STATUS)
+            .filter_map(|entry| entry.data.get("mode").and_then(Value::as_str))
+            .last()
+            .unwrap_or("auto")
+            .to_owned();
+        let run_id = new_run_id();
+        let Some((stops, stage, sender)) = self.register(&session_id, &run_id) else { return Ok(()) };
+        let status_seq = journal
+            .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "manage", "mode": mode, "kind": "turn", "data_version": set.version()}))
+            .await?;
+        let detail = json!({"work": text, "route": "MANAGE", "effort": set.effort.default, "by": "host"});
+        journal
+            .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false}))
+            .await?;
+        let _ = host.session_status(&session_id, SessionStatus::Running).await;
+        let this = self.clone();
+        self.spawn(async move {
+            let outcome = this.drive_foreground(ctx, &session_id, run_id, status_seq, mode, stops, stage).await;
+            let _ = sender.send(Some(outcome.map(|_| empty_result("done"))));
+        });
+        Ok(())
+    }
+
     // ---- chatflow.agent_run -------------------------------------------------------------------
 
     async fn agent_run(&self, ctx: Ctx, call: &Call, params: AgentRunParams) -> Result<AgentRunResult, RpcError> {
@@ -1601,7 +1703,7 @@ impl Chatflow {
     async fn resume_all(&self, ctx: Ctx) -> Result<(), RpcError> {
         let host = Host::new(ctx.clone());
         let sessions = host.session_list(None).await?;
-        for session in sessions.into_iter().filter(|session| session.kind == SessionKind::Chat && matches!(session.status, SessionStatus::Running | SessionStatus::Waiting)) {
+        for session in sessions.into_iter().filter(|session| session.flow == FLOW && session.kind == SessionKind::Chat && matches!(session.status, SessionStatus::Running | SessionStatus::Waiting)) {
             let journal = Journal::load(host.clone(), &session.id).await?;
             let Some(status) = running_status(&journal) else { continue };
             let run_id = str_field(&status.data, "run_id").to_owned();
@@ -1761,30 +1863,32 @@ impl Plugin for Chatflow {
     fn handle(&self, ctx: Ctx, call: Call) -> BoxFuture<'static, Result<Value, RpcError>> {
         let this = self.clone();
         Box::pin(async move {
-            match call.method.as_str() {
-                methods::TURN => to_value(&this.turn(ctx, parse_params(call.params.clone())?).await?),
-                methods::STEER => this.steer(ctx, parse_params(call.params.clone())?).await,
-                methods::CANCEL => this.cancel(ctx, parse_params(call.params.clone())?).await,
-                methods::STATE => to_value(&this.state(ctx, parse_params(call.params.clone())?).await?),
-                methods::RUNNING => to_value(&this.running()),
-                methods::APPROVE => this.approve(ctx, parse_params(call.params.clone())?).await,
-                methods::ATTACHMENT_PUT => to_value(&this.attachment_put(ctx, parse_params(call.params.clone())?).await?),
-                methods::SPEC_UPDATE => this.spec_update(ctx, parse_params(call.params.clone())?).await,
-                methods::SPEC_SAVE => this.spec_save(ctx, parse_params(call.params.clone())?).await,
-                methods::DECISION_ANSWER => this.decision_answer(ctx, parse_params(call.params.clone())?).await,
-                methods::KNOWLEDGE_ANSWER => this.knowledge_answer(ctx, parse_params(call.params.clone())?).await,
-                methods::PREWARM => to_value(&this.prewarm(ctx, parse_params(call.params.clone())?).await?),
-                methods::PLAN_UPDATE => this.plan_update(ctx, parse_params(call.params.clone())?).await,
-                methods::PLAN_IMPLEMENT => to_value(&this.plan_implement(ctx, parse_params(call.params.clone())?).await?),
-                methods::PLAN_REVISE => to_value(&this.plan_revise(ctx, parse_params(call.params.clone())?).await?),
-                methods::PLAN_EDIT => this.plan_edit(ctx, parse_params(call.params.clone())?).await,
-                methods::PLAN_COMMENT => this.plan_comment(ctx, parse_params(call.params.clone())?).await,
-                methods::IDEATION_CHOOSE => this.ideation_choose(ctx, parse_params(call.params.clone())?).await,
-                methods::AGENT_RUN => {
+            // `chatflow-coding.turn` -> `turn`.
+            let verb = call.method.split_once('.').map_or(call.method.as_str(), |(_, verb)| verb);
+            match verb {
+                verbs::TURN => to_value(&this.turn(ctx, parse_params(call.params.clone())?).await?),
+                verbs::STEER => this.steer(ctx, parse_params(call.params.clone())?).await,
+                verbs::CANCEL => this.cancel(ctx, parse_params(call.params.clone())?).await,
+                verbs::STATE => to_value(&this.state(ctx, parse_params(call.params.clone())?).await?),
+                verbs::RUNNING => to_value(&this.running()),
+                verbs::APPROVE => this.approve(ctx, parse_params(call.params.clone())?).await,
+                verbs::ATTACHMENT_PUT => to_value(&this.attachment_put(ctx, parse_params(call.params.clone())?).await?),
+                verbs::SPEC_UPDATE => this.spec_update(ctx, parse_params(call.params.clone())?).await,
+                verbs::SPEC_SAVE => this.spec_save(ctx, parse_params(call.params.clone())?).await,
+                verbs::DECISION_ANSWER => this.decision_answer(ctx, parse_params(call.params.clone())?).await,
+                verbs::KNOWLEDGE_ANSWER => this.knowledge_answer(ctx, parse_params(call.params.clone())?).await,
+                verbs::PREWARM => to_value(&this.prewarm(ctx, parse_params(call.params.clone())?).await?),
+                verbs::PLAN_UPDATE => this.plan_update(ctx, parse_params(call.params.clone())?).await,
+                verbs::PLAN_IMPLEMENT => to_value(&this.plan_implement(ctx, parse_params(call.params.clone())?).await?),
+                verbs::PLAN_REVISE => to_value(&this.plan_revise(ctx, parse_params(call.params.clone())?).await?),
+                verbs::PLAN_EDIT => this.plan_edit(ctx, parse_params(call.params.clone())?).await,
+                verbs::PLAN_COMMENT => this.plan_comment(ctx, parse_params(call.params.clone())?).await,
+                verbs::IDEATION_CHOOSE => this.ideation_choose(ctx, parse_params(call.params.clone())?).await,
+                verbs::AGENT_RUN => {
                     let params: AgentRunParams = parse_params(call.params.clone())?;
                     to_value(&this.agent_run(ctx, &call, params).await?)
                 }
-                other => Err(RpcError::unknown_method(other)),
+                _ => Err(RpcError::unknown_method(&call.method)),
             }
         })
     }
@@ -1852,6 +1956,15 @@ impl Plugin for Chatflow {
             if topic == tools_topics::JOB_EVENT {
                 if let Err(error) = this.job_event(ctx, data).await {
                     tracing::warn!(%error, "could not deliver a background job event");
+                }
+            } else if topic == agents_topics::SUPERVISE {
+                match serde_json::from_value::<Supervise>(data) {
+                    Ok(event) => {
+                        if let Err(error) = this.supervise_event(ctx, event).await {
+                            tracing::warn!(%error, "could not tell a session about its agents");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "an unreadable supervision event"),
                 }
             } else if topic == frame_topics::SESSION_DELETED
                 && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data)

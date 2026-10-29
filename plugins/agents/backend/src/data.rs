@@ -62,6 +62,11 @@ pub struct SchedulerConfig {
     pub foreground_tpot_ms: f64,
     pub gain: f64,
     pub probe_after_ms: u64,
+    /// Context one agent works in; the starting limit is the conversations of this size the
+    /// model's shared pool holds, minus one for the foreground.
+    pub working_context_tokens: u64,
+    /// Longest share of a window the model may spend restoring spilled conversations.
+    pub pool_restore_share: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

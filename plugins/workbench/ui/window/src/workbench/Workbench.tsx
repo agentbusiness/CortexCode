@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
-import { ComputerScope, Cross, Divider, HostContext, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
+import { ComputerScope, Cross, Divider, HostContext, useSelection, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
 import { SlotHost } from './SlotHost';
 import { Splash } from './Splash';
 import { WorkbenchContext, importPlugin, linkStyle, missingSdk, type WorkbenchServices } from './context';
@@ -134,14 +134,26 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
 
 /** A slot whose plugin can be mounted again from scratch (Reload in Settings). */
 function BoundSlot({ registry, name, props, className }: SlotRenderProps & { registry: PluginRegistry }) {
-  const token = useSyncExternalStore(
+  const byFlow = useSyncExternalStore((listener) => registry.subscribe(listener), () => registry.byFlow(name));
+  return byFlow ? <FlowSlot registry={registry} name={name} props={props} className={className} /> : <PickedSlot registry={registry} name={name} props={props} className={className} />;
+}
+
+/** A slot whose plugins belong to flows (the conversation, its composer): the open session's. */
+function FlowSlot(props: SlotRenderProps & { registry: PluginRegistry }) {
+  const { session } = useSelection();
+  return <PickedSlot {...props} flow={session?.flow ?? 'coding'} />;
+}
+
+function PickedSlot({ registry, name, props, className, flow }: SlotRenderProps & { registry: PluginRegistry; flow?: string }) {
+  const picked = useSyncExternalStore(
     (listener) => registry.subscribe(listener),
     () => {
-      const plugin = registry.forSlot(name);
-      return plugin ? `${plugin.id}:${registry.reloadToken(plugin.id)}` : '';
+      const plugin = registry.forSlot(name, flow);
+      return plugin ? `${plugin.id}\n${plugin.id}:${registry.reloadToken(plugin.id)}` : '';
     },
   );
-  return <SlotHost key={token} name={name} props={props} className={className} />;
+  const [pluginId, token] = picked ? picked.split('\n') : [undefined, ''];
+  return <SlotHost key={token} name={name} pluginId={pluginId} props={props} className={className} />;
 }
 
 /** Every plugin contributed to a slot, each in its own slot host (each hot-swaps on its own). */

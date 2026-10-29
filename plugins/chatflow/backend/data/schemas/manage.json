@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "properties": {
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "enum": [
+              "@agents"
+            ]
+          },
+          "action": {
+            "enum": [
+              "stop",
+              "restart",
+              "message"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 600
+          }
+        },
+        "required": [
+          "agent",
+          "action",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "replan": {
+      "enum": [
+        "no",
+        "yes"
+      ]
+    },
+    "brief": {
+      "type": "string",
+      "maxLength": 1200,
+      "x-when": {
+        "replan": [
+          "yes"
+        ]
+      }
+    }
+  },
+  "required": [
+    "actions",
+    "replan",
+    "brief"
+  ],
+  "additionalProperties": false
+}

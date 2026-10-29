@@ -30,17 +30,18 @@ export class PluginRegistry {
   }
 
   /** label/order from each build's manifest.json, by content hash (a build never changes). */
-  private readonly manifests = new Map<string, Promise<Pick<UiPlugin, 'label' | 'order'>>>();
+  private readonly manifests = new Map<string, Promise<Pick<UiPlugin, 'label' | 'order' | 'flow'>>>();
 
-  private presentation(plugin: UiPlugin): Promise<Pick<UiPlugin, 'label' | 'order'>> {
+  private presentation(plugin: UiPlugin): Promise<Pick<UiPlugin, 'label' | 'order' | 'flow'>> {
     let pending = this.manifests.get(plugin.hash);
     if (!pending) {
       const url = new URL('manifest.json', new URL(plugin.entry_url, location.href)).href;
       pending = fetch(url)
         .then((response) => (response.ok ? response.json() : {}))
-        .then((manifest: { label?: unknown; order?: unknown }) => ({
+        .then((manifest: { label?: unknown; order?: unknown; flow?: unknown }) => ({
           ...(typeof manifest.label === 'string' && manifest.label.trim() ? { label: manifest.label } : {}),
           ...(typeof manifest.order === 'number' && Number.isFinite(manifest.order) ? { order: manifest.order } : {}),
+          ...(typeof manifest.flow === 'string' && manifest.flow ? { flow: manifest.flow } : {}),
         }))
         // A manifest that cannot be read leaves the plugin named by its slot.
         .catch(() => ({}));
@@ -63,9 +64,14 @@ export class PluginRegistry {
     this.emit();
   }
 
-  /** The plugin for a slot. Several for one slot: the highest version, then the first listed. */
-  forSlot(slot: string): UiPlugin | undefined {
-    const candidates = this.plugins.filter((plugin) => plugin.slot === slot);
+  /** The plugin for a slot. Several for one slot: the one of `flow` (the open session's) when some
+   * belong to a flow, then the highest version, then the first listed. */
+  forSlot(slot: string, flow?: string): UiPlugin | undefined {
+    let candidates = this.plugins.filter((plugin) => plugin.slot === slot);
+    if (flow !== undefined && candidates.some((plugin) => plugin.flow)) {
+      const own = candidates.filter((plugin) => plugin.flow === flow);
+      if (own.length > 0) candidates = own;
+    }
     if (candidates.length <= 1) return candidates[0];
     return [...candidates].sort((a, b) => compareVersions(b.version, a.version))[0];
   }
@@ -102,6 +108,11 @@ export class PluginRegistry {
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** Some plugin of the slot belongs to a flow: the window picks by the open session's flow. */
+  byFlow(slot: string): boolean {
+    return this.plugins.some((plugin) => plugin.slot === slot && plugin.flow);
   }
 
   private upsert(plugin: UiPlugin): void {

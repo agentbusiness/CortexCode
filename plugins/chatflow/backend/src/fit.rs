@@ -189,7 +189,8 @@ impl Drop for Prewarm {
 /// (entries with a lower seq; `u64::MAX` = all) is past `trigger` tokens
 /// (`limits.compact_early_tokens` while tools run, `limits.compact_idle_tokens` when the turn
 /// ended), the least compaction that reaches the target or halves it. What was cut is prefilled in
-/// the background. `build` makes the prompt without a stage message (system and projection): what
+/// the background, except for an agent that hibernates while it waits. `build` makes the prompt
+/// without a stage message (system and projection): what
 /// every later call starts with. Best effort: a failure leaves the conversation as it was, for
 /// [`fitted`] to handle.
 pub async fn prepare(
@@ -211,11 +212,13 @@ pub async fn prepare(
             false
         }
     };
-    // A background agent waiting on a long tool hands its slot back (hibernation); a prewarm would
-    // hold it.
-    if trigger == 0 || (env.priority == Priority::Agent && limits.hibernate_after_ms > 0) {
+    if trigger == 0 {
         return None;
     }
+    // A background agent waiting on a long tool hands its slot back (hibernation); a prewarm would
+    // hold it. It is still compacted (counting holds no slot): left whole, agents grew to 139k and
+    // pushed each other out of the shared pool.
+    let hibernates = env.priority == Priority::Agent && limits.hibernate_after_ms > 0;
     let early = u64::from(trigger);
     // The newest call's prompt and answer bound the conversation since (its prompt held all of it
     // and a stage message): below the share no exact count is needed. A cut made it smaller still.
@@ -263,6 +266,9 @@ pub async fn prepare(
             }
         }
     } else if !cut {
+        return None;
+    }
+    if hibernates {
         return None;
     }
     let messages = crate::prewarm::closed(build(&upto(&journal.entries_vec(), before)));

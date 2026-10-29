@@ -40,6 +40,9 @@ import { mentionsOf, type KnownProject, type SymbolHit } from './mentions';
 import { PASTE_AS_FILE, type AttachContext, type AttachShell, type Attachment, type PasteAsFile, type PutParams, type PutResult } from './attachments';
 import './composer.css';
 
+/** This view's flow: its calls go to the coding flow's category. */
+const FLOW = 'chatflow-coding';
+
 /** `memory.search`'s answer, as far as the completion reads it. */
 interface SearchAnswer {
   hits: Array<{ symbol: SymbolHit }>;
@@ -81,7 +84,7 @@ function ComposerPlugin() {
   const mode = modes[draftKey] ?? defaultMode;
   const flow = useQuery<FlowState>(
     sessionId && session?.kind !== 'agent' ? `chatflow.state:${sessionId}` : null,
-    (c) => c.call<FlowState>('chatflow.state', { session_id: sessionId }),
+    (c) => c.call<FlowState>(`${FLOW}.state`, { session_id: sessionId }),
     { topics: sessionId ? [`journal.${sessionId}`] : [], when: (_t, data) => (data as JournalPatch)?.op === 'create' && ['status', 'steer'].includes((data as { entry: JournalEntry }).entry.kind) },
   );
   const agents = useQuery<AgentRecord[]>(
@@ -105,7 +108,7 @@ function ComposerPlugin() {
     if (warmedFor.current === state) return undefined;
     const timer = setTimeout(() => {
       warmedFor.current = state;
-      void client.call('chatflow.prewarm', { session_id: sessionId }).catch(() => undefined);
+      void client.call(`${FLOW}.prewarm`, { session_id: sessionId }).catch(() => undefined);
     }, PREWARM_AFTER_MS);
     return () => clearTimeout(timer);
   }, [client, writing, draft, sessionId, session?.kind, running, lastSeq]);
@@ -117,7 +120,7 @@ function ComposerPlugin() {
   useEffect(() => {
     if (!newConversation) return undefined;
     const timer = setTimeout(() => {
-      void client.call('chatflow.prewarm', { project_id: newConversation }).catch(() => undefined);
+      void client.call(`${FLOW}.prewarm`, { project_id: newConversation }).catch(() => undefined);
     }, writing ? PREWARM_AFTER_MS : 0);
     return () => clearTimeout(timer);
   }, [client, newConversation, writing]);
@@ -140,18 +143,18 @@ function ComposerPlugin() {
         return;
       }
       if (target.type === 'chat') {
-        await client.call('chatflow.steer', { session_id: sessionId, text, kind: target.kind, ...carry, ...mentioned });
+        await client.call(`${FLOW}.steer`, { session_id: sessionId, text, kind: target.kind, ...carry, ...mentioned });
         return;
       }
       let id = sessionId;
       if (!id) {
         if (!projectId) throw new Error('Open a project first.');
-        const created = await client.call<Session>('frame.session.create', { project_id: projectId, kind: 'chat', title: '' });
+        const created = await client.call<Session>('frame.session.create', { project_id: projectId, kind: 'chat', title: '', flow: 'coding' });
         id = created.id;
         selection.select(projectId, id);
       }
       setShared('chat.stick', Date.now());
-      await client.call('chatflow.turn', { session_id: id, text, mode, ...carry, ...mentioned });
+      await client.call(`${FLOW}.turn`, { session_id: id, text, mode, ...carry, ...mentioned });
     } catch (cause) {
       setError(errorMessage(cause));
       throw cause;
@@ -162,7 +165,7 @@ function ComposerPlugin() {
     if (!sessionId) return;
     setStopping(true);
     try {
-      await client.call('chatflow.cancel', { session_id: sessionId });
+      await client.call(`${FLOW}.cancel`, { session_id: sessionId });
     } catch (cause) {
       setError(errorMessage(cause));
       setStopping(false);
@@ -170,7 +173,7 @@ function ComposerPlugin() {
   };
 
   const attach: AttachContext = {
-    put: (params: PutParams) => client.call<PutResult>('chatflow.attachment.put', params),
+    put: (params: PutParams) => client.call<PutResult>(`${FLOW}.attachment.put`, params),
     shell: host.shell as unknown as AttachShell | null,
     roots: [project?.root ?? '', workspace ?? ''].filter(Boolean),
     projectId,

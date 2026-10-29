@@ -62,6 +62,9 @@ enum Stage {
     Skills { route_seq: u64 },
     Reads { from_seq: u64 },
     StatusReads,
+    /// MANAGE: the session's own agents are stopped, restarted or messaged, and the work may be
+    /// planned again ([`crate::manage`]).
+    Manage,
     Decide { allow_more: bool },
     /// A change request: the host records the decision to do it from ROUTE's own fields (no model
     /// call, no reads), so the plan comes next; discovery happens in the tasks.
@@ -255,6 +258,9 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
                 Stage::Diagnostics { route_seq: last.seq }
             }
             "LOOKUP" | "ANSWER" => Stage::Explore,
+            "MANAGE" if reply_finished(&run, last.seq) => Stage::Done,
+            "MANAGE" if note_after(&run, last.seq, "managed") => Stage::Reply,
+            "MANAGE" => Stage::Manage,
             "STATUS" if reply_finished(&run, last.seq) => Stage::Done,
             "STATUS" if host_reads_after(&run, last.seq) > 0 => Stage::Reply,
             "STATUS" => Stage::StatusReads,
@@ -536,6 +542,10 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let planned = status_reads(&env.scope);
                 let any = env.stops.any();
                 reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await.map(|_| ())
+            }
+            Stage::Manage => {
+                set_stage(env, journal, status_seq, "manage").await?;
+                crate::manage::run(env, journal).await
             }
             Stage::Commit { route_seq } => {
                 set_stage(env, journal, status_seq, "decide").await?;
@@ -1293,17 +1303,21 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let skills_max = env.data.limits.skills_per_turn;
     // Each task's `checks` is a pick of the project's own check commands (none: no checks).
     let candidates = crate::verifiers::candidates(env, &run_files(&entries, &env.run_id)).await;
+    // The session's background work still open: the plan may take its place (`replaces`).
+    let open_work = crate::manage::open_work(env, &entries).await;
+    let open_labels: Vec<String> = open_work.iter().map(crate::manage::OpenWork::label).collect();
     let shape = stage_shape(env, stage)?
+        .filled(schemas::OPEN_WORK_PLACEHOLDER, &open_labels, None)
         .filled(schemas::REQUIREMENTS_PLACEHOLDER, &requirement_ids, None)
         .filled(schemas::TASKS_PLACEHOLDER, &plan::task_numbers(max), None)
         .filled(schemas::VERIFIERS_PLACEHOLDER, &crate::verifiers::commands(&candidates), None)
         .with_catalog(&catalog, skills_max);
     // The planner is told how its plan is used: carried out at once task by task (auto), written
     // again after a task ended badly, or the next version of the open plan.
-    // Joined computers free to run tasks now (the mesh; none without it): the planner hears the
-    // number only. An auto plan with free computers runs its independent tasks as agents at once
+    // Agents free to run tasks now (joined computers and local scheduler slots): the planner hears
+    // the number only. An auto plan with free agents runs its independent tasks as agents at once
     // (`parallel_implementation`), so the planner is told that instead of "here, one at a time".
-    let free = mesh_capacity(env).await;
+    let free = agent_capacity(env).await;
     let edit = match &mode {
         PlanMode::Auto if free > 0 => env.data.text("plan_auto_parallel_live", &[("count", &free.to_string())]),
         PlanMode::Auto => env.data.text("plan_auto_live", &[]),
@@ -1330,15 +1344,16 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     };
     let parallel = if free > 0 && !auto { env.data.text("plan_parallel", &[("count", &free.to_string())]) } else { String::new() };
     // Each task's `skills` choose from the catalog, shown last.
-    let live = joined(&[edit, parallel, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
+    let live = joined(&[open_live, edit, parallel, spec::live_text(&env.data, &entries, "spec_live"), crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (doc, tasks) = plan::from_output(&output, max, plan::Known { requirements: &requirement_ids, skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
     }
-    // One task is the default: the request is split only where it names several parts (the
-    // planner's call); several requirements of one part stay one task.
+    // Tasks are small parts, each checked on its own (the planner's call); parts that change the
+    // same files wait for each other.
     let mut made = match (&mode, &previous) {
         (PlanMode::Replan { outcome, .. }, Some(previous)) => {
             let mut replanned = plan::replanned(previous, doc, tasks, output.note.trim());
@@ -1360,14 +1375,18 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             steps_done: Vec::new(),
             replans: 0,
             by: String::new(),
+            replaces: Vec::new(),
         },
     };
     if let Some(previous) = &previous {
         made.diff = Some(plan::diff(previous, &made));
     }
+    made.replaces = open_work.iter().filter(|item| output.replaces.contains(&item.label())).map(|item| item.task.id.clone()).collect();
     let seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
     if auto {
         journal.set(seq, "implement_run", json!(env.run_id)).await?;
+        // Carried out now: what it takes the place of stops now.
+        stop_replaced_work(env, journal, seq, &made).await?;
     }
     if let Some(previous) = &previous {
         cancel_replaced_tasks(env, previous, &made).await;
@@ -1378,14 +1397,25 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
 /// The task records of `previous` that its next version `made` does not carry are cancelled: a
 /// replaced plan's tasks are not work any more (seen: version 1's tasks left pending in the task
 /// list beside version 2's). Best effort: a record left open only shows in the list.
+/// Cancelled through the agents plugin, so an agent still working on one stops with it (seen: a
+/// replan left the first plan's agents running beside the new ones).
 async fn cancel_replaced_tasks(env: &RunEnv, previous: &plan::Plan, made: &plan::Plan) {
     let kept: HashSet<&str> = made.tasks.iter().filter_map(|task| task.task_id.as_deref()).chain(made.root_task.as_deref()).collect();
-    let records = previous.tasks.iter().filter_map(|task| task.task_id.as_deref()).chain(previous.root_task.as_deref());
-    for id in records.filter(|id| !kept.contains(id)) {
-        if let Err(error) = env.host.call(memory_methods::TASK_UPDATE, json!({"id": id, "status": "cancelled"})).await {
-            tracing::warn!(%error, task = id, "cancelling a replaced plan's task failed");
-        }
+    // Subtasks first: a root task's cancel would otherwise reach them through the tree anyway.
+    let records: Vec<String> = previous.tasks.iter().filter_map(|task| task.task_id.clone()).chain(previous.root_task.clone()).filter(|id| !kept.contains(id.as_str())).collect();
+    crate::manage::cancel_tasks(env, &records).await;
+}
+
+/// The open background work a plan replaces stops when the plan is carried out (once: the list is
+/// cleared on the plan entry); a note says what stopped.
+async fn stop_replaced_work(env: &RunEnv, journal: &mut Journal, plan_seq: u64, made: &plan::Plan) -> Result<(), RpcError> {
+    if made.replaces.is_empty() {
+        return Ok(());
     }
+    let stopped = crate::manage::cancel_tasks(env, &made.replaces).await;
+    journal.set(plan_seq, "replaces", json!([])).await?;
+    let names = if stopped.is_empty() { "-".to_owned() } else { stopped.join(", ") };
+    journal.note(&env.run_id, "replaced", &env.data.text("replaced", &[("agents", &names), ("count", &made.replaces.len().to_string())]), true).await.map(|_| ())
 }
 
 /// IMPLEMENT: the open plan (or the one the Implement button named) goes to the existing
@@ -1405,6 +1435,8 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     };
     journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
+    stop_replaced_work(env, journal, plan_seq, &current).await?;
+    current.replaces.clear();
     let current_spec = spec::current(&entries).map(|(_, spec)| spec);
     if current.tasks.len() <= 1 {
         let decision = plan::foreground_decision(&env.data, &current, current_spec.as_ref(), &env.data.effort.default);
@@ -1413,7 +1445,7 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
             .await
             .map(|_| ());
     }
-    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref()).await {
+    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref(), true).await {
         Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
         Err(error) if error.code == codes::CANCELLED => Err(error),
         Err(error) => {
@@ -1451,6 +1483,35 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
             root.id
         }
     };
+    // What failed before any change is one task of its own, the last, waiting for all the others:
+    // they are done when they make nothing worse (`checks::awaited`), and it leaves every check
+    // passing. Added once, before any task is made.
+    let fix_title = env.data.text("baseline_task_title", &[]);
+    if current.tasks.iter().all(|task| task.task_id.is_none()) && current.tasks.last().is_some_and(|task| task.title != fix_title) {
+        let failures = crate::checks::baseline_failures(journal, &env.run_id);
+        if !failures.is_empty() {
+            let lines: String = failures
+                .iter()
+                .map(|(command, tests)| {
+                    let tests = match tests {
+                        Some(names) if !names.is_empty() => names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "),
+                        _ => env.data.text("baseline_task_unknown", &[]),
+                    };
+                    env.data.text("baseline_task_failure", &[("command", command), ("tests", &tests)])
+                })
+                .collect();
+            let n = current.tasks.len() as u32 + 1;
+            current.tasks.push(plan::PlanTask {
+                n,
+                title: fix_title,
+                brief: env.data.text("baseline_task_brief", &[("failures", &lines)]),
+                checks: failures.into_iter().map(|(command, _)| command).collect(),
+                depends_on: (1..n).collect(),
+                ..Default::default()
+            });
+            journal.set(plan_seq, "tasks", serde_json::to_value(&current.tasks)?).await?;
+        }
+    }
     let dirs = [env.scope.workspace.as_str(), env.scope.root.as_str()];
     for index in 0..current.tasks.len() {
         if current.tasks[index].task_id.is_some() {
@@ -1485,7 +1546,19 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
     Ok(root)
 }
 
-async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, current_spec: Option<&spec::Spec>) -> Result<String, RpcError> {
+/// `baseline`: run the plan's checks first (a skill's units check work that is not there yet, so
+/// theirs fail by design and are never a baseline).
+async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, current_spec: Option<&spec::Spec>, baseline: bool) -> Result<String, RpcError> {
+    // The plan's checks on the code before any task: what fails already becomes the last task.
+    if baseline && current.tasks.iter().all(|task| task.task_id.is_none()) {
+        let mut checks: Vec<String> = Vec::new();
+        for check in current.tasks.iter().flat_map(|task| &task.checks) {
+            if !checks.contains(check) {
+                checks.push(check.clone());
+            }
+        }
+        crate::checks::record_baseline(env, journal, &checks).await?;
+    }
     materialize_plan_tasks(env, journal, plan_seq, current, current_spec, &[]).await?;
     let spawned: HashSet<String> = journal.entries().filter(|entry| entry.kind == kinds::AGENT_SPAWNED).map(|entry| str_field(&entry.data, "task_id").to_owned()).collect();
     let mut text = env.data.text("implement_started", &[("plan_id", &current.plan_id), ("version", &current.version.to_string()), ("count", &current.tasks.len().to_string())]);
@@ -1513,22 +1586,37 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
 
 /// How many joined computers could take a session's model calls now (the mesh plugin; 0 without it).
 async fn mesh_capacity(env: &RunEnv) -> u64 {
-    env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({"tag": cc_protocol::contracts::model::tags::CODING})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
+    env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({"tag": crate::chatflow::FLOW})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
 }
 
-/// The auto plan just written: when two of its tasks could run at the same time and a joined
-/// computer is free to take one, every task goes to the agents now (the ready ones start, the
+/// How many agents could start a task now: joined computers, plus the agents scheduler's free
+/// slots on this machine when its limit holds two or more (one slot is the same work, one task at
+/// a time, so the foreground does it).
+async fn agent_capacity(env: &RunEnv) -> u64 {
+    let local = env
+        .host
+        .get::<cc_protocol::contracts::agents::SchedulerState>(agents_methods::SCHEDULER, json!({"project_id": env.scope.project_id}))
+        .await
+        .ok()
+        .filter(|state| state.max_parallel >= 2)
+        .map(|state| u64::from(state.max_parallel).saturating_sub(state.running.len() as u64))
+        .unwrap_or(0);
+    mesh_capacity(env).await + local
+}
+
+/// The auto plan just written: when two of its tasks could run at the same time and an agent
+/// (a joined computer or a local scheduler slot) is free to take one, every task goes to the agents now (the ready ones start, the
 /// rest as what they depend on finishes, each agent's model placed by the mesh), and this turn
 /// ends with the delegation note. Otherwise the Act stage carries the plan out here, task by task.
 async fn parallel_implementation(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
     let Some((plan_seq, mut current)) = plan::for_run(&entries, &env.run_id) else { return Ok(()) };
-    if current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || mesh_capacity(env).await == 0 {
+    if current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || agent_capacity(env).await == 0 {
         return Ok(());
     }
     let current_spec = spec::current(&entries).map(|(_, spec)| spec);
     journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
-    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref()).await {
+    match implement_by_agents(env, journal, plan_seq, &mut current, current_spec.as_ref(), true).await {
         Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
         Err(error) if error.code == codes::CANCELLED => Err(error),
         // The agents could not take it: the Act stage does it here, task by task, as without the mesh.
@@ -1549,7 +1637,7 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
     let Some((uri, (list_command, unit_done))) = skillsel::of_decision(&route).into_iter().find_map(|uri| env.prefix.skill_units.get(&uri).cloned().map(|commands| (uri, commands))) else {
         return Ok(false);
     };
-    if mesh_capacity(env).await == 0 {
+    if agent_capacity(env).await == 0 {
         return Ok(false);
     }
     let check = cc_protocol::contracts::memory::ContractCheck { name: "units".to_owned(), kind: "command".to_owned(), spec: list_command, expect: None };
@@ -1594,7 +1682,7 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
     };
     let plan_seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
-    match implement_by_agents(env, journal, plan_seq, &mut made, None).await {
+    match implement_by_agents(env, journal, plan_seq, &mut made, None, false).await {
         Ok(text) => {
             journal.note(&env.run_id, "implement_done", &text, true).await?;
             Ok(true)

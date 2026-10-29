@@ -218,6 +218,38 @@ pub mod topics {
     pub const PLUGIN_UNIT: &str = "plugin.unit";
 }
 
+/// Ways of working (chat flows) and where their calls go. A flow is a plugin of the `chatflow`
+/// family in the category `chatflow-<flow>`; its name is also the tag of the models it asks for
+/// (`model::tags`). A project lists the flows that work in it; a session belongs to one, for life.
+pub mod flows {
+    /// CortexCode's own flow, and every project's and session's from before flows were named.
+    pub const CODING: &str = "coding";
+    const FAMILY: &str = "chatflow-";
+
+    pub fn default_flow() -> String {
+        CODING.to_owned()
+    }
+
+    pub fn default_flows() -> Vec<String> {
+        vec![default_flow()]
+    }
+
+    /// `coding` -> `chatflow-coding`.
+    pub fn category(flow: &str) -> String {
+        format!("{FAMILY}{flow}")
+    }
+
+    /// `coding`, `turn` -> `chatflow-coding.turn`.
+    pub fn method(flow: &str, verb: &str) -> String {
+        format!("{FAMILY}{flow}.{verb}")
+    }
+
+    /// `chatflow-coding` -> `coding`; None for a category of no flow.
+    pub fn flow_of(category: &str) -> Option<&str> {
+        category.strip_prefix(FAMILY).filter(|flow| !flow.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Project {
     pub id: String,
@@ -225,6 +257,9 @@ pub struct Project {
     pub root: String,
     pub name: String,
     pub created_ms: u64,
+    /// The flows that work in this project ([`flows`]): the flows installed when it was opened.
+    #[serde(default = "flows::default_flows")]
+    pub flows: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -288,6 +323,9 @@ pub struct Session {
     /// readable, and new work starts in a new session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The flow the session belongs to, for life ([`flows`]): its calls go to that flow.
+    #[serde(default = "flows::default_flow")]
+    pub flow: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -306,6 +344,9 @@ pub struct SessionCreateParams {
     pub workspace: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// The session's flow: one of the project's. Absent: the parent's, else the project's first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

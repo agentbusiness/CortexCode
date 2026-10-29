@@ -245,6 +245,17 @@ function Sidebar() {
       throw cause;
     }
   };
+  // Stopping an agent: its run ends and its task is cancelled (`agents.stop`); what it changed stays.
+  const stopAgent = async (row: ProjectRow, agent: string) => {
+    setError(null);
+    try {
+      await runtimeFor(row.node).client.call('agents.stop', { project_id: row.project.id, agent });
+      await everything.refresh();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      throw cause;
+    }
+  };
   const deleteProject = async (row: ProjectRow) => {
     setError(null);
     try {
@@ -314,6 +325,7 @@ function Sidebar() {
               onNewChat={() => void newChat(row)}
               creating={busy === `new:${row.key}`}
               onDeleteSession={(sessionId) => deleteSession(row, sessionId)}
+              onStopAgent={(agent) => stopAgent(row, agent)}
               onDelete={() => deleteProject(row)}
             />
           </ComputerScope>
@@ -443,7 +455,7 @@ function StripProject({ project, remote, notices, selected, selectedSession, onS
   );
 }
 
-function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession, onSelect, onNewChat, creating, onDeleteSession, onDelete }: {
+function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession, onSelect, onNewChat, creating, onDeleteSession, onStopAgent, onDelete }: {
   row: ProjectRow;
   notices: Map<string, Notice>;
   open: boolean;
@@ -454,6 +466,7 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   onNewChat: () => void;
   creating: boolean;
   onDeleteSession: (sessionId: string) => Promise<void>;
+  onStopAgent: (agent: string) => Promise<void>;
   onDelete: () => Promise<void>;
 }) {
   const { project } = row;
@@ -536,7 +549,7 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
                 {agentRows.map((row) => {
                   const notice = row.sessionId && selectedSession !== row.sessionId ? notices.get(row.sessionId) : undefined;
                   return (
-                    <li key={row.name} className={[row.sessionId && selectedSession === row.sessionId ? 'sel' : '', needsYou(row.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
+                    <li key={row.name} className={['cx-row', row.sessionId && selectedSession === row.sessionId ? 'sel' : '', needsYou(row.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
                       data-agent={row.name} data-status={row.status} data-notice={notice?.kind}>
                       <button type="button" disabled={!row.sessionId} onClick={() => row.sessionId && onSelect(row.sessionId)}
                         title={row.sessionId ? `Show @${row.name}'s session${notice ? ` — ${notice.title}` : ''}` : `@${row.name} has no session yet`}>
@@ -552,6 +565,12 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
                           {row.updated ? <span className="ap faint">{ago(row.updated, now)}</span> : null}
                         </div>
                       </button>
+                      <DeleteButton what="agent" verb="Stop" detail="its run ends and its task is cancelled; what it changed stays in the files"
+                        confirm={{ title: `Stop @${row.name}?`, body: `@${row.name}'s run ends and its task is cancelled, with the tasks waiting for it. What it already changed stays in the files.`, action: 'Stop agent', busy: 'Stopping…' }}
+                        onDelete={async () => {
+                          await onStopAgent(row.name);
+                          await Promise.all([agents.refresh(), sessions.refresh()]);
+                        }} />
                     </li>
                   );
                 })}
@@ -598,10 +617,12 @@ interface Confirm {
   title: string;
   body: string;
   action: string;
+  /** What the confirm button says while it runs (default "Deleting…"). */
+  busy?: string;
 }
 
-/** An × shown on hover; a click asks in the theme's confirm dialog, and Delete there deletes. */
-function DeleteButton({ what, detail, confirm, onDelete }: { what: string; detail: string; confirm: Confirm; onDelete: () => Promise<void> }) {
+/** An × shown on hover; a click asks in the theme's confirm dialog, and its action there runs. */
+function DeleteButton({ what, verb = 'Delete', detail, confirm, onDelete }: { what: string; verb?: string; detail: string; confirm: Confirm; onDelete: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [asking, setAsking] = useState(false);
   const run = async () => {
@@ -617,7 +638,7 @@ function DeleteButton({ what, detail, confirm, onDelete }: { what: string; detai
   };
   return (
     <>
-      <button type="button" className="cx-del" data-action={`delete-${what}`} aria-label={`Delete ${what}`} title={`Delete this ${what}: ${detail}`} disabled={busy}
+      <button type="button" className="cx-del" data-action={`${verb.toLowerCase()}-${what}`} aria-label={`${verb} ${what}`} title={`${verb} this ${what}: ${detail}`} disabled={busy}
         onClick={(event) => {
           event.stopPropagation();
           setAsking(true);
@@ -642,7 +663,7 @@ function ConfirmDialog({ confirm, busy, onConfirm, onCancel }: { confirm: Confir
         <p id="cx-confirm-body" className="cx-confirm-body">{confirm.body}</p>
         <div className="modal-actions cx-confirm-actions">
           <button type="button" className="detent" disabled={busy} onClick={onCancel}>Cancel</button>
-          <button type="button" className="detent warn" ref={confirmButton} disabled={busy} onClick={onConfirm}>{busy ? 'Deleting…' : confirm.action}</button>
+          <button type="button" className="detent warn" ref={confirmButton} disabled={busy} onClick={onConfirm}>{busy ? confirm.busy ?? 'Deleting…' : confirm.action}</button>
         </div>
       </div>
     </div>,
@@ -657,6 +678,10 @@ function NoticeTag({ notice }: { notice: Notice }) {
 
 function StatePip({ status }: { status: string }) {
   return <span className={`cx-pip cx-pip-${status}`} aria-hidden />;
+}
+
+function isStopped(status: string): boolean {
+  return status === 'stopped' || status === 'cancelled';
 }
 
 function isActive(status: string): boolean {
@@ -705,12 +730,15 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       existing.title = session.title || existing.title;
       // The session's own state is the live one while it runs.
       if (session.status === 'running') existing.status = 'running';
+      // Its run was stopped from its session: the agent is stopped too, unless it had finished.
+      else if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
       existing.updated = Math.max(existing.updated, session.updated_ms);
     } else {
       rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms });
     }
   }
-  return [...rows.values()].sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
+  // A stopped agent leaves the list.
+  return [...rows.values()].filter((row) => !isStopped(row.status)).sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
 }
 
 export default definePlugin({ slot: 'workbench.sidebar@1', component: SidebarRoot });

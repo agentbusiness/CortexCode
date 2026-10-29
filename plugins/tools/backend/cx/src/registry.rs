@@ -185,6 +185,27 @@ fn format_agents(value: &Value) -> String {
     out
 }
 
+fn format_restarted(value: &Value) -> String {
+    format!("@{} works on its task again\n", s(value, "name"))
+}
+
+/// `agents.cancel` and `agents.stop`: the tasks cancelled and the agents stopped.
+fn format_cancelled(value: &Value) -> String {
+    let list = |field: &str| value.get(field).and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+    let (tasks, agents) = (list(if value.get("cancelled").is_some() { "cancelled" } else { "tasks" }), list("agents"));
+    let mut out = String::new();
+    if !agents.is_empty() {
+        let names: Vec<String> = agents.iter().map(|name| format!("@{name}")).collect();
+        let _ = writeln!(out, "stopped: {}", names.join(", "));
+    }
+    if tasks.is_empty() {
+        out.push_str("no task was open to cancel\n");
+    } else {
+        let _ = writeln!(out, "cancelled: {}", tasks.join(", "));
+    }
+    out
+}
+
 fn symbol_line(symbol: &Value) -> String {
     format!(
         "{} {}  {}:{}-{}  sid={}",
@@ -589,8 +610,8 @@ pub fn commands() -> Vec<Command> {
             schema: schema(
                 json!({
                     "text": string("The message."),
-                    "kind": json!({"type": "string", "enum": ["proposal", "idea", "claim", "blocker", "question", "handoff", "review_request", "patch_offer", "decision", "status"], "description": "Message kind (default status)."}),
-                    "to": name("Addressed agent (optional)."),
+                    "kind": json!({"type": "string", "enum": ["need", "proposal", "idea", "claim", "blocker", "question", "handoff", "review_request", "patch_offer", "decision", "status"], "description": "Message kind (default status); need asks for something."}),
+                    "to": name("Addressed agent, or lead for the session that started the work (optional)."),
                     "refs": strings("Referenced task ids, paths or symbols (repeatable).")
                 }),
                 &["text"],
@@ -648,9 +669,26 @@ pub fn commands() -> Vec<Command> {
             format: format_json,
         },
         Command {
+            path: "agent handoff",
+            method: "agents.handoff",
+            summary: "Hand a piece of work to a flow (coding) in a project; its result comes back here when done.",
+            positional: &["brief"],
+            schema: schema(
+                json!({"brief": string("What to do, in full: the work's only brief."), "in": name("The project to work in, by name (default: this one)."), "flow": name("The flow to do it (default: this session's).")}),
+                &["brief"],
+            ),
+            prepare: Prepare::None,
+            build: |context, mut args| {
+                let from_session = context.session_id.clone().ok_or_else(|| "no session: cx agent handoff runs inside a session (CORTEX_SESSION_ID)".to_owned())?;
+                let project = args.remove("in");
+                Ok(with(args, json!({"from_session": from_session, "project": project})))
+            },
+            format: format_json,
+        },
+        Command {
             path: "agent stop",
             method: "agents.stop",
-            summary: "Stop an agent.",
+            summary: "Stop an agent; its task and the tasks waiting for it are cancelled.",
             positional: &["agent"],
             schema: schema(json!({"agent": name("Agent name (@name works too).")}), &["agent"]),
             prepare: Prepare::None,
@@ -660,7 +698,32 @@ pub fn commands() -> Vec<Command> {
                 }
                 Ok(with(args, json!({"project_id": context.project()?})))
             },
-            format: format_json,
+            format: format_cancelled,
+        },
+        Command {
+            path: "agent restart",
+            method: "agents.restart",
+            summary: "Put a blocked or stopped agent back on its task.",
+            positional: &["agent"],
+            schema: schema(json!({"agent": name("Agent name (@name works too).")}), &["agent"]),
+            prepare: Prepare::None,
+            build: |context, mut args| {
+                if let Some(Value::String(agent)) = args.get_mut("agent") {
+                    *agent = agent.trim_start_matches('@').to_owned();
+                }
+                Ok(with(args, json!({"project_id": context.project()?})))
+            },
+            format: format_restarted,
+        },
+        Command {
+            path: "task cancel",
+            method: "agents.cancel",
+            summary: "Cancel a task and the tasks waiting for it; their agents stop.",
+            positional: &["task_id"],
+            schema: schema(json!({"task_id": string("Task id.")}), &["task_id"]),
+            prepare: Prepare::None,
+            build: project_args,
+            format: format_cancelled,
         },
         Command {
             path: "graph search",

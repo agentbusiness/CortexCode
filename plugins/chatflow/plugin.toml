@@ -14,7 +14,7 @@ platforms = ["macos", "linux"]
 
 # The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
 [backend]
-category = "chatflow"
+category = "chatflow-coding"
 contract = "chatflow@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]

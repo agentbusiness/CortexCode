@@ -38,6 +38,9 @@ import { answerStarted, buildTurns, liveReasoning, runState } from './transcript
 import { decisionLines, progressLine, useLiveRun } from './live';
 import './chat.css';
 
+/** This view's flow: its calls go to the coding flow's category. */
+const FLOW = 'chatflow-coding';
+
 function Chat() {
   const client = useClient();
   const host = useHost();
@@ -59,7 +62,7 @@ function Chat() {
 
   const flow = useQuery<FlowState>(
     sessionId && session?.kind !== 'agent' ? `chatflow.state:${sessionId}` : null,
-    (c) => c.call<FlowState>('chatflow.state', { session_id: sessionId }),
+    (c) => c.call<FlowState>(`${FLOW}.state`, { session_id: sessionId }),
     {
       topics: sessionId ? [`journal.${sessionId}`] : [],
       when: (_topic, data) => {
@@ -171,7 +174,7 @@ function Chat() {
   const actions = useMemo<TurnActions>(() => ({
     approve: async (seq, approve) => {
       if (!sessionId) return;
-      await client.call('chatflow.approve', { session_id: sessionId, seq, approve });
+      await client.call(`${FLOW}.approve`, { session_id: sessionId, seq, approve });
     },
     openFile: (path) => {
       if (workspace) openInCode({ root: workspace, path });
@@ -213,50 +216,50 @@ function Chat() {
     },
     updateSpec: async (change) => {
       if (!sessionId) return;
-      await client.call('chatflow.spec.update', { session_id: sessionId, ...change });
+      await client.call(`${FLOW}.spec.update`, { session_id: sessionId, ...change });
     },
     saveSpec: async () => {
-      const saved = await client.call<{ path: string; relative?: string }>('chatflow.spec.save', { session_id: sessionId });
+      const saved = await client.call<{ path: string; relative?: string }>(`${FLOW}.spec.save`, { session_id: sessionId });
       return saved?.relative || saved?.path || '';
     },
     answerDecision: async (seq, accept) => {
       if (!sessionId) return;
-      await client.call('chatflow.decision.answer', { session_id: sessionId, seq, accept });
+      await client.call(`${FLOW}.decision.answer`, { session_id: sessionId, seq, accept });
     },
     setPlanStatus: async (planId, status) => {
       if (!sessionId) return;
-      await client.call('chatflow.plan.update', { session_id: sessionId, plan_id: planId, status });
+      await client.call(`${FLOW}.plan.update`, { session_id: sessionId, plan_id: planId, status });
     },
     implementPlan: async (planId) => {
       if (!sessionId) return;
       setShared('chat.stick', Date.now());
-      await client.call('chatflow.plan.implement', { session_id: sessionId, plan_id: planId });
+      await client.call(`${FLOW}.plan.implement`, { session_id: sessionId, plan_id: planId });
     },
     editPlan: async (change) => {
       if (!sessionId) return;
-      await client.call('chatflow.plan.edit', { session_id: sessionId, ...change });
+      await client.call(`${FLOW}.plan.edit`, { session_id: sessionId, ...change });
     },
     commentPlan: async (planId, task, text) => {
       if (!sessionId) return;
-      await client.call('chatflow.plan.comment', { session_id: sessionId, plan_id: planId, text, ...(task === null ? {} : { task }) });
+      await client.call(`${FLOW}.plan.comment`, { session_id: sessionId, plan_id: planId, text, ...(task === null ? {} : { task }) });
     },
     removeComment: async (planId, seq) => {
       if (!sessionId) return;
-      await client.call('chatflow.plan.comment', { session_id: sessionId, plan_id: planId, remove: seq });
+      await client.call(`${FLOW}.plan.comment`, { session_id: sessionId, plan_id: planId, remove: seq });
     },
     revisePlan: async (planId) => {
       if (!sessionId) return;
       setShared('chat.stick', Date.now());
-      await client.call('chatflow.plan.revise', { session_id: sessionId, plan_id: planId, mode: defaultMode });
+      await client.call(`${FLOW}.plan.revise`, { session_id: sessionId, plan_id: planId, mode: defaultMode });
     },
     chooseOption: async (seq, option) => {
       if (!sessionId) return;
-      await client.call('chatflow.ideation.choose', { session_id: sessionId, seq, option });
+      await client.call(`${FLOW}.ideation.choose`, { session_id: sessionId, seq, option });
     },
     sendMessage: async (text) => {
       if (!sessionId) return;
       setShared('chat.stick', Date.now());
-      await client.call('chatflow.turn', { session_id: sessionId, text, mode: defaultMode });
+      await client.call(`${FLOW}.turn`, { session_id: sessionId, text, mode: defaultMode });
     },
   }), [workspace, client, sessionId, projectId, selection, host, defaultMode]);
   const spec = useMemo(() => currentSpec(entries), [entries]);

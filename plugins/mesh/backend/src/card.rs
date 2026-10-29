@@ -163,14 +163,20 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
         let Some(id) = project.get("id").and_then(Value::as_str) else { continue };
         let name = project.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
         let created_ms = project.get("created_ms").and_then(Value::as_u64).unwrap_or(0);
-        project_cards.push(ProjectCard { id: id.to_owned(), name, description: description(ctx, id).await, created_ms });
+        let flows = project.get("flows").and_then(|flows| serde_json::from_value(flows.clone()).ok()).unwrap_or_else(cc_protocol::contracts::frame::flows::default_flows);
+        project_cards.push(ProjectCard { id: id.to_owned(), name, description: description(ctx, id).await, created_ms, flows });
     }
+    // The flows running here: the active plugins of the chat flow family.
+    let mut flows: Vec<String> = plugins.iter().filter(|plugin| plugin.state == "active").filter_map(|plugin| cc_protocol::contracts::frame::flows::flow_of(&plugin.category).map(str::to_owned)).collect();
+    flows.sort();
+    flows.dedup();
     let on_mains = on_mains();
     Card {
         node: node.to_owned(),
         name: name.to_owned(),
         software: "cortexcode".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        flows,
         chip: machine.chip,
         memory_bytes: machine.memory_bytes,
         cpu_cores: machine.cpu_cores,

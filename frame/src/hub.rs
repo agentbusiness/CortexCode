@@ -266,6 +266,16 @@ impl Frame {
 
     // ----- routing -----
 
+    /// The flows installed here (plugins of the `chatflow` family, enabled), CortexCode's own
+    /// first; none installed: the coding flow.
+    pub fn installed_flows(&self) -> Vec<String> {
+        use cc_protocol::contracts::frame::flows;
+        let mut installed: Vec<String> = self.sup.slots().iter().filter(|slot| !slot.is_disabled()).filter_map(|slot| flows::flow_of(&slot.category).map(str::to_owned)).collect();
+        installed.sort_by_key(|flow| (flow != flows::CODING, flow.clone()));
+        installed.dedup();
+        if installed.is_empty() { flows::default_flows() } else { installed }
+    }
+
     pub fn route(&self, category: &str) -> Option<Route> {
         self.routes.read().ok().and_then(|routes| routes.get(category).cloned())
     }
@@ -654,7 +664,7 @@ impl Frame {
                 if !std::path::Path::new(&params.root).is_absolute() {
                     return Err(RpcError::invalid_params(format!("project root `{}` must be an absolute path", params.root)));
                 }
-                let (project, created) = self.state.open_project(&params.root)?;
+                let (project, created) = self.state.open_project(&params.root, self.installed_flows())?;
                 if created {
                     self.publish(topics::PROJECT_CHANGED, &to_value(&project)?);
                 }

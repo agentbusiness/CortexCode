@@ -48,8 +48,12 @@ search_limit = 5
 # slot, the chat flow hibernates its KV). A control loop moves the limit within [min, max] to the
 # measured best agent throughput while keeping foreground latency within target.
 [scheduler]
-# Initial limit; 0 = the conversations the model holds resident at once, minus one.
+# Initial limit; 0 = the conversations of `working_context_tokens` the model's shared pool holds,
+# minus one for the foreground.
 start = 0
+# Context one agent works in. The pool is shared: more agents than it holds at this size push each
+# other out to disk and each works in less.
+working_context_tokens = 65536
 min = 1
 # 0 = no ceiling: the limit rises while it raises measured agent throughput and the foreground
 # targets below hold. The model plugin interleaves running requests (concurrency, not parallel
@@ -66,6 +70,9 @@ settle_ms = 20000
 foreground_queue_ms = 1000
 foreground_prefill_slowdown = 1.5
 foreground_tpot_ms = 150
+# Pool pressure: the limit steps down when restoring spilled conversations from disk takes more
+# than this share of a window (agents evicting each other).
+pool_restore_share = 0.1
 # A higher limit is kept only when it raises agent throughput by at least this fraction.
 gain = 0.05
 # Re-measure the neighbours of a held limit after this long (ms).

@@ -11,7 +11,7 @@
 use crate::store::{Op, Outbox};
 use cc_protocol::contracts::frame::{
     ProjectDeleted,
-    Project, Session, SessionCreateParams, SessionStatus, SessionUpdateParams, UiStateDocument,
+    flows, Project, Session, SessionCreateParams, SessionStatus, SessionUpdateParams, UiStateDocument,
 };
 use cc_protocol::contracts::now_ms;
 use cc_protocol::RpcError;
@@ -119,8 +119,9 @@ impl StateStore {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Open (or re-open) a project by root. Returns the project and whether it is new.
-    pub fn open_project(&self, root: &str) -> Result<(Project, bool), RpcError> {
+    /// Open (or re-open) a project by root; a new one takes `flows` (the flows installed now).
+    /// Returns the project and whether it is new.
+    pub fn open_project(&self, root: &str, flows: Vec<String>) -> Result<(Project, bool), RpcError> {
         let canonical = std::fs::canonicalize(root)
             .map_err(|error| RpcError::invalid_params(format!("project root `{root}`: {error}")))?;
         if !canonical.is_dir() {
@@ -133,7 +134,7 @@ impl StateStore {
             return Ok((existing.clone(), false));
         }
         let name = canonical.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.clone());
-        let project = Project { id: id.clone(), root, name, created_ms: now_ms() };
+        let project = Project { id: id.clone(), root, name, created_ms: now_ms(), flows };
         self.outbox.send(Op::PutProject(project.clone()))?;
         inner.deleted.remove(&id);
         inner.projects.insert(id, project.clone());
@@ -158,11 +159,19 @@ impl StateStore {
             .get(&params.project_id)
             .cloned()
             .ok_or_else(|| RpcError::not_found(format!("no project `{}`", params.project_id)))?;
-        if let Some(parent) = &params.parent
-            && !inner.sessions.contains_key(parent)
-        {
-            return Err(RpcError::not_found(format!("no parent session `{parent}`")));
-        }
+        let parent_flow = match &params.parent {
+            Some(parent) => Some(inner.sessions.get(parent).ok_or_else(|| RpcError::not_found(format!("no parent session `{parent}`")))?.flow.clone()),
+            None => None,
+        };
+        // Its flow: the one asked for, else the parent's when the project takes it, else the
+        // project's first.
+        let flow = match params.flow {
+            Some(flow) if !project.flows.contains(&flow) => {
+                return Err(RpcError::invalid_params(format!("the project {} does not take the {flow} flow (it takes: {})", project.name, project.flows.join(", "))));
+            }
+            Some(flow) => flow,
+            None => parent_flow.filter(|flow| project.flows.contains(flow)).or_else(|| project.flows.first().cloned()).unwrap_or_else(flows::default_flow),
+        };
         let now = now_ms();
         let session = Session {
             id: format!("s_{}", uuid::Uuid::new_v4().simple()),
@@ -177,6 +186,7 @@ impl StateStore {
             created_ms: now,
             updated_ms: now,
             model: None,
+            flow,
         };
         self.outbox.send(Op::PutSession(session.clone()))?;
         inner.sessions.insert(session.id.clone(), session.clone());

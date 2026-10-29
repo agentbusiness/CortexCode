@@ -5,6 +5,10 @@
 //!   for the `repeat_at`-th time (data, shipped as 3) since the last correction is a repetition;
 //! - the same failing contract report for the third time is a repetition;
 //! - a generation the model plugin stopped as repeating itself (`finish_reason = repeated`) is one.
+//! - the same command (its first command, without output filters and redirections) ending with the
+//!   same exit status for the `repeat_at`-th time with no edit in between is a rerun: told once
+//!   per edit-free stretch that it cannot show anything new (seen: a passing test run again eight
+//!   times, each with another `| grep`), never a stop.
 //!
 //! The first repetition earns a corrective replanning message; a repetition after that stops the
 //! run with an honest status. A repeated read never stops it: reading a file again changes
@@ -15,6 +19,29 @@ use std::collections::HashMap;
 
 /// The model's read tool (files, folders, URIs).
 const READ: &str = "read";
+/// The model's command tool.
+const RUN: &str = "run";
+
+/// The command a `run` call is about: its first command that is not `cd`, `echo` or `sleep`,
+/// without what follows a pipe and without redirections (`cargo test x 2>&1 | grep ok` and
+/// `echo ==; cargo test x > log` are both `cargo test x`). Mechanical; empty when none.
+pub fn base_command(command: &str) -> String {
+    command
+        .split(|c| c == ';' || c == '\n')
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+        .map(|part| part.split('|').next().unwrap_or("").split_whitespace().take_while(|word| !word.contains('>') && !word.starts_with('<')).collect::<Vec<_>>().join(" "))
+        .find(|part| !part.is_empty() && !["cd", "echo", "sleep", "printf"].contains(&part.split(' ').next().unwrap_or("")))
+        .unwrap_or_default()
+}
+
+/// How a command's output ended: its last `[exit …]`, timeout or no-status line (the tools
+/// plugin's), or the whole output when it has none.
+fn ending(output: &str) -> u64 {
+    let last = output.lines().rev().find(|line| line.starts_with('[')).unwrap_or(output);
+    // `[exit 0, 12s]` and `[exit 0]` end the same way.
+    fingerprint(last.split(',').next().unwrap_or(last))
+}
 
 /// FNV-1a 64: a stable fingerprint (mechanical; equality of bytes, not meaning).
 pub fn fingerprint(text: &str) -> u64 {
@@ -54,6 +81,9 @@ pub enum Verdict {
     /// The same read with the same result for the `READ_REPEAT_AT`-th time: told once that the
     /// content is above (a reread is harmless; it never escalates or stops the run).
     Reread(String),
+    /// The same command with the same exit status for the `repeat_at`-th time with no edit in
+    /// between: told once per edit-free stretch (never escalates or stops the run).
+    Rerun(String),
 }
 
 /// Identical reads (same target, same content) before the model is told it has them already.
@@ -67,11 +97,13 @@ pub struct Detector {
     read_corrected: bool,
     /// How many identical (call, result) pairs make a repetition (data: `limits.repeat_at`).
     repeat_at: u32,
+    /// Base command and exit status of the runs since the last edit, with their count.
+    runs: HashMap<(String, u64), u32>,
 }
 
 impl Detector {
     pub fn new(repeat_at: u32) -> Self {
-        Self { seen: HashMap::new(), corrected: false, read_corrected: false, repeat_at: repeat_at.max(2) }
+        Self { seen: HashMap::new(), corrected: false, read_corrected: false, repeat_at: repeat_at.max(2), runs: HashMap::new() }
     }
 
     /// Canonical signature of a call: arguments with object keys sorted (mechanical).
@@ -89,6 +121,22 @@ impl Detector {
     /// Record one executed tool call and its output: a read counts toward the correction only.
     pub fn observe_call(&mut self, tool: &str, args: &serde_json::Value, output: &str) -> Verdict {
         let signature = Self::signature(tool, args);
+        if tool == RUN {
+            let exact = self.observe(&signature, output);
+            if exact != Verdict::Fine {
+                return exact;
+            }
+            let base = base_command(args.get("command").and_then(serde_json::Value::as_str).unwrap_or(""));
+            if base.is_empty() {
+                return Verdict::Fine;
+            }
+            let count = self.runs.entry((base.clone(), ending(output))).or_insert(0);
+            *count += 1;
+            if *count == self.repeat_at {
+                return Verdict::Rerun(format!("`{}`", base.chars().take(300).collect::<String>()));
+            }
+            return Verdict::Fine;
+        }
         if tool != READ {
             return self.observe(&signature, output);
         }
@@ -136,6 +184,7 @@ impl Detector {
     /// New input from the user, or a new plan task, resets the detector.
     pub fn reset(&mut self) {
         self.seen.clear();
+        self.runs.clear();
         self.corrected = false;
         self.read_corrected = false;
     }
@@ -145,5 +194,6 @@ impl Detector {
     /// correction already given stands.
     pub fn changed(&mut self) {
         self.seen.clear();
+        self.runs.clear();
     }
 }

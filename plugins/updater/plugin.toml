@@ -23,7 +23,7 @@ publishes = ["update.changed"]
 uses = [
   "frame.plugins.list", "frame.plugins.install", "frame.plugins.install_many", "frame.plugins.bundled",
   "frame.update.status", "frame.update.stage", "frame.update.restart",
-  "source.release.status", "source.release.merge", "source.release.reset", "chatflow.running",
+  "source.release.status", "source.release.merge", "source.release.reset", "chatflow-coding.running",
 ]
 
 [backend.config]

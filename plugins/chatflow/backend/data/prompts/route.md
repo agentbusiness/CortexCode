@@ -7,6 +7,7 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 1. `work`: one sentence saying what the user wants and which code or behaviour it is about. Resolve "it", "that" and similar words from the conversation.
 2. `asks`: each thing the message asks for, one item each, in the message's words: a change, a fix, a question, something to find out, a plan. "Fix the export and add a CSV option" gives two. A message that describes several behaviours (rules, cases, errors, limits) gives one item per behaviour, not one for the whole. Empty for a greeting, thanks or small talk.
 3. `route`, the kind of request. Pick the first that fits:
+- MANAGE: the user wants background agents or their tasks changed: stopped, cancelled, restarted, retried, told something, taken over, or their work planned again.
 - STATUS: a question about the background agents, their tasks or the project board.
 - IMPLEMENT: a plan is open (shown above) and the user says to carry it out.
 - IDEATE: the user asks for options or approaches to choose from on an open design question (an architecture, an API, an algorithm, a strategy). Not for a question with one answer: that is LOOKUP.
@@ -23,4 +24,4 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 9. `teaches`: yes when the message states a lasting fact about this project (what a term means here, a rule it follows, how its environment behaves, what was tried) or asks to remember something; no for requests, questions and general knowledge.
 10. `files`: the repository paths the user's message or the conversation names. Empty when none is named: never guess a path.
 
-Examples: "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is IDEATE.
+Examples: "stop the agents, they are stuck" is MANAGE. "the export writes the columns in the wrong order, fix it" is DO. "how does the export pick its columns?" is LOOKUP. "plan how to add a cache, I want to review it first" is PLAN. "what are our options for caching the export?" is IDEATE.
