@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-typescript"
 name = "TypeScript"
-version = "0.1.4"
+version = "0.1.5"
 description = "Everything CortexCode knows about TypeScript and JavaScript: the code graph's facts of .ts/.tsx/.js files and package.json, typescript-language-server diagnostics, definition, references and hover, tsc / npm test / eslint verifiers and TypeScript skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

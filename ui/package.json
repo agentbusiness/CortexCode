@@ -1,7 +1,7 @@
 {
   "name": "cortexcode-ui",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "CortexCode window shell: the Electron shell the frame starts, the UI SDK and the build of every UI package",
   "type": "module",
   "main": "shell/main.js",

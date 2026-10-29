@@ -7,7 +7,7 @@
 [plugin]
 id = "vcs-git"
 name = "Git"
-version = "0.1.6"
+version = "0.1.7"
 description = "git status, diff with hunks, log, branches, per-hunk stage/unstage/revert, commit, merge with conflict report, shadow checkpoints that never touch the user's history, push and on-demand GitHub status; the GitHub connection (device sign-in or a token, kept in the Keychain or a private file), repositories, forks, pull requests and clones; the Git card section and Settings > GitHub."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
