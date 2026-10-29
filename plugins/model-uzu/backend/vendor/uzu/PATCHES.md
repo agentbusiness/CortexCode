@@ -133,3 +133,12 @@ MRoPE to 1-D (exact for text only). P7 adds what the language model side needs p
 
 The speculator (DFlash) keeps its own sequential positions; verification stays lossless after
 images, only the acceptance rate can change.
+
+## P8: no draft past the context's end
+
+`speculators/dflash_tfm.rs` `make_shape`: a DFlash draft block always takes `dflash_depth` positions
+(the block size, 16), whatever depth the tree is cut to, and `encode_draft` asserts they fit the
+draft model's RoPE capacity. uzu cut only the tree, so a generation that reached the last 16
+positions of the context panicked ("DFlash block positions exceed configured RoPE capacity") and the
+conversation was lost. With fewer positions left than a block, the stream decodes without drafting
+and ends at the context's end as a plain stream does.

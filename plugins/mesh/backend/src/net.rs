@@ -5,7 +5,7 @@
 //! closed at once. On `cortex/frame/1` every request is its own bidirectional stream carrying the
 //! frame's own envelopes ([`cc_protocol::envelope::Message`]): the requester writes one `Req`, the
 //! serving side answers with `Item`s and one `Res`, and a `Cancel` or a closed stream cancels the
-//! forwarded call. What a member may ask is fixed ([`lendable`]: the model); the serving side
+//! forwarded call. What a member may ask is fixed ([`lendable`]: the model and traces); the serving side
 //! forwards such a call to its own frame (`ctx.call_stream`) and nothing else.
 //!
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
@@ -42,10 +42,11 @@ pub const FRAME_ALPN: &[u8] = b"cortex/frame/1";
 /// How long a dial may take before the member counts as unreachable for now.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// What every member lends every other: its model. Everything else is private to the node, never
-/// forwarded (a member's window reaches this frame's projects through `mesh.window` instead).
+/// What every member lends every other: its model, and its traces (`system.trace.*`, `system.traces`:
+/// a trace only observes a process, it never changes one). Everything else is private to the node,
+/// never forwarded (a member's window reaches this frame's projects through `mesh.window` instead).
 pub fn lendable(method: &str) -> bool {
-    cc_protocol::contracts::category_of(method) == "model"
+    cc_protocol::contracts::category_of(method) == "model" || method == "system.traces" || method.starts_with("system.trace.")
 }
 
 // --- accepting ---------------------------------------------------------------------------------

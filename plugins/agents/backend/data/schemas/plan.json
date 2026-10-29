@@ -3,15 +3,16 @@
   "properties": {
     "tasks": {
       "type": "array",
+      "maxItems": 12,
       "items": {
         "type": "object",
         "properties": {
-          "title": {"type": "string"},
-          "brief": {"type": "string"},
-          "plan": {"type": "string"},
+          "title": {"type": "string", "maxLength": 120},
+          "brief": {"type": "string", "maxLength": 3000},
+          "plan": {"type": "string", "maxLength": 3000},
           "checks": {"type": "array", "items": {"enum": ["@verifiers"]}, "maxItems": 4},
-          "touches": {"type": "array", "items": {"type": "string"}},
-          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "touches": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 16},
+          "depends_on": {"type": "array", "items": {"type": "string", "maxLength": 120}, "maxItems": 12},
           "effort": {"enum": ["none", "low", "medium", "high", "xhigh"]}
         },
         "required": ["title", "brief", "plan", "checks", "touches", "depends_on", "effort"],

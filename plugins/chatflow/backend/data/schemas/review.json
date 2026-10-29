@@ -2,7 +2,8 @@
   "type": "object",
   "properties": {
     "found": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 1500
     },
     "replan": {
       "enum": [

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use uzu_engine::engine::language_model::stream::SamplingMethod;
 
 /// The uzu source this plugin embeds (vendor/uzu, see vendor/uzu/REVISION).
-pub const ENGINE_REVISION: &str = "uzu 0.6.7 (391abc29abb26f18aa812f6f02e8b023aed11364) + CortexCode patches P1-P7";
+pub const ENGINE_REVISION: &str = "uzu 0.6.7 (391abc29abb26f18aa812f6f02e8b023aed11364) + CortexCode patches P1-P8";
 /// Minimum context one conversation needs for an agent turn (config `min_context_per_slot`).
 pub const DEFAULT_MIN_CONTEXT_PER_SLOT: u64 = 32_768;
 /// Reasoning budget (tokens) per thinking effort when the caller names none: the model is made to

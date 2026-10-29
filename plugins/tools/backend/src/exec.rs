@@ -2633,6 +2633,8 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let repeats = stop_repeats(core, session_id, &effective_cwd, command).await;
     let sink = items.clone();
     core.tree.begin_run(&session.workspace, session_id);
+    // The CortexTerm on this Mac, if there is one, records what the command does.
+    let tracing = crate::trace::begin(host.clone(), core.shells.groups.clone(), session_id.to_owned(), command.to_owned());
     let result = core
         .shells
         .run(&identity, RunRequest { command, cwd, env: Vec::new(), toolchain, timeout }, cancel, move |chunk: &[u8]| {
@@ -2644,7 +2646,14 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     core.tree.end_run(&session.workspace, session_id);
     let run = match result {
         Ok(run) => run,
-        Err(error) => return Out::fail("shell_error", format!("could not run the command: {error}")),
+        Err(error) => {
+            tracing.abort();
+            return Out::fail("shell_error", format!("could not run the command: {error}"));
+        }
+    };
+    let traced = match tracing.await.ok().flatten() {
+        Some(recording) => crate::trace::finish(host.as_ref(), recording, run.duration_ms, &session.workspace).await,
+        None => None,
     };
     // EPERM names a path. A program file there could not start: macOS never lets a sandboxed
     // command start a program that takes more rights (setuid tools such as `ps` and `top`), whatever
@@ -2708,6 +2717,9 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             text,
             "[no Python venv for this workspace ({error}); python and pip are the system ones, and installs into them are refused]"
         );
+    }
+    if let Some(line) = &traced {
+        let _ = writeln!(text, "{line}");
     }
     let (ok, kind) = if run.timed_out {
         let _ = writeln!(text, "{}", timeout_line(timeout_ms, run.running.as_deref()));

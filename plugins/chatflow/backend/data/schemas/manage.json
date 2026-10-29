@@ -29,7 +29,8 @@
           "text"
         ],
         "additionalProperties": false
-      }
+      },
+      "maxItems": 12
     },
     "replan": {
       "enum": [
