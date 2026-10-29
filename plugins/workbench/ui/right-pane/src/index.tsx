@@ -2,7 +2,8 @@
  * workbench.rightPane@1 — the right pane host. Every plugin on a `pane.<name>@1` slot is a view
  * (code, terminal, markdown, board, browser, and any other dropped in); one is in front. A view
  * mounts the first time it is opened and stays mounted after, hidden, so a terminal or a browser
- * keeps its life while another view is in front. Props to each view: `{ active }`.
+ * keeps its life while another view is in front. Props to each view: `{ active }`. The pane is
+ * opened and closed from the band (Open pane / Close pane, next to the card's button).
  */
 
 import { useState } from 'react';
@@ -14,7 +15,6 @@ function RightPane() {
   const host = useHost();
   const views = paneViews(useUiPlugins());
   const [tab, setTab] = useShared<string>('pane.tab', 'code');
-  const [, setCollapsed] = useShared<boolean>('layout.paneCollapsed', false);
   const active = views.some((view) => view.name === tab) ? tab : views[0]?.name ?? '';
   const [visited, setVisited] = useState<string[]>(active ? [active] : []);
   if (active && !visited.includes(active)) setVisited([...visited, active]);
@@ -30,9 +30,6 @@ function RightPane() {
             </button>
           ))}
         </div>
-        <span className="grow" />
-        <button className="detent cx-pane-hide" type="button" data-action="collapse-pane" onClick={() => setCollapsed(true)}
-          title="Hide the right pane; the conversation takes the width. Open pane, next to the card's button, brings it back.">Hide pane</button>
       </div>
       <div className="cx-pane-body">
         {views.length === 0 && <p className="empty-line">No right-pane views are installed.</p>}

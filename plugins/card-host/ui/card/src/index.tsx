@@ -1,7 +1,7 @@
 /**
  * workbench.band@1 — the card host (card.host), at the right of the brand band. A toggle that says
- * the state of things while closed (+A −R · agents running) and, with the right
- * pane collapsed, Open pane next to it; and the card it opens, anchored under the band at the
+ * the state of things while closed (KV fill · agents running) and, next to it, Open pane or Close
+ * pane (the right pane's one switch); and the card it opens, anchored under the band at the
  * toggle's right edge: the header (`card.header@1`), then every section plugin (`card.git@1`,
  * `card.agents@1`, `card.tasks@1`, `card.board@1`, `card.index@1`, `card.model@1`, and any other
  * `card.<name>@1` dropped in; a section with nothing to say renders nothing), then the foot: the
@@ -9,7 +9,7 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { ComputerScope, definePlugin, useCodeTarget, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord, type VcsStatus } from '@cortex/sdk';
+import { ComputerScope, definePlugin, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord } from '@cortex/sdk';
 import { cardSections } from './sections';
 import './card.css';
 
@@ -27,14 +27,11 @@ function CardRoot() {
 function Card() {
   const host = useHost();
   const plugins = useUiPlugins();
-  const { projectId, project } = useSelection();
-  const { target } = useCodeTarget();
+  const { projectId } = useSelection();
   const [open, setOpen] = useShared<boolean>('card.open', false);
   const [settings, setSettings] = useShared<string | null>('settings.open', null);
   const [, setOverlay] = useShared<boolean>('overlay.open', false);
   const [collapsed, setCollapsed] = useShared<boolean>('layout.paneCollapsed', false);
-  const root = target?.root ?? project?.root ?? null;
-  const status = useQuery<VcsStatus>(root ? `vcs.status:${root}` : null, (c) => c.call<VcsStatus>('vcs.status', { root }), { topics: ['vcs.changed', 'tools.files_changed'] });
   const agents = useQuery<AgentRecord[]>(projectId ? `agents.list:${projectId}` : null, async (c) => (await c.call<{ agents: AgentRecord[] }>('agents.list', { project_id: projectId }))?.agents ?? [], { topics: ['agents.changed'] });
 
   const toggle = (next: boolean) => {
@@ -75,13 +72,14 @@ function Card() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, settings]);
 
+  const kv = useKv();
   const sessions = useSessions(projectId);
   const waiting = (sessions.data ?? []).filter((session) => session.status === 'waiting').length
     + (agents.data ?? []).filter((agent) => agent.status === 'blocked').length;
   const running = (agents.data ?? []).filter((agent) => ['working', 'running', 'blocked', 'verifying'].includes(agent.status)).length;
   const parts: string[] = [];
   if (waiting > 0) parts.push(`${waiting} need${waiting === 1 ? 's' : ''} you`);
-  if (status.data?.is_repo) parts.push(`+${status.data.added_lines} −${status.data.removed_lines}`);
+  if (kv) parts.push(`KV ${Math.round(kv.share)}%`);
   if (agents.data) parts.push(`${running} agent${running === 1 ? '' : 's'}`);
   const sections = cardSections(plugins);
 
@@ -92,10 +90,8 @@ function Card() {
           title={open ? 'Hide the card' : 'Open the card: git, agents, tasks, board, index, model, settings'} data-summary={parts.join(' · ')}>
           {parts.length ? parts.join(' · ') : 'Card'}
         </button>
-        {collapsed && (
-          <button type="button" className="detent cx-pane-open" data-action="open-pane" onClick={() => setCollapsed(false)}
-            title="Open the right pane again, at its last width and tab">Open pane</button>
-        )}
+        <button type="button" className="detent cx-pane-open" data-action={collapsed ? 'open-pane' : 'close-pane'} aria-pressed={!collapsed} onClick={() => setCollapsed(!collapsed)}
+          title={collapsed ? 'Open the right pane again, at its last width and tab' : 'Close the right pane; the conversation takes the width'}>{collapsed ? 'Open pane' : 'Close pane'}</button>
       </div>
       {/* Mounted from the start and only shown when open, so the sections are ready at once. */}
       {(
@@ -108,8 +104,8 @@ function Card() {
             <button type="button" className="cx-icon" onClick={() => openSettings()} data-action="settings" title="Settings: model, plugins, agents, machine…" aria-label="Settings">
               <Gear />
             </button>
-            <KvMeter open={open} />
-            <button type="button" className="detent" data-action="hide" onClick={() => toggle(false)}>Hide</button>
+            <KvMeter kv={kv} />
+            <button type="button" className="detent tiny" data-action="hide" onClick={() => toggle(false)}>Hide</button>
           </div>
         </div>
       )}
@@ -121,26 +117,31 @@ function Card() {
 
 interface Slots { slots: Array<{ busy: boolean; n_tokens: number }>; queued: number }
 
-/** How much of the model's KV pool the conversations hold, read every two seconds while the card is open. */
-function KvMeter({ open }: { open: boolean }) {
+interface Kv { used: number; total: number; share: number }
+
+/** How much of the model's KV pool the conversations hold, read every two seconds: the band's
+ * button says it, the card's foot draws it. */
+function useKv(): Kv | null {
   const { info } = useModelState();
   const slots = useQuery<Slots>('model.slots', (c) => c.call<Slots>('model.slots', {}));
   useEffect(() => {
-    if (!open) return;
-    void slots.refresh();
     const timer = setInterval(() => void slots.refresh(), 2000);
     return () => clearInterval(timer);
     // `refresh` is stable per key.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, []);
   const total = info.data?.ctx_total ?? 0;
-  if (!slots.data || total <= 0) return <span className="cx-kv-meter" />;
+  if (!slots.data || total <= 0) return null;
   const used = slots.data.slots.reduce((sum, slot) => sum + slot.n_tokens, 0);
-  const share = Math.min(100, (used / total) * 100);
+  return { used, total, share: Math.min(100, (used / total) * 100) };
+}
+
+function KvMeter({ kv }: { kv: Kv | null }) {
+  if (!kv) return <span className="cx-kv-meter" />;
   return (
-    <span className="cx-kv-meter" data-kv={Math.round(share)} title={`${used.toLocaleString()} of ${total.toLocaleString()} KV tokens in use`}>
-      <span className="cx-kv-bar"><span style={{ width: `${share}%` }} /></span>
-      <span className="ap faint">KV {Math.round(share)}%</span>
+    <span className="cx-kv-meter" data-kv={Math.round(kv.share)} title={`${kv.used.toLocaleString()} of ${kv.total.toLocaleString()} KV tokens in use`}>
+      <span className="cx-kv-bar"><span style={{ width: `${kv.share}%` }} /></span>
+      <span className="ap faint">KV {Math.round(kv.share)}%</span>
     </span>
   );
 }

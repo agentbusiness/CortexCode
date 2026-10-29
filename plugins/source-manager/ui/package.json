@@ -10,7 +10,6 @@
   "workspaces": [
     "settings-history",
     "settings-backup",
-    "settings-share",
     "settings-storage"
   ]
 }

@@ -155,7 +155,7 @@ skills_per_turn = 3
 # turn's skills.
 skills_in_prefix = true
 # A user message whose text is longer than this (characters) becomes the session's spec when the
-# session has none yet. 0 = only when the user marks it or the router asks for one. Off: a long
+# session has none yet. 0 = only when the router judges the message a spec. Off: a long
 # message is often a pasted log or stack trace, not a list of requirements.
 spec_min_chars = 0
 # Spec text pinned whole at most (characters): pasted text beyond it is referenced by its path.

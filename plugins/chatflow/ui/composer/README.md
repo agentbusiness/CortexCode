@@ -2,8 +2,7 @@
 
 Where text is written: new turns, steering, follow-ups, agents; mode and stop; attachments
 (paste a screenshot, drop or pick files and folders; chips with previews, removable before sending;
-limits: 20 MB per stored file, 20 attachments per message); Spec, which keeps a new turn's message as
-the conversation's spec (`spec: true` on `chatflow.turn`); mentions, `@<project>` and
+limits: 20 MB per stored file, 20 attachments per message); mentions, `@<project>` and
 `@<project>:<symbol>` completed from `memory.project.list` and `memory.search` (scoped to that
 project) and sent as `mentions` with every message, `chatflow.turn`, `chatflow.steer` and
 `agents.steer` (the chat flow opens each project read-only and names it to the run).

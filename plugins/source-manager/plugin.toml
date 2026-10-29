@@ -37,12 +37,6 @@ dir = "ui/settings-backup"
 id = "source-manager.settings-backup"
 slot = "settings.backup@1"
 
-# Settings > Share improvements with CortexCode.
-[[ui.package]]
-dir = "ui/settings-share"
-id = "source-manager.settings-share"
-slot = "settings.share@1"
-
 # Settings > Storage.
 [[ui.package]]
 dir = "ui/settings-storage"

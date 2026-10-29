@@ -1,5 +1,4 @@
 /* settings.backup@1 — the design's settings rows (.row, .nm, .sw, .detent come from the theme). */
-#cc .cx-backup{max-width:72ch;}
 #cc .cx-backup .row .grow{min-width:0;}
 #cc .cx-backup .sw:disabled{cursor:default;border-color:var(--rule);}
 #cc .cx-backup-note{font-family:var(--font-reading);font-size:13.5px;line-height:1.45;color:var(--ink-3);margin-top:4px;overflow-wrap:anywhere;}

@@ -4,4 +4,3 @@
 /* The eye centres the name on its lowercase body, 1.3px below its capitals' middle at 15px: the
    folder sits that much lower so it looks centred on the name. */
 #cc .cx-card-root{flex:1;min-width:0;text-transform:none;letter-spacing:.04em;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left;position:relative;top:1.5px;}
-#cc .cx-card-menu{flex:0 0 auto;}

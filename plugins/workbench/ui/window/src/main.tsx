@@ -119,6 +119,7 @@ const shell: ShellBridge | null = shellApi
   ? {
       pickFolder: (title) => shellApi.pickFolder(title),
       pickFile: (title) => shellApi.pickFile(title),
+      ...(shellApi.pickPaths ? { pickPaths: (title?: string) => shellApi.pickPaths!(title) } : {}),
       reveal: (file) => shellApi.reveal(file),
       setBrowserBounds: (bounds) => shellApi.setBrowserBounds(bounds),
       pathForFile: (file) => shellApi.pathForFile?.(file) ?? '',

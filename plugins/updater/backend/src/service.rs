@@ -25,7 +25,7 @@ use cc_protocol::contracts::source::{
     ReleaseMergeParams, ReleaseResetParams, ReleaseResetResult, ReleaseStatus, ReleaseStatusParams, UpdateResult, methods as source_methods,
 };
 use cc_protocol::contracts::update::{
-    Applied, DecideParams, DismissParams, Failed, FrameUpdate, Pending, ResetItem, ResetPlan, ResetResult, RoundItem, Status, choices, methods,
+    Applied, DecideParams, DismissParams, Failed, FrameUpdate, Pending, ResetItem, ResetParams, ResetPlan, ResetResult, RoundItem, Status, choices, methods,
     reset_actions, reset_sources, topics,
 };
 use cc_protocol::release::{self, Asset, Catalog, PluginEntry};
@@ -290,7 +290,10 @@ impl Updater {
                 to_value(&self.status())
             }
             methods::RESET_PLAN => to_value(&self.reset_plan().await?),
-            methods::RESET => to_value(&self.reset().await?),
+            methods::RESET => {
+                let params: ResetParams = if params.is_null() { ResetParams::default() } else { parse_params(params)? };
+                to_value(&self.reset(&params.plugins).await?)
+            }
             other => Err(RpcError::unknown_method(other)),
         }
     }
@@ -394,10 +397,10 @@ impl Updater {
         Ok(ResetPlan { plugins: items.into_iter().map(|(item, _)| item).collect(), running: self.run_going(&ctx).await, offline })
     }
 
-    /// Every plugin back to its official release, or to the app's own package when the releases
-    /// cannot be read. Refused while a run is going (the install would cut it off) or while a
-    /// check runs.
-    pub async fn reset(self: &Arc<Self>) -> Result<ResetResult, RpcError> {
+    /// The named plugins (none named: every plugin) back to their official release, or to the
+    /// app's own package when the releases cannot be read. Refused while a run is going (the
+    /// install would cut it off) or while a check runs.
+    pub async fn reset(self: &Arc<Self>, only: &[String]) -> Result<ResetResult, RpcError> {
         let ctx = self.ctx.get().cloned().ok_or_else(|| RpcError::internal("not connected to the frame yet"))?;
         if self.run_going(&ctx).await {
             return Err(RpcError::invalid_params("A conversation is running and the reset would cut it off. Wait for it to end, then reset again."));
@@ -405,7 +408,7 @@ impl Updater {
         if self.checking.swap(true, Ordering::SeqCst) {
             return Err(RpcError::invalid_params("An update check is running. Try again in a moment."));
         }
-        let outcome = self.reset_all().await;
+        let outcome = self.reset_all(only).await;
         self.with_status(|status| {
             status.state = "idle".into();
             status.detail = String::new();
@@ -416,9 +419,12 @@ impl Updater {
         outcome
     }
 
-    async fn reset_all(&self) -> Result<ResetResult, RpcError> {
+    async fn reset_all(&self, only: &[String]) -> Result<ResetResult, RpcError> {
         let (ctx, client, catalog, _, bundled, platform, running_frame) = self.reset_sources(true).await?;
-        let items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
+        let mut items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
+        if !only.is_empty() {
+            items.retain(|(item, _)| only.contains(&item.plugin));
+        }
         self.round_open.store(false, Ordering::SeqCst);
         self.enter_round(
             items

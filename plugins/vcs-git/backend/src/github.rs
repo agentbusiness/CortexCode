@@ -273,7 +273,7 @@ impl Github {
             method: settings.method,
             scopes: settings.scopes,
             device_available: !lock(&self.client_id).is_empty(),
-            dev_folder: settings.dev_folder,
+            dev_folder: self.dev_folder().map(|folder| folder.to_string_lossy().into_owned()),
             error: None,
         }
     }
@@ -282,8 +282,15 @@ impl Github {
         GithubStatus { error: Some(error.to_owned()), ..self.status() }
     }
 
+    /// The folder new clones go into: the one chosen, else `~/DEV`; created when missing.
     pub fn dev_folder(&self) -> Option<PathBuf> {
-        self.settings.get().dev_folder.as_ref().map(PathBuf::from)
+        let folder = self.settings.get().dev_folder.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("DEV")))?;
+        if !folder.is_dir()
+            && let Err(error) = std::fs::create_dir_all(&folder)
+        {
+            tracing::warn!(folder = %folder.display(), %error, "cannot create the dev folder");
+        }
+        Some(folder)
     }
 
     /// Read the account and dev folder from the store (or once from the file they were kept in).

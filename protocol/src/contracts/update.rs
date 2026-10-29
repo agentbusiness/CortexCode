@@ -20,9 +20,9 @@ pub mod methods {
     pub const DISMISS: &str = "update.dismiss";
     /// `{}` -> [`super::ResetPlan`]. What a reset of every plugin to its official release would do.
     pub const RESET_PLAN: &str = "update.reset_plan";
-    /// `{}` -> [`super::ResetResult`]. Put every plugin back to its official release: the user's
-    /// edits to its data in the live folder are dropped and the release package installed. Refused
-    /// while a run is going.
+    /// [`super::ResetParams`] -> [`super::ResetResult`]. Put the named plugins (none named: every
+    /// plugin) back to their official release: the user's edits to their data in the live folder
+    /// are dropped and the release package installed. Refused while a run is going.
     pub const RESET: &str = "update.reset";
 }
 
@@ -212,6 +212,13 @@ pub struct ResetItem {
     pub files: Vec<String>,
     /// One of [`reset_actions`].
     pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResetParams {
+    /// The plugins to reset; empty: every plugin.
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -4,9 +4,10 @@
 //! person's set of nodes: a signed membership log every member holds. Members connect to each other
 //! (direct on a LAN, hole-punched or relayed elsewhere) and exchange capability cards. A project
 //! lives on its own computer, and every member's window can work in it there (`mesh.link`). Every
-//! member lends its model to every other, through the frame's own `model` contract, forwarded; a
+//! member lends its model to every other unless its person turns that off (`mesh.lend`), through
+//! the frame's own `model` contract, forwarded; a
 //! request names the work it is for (a tag, `coding`), and only a model tagged for that work takes
-//! it. Nothing to configure: one invitation joins a computer, Remove takes it out; what runs where
+//! it. One invitation joins a computer, Remove takes it out; what runs where
 //! is decided from the cards.
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,10 @@ pub mod methods {
     pub const CLAIM: &str = "mesh.claim";
     /// [`super::ClaimParams`] -> `{}`: the use is over; the resource is free for the next run.
     pub const RELEASE: &str = "mesh.release";
+    /// [`super::LendParams`] -> [`super::MeshStatus`]: whether members may use this computer's
+    /// model (off: its card shows no model and its claims are refused); this computer still uses
+    /// theirs.
+    pub const LEND: &str = "mesh.lend";
 }
 
 pub mod topics {
@@ -266,6 +271,18 @@ pub struct MeshStatus {
     /// Sessions whose model calls run on a member now.
     #[serde(default)]
     pub placed: Vec<Placed>,
+    /// Members may use this computer's model (`mesh.lend`).
+    #[serde(default = "lends_by_default")]
+    pub lend: bool,
+}
+
+fn lends_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LendParams {
+    pub lend: bool,
 }
 
 /// A network: the computers joined together, named by the computer that started it.

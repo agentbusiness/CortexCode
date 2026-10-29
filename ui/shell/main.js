@@ -160,6 +160,15 @@ async function start() {
     fs.writeFileSync(file, bytes);
     return { path: file };
   });
+  // Files and folders in one dialog (attachments): every chosen path, none when cancelled.
+  ipcMain.handle('cortex:pick-paths', async (event, title) => {
+    if (!fromWorkbench(event)) return [];
+    const result = await dialog.showOpenDialog(window, {
+      title: typeof title === 'string' && title ? title : 'Attach files or folders',
+      properties: ['openFile', 'openDirectory', 'multiSelections'],
+    });
+    return result.canceled ? [] : result.filePaths;
+  });
   ipcMain.handle('cortex:pick-file', async (event, title) => {
     if (!fromWorkbench(event)) return null;
     const result = await dialog.showOpenDialog(window, { title: typeof title === 'string' ? title : 'Choose a file', properties: ['openFile'] });

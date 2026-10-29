@@ -66,9 +66,12 @@
 #cc .cx-sidebar .cx-notice-tag{white-space:nowrap;}
 #cc .cx-strip-mark.cx-notice{box-shadow:inset 0 0 0 1px var(--rubric);}
 
-/* the open sidebar's foot: Fold, which leaves the strip */
-#cc .cx-sidebar-foot{flex:0 0 auto;display:flex;align-items:center;padding:8px 16px 8px 0;border-top:1px solid var(--rule);}
-#cc .cx-sidebar-fold{display:inline-flex;align-items:center;gap:8px;}
+/* the open sidebar's foot: Fold (its caret alone, at the right), which leaves the strip. Level
+   with the composer's buttons: their foot is the conversation's 12px, the box's 1px rule and the
+   tools' 8px above the window's bottom. */
+#cc .cx-sidebar-foot{flex:0 0 auto;display:flex;align-items:center;justify-content:flex-end;padding:8px 16px 21px 0;}
+#cc .cx-sidebar-fold{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;}
+#cc .cx-sidebar-fold,#cc .cx-sidebar-fold:hover{border-color:transparent;}
 #cc .cx-sidebar-fold svg{width:8px;height:8px;}
 /* folded: a 44px rail — New chat, then per project (a hairline apart) one 32px mark per
    conversation and agent: a short code with its state as a dot in the corner; Show at the foot,

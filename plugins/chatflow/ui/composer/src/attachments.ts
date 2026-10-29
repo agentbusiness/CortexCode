@@ -81,6 +81,8 @@ export interface PutParams {
 /** What the Electron shell offers for attachments (each member absent in older shells). */
 export interface AttachShell {
   pickFolder(title?: string): Promise<string | null>;
+  /** Files and folders in one dialog (absent in older shells). */
+  pickPaths?(title?: string): Promise<string[]>;
   pathForFile?(file: File): string;
   saveAttachment?(bytes: Uint8Array, name: string): Promise<{ path?: string; error?: string }>;
 }

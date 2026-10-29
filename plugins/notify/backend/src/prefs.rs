@@ -30,8 +30,8 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: kinds::JOB, label: "Long job ended", description: "A background job that ran a while finished or failed.", default: true },
     KindInfo { kind: kinds::SWAP_FAILED, label: "Plugin swap failed", description: "A hot-swap failed or was rolled back.", default: true },
     KindInfo { kind: kinds::REPORT, label: "Report ready", description: "A report announced its result.", default: true },
-    KindInfo { kind: kinds::SPAWNED, label: "Agent started", description: "An agent was started on a task.", default: false },
-    KindInfo { kind: kinds::CANCELLED, label: "Run cancelled", description: "A run was cancelled or an agent was stopped.", default: false },
+    KindInfo { kind: kinds::SPAWNED, label: "Agent started", description: "An agent was started on a task.", default: true },
+    KindInfo { kind: kinds::CANCELLED, label: "Run cancelled", description: "A run was cancelled or an agent was stopped.", default: true },
     KindInfo { kind: kinds::INFO, label: "Other notices", description: "Anything else a plugin posts.", default: true },
 ];
 
