@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ComputerScope, Cross, Divider, HostContext, useShared, useThemeData, type Host, type ShellBridge, type SlotListProps, type SlotRenderProps } from '@cortex/sdk';
 import { SlotHost } from './SlotHost';
 import { Splash } from './Splash';
-import { WorkbenchContext, importPlugin, linkStyle, type WorkbenchServices } from './context';
+import { WorkbenchContext, importPlugin, linkStyle, missingSdk, type WorkbenchServices } from './context';
 import type { PluginRegistry } from './registry';
 import type { SwapRecord } from './engine';
 
@@ -54,10 +54,14 @@ export function Workbench({ registry, shell }: { registry: PluginRegistry; shell
     else if (record.outcome === 'rejected') {
       console.error(`UI plugin for ${record.slot} rejected: ${record.reason ?? ''}`);
       notify(`Kept the running ${slotLabel(record.slot)}: the new build failed (${record.reason ?? 'no reason given'})`);
+    } else if (record.outcome === 'waiting') {
+      // Not a failure: the window that brings the names reloads the page, and the build mounts then.
+      console.info(`UI plugin for ${record.slot} waits for the workbench update: ${record.reason ?? ''}`);
+      notify(`The new ${slotLabel(record.slot)} waits for the workbench update`);
     }
   }, [notify]);
 
-  const services = useMemo<WorkbenchServices>(() => ({ registry, loadModule: importPlugin, loadStyle: linkStyle, onSwap }), [registry, onSwap]);
+  const services = useMemo<WorkbenchServices>(() => ({ registry, loadModule: importPlugin, loadStyle: linkStyle, missingSdk, onSwap }), [registry, onSwap]);
 
   const host = useMemo<Host>(() => ({
     Slot: (props: SlotRenderProps) => <BoundSlot registry={registry} {...props} />,

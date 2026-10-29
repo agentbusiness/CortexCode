@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 #include "llama-ext.h"  // staging API: the MTP head's hidden-state rows (llama_set_embeddings_nextn)
+#include "mtmd.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -176,6 +178,139 @@ int32_t bn_decode_embd(void * ctx, const int32_t * tokens, const float * embd, i
     int32_t status = llama_decode(static_cast<llama_context *>(ctx), batch);
     llama_batch_free(batch);
     return status;
+}
+
+// An image's rows: `n` embeddings of `n_embd` floats with their positions, `pos4` holding (t, x, y,
+// z) per row (absolute). `mrope` 1: the model reads four positions per row (Qwen's M-RoPE), else t.
+int32_t bn_decode_image(void * ctx, const float * embd, int32_t n, int32_t n_embd, const int32_t * pos4, int32_t mrope, int32_t seq) {
+    const int32_t per_row = mrope ? 4 : 1;
+    std::vector<llama_pos> pos((size_t) n * per_row);
+    for (int32_t i = 0; i < n; i++) {
+        // Planar, one section after another: t, y, x, z (mtmd-helper's set_position_mrope_2d).
+        pos[i] = pos4[i * 4];
+        if (mrope) {
+            pos[i + n] = pos4[i * 4 + 2];
+            pos[i + n * 2] = pos4[i * 4 + 1];
+            pos[i + n * 3] = pos4[i * 4 + 3];
+        }
+    }
+    std::vector<int32_t> n_seq_id(n, 1);
+    llama_seq_id seq_id = seq;
+    std::vector<llama_seq_id *> seq_ids(n + 1, &seq_id);
+    seq_ids[n] = nullptr;
+    std::vector<int8_t> logits(n, 0);
+    llama_batch batch = {
+        /*n_tokens =*/ n,
+        /*token    =*/ nullptr,
+        /*embd     =*/ const_cast<float *>(embd),
+        /*pos      =*/ pos.data(),
+        /*n_seq_id =*/ n_seq_id.data(),
+        /*seq_id   =*/ seq_ids.data(),
+        /*logits   =*/ logits.data(),
+    };
+    (void) n_embd;
+    return llama_decode(static_cast<llama_context *>(ctx), batch);
+}
+
+// Floats per input embedding row (what an image row must have).
+int32_t bn_model_n_embd_inp(const void * model) {
+    return llama_model_n_embd_inp(static_cast<const llama_model *>(model));
+}
+
+// ---- images (mtmd) ------------------------------------------------------------------------------
+
+// The vision projector for `model`; `max_tokens` caps an image's tokens (larger images are
+// downscaled), `use_gpu` 0 runs the encoder on the CPU.
+void * bn_vision_load(const char * path, const void * model, int32_t use_gpu, int32_t threads, int32_t max_tokens, char * error, size_t error_len) {
+    mtmd_log_set(log_callback, nullptr);
+    auto params = mtmd_context_params_default();
+    params.use_gpu = use_gpu != 0;
+    params.print_timings = false;
+    params.warmup = false;
+    if (threads > 0) {
+        params.n_threads = threads;
+    }
+    if (max_tokens > 0) {
+        params.image_max_tokens = max_tokens;
+    }
+    mtmd_context * ctx = mtmd_init_from_file(path, static_cast<const llama_model *>(model), params);
+    if (!ctx) {
+        set_error(error, error_len, std::string("llama.cpp could not load the vision projector ") + path + " (see the plugin log)");
+    } else if (!mtmd_support_vision(ctx)) {
+        mtmd_free(ctx);
+        ctx = nullptr;
+        set_error(error, error_len, std::string(path) + " has no vision encoder");
+    }
+    return ctx;
+}
+
+void bn_vision_free(void * vision) {
+    mtmd_free(static_cast<mtmd_context *>(vision));
+}
+
+int32_t bn_vision_mrope(const void * vision) {
+    return mtmd_decode_use_mrope(static_cast<const mtmd_context *>(vision)) ? 1 : 0;
+}
+
+// Preprocess an RGB image (`nx` × `ny`, 3 bytes per pixel) into its chunk: returns the chunk (free
+// it with bn_vision_chunk_free) and its token and position counts.
+void * bn_vision_prepare(void * vision, const uint8_t * rgb, uint32_t nx, uint32_t ny, int32_t * n_tokens, int32_t * n_pos, char * error, size_t error_len) {
+    auto * ctx = static_cast<mtmd_context *>(vision);
+    mtmd_bitmap * bitmap = mtmd_bitmap_init(nx, ny, rgb);
+    if (!bitmap) {
+        set_error(error, error_len, "could not take the image");
+        return nullptr;
+    }
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const char * marker = mtmd_default_marker();
+    mtmd_input_text text = {marker, strlen(marker), false, true};
+    const mtmd_bitmap * bitmaps[] = {bitmap};
+    int32_t status = mtmd_tokenize(ctx, chunks, &text, bitmaps, 1);
+    mtmd_input_chunk * image = nullptr;
+    if (status == 0) {
+        for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
+            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+            if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                image = mtmd_input_chunk_copy(chunk);
+                break;
+            }
+        }
+    }
+    mtmd_input_chunks_free(chunks);
+    mtmd_bitmap_free(bitmap);
+    if (!image) {
+        set_error(error, error_len, status == 2 ? "the image could not be preprocessed" : "the image gave no image tokens");
+        return nullptr;
+    }
+    *n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(image);
+    *n_pos = mtmd_input_chunk_get_n_pos(image);
+    return image;
+}
+
+// Each row's position relative to the image's first (t, x, y, z per row).
+void bn_vision_positions(const void * chunk, int32_t * out) {
+    const auto * image = mtmd_input_chunk_get_tokens_image(static_cast<const mtmd_input_chunk *>(chunk));
+    size_t n = mtmd_image_tokens_get_n_tokens(image);
+    for (size_t i = 0; i < n; i++) {
+        mtmd_decoder_pos pos = mtmd_image_tokens_get_decoder_pos(image, 0, i);
+        out[i * 4] = (int32_t) pos.t;
+        out[i * 4 + 1] = (int32_t) pos.x;
+        out[i * 4 + 2] = (int32_t) pos.y;
+        out[i * 4 + 3] = (int32_t) pos.z;
+    }
+}
+
+// Run the encoder on a chunk; its embeddings are then at bn_vision_embd (n_tokens × n_embd_inp).
+int32_t bn_vision_encode(void * vision, const void * chunk) {
+    return mtmd_encode_chunk(static_cast<mtmd_context *>(vision), static_cast<const mtmd_input_chunk *>(chunk));
+}
+
+const float * bn_vision_embd(void * vision) {
+    return mtmd_get_output_embd(static_cast<mtmd_context *>(vision));
+}
+
+void bn_vision_chunk_free(void * chunk) {
+    mtmd_input_chunk_free(static_cast<mtmd_input_chunk *>(chunk));
 }
 
 // The logits of the last token that requested them (n_vocab floats).

@@ -38,9 +38,9 @@ pub const MAX_TOTAL_BYTES: u64 = 12_000_000_000;
 /// and 168 MiB on the CPU at a 1024-token micro-batch; they scale with it, and the plan uses 256)
 /// plus headroom.
 pub const COMPUTE_RESERVE: u64 = GIB / 2;
-/// Sequences kept for shared leading blocks. None until shared blocks are served (a sequence holds
-/// a recurrent state whether used or not).
-pub const SEEDS: u64 = 0;
+/// Sequences kept for shared leading blocks (a sequence holds a recurrent state whether used or
+/// not). One: the open project's chat block; others come back from disk in a fraction of a second.
+pub const SEEDS: u64 = 1;
 /// The most the shared pool takes: 131,072 tokens of 8-bit KV (4.25 GiB on the 27B). Under
 /// [`MAX_TOTAL_BYTES`] it gets what the rest leaves (PQ2_0: about 80k tokens);
 /// any resident conversation may use all of it.
@@ -178,9 +178,11 @@ pub struct Plan {
 }
 
 /// Resident conversations and checkpoints each, most preferred first: the chat, an agent and a
-/// spare; two checkpoints cover a call's reuse points (the history before the last message, the
-/// end of the prompt).
-const SHAPES: &[(u64, u64)] = &[(3, 2), (2, 2), (1, 2)];
+/// spare. A call makes three reuse points (the end of the leading system block, the history before
+/// the last message, the end of the prompt); with two kept, the leading block's was dropped within
+/// a turn and the next turn read the whole prompt again. Four keep it and a spare; fewer
+/// conversations come before fewer checkpoints, and two only where nothing else fits.
+const SHAPES: &[(u64, u64)] = &[(3, 4), (2, 4), (1, 4), (1, 3), (1, 2)];
 
 fn plan_for(geometry: &Geometry, budget: u64, kv: KvType, resident: u64, checkpoints: u64) -> Option<Plan> {
     let sequences = resident + SEEDS;
@@ -209,8 +211,9 @@ fn plan_for(geometry: &Geometry, budget: u64, kv: KvType, resident: u64, checkpo
 
 /// The plan, within the machine's budget and [`MAX_TOTAL_BYTES`]: the first shape whose pool
 /// reaches [`TARGET_POOL_TOKENS`] (or the native context, when smaller); on a machine without room
-/// for that, the first shape that gives one conversation `min_context` tokens. None: this machine
-/// cannot hold the model with `min_context`.
+/// for that, of the shapes that give one conversation `min_context` tokens the one with the most
+/// checkpoints and then the largest pool (a 16 GB Mac: one conversation with a large pool, not two
+/// in a small one). None: this machine cannot hold the model with `min_context`.
 pub fn fit(geometry: &Geometry, budget: &Budget, min_context: u64) -> Option<Plan> {
     let usable = budget.usable().min(MAX_TOTAL_BYTES);
     let target = TARGET_POOL_TOKENS.min(geometry.native_context);
@@ -219,5 +222,5 @@ pub fn fit(geometry: &Geometry, budget: &Budget, min_context: u64) -> Option<Pla
         return Some(plan);
     }
     let floor = min_context.min(geometry.native_context);
-    plans().find(|plan| plan.ctx_total >= floor)
+    plans().filter(|plan| plan.ctx_total >= floor).max_by_key(|plan| (plan.checkpoints, plan.ctx_total))
 }

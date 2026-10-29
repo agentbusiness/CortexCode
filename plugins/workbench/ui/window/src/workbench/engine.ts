@@ -6,6 +6,8 @@
  * without error; then the old version unmounts. A version that fails to load, fails to render
  * hidden, or never becomes ready is rejected and the running version stays. A version that fails
  * after the flip is rejected too, and the last version that ran well is mounted again in its place.
+ * A version that imports SDK names this page's SDK lacks is neither loaded nor rejected: it waits
+ * for the window that brings them (a new window reloads the page), and the running version stays.
  *
  * The engine holds no plugin state: whatever a slot must keep across versions lives in the
  * workbench's durable store, which every version reads.
@@ -16,6 +18,7 @@ import type { SlotProps, UiPlugin, UiPluginDefinition } from '@cortex/sdk';
 
 export type Loader = (plugin: UiPlugin) => Promise<UiPluginDefinition>;
 export type StyleLoader = (plugin: UiPlugin, key: string) => Promise<() => void>;
+export type SdkCheck = (plugin: UiPlugin) => Promise<string[]>;
 
 export interface Instance {
   key: string;
@@ -30,7 +33,7 @@ export interface SwapRecord {
   slot: string;
   from: string | null;
   to: string;
-  outcome: 'swapped' | 'rejected' | 'rolled_back';
+  outcome: 'swapped' | 'rejected' | 'rolled_back' | 'waiting';
   reason?: string;
 }
 
@@ -45,12 +48,17 @@ export class SlotEngine {
   /** The active version failed and nothing older can replace it. */
   broken: { instance: Instance; reason: string } | null = null;
   readonly rejected = new Set<string>();
+  /** The wanted version needs SDK names this page lacks; it mounts after the window updates. */
+  waiting: { plugin: UiPlugin; missing: string[] } | null = null;
+  /** Why each rejected version was rejected, by its hash. */
+  readonly reasons = new Map<string, string>();
   readonly history: SwapRecord[] = [];
   /** Versions that ran well, newest last (candidates for a rollback). */
   private good: Array<{ plugin: UiPlugin; component: ComponentType<SlotProps> }> = [];
   private readonly listeners = new Set<Listener>();
   private readonly load: Loader;
   private readonly loadStyle: StyleLoader;
+  private readonly missingSdk: SdkCheck;
   private desired: UiPlugin | null = null;
   private counter = 0;
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,10 +67,11 @@ export class SlotEngine {
   private loadGeneration = 0;
   onRecord: ((record: SwapRecord) => void) | null = null;
 
-  constructor(slot: string, load: Loader, loadStyle: StyleLoader) {
+  constructor(slot: string, load: Loader, loadStyle: StyleLoader, missingSdk: SdkCheck) {
     this.slot = slot;
     this.load = load;
     this.loadStyle = loadStyle;
+    this.missingSdk = missingSdk;
   }
 
   subscribe(listener: Listener): () => void {
@@ -83,6 +92,7 @@ export class SlotEngine {
     if (plugin.hash === this.active?.plugin.hash && !this.broken) return;
     if (plugin.hash === this.staging?.plugin.hash) return;
     if (plugin.hash === this.loading) return;
+    if (plugin.hash === this.waiting?.plugin.hash) return;
     if (this.rejected.has(plugin.hash)) return;
     void this.stage(plugin);
   }
@@ -144,10 +154,21 @@ export class SlotEngine {
     const broken = this.broken;
     if (!broken) return;
     this.rejected.delete(broken.instance.plugin.hash);
+    this.reasons.delete(broken.instance.plugin.hash);
     this.broken = null;
     this.active = null;
     broken.instance.dropStyle();
     void this.stage(broken.instance.plugin);
+    this.emit();
+  }
+
+  /** Load the wanted version again after it was rejected (the failure card's button). */
+  retryRejected(): void {
+    const desired = this.desired;
+    if (!desired || !this.rejected.has(desired.hash)) return;
+    this.rejected.delete(desired.hash);
+    this.reasons.delete(desired.hash);
+    void this.stage(desired);
     this.emit();
   }
 
@@ -166,6 +187,10 @@ export class SlotEngine {
     this.loadGeneration++;
     this.loading = null;
     this.desired = null;
+    if (this.waiting) {
+      this.waiting = null;
+      this.emit();
+    }
     if (!this.active && !this.staging && !this.broken) return;
     this.clearTimer();
     this.active?.dropStyle();
@@ -190,6 +215,20 @@ export class SlotEngine {
   private async stage(plugin: UiPlugin): Promise<void> {
     const generation = ++this.loadGeneration;
     this.loading = plugin.hash;
+    if (this.waiting) {
+      this.waiting = null;
+      this.emit();
+    }
+    // An unreadable manifest is no verdict: the import below then says what is wrong.
+    const missing = await this.missingSdk(plugin).catch(() => [] as string[]);
+    if (generation !== this.loadGeneration || this.disposed) return;
+    if (missing.length > 0) {
+      this.loading = null;
+      this.waiting = { plugin, missing };
+      this.record({ from: this.active?.plugin.hash ?? null, to: plugin.hash, outcome: 'waiting', reason: `needs ${missing.join(', ')} from a newer workbench` });
+      this.emit();
+      return;
+    }
     let definition: UiPluginDefinition;
     try {
       definition = await this.load(plugin);
@@ -258,6 +297,7 @@ export class SlotEngine {
 
   private record(partial: Omit<SwapRecord, 'at' | 'slot'>): void {
     const record: SwapRecord = { at: Date.now(), slot: this.slot, ...partial };
+    if (partial.outcome === 'rejected') this.reasons.set(partial.to, partial.reason ?? 'no reason given');
     this.history.push(record);
     this.onRecord?.(record);
   }

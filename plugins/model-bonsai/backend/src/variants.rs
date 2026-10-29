@@ -368,10 +368,44 @@ pub async fn install_from(
     cache: &VerifyCache,
     on_progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<PathBuf, String> {
+    install_files(base, spec, spec.files, models_dir, cache, on_progress).await
+}
+
+/// Make the variant's vision projector present and verified (its own download, beside the model).
+pub async fn install_vision(
+    spec: &'static Spec,
+    models_dir: &Path,
+    cache: &VerifyCache,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<PathBuf, String> {
+    let Some(mmproj) = spec.mmproj else { return Err(format!("`{}` has no vision projector", spec.id)) };
+    install_files(HUGGING_FACE, spec, std::slice::from_ref(mmproj), models_dir, cache, on_progress).await?;
+    Ok(spec.local_dir(models_dir).join(mmproj.path))
+}
+
+/// The variant's vision projector, when it is installed and verified (by record, no hashing).
+pub fn vision_installed(spec: &Spec, models_dir: &Path) -> Result<PathBuf, String> {
+    let mmproj = spec.mmproj.ok_or("this model has no vision projector")?;
+    let path = spec.local_dir(models_dir).join(mmproj.path);
+    if VerifyCache::new(models_dir).recorded(&path).as_deref() == Some(expected_digest(mmproj).as_str()) {
+        Ok(path)
+    } else {
+        Err(format!("the vision projector is not installed yet ({}, {:.2} GB; it downloads with the model)", mmproj.path, mmproj.bytes as f64 / 1e9))
+    }
+}
+
+async fn install_files(
+    base: &str,
+    spec: &'static Spec,
+    files: &'static [FileSpec],
+    models_dir: &Path,
+    cache: &VerifyCache,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<PathBuf, String> {
     let dir = spec.local_dir(models_dir);
-    let total = spec.total_bytes();
+    let total: u64 = files.iter().map(|file| file.bytes).sum();
     let mut before = 0u64;
-    for file in spec.files {
+    for file in files {
         let target = dir.join(file.path);
         let report = |phase: &str, done: u64, detail: String| {
             on_progress(Progress {

@@ -12,7 +12,16 @@
 //!   rendering the request (the end of the leading system block, the end of the history before the
 //!   last message) and before the last prompt token, and keeps a checkpoint there (at most the
 //!   fitted number per conversation, least recently used dropped first). A caller that ends every
-//!   call with a per-call message so resumes each call at the history the calls share.
+//!   call with a per-call message so resumes each call at the history the calls share. The
+//!   shortest checkpoint (the end of the leading system block) is never the one evicted: a later
+//!   turn's prompt differs after the history, so it is the point every next call can resume from.
+//! - **Shared leading blocks.** Conversations of one project start with the same system block
+//!   (system prompt, tools). The prefill that reaches a prompt's `shared` point keeps the block on
+//!   a sequence of its own (a [`Seed`]): its attention rows are shared with the conversation (no
+//!   copy; llama.cpp counts a cell once for every sequence on it), its recurrent state is the
+//!   checkpoint there. A request whose conversation holds less of its prompt starts from a copy
+//!   of it, so a new conversation reads only what follows the block. A seed is saved to disk
+//!   (`seeds.rs`) and comes back from there after a restart or for another project's block.
 //! - **Scheduling.** Every step advances one request by one prefill step (at most 1024 tokens) or
 //!   one token, choosing the highest priority class first and rotating within it. Foreground
 //!   requests therefore preempt agent work at the next step. Requests beyond the resident
@@ -31,11 +40,18 @@
 //!   recurrent-state snapshot, `n_rs_seq`). The output is exactly what plain decoding samples.
 //!   The draft context holds the MTP layer's own cache for every sequence: each row pairs a token
 //!   with the model's hidden state at the position before it, fed as the model reads them.
+//! - **Images** (`vision.rs`). An image is a run of rows in the prompt (one `<|image_pad|>` token
+//!   each, told apart by the image's identity), fed as the encoder's embeddings. With Qwen's M-RoPE
+//!   an image advances the positions by fewer than its rows, so a sequence's next position is
+//!   counted from its images ([`position`]). A request whose next rows are an image not encoded
+//!   yet waits for the vision thread while the others run; images already in the conversation's
+//!   sequence are never encoded again.
 
 use crate::fit::{self, Budget, Geometry, Plan};
 use crate::grammar::{Grammar, GrammarCompiler, GrammarSpec};
 use crate::llama::{self, Context, ContextParams, Gpu, Logits, Model};
 use crate::sampler::{Sampler, SamplingPlan};
+use crate::vision::{Encoded, VisionHandle};
 use cc_protocol::contracts::model::{Priority, QueueDepth, SlotState, progress_phase, topics as model_topics};
 use serde::Serialize;
 use serde_json::Value;
@@ -86,6 +102,11 @@ pub struct EngineConfig {
     pub ctx_total: Option<u64>,
     /// An operator cap on resident conversations (None: the fit's).
     pub max_resident: Option<u64>,
+    /// The variant's vision projector (loaded on first use, once installed) and the pixel budget
+    /// per image; None: text only.
+    pub vision: Option<(PathBuf, u64)>,
+    /// Where shared leading blocks are saved (None: kept in memory only).
+    pub seeds_dir: Option<PathBuf>,
 }
 
 /// Facts about the loaded engine.
@@ -136,15 +157,33 @@ pub enum Work {
     Prewarm,
 }
 
+/// An image of a prompt: `rows` tokens from `start`, fed as the image's embeddings.
+#[derive(Debug, Clone)]
+pub struct PromptImage {
+    pub start: usize,
+    pub rows: usize,
+    /// Positions the image advances the sequence by.
+    pub n_pos: u32,
+    /// The image and its size (two images are the same input only when this matches).
+    pub key: u64,
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 pub struct Request {
     /// Numbered by the engine when it receives the request.
     pub id: u64,
     pub key: String,
     pub prompt: Vec<u32>,
+    /// The prompt's images, in order (their rows are `<|image_pad|>` tokens in `prompt`).
+    pub images: Vec<PromptImage>,
     /// Prompt lengths, besides `prompt.len() - 1`, at which the prefill keeps a checkpoint.
     pub checkpoints: Vec<usize>,
-    /// A prewarm of the leading block alone, for conversations not created yet. Kept blocks shared
-    /// across conversations come with the next stage; until then it ends at once.
+    /// The prompt length that ends its leading system block (one of `checkpoints`): what
+    /// conversations of a project share ([`Seed`]).
+    pub shared: Option<usize>,
+    /// A prewarm of the leading block alone, for conversations not created yet: it ends kept as a
+    /// [`Seed`], and no conversation has its key.
     pub shared_only: bool,
     /// A prewarm that runs only while no other conversation is served: it waits while another
     /// conversation's request runs or waits, and such a request stops it at its next step.
@@ -205,6 +244,8 @@ pub enum Command {
     /// Drop a conversation for good (its session was deleted): its requests stop and its sequence
     /// is cleared.
     Forget(String),
+    /// The vision thread encoded image `image` of request `request`.
+    Encoded { request: u64, image: usize, result: Result<Arc<Encoded>, String> },
     Shutdown,
 }
 
@@ -222,6 +263,8 @@ pub struct EngineHandle {
     tx: Mutex<mpsc::Sender<Command>>,
     pub tokenizer: Arc<Tokenizer>,
     pub loaded: Loaded,
+    /// Image input (None: the variant has no vision projector).
+    pub vision: Option<Arc<VisionHandle>>,
     view: Arc<Mutex<View>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -252,13 +295,14 @@ impl Drop for EngineHandle {
 }
 
 /// What a load hands the engine thread: the model's context, the drafter, the tokenizer, the
-/// grammar compiler and the facts.
-type LoadedEngine = (Context, Option<Drafter>, Arc<Tokenizer>, GrammarCompiler, Loaded);
+/// grammar compiler, the facts and the vision thread.
+type LoadedEngine = (Context, Option<Drafter>, Arc<Tokenizer>, GrammarCompiler, Loaded, Option<Arc<VisionHandle>>);
 
 /// Load the model, fit the context to the machine and start the engine thread.
 pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle, String> {
     let (tx, rx) = mpsc::channel::<Command>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(Arc<Tokenizer>, Loaded), String>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(Arc<Tokenizer>, Loaded, Option<Arc<VisionHandle>>), String>>();
+    let encoded_tx = tx.clone();
     let view = Arc::new(Mutex::new(View::default()));
     let worker_view = view.clone();
     let thread = std::thread::Builder::new()
@@ -337,24 +381,29 @@ pub fn start(config: EngineConfig, publisher: Publisher) -> Result<EngineHandle,
                     resident,
                     draft_tokens: if drafter.is_some() { plan.draft_tokens } else { 0 },
                 };
-                Ok((context, drafter, Arc::new(tokenizer), compiler, loaded))
+                let vision = match config.vision.clone() {
+                    Some((mmproj, max_pixels)) => Some(Arc::new(VisionHandle::start(mmproj, model.clone(), max_pixels)?)),
+                    None => None,
+                };
+                Ok((context, drafter, Arc::new(tokenizer), compiler, loaded, vision))
             })();
-            let (context, drafter, compiler, loaded) = match loaded {
-                Ok((context, drafter, tokenizer, compiler, loaded)) => {
-                    let _ = ready_tx.send(Ok((tokenizer, loaded.clone())));
-                    (context, drafter, compiler, loaded)
+            let (context, drafter, compiler, loaded, vision) = match loaded {
+                Ok((context, drafter, tokenizer, compiler, loaded, vision)) => {
+                    let _ = ready_tx.send(Ok((tokenizer, loaded.clone(), vision.clone())));
+                    (context, drafter, compiler, loaded, vision)
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
-            let mut worker = Worker::new(context, drafter, compiler, &loaded, rx, worker_view, publisher);
+            let store = config.seeds_dir.clone().map(|dir| crate::seeds::Store::new(dir, &config.weights, loaded.plan.kv_type));
+            let mut worker = Worker::new(context, drafter, compiler, &loaded, rx, worker_view, publisher, vision, encoded_tx, store);
             worker.run();
         })
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
     match ready_rx.recv() {
-        Ok(Ok((tokenizer, loaded))) => Ok(EngineHandle { tx: Mutex::new(tx), tokenizer, loaded, view, thread: Mutex::new(Some(thread)) }),
+        Ok(Ok((tokenizer, loaded, vision))) => Ok(EngineHandle { tx: Mutex::new(tx), tokenizer, loaded, vision, view, thread: Mutex::new(Some(thread)) }),
         Ok(Err(error)) => {
             let _ = thread.join();
             Err(error)
@@ -531,6 +580,22 @@ impl Drafter {
         }
     }
 
+    /// `to` starts as a copy of `from`'s first `len` rows (a shared leading block), `last` being
+    /// the model's hidden state at the last of them. False: `from` has no complete rows (its
+    /// drafts were off), and `to` drafts nothing until it starts over.
+    fn copy(&mut self, from: u32, to: u32, len: usize, last: &[f32]) -> bool {
+        self.flush(from);
+        self.clear(to);
+        if self.lanes[from as usize].off || last.len() != self.n_embd {
+            self.lanes[to as usize].off = true;
+            return false;
+        }
+        self.context.seq_cp(from, to);
+        self.context.seq_rm(to, len as i32, -1);
+        self.lanes[to as usize].last.copy_from_slice(last);
+        true
+    }
+
     /// The sequence starts over (empty).
     fn clear(&mut self, seq: u32) {
         self.context.seq_rm(seq, -1, -1);
@@ -557,12 +622,42 @@ struct Checkpoint {
     last_used: Instant,
 }
 
+/// An image a sequence holds (or is reading): `len` rows from `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotImage {
+    start: usize,
+    len: usize,
+    n_pos: u32,
+    key: u64,
+}
+
+/// The position after the first `len` rows of a sequence holding `images`: every whole image
+/// before it advances the positions by its `n_pos`, not by its rows.
+fn position(images: &[SlotImage], len: usize) -> u32 {
+    let saved: usize = images.iter().filter(|image| image.start + image.len <= len).map(|image| image.len - image.n_pos as usize).sum();
+    (len - saved) as u32
+}
+
+/// A leading system block shared across conversations, on a sequence of its own (after the
+/// resident conversations' sequences). Empty `tokens`: the sequence holds nothing.
+struct Seed {
+    seq: u32,
+    tokens: Vec<u32>,
+    /// The model's hidden state at the block's last token (for the drafter).
+    hidden: Vec<f32>,
+    /// The draft context holds the block's rows (a conversation started from it may draft).
+    drafts: bool,
+    last_used: Instant,
+}
+
 /// One resident conversation: a sequence of the context.
 struct Slot {
     seq: u32,
     key: Option<String>,
     /// The tokens the sequence holds.
     tokens: Vec<u32>,
+    /// The images among them.
+    images: Vec<SlotImage>,
     /// Checkpoints of the sequence, each a prefix of `tokens` (a rollback voids the longer ones).
     checkpoints: Vec<Checkpoint>,
     busy: Option<Priority>,
@@ -601,6 +696,9 @@ struct Active {
     drafted: u32,
     accepted: u32,
     reporter: crate::progress::Reporter,
+    /// Per image of the request: its encoding, once the vision thread sent it (images already in
+    /// the sequence are never asked for).
+    encoded: Vec<Option<Result<Arc<Encoded>, String>>>,
 }
 
 enum Placement {
@@ -639,6 +737,9 @@ struct Worker {
     compiler: GrammarCompiler,
     rx: mpsc::Receiver<Command>,
     slots: Vec<Slot>,
+    seeds: Vec<Seed>,
+    /// Where seeds are saved (None: memory only).
+    store: Option<crate::seeds::Store>,
     active: Vec<Active>,
     waiting: VecDeque<Box<Request>>,
     held: HashMap<String, Instant>,
@@ -656,13 +757,33 @@ struct Worker {
     last_work: Instant,
     /// The idle-only request whose wait for room was last logged.
     idle_wait_logged: Option<u64>,
+    vision: Option<Arc<VisionHandle>>,
+    /// The engine's own channel, for the vision thread's encodings.
+    encoded_tx: mpsc::Sender<Command>,
 }
 
 impl Worker {
-    fn new(context: Context, drafter: Option<Drafter>, compiler: GrammarCompiler, loaded: &Loaded, rx: mpsc::Receiver<Command>, view: Arc<Mutex<View>>, publisher: Publisher) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        context: Context,
+        drafter: Option<Drafter>,
+        compiler: GrammarCompiler,
+        loaded: &Loaded,
+        rx: mpsc::Receiver<Command>,
+        view: Arc<Mutex<View>>,
+        publisher: Publisher,
+        vision: Option<Arc<VisionHandle>>,
+        encoded_tx: mpsc::Sender<Command>,
+        store: Option<crate::seeds::Store>,
+    ) -> Self {
         let n_embd = drafter.as_ref().map_or(0, |drafter| drafter.n_embd);
         let slots = (0..loaded.resident)
-            .map(|seq| Slot { seq: seq as u32, key: None, tokens: Vec::new(), checkpoints: Vec::new(), busy: None, last_used: Instant::now() })
+            .map(|seq| Slot { seq: seq as u32, key: None, tokens: Vec::new(), images: Vec::new(), checkpoints: Vec::new(), busy: None, last_used: Instant::now() })
+            .collect();
+        // The seeds' sequences follow every resident sequence the plan made (an operator cap on
+        // resident conversations leaves some of those unused).
+        let seeds = (loaded.plan.resident..loaded.plan.sequences)
+            .map(|seq| Seed { seq: seq as u32, tokens: Vec::new(), hidden: Vec::new(), drafts: false, last_used: Instant::now() })
             .collect();
         let worker = Self {
             context,
@@ -672,6 +793,8 @@ impl Worker {
             compiler,
             rx,
             slots,
+            seeds,
+            store,
             active: Vec::new(),
             waiting: VecDeque::new(),
             held: HashMap::new(),
@@ -686,6 +809,8 @@ impl Worker {
             logits: Vec::new(),
             last_work: Instant::now(),
             idle_wait_logged: None,
+            vision,
+            encoded_tx,
         };
         worker.publish_view();
         worker
@@ -697,8 +822,9 @@ impl Worker {
         // for a state-changing command instead of polling the expired deadline.
         let mut idle_room_checked = None;
         loop {
-            // Block for a command only when nothing runs and nothing waiting can start.
-            let idle = self.active.is_empty() && (self.waiting.is_empty() || stalled);
+            // Block for a command only when nothing can step (requests waiting for an image's
+            // encoding wake the worker with it) and nothing waiting can start.
+            let idle = !self.any_runnable() && (self.waiting.is_empty() || stalled);
             // An idle-only generation waiting for the quiet period wakes the worker when it ends.
             let wake = self.waiting.iter().any(|request| idle_generation(request)).then(|| self.last_work + IDLE_ROOM_AFTER).filter(|at| Some(*at) != idle_room_checked);
             let command = if idle && !self.shutting_down {
@@ -744,8 +870,8 @@ impl Worker {
             if admission_at >= quiet_at {
                 idle_room_checked = Some(quiet_at);
             }
-            stalled = self.active.is_empty() && !self.waiting.is_empty();
-            if !self.active.is_empty() {
+            stalled = !self.any_runnable() && !self.waiting.is_empty();
+            if self.any_runnable() {
                 self.step();
             }
         }
@@ -795,6 +921,13 @@ impl Worker {
                 }
                 self.publish_view();
             }
+            Command::Encoded { request, image, result } => {
+                if let Some(active) = self.active.iter_mut().find(|active| active.request.id == request)
+                    && let Some(slot) = active.encoded.get_mut(image)
+                {
+                    *slot = Some(result);
+                }
+            }
             Command::Shutdown => self.shutting_down = true,
         }
     }
@@ -816,7 +949,16 @@ impl Worker {
 
     /// Cells the pool holds: every sequence's tokens and the running requests' reserves.
     fn pool_used(&self) -> u64 {
-        self.slots.iter().map(|slot| slot.tokens.len() as u64).sum::<u64>() + self.reserved_tokens()
+        self.slots.iter().map(|slot| slot.tokens.len() as u64).sum::<u64>() + self.seed_tokens() + self.reserved_tokens()
+    }
+
+    /// Cells only the seeds hold: a seed's rows are a conversation's too while it starts with them.
+    fn seed_tokens(&self) -> u64 {
+        self.seeds
+            .iter()
+            .filter(|seed| !self.slots.iter().any(|slot| slot.tokens.starts_with(&seed.tokens)))
+            .map(|seed| seed.tokens.len() as u64)
+            .sum()
     }
 
     fn waiting_order(&self) -> Vec<usize> {
@@ -881,24 +1023,32 @@ impl Worker {
         } else if !matches!(self.waiting[position].work, Work::Prewarm) {
             self.stop_idle_prewarms(&key);
         }
-        // A prewarm of a leading block for conversations not created yet: nothing keeps such a
-        // block at this stage, so it is done at once.
+        // A prewarm of a leading block for conversations not created yet: done without a slot when
+        // the block is kept (a seed, an idle conversation that starts with it, or a saved copy);
+        // else it is read like any prewarm and kept at its end. Without a block it ends at once.
         if self.waiting[position].shared_only {
-            let Some(request) = self.waiting.remove(position) else { return Placement::Wait };
-            self.publish_ended(&request, None, "prefilled");
-            let _ = request.events.send(Event::Done(Outcome {
-                finish: Finish::Prefilled,
-                prompt_tokens: request.prompt.len() as u32,
-                cached_tokens: 0,
-                completion_tokens: 0,
-                queue_ms: ms(request.arrival),
-                prefill_ms: 0.0,
-                decode_ms: 0.0,
-                slot: 0,
-                draft_total: 0,
-                draft_accepted: 0,
-            }));
-            return Placement::Admitted;
+            let block = self.waiting[position].shared.filter(|&shared| shared > 0 && shared < self.waiting[position].prompt.len());
+            let kept = match block {
+                Some(shared) => self.seed_holding(position, shared),
+                None => Some(0),
+            };
+            if let Some(cached) = kept {
+                let Some(request) = self.waiting.remove(position) else { return Placement::Wait };
+                self.publish_ended(&request, None, "prefilled");
+                let _ = request.events.send(Event::Done(Outcome {
+                    finish: Finish::Prefilled,
+                    prompt_tokens: request.prompt.len() as u32,
+                    cached_tokens: cached as u32,
+                    completion_tokens: 0,
+                    queue_ms: ms(request.arrival),
+                    prefill_ms: 0.0,
+                    decode_ms: 0.0,
+                    slot: 0,
+                    draft_total: 0,
+                    draft_accepted: 0,
+                }));
+                return Placement::Admitted;
+            }
         }
         let priority = self.waiting[position].priority;
         let blocked_by_higher = self
@@ -940,6 +1090,7 @@ impl Worker {
                     tracing::info!(cache_key = ?self.slots[index].key, tokens = self.slots[index].tokens.len(), "dropping an idle conversation for room in the pool");
                     self.clear_slot(index);
                 }
+                None if self.drop_seed() => {}
                 None => break,
             }
         }
@@ -1037,6 +1188,7 @@ impl Worker {
         let slot = &mut self.slots[index];
         slot.key = None;
         slot.tokens.clear();
+        slot.images.clear();
         slot.checkpoints.clear();
     }
 
@@ -1051,7 +1203,15 @@ impl Worker {
         let prompt = &request.prompt;
         let slot = &self.slots[slot_index];
         // At least the last prompt token is always fed: its forward pass gives the first logits.
-        let common = slot.tokens.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+        let mut common = slot.tokens.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+        // Image rows match only as the same whole image (every row is the same pad token).
+        for image in request.images.iter().take_while(|image| image.start < common) {
+            let same = slot.images.iter().any(|held| held.start == image.start && held.len == image.rows && held.key == image.key);
+            if !same || image.start + image.rows > common {
+                common = image.start;
+                break;
+            }
+        }
         let usable = common.min(prompt.len() - 1);
         let cached = if usable == slot.tokens.len() {
             usable
@@ -1064,10 +1224,12 @@ impl Worker {
                 .max_by_key(|(_, checkpoint)| checkpoint.len)
                 .map(|(position, _)| position);
             let seq = slot.seq;
-            let restored = best.and_then(|position| {
-                let checkpoint = &self.slots[slot_index].checkpoints[position];
+            let restored = best.and_then(|index| {
+                let slot = &self.slots[slot_index];
+                let checkpoint = &slot.checkpoints[index];
                 let len = checkpoint.len;
-                (self.context.set_state(seq, true, &checkpoint.state) && self.context.seq_rm(seq, len as i32, -1)).then_some((position, len))
+                let at = position(&slot.images, len);
+                (self.context.set_state(seq, true, &checkpoint.state) && self.context.seq_rm(seq, at as i32, -1)).then_some((index, len))
             });
             match restored {
                 Some((position, len)) => {
@@ -1079,6 +1241,7 @@ impl Worker {
                     // The rows after the rollback point will be rewritten: longer checkpoints are void.
                     slot.checkpoints.retain(|checkpoint| checkpoint.len <= len);
                     slot.tokens.truncate(len);
+                    slot.images.retain(|image| image.start + image.len <= len);
                     len
                 }
                 None => {
@@ -1088,10 +1251,20 @@ impl Worker {
                     }
                     let slot = &mut self.slots[slot_index];
                     slot.tokens.clear();
+                    slot.images.clear();
                     slot.checkpoints.clear();
                     0
                 }
             }
+        };
+        // A shared leading block that covers more of the prompt than the conversation holds (a new
+        // conversation, or one whose history changed before it): start from a copy of it.
+        let cached = match request.shared.filter(|&shared| shared > cached && shared < prompt.len()) {
+            Some(shared) if !request.images.iter().any(|image| image.start < shared) => match self.seed_for(&prompt[..shared]) {
+                Some(seed) => self.start_from_seed(slot_index, seed),
+                None => cached,
+            },
+            _ => cached,
         };
         let slot = &mut self.slots[slot_index];
         slot.last_used = Instant::now();
@@ -1105,6 +1278,22 @@ impl Worker {
             Work::Generate { think_budget: Some(_), .. } => Some(0),
             _ => None,
         };
+        // The images still to read go to the vision thread now; the text before them is read meanwhile.
+        let mut encoded: Vec<Option<Result<Arc<Encoded>, String>>> = request.images.iter().map(|_| None).collect();
+        for (index, image) in request.images.iter().enumerate().filter(|(_, image)| image.start + image.rows > cached) {
+            let Some(vision) = &self.vision else {
+                encoded[index] = Some(Err("this model takes no images".into()));
+                continue;
+            };
+            let tx = self.encoded_tx.clone();
+            let id = request.id;
+            let done = Box::new(move |result| {
+                let _ = tx.send(Command::Encoded { request: id, image: index, result });
+            });
+            if let Err(error) = vision.encode(image.path.clone(), image.sha256.clone(), done) {
+                encoded[index] = Some(Err(error));
+            }
+        }
         self.active.push(Active {
             slot: slot_index,
             request,
@@ -1121,6 +1310,7 @@ impl Worker {
             drafted: 0,
             accepted: 0,
             reporter: crate::progress::Reporter::default(),
+            encoded,
         });
         let index = self.active.len() - 1;
         self.report(index, progress_phase::PREFILL);
@@ -1134,8 +1324,9 @@ impl Worker {
             self.finish(index, Finish::Stopped);
             return;
         }
-        let Some(best) = self.active.iter().map(|active| class(active.request.priority)).min() else { return };
-        let candidates: Vec<usize> = (0..self.active.len()).filter(|&index| class(self.active[index].request.priority) == best).collect();
+        let runnable: Vec<usize> = (0..self.active.len()).filter(|&index| self.runnable(index)).collect();
+        let Some(best) = runnable.iter().map(|&index| class(self.active[index].request.priority)).min() else { return };
+        let candidates: Vec<usize> = runnable.into_iter().filter(|&index| class(self.active[index].request.priority) == best).collect();
         let turn = &mut self.turn[best];
         *turn = (*turn + 1) % candidates.len().max(1);
         let index = candidates[*turn % candidates.len()];
@@ -1145,17 +1336,71 @@ impl Worker {
         }
     }
 
+    /// The image whose rows a prefill at `next` reads, if any.
+    fn image_at(active: &Active, next: usize) -> Option<usize> {
+        active.request.images.iter().position(|image| image.start <= next && next < image.start + image.rows)
+    }
+
+    /// Whether the request can take a step now: not while its next rows are an image the vision
+    /// thread has not encoded yet (a stopped request can always end).
+    fn runnable(&self, index: usize) -> bool {
+        let active = &self.active[index];
+        if active.request.stop.load(Ordering::SeqCst) || active.request.events.is_closed() {
+            return true;
+        }
+        match active.phase {
+            Phase::Prefill { next } => Self::image_at(active, next).is_none_or(|image| active.encoded[image].is_some()),
+            Phase::Generate(_) => true,
+        }
+    }
+
+    fn any_runnable(&self) -> bool {
+        (0..self.active.len()).any(|index| self.runnable(index))
+    }
+
     fn advance(&mut self, index: usize) -> Result<(), String> {
         let slot_index = self.active[index].slot;
         let start = match &self.active[index].phase {
             Phase::Prefill { next } => *next,
             Phase::Generate(_) => return self.decode_step(index),
         };
-        let end = self.active[index].request.prompt.len() - 1;
+        // A leading block's prewarm reads the block alone.
+        let end = match (self.active[index].request.shared_only, self.active[index].request.shared) {
+            (true, Some(shared)) => shared,
+            _ => self.active[index].request.prompt.len() - 1,
+        };
+        if start < end
+            && let Some(image) = Self::image_at(&self.active[index], start)
+        {
+            // An image's rows, at most a prefill step of them.
+            let encoded = match &self.active[index].encoded[image] {
+                Some(Ok(encoded)) => encoded.clone(),
+                Some(Err(error)) => return Err(format!("image {} could not be read: {error}", image + 1)),
+                None => return Ok(()),
+            };
+            let held = self.active[index].request.images[image].clone();
+            if encoded.rows != held.rows || encoded.n_pos != held.n_pos {
+                return Err(format!("image {} encoded to {} rows where the prompt has {}", image + 1, encoded.rows, held.rows));
+            }
+            let from = start - held.start;
+            let stop = (start + PREFILL_CHUNK).min(held.start + held.rows);
+            let rows = self.active[index].request.prompt[start..stop].to_vec();
+            self.feed_image(slot_index, &held, &encoded, from, &rows)?;
+            if let Phase::Prefill { next } = &mut self.active[index].phase {
+                *next = stop;
+            }
+            // Its embeddings are no longer needed once every row is in.
+            if stop == held.start + held.rows {
+                self.active[index].encoded[image] = Some(Err("already read".into()));
+            }
+            self.report(index, progress_phase::PREFILL);
+            return Ok(());
+        }
         if start < end {
-            // Up to the next reuse point (checkpointed when reached).
+            // Up to the next reuse point (checkpointed when reached) or the next image.
             let reuse = self.active[index].request.checkpoints.iter().copied().filter(|&point| point > start && point < end).min();
-            let stop = (start + PREFILL_CHUNK).min(end).min(reuse.unwrap_or(usize::MAX));
+            let image = self.active[index].request.images.iter().map(|image| image.start).filter(|&at| at > start).min();
+            let stop = (start + PREFILL_CHUNK).min(end).min(reuse.unwrap_or(usize::MAX)).min(image.unwrap_or(usize::MAX));
             let chunk = self.active[index].request.prompt[start..stop].to_vec();
             self.feed(slot_index, &chunk, Logits::None)?;
             if let Phase::Prefill { next } = &mut self.active[index].phase {
@@ -1163,12 +1408,14 @@ impl Worker {
             }
             if reuse == Some(stop) {
                 self.checkpoint(slot_index, stop);
+                self.seed(index, stop);
             }
             self.report(index, progress_phase::PREFILL);
             return Ok(());
         }
         // Everything but the last token is in the sequence: checkpoint it, then generate.
         self.checkpoint(slot_index, end);
+        self.seed(index, end);
         if matches!(self.active[index].request.work, Work::Prewarm) {
             self.finish(index, Finish::Prefilled);
             return Ok(());
@@ -1191,8 +1438,37 @@ impl Worker {
     /// hidden states to the drafter.
     fn feed(&mut self, slot_index: usize, tokens: &[u32], logits: Logits) -> Result<(), String> {
         let seq = self.slots[slot_index].seq;
+        let slot = &self.slots[slot_index];
+        let pos = position(&slot.images, slot.tokens.len());
+        self.context.decode_batch(tokens, pos, seq, logits)?;
+        self.note_read(slot_index, tokens);
+        Ok(())
+    }
+
+    /// Feed rows `from..` of an image (`rows` are their pad tokens in the prompt).
+    fn feed_image(&mut self, slot_index: usize, image: &PromptImage, encoded: &Encoded, from: usize, rows: &[u32]) -> Result<(), String> {
+        let slot = &mut self.slots[slot_index];
+        if from == 0 {
+            slot.images.push(SlotImage { start: image.start, len: image.rows, n_pos: image.n_pos, key: image.key });
+        }
+        let seq = slot.seq;
+        let first = position(&slot.images, image.start) as i32;
+        // Absolute positions: the image's own (t, x, y) from its first position; M-RoPE leaves z at 0.
+        let positions: Vec<i32> = encoded.positions[from * 4..(from + rows.len()) * 4]
+            .chunks_exact(4)
+            .flat_map(|row| [row[0] + first, row[1] + first, row[2] + first, if encoded.mrope { row[3] } else { row[3] + first }])
+            .collect();
+        let embd = &encoded.embd[from * encoded.n_embd..(from + rows.len()) * encoded.n_embd];
+        self.context.decode_image(embd, &positions, encoded.n_embd, 0, rows.len(), encoded.mrope, seq)?;
+        self.note_read(slot_index, rows);
+        Ok(())
+    }
+
+    /// The model read `tokens` after what the slot held: keep them, and hand the model's hidden
+    /// states to the drafter (whose own positions count rows).
+    fn note_read(&mut self, slot_index: usize, tokens: &[u32]) {
+        let seq = self.slots[slot_index].seq;
         let pos0 = self.slots[slot_index].tokens.len() as u32;
-        self.context.decode_batch(tokens, pos0, seq, logits)?;
         self.slots[slot_index].tokens.extend_from_slice(tokens);
         if let Some(drafter) = self.drafter.as_mut() {
             self.hidden.clear();
@@ -1210,13 +1486,13 @@ impl Worker {
                 drafter.lanes[seq as usize].off = true;
             }
         }
-        Ok(())
     }
 
     /// Remove the slot's last token (a rejected guess) from the model and the drafter.
     fn unread_last(&mut self, slot_index: usize) -> Result<(), String> {
         let seq = self.slots[slot_index].seq;
-        let pos = self.slots[slot_index].tokens.len().saturating_sub(1);
+        let slot = &self.slots[slot_index];
+        let pos = position(&slot.images, slot.tokens.len().saturating_sub(1));
         if !self.context.seq_rm(seq, pos as i32, -1) {
             return Err("the model could not remove a rejected draft".into());
         }
@@ -1359,7 +1635,9 @@ impl Worker {
     }
 
     /// Keep a checkpoint of the slot's sequence at `len` tokens (when it holds exactly that many
-    /// and none is kept there yet), evicting the least recently used beyond the fitted count.
+    /// and none is kept there yet), evicting the least recently used beyond the fitted count. The
+    /// shortest stays (the end of the leading system block): a later turn's prompt differs after
+    /// the history, so it is the point every next call can resume from.
     fn checkpoint(&mut self, slot_index: usize, len: usize) {
         let slot = &self.slots[slot_index];
         if self.checkpoints == 0 || len == 0 || slot.tokens.len() != len || slot.checkpoints.iter().any(|checkpoint| checkpoint.len == len) {
@@ -1374,9 +1652,204 @@ impl Worker {
         let checkpoints = &mut self.slots[slot_index].checkpoints;
         checkpoints.push(Checkpoint { len, state, hidden, last_used: Instant::now() });
         while checkpoints.len() > self.checkpoints {
-            let Some(oldest) = checkpoints.iter().enumerate().min_by_key(|(_, checkpoint)| checkpoint.last_used).map(|(position, _)| position) else { break };
+            let first = checkpoints.iter().map(|checkpoint| checkpoint.len).min();
+            let Some(oldest) = checkpoints
+                .iter()
+                .enumerate()
+                .filter(|(_, checkpoint)| checkpoints.len() == 1 || Some(checkpoint.len) != first)
+                .min_by_key(|(_, checkpoint)| checkpoint.last_used)
+                .map(|(position, _)| position)
+            else {
+                break;
+            };
             checkpoints.remove(oldest);
         }
+    }
+
+    // ---- shared leading blocks ----------------------------------------------------------------
+
+    /// For waiting `shared_only` request `position`, whose block ends at `shared`: the block's
+    /// length when it is kept now (a seed, a saved copy, or an idle conversation that starts with
+    /// it and has its checkpoint). None: the block has to be read.
+    fn seed_holding(&mut self, position: usize, shared: usize) -> Option<usize> {
+        let block = self.waiting[position].prompt[..shared].to_vec();
+        if self.seed_for(&block).is_some() {
+            return Some(shared);
+        }
+        let slot = self.slots.iter().position(|slot| {
+            slot.busy.is_none()
+                && slot.tokens.starts_with(&block)
+                && slot.images.iter().all(|image| image.start >= shared)
+                && slot.checkpoints.iter().any(|checkpoint| checkpoint.len == shared)
+        })?;
+        self.keep_seed(slot, shared).then_some(shared)
+    }
+
+    /// The seed that is exactly `block`: kept, or restored from disk.
+    fn seed_for(&mut self, block: &[u32]) -> Option<usize> {
+        if let Some(index) = self.seeds.iter().position(|seed| seed.tokens == block) {
+            self.seeds[index].last_used = Instant::now();
+            return Some(index);
+        }
+        self.restore_seed(block)
+    }
+
+    /// Keep active request `index`'s leading block as a seed when its slot holds exactly that
+    /// (`length` is its `shared` point) and no seed holds the same tokens.
+    fn seed(&mut self, index: usize, length: usize) {
+        let request = &self.active[index].request;
+        let slot_index = self.active[index].slot;
+        if request.shared != Some(length) || request.images.iter().any(|image| image.start < length) || self.slots[slot_index].tokens.len() != length {
+            return;
+        }
+        if let Some(seed) = self.seeds.iter_mut().find(|seed| seed.tokens[..] == request.prompt[..length]) {
+            seed.last_used = Instant::now();
+            return;
+        }
+        self.keep_seed(slot_index, length);
+    }
+
+    /// The seed sequence a new block takes: an empty one, else the least recently used.
+    fn seed_place(&self) -> Option<usize> {
+        self.seeds
+            .iter()
+            .position(|seed| seed.tokens.is_empty())
+            .or_else(|| self.seeds.iter().enumerate().min_by_key(|(_, seed)| seed.last_used).map(|(index, _)| index))
+    }
+
+    /// Keep the first `len` tokens of slot `slot_index`'s sequence as a seed. The slot holds them
+    /// and a checkpoint at `len`; the rows are shared with the slot, not copied, and a slot already
+    /// past the block puts the seed back to the checkpoint.
+    fn keep_seed(&mut self, slot_index: usize, len: usize) -> bool {
+        let Some(place) = self.seed_place() else { return false };
+        let Some(checkpoint) = self.slots[slot_index].checkpoints.iter().position(|checkpoint| checkpoint.len == len) else { return false };
+        self.clear_seed(place);
+        let seq = self.seeds[place].seq;
+        let slot = &self.slots[slot_index];
+        let (from, longer) = (slot.seq, slot.tokens.len() > len);
+        self.context.seq_cp(from, seq);
+        if longer && !(self.context.set_state(seq, true, &slot.checkpoints[checkpoint].state) && self.context.seq_rm(seq, len as i32, -1)) {
+            self.context.seq_rm(seq, -1, -1);
+            return false;
+        }
+        let hidden = slot.checkpoints[checkpoint].hidden.clone();
+        let tokens = slot.tokens[..len].to_vec();
+        let drafts = self.drafter.as_mut().is_some_and(|drafter| drafter.copy(from, seq, len, &hidden));
+        self.seeds[place] = Seed { seq, tokens, hidden, drafts, last_used: Instant::now() };
+        tracing::info!(length = len, "keeping a shared leading block");
+        self.save_seed(place);
+        true
+    }
+
+    /// Put seed `index`'s block on slot `slot_index` in place of what the slot holds, with its
+    /// checkpoint at the block's end; returns the block's length.
+    fn start_from_seed(&mut self, slot_index: usize, index: usize) -> usize {
+        let seq = self.slots[slot_index].seq;
+        let seed = &self.seeds[index];
+        let (from, len) = (seed.seq, seed.tokens.len());
+        self.context.seq_rm(seq, -1, -1);
+        self.context.seq_cp(from, seq);
+        if let Some(drafter) = self.drafter.as_mut()
+            && !(seed.drafts && drafter.copy(from, seq, len, &seed.hidden))
+        {
+            drafter.clear(seq);
+            drafter.lanes[seq as usize].off = true;
+        }
+        // The recurrent state is the seed's until the slot writes (llama.cpp copies it then).
+        let checkpoint = Checkpoint { len, state: self.context.state(seq, true), hidden: seed.hidden.clone(), last_used: Instant::now() };
+        let tokens = seed.tokens.clone();
+        self.seeds[index].last_used = Instant::now();
+        let slot = &mut self.slots[slot_index];
+        slot.tokens = tokens;
+        slot.images.clear();
+        slot.checkpoints = if checkpoint.state.is_empty() { Vec::new() } else { vec![checkpoint] };
+        tracing::debug!(cache_key = ?slot.key, tokens = len, "started from a shared leading block");
+        len
+    }
+
+    fn clear_seed(&mut self, index: usize) {
+        let seq = self.seeds[index].seq;
+        self.context.seq_rm(seq, -1, -1);
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.clear(seq);
+        }
+        let seed = &mut self.seeds[index];
+        seed.tokens.clear();
+        seed.hidden = Vec::new();
+        seed.drafts = false;
+    }
+
+    /// Drop the least recently used seed whose rows no conversation shares (room in the pool).
+    /// Its saved copy stays on disk.
+    fn drop_seed(&mut self) -> bool {
+        let Some(index) = self
+            .seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, seed)| !seed.tokens.is_empty() && !self.slots.iter().any(|slot| slot.tokens.starts_with(&seed.tokens)))
+            .min_by_key(|(_, seed)| seed.last_used)
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        tracing::info!(tokens = self.seeds[index].tokens.len(), "dropped a shared leading block");
+        self.clear_seed(index);
+        true
+    }
+
+    /// Save seed `index` to disk (written on another thread).
+    fn save_seed(&mut self, index: usize) {
+        let Some(store) = &self.store else { return };
+        let seed = &self.seeds[index];
+        if store.has(&seed.tokens) {
+            return;
+        }
+        let state = self.context.state(seed.seq, false);
+        if state.is_empty() {
+            return;
+        }
+        let draft_state = match self.drafter.as_mut() {
+            Some(drafter) if seed.drafts => drafter.context.state(seed.seq, false),
+            _ => Vec::new(),
+        };
+        store.save(crate::seeds::Saved { tokens: seed.tokens.clone(), state, hidden: seed.hidden.clone(), draft_state });
+    }
+
+    /// Restore the saved block that is exactly `block` onto a seed sequence (the least recently
+    /// used one makes room). None: none is saved, the pool has no room, or it does not restore.
+    fn restore_seed(&mut self, block: &[u32]) -> Option<usize> {
+        let place = self.seed_place()?;
+        let freed = if self.slots.iter().any(|slot| slot.tokens.starts_with(&self.seeds[place].tokens)) { 0 } else { self.seeds[place].tokens.len() as u64 };
+        if self.pool_used().saturating_sub(freed) + block.len() as u64 > self.pool_tokens {
+            return None;
+        }
+        let started = Instant::now();
+        let saved = self.store.as_ref()?.load(block)?;
+        self.clear_seed(place);
+        let seq = self.seeds[place].seq;
+        // Deleted when it does not restore (it is saved again once the block is read), so a
+        // request waiting in admission never reads the same file twice.
+        if !self.context.set_state(seq, false, &saved.state) || self.context.seq_pos_max(seq) != block.len() as i32 - 1 {
+            self.context.seq_rm(seq, -1, -1);
+            if let Some(store) = &self.store {
+                store.forget(block);
+            }
+            tracing::info!(tokens = block.len(), "a saved shared leading block did not restore; reading it instead");
+            return None;
+        }
+        let drafts = match self.drafter.as_mut() {
+            Some(drafter) if !saved.draft_state.is_empty() && saved.hidden.len() == drafter.n_embd => {
+                let restored = drafter.context.set_state(seq, false, &saved.draft_state);
+                if !restored {
+                    drafter.clear(seq);
+                }
+                restored
+            }
+            _ => false,
+        };
+        self.seeds[place] = Seed { seq, tokens: block.to_vec(), hidden: saved.hidden, drafts, last_used: Instant::now() };
+        tracing::info!(tokens = block.len(), ms = started.elapsed().as_millis() as u64, "restored a shared leading block from disk");
+        Some(place)
     }
 
     fn release(&mut self, index: usize) -> Active {
@@ -1389,8 +1862,9 @@ impl Worker {
 
     fn finish(&mut self, index: usize, finish: Finish) {
         let active = self.release(index);
-        // An idle-only generation leaves nothing in the pool.
-        if active.request.idle_only && !matches!(active.request.work, Work::Prewarm) {
+        // An idle-only generation leaves nothing in the pool, like a leading block's prewarm (the
+        // block lives on as a seed; no conversation has this key).
+        if active.request.shared_only || (active.request.idle_only && !matches!(active.request.work, Work::Prewarm)) {
             self.clear_slot(active.slot);
         }
         let prefill_ms = active.first_token.map_or(ms(active.admitted), |first| first.duration_since(active.admitted).as_secs_f64() * 1000.0);
