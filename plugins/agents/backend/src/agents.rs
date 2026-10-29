@@ -59,6 +59,7 @@ pub fn hello() -> Hello {
         methods::LIST,
         methods::STEER,
         methods::STOP,
+        methods::RESTART,
         methods::VERIFY,
         methods::MERGE,
         methods::SCHEDULER,
@@ -1026,6 +1027,41 @@ impl Agents {
         Ok(json!({"stopped": true, "was_queued": was_queued}))
     }
 
+    /// A blocked or stopped agent back on its task, in its own session. A run cut off by an error
+    /// is still `running` in the journal and resumes as it was; an ended run gets a follow-up, so
+    /// the chat flow starts a new run that continues from the work already in the session.
+    async fn restart(&self, ctx: Ctx, params: AgentRefParams) -> Result<AgentRecord, RpcError> {
+        let host = Host::new(ctx.clone());
+        let mut record = agent(&host, &params.project_id, &params.agent).await?;
+        if record.status != "blocked" && record.status != "stopped" {
+            return Err(RpcError::invalid_params(format!("{} is {}; only a blocked or stopped agent restarts", record.name, record.status)));
+        }
+        let (Some(session_id), Some(task_id)) = (record.session_id.clone(), record.task_id.clone()) else {
+            return Err(RpcError::invalid_params(format!("{} has no session or task to go back to", record.name)));
+        };
+        let entries = host.journal_read(&session_id, 1).await?;
+        let cut_off = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == kinds::STATUS)
+            .is_some_and(|status| status.data.get("state").and_then(Value::as_str) == Some("running"));
+        if !cut_off {
+            let text = self.inner.data.get().text("restart_followup", &[]);
+            host.journal_append(&session_id, kinds::STEER, json!({"text": text, "kind": "followup", "target": "chat", "consumed": false})).await?;
+        }
+        // A stop cancelled the old scope for good; the restarted run gets a fresh one.
+        let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
+        lock(&self.inner.cancellations).remove(&key);
+        record.status = "working".into();
+        let record = upsert(&ctx, &host, record).await?;
+        let task = task(&host, &task_id).await?;
+        update_task(&host, json!({"id": task.id, "status": "in_progress"})).await?;
+        let text = self.inner.data.get().text("board_restart", &[("title", &task.title)]);
+        board(&host, &record.project_id, "status", &record.name, &text, std::slice::from_ref(&task.id)).await;
+        self.enqueue(ctx, key).await;
+        Ok(record)
+    }
+
     fn scheduler_state(&self) -> SchedulerState {
         let config = self.inner.data.get().scheduler.clone();
         let scheduler = lock(&self.inner.scheduler);
@@ -1417,6 +1453,7 @@ impl Plugin for Agents {
                 }
                 methods::STEER => this.steer(ctx, parse_params(params)?).await,
                 methods::STOP => this.stop(ctx, parse_params(params)?).await,
+                methods::RESTART => to_value(&this.restart(ctx, parse_params(params)?).await?),
                 methods::VERIFY => to_value(&this.verify(ctx, parse_params(params)?).await?),
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),
                 methods::SCHEDULER => to_value(&this.scheduler_state()),

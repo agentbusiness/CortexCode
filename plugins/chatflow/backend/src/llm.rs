@@ -83,7 +83,8 @@ async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Pri
         .entries()
         .filter(|entry| entry.kind == kinds::STATUS && entry.data.get("run_id").and_then(Value::as_str) == Some(run_id) && entry.data.get("state").and_then(Value::as_str) == Some("running"))
         .last()
-        .map(|entry| (entry.seq, entry.data.get("stage").cloned().unwrap_or(Value::Null)));
+        // An agent's status has no stage; "" reads as none and, unlike null, can be set back.
+        .map(|entry| (entry.seq, entry.data.get("stage").cloned().unwrap_or_else(|| json!(""))));
     let show = tokio::time::sleep(SHOW_WAIT);
     tokio::pin!(show);
     let mut shown = false;

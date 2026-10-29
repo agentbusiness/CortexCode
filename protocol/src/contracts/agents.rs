@@ -14,6 +14,10 @@ pub mod methods {
     pub const LIST: &str = "agents.list";
     pub const STEER: &str = "agents.steer";
     pub const STOP: &str = "agents.stop";
+    /// [`super::AgentRefParams`] -> [`crate::contracts::memory::AgentRecord`]: a blocked or stopped
+    /// agent works on its task again, in its own session (a run cut off resumes; an ended one
+    /// continues from what it did).
+    pub const RESTART: &str = "agents.restart";
     /// Run a task's contract checks in its workspace and record the verdict.
     pub const VERIFY: &str = "agents.verify";
     /// Merge a verified agent workspace branch into the project.

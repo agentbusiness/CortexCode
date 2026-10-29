@@ -224,6 +224,12 @@ function Agents({ projectId, onOpen }: { projectId: string; onOpen: (sessionId: 
                       {busy === `stop:${agent.name}` ? 'Stopping…' : 'Stop'}
                     </button>
                   )}
+                  {(agent.status === 'blocked' || agent.status === 'stopped') && agent.session_id && agent.task_id && (
+                    <button className="detent" type="button" disabled={busy !== null}
+                      onClick={() => void act(`restart:${agent.name}`, 'agents.restart', { project_id: projectId, agent: agent.name })}>
+                      {busy === `restart:${agent.name}` ? 'Restarting…' : 'Restart'}
+                    </button>
+                  )}
                 </div>
               </div>
             </li>
