@@ -55,6 +55,11 @@
 
 #cc .cx-sub{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px 2px 16px;}
 #cc .cx-task{color:var(--ink-2);}
+/* Agents are orange, so they never read as a remote project (counter blue). */
+#cc .cx-agents .cx-at,#cc .cx-agents .ap.origin{color:var(--rubric-lift);}
+/* An agent whose model runs on another computer: its role in the counter blue of other computers. */
+#cc .cx-agents .ap.cx-away{color:var(--counter);}
+#cc .cx-agents .cx-pip-running,#cc .cx-agents .cx-pip-working,#cc .cx-agents .cx-pip-in_progress,#cc .cx-agents .cx-pip-verifying{background:var(--rubric-lift);}
 
 
 /* A conversation or agent that needs the person (an ask-mode call to allow, a block) is washed in

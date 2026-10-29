@@ -351,6 +351,7 @@ impl Mesh {
             chosen = Some(index);
         }
         let option = &options[chosen.unwrap_or(0)];
+        let was = lock(&self.placements.placed).get(&session).cloned();
         if option.node.is_empty() {
             if let Some(ctx) = self.ctx.get() {
                 let _ = ctx.call("frame.route.clear", json!({"category": "model", "key": session})).await;
@@ -364,6 +365,9 @@ impl Mesh {
         let moved = lock(&self.claims.last).insert(session.clone(), option.node.clone()).is_some_and(|before| before != option.node);
         if moved {
             tracing::info!(session = %session, to = %option.name, "a session's next model call moves to a better free model");
+        }
+        // Where the session's calls run is shown (the sidebar's agents): every change is published.
+        if moved || was != lock(&self.placements.placed).get(&session).cloned() {
             self.notify("placed");
         }
         let tier = match option.tier {

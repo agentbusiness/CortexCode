@@ -3,7 +3,8 @@
  * their live state. Everything listed runs in parallel; selecting a row only changes what the
  * other regions show. The projects are the whole network's: this computer's, then the joined
  * computers' (`mesh.projects`), each with its description; another computer's name is set in blue
- * and its rows talk to that computer, where the project's sessions, files and memory live. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
+ * and its rows talk to that computer, where the project's sessions, files and memory live. An agent
+ * whose model runs on another computer has its role in that blue. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
  * action dropped in). A notification CortexCode showed only here — because its window was in front,
  * or because macOS did not show it — marks its session's row until the session is opened.
  */
@@ -479,6 +480,9 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
 
   // An agent is one row: its record (status, task) joined with its session (live state), by name.
   const agentRows = mergeAgents(records, agentSessions);
+  // Agents whose model calls run on another computer (`mesh.status` placed): their role in blue.
+  const mesh = useQuery<{ placed?: Array<{ session_id: string; name: string }> }>('mesh.status', (c) => c.call('mesh.status', {}), { topics: ['mesh.changed'] });
+  const away = new Map((row.node ? [] : mesh.data?.placed ?? []).map((placed) => [placed.session_id, placed.name]));
 
   return (
     <section className={`cx-proj${isSelected ? ' on' : ''}${row.node ? ' cx-proj-remote' : ''}`} data-project={project.id} data-node={row.node ?? undefined}>
@@ -540,7 +544,9 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
                         <div className="r">
                           <StatePip status={row.status} />
                           <span className={`ap${statusTone(row.status)}`}>{STATUS_LABEL[row.status] ?? row.status}</span>
-                          {row.role && <span className="ap faint">{row.role}</span>}
+                          {row.role && (row.sessionId && away.has(row.sessionId)
+                            ? <span className="ap cx-away" title={`Its model runs on ${away.get(row.sessionId)}`}>{row.role}</span>
+                            : <span className="ap faint">{row.role}</span>)}
                           {notice && <NoticeTag notice={notice} />}
                           <span className="grow" />
                           {row.updated ? <span className="ap faint">{ago(row.updated, now)}</span> : null}

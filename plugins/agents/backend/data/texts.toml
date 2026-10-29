@@ -34,12 +34,14 @@ pulled_clean = "The project's latest changes merged into your workspace cleanly;
 pulled_conflicts = "The project's latest changes were merged into your workspace and left conflict markers in those files."
 pull_failed = "Merging the project's changes into your workspace failed ({error})."
 branch_unknown = "The project's branch could not be read."
+restart_followup = "Your run on this task ended before the task was done. Continue the task from where the work above stopped."
 
 # ---- board posts (read by other agents) ----------------------------------------------------------
 board_claim = "Working on \"{title}\".{touches}"
 board_touches = " Touches: {touches}."
 board_error = "Stopped by an error: {error}"
 board_run_ended = "Run ended: {outcome}."
+board_restart = "Working on \"{title}\" again."
 board_done = "Done: {title}. {summary}"
 board_failing = "{title}: the work is in the project, but its contract fails there."
 board_conflict = "{title}: merge conflict in {files}; handed back to {agent}"
