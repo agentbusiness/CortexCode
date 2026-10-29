@@ -26,5 +26,11 @@ body{overflow:hidden;}
 #cc .cx-slot>.cx-instance{flex:1;min-height:0;min-width:0;display:flex;flex-direction:column;}
 #cc .cx-band-item{flex:0 0 auto;flex-direction:row;align-items:center;}
 #cc .cx-band-item>.cx-instance{flex-direction:row;align-items:center;}
+/* The band never carries a slot's waiting or vacancy text: it would push the window below. */
+#cc .cx-band-item>.cx-slot-empty,#cc .cx-band-item .cx-slot-failed{display:none;}
 #cc .cx-theme-slot{display:none;}
 
+
+/* A failed slot's card floats over the window, so the region it failed in keeps its layout. */
+#cc .cx-slot-alert{position:fixed;top:56px;right:16px;z-index:86;width:min(440px,calc(100vw - 32px));margin:0;}
+#cc .cx-slot-alert p{overflow-wrap:anywhere;}

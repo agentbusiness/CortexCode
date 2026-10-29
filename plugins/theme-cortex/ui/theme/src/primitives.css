@@ -16,6 +16,7 @@
 /* A slot that failed, or that no plugin fills. */
 #cc .cx-slot-empty{padding:20px 16px;}
 #cc .cx-slot-failed{padding:16px;}
+#cc .cx-slot-alert{background:var(--ground);border:1px solid var(--rubric-lift);box-shadow:0 8px 28px rgba(0,0,0,.35);}
 
 /* ─── state marks: the design's 5px square ─────────────────────────────────────
    Live is the rubric, waiting its lift, finished a filled third ink, failed outlined in the deep

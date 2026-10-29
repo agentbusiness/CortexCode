@@ -78,8 +78,10 @@ step "building the UI packages"
 
 # --- every plugin, built and packed -------------------------------------------------------------
 # The digest covers what the plugin builds with (scripts/release/digest.mjs), as a release's does.
+# The plugin with the window (window@1) goes first: the window carries the SDK the other UI
+# packages import, so a running app gets it before the packages built against it.
 wanted=()
-for toml in plugins/*/plugin.toml; do
+for toml in $(grep -l '^slot = "window@1"' plugins/*/plugin.toml) $(grep -L '^slot = "window@1"' plugins/*/plugin.toml); do
   dir="$(dirname "$toml")"
   read -r id version < <("$pack" info "$dir" | /usr/bin/python3 -c 'import json,sys; p=json.load(sys.stdin)["plugin"]; print(p["id"], p["version"].split("+")[0])')
   digest="$(node scripts/release/digest.mjs plugin "$dir")"

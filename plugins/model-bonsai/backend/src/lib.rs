@@ -4,7 +4,9 @@
 //! - [`llama`]: the vendored engine through the shim's flat C ABI.
 //! - [`engine`]: the engine thread: the loaded model, its fitted context, generation.
 //! - [`fit`]: the memory plan from the GGUF header and the machine.
+//! - [`seeds`]: shared leading blocks saved on disk.
 //! - [`sampler`], [`grammar`], [`constraint`]: sampling on the host, llguidance constraints.
+//! - [`vision`]: images, through the variant's vision projector on its own thread.
 //! - [`runtime`]: installing and loading variants, and the `model.*` request paths.
 //! - [`template`], [`parse`], [`repeat`], [`progress`], [`metrics`], [`variants`], [`machine`]:
 //!   shared with the uzu plugin.
@@ -23,5 +25,7 @@ pub mod progress;
 pub mod repeat;
 pub mod runtime;
 pub mod sampler;
+pub mod seeds;
 pub mod template;
 pub mod variants;
+pub mod vision;

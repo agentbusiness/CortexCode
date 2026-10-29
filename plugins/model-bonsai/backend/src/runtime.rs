@@ -11,9 +11,10 @@ use crate::repeat::Guard;
 use crate::sampler::SamplingPlan;
 use crate::template::{self, ChatTemplate};
 use crate::variants::{self, Progress, Spec, VerifyCache};
+use crate::vision;
 use cc_protocol::contracts::model::{
-    ChatDelta, ChatMessage, ChatParams, ChatResult, CompleteParams, CountResult, HoldParams, ModelInfo, PrewarmParams, Priority, Sampling,
-    SelectResult, SlotsResult, Thinking, TokenizeParams, TokenizeResult, ToolSpec, Usage, Variant, VariantsResult,
+    ChatDelta, ChatMessage, ChatParams, ChatResult, CompleteParams, ContentPart, CountResult, HoldParams, ModelInfo, PrewarmParams, Priority,
+    Sampling, SelectResult, SlotsResult, Thinking, TokenizeParams, TokenizeResult, ToolSpec, Usage, Variant, VariantsResult, VisionInfo,
 };
 use cc_protocol::{ItemSink, RpcError, codes};
 use serde::{Deserialize, Serialize};
@@ -45,9 +46,16 @@ pub const THINK_BUDGET_CLOSE: &str =
 /// `[plugin.config]` of the model plugin.
 #[derive(Debug, Clone, Deserialize, Default, Serialize)]
 pub struct Config {
-    /// Variant id from the catalog (default `bonsai2-27b-pq2`, the only one).
+    /// Variant id from the catalog (default `bonsai2-27b-pq2-mtp`).
     #[serde(default)]
     pub variant: Option<String>,
+    /// Image input: `auto` (default: the variant's vision projector downloads with the model and
+    /// loads when an image needs it) or `off`.
+    #[serde(default)]
+    pub vision: Option<String>,
+    /// Pixel budget per image; larger images are downscaled (default 2,400,000, about 2,340 tokens).
+    #[serde(default)]
+    pub max_image_pixels: Option<u64>,
     /// Where variants are installed (default `$CORTEX_HOME/models`).
     #[serde(default)]
     pub models_dir: Option<String>,
@@ -102,9 +110,10 @@ pub struct Loaded {
     pub think_close: Vec<u32>,
 }
 
-/// A prompt ready for the engine: its tokens and its reuse points.
+/// A prompt ready for the engine: its tokens, its images and its reuse points.
 pub struct Prompt {
     pub tokens: Vec<u32>,
+    pub images: Vec<engine::PromptImage>,
     /// Prompt lengths the engine checkpoints while prefilling (see [`reuse_points`]).
     pub checkpoints: Vec<usize>,
     /// The reuse point that ends the leading system block (one of `checkpoints`).
@@ -145,6 +154,26 @@ pub fn reuse_points(tokens: &[u32], prefixes: &[&[Value]], render: &dyn Fn(&[Val
     points.sort_unstable();
     points.dedup();
     points
+}
+
+/// A value no other image of another size shares, from the image's digest and its rows (the same
+/// picture at another size is other input). FNV-1a.
+fn image_key(sha256: &str, rows: usize) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in sha256.bytes().chain((rows as u64).to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Reuse points counted before the images' placeholders were expanded, in the expanded prompt:
+/// every image before a point moves it by its rows less the placeholder.
+fn expanded_points(points: &[usize], images: &[engine::PromptImage]) -> Vec<usize> {
+    points
+        .iter()
+        .map(|&point| images.iter().fold(point, |point, image| if image.start < point { point + image.rows - 1 } else { point }))
+        .collect()
 }
 
 /// Sets the request's stop flag when the owning future is dropped (cancellation).
@@ -268,12 +297,55 @@ impl Runtime {
         // `model.install` events (the card and the model settings show them), instead of a load
         // that fails and leaves the app without a model.
         match self.load(&variant, true).await {
-            Ok(loaded) => self.set_phase(Phase::Ready(loaded)),
+            Ok(loaded) => {
+                let spec = loaded.spec;
+                self.set_phase(Phase::Ready(loaded));
+                self.install_vision_later(spec);
+            }
             Err(error) => {
                 tracing::error!(%error, "model load failed");
                 self.set_phase(Phase::Failed(error));
             }
         }
+    }
+
+    fn vision_enabled(&self) -> bool {
+        self.config.vision.as_deref() != Some("off")
+    }
+
+    fn max_image_pixels(&self) -> u64 {
+        self.config.max_image_pixels.unwrap_or(vision::DEFAULT_MAX_IMAGE_PIXELS).max(vision::PIXELS_PER_ROW * 8)
+    }
+
+    /// Fetch the variant's vision projector beside the loaded model (its own download: the model
+    /// serves meanwhile, and a failure, e.g. offline, leaves it text-only until the next start).
+    fn install_vision_later(self: &Arc<Self>, spec: &'static Spec) {
+        if !self.vision_enabled() || spec.mmproj.is_none() || variants::vision_installed(spec, &self.paths.models_dir).is_ok() {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let cache = VerifyCache::new(&runtime.paths.models_dir);
+            let progress = runtime.install_progress();
+            match variants::install_vision(spec, &runtime.paths.models_dir, &cache, &progress).await {
+                Ok(path) => tracing::info!(path = %path.display(), "vision projector installed; images are accepted"),
+                Err(error) => {
+                    tracing::warn!(%error, variant = spec.id, "the vision projector could not be installed; images stay unavailable");
+                    runtime.publish("model.install", json!({"variant": spec.id, "phase": "failed", "file": "vision", "detail": error}));
+                }
+            }
+        });
+    }
+
+    /// Why images are not accepted now, if they are not.
+    fn vision_unavailable(&self, loaded: &Loaded) -> Option<String> {
+        if !self.vision_enabled() {
+            return Some("image input is switched off (plugin config `vision = \"off\"`)".into());
+        }
+        if loaded.engine.vision.is_none() {
+            return Some("this model has no vision projector".into());
+        }
+        variants::vision_installed(loaded.spec, &self.paths.models_dir).err()
     }
 
     /// The loaded model, once it has loaded (or switched).
@@ -366,6 +438,10 @@ impl Runtime {
             min_context: self.config.min_context_per_slot.unwrap_or(DEFAULT_MIN_CONTEXT_PER_SLOT),
             ctx_total: self.config.ctx_total,
             max_resident: self.config.slots.map(u64::from),
+            vision: (self.vision_enabled() && spec.mmproj.is_some())
+                .then(|| spec.mmproj.map(|mmproj| (dir.join(mmproj.path), self.max_image_pixels())))
+                .flatten(),
+            seeds_dir: Some(self.paths.data_dir.join("seeds")),
         };
         let started = Instant::now();
         let publisher = self.publisher.clone();
@@ -400,13 +476,69 @@ impl Runtime {
         }))
     }
 
-    /// Render and tokenize a conversation, with its reuse points (text only at this stage).
-    fn render(&self, loaded: &Loaded, messages: &[ChatMessage], tools: &[ToolSpec], thinking: &Thinking) -> Result<Prompt, RpcError> {
+    /// Render and tokenize a conversation, with its images and reuse points.
+    async fn render(&self, loaded: &Loaded, messages: &[ChatMessage], tools: &[ToolSpec], thinking: &Thinking) -> Result<Prompt, RpcError> {
+        let mut prompt = self.render_text(loaded, messages, tools, thinking)?;
+        let images: Vec<(&str, &str)> = messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                ContentPart::Image { sha256, path, .. } => Some((sha256.as_str(), path.as_str())),
+                _ => None,
+            })
+            .collect();
+        if images.is_empty() {
+            return Ok(prompt);
+        }
+        if let Some(reason) = self.vision_unavailable(loaded) {
+            return Err(RpcError::invalid_params(format!("this model cannot take images now: {reason}")));
+        }
+        let vision = loaded.engine.vision.as_ref().ok_or_else(|| RpcError::invalid_params("this model takes no images"))?;
+        let pad = loaded.engine.tokenizer.token_to_id("<|image_pad|>").ok_or_else(|| RpcError::internal("the tokenizer has no <|image_pad|> token"))?;
+        let placeholders = prompt.tokens.iter().filter(|token| **token == pad).count();
+        if placeholders != images.len() {
+            return Err(RpcError::invalid_params(format!(
+                "the prompt has {placeholders} image placeholder tokens for {} images (text may not contain the image placeholder)",
+                images.len()
+            )));
+        }
+        let mut shapes = Vec::with_capacity(images.len());
+        for (sha256, path) in &images {
+            let shape = vision.measure(expand_home(path), sha256.to_lowercase()).await.map_err(RpcError::invalid_params)?;
+            shapes.push(shape);
+        }
+        // Each placeholder becomes the image's run of rows.
+        let mut tokens = Vec::with_capacity(prompt.tokens.len() + shapes.iter().map(|shape| shape.rows).sum::<usize>());
+        let mut prompt_images = Vec::with_capacity(images.len());
+        let mut next = images.iter().zip(&shapes);
+        for token in &prompt.tokens {
+            if *token != pad {
+                tokens.push(*token);
+                continue;
+            }
+            let Some(((sha256, path), shape)) = next.next() else { break };
+            let sha256 = sha256.to_lowercase();
+            prompt_images.push(engine::PromptImage {
+                start: tokens.len(),
+                rows: shape.rows,
+                n_pos: shape.n_pos,
+                key: image_key(&sha256, shape.rows),
+                path: expand_home(path),
+                sha256,
+            });
+            tokens.extend(std::iter::repeat_n(pad, shape.rows));
+        }
+        prompt.checkpoints = expanded_points(&prompt.checkpoints, &prompt_images);
+        prompt.shared = prompt.shared.and_then(|point| expanded_points(&[point], &prompt_images).first().copied());
+        prompt.tokens = tokens;
+        prompt.images = prompt_images;
+        Ok(prompt)
+    }
+
+    /// Render and tokenize a conversation (one placeholder token per image), with its reuse points.
+    fn render_text(&self, loaded: &Loaded, messages: &[ChatMessage], tools: &[ToolSpec], thinking: &Thinking) -> Result<Prompt, RpcError> {
         if messages.is_empty() {
             return Err(RpcError::invalid_params("messages is empty"));
-        }
-        if messages.iter().any(|message| !message.parts.is_empty()) {
-            return Err(RpcError::invalid_params("this model takes no images yet"));
         }
         let tool_values: Vec<Value> = tools.iter().map(template::tool_value).collect();
         // The effort announcement goes after every reuse point (see `ChatTemplate::rendering`).
@@ -426,7 +558,7 @@ impl Runtime {
         checkpoints.extend(shared);
         checkpoints.sort_unstable();
         checkpoints.dedup();
-        Ok(Prompt { tokens, checkpoints, shared })
+        Ok(Prompt { tokens, images: Vec::new(), checkpoints, shared })
     }
 
     fn encode(&self, loaded: &Loaded, text: &str) -> Result<Vec<u32>, RpcError> {
@@ -461,7 +593,9 @@ impl Runtime {
             id: 0,
             key,
             prompt: prompt.tokens,
+            images: prompt.images,
             checkpoints: prompt.checkpoints,
+            shared: prompt.shared,
             shared_only,
             idle_only,
             priority,
@@ -580,7 +714,7 @@ impl Runtime {
         if constraints.len() > 1 {
             return Err(RpcError::invalid_params("json_schema, grammar and a forcing tool_choice are exclusive; send one constraint"));
         }
-        let prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking)?;
+        let prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking).await?;
         let key = params
             .cache_key
             .clone()
@@ -609,7 +743,7 @@ impl Runtime {
             return Err(RpcError::new(codes::INVALID_PARAMS, "n_probs is not served yet"));
         }
         let loaded = self.ready().await?;
-        let prompt = Prompt { tokens: self.encode(&loaded, &params.prompt)?, checkpoints: Vec::new(), shared: None };
+        let prompt = Prompt { tokens: self.encode(&loaded, &params.prompt)?, images: Vec::new(), checkpoints: Vec::new(), shared: None };
         let key = params.cache_key.clone().unwrap_or_else(|| format!("complete:{}", uuid::Uuid::new_v4().simple()));
         let work = Work::Generate {
             max_tokens: params.max_tokens,
@@ -632,7 +766,7 @@ impl Runtime {
 
     pub async fn prewarm(&self, params: PrewarmParams, cancel: CancellationToken) -> Result<Value, RpcError> {
         let loaded = self.ready().await?;
-        let prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking)?;
+        let prompt = self.render(&loaded, &params.messages, &params.tools, &params.thinking).await?;
         if params.shared_only && prompt.shared.is_none() {
             return Err(RpcError::invalid_params("shared_only: the messages start with no system block followed by another message"));
         }
@@ -678,7 +812,7 @@ impl Runtime {
 
     pub async fn count(&self, messages: &[ChatMessage], tools: &[ToolSpec], thinking: &Thinking) -> Result<CountResult, RpcError> {
         let loaded = self.ready().await?;
-        Ok(CountResult { tokens: self.render(&loaded, messages, tools, thinking)?.tokens.len() as u32 })
+        Ok(CountResult { tokens: self.render(&loaded, messages, tools, thinking).await?.tokens.len() as u32 })
     }
 
     pub async fn slots(&self) -> Result<SlotsResult, RpcError> {
@@ -699,6 +833,7 @@ impl Runtime {
     pub fn info(&self, loaded: &Loaded) -> ModelInfo {
         let facts = &loaded.engine.loaded;
         let spec = loaded.spec;
+        let vision_unavailable = self.vision_unavailable(loaded);
         ModelInfo {
             model_id: spec.model_id(),
             variant: loaded.variant.clone(),
@@ -737,11 +872,18 @@ impl Runtime {
                 "machine": loaded.machine,
                 "settings": {"batch": crate::fit::BATCH, "micro_batch": crate::fit::MICRO_BATCH},
                 "speculation": {"enabled": facts.draft_tokens > 0, "mtp_layers": facts.geometry.mtp_layers, "draft_tokens": facts.draft_tokens},
-                "input_modalities": ["text"],
+                "input_modalities": if vision_unavailable.is_none() { json!(["text", "image"]) } else { json!(["text"]) },
                 "stop_token_ids": facts.stop_token_ids,
-                "stage": "generation with checkpoints and constraints; shared blocks, hibernation, images and the endpoint come next",
+                "stage": "generation with checkpoints, constraints and images; shared blocks, hibernation and the endpoint come next",
             }),
-            vision: None,
+            vision: loaded.engine.vision.as_ref().map(|handle| VisionInfo {
+                available: vision_unavailable.is_none(),
+                loaded: handle.loaded(),
+                max_image_pixels: handle.max_image_pixels,
+                max_image_tokens: u32::try_from(handle.max_image_pixels / vision::PIXELS_PER_ROW).unwrap_or(u32::MAX),
+                idle_unload_s: vision::IDLE_UNLOAD.as_secs(),
+                detail: vision_unavailable.clone(),
+            }),
         }
     }
 
@@ -782,7 +924,9 @@ impl Runtime {
             return match self.load(variant, true).await {
                 Ok(loaded) => {
                     let info = self.info(&loaded);
+                    let spec = loaded.spec;
                     self.set_phase(Phase::Ready(loaded));
+                    self.install_vision_later(spec);
                     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
                     Ok(SelectResult { variant: variant.to_owned(), previous: String::new(), changed: true, reload_ms: load_ms, unload_ms: 0.0, load_ms, info })
                 }
@@ -793,6 +937,8 @@ impl Runtime {
             };
         };
         if previous.variant == variant {
+            // Selecting the loaded variant fetches its vision projector when it is missing.
+            self.install_vision_later(previous.spec);
             return Ok(SelectResult {
                 variant: variant.to_owned(),
                 previous: previous.variant.clone(),
@@ -822,7 +968,9 @@ impl Runtime {
             Ok(loaded) => {
                 let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
                 let info = self.info(&loaded);
+                let spec = loaded.spec;
                 self.set_phase(Phase::Ready(loaded));
+                self.install_vision_later(spec);
                 Ok(SelectResult {
                     variant: variant.to_owned(),
                     previous: previous_variant,

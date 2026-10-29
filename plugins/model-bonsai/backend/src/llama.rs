@@ -53,6 +53,17 @@ unsafe extern "C" {
     fn bn_state_get(ctx: *mut c_void, dst: *mut u8, size: u64, seq: i32, partial: i32) -> u64;
     fn bn_state_set(ctx: *mut c_void, src: *const u8, size: u64, seq: i32, partial: i32) -> u64;
     fn bn_gpu_memory(free: *mut u64, total: *mut u64, name: *mut c_char, len: usize) -> i32;
+    fn bn_decode_image(ctx: *mut c_void, embd: *const f32, n: i32, n_embd: i32, pos4: *const i32, mrope: i32, seq: i32) -> i32;
+    fn bn_model_n_embd_inp(model: *const c_void) -> i32;
+    fn bn_vision_load(path: *const c_char, model: *const c_void, use_gpu: i32, threads: i32, max_tokens: i32, error: *mut c_char, error_len: usize) -> *mut c_void;
+    fn bn_vision_free(vision: *mut c_void);
+    fn bn_vision_mrope(vision: *const c_void) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn bn_vision_prepare(vision: *mut c_void, rgb: *const u8, nx: u32, ny: u32, n_tokens: *mut i32, n_pos: *mut i32, error: *mut c_char, error_len: usize) -> *mut c_void;
+    fn bn_vision_positions(chunk: *const c_void, out: *mut i32);
+    fn bn_vision_encode(vision: *mut c_void, chunk: *const c_void) -> i32;
+    fn bn_vision_embd(vision: *mut c_void) -> *const f32;
+    fn bn_vision_chunk_free(chunk: *mut c_void);
 }
 
 /// The engine's revision (the vendored fork, see `vendor/llama.cpp/REVISION`).
@@ -139,6 +150,12 @@ impl Model {
     pub fn n_layer_nextn(&self) -> u32 {
         // SAFETY: a live model.
         u32::try_from(unsafe { bn_model_n_layer_nextn(self.ptr.as_ptr()) }).unwrap_or(0)
+    }
+
+    /// Floats in one input embedding row (what an image row carries).
+    pub fn n_embd_inp(&self) -> usize {
+        // SAFETY: a live model.
+        usize::try_from(unsafe { bn_model_n_embd_inp(self.ptr.as_ptr()) }).unwrap_or(0)
     }
 
     /// Floats in one hidden-state row (what the MTP head reads from the target).
@@ -315,6 +332,20 @@ impl Context {
         decode_status(status)
     }
 
+    /// Rows `[from, from + n)` of an image: `embd` holds the image's rows (`n_embd` floats each)
+    /// and `pos4` their absolute positions (t, x, y, z per row); `mrope` as [`Vision::mrope`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_image(&mut self, embd: &[f32], pos4: &[i32], n_embd: usize, from: usize, n: usize, mrope: bool, seq: u32) -> Result<(), String> {
+        if n == 0 || n > self.n_batch || (from + n) * n_embd > embd.len() || (from + n) * 4 > pos4.len() {
+            return Err(format!("image rows {from}..{} do not fit the image or the batch", from + n));
+        }
+        // SAFETY: the slices hold rows `from..from + n` (checked above); n is at most n_batch.
+        let status = unsafe {
+            bn_decode_image(self.ptr.as_ptr(), embd[from * n_embd..].as_ptr(), n as i32, n_embd as i32, pos4[from * 4..].as_ptr(), i32::from(mrope), seq as i32)
+        };
+        decode_status(status)
+    }
+
     /// The logits of the last decoded token that kept them.
     pub fn logits(&mut self) -> &[f32] {
         // SAFETY: after a decode with logits, the shim returns n_vocab floats owned by the context,
@@ -407,5 +438,105 @@ impl Drop for Context {
     fn drop(&mut self) {
         // SAFETY: the context is freed once, before its model (it holds the model's Arc).
         unsafe { bn_context_free(self.ptr.as_ptr()) }
+    }
+}
+
+/// The vision projector (llama.cpp's `mtmd`) for a loaded model: images to embedding rows. Used by
+/// one thread (the vision worker).
+pub struct Vision {
+    ptr: NonNull<c_void>,
+    _model: Arc<Model>,
+    n_embd: usize,
+    mrope: bool,
+}
+
+// SAFETY: the projector is moved to the vision thread and used only there.
+unsafe impl Send for Vision {}
+
+/// An image ready for the encoder: its rows and their positions relative to the first.
+pub struct ImageChunk {
+    ptr: NonNull<c_void>,
+    pub n_tokens: usize,
+    /// Positions the image advances the sequence by.
+    pub n_pos: u32,
+    /// (t, x, y, z) per row, relative to the image's first position.
+    pub positions: Vec<i32>,
+}
+
+// SAFETY: a chunk is plain data owned by whoever holds it.
+unsafe impl Send for ImageChunk {}
+
+impl Drop for ImageChunk {
+    fn drop(&mut self) {
+        // SAFETY: freed once.
+        unsafe { bn_vision_chunk_free(self.ptr.as_ptr()) }
+    }
+}
+
+impl Vision {
+    /// Load `path` for `model`; `max_tokens` caps one image's rows (larger images are downscaled).
+    pub fn load(path: &Path, model: Arc<Model>, gpu: bool, max_tokens: u32) -> Result<Vision, String> {
+        let text = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "projector path contains a NUL byte".to_owned())?;
+        let mut error = vec![0u8; 512];
+        // SAFETY: the path is NUL-terminated; a live model; the error buffer has the given length.
+        let ptr = unsafe {
+            bn_vision_load(text.as_ptr(), model.ptr.as_ptr(), i32::from(gpu), crate::machine::engine_threads(), max_tokens as i32, error.as_mut_ptr().cast(), error.len())
+        };
+        let ptr = NonNull::new(ptr).ok_or_else(|| error_text(&error))?;
+        // SAFETY: a live projector.
+        let mrope = unsafe { bn_vision_mrope(ptr.as_ptr()) } != 0;
+        let n_embd = model.n_embd_inp();
+        Ok(Vision { ptr, _model: model, n_embd, mrope })
+    }
+
+    /// Floats per image row.
+    pub fn n_embd(&self) -> usize {
+        self.n_embd
+    }
+
+    /// The model reads four positions per image row (Qwen's M-RoPE).
+    pub fn mrope(&self) -> bool {
+        self.mrope
+    }
+
+    /// Preprocess an 8-bit RGB image into its chunk (resized as the model's processor does).
+    pub fn prepare(&mut self, rgb: &[u8], width: u32, height: u32) -> Result<ImageChunk, String> {
+        if rgb.len() != width as usize * height as usize * 3 {
+            return Err("the image's pixels do not match its size".into());
+        }
+        let (mut n_tokens, mut n_pos) = (0i32, 0i32);
+        let mut error = vec![0u8; 512];
+        // SAFETY: `rgb` holds width × height × 3 bytes; the out pointers are valid.
+        let ptr = unsafe { bn_vision_prepare(self.ptr.as_ptr(), rgb.as_ptr(), width, height, &mut n_tokens, &mut n_pos, error.as_mut_ptr().cast(), error.len()) };
+        let ptr = NonNull::new(ptr).ok_or_else(|| error_text(&error))?;
+        let n_tokens = usize::try_from(n_tokens).unwrap_or(0);
+        let mut positions = vec![0i32; n_tokens * 4];
+        // SAFETY: the chunk has n_tokens rows; `positions` holds four values per row.
+        unsafe { bn_vision_positions(ptr.as_ptr(), positions.as_mut_ptr()) };
+        Ok(ImageChunk { ptr, n_tokens, n_pos: u32::try_from(n_pos).unwrap_or(0), positions })
+    }
+
+    /// Run the encoder: the chunk's rows, `n_tokens × n_embd` floats.
+    pub fn encode(&mut self, chunk: &ImageChunk) -> Result<Vec<f32>, String> {
+        // SAFETY: a live projector and chunk.
+        let status = unsafe { bn_vision_encode(self.ptr.as_ptr(), chunk.ptr.as_ptr()) };
+        if status != 0 {
+            return Err(format!("the vision encoder failed ({status})"));
+        }
+        // SAFETY: after a successful encode the projector holds n_tokens × n_embd floats.
+        unsafe {
+            let ptr = bn_vision_embd(self.ptr.as_ptr());
+            if ptr.is_null() {
+                return Err("the vision encoder gave no embeddings".into());
+            }
+            Ok(std::slice::from_raw_parts(ptr, chunk.n_tokens * self.n_embd).to_vec())
+        }
+    }
+}
+
+impl Drop for Vision {
+    fn drop(&mut self) {
+        // SAFETY: freed once, before the model it holds.
+        unsafe { bn_vision_free(self.ptr.as_ptr()) }
     }
 }

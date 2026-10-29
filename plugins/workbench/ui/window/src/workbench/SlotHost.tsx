@@ -1,4 +1,5 @@
-import { Activity, Component, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
+import { Activity, Component, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 import { SlotProvider, type UiPlugin } from '@cortex/sdk';
 import { SlotEngine, type Instance } from './engine';
@@ -14,9 +15,9 @@ import { WorkbenchContext } from './context';
 export function SlotHost({ name, props, className, pluginId }: { name: string; props?: Record<string, unknown>; className?: string; pluginId?: string }) {
   const workbench = useContext(WorkbenchContext);
   if (!workbench) throw new Error('SlotHost outside the workbench');
-  const { registry, loadModule, loadStyle, onSwap } = workbench;
+  const { registry, loadModule, loadStyle, missingSdk, onSwap } = workbench;
 
-  const engine = useMemo(() => new SlotEngine(name, loadModule, loadStyle), [name, loadModule, loadStyle]);
+  const engine = useMemo(() => new SlotEngine(name, loadModule, loadStyle, missingSdk), [name, loadModule, loadStyle, missingSdk]);
   useEffect(() => {
     engine.onRecord = onSwap;
     return () => engine.dispose();
@@ -68,8 +69,9 @@ export function SlotHost({ name, props, className, pluginId }: { name: string; p
   const instances = engine.instances();
   const active = engine.active;
   const rejected = [...engine.rejected].join(' ');
-  // Settled: a plugin is mounted, it failed, or none will come (the start-up splash waits for it).
-  const settled = Boolean(active) || Boolean(engine.broken) || (registryLoaded && (!desired || rejected !== ''));
+  // Settled: a plugin is mounted, it failed, it waits for a newer window, or none will come (the
+  // start-up splash waits for it).
+  const settled = Boolean(active) || Boolean(engine.broken) || Boolean(engine.waiting) || (registryLoaded && (!desired || rejected !== ''));
   return (
     <div
       ref={container}
@@ -101,26 +103,28 @@ export function SlotHost({ name, props, className, pluginId }: { name: string; p
         </Activity>
       ))}
       {engine.broken && (
-        <div className="cx-slot-failed">
-          <div className="notice contradiction" role="alert">
-            <span className="kindmark" />
-            <span className="ap lbl">{engine.broken.instance.plugin.id} stopped</span>
-            <p>{engine.broken.reason}</p>
-            <div className="acts">
-              <button className="detent" type="button" onClick={() => engine.retry()}>Mount again</button>
-            </div>
-          </div>
-        </div>
+        <SlotFailure
+          title={`${engine.broken.instance.plugin.id} stopped`}
+          reason={engine.broken.reason}
+          onRetry={() => engine.retry()}
+        />
       )}
-      {!active && !engine.staging && !engine.broken && (
-        <SlotVacancy name={name} desired={desired} registryLoaded={registry.isLoaded()} registryError={registry.error} rejected={rejected !== ''} />
+      {!engine.broken && !active && !engine.staging && registryLoaded && desired && rejected !== '' && (
+        <SlotFailure
+          title={`${desired.id} ${desired.version} could not be mounted`}
+          reason={engine.reasons.get(desired.hash) ?? 'no reason given'}
+          onRetry={() => engine.retryRejected()}
+        />
+      )}
+      {!active && !engine.staging && !engine.broken && !engine.waiting && rejected === '' && (
+        <SlotVacancy name={name} desired={desired} registryLoaded={registry.isLoaded()} registryError={registry.error} />
       )}
     </div>
   );
 }
 
 function engineVersion(engine: SlotEngine): string {
-  return `${engine.active?.key ?? ''}|${engine.staging?.key ?? ''}|${engine.broken ? 'x' : ''}|${engine.rejected.size}`;
+  return `${engine.active?.key ?? ''}|${engine.staging?.key ?? ''}|${engine.broken ? 'x' : ''}|${engine.rejected.size}|${engine.waiting?.plugin.hash ?? ''}`;
 }
 
 function PluginComponent({ instance, name, props }: { instance: Instance; name: string; props?: Record<string, unknown> }) {
@@ -128,18 +132,38 @@ function PluginComponent({ instance, name, props }: { instance: Instance; name: 
   return <Plugin slot={name} {...props} />;
 }
 
-function SlotVacancy({ name, desired, registryLoaded, registryError, rejected }: {
+/**
+ * A slot that failed draws nothing in its place (a band or header keeps its layout); the failure is
+ * a card floating over the window, with its reason and a way to mount it again.
+ */
+function SlotFailure({ title, reason, onRetry }: { title: string; reason: string; onRetry: () => void }) {
+  const [closed, setClosed] = useState(false);
+  const host = document.getElementById('cc') ?? document.body;
+  if (closed) return null;
+  return createPortal(
+    <div className="cx-slot-alert notice contradiction" role="alert">
+      <span className="kindmark" />
+      <span className="ap lbl">{title}</span>
+      <p>{reason}</p>
+      <div className="acts">
+        <button className="detent" type="button" onClick={onRetry}>Mount again</button>
+        <button className="detent" type="button" onClick={() => setClosed(true)}>Close</button>
+      </div>
+    </div>,
+    host,
+  );
+}
+
+function SlotVacancy({ name, desired, registryLoaded, registryError }: {
   name: string;
   desired: UiPlugin | undefined;
   registryLoaded: boolean;
   registryError: string | null;
-  rejected: boolean;
 }) {
   let text: string;
   if (registryError && !registryLoaded) text = `The plugin list is unavailable: ${registryError}`;
   else if (!registryLoaded) text = 'Loading…';
   else if (!desired) text = `No UI plugin fills ${name}.`;
-  else if (rejected) text = `${desired.id} ${desired.version} could not be mounted; see the console for the reason.`;
   else text = 'Loading…';
   return (
     <div className="cx-slot-empty">
