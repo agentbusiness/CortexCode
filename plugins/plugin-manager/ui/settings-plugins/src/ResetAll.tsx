@@ -239,7 +239,7 @@ export function ResetAll() {
   );
 }
 
-interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { status: string }[]; restart?: unknown | null }
+interface CheckStatus { state: string; detail: string; error?: string | null; waiting?: string[]; pending?: unknown[]; round?: { state: string }[]; restart?: unknown | null }
 
 /** Look at the catalog now (update.check): what applies by itself installs, as the updater's popup
  * shows; here one line says what the check found. */
@@ -252,12 +252,14 @@ function CheckUpdates() {
     setFound(null);
     try {
       const status = await client.call<CheckStatus>('update.check', {});
-      const busy = (status.round ?? []).filter((item) => item.status !== 'done' && item.status !== 'failed').length;
+      // A round row is queued | downloading | installing | done | at_restart | failed.
+      const round = status.round ?? [];
+      const busy = round.filter((item) => ['queued', 'downloading', 'installing'].includes(item.state)).length;
       setFound(status.error ? `The check failed: ${status.error}`
         : busy > 0 ? `${busy === 1 ? '1 update' : `${busy} updates`} installing`
         : (status.waiting?.length ?? 0) > 0 ? 'Updates wait for the running work to end'
         : (status.pending?.length ?? 0) > 0 ? 'Updates wait for your answer'
-        : status.restart ? 'Restart to finish the update'
+        : status.restart || round.some((item) => item.state === 'at_restart') ? 'Restart to finish the update'
         : 'Everything is up to date');
     } catch (cause) {
       setFound(errorMessage(cause));
