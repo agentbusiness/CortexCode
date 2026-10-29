@@ -13,7 +13,7 @@ use crate::llama::{self, Model, Vision};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// Default pixel budget per image (about 2,340 rows of 32×32 px); larger images are downscaled.
@@ -56,10 +56,10 @@ enum Job {
 }
 
 pub struct VisionHandle {
-    tx: Option<mpsc::Sender<Job>>,
+    tx: Mutex<Option<mpsc::Sender<Job>>>,
     loaded: Arc<AtomicBool>,
     pub max_image_pixels: u64,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl VisionHandle {
@@ -73,7 +73,7 @@ impl VisionHandle {
             .name("bonsai-vision".into())
             .spawn(move || Worker { mmproj, model, max_rows, vision: None, loaded: flag, shapes: HashMap::new(), kept: VecDeque::new() }.run(rx))
             .map_err(|error| format!("cannot start the vision thread: {error}"))?;
-        Ok(VisionHandle { tx: Some(tx), loaded, max_image_pixels, thread: Some(thread) })
+        Ok(VisionHandle { tx: Mutex::new(Some(tx)), loaded, max_image_pixels, thread: Mutex::new(Some(thread)) })
     }
 
     /// The projector is in memory now.
@@ -94,17 +94,26 @@ impl VisionHandle {
     }
 
     fn send(&self, job: Job) -> Result<(), String> {
-        self.tx.as_ref().ok_or("the vision thread stopped")?.send(job).map_err(|_| "the vision thread stopped".to_owned())
+        let tx = self.tx.lock().map_err(|_| "the vision channel is poisoned".to_owned())?;
+        tx.as_ref().ok_or("the vision thread stopped")?.send(job).map_err(|_| "the vision thread stopped".to_owned())
+    }
+
+    /// Stop the worker and free the projector and its hold on the model (blocks until it has):
+    /// the GPU must hold nothing of the model when the process exits.
+    pub fn shutdown(&self) {
+        // Closing the channel ends the worker.
+        if let Ok(mut tx) = self.tx.lock() {
+            tx.take();
+        }
+        if let Some(thread) = self.thread.lock().ok().and_then(|mut thread| thread.take()) {
+            let _ = thread.join();
+        }
     }
 }
 
 impl Drop for VisionHandle {
     fn drop(&mut self) {
-        // Closing the channel ends the worker, which frees the projector.
-        self.tx.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.shutdown();
     }
 }
 
