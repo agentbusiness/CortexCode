@@ -251,17 +251,26 @@ gh_api() {
 }
 
 # gh_release <tag> <title> <notes> <make_latest: true|false> <prerelease: true|false>: the release
-# id, created when the tag has none (the tag is made on the repository's default branch).
+# id, created when the tag has none (the tag is made on the repository's default branch). GitHub
+# sometimes answers a create with a server error: the tag is looked up again and the create retried.
 gh_release() {
-  local tag="$1" title="$2" notes="$3" latest="$4" prerelease="$5" found body
-  found="$(curl -sSL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$tag")"
-  if [ "$found" = 200 ]; then
-    gh_api GET "/repos/$RELEASE_REPO/releases/tags/$tag" | jq -r .id
-    return
-  fi
+  local tag="$1" title="$2" notes="$3" latest="$4" prerelease="$5" found body created attempt
   body="$(jq -n --arg tag "$tag" --arg title "$title" --arg notes "$notes" --arg latest "$latest" --argjson pre "$prerelease" \
     '{tag_name: $tag, name: $title, body: $notes, make_latest: $latest, prerelease: $pre}')"
-  gh_api POST "/repos/$RELEASE_REPO/releases" "$body" | jq -r .id
+  for attempt in 1 2 3 4; do
+    found="$(curl -sSL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$tag")"
+    if [ "$found" = 200 ]; then
+      gh_api GET "/repos/$RELEASE_REPO/releases/tags/$tag" | jq -r .id
+      return
+    fi
+    if created="$(gh_api POST "/repos/$RELEASE_REPO/releases" "$body")"; then
+      jq -r .id <<<"$created"
+      return
+    fi
+    step "GitHub did not create the release $tag (attempt $attempt of 4); trying again in $((attempt * 15)) s" >&2
+    sleep $((attempt * 15))
+  done
+  die "GitHub did not create the release $tag"
 }
 
 # gh_upload <release id> <file> [asset name]: replaces an asset of the same name.
