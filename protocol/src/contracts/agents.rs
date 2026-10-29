@@ -11,6 +11,11 @@ pub mod methods {
     pub const DELEGATE: &str = "agents.delegate";
     /// Start a named agent on an existing task.
     pub const SPAWN: &str = "agents.spawn";
+    /// [`super::HandoffParams`] -> [`crate::contracts::memory::AgentRecord`]: hand a piece of work
+    /// to a flow (`coding`) in a project (this one or another): a task there and an agent of that
+    /// flow on it, whose session is a child of the asking one. The asking session keeps going;
+    /// the result comes back into it as a note when the work is done (or blocked).
+    pub const HANDOFF: &str = "agents.handoff";
     pub const LIST: &str = "agents.list";
     pub const STEER: &str = "agents.steer";
     pub const STOP: &str = "agents.stop";
@@ -18,6 +23,10 @@ pub mod methods {
     /// agent works on its task again, in its own session (a run cut off resumes; an ended one
     /// continues from what it did).
     pub const RESTART: &str = "agents.restart";
+    /// [`super::CancelParams`] -> [`super::CancelResult`]: a task is cancelled with what hangs on
+    /// it (its subtasks and the tasks waiting for it that have not finished); their agents stop.
+    /// What their work already changed stays in the files.
+    pub const CANCEL: &str = "agents.cancel";
     /// Run a task's contract checks in its workspace and record the verdict.
     pub const VERIFY: &str = "agents.verify";
     /// Merge a verified agent workspace branch into the project.
@@ -33,6 +42,59 @@ pub mod methods {
 pub mod topics {
     /// `{agent, project_id, status, task_id}`
     pub const AGENT_CHANGED: &str = "agents.changed";
+    /// A [`super::Supervise`]: something in a session's delegated work needs that session's
+    /// decision (an agent blocked, a need for the lead, the whole tree done). The chat flow tells
+    /// the session and, when nothing runs in it, wakes it to decide.
+    pub const SUPERVISE: &str = "agents.supervise";
+}
+
+/// What a supervision event is about.
+pub mod events {
+    /// An agent's run ended without its task done (an error, a failed contract, a give-up).
+    pub const BLOCKED: &str = "blocked";
+    /// An agent asked the lead for something on the board (`to: lead`).
+    pub const NEED: &str = "need";
+    /// Every task of the tree is done and verified.
+    pub const TREE_DONE: &str = "tree_done";
+}
+
+/// Published on [`topics::SUPERVISE`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Supervise {
+    /// Unique per event: whichever chat flow instance hears it first tells the session, once.
+    pub id: String,
+    /// The session that delegated the work (the agent's session's parent).
+    pub session_id: String,
+    pub project_id: String,
+    /// One of [`events`].
+    pub event: String,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    /// The run's summary, the failing checks' names or the agent's message.
+    #[serde(default)]
+    pub text: String,
+    /// The failing tests the contract run named, when it named them (compared with the run
+    /// before: the same failure twice is the user's to decide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tests: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelParams {
+    pub project_id: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CancelResult {
+    /// Every task cancelled, the named one first.
+    pub tasks: Vec<String>,
+    /// Agents stopped because their task was cancelled.
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,6 +134,28 @@ pub struct SpawnParams {
     pub role: Option<String>,
     #[serde(default)]
     pub from_session: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// The agent session's flow (absent: the asking session's, else the project's first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HandoffParams {
+    /// The asking session: the work's session is its child, and the result comes back to it.
+    pub from_session: String,
+    /// The project to work in: its id or its name (absent: the asking session's project).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The flow to do the work (absent: the asking session's).
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// What to do, in the asker's words: the task's brief.
+    pub brief: String,
+    /// The task's title (absent: the brief's first line).
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default = "default_mode")]
     pub mode: String,
 }

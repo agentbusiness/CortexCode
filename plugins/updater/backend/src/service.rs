@@ -15,10 +15,10 @@
 //!   the user's own builds and changes included, after one confirmation.
 
 use crate::fetch;
-use cc_protocol::contracts::chatflow::{RunningResult, methods as chatflow_methods};
+use cc_protocol::contracts::chatflow::{RunningResult, verbs as chatflow_verbs};
 use cc_protocol::contracts::frame::{
     BundledResult, InstallManyParams, InstallManyResult, InstallParams, PackageSwapResult, PluginListResult, UpdateStageParams,
-    UpdateStatus as FrameStatus, methods as frame_methods,
+    UpdateStatus as FrameStatus, flows, methods as frame_methods,
 };
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::source::{
@@ -731,12 +731,16 @@ impl Updater {
         cached.as_ref().filter(|(at, _)| at.elapsed() < max_age).map(|(_, outcome)| outcome.clone())
     }
 
-    /// Whether a conversation run is going (an update would cut it off).
+    /// Whether a conversation run is going in any flow (an update would cut it off).
     async fn run_going(&self, ctx: &Ctx) -> bool {
-        match call::<RunningResult>(ctx, chatflow_methods::RUNNING, json!({})).await {
-            Ok(running) => !running.sessions.is_empty(),
-            Err(_) => false,
+        let Ok(list) = call::<PluginListResult>(ctx, frame_methods::PLUGINS_LIST, json!({})).await else { return false };
+        for plugin in list.plugins.iter().filter(|plugin| plugin.state == "active") {
+            let Some(flow) = flows::flow_of(&plugin.category) else { continue };
+            if call::<RunningResult>(ctx, &flows::method(flow, chatflow_verbs::RUNNING), json!({})).await.is_ok_and(|running| !running.sessions.is_empty()) {
+                return true;
+            }
         }
+        false
     }
 
     /// Split what differs from the latest: what applies now, and what asks the user. A build of

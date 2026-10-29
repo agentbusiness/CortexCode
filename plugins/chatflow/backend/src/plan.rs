@@ -136,6 +136,10 @@ pub struct Plan {
     /// `user` for a version the user edited by hand (`chatflow.plan.edit`); empty for the planner's.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub by: String,
+    /// Tasks of the session's open background work this plan takes the place of: cancelled (their
+    /// agents stopped) when the plan is carried out, then cleared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -209,6 +213,7 @@ pub fn replanned(previous: &Plan, doc: PlanDoc, new_tasks: Vec<PlanTask>, note: 
         steps_done: done,
         replans: previous.replans + 1,
         by: String::new(),
+        replaces: Vec::new(),
     }
 }
 
@@ -262,11 +267,10 @@ pub struct Known<'a> {
 /// out (the numbers the model wrote are mapped to the kept ones); a dependency on a later task,
 /// itself or a number that does not exist is dropped, so the graph is acyclic in the order
 /// written; at most `max_tasks`; `covers` keeps known requirement ids, `skills` catalog skills.
-/// Tasks that touch exactly the same files and symbols are one part of the work, not several
-/// (a split is for parts the request names, and those touch different code): each later such task
-/// joins the first one when its prerequisites can still run first (its brief, dependencies,
-/// checks, requirements and skills are kept), and the rest are renumbered.
-/// A task that touches nothing joins the task before it.
+/// Tasks that touch exactly the same files and symbols stay separate small tasks: each later such
+/// task waits for the latest earlier one, so they never run at the same time.
+/// A task that touches nothing joins the task before it (its brief, dependencies, checks,
+/// requirements and skills are kept), and the rest are renumbered.
 pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     let key = |task: &PlanTask| {
         let mut touches: Vec<String> = task.touches.iter().map(|item| item.trim().trim_start_matches("./").to_owned()).filter(|item| !item.is_empty()).collect();
@@ -276,11 +280,13 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     };
     let mut merged: Vec<PlanTask> = Vec::new();
     let mut renumber: HashMap<u32, u32> = HashMap::new();
+    // (task, the earlier task with the same touches it waits for), both in the new numbering.
+    let mut waits: Vec<(u32, u32)> = Vec::new();
     for task in tasks {
         let touches = key(&task);
         // A task that touches nothing changes no code (only runs or reviews): it joins the task
         // before it, whose own checks run its cases.
-        let target = if touches.is_empty() { merged.len().checked_sub(1) } else { merged.iter().position(|kept| key(kept) == touches) };
+        let target = if touches.is_empty() { merged.len().checked_sub(1) } else { None };
         // Moving this task into an earlier one must not move its work before a prerequisite.
         // A dependency already folded into the target is satisfied inside the combined task.
         let target = target.filter(|index| task.depends_on.iter().all(|dependency| {
@@ -303,10 +309,14 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
         }
         let n = merged.len() as u32 + 1;
         renumber.insert(task.n, n);
+        if let Some(same) = merged.iter().rev().find(|kept| !touches.is_empty() && key(kept) == touches) {
+            waits.push((n, same.n));
+        }
         merged.push(PlanTask { n, ..task });
     }
     for task in &mut merged {
-        let mut depends: Vec<u32> = task.depends_on.iter().filter_map(|d| renumber.get(d).copied()).filter(|d| *d < task.n).collect();
+        let same = waits.iter().filter(|(n, _)| *n == task.n).map(|(_, same)| *same);
+        let mut depends: Vec<u32> = task.depends_on.iter().filter_map(|d| renumber.get(d).copied()).chain(same).filter(|d| *d < task.n).collect();
         depends.sort_unstable();
         depends.dedup();
         task.depends_on = depends;

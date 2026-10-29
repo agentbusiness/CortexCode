@@ -14,6 +14,8 @@ export interface Project {
   root: string;
   name: string;
   created_ms: number;
+  /** The flows (ways of working) that work in it: `coding`, later `office`, ... */
+  flows?: string[];
 }
 
 export type SessionKind = 'chat' | 'agent';
@@ -31,6 +33,13 @@ export interface Session {
   status: SessionStatus;
   created_ms: number;
   updated_ms: number;
+  /** The flow the session belongs to, for life (`coding`); its calls go to `chatflow-<flow>`. */
+  flow?: string;
+}
+
+/** A session's flow: its calls go to `chatflow-<flow>.<verb>`. Records from before flows: coding. */
+export function flowMethod(flow: string | undefined | null, verb: string): string {
+  return `chatflow-${flow || 'coding'}.${verb}`;
 }
 
 export interface JournalEntry {
@@ -57,6 +66,8 @@ export interface UiPlugin {
    * section, a settings panel), and where it sorts among its slot family (lower first). */
   label?: string;
   order?: number;
+  /** From the manifest: the flow whose sessions it shows (`coding`), when it belongs to one. */
+  flow?: string;
 }
 
 export interface PluginInfo {

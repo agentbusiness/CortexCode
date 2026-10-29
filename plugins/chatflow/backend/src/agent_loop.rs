@@ -298,8 +298,53 @@ pub async fn deliver_steers(journal: &mut Journal) -> Result<Vec<String>, RpcErr
     Ok(pending.iter().map(|steer| str_field(&steer.data, "text").trim().to_owned()).filter(|text| !text.is_empty()).collect())
 }
 
-/// Deliver board messages addressed to this agent since the last delivery.
-async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str) -> Result<(), RpcError> {
+/// An agent's team: the other open tasks of its tree (same parent), by id, with its own task.
+pub struct Team {
+    pub me: Task,
+    pub others: HashMap<String, Task>,
+}
+
+impl Team {
+    /// The tree of `task` as memory holds it now (no tree: a team of one).
+    pub async fn of(env: &RunEnv, task: &Task) -> Team {
+        let mut others = HashMap::new();
+        if let Some(parent) = &task.parent_id
+            && let Ok(list) = env.host.get::<cc_protocol::contracts::memory::TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": task.project_id, "parent_id": parent})).await
+        {
+            others = list.tasks.into_iter().filter(|other| other.id != task.id).map(|other| (other.id.clone(), other)).collect();
+        }
+        Team { me: task.clone(), others }
+    }
+
+    /// The team as the agent's stage line names it: each other agent with its task (none: empty).
+    pub fn live(&self, data: &Dataset) -> String {
+        let members: Vec<String> = self
+            .others
+            .values()
+            .filter(|task| !matches!(task.status.as_str(), "done" | "cancelled"))
+            .filter_map(|task| task.assignee.as_ref().map(|name| data.text("team_member", &[("name", name), ("title", &task.title)])))
+            .collect();
+        if members.is_empty() { String::new() } else { data.text("team_live", &[("members", &members.join(", "))]) }
+    }
+
+    /// Whether a task's work bears on this agent's: one waits for the other, or they touch the
+    /// same files or symbols.
+    fn related(&self, other: &Task) -> bool {
+        self.me.depends_on.contains(&other.id)
+            || other.depends_on.contains(&self.me.id)
+            || other.touches.iter().any(|touch| self.me.touches.contains(touch))
+    }
+}
+
+/// Board kinds that ask or decide something: from a teammate they always reach the agent.
+const ASKING_KINDS: &[&str] = &["need", "question", "decision", "proposal"];
+
+/// Deliver the board messages that bear on this agent since the last delivery (the host decides,
+/// so the model sees few): those addressed to it; from its team, what asks or decides something
+/// and what is about a task related to its own (one waits for the other, or they touch the same
+/// code); from outside its team, only a claim on code it touches. A newer message from the same
+/// author about the same task replaces the older one.
+async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str, team: Option<&Team>) -> Result<(), RpcError> {
     let since = journal
         .entries()
         .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "board")
@@ -313,14 +358,49 @@ async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str) -> Resul
     else {
         return Ok(());
     };
+    let mut kept: Vec<&cc_protocol::contracts::memory::BoardMessage> = Vec::new();
     for message in list.messages.iter().filter(|message| message.author != name && message.ts_ms > since) {
+        let relevant = match (&message.to, team) {
+            (Some(_), _) | (None, None) => true,
+            (None, Some(team)) => {
+                let about = message.refs.iter().find_map(|reference| team.others.get(reference));
+                match about {
+                    Some(task) => ASKING_KINDS.contains(&message.kind.as_str()) || team.related(task),
+                    None if message.kind == "claim" => match message.refs.first() {
+                        Some(reference) => env
+                            .host
+                            .get::<Task>(memory_methods::TASK_GET, json!({"id": reference}))
+                            .await
+                            .is_ok_and(|task| task.touches.iter().any(|touch| team.me.touches.contains(touch))),
+                        None => false,
+                    },
+                    // The lead and the user speak to the whole team.
+                    None => matches!(message.author.as_str(), "lead" | "user" | "chat"),
+                }
+            }
+        };
+        if !relevant {
+            continue;
+        }
+        let topic = message.refs.first();
+        kept.retain(|earlier| !(earlier.author == message.author && earlier.refs.first() == topic && topic.is_some()));
+        kept.push(message);
+    }
+    // Each message is recorded with its own time; the newest of the whole batch marks the delivery
+    // so skipped ones are not looked at again.
+    let newest = list.messages.iter().map(|message| message.ts_ms).max().unwrap_or(since);
+    for message in &kept {
         let text = env.data.text("board_message", &[("author", &message.author), ("kind", &message.kind), ("text", &message.text)]);
         journal
             .append(
                 kinds::NOTE,
-                json!({"text": text, "purpose": "board", "run_id": env.run_id, "host_message": true, "board_ts": message.ts_ms}),
+                json!({"text": text, "purpose": "board", "run_id": env.run_id, "host_message": true, "board_ts": message.ts_ms.max(newest)}),
             )
             .await?;
+    }
+    if kept.is_empty() && newest > since {
+        // Nothing relevant: the mark moves on without a message to the model.
+        journal.append(kinds::NOTE, json!({"text": "", "purpose": "board", "run_id": env.run_id, "host_message": false, "board_ts": newest})).await?;
     }
     Ok(())
 }
@@ -728,6 +808,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // do not check the change (seen: tests that passed on wrong code, the fix taken as done).
     let mut last_pass: Option<(String, u64)> = None;
     let mut baseline_checked = false;
+    // An agent works beside the others of its tree: it hears what bears on its task from them.
+    let agent_team = match (&spec.kind, &spec.task) {
+        (LoopKind::Agent { .. }, Some(task)) => Some(Team::of(env, task).await),
+        _ => None,
+    };
     let (stage, live) = match &spec.kind {
         // With a spec, the closing summary states coverage per open requirement (the self-review).
         // No per-requirement review in the closing summary (it made the model narrate instead of
@@ -740,7 +825,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // progress report at "Current stage: ASK" while the tool had 168 lines open).
         LoopKind::Question => ("ASK", if crate::flow::work_open_round(&entries, &env.run_id) { env.data.text("work_open_stage", &[]) } else { String::new() }),
         LoopKind::Discover => ("DISCOVER", String::new()),
-        LoopKind::Agent { name } => ("TASK", env.data.text("agent_live", &[("name", name)])),
+        LoopKind::Agent { name } => ("TASK", format!("{}{}", agent_team.as_ref().map(|team| team.live(&env.data)).unwrap_or_default(), env.data.text("agent_live", &[("name", name)]))),
     };
     env.set_stage("act");
     let mut turns = 0u32;
@@ -781,7 +866,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
         }
         if let LoopKind::Agent { name } = &spec.kind {
-            deliver_board(journal, env, name).await?;
+            deliver_board(journal, env, name, agent_team.as_ref()).await?;
         }
         // The guide of a language the work just reached its first file of, before the next step.
         if !matches!(spec.kind, LoopKind::Discover) {
@@ -848,7 +933,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &what, research), true).await?;
                         effort = max_effort(&effort, &env.data.effort.escalate);
                     }
-                    Verdict::Fine | Verdict::Reread(_) => {}
+                    Verdict::Fine | Verdict::Reread(_) | Verdict::Rerun(_) => {}
                 }
                 journal.note(&env.run_id, "model_error", &env.data.text("generation_failed", &[("error", &error.message)]), true).await?;
                 continue;
@@ -966,6 +1051,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             if report.ok {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
             }
+            // Only tests that failed before the work fail, and a later task waits for this one
+            // (the plan's last task fixes what failed before): this task is done.
+            if crate::checks::no_worse(journal, &report) && crate::checks::awaited(env, task).await {
+                journal.note(&env.run_id, "verify", &env.data.text("checks_no_worse", &[]), false).await?;
+                // In the project itself it is done now; an agent's workspace waits for the merge
+                // steward, which judges it the same way after merging.
+                if env.scope.workspace == env.scope.root {
+                    let _ = env.host.call(memory_methods::TASK_UPDATE, json!({"id": task.id, "status": "done"})).await;
+                }
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
+            }
             let failures = report_text(&env.data, &report);
             match detector.observe("contract", &failures) {
                 Verdict::Stop(_) => {
@@ -976,7 +1072,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 Verdict::Replan(_) => {
                     journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_checks", &[]), research), true).await?;
                 }
-                Verdict::Fine | Verdict::Reread(_) => {}
+                Verdict::Fine | Verdict::Reread(_) | Verdict::Rerun(_) => {}
             }
             let failures = format!("{failures}{}", crate::checks::failed_before(&env.data, journal, &env.run_id, &report));
             journal.note(&env.run_id, "verify", &prompts::contract_failure(&env.data, &failures), true).await?;
@@ -1257,6 +1353,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         } else if let Some(Verdict::Reread(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Reread(_))) {
             // A reread is harmless: said once, plainly, with the step to take.
             journal.note(&env.run_id, "repeat", &env.data.text("reread", &[("what", what)]), true).await?;
+        } else if let Some(Verdict::Rerun(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Rerun(_))) {
+            // A passing check run again with nothing changed: the step is to finish.
+            journal.note(&env.run_id, "repeat", &env.data.text("rerun", &[("what", what)]), true).await?;
         }
         // A plan task that used its calls without finishing is stuck: it ends here and the flow
         // writes the tasks still to do again with another approach, from where the model says it is.

@@ -8,4 +8,4 @@ Make the change with your tools. Commands run in the repository root.
 2. Change only what the task needs. Use anchored edits for existing files and content for new files.
 3. Verify the change as the request and project contract permit. Create or run tests only when they authorize it; otherwise use the permitted checks.
 4. Investigate failures against the request and the code. Do not change expected results merely to match output. Report checks that cannot run and choices the evidence leaves open.
-5. When the work is complete, report what changed, what each permitted check showed and any remaining limits.
+5. Names, style and warnings in code your checks pass are not part of the work: as soon as the checks pass, report what changed, what each permitted check showed and any remaining limits.

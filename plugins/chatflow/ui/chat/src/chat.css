@@ -5,7 +5,13 @@
 #cc .cx-chat .conversation-scroll{padding:24px 8px 0 0;}
 /* One width for everything in a turn: the feed's. No element narrows itself (the theme's 64ch on
    your message is undone here), so prose, the route detail, steps and cards line up. */
-#cc .cx-chat .conversation-feed{max-width:820px;}
+#cc .cx-chat .conversation-feed{max-width:820px;min-width:0;}
+/* Nothing in the feed runs past it: any text may break inside a long unbroken run (a compiler's
+   ^^^^ underline, a path, a signature), which also lets every grid and flex box shrink to the feed.
+   Text kept as written (code, logs) scrolls inside its own box instead. */
+#cc .cx-chat .conversation-feed{overflow-wrap:anywhere;}
+#cc .cx-chat .conversation-feed pre{max-width:100%;overflow:auto;}
+#cc .cx-chat .conversation-feed :is(.notice,.cx-activity,.cx-edits,.cx-test-results,.turn,.message-body){min-width:0;max-width:100%;}
 #cc .cx-chat .turn.you .say{max-width:none;white-space:pre-wrap;}
 #cc .cx-chat .prose{max-width:none;}
 #cc .cx-lead{font-size:16px;margin-top:12px;}

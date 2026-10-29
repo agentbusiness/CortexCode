@@ -6,7 +6,7 @@
 //
 // It builds src/index.tsx as one ES module library into dist/ (index.js, style.css, chunks/),
 // keeps the modules the workbench shares through its import map external (React, ReactDOM, the
-// JSX runtime and @cortex/sdk), and writes dist/manifest.json — {id, version, slot, entry, css, label?, order?,
+// JSX runtime and @cortex/sdk), and writes dist/manifest.json — {id, version, slot, entry, css, label?, order?, flow?,
 // build, sdk_imports} — from the package's `cortex` field and the names the bundle imports from the SDK. The frame serves a plugin from that directory.
 
 import { createHash } from 'node:crypto';
@@ -41,7 +41,8 @@ export function pluginIdentity(dir) {
   if (typeof pkg.version !== 'string') throw new Error(`${pkg.name}: package.json needs a version`);
   if (cortex.label !== undefined && (typeof cortex.label !== 'string' || !cortex.label.trim())) throw new Error(`${pkg.name}: cortex.label must be a non-empty string`);
   if (cortex.order !== undefined && !Number.isFinite(cortex.order)) throw new Error(`${pkg.name}: cortex.order must be a number`);
-  return { name: pkg.name, version: pkg.version, id: cortex.id, slot: cortex.slot, label: cortex.label, order: cortex.order };
+  if (cortex.flow !== undefined && (typeof cortex.flow !== 'string' || !/^[a-z0-9-]+$/.test(cortex.flow))) throw new Error(`${pkg.name}: cortex.flow must be a flow's name like "coding"`);
+  return { name: pkg.name, version: pkg.version, id: cortex.id, slot: cortex.slot, label: cortex.label, order: cortex.order, flow: cortex.flow };
 }
 
 /** Content hash of what the bundle is built from: identical sources give an identical bundle. */
@@ -99,6 +100,8 @@ function manifestPlugin(dir, identity, stamp) {
         // How hosts present the plugin (a tab, a section, a settings panel), when it says.
         ...(identity.label !== undefined ? { label: identity.label } : {}),
         ...(identity.order !== undefined ? { order: identity.order } : {}),
+        // The flow whose sessions it shows, when it belongs to one (the window picks it for them).
+        ...(identity.flow !== undefined ? { flow: identity.flow } : {}),
         // What the bundle needs from the window's SDK; the workbench waits for a window that has it.
         sdk_imports: imports,
       };

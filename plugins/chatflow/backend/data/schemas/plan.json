@@ -37,7 +37,7 @@
               "type": "string",
               "maxLength": 200
             },
-            "maxItems": 12
+            "maxItems": 4
           },
           "depends_on": {
             "type": "array",
@@ -93,6 +93,15 @@
         "additionalProperties": false
       }
     },
+    "replaces": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "@open_work"
+        ]
+      },
+      "maxItems": 24
+    },
     "note": {
       "type": "string"
     }
@@ -104,6 +113,7 @@
     "architecture",
     "risks",
     "tasks",
+    "replaces",
     "note"
   ],
   "additionalProperties": false

@@ -18,7 +18,7 @@ React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
 - **Workbench state read:** `projectId`, `sessionId`
 - **Workbench state written:** `board.focus`, `board.view`, `pane.tab`
 - **Own durable state (survives hot swaps):** none
-- **Frame methods called:** `memory.task.list`
+- **Frame methods called:** `agents.cancel`, `agents.list`, `agents.restart`, `memory.task.list`
 - **Topics followed:** `agents.changed`, `memory.task.changed`
 
 Styles use the theme's tokens and primitives only (`ui/verify/tokens.mjs` checks). Nothing is

@@ -26,6 +26,7 @@ pub mod journal;
 pub mod learn;
 pub mod live;
 pub mod llm;
+pub mod manage;
 pub mod night;
 pub mod plan;
 pub mod prewarm;

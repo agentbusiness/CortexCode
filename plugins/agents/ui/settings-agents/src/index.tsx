@@ -11,7 +11,7 @@ interface Scheduler {
   running: string[];
   queued: string[];
   max_parallel: number;
-  detail?: { why?: string; bounds?: { min?: number; max?: number }; model?: { slots?: number } };
+  detail?: { why?: string; bounds?: { min?: number; max?: number }; model?: { slots?: number; room?: number } };
 }
 
 function AgentDefaults() {
@@ -31,7 +31,7 @@ function AgentDefaults() {
           <p className="cx-settings-line" data-limit={scheduler.data.max_parallel}>{scheduler.data.max_parallel} {scheduler.data.max_parallel === 1 ? 'agent runs' : 'agents run'} at once now · {scheduler.data.running.length} running, {scheduler.data.queued.length} queued.</p>
           <p className="hint">
             Not a setting: the limit adapts {scheduler.data.detail?.bounds?.max ? `between ${scheduler.data.detail?.bounds?.min ?? 1} and ${scheduler.data.detail.bounds.max}` : `from ${scheduler.data.detail?.bounds?.min ?? 1} up, with no ceiling`}
-            {scheduler.data.detail?.model?.slots ? `, starting at the ${scheduler.data.detail.model.slots} conversations the model holds resident, minus one for you` : ''}. It steps down only when agents measurably slow your own chat, and up while more agents raise throughput.
+            {scheduler.data.detail?.model?.room ? `, starting at the ${scheduler.data.detail.model.room} full-size conversations the model's memory holds, minus one for you` : ''}. It steps down when agents measurably slow your own chat or push each other out of memory, and up while more agents raise throughput.
             {scheduler.data.detail?.why && scheduler.data.detail.why !== 'initial limit' ? <> Last change: {scheduler.data.detail.why}.</> : null}
           </p>
         </>

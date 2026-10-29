@@ -108,6 +108,9 @@ pub struct Card {
     /// `cortexcode` (or another app on the mesh), and its version.
     pub software: String,
     pub version: String,
+    /// The flows (ways of working) this computer runs: `coding`, later `office`, ...
+    #[serde(default)]
+    pub flows: Vec<String>,
     pub chip: String,
     pub memory_bytes: u64,
     pub cpu_cores: u32,
@@ -161,6 +164,9 @@ pub struct ProjectCard {
     #[serde(default)]
     pub description: String,
     pub created_ms: u64,
+    /// The flows that work in it.
+    #[serde(default = "crate::contracts::frame::flows::default_flows")]
+    pub flows: Vec<String>,
 }
 
 /// A project of the network and the computer it lives on.

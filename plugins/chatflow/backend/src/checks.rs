@@ -238,6 +238,68 @@ pub fn failed_before(data: &Dataset, journal: &Journal, run_id: &str, report: &V
     lines
 }
 
+/// Whether the work made nothing worse: every failed check of `report` fails only tests that a
+/// baseline of this session named as failing for the same command before (both lists known).
+/// Unknown failing tests (a build error, a report without names) are never "nothing worse".
+pub fn no_worse(journal: &Journal, report: &VerifyReport) -> bool {
+    let failed: Vec<_> = report.checks.iter().filter(|check| !check.ok).collect();
+    !failed.is_empty()
+        && failed.iter().all(|check| {
+            let (Some(now), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) else { return false };
+            let before = journal
+                .entries()
+                .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "baseline")
+                .filter_map(|note| note.data.get("failed_tests")?.get(&spec.spec)?.as_array().cloned())
+                .last();
+            before.is_some_and(|before| now.iter().all(|name| before.iter().any(|known| known.as_str() == Some(name.as_str()))))
+        })
+}
+
+/// Whether a later task of the same plan still waits for `task`: such a task is done when it made
+/// nothing worse, and what failed before is the work of the task that waits (the plan's last task,
+/// "fix what failed before", waits for them all). A task nothing waits for must pass its checks.
+pub async fn awaited(env: &RunEnv, task: &Task) -> bool {
+    let Some(parent) = &task.parent_id else { return false };
+    let Ok(list) = env.host.get::<cc_protocol::contracts::memory::TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": task.project_id, "parent_id": parent})).await else { return false };
+    list.tasks.iter().any(|other| other.id != task.id && other.depends_on.contains(&task.id) && !matches!(other.status.as_str(), "done" | "cancelled" | "failed"))
+}
+
+/// The commands that failed in this run's newest baseline, with their failing tests (names when
+/// known): what the plan's last task fixes. Empty when the baseline passed or none ran.
+pub fn baseline_failures(journal: &Journal, run_id: &str) -> Vec<(String, Option<Vec<String>>)> {
+    let Some(note) = run_notes(journal, run_id, "baseline").last().copied() else { return Vec::new() };
+    let Some(map) = note.data.get("failed_tests").and_then(Value::as_object) else { return Vec::new() };
+    map.iter()
+        .map(|(command, names)| (command.clone(), names.as_array().map(|names| names.iter().filter_map(Value::as_str).map(str::to_owned).collect())))
+        .collect()
+}
+
+/// Run `checks` on the work before any change and journal it as this run's baseline (no decision:
+/// the plan's checks stand as written). For a plan that goes to agents, whose runs settle their own
+/// checks later.
+pub async fn record_baseline(env: &RunEnv, journal: &mut Journal, checks: &[String]) -> Result<(), RpcError> {
+    if checks.is_empty() || !run_notes(journal, &env.run_id, "baseline").is_empty() {
+        return Ok(());
+    }
+    let current = contract::contract_from(checks);
+    let (report, _) = contract::verify(&env.host, "baseline", &env.scope.workspace, &current, &env.stops.any()).await?;
+    journal
+        .append(
+            kinds::NOTE,
+            json!({
+                "text": report_text(&env.data, "baseline", &report),
+                "purpose": "baseline",
+                "run_id": env.run_id,
+                "host_message": false,
+                "passed": report.checks.iter().filter(|check| check.ok).count(),
+                "checks": report.checks.len(),
+                "failed_tests": failed_tests_by_command(&report),
+            }),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// The baseline output a proposal made before the work rests on.
 pub fn baseline_evidence(journal: &Journal, run_id: &str) -> String {
     run_notes(journal, run_id, "baseline").last().map(|note| str_field(&note.data, "text").to_owned()).unwrap_or_default()

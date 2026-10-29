@@ -303,7 +303,7 @@ async fn run_arm(host: &Host, paths: &Paths, replayer: &dyn Replayer, c: &Candid
     let project_id = str_field(&project, "id").to_owned();
     let head: String = c.item.name.chars().take(60).collect();
     let session = host
-        .session_create(&SessionCreateParams { project_id, kind: SessionKind::Chat, title: format!("Replay {arm}: {head}"), agent: None, parent: None, workspace: None, task_id: None })
+        .session_create(&SessionCreateParams { project_id, kind: SessionKind::Chat, title: format!("Replay {arm}: {head}"), agent: None, parent: None, workspace: None, task_id: None, flow: Some(crate::chatflow::FLOW.to_owned()) })
         .await
         .map_err(|error| error.message)?;
     check()?;

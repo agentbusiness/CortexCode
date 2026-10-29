@@ -20,6 +20,7 @@ import {
   useQuery,
   useSelection,
   useShared,
+  flowMethod,
   type Session,
 } from '@cortex/sdk';
 import type { SecurityChanged, SecurityFinding, SecurityFindingDetail, SecurityStatus, SecuritySummary, SecurityTraceStep } from './types';
@@ -117,7 +118,7 @@ function Security() {
   const startSession = async (title: string, text: string): Promise<string> => {
     const created = await client.call<Session>('frame.session.create', { project_id: projectId, kind: 'chat', title });
     setShared('chat.stick', Date.now());
-    await client.call('chatflow.turn', { session_id: created.id, text, mode });
+    await client.call(flowMethod(created.flow, 'turn'), { session_id: created.id, text, mode });
     return created.id;
   };
 

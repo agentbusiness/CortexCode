@@ -10,8 +10,8 @@ use crate::history::{History, Recorded, same_content};
 use crate::native::NativeDelivery;
 use crate::native::helper::NativeActivation;
 use crate::prefs::{self, Prefs, kind_info};
-use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, methods as chatflow_methods};
-use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, Project, Session, SessionKind, kinds as entry_kinds, methods as frame_methods};
+use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, verbs as chatflow_verbs};
+use cc_protocol::contracts::frame::{JournalEntry, JournalReadResult, Project, Session, SessionKind, flows, kinds as entry_kinds, methods as frame_methods};
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::methods as memory_methods;
 use cc_protocol::contracts::notify::{
@@ -682,7 +682,12 @@ impl Notifier {
             && n.kind == kinds::APPROVAL
             && let (Some(session_id), Some(seq)) = (n.target.get("session_id").and_then(Value::as_str), n.target.get("approval_seq").and_then(Value::as_u64))
         {
-            match self.call(chatflow_methods::APPROVE, json!({"session_id": session_id, "seq": seq, "approve": true})).await {
+            // The session's own flow answers it.
+            let flow = match self.call(frame_methods::SESSION_GET, json!({"id": session_id})).await {
+                Ok(session) => session.get("flow").and_then(Value::as_str).unwrap_or(flows::CODING).to_owned(),
+                Err(_) => flows::default_flow(),
+            };
+            match self.call(&flows::method(&flow, chatflow_verbs::APPROVE), json!({"session_id": session_id, "seq": seq, "approve": true})).await {
                 Ok(_) => tracing::info!(session_id, seq, "approved from the notification"),
                 Err(error) => tracing::warn!(%error, session_id, seq, "the notification's Approve did not reach the chat flow"),
             }

@@ -222,6 +222,12 @@ schema = "schemas/checks.json"
 effort = "none"
 sampling = "decision"
 
+[stage.MANAGE]
+rules = "manage"
+schema = "schemas/manage.json"
+effort = "none"
+sampling = "decision"
+
 [stage.REPLY]
 rules = "reply"
 effort = "decided"

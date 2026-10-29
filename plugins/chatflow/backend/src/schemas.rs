@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
-pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "PLAN", "IDEATE", "IMPLEMENT"];
+pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "MANAGE", "PLAN", "IDEATE", "IMPLEMENT"];
 pub const DECISIONS: &[&str] = &["MORE", "ANSWER", "DO", "DELEGATE", "PLAN"];
 
 /// The shape of a constrained output.
@@ -54,6 +54,11 @@ pub const GROUNDING_PLACEHOLDER: &str = "@grounding";
 /// apply to the project, filled at run time): a decision's `checks` can only be those, never a
 /// command the model writes, so no check carries an expected value the model worked out.
 pub const VERIFIERS_PLACEHOLDER: &str = "@verifiers";
+/// Placeholder of an enum of the agents a session started whose work is still open (MANAGE).
+pub const AGENTS_PLACEHOLDER: &str = "@agents";
+/// Placeholder of a pick of a session's open background work (a plan's `replaces`): a plan can
+/// only replace work that exists; none open removes the property.
+pub const OPEN_WORK_PLACEHOLDER: &str = "@open_work";
 
 impl Shape {
     /// The top-level properties written as free text (a plain string, gated or not), in order:
@@ -447,6 +452,28 @@ pub struct Review {
     pub replan: String,
 }
 
+/// MANAGE: what happens to a session's background agents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Manage {
+    #[serde(default)]
+    pub actions: Vec<ManageAction>,
+    #[serde(default)]
+    pub replan: String,
+    #[serde(default)]
+    pub brief: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ManageAction {
+    #[serde(default)]
+    pub agent: String,
+    /// stop | restart | message
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Checks {
     #[serde(default)]
@@ -500,6 +527,9 @@ pub struct PlanOutput {
     pub risks: Vec<String>,
     #[serde(default)]
     pub tasks: Vec<PlanTaskOutput>,
+    /// Open background work this plan takes the place of (labels of the `@open_work` pick).
+    #[serde(default)]
+    pub replaces: Vec<String>,
     #[serde(default)]
     pub note: String,
 }

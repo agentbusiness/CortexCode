@@ -53,7 +53,6 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("tools", "tools@1"),
     ("vcs", "vcs@1"),
     ("terminal", "terminal@1"),
-    ("chatflow", "chatflow@1"),
     ("agents", "agents@1"),
     ("browser", "browser@1"),
     ("source", "source@1"),
@@ -67,8 +66,9 @@ pub const CATEGORIES: &[(&str, &str)] = &[
 /// Families: any number of plugins, each in its own category `<family>-<name>` (lowercase letters,
 /// digits and `-`), all speaking the family's contract. One language plugin per language:
 /// `lang-rust`, `lang-go`, ... all serve `lang@1`; one skills plugin per body of know-how:
-/// `skills-engineering`, ... all serve `skills@1`.
-pub const FAMILIES: &[(&str, &str)] = &[("lang", "lang@1"), ("skills", "skills@1")];
+/// `skills-engineering`, ... all serve `skills@1`. One chat flow per way of working:
+/// `chatflow-coding`, later `chatflow-office`, ... all serve `chatflow@1` ([`frame::flows`]).
+pub const FAMILIES: &[(&str, &str)] = &[("lang", "lang@1"), ("skills", "skills@1"), ("chatflow", "chatflow@1")];
 
 /// The contract a category speaks (`vcs` -> `vcs@1`, `lang-go` -> `lang@1`), None when unknown.
 pub fn contract_of(category: &str) -> Option<&'static str> {

@@ -1,24 +1,31 @@
 //! `chatflow@1`: the conversation and agent loop (router -> host reads -> decide -> act/reply).
 //!
+//! A family: each way of working is its own plugin in its own category (`chatflow-coding`), and a
+//! session's calls go to its flow's category (`chatflow-<flow>.<verb>`, [`super::frame::flows`]).
+//! [`verbs`] are the method names without the category. Event topics stay `chatflow.*` for every
+//! flow (their data names the session).
+//!
 //! All progress is written to the session journal through the frame; these methods return quickly
 //! (except `chatflow.agent_run`, which runs an agent loop to completion for the agents plugin).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub mod methods {
+/// The methods every flow serves, without the category: call them as
+/// `frame::flows::method(flow, verbs::TURN)`.
+pub mod verbs {
     /// Start a foreground turn from a user message. Returns immediately with the run id.
-    pub const TURN: &str = "chatflow.turn";
+    pub const TURN: &str = "turn";
     /// Steer a running session (`steer`: inject at the next tool boundary; `followup`: after the run).
-    pub const STEER: &str = "chatflow.steer";
-    pub const CANCEL: &str = "chatflow.cancel";
-    pub const STATE: &str = "chatflow.state";
+    pub const STEER: &str = "steer";
+    pub const CANCEL: &str = "cancel";
+    pub const STATE: &str = "state";
     /// `{}` -> [`super::RunningResult`]: the sessions with a run going now (an update waits for none).
-    pub const RUNNING: &str = "chatflow.running";
+    pub const RUNNING: &str = "running";
     /// Run an agent loop on a task in a session to completion (streams progress items).
-    pub const AGENT_RUN: &str = "chatflow.agent_run";
+    pub const AGENT_RUN: &str = "agent_run";
     /// Answer a pending approval (ask mode): [`super::ApproveParams`] -> `{state}`.
-    pub const APPROVE: &str = "chatflow.approve";
+    pub const APPROVE: &str = "approve";
     /// Put a message attachment into the content-addressed attachment store:
     /// [`super::AttachmentPutParams`] -> [`super::AttachmentPutResult`]. Bytes (a pasted screenshot
     /// the shell wrote to `$CORTEX_HOME/attachments/incoming/`, or base64 `data` where there is no
@@ -26,50 +33,50 @@ pub mod methods {
     /// project is referenced by its path (nothing is copied, nothing is written into the
     /// repository); a file from elsewhere is copied into the store. The shape is the planned
     /// `frame.attachment.put`'s, so the store can move to the frame without reshaping callers.
-    pub const ATTACHMENT_PUT: &str = "chatflow.attachment.put";
+    pub const ATTACHMENT_PUT: &str = "attachment.put";
     /// The user's edit of the session's spec: [`super::SpecUpdateParams`] -> `{version}` (a new
     /// `spec` entry; requirements without an id get the next free one).
-    pub const SPEC_UPDATE: &str = "chatflow.spec.update";
+    pub const SPEC_UPDATE: &str = "spec.update";
     /// Write the current spec into the repository as `docs/specs/<slug>.md` (the session's
     /// workspace): [`super::SessionParams`] -> `{path}`.
-    pub const SPEC_SAVE: &str = "chatflow.spec.save";
+    pub const SPEC_SAVE: &str = "spec.save";
     /// Approve a draft plan or return an approved one to draft: [`super::PlanUpdateParams`] ->
     /// `{status, changed}`.
-    pub const PLAN_UPDATE: &str = "chatflow.plan.update";
+    pub const PLAN_UPDATE: &str = "plan.update";
     /// Hand the session's open plan to the task and agent machinery (a turn whose route is
     /// IMPLEMENT): [`super::PlanRefParams`] -> [`super::TurnResult`].
-    pub const PLAN_IMPLEMENT: &str = "chatflow.plan.implement";
+    pub const PLAN_IMPLEMENT: &str = "plan.implement";
     /// Accept or reject a proposed decision: [`super::DecisionAnswerParams`] -> `{state, changed}`.
     /// An accepted decision joins the spec's `decisions` (or the session's decision list) and the
     /// project's knowledge (`memory.knowledge.upsert`, kind `decision`; the entry keeps the
     /// `knowledge_id`).
-    pub const DECISION_ANSWER: &str = "chatflow.decision.answer";
+    pub const DECISION_ANSWER: &str = "decision.answer";
     /// The user's own edit of an open plan (the plan card's inline editor): [`super::PlanEditParams`]
     /// -> `{version, seq}`. A new version `by: user`, back to draft, with its difference; no model
     /// call. Refused with `conflict` when the plan moved on since `base_version`.
-    pub const PLAN_EDIT: &str = "chatflow.plan.edit";
+    pub const PLAN_EDIT: &str = "plan.edit";
     /// Add a comment to an open plan, on the plan or on one task: [`super::PlanCommentParams`] ->
     /// `{seq}` (a `plan_comment` entry), or take one back ([`super::PlanCommentParams::remove`]).
-    pub const PLAN_COMMENT: &str = "chatflow.plan.comment";
+    pub const PLAN_COMMENT: &str = "plan.comment";
     /// Send the plan's open comments as one change request: a turn whose route is PLAN (no router
     /// call), its message the comments, each under the part it is about: [`super::PlanRefParams`]
     /// -> [`super::TurnResult`]. The comments are marked sent with the run.
-    pub const PLAN_REVISE: &str = "chatflow.plan.revise";
+    pub const PLAN_REVISE: &str = "plan.revise";
     /// Choose one option of an ideation (the options card): [`super::IdeationChooseParams`] ->
     /// `{seq}` of the accepted `decision` entry it records (it joins the spec or the decision list
     /// and the project's knowledge, as an accepted decision does).
-    pub const IDEATION_CHOOSE: &str = "chatflow.ideation.choose";
+    pub const IDEATION_CHOOSE: &str = "ideation.choose";
     /// Accept (with the text as edited), or reject, a knowledge item the model proposed from the
     /// user's message: [`super::KnowledgeAnswerParams`] -> `{state, changed, stored?}`. An
     /// accepted item is written to the project's knowledge (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
-    pub const KNOWLEDGE_ANSWER: &str = "chatflow.knowledge.answer";
+    pub const KNOWLEDGE_ANSWER: &str = "knowledge.answer";
     /// Prefill the session's prompt prefix into the model's cache in the background (a conversation
     /// opened or selected, the user typing, a turn ended), so the next turn's first call reads only
     /// the new message: [`super::PrewarmParams`] -> [`super::PrewarmResult`]. Best effort and at
     /// background priority; the session's next model call takes over what it prefilled. With a
     /// `project_id` and no session (a new conversation being written), the project's chat system
     /// block is prefilled for the conversation about to be created.
-    pub const PREWARM: &str = "chatflow.prewarm";
+    pub const PREWARM: &str = "prewarm";
 }
 
 /// What `chatflow.prewarm` warms: a session, or the system block of a project's next conversation.

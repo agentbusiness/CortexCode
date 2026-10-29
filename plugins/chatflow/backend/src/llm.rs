@@ -77,7 +77,7 @@ const SHOW_WAIT: Duration = Duration::from_millis(1500);
 /// one the moment it frees; a freed model goes to the oldest waiting run. A wait shows as the
 /// turn's `wait` stage. Without the mesh plugin the call runs here. Returns the computer's name.
 async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Priority, tokens: u32, cancel: &CancellationToken) -> Result<Option<String>, RpcError> {
-    let params = json!({"kind": "model", "tag": cc_protocol::contracts::model::tags::CODING, "session_id": session, "foreground": priority == Priority::Foreground, "tokens": tokens});
+    let params = json!({"kind": "model", "tag": crate::chatflow::FLOW, "session_id": session, "foreground": priority == Priority::Foreground, "tokens": tokens});
     let Ok(mut call) = journal.host().ctx().call_stream(mesh_methods::CLAIM, params) else { return Ok(None) };
     let status = journal
         .entries()
@@ -114,7 +114,7 @@ async fn claim(journal: &mut Journal, session: &str, run_id: &str, priority: Pri
 /// now; the answer's tier is then `busy` when none is). Ok(None) without the mesh plugin: the
 /// call runs here. Err when cancelled while waiting.
 pub async fn claim_key(host: &crate::host::Host, key: &str, wait: bool, cancel: Option<&CancellationToken>) -> Result<Option<Value>, RpcError> {
-    let params = json!({"kind": "model", "tag": cc_protocol::contracts::model::tags::CODING, "session_id": key, "wait": wait});
+    let params = json!({"kind": "model", "tag": crate::chatflow::FLOW, "session_id": key, "wait": wait});
     let Ok(mut call) = host.ctx().call_stream(mesh_methods::CLAIM, params) else { return Ok(None) };
     let stopped = async {
         match cancel {
