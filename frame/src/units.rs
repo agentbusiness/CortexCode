@@ -76,7 +76,8 @@ impl Unit {
         self.lock().current.clone()
     }
 
-    /// The backend's category (it never changes between versions; install checks it).
+    /// The backend's category (it changes between versions only when this frame no longer knows
+    /// the old one; install checks it).
     pub fn category(&self) -> Option<String> {
         self.current().manifest.backend.as_ref().map(|b| b.category.clone())
     }
@@ -649,6 +650,11 @@ fn check_same_category(unit: &Unit, installed: &Installed) -> Result<(), String>
     if category == packed {
         return Ok(());
     }
+    // A category this frame no longer knows (`chatflow` became the family member `chatflow-coding`)
+    // gives way to the one the package serves: without it the plugin could never be updated again.
+    if packed.is_some() && category.as_deref().is_some_and(|old| cc_protocol::contracts::contract_of(old).is_none()) {
+        return Ok(());
+    }
     let describe = |c: &Option<String>| c.as_deref().map(|c| format!("category `{c}`")).unwrap_or_else(|| "no category".into());
     Err(format!("plugin `{}` serves {}, the package serves {}", unit.id, describe(&category), describe(&packed)))
 }
@@ -683,21 +689,43 @@ fn held_message(version: &str) -> String {
 /// them, and answer that they wait.
 fn hold_for_restart(frame: &Frame, archives: &[PathBuf]) -> Option<RpcError> {
     let version = crate::update::restart_pending(&frame.home.root)?;
-    let incoming = frame.units.root.join(INCOMING);
     for archive in archives {
-        let Some(name) = archive.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        let name = if name.ends_with(".ccplugin") { name } else { format!("{name}.ccplugin") };
-        let staging = incoming.join(format!(".{name}.{}", std::process::id()));
-        let placed = std::fs::create_dir_all(&incoming)
-            .and_then(|()| std::fs::copy(archive, &staging))
-            .and_then(|_| std::fs::rename(&staging, incoming.join(&name)));
-        if let Err(error) = placed {
-            let _ = std::fs::remove_file(&staging);
-            return Some(RpcError::internal(format!("CortexCode {version} is staged, and {name} could not be kept for the restart: {error}")));
+        if let Err(error) = keep_for_start(frame, archive) {
+            return Some(RpcError::internal(format!("CortexCode {version} is staged, and {error}")));
         }
-        tracing::info!(package = %name, %version, "a frame update is staged; the package installs at the restart");
+        tracing::info!(package = %archive.display(), %version, "a frame update is staged; the package installs at the restart");
     }
     Some(RpcError::new(RESTART_PENDING, held_message(&version)))
+}
+
+/// Put `archive` in `.incoming/`, where the next start installs it.
+fn keep_for_start(frame: &Frame, archive: &Path) -> Result<(), String> {
+    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = if name.ends_with(".ccplugin") { name } else { format!("{name}.ccplugin") };
+    let incoming = frame.units.root.join(INCOMING);
+    let staging = incoming.join(format!(".{name}.{}", std::process::id()));
+    let placed = std::fs::create_dir_all(&incoming)
+        .and_then(|()| std::fs::copy(archive, &staging))
+        .and_then(|_| std::fs::rename(&staging, incoming.join(&name)));
+    placed.map_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        format!("{name} could not be kept for the restart: {error}")
+    })
+}
+
+/// A package that moves its plugin to another category (one this frame no longer knows gave way)
+/// cannot be swapped in while running, since backends are swapped within a category: it waits in
+/// `.incoming/` and installs at the next start.
+fn hold_category_change(frame: &Frame, unit: &Unit, installed: &Installed, archive: &Path) -> Option<RpcError> {
+    let packed = installed.manifest.backend.as_ref().map(|b| b.category.clone());
+    if unit.category() == packed {
+        return None;
+    }
+    if let Err(error) = keep_for_start(frame, archive) {
+        return Some(RpcError::internal(error));
+    }
+    tracing::info!(plugin = %unit.id, version = %installed.version(), "the package moves the plugin to another category; it installs at the restart");
+    Some(RpcError::new(RESTART_PENDING, format!("{} {} installs when the app restarts: it serves a new category.", unit.id, installed.version())))
 }
 
 fn step(list: &mut Vec<SwapStep>, name: &str, ok: bool, started: Instant, detail: impl Into<String>) {
@@ -848,9 +876,10 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
     let mut prepared = Vec::new();
     let mut previous = BTreeMap::new();
     let mut targets = BTreeMap::new();
+    let archives: Vec<PathBuf> = params.paths.iter().map(PathBuf::from).collect();
+    let mut moves_category = None;
     // Validate and unpack everything before replacing any running version.
-    for path in params.paths {
-        let archive = PathBuf::from(path);
+    for archive in archives.clone() {
         if !archive.is_absolute() { return Err(RpcError::invalid_params("package paths must be absolute")); }
         let copy = frame.clone();
         let installed = tokio::task::spawn_blocking(move || {
@@ -860,11 +889,23 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
         if targets.contains_key(&id) { return Err(RpcError::invalid_params(format!("duplicate plugin `{id}` in install"))); }
         let unit = frame.units.get(&id).ok_or_else(|| RpcError::invalid_params(format!("{id} has no installed version to restore; install this new plugin separately")))?;
         check_same_category(&unit, &installed).map_err(RpcError::invalid_params)?;
+        if moves_category.is_none() && unit.category() != installed.manifest.backend.as_ref().map(|b| b.category.clone()) {
+            moves_category = Some(format!("{id} {}", installed.version()));
+        }
         let state = unit.lock();
         previous.insert(id.clone(), InstalledRecord { current: state.current.version().to_owned(), previous: state.previous.as_ref().map(|p| p.version().to_owned()), known_good: state.known_good.clone() });
         targets.insert(id, installed.version().to_owned());
         drop(state);
         prepared.push(Arc::new(installed));
+    }
+    // A package that moves its plugin to another category installs at the next start, and the
+    // rest of the batch with it, so the batch lands together.
+    if let Some(moved) = moves_category {
+        for archive in &archives {
+            keep_for_start(frame, archive).map_err(RpcError::internal)?;
+        }
+        tracing::info!(package = %moved, "the package moves its plugin to another category; the batch installs at the restart");
+        return Err(RpcError::new(RESTART_PENDING, format!("{moved} serves a new category: the update installs when the app restarts.")));
     }
     // The successor can wait for this operation after activation; no work remains in its parent.
     prepared.sort_by_key(|installed| installed.manifest.backend.as_ref().is_some_and(|b| b.category == "source"));
@@ -973,6 +1014,7 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
     let started = Instant::now();
     let installed = {
         let frame = frame.clone();
+        let archive = archive.clone();
         tokio::task::spawn_blocking(move || {
             crate::package::install_archive(&frame.units.root, &archive, &|id, version| frame.units.in_use(id, version))
         })
@@ -986,6 +1028,9 @@ pub async fn install(frame: &Arc<Frame>, path: &str) -> Result<PackageSwapResult
     let (unit, from_version, outcome) = match frame.units.get(&id) {
         Some(unit) => {
             check_same_category(&unit, &installed).map_err(RpcError::invalid_params)?;
+            if let Some(held) = hold_category_change(frame, &unit, &installed, &archive) {
+                return Err(held);
+            }
             let from_version = unit.current().version().to_owned();
             let outcome = switch(frame, &unit, installed.clone(), "install", &mut steps).await;
             (unit, from_version, outcome)
