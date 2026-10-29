@@ -180,6 +180,9 @@ export function whatText(items: readonly ActivityItem[], live: boolean, now?: nu
     if (item.kind === 'step') parts.push(stepText(item.step));
     else if (item.kind === 'note') parts.push(noteLabel(item.entry));
   }
+  // Only reasoning: the line still says what it holds, never a caret beside nothing.
+  const reasoning = items.find((item): item is Extract<ActivityItem, { kind: 'reasoning' }> => item.kind === 'reasoning');
+  if (parts.length === 0 && reasoning) parts.push(reasoningLabel(reasoning.entry));
   return parts.join(' · ');
 }
 
@@ -224,7 +227,9 @@ export function Activity({ turn, items, live, progress, onOpenFile, closing = tr
     known.ms = 0;
     known.tokens = 0;
   }
-  const what = whatText(items, live, now);
+  const calls = turn.usage.length;
+  // Nothing done of its own (only the turn's cost): the line names the model calls behind it.
+  const what = whatText(items, live, now) || (!live && closing && calls ? `${calls} model call${calls === 1 ? '' : 's'}` : '');
   const running = live ? runningStep(items) : null;
   const tail = running ? outputTail(str(running.call.data.live_output)) : '';
   let end: string;
