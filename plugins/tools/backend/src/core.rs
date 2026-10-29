@@ -104,8 +104,6 @@ pub struct Core {
     pub approvals: cc_protocol::stored::Stored<HashMap<String, BTreeSet<String>>>,
     /// Per session: edits of project files since its last run (an edit result names the next step).
     pub edits_since_run: Mutex<HashMap<String, usize>>,
-    /// Per session: the files `edit` wrote (the model's work, which a turn's cleanup keeps).
-    pub edited: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
     /// Per session: the files `edit` created in the running turn (cleared when it ends). The model
     /// may write those whole again: nothing of the user's is in them.
     pub created: Mutex<HashMap<String, BTreeSet<PathBuf>>>,
@@ -204,7 +202,6 @@ impl Core {
             file_locks: Mutex::new(HashMap::new()),
             approvals: cc_protocol::stored::Stored::new("tools.approvals"),
             edits_since_run: Mutex::new(HashMap::new()),
-            edited: Mutex::new(HashMap::new()),
             created: Mutex::new(HashMap::new()),
             originals: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashMap::new()),

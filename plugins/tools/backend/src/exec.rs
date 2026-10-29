@@ -1271,11 +1271,7 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         let _ = writeln!(output, "{display} now holds working code: change it from here with anchored edits, one or two definitions per call.");
     }
     let (syntax_issues, syntax) = syntax_check(&absolute, &old_text, &new);
-    // The model's work: a turn's cleanup keeps what `edit` wrote; a file it created this turn may
-    // be written whole again.
-    if let Ok(mut edited) = core.edited.lock() {
-        edited.entry(session.context.session_id.clone()).or_default().insert(absolute.clone());
-    }
+    // A file it created this turn may be written whole again.
     if old.is_none()
         && let Ok(mut created) = core.created.lock()
     {

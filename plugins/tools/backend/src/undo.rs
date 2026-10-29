@@ -700,6 +700,19 @@ impl ProjectLog {
 
     // --- reading ---------------------------------------------------------------------------
 
+    /// The newest standing step that touched `path` (relative): its session and label.
+    pub fn last_step(&self, path: &str) -> Option<(Option<String>, String)> {
+        let state = lock(&self.state);
+        let active = active_set(&state.records);
+        state
+            .records
+            .iter()
+            .rev()
+            .filter(|record| active.contains(&record.seq))
+            .find(|record| record.files.iter().any(|file| file.path == path))
+            .map(|record| (record.session_id.clone(), record.label.clone()))
+    }
+
     pub fn timeline(&self, params: &TimelineParams) -> TimelineResult {
         let state = lock(&self.state);
         let active = active_set(&state.records);

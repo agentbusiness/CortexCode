@@ -1451,6 +1451,13 @@
  * column one and sit under the kindmark instead of under the text it belongs to.
  */
 #cc .notice > .ap{grid-column:2;margin-top:9px;}
+/*
+ * The content column may shrink below its longest unbroken word: the design's `1fr` is
+ * `minmax(auto, 1fr)`, so a notice carrying a test log (long test names, dotted runs) grew past
+ * the feed and pushed the conversation sideways.
+ */
+#cc .notice{grid-template-columns:auto minmax(0,1fr);}
+#cc .notice > *{min-width:0;}
 
 /*
  * The streaming caret, sized to whatever it follows and stilled for anyone who asked for that.

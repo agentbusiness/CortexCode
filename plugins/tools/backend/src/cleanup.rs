@@ -2,9 +2,12 @@
 //! never the model): the scratch folder `tmp/` (one-off tries) and new untracked files the turn's
 //! commands made (build output, caches, logs; seen: a C++ `build/` folder in the change's diff).
 //!
-//! Kept: every file `edit` wrote in the session (the model's work: code, tests), files git
-//! ignores (the project's own build and dependency folders), files that existed before the turn,
-//! the workspace's `.cortex-*` files, and everything when the session's user let a command past the
+//! Who made a file is read from the step log on disk: a new untracked file goes only when the
+//! newest step that touched it is a command of this session. Kept: what any `edit` wrote, what
+//! other sessions made (agents work in the same folder at the same time; seen: one agent's turn
+//! ending removed the new files of three others), what the log does not know, files git ignores
+//! (the project's own build and dependency folders), files that existed before the turn, the
+//! workspace's `.cortex-*` files, and everything when the session's user let a command past the
 //! sandbox (an install the user approved makes files they asked for).
 
 use crate::core::Core;
@@ -37,11 +40,15 @@ pub fn turn_end(core: &Core, workspace: &Path, session_id: &str, since_ms: u64) 
     if core.approved(session_id).iter().any(|class| class.starts_with(cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX)) {
         return removed;
     }
-    let edited = core.edited.lock().map(|edited| edited.get(session_id).cloned().unwrap_or_default()).unwrap_or_default();
+    let log = core.steps.open(workspace);
     for path in new_untracked(workspace, since_ms) {
         let relative = path.strip_prefix(workspace).map(Path::to_path_buf).unwrap_or_else(|_| path.clone());
         let name = relative.to_string_lossy();
-        if edited.contains(&path) || name.starts_with(".cortex") || name.starts_with(".git/") {
+        if name.starts_with(".cortex") || name.starts_with(".git/") {
+            continue;
+        }
+        let made_by_own_command = log.last_step(&name).is_some_and(|(session, label)| session.as_deref() == Some(session_id) && label == "run");
+        if !made_by_own_command {
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
