@@ -234,7 +234,7 @@ fetch_asset() {
   if [ -n "$copy" ]; then
     cp "$copy" "$dir/$name"
   else
-    curl -fsSL -o "$dir/$name" "$url" || die "cannot download $url"
+    curl -fsSL --retry 4 --retry-delay 5 -o "$dir/$name" "$url" || die "cannot download $url"
   fi
   [ "$(sha256_of "$dir/$name")" = "$sha" ] || die "$name does not match the catalog's checksum"
   printf '%s' "$dir/$name"
@@ -242,10 +242,12 @@ fetch_asset() {
 
 # ----- GitHub ----------------------------------------------------------------------------------
 
-# gh_api <METHOD> <path> [json body]: the response body; fails on an HTTP error.
+# gh_api <METHOD> <path> [json body]: the response body; fails on an HTTP error. GitHub's passing
+# server errors are retried, except for a POST (it could create twice; gh_release retries its own).
 gh_api() {
   local method="$1" path="$2" body="${3:-}"
   local args=(-fsSL -X "$method" -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+  [ "$method" = POST ] || args+=(--retry 4 --retry-delay 5)
   [ -z "$body" ] || args+=(-H "Content-Type: application/json" --data "$body")
   curl "${args[@]}" "https://api.github.com$path"
 }
@@ -305,11 +307,11 @@ fetch_catalog() {
     return
   fi
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    code="$(curl -sSL -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$RELEASE_REPO/releases/tags/catalog")"
+    code="$(curl -sSL --retry 4 --retry-delay 5 -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$RELEASE_REPO/releases/tags/catalog")"
     case "$code" in
       200) asset="$(jq -r '.assets[] | select(.name == "catalog.json") | .url' "$out")"
            if [ -n "$asset" ]; then
-             code="$(curl -sSL -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$asset")"
+             code="$(curl -sSL --retry 4 --retry-delay 5 -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$asset")"
            else
              code=404
            fi ;;
@@ -317,7 +319,7 @@ fetch_catalog() {
       *) die "cannot read the catalog release ($code)" ;;
     esac
   else
-    code="$(curl -sSL -o "$out" -w '%{http_code}' "$(catalog_url)")"
+    code="$(curl -sSL --retry 4 --retry-delay 5 -o "$out" -w '%{http_code}' "$(catalog_url)")"
   fi
   case "$code" in
     200) jq -e '.format == "cortexcode-catalog/1"' "$out" >/dev/null || die "the published catalog is not a catalog" ;;
