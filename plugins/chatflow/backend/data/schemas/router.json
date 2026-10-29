@@ -2,13 +2,16 @@
   "type": "object",
   "properties": {
     "work": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 1000
     },
     "asks": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "type": "string",
+        "maxLength": 600
+      },
+      "maxItems": 12
     },
     "route": {
       "enum": [
@@ -64,8 +67,10 @@
     "files": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "type": "string",
+        "maxLength": 300
+      },
+      "maxItems": 24
     }
   },
   "required": [

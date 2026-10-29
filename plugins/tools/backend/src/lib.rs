@@ -30,6 +30,7 @@ pub mod shell;
 pub mod term;
 pub mod testout;
 pub mod textedit;
+pub mod trace;
 pub mod tree;
 pub mod undo;
 pub mod uris;

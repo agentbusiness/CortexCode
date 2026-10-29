@@ -597,7 +597,11 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 // A reply runs no tools. They stay listed, so the system block matches the other
                 // calls' and is read from the cache; `none` makes the model plugin refuse the
                 // tool-call token (listed and allowed, the model wrote a tool call into the answer).
-                let call = env.call("REPLY", &effort, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
+                let mut call = env.call("REPLY", &effort, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
+                // Every generating call carries a budget (the loop's are in agent_loop).
+                if env.data.limits.reply_think_tokens > 0 {
+                    call.think_budget = Some(env.data.limits.reply_think_tokens);
+                }
                 let any = env.stops.any();
                 llm::chat(journal, call, &any).await.map(|_| ())
             }

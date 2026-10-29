@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "reason": {"type": "string"},
+    "reason": {"type": "string", "maxLength": 1500},
     "decision": {"enum": ["accept", "refuse"]}
   },
   "required": ["reason", "decision"],

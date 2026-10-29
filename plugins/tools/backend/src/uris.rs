@@ -234,11 +234,13 @@ pub async fn read(host: &dyn Host, scope: &Scope<'_>, uri: &str) -> Result<Strin
         "definition" | "references" | "hover" | "diagnostics" => {
             crate::langs::read_uri(host, scope.workspace, scheme, &decode(path)).await.map_err(|message| UriError::new("unavailable", message))
         }
+        // What a command did to the machine, recorded by the CortexTerm on this Mac.
+        "trace" => crate::trace::read(host, &decode(path), scope.workspace).await,
         "research" => crate::research::read(host, uri, scope.workspace.join(crate::sandbox::OFFLINE_MARKER).exists()).await,
         other => Err(UriError::new(
             "bad_uri",
             format!(
-                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, rule://, knowledge://, skill:// and research:// (see read's `path`)"
+                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, rule://, knowledge://, skill://, research:// and trace:// (see read's `path`)"
             ),
         )),
     }

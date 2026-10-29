@@ -174,7 +174,11 @@ impl<B: Backend> DFlashTfmSpeculator<B> {
         &self,
         max_depth: Option<u32>,
     ) -> Option<DFlashTfmTreeShape> {
-        if max_depth.is_some_and(|max_depth| max_depth < 2) {
+        // CortexCode patch P8: a draft block takes `dflash_depth` positions whatever the tree's
+        // depth, so near the end of the context the stream decodes without drafting instead of
+        // the draft running past the RoPE capacity.
+        let dflash_depth = self.shape.dflash_depth_override.unwrap_or(self.dflash.block_size());
+        if max_depth.is_some_and(|max_depth| max_depth < u32::max(2, dflash_depth)) {
             return None;
         }
 

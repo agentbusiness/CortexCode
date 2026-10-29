@@ -6,19 +6,24 @@
       "maxLength": 1500
     },
     "goal": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 1000
     },
     "approach": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 3000
     },
     "architecture": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 3000
     },
     "risks": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "type": "string",
+        "maxLength": 600
+      },
+      "maxItems": 8
     },
     "tasks": {
       "type": "array",
@@ -26,10 +31,12 @@
         "type": "object",
         "properties": {
           "title": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 120
           },
           "brief": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 3000
           },
           "known": {
             "type": "array",
@@ -53,13 +60,16 @@
               "enum": [
                 "@tasks"
               ]
-            }
+            },
+            "maxItems": 12
           },
           "touches": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 300
+            },
+            "maxItems": 16
           },
           "checks": {
             "type": "array",
@@ -91,7 +101,8 @@
           "skills"
         ],
         "additionalProperties": false
-      }
+      },
+      "maxItems": 12
     },
     "replaces": {
       "type": "array",
@@ -103,7 +114,8 @@
       "maxItems": 24
     },
     "note": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 600
     }
   },
   "required": [

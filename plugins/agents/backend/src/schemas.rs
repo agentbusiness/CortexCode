@@ -17,8 +17,13 @@ pub const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Str,
+    /// A string of at most this many characters (`maxLength`): free text the model must close.
+    StrMax(usize),
     OneOf(Vec<String>),
     List(Box<Shape>),
+    /// A list of at most this many items (`maxItems`): a list the model must close (seen in the
+    /// chat flow: a decision ran on for 207k tokens, to the end of the context).
+    ListMax(Box<Shape>, usize),
     /// Properties in the order they are written; all required.
     Obj(Vec<(String, Shape)>),
     /// Up to `max` picks from `values` (a JSON array of enum strings). The schema holds one
@@ -106,8 +111,17 @@ pub fn shape_from_schema(schema: &Value) -> Result<Shape, String> {
         return Ok(Shape::OneOf(values));
     }
     match schema.get("type").and_then(Value::as_str) {
-        Some("string") => Ok(Shape::Str),
-        Some("array") => Ok(Shape::List(Box::new(shape_from_schema(schema.get("items").ok_or("array without `items`")?)?))),
+        Some("string") => Ok(match schema.get("maxLength").and_then(Value::as_u64) {
+            Some(max) => Shape::StrMax(max as usize),
+            None => Shape::Str,
+        }),
+        Some("array") => {
+            let item = Box::new(shape_from_schema(schema.get("items").ok_or("array without `items`")?)?);
+            Ok(match schema.get("maxItems").and_then(Value::as_u64) {
+                Some(max) => Shape::ListMax(item, max as usize),
+                None => Shape::List(item),
+            })
+        }
         Some("object") => {
             let properties = schema.get("properties").and_then(Value::as_object).ok_or("object without `properties`")?;
             let required: Vec<&str> = schema
@@ -135,8 +149,10 @@ pub fn shape_from_schema(schema: &Value) -> Result<Shape, String> {
 pub fn json_schema(shape: &Shape) -> Value {
     match shape {
         Shape::Str => json!({"type": "string"}),
+        Shape::StrMax(max) => json!({"type": "string", "maxLength": max}),
         Shape::OneOf(values) => json!({"enum": values}),
         Shape::List(item) => json!({"type": "array", "items": json_schema(item)}),
+        Shape::ListMax(item, max) => json!({"type": "array", "items": json_schema(item), "maxItems": max}),
         Shape::Obj(properties) => {
             let mut map = serde_json::Map::new();
             for (name, shape) in properties {
@@ -183,6 +199,14 @@ pub fn grammar(shape: &Shape) -> String {
 fn rule_for(shape: &Shape, rules: &mut Vec<String>) -> String {
     match shape {
         Shape::Str => "string".to_owned(),
+        Shape::StrMax(max) => {
+            let name = format!("text{max}");
+            let rule = format!("{name} ::= \"\\\"\" char{{0,{max}}} \"\\\"\" space");
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+            name
+        }
         Shape::OneOf(values) => {
             let name = format!("enum{}", rules.len());
             // Each value as its JSON string (a command may hold quotes or backslashes).
@@ -194,6 +218,13 @@ fn rule_for(shape: &Shape, rules: &mut Vec<String>) -> String {
             let item_rule = rule_for(item, rules);
             let name = format!("list{}", rules.len());
             rules.push(format!("{name} ::= \"[\" space ({item_rule} (\",\" space {item_rule})*)? \"]\" space"));
+            name
+        }
+        Shape::ListMax(item, max) => {
+            let item_rule = rule_for(item, rules);
+            let name = format!("list{}", rules.len());
+            let more = max.saturating_sub(1);
+            rules.push(format!("{name} ::= \"[\" space ({item_rule} (\",\" space {item_rule}){{0,{more}}})? \"]\" space"));
             name
         }
         Shape::Pick { values, max } => {

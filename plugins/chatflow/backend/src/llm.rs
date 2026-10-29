@@ -266,6 +266,7 @@ async fn stream_once(
     let mut content = TextStream::new(kinds::ASSISTANT_MESSAGE, base.clone());
     let mut reasoning = TextStream::new(kinds::REASONING, base);
     let mut live = Live::new(journal, target, stage);
+    let mut decision = DecisionText::new(target, stage);
     let mut writing = Writing::new(journal, target, stage);
     let mut stream = journal.host().ctx().call_stream(model_methods::CHAT, params.clone())?;
     loop {
@@ -284,12 +285,16 @@ async fn stream_once(
         match delta.kind.as_str() {
             "reasoning" => reasoning.push(journal, &delta.text).await?,
             "content" if target.content => content.push(journal, &delta.text).await?,
-            "content" => live.push(journal, &delta.text, false),
+            "content" => {
+                live.push(journal, &delta.text, false);
+                decision.push(journal, &delta.text).await;
+            }
             "tool_call" => writing.push(journal, reasoning.seq(), &delta.text).await,
             _ => {}
         }
     }
     live.push(journal, "", true);
+    decision.flush(journal).await;
     writing.finish(journal);
     let outcome = stream.finish().await;
     let result: ChatResult = match outcome {
@@ -378,10 +383,57 @@ impl Writing {
     }
 }
 
+/// A constrained decision's raw text, journaled while it streams (a transcript-only note with no
+/// text, so neither the model nor the chat sees it): a decision is otherwise recorded only once
+/// it is read (seen: a DECIDE that wrote 207k tokens in 33 minutes left nothing to read back).
+struct DecisionText {
+    base: Value,
+    seq: Option<u64>,
+    pending: String,
+    flushed: Instant,
+}
+
+/// Least interval between two journal writes of a decision's text.
+const DECISION_JOURNAL_EVERY: Duration = Duration::from_secs(2);
+
+impl DecisionText {
+    fn new(target: &StreamTo, stage: &str) -> Self {
+        let base = json!({"text": "", "purpose": "decision_text", "host_message": false, "run_id": target.run_id, "stage": stage, "raw": ""});
+        Self { base, seq: None, pending: String::new(), flushed: Instant::now() }
+    }
+
+    async fn push(&mut self, journal: &mut Journal, text: &str) {
+        self.pending.push_str(text);
+        if self.flushed.elapsed() >= DECISION_JOURNAL_EVERY {
+            self.flush(journal).await;
+        }
+    }
+
+    async fn flush(&mut self, journal: &mut Journal) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let chunk = std::mem::take(&mut self.pending);
+        self.flushed = Instant::now();
+        match self.seq {
+            None => {
+                let mut data = self.base.clone();
+                data["raw"] = Value::String(chunk);
+                self.seq = journal.append(kinds::NOTE, data).await.ok();
+            }
+            Some(seq) => {
+                let _ = journal.append_text(seq, "raw", &chunk).await;
+            }
+        }
+    }
+}
+
 /// A decision's free text as it streams (see [`crate::live`]).
 struct Live {
     fields: Vec<String>,
     raw: String,
+    chars: usize,
+    built: Option<Instant>,
     throttle: crate::live::Throttle,
     event: LiveFields,
 }
@@ -391,6 +443,8 @@ impl Live {
         Self {
             fields: target.live.clone(),
             raw: String::new(),
+            chars: 0,
+            built: None,
             throttle: crate::live::Throttle::default(),
             event: LiveFields { session_id: journal.session_id().to_owned(), run_id: target.run_id.clone(), stage: stage.to_owned(), fields: Vec::new(), done: false },
         }
@@ -398,12 +452,20 @@ impl Live {
 
     /// Add streamed text; publish what changed when due (`done`: the call ended, publish the last).
     fn push(&mut self, journal: &Journal, text: &str, done: bool) {
-        if self.fields.is_empty() {
+        self.raw.push_str(text);
+        self.chars += text.chars().count();
+        // The fields are read from the whole text: only when an event can go out.
+        let now = std::time::Instant::now();
+        if !done && self.built.is_some_and(|built| now.duration_since(built) < crate::live::EVERY) {
             return;
         }
-        self.raw.push_str(text);
-        let fields: Vec<(String, String)> = crate::live::string_fields(&self.raw).into_iter().filter(|(name, _)| self.fields.contains(name)).collect();
-        let now = std::time::Instant::now();
+        self.built = Some(now);
+        let mut fields: Vec<(String, String)> = crate::live::string_fields(&self.raw).into_iter().filter(|(name, _)| self.fields.contains(name)).collect();
+        // How much is written, also where no free text shows it (a list growing, seen: a decision
+        // that ran 33 minutes with nothing on screen but "thinking").
+        if !done && self.chars > 0 {
+            fields.push(("size".to_owned(), format!("Writing the decision: {} characters so far", self.chars)));
+        }
         let fields = if done { Some(fields) } else { self.throttle.due(fields, now) };
         let Some(fields) = fields else { return };
         if done && fields.is_empty() && self.event.fields.is_empty() {

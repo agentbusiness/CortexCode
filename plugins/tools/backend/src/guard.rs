@@ -394,6 +394,11 @@ impl ShellGroups {
         }
     }
 
+    /// The process group (the shell's pid) of a session's shell, while it runs.
+    pub fn pid(&self, session: &str) -> Option<i32> {
+        self.live.lock().ok()?.get(session).map(|(pgid, _)| *pgid)
+    }
+
     fn list(&self) -> Vec<(String, i32, String)> {
         self.live.lock().map(|live| live.iter().map(|(session, (pgid, workspace))| (session.clone(), *pgid, workspace.clone())).collect()).unwrap_or_default()
     }

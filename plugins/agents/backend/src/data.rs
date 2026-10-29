@@ -286,7 +286,7 @@ impl Dataset {
         }
         let schema: Value = serde_json::from_str(text_of(&plan.schema)?).map_err(|error| format!("{}: {error}", plan.schema))?;
         let plan_shape = schemas::shape_from_schema(&schema).map_err(|error| format!("{}: {error}", plan.schema))?;
-        let Some(Shape::List(task)) = plan_shape.field("tasks") else { return Err(format!("{}: needs a `tasks` array", plan.schema)) };
+        let Some(Shape::List(task) | Shape::ListMax(task, _)) = plan_shape.field("tasks") else { return Err(format!("{}: needs a `tasks` array", plan.schema)) };
         for field in TASK_FIELDS {
             if task.field(field).is_none() {
                 return Err(format!("{}: each task needs `{field}`", plan.schema));

@@ -52,7 +52,7 @@ cortex-pack build plugins/mesh --install  # packs and installs; the frame hot-sw
   the selected path is `lan` (direct, a private address), `direct` (hole-punched across networks)
   or `relay`. On `cortex/frame/1` every request is one bidirectional stream carrying the frame's
   own envelopes: one `Req`, then `Item`s and one `Res`; a `Cancel` or a closed stream cancels the
-  forwarded call. The serving side forwards only what members lend (`lendable`: `model.*`) to
+  forwarded call. The serving side forwards only what members lend (`lendable`: `model.*`, and `system.trace.*` and `system.traces`, which only observe a process) to
   its own frame, nothing else.
 - **Cards** (`card.rs`): what the frame and the plugins report (machine, free disk and memory,
   mains, a person active, the model with its variant, family, tags, busy slots and speed, every plugin

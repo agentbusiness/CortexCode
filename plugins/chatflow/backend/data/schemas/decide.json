@@ -2,7 +2,8 @@
   "type": "object",
   "properties": {
     "missing": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 2000
     },
     "route": {
       "enum": [
@@ -42,35 +43,41 @@
     "symbols": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 300
       },
       "x-when": {
         "route": [
           "MORE"
         ]
-      }
+      },
+      "maxItems": 24
     },
     "files": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 300
       },
       "x-when": {
         "route": [
           "MORE"
         ]
-      }
+      },
+      "maxItems": 24
     },
     "queries": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 300
       },
       "x-when": {
         "route": [
           "MORE"
         ]
-      }
+      },
+      "maxItems": 24
     },
     "brief": {
       "type": "string",
@@ -79,7 +86,8 @@
           "DELEGATE",
           "PLAN"
         ]
-      }
+      },
+      "maxLength": 6000
     },
     "checks": {
       "type": "array",
@@ -97,7 +105,8 @@
       }
     },
     "note": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 600
     }
   },
   "required": [

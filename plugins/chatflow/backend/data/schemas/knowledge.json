@@ -15,10 +15,12 @@
             ]
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 120
           },
           "text": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 600
           },
           "state": {
             "enum": [
@@ -46,7 +48,8 @@
           "binds"
         ],
         "additionalProperties": false
-      }
+      },
+      "maxItems": 3
     }
   },
   "required": [

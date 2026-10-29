@@ -88,6 +88,9 @@ fix_think_tokens = 384
 # own table (4096 for medium) never applies (seen: a loop without a plan step ran 4k thoughts for
 # two hours).
 loop_think_tokens = 1024
+# A reply's thinking (REPLY): the answer is written from what the turn read, so it needs a plan of
+# the answer, not a re-derivation. Without it the model plugin's table applied (16384 at xhigh).
+reply_think_tokens = 2048
 # Steps whose reasoning stays in the prompt (newest first); older steps keep their answer and calls
 # only, as the model's template renders earlier turns. 0 (none): the engine then resumes every step
 # from the checkpoint at the end of the previous prompt and re-reads only the answer and the new

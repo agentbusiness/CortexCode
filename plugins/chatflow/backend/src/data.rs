@@ -161,6 +161,10 @@ fn default_loop_think_tokens() -> u32 {
     1024
 }
 
+fn default_reply_think_tokens() -> u32 {
+    2048
+}
+
 fn default_reasoning_steps() -> u32 {
     0
 }
@@ -234,6 +238,10 @@ pub struct Limits {
     /// is never what a step gets (seen: a loop without a plan step ran 4k-token thoughts for hours).
     #[serde(default = "default_loop_think_tokens")]
     pub loop_think_tokens: u32,
+    /// Most thinking tokens of a reply (REPLY): without it a reply got the model plugin's table
+    /// for the decided effort (16384 for xhigh, minutes of thinking before a word of the answer).
+    #[serde(default = "default_reply_think_tokens")]
+    pub reply_think_tokens: u32,
     /// Steps, newest first, whose reasoning the prompt still carries; older steps show their answer
     /// and calls only, as the model's own template renders earlier turns (seen: 4k tokens of
     /// thinking per step kept for 280 steps filled the window). The engine resumes from the
