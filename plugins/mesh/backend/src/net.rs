@@ -16,6 +16,9 @@
 //! release` (one use of this computer's model for a member's run, when the model has the run's
 //! tag: [`crate::claims`]).
 //!
+//! `mesh.model.yield {to_tag}` (only from an app on this machine: forwarded to this frame's model
+//! plugin as `model.yield`, one model per machine).
+//!
 //! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
 
 use crate::members::Entry;
@@ -54,11 +57,21 @@ impl ProtocolHandler for FrameHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let node = connection.remote_id().to_string();
         if !self.0.is_member(&node) {
+            // An app on this machine that just started: its file may be new.
+            self.0.refresh_local();
+        }
+        if !self.0.is_member(&node) {
             tracing::info!(node = %&node[..node.len().min(10)], "a connection from a key that is not a member; closed");
             connection.close(1u32.into(), b"not a member");
             return Ok(());
         }
         self.0.connected(&node, connection.clone());
+        {
+            // The dialer sends its card; this side's goes back at once (not at the next round).
+            let mesh = self.0.clone();
+            let node = node.clone();
+            tokio::spawn(async move { mesh.push_card_to(&node).await });
+        }
         serve_connection(self.0.clone(), node.clone(), connection.clone()).await;
         self.0.disconnected(&node, &connection);
         Ok(())
@@ -132,7 +145,8 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
         }
         "mesh.log.push" => {
             let entries: Vec<Entry> = serde_json::from_value(params.get("entries").cloned().unwrap_or(Value::Null)).unwrap_or_default();
-            let outcome = mesh.log_received(entries).map(|changed| json!({"changed": changed})).map_err(RpcError::invalid_params);
+            // An app on this machine only, not in this network's log: its log is another network's.
+            let outcome = if !mesh.local_only(&node) { mesh.log_received(entries).map(|changed| json!({"changed": changed})).map_err(RpcError::invalid_params) } else { Ok(json!({"changed": false})) };
             let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
@@ -181,6 +195,20 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let session = params.get("session_id").and_then(Value::as_str).unwrap_or("");
             mesh.give_back(&node, session);
             let message = answer(Ok(json!({})));
+            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
+        "mesh.model.yield" => {
+            // Another app on this machine needs a model of another kind: this frame's model plugin
+            // unloads its own (one model per machine). Only an app on this machine may ask.
+            let outcome = if !mesh.is_local(&node) {
+                Err(RpcError::new(codes::CONTRACT_VIOLATION, "only an app on this machine may ask its model to yield"))
+            } else {
+                match mesh.ctx() {
+                    Ok(ctx) => ctx.call(cc_protocol::contracts::model::methods::YIELD, params).await,
+                    Err(error) => Err(error),
+                }
+            };
+            let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.window.ticket" => {
@@ -319,9 +347,11 @@ impl Mesh {
         let _ = self.router.set(router);
         let mesh = self.clone();
         tokio::spawn(async move {
+            mesh.refresh_local();
             mesh.dial_all().await;
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
+                mesh.refresh_local();
                 mesh.dial_all().await;
                 mesh.push_card().await;
                 mesh.auto_place().await;
@@ -341,30 +371,46 @@ impl Mesh {
 
     /// Dial every member not connected now.
     pub async fn dial_all(self: &Arc<Self>) {
-        let Some(endpoint) = self.endpoint.get() else { return };
         let members = self.members();
         for (node, member) in members {
             if node == self.me.hex() || self.connection(&node).is_some() {
                 continue;
             }
-            let Ok(id) = node.parse::<EndpointId>() else { continue };
-            let addr = member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id));
             let mesh = self.clone();
-            let endpoint = endpoint.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, FRAME_ALPN)).await {
-                    Ok(Ok(connection)) => {
-                        mesh.connected(&node, connection.clone());
-                        mesh.push_card_to(&node).await;
-                        mesh.push_log_to(&node).await;
-                        // The member's requests come over this connection too.
-                        serve_connection(mesh.clone(), node.clone(), connection.clone()).await;
-                        mesh.disconnected(&node, &connection);
-                    }
-                    Ok(Err(error)) => tracing::debug!(node = %&node[..node.len().min(10)], %error, "member not reachable"),
-                    Err(_) => tracing::debug!(node = %&node[..node.len().min(10)], "member not reachable (timeout)"),
+            tokio::spawn(async move { mesh.dial(&member).await });
+        }
+    }
+
+    /// Connect to one member (its requests are then served on the connection in the background);
+    /// false when it is not reachable now.
+    pub async fn dial(self: &Arc<Self>, member: &cc_protocol::contracts::mesh::Member) -> bool {
+        let Some(endpoint) = self.endpoint.get() else { return false };
+        let node = member.node.clone();
+        let Ok(id) = node.parse::<EndpointId>() else { return false };
+        let addr = member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id));
+        match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, FRAME_ALPN)).await {
+            Ok(Ok(connection)) => {
+                self.connected(&node, connection.clone());
+                self.push_card_to(&node).await;
+                if !self.local_only(&node) {
+                    self.push_log_to(&node).await;
                 }
-            });
+                // The member's requests come over this connection too.
+                let mesh = self.clone();
+                tokio::spawn(async move {
+                    serve_connection(mesh.clone(), node.clone(), connection.clone()).await;
+                    mesh.disconnected(&node, &connection);
+                });
+                true
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(node = %&node[..node.len().min(10)], %error, "member not reachable");
+                false
+            }
+            Err(_) => {
+                tracing::debug!(node = %&node[..node.len().min(10)], "member not reachable (timeout)");
+                false
+            }
         }
     }
 
@@ -419,7 +465,7 @@ impl Mesh {
     }
 
     pub async fn push_log(&self) {
-        let nodes: Vec<String> = self.connections().keys().cloned().collect();
+        let nodes: Vec<String> = self.connections().keys().filter(|node| !self.local_only(node)).cloned().collect();
         for node in nodes {
             self.push_log_to(&node).await;
         }

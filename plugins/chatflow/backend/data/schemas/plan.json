@@ -31,6 +31,14 @@
           "brief": {
             "type": "string"
           },
+          "known": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 300
+            },
+            "maxItems": 8
+          },
           "rules": {
             "type": "array",
             "items": {
@@ -62,14 +70,6 @@
             },
             "maxItems": 4
           },
-          "covers": {
-            "type": "array",
-            "items": {
-              "enum": [
-                "@requirements"
-              ]
-            }
-          },
           "skills": {
             "type": "array",
             "items": {
@@ -83,11 +83,11 @@
         "required": [
           "title",
           "brief",
+          "known",
           "rules",
           "depends_on",
           "touches",
           "checks",
-          "covers",
           "skills"
         ],
         "additionalProperties": false

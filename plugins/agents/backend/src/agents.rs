@@ -1237,16 +1237,18 @@ impl Agents {
     /// End an agent's run (its scheduler place, its model call) and record it stopped.
     async fn halt(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord) -> Result<AgentRecord, RpcError> {
         let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
+        // The run is cancelled while its caller is still there: the controller's end drops the
+        // `agent_run` call, and a run whose caller went away parks (no end status, so it would
+        // still read as running).
+        if let Some(session_id) = &record.session_id {
+            host.call(&flow_method(host, session_id, chatflow_verbs::CANCEL).await, json!({"session_id": session_id})).await?;
+        }
         self.cancel_agent(&key);
         lock(&self.inner.scheduler).dequeue(&key);
         if record.status != "done" {
             record.status = "stopped".into();
         }
-        let record = upsert(ctx, host, record).await?;
-        if let Some(session_id) = &record.session_id {
-            host.call(&flow_method(host, session_id, chatflow_verbs::CANCEL).await, json!({"session_id": session_id})).await?;
-        }
-        Ok(record)
+        upsert(ctx, host, record).await
     }
 
     /// `first` and everything that hangs on it: its subtasks and, in its tree, the unfinished tasks

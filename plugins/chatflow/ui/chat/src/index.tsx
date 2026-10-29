@@ -32,8 +32,8 @@ import { isScaffolding } from './Activity';
 import { editSteps } from './Edits';
 import { displayDiffs } from './StepRow';
 import { Working } from './Working';
-import { IdeationContext, SpecCard, type IdeationContextValue } from './IdeationCards';
-import { acceptedDecisions, currentSpec, newestPlans, specVersions } from './ideation';
+import { PlanContext, type PlanContextValue } from './PlanCard';
+import { newestPlans } from './plan';
 import { answerStarted, buildTurns, liveReasoning, runState } from './transcript';
 import { decisionLines, progressLine, useLiveRun } from './live';
 import './chat.css';
@@ -214,22 +214,6 @@ function Chat() {
       setShared('board.focus', taskId);
       showPane('board');
     },
-    updateSpec: async (change) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.spec.update`, { session_id: sessionId, ...change });
-    },
-    saveSpec: async () => {
-      const saved = await client.call<{ path: string; relative?: string }>(`${FLOW}.spec.save`, { session_id: sessionId });
-      return saved?.relative || saved?.path || '';
-    },
-    answerDecision: async (seq, accept) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.decision.answer`, { session_id: sessionId, seq, accept });
-    },
-    setPlanStatus: async (planId, status) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.plan.update`, { session_id: sessionId, plan_id: planId, status });
-    },
     implementPlan: async (planId) => {
       if (!sessionId) return;
       setShared('chat.stick', Date.now());
@@ -239,32 +223,8 @@ function Chat() {
       if (!sessionId) return;
       await client.call(`${FLOW}.plan.edit`, { session_id: sessionId, ...change });
     },
-    commentPlan: async (planId, task, text) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.plan.comment`, { session_id: sessionId, plan_id: planId, text, ...(task === null ? {} : { task }) });
-    },
-    removeComment: async (planId, seq) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.plan.comment`, { session_id: sessionId, plan_id: planId, remove: seq });
-    },
-    revisePlan: async (planId) => {
-      if (!sessionId) return;
-      setShared('chat.stick', Date.now());
-      await client.call(`${FLOW}.plan.revise`, { session_id: sessionId, plan_id: planId, mode: defaultMode });
-    },
-    chooseOption: async (seq, option) => {
-      if (!sessionId) return;
-      await client.call(`${FLOW}.ideation.choose`, { session_id: sessionId, seq, option });
-    },
-    sendMessage: async (text) => {
-      if (!sessionId) return;
-      setShared('chat.stick', Date.now());
-      await client.call(`${FLOW}.turn`, { session_id: sessionId, text, mode: defaultMode });
-    },
   }), [workspace, client, sessionId, projectId, selection, host, defaultMode]);
-  const spec = useMemo(() => currentSpec(entries), [entries]);
-  const decisions = useMemo(() => acceptedDecisions(entries), [entries]);
-  const ideation = useMemo<IdeationContextValue>(() => ({ entries, running, newestPlans: newestPlans(entries), specVersions: specVersions(entries) }), [entries, running]);
+  const planContext = useMemo<PlanContextValue>(() => ({ entries, running, newestPlans: newestPlans(entries) }), [entries, running]);
 
   const lastTurn = turns.at(-1);
   // One place says what happens now: the turn's own step list once it has steps or reasoning
@@ -274,7 +234,7 @@ function Chat() {
 
   return (
     <RevealContext.Provider value={reveal.sessionId === sessionId ? reveal : NO_REVEAL}>
-    <IdeationContext.Provider value={ideation}>
+    <PlanContext.Provider value={planContext}>
     <div className="cx-chat conversation" data-build={__CORTEX_BUILD__} data-session={sessionId ?? ''} data-running={running ? 'true' : 'false'}
       data-focus-seq={reveal.sessionId === sessionId && reveal.landed && reveal.seq !== null ? reveal.seq : undefined}>
       {/* No header row: the project, title, agent and run state are in the brand band (chatflow.band-session). */}
@@ -314,7 +274,6 @@ function Chat() {
                   <p className="prose cx-lead">This conversation is empty.</p>
                 </div>
               )}
-              <SpecCard spec={spec} decisions={decisions} actions={actions} />
               {turns.map((turn, index) => (
                 <TurnView key={turn.key} turn={turn} actions={actions} live={running && index === turns.length - 1}
                   progress={running && index === turns.length - 1 && !showWorking ? progressLine(liveRun.progress) : ''}
@@ -347,7 +306,7 @@ function Chat() {
       {error && <p className="inline-error" role="alert">{error}</p>}
       {project && <host.Slot name="chat.composer@1" className="cx-composer-slot" />}
     </div>
-    </IdeationContext.Provider>
+    </PlanContext.Provider>
     </RevealContext.Provider>
   );
 }

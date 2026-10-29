@@ -6,7 +6,7 @@
 [plugin]
 id = "mesh"
 name = "Mesh"
-version = "0.1.12"
+version = "0.1.13"
 description = "This person's CortexCode instances linked together: pairing with a short code, a signed membership, encrypted connections over the local network or a relay, capability cards, and borrowing a member's model or hands through the frame's own contracts."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
@@ -22,11 +22,11 @@ swap = "blue_green"
 provides = [
   "mesh.status", "mesh.pair.start", "mesh.pair.join", "mesh.pair.cancel", "mesh.members", "mesh.revoke",
   "mesh.leave", "mesh.name", "mesh.card", "mesh.peers", "mesh.call", "mesh.place", "mesh.place.end",
-  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release",
+  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release", "mesh.model.yield",
 ]
 subscribes = ["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"]
 publishes = ["mesh.changed"]
-uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "model.info", "model.slots", "model.metrics", "agents.scheduler", "container.list"]
+uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "model.info", "model.slots", "model.metrics", "model.yield", "agents.scheduler", "container.list"]
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]

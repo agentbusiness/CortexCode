@@ -56,6 +56,13 @@ impl Plugin for MeshPlugin {
                 // A model plugin here may have started, stopped or swapped.
                 mesh.forget_card();
                 mesh.models_changed();
+            } else if topic == "model.state" {
+                // This computer's model loaded, unloaded or now borrows another app's: the card
+                // changes, and the apps on this machine should know at once.
+                mesh.forget_card();
+                mesh.models_changed();
+                mesh.event(&topic, &data);
+                mesh.push_card().await;
             } else if topic.starts_with("project.")
                 || (topic == cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED && data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION))
             {
@@ -69,6 +76,7 @@ impl Plugin for MeshPlugin {
     fn shutdown(&self, ctx: Ctx) -> BoxFuture<'static, ()> {
         let mesh = self.mesh(&ctx);
         Box::pin(async move {
+            cc_mesh::local::withdraw(cc_mesh::SOFTWARE, &mesh.me.hex());
             if let Some(endpoint) = mesh.endpoint.get() {
                 endpoint.close().await;
             }

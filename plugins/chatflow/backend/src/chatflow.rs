@@ -19,10 +19,10 @@ use crate::repetition::{Detector, Verdict};
 use crate::schemas;
 use cc_protocol::contracts::chatflow::{
     KnowledgeAnswerParams,
-    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, DecisionAnswerParams, FlowState, IdeationChooseParams, PlanCommentParams, PlanEditParams, PlanRefParams, PlanUpdateParams,
-    PrewarmParams, PrewarmResult, SessionParams, SpecUpdateParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, plan_status, verbs,
+    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, FlowState, PlanCommentParams, PlanEditParams, PlanRefParams, PlanUpdateParams,
+    PrewarmParams, PrewarmResult, SessionParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, plan_status, verbs,
 };
-use crate::{ideation, plan, spec};
+use crate::{plan, proposal};
 use cc_protocol::contracts::tools::topics as tools_topics;
 use cc_protocol::contracts::agents::{Supervise, events as agent_events, topics as agents_topics};
 use cc_protocol::contracts::frame::{
@@ -57,15 +57,11 @@ pub fn hello() -> Hello {
         verbs::AGENT_RUN,
         verbs::APPROVE,
         verbs::ATTACHMENT_PUT,
-        verbs::SPEC_UPDATE,
-        verbs::SPEC_SAVE,
         verbs::PLAN_UPDATE,
         verbs::PLAN_IMPLEMENT,
         verbs::PLAN_EDIT,
         verbs::PLAN_COMMENT,
         verbs::PLAN_REVISE,
-        verbs::IDEATION_CHOOSE,
-        verbs::DECISION_ANSWER,
         verbs::KNOWLEDGE_ANSWER,
         verbs::PREWARM,
     ]
@@ -871,7 +867,7 @@ impl Chatflow {
                     .await?;
                 let detail = json!({"work": work, "route": "MANAGE", "effort": self.inner.data.get().effort.default, "by": "host"});
                 journal
-                    .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false}))
+                    .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id}))
                     .await?;
                 if let Ok(mut runs) = self.inner.runs.lock()
                     && let Some(handle) = runs.get_mut(session_id)
@@ -918,112 +914,7 @@ impl Chatflow {
         result
     }
 
-    // ---- spec, decisions, plans ----------------------------------------------------------------
-
-    /// The user's edit of the spec: a new version `by: user`.
-    async fn spec_update(&self, ctx: Ctx, params: SpecUpdateParams) -> Result<Value, RpcError> {
-        let host = Host::new(ctx);
-        let mut journal = Journal::load(host.clone(), &params.session_id).await?;
-        let entries = journal.entries_vec();
-        let data = self.inner.data.get();
-        let current = spec::current(&entries).map(|(_, spec)| spec);
-        spec::check_base(current.as_ref(), params.base_version)?;
-        let next = spec::user_update(&data, current.as_ref(), params.title.as_deref(), params.text.as_deref(), params.requirements.as_deref(), spec::accepted(&entries))
-            .map_err(RpcError::invalid_params)?;
-        let (seq, version) = spec::append(&mut journal, &next, None).await?;
-        Ok(json!({"version": version, "seq": seq}))
-    }
-
-    /// Write the spec into the session's workspace as `docs/specs/<slug>.md`.
-    async fn spec_save(&self, ctx: Ctx, params: SessionParams) -> Result<Value, RpcError> {
-        let host = Host::new(ctx);
-        let journal = Journal::load(host.clone(), &params.session_id).await?;
-        let Some((_, current)) = spec::current(&journal.entries_vec()) else { return Err(RpcError::not_found("this conversation has no spec")) };
-        let session = host.session_get(&params.session_id).await?;
-        let root = if session.workspace.is_empty() { host.project_get(&session.project_id).await?.root } else { session.workspace.clone() };
-        let relative = PathBuf::from("docs").join("specs").join(format!("{}.md", spec::slug(&current.title)));
-        let path = PathBuf::from(&root).join(&relative);
-        let data = self.inner.data.get();
-        let text = spec::markdown(&data, &current);
-        let written = path.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Some(parent) = written.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&written, text)
-        })
-        .await
-        .map_err(|error| RpcError::internal(format!("the write task failed: {error}")))?
-        .map_err(|error| RpcError::internal(format!("{}: {error}", path.display())))?;
-        let shown = relative.to_string_lossy().to_string();
-        host.journal_append(
-            &params.session_id,
-            kinds::NOTE,
-            json!({"text": data.text("spec_saved", &[("path", &shown)]), "purpose": "spec_saved", "host_message": true, "path": shown, "version": current.version}),
-        )
-        .await?;
-        Ok(json!({"path": path.to_string_lossy(), "relative": shown}))
-    }
-
-    /// Accept or reject a proposed decision; an accepted one joins the spec (a new version).
-    async fn decision_answer(&self, ctx: Ctx, params: DecisionAnswerParams) -> Result<Value, RpcError> {
-        let host = Host::new(ctx);
-        let entry = host
-            .journal_read(&params.session_id, params.seq)
-            .await?
-            .into_iter()
-            .find(|entry| entry.seq == params.seq)
-            .ok_or_else(|| RpcError::not_found("no such journal entry"))?;
-        if entry.kind != chatflow_kinds::DECISION {
-            return Err(RpcError::invalid_params("that entry is not a decision"));
-        }
-        let current = str_field(&entry.data, "state").to_owned();
-        if current != spec::PROPOSED {
-            return Ok(json!({"state": current, "changed": false}));
-        }
-        let state = if params.accept { spec::ACCEPTED } else { spec::REJECTED };
-        host.journal_set(&params.session_id, params.seq, "state", json!(state)).await?;
-        if params.accept {
-            self.accepted_decision(&host, &params.session_id, params.seq, &entry.data).await?;
-        }
-        Ok(json!({"state": state, "changed": true}))
-    }
-
-    /// What an accepted decision does: it joins the spec (a new version) and is written to the
-    /// project's knowledge as a `decision` item; the entry keeps the item's id.
-    async fn accepted_decision(&self, host: &Host, session_id: &str, seq: u64, data: &Value) -> Result<(), RpcError> {
-        let mut journal = Journal::load(host.clone(), session_id).await?;
-        if let Some((_, current)) = spec::current(&journal.entries_vec()) {
-            let decided = spec::Decided {
-                decided: str_field(data, "decided").to_owned(),
-                because: str_field(data, "because").to_owned(),
-                rejected: str_field(data, "rejected").to_owned(),
-                seq: Some(seq),
-            };
-            let next = spec::with_decision(&self.inner.data.get(), &current, decided);
-            spec::append(&mut journal, &next, None).await?;
-        }
-        // The decision is project knowledge too (owner decision, docs/PROJECT-KNOWLEDGE-IDEAS.md
-        // §11): a `decision` item in the graph; the entry keeps its id. Memory being away never
-        // fails the answer.
-        let decided = str_field(data, "decided").trim().to_owned();
-        let because = str_field(data, "because").trim().to_owned();
-        let rejected = str_field(data, "rejected").trim().to_owned();
-        let mut text = decided.clone();
-        if !because.is_empty() {
-            text.push_str(&format!(" Because {}", because.trim_end_matches('.')));
-            text.push('.');
-        }
-        if !rejected.is_empty() {
-            text.push_str(&format!(" Rejected: {rejected}"));
-        }
-        let item = json!({
-            "kind": "decision", "name": knowledge_name(&decided), "text": text, "source": "user", "by": "user",
-            "evidence": [format!("journal://{session_id}/{seq}")]
-        });
-        self.remember(host, session_id, seq, item).await;
-        Ok(())
-    }
+    // ---- knowledge, plans -----------------------------------------------------------------------
 
     /// Accept (with the text as edited) or reject a knowledge item the model proposed; an accepted
     /// one is written to the project's knowledge, bound to the code it named, with the journal entry
@@ -1040,10 +931,10 @@ impl Chatflow {
             return Err(RpcError::invalid_params("that entry is not a knowledge item"));
         }
         let current = str_field(&entry.data, "state").to_owned();
-        if current != spec::PROPOSED {
+        if current != proposal::PROPOSED {
             return Ok(json!({"state": current, "changed": false}));
         }
-        let state = if params.accept { spec::ACCEPTED } else { spec::REJECTED };
+        let state = if params.accept { proposal::ACCEPTED } else { proposal::REJECTED };
         host.journal_set(&params.session_id, params.seq, "state", json!(state)).await?;
         if !params.accept {
             return Ok(json!({"state": state, "changed": true}));
@@ -1180,7 +1071,7 @@ impl Chatflow {
             .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": card.stage, "mode": mode, "kind": "turn", "data_version": data.version()}))
             .await?;
         let detail = json!({"work": card.text, "route": card.route, "effort": data.effort.default, "by": "user"});
-        let mut route = json!({"route": card.route, "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false});
+        let mut route = json!({"route": card.route, "stage": "route", "detail": detail, "raw": "", "run_id": run_id});
         merge_fields(&mut route, card.route_fields);
         journal.append(kinds::ROUTE, route).await?;
         let _ = host.session_status(session_id, SessionStatus::Running).await;
@@ -1239,28 +1130,6 @@ impl Chatflow {
         }
         let seq = host.journal_append(&params.session_id, chatflow_kinds::PLAN_COMMENT, data).await?;
         Ok(json!({"seq": seq, "state": "open"}))
-    }
-
-    /// Choose an option of an ideation: an accepted decision (it joins the spec or the decision
-    /// list and the project's knowledge), and the options entry keeps the choice.
-    async fn ideation_choose(&self, ctx: Ctx, params: IdeationChooseParams) -> Result<Value, RpcError> {
-        let host = Host::new(ctx);
-        let journal = Journal::load(host.clone(), &params.session_id).await?;
-        let entry = journal.get(params.seq).cloned().ok_or_else(|| RpcError::not_found("no such journal entry"))?;
-        let options = ideation::options_at(&entry).ok_or_else(|| RpcError::invalid_params("that entry is not an ideation's options"))?;
-        if let (Some(chosen), Some(seq)) = (&options.chosen, options.decision_seq) {
-            return Ok(json!({"chosen": chosen, "seq": seq, "changed": false}));
-        }
-        let (decided, because, rejected) = ideation::chosen_decision(&options, &params.option).ok_or_else(|| RpcError::invalid_params(format!("no option {}", params.option)))?;
-        let mut accepted = spec::proposed_entry(&decided, &because, &rejected, str_field(&entry.data, "run_id"));
-        accepted["state"] = json!(spec::ACCEPTED);
-        accepted["ideation_seq"] = json!(params.seq);
-        let seq = host.journal_append(&params.session_id, chatflow_kinds::DECISION, accepted.clone()).await?;
-        let chosen = if params.option.eq_ignore_ascii_case("radical") { "radical".to_owned() } else { params.option.to_uppercase() };
-        host.journal_set(&params.session_id, params.seq, "chosen", json!(chosen)).await?;
-        host.journal_set(&params.session_id, params.seq, "decision_seq", json!(seq)).await?;
-        self.accepted_decision(&host, &params.session_id, seq, &accepted).await?;
-        Ok(json!({"chosen": chosen, "seq": seq, "changed": true}))
     }
 
     // ---- chatflow.steer / cancel / state ------------------------------------------------------
@@ -1483,7 +1352,7 @@ impl Chatflow {
             .await?;
         let detail = json!({"work": text, "route": "MANAGE", "effort": set.effort.default, "by": "host"});
         journal
-            .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id, "spec_action": "none", "settles": false}))
+            .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id}))
             .await?;
         let _ = host.session_status(&session_id, SessionStatus::Running).await;
         let this = self.clone();
@@ -1640,10 +1509,14 @@ impl Chatflow {
                 .await?;
             outcome = agent_loop::run(&env, &mut journal, &spec).await;
         }
+        // A run that was cancelled ends cancelled even when its caller went away too (parking
+        // it would leave no end status, so it would read as running for ever).
+        let cancelled = stops.cancel.is_cancelled();
         let outcome = match outcome {
-            Ok(outcome) if outcome.outcome == "parked" => return Err(parked()),
+            Ok(outcome) if outcome.outcome == "parked" && !cancelled => return Err(parked()),
+            Ok(outcome) if outcome.outcome == "parked" => LoopOutcome { outcome: "cancelled".into(), summary: "Cancelled.".into(), ..outcome },
             Ok(outcome) => outcome,
-            Err(error) if error.code == codes::CANCELLED && stops.park.is_cancelled() => return Err(parked()),
+            Err(error) if error.code == codes::CANCELLED && stops.park.is_cancelled() && !cancelled => return Err(parked()),
             Err(error) if error.code == codes::CANCELLED => LoopOutcome {
                 outcome: "cancelled".into(),
                 summary: "Cancelled.".into(),
@@ -1873,9 +1746,6 @@ impl Plugin for Chatflow {
                 verbs::RUNNING => to_value(&this.running()),
                 verbs::APPROVE => this.approve(ctx, parse_params(call.params.clone())?).await,
                 verbs::ATTACHMENT_PUT => to_value(&this.attachment_put(ctx, parse_params(call.params.clone())?).await?),
-                verbs::SPEC_UPDATE => this.spec_update(ctx, parse_params(call.params.clone())?).await,
-                verbs::SPEC_SAVE => this.spec_save(ctx, parse_params(call.params.clone())?).await,
-                verbs::DECISION_ANSWER => this.decision_answer(ctx, parse_params(call.params.clone())?).await,
                 verbs::KNOWLEDGE_ANSWER => this.knowledge_answer(ctx, parse_params(call.params.clone())?).await,
                 verbs::PREWARM => to_value(&this.prewarm(ctx, parse_params(call.params.clone())?).await?),
                 verbs::PLAN_UPDATE => this.plan_update(ctx, parse_params(call.params.clone())?).await,
@@ -1883,7 +1753,6 @@ impl Plugin for Chatflow {
                 verbs::PLAN_REVISE => to_value(&this.plan_revise(ctx, parse_params(call.params.clone())?).await?),
                 verbs::PLAN_EDIT => this.plan_edit(ctx, parse_params(call.params.clone())?).await,
                 verbs::PLAN_COMMENT => this.plan_comment(ctx, parse_params(call.params.clone())?).await,
-                verbs::IDEATION_CHOOSE => this.ideation_choose(ctx, parse_params(call.params.clone())?).await,
                 verbs::AGENT_RUN => {
                     let params: AgentRunParams = parse_params(call.params.clone())?;
                     to_value(&this.agent_run(ctx, &call, params).await?)
@@ -1982,22 +1851,6 @@ impl Plugin for Chatflow {
             let _ = tokio::time::timeout(agent_loop::PARK_GRACE + Duration::from_millis(1500), inner.tasks.wait()).await;
         })
     }
-}
-
-/// A knowledge item's name from a decision's statement: its first words, at most 60 characters,
-/// cut at a word.
-fn knowledge_name(statement: &str) -> String {
-    let mut name = String::new();
-    for word in statement.split_whitespace() {
-        if !name.is_empty() && name.len() + 1 + word.len() > 60 {
-            break;
-        }
-        if !name.is_empty() {
-            name.push(' ');
-        }
-        name.push_str(word);
-    }
-    if name.is_empty() { statement.chars().take(60).collect() } else { name }
 }
 
 /// A conversation's name from its first message: the first line's first words, at most 48

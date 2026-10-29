@@ -17,21 +17,17 @@
 //!   rewrite near the start re-reads the whole conversation). What changed is shown where it
 //!   happened, at the end. In-place changes are applied only up to the `context` entry's
 //!   `settled_through` mark, which each compaction moves to its newest entry ([`crate::fit`]).
-//! - The spec settled at the last compaction (or, without one, the accepted decisions) is one host
-//!   message right after the system prompt, whole ([`crate::spec::pinned`]); the user message it
-//!   was made from is shown as a reference to it, and each settled `spec` entry in place as one
-//!   line saying what changed. A `spec` entry after the mark is shown whole in place, and so is a
-//!   decision accepted after it.
 //! - A `plan` entry -> host message: the plan as it was made, without its status or task states
 //!   (the step message says which task is now); a version replaced by one before the mark is one
 //!   line, and a plan being carried out before the mark is its goal and task titles.
 //! - `status`, `usage`, `error`, `task_link`, `agent_spawned`, `verification`, `context`,
-//!   `decision` and unconsumed steers are not part of the conversation.
+//!   unconsumed steers, and the `spec`, `decision` and `ideation` entries of older sessions are not
+//!   part of the conversation.
 //! - Entries marked `interrupted` (a generation cut off by a hot-swap) are skipped: the step is
 //!   generated again.
 //! - Compaction marks on the `context` entry ([`crate::fit`] sets them): a tool output at or before
 //!   `folded_through` is one line saying it was folded; a finished turn whose terminal status is at
-//!   or before `digested_through` keeps its user message, steers, plans and spec changes, and the
+//!   or before `digested_through` keeps its user message, steers and plans, and the
 //!   rest of it becomes one host note listing its calls plus its final answer, placed where it ended;
 //!   steps at or before `steps_through` that no turn digest covers (the running turn's older steps)
 //!   become one host note listing their calls, placed where the first of them was.
@@ -41,7 +37,7 @@
 
 use crate::attachments;
 use crate::data::Dataset;
-use crate::{plan, spec};
+use crate::plan;
 use cc_protocol::contracts::chatflow::kinds as chatflow_kinds;
 use crate::journal::extra_kinds;
 use cc_protocol::contracts::frame::{JournalEntry, kinds};
@@ -494,14 +490,8 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     };
 
     let mut messages: Vec<ChatMessage> = Vec::new();
-    // Pinned right after the system prompt: the settled spec (or the decision list), whole.
-    if let Some(pinned) = spec::pinned(ds, settled) {
-        messages.push(host_message(ds, &pinned));
-    }
     let pins = Pins {
-        source: spec::current(settled).and_then(|(_, current)| current.source_seq).and_then(|seq| spec::source_reference(ds, settled, seq).map(|text| (seq, text))),
         newest_plans: plan::newest_versions(settled),
-        spec_versions: spec::versions(entries),
         settled: settled_through,
     };
     let mut emitted_results: HashSet<String> = HashSet::new();
@@ -531,10 +521,10 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             continue;
         }
         if let Some(digest) = digests.of(entry, &calls) {
-            // A digested turn: its user message, plans and spec changes stay; everything else of
+            // A digested turn: its user message and plans stay; everything else of
             // it becomes one host note and its final answer, where the turn ended.
             flush_host(&mut host_group, &mut messages);
-            if matches!(entry.kind.as_str(), kinds::USER_MESSAGE | chatflow_kinds::PLAN | chatflow_kinds::SPEC) || crate::ideation::is_answer(entry) {
+            if matches!(entry.kind.as_str(), kinds::USER_MESSAGE | chatflow_kinds::PLAN) {
                 emit_other(ds, entry, &mut messages, &emitted_results, &calls, &render_output, &mut host_group, image_input, &pins);
             } else if digest.end == entry.seq {
                 if !digest.calls.is_empty() {
@@ -642,14 +632,10 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     messages
 }
 
-/// What the spec and plans change about entries in place.
+/// What plans change about entries in place.
 struct Pins {
-    /// The user message the settled spec was made from, and the reference it is shown as.
-    source: Option<(u64, String)>,
     /// Seq of the newest settled version of each plan.
     newest_plans: HashMap<String, u64>,
-    /// The version of each `spec` entry (its place in append order).
-    spec_versions: HashMap<u64, u32>,
     /// The `settled_through` mark: in-place changes count up to it.
     settled: u64,
 }
@@ -693,40 +679,11 @@ fn emit_other(
     match entry.kind.as_str() {
         kinds::USER_MESSAGE => {
             let attached = attachments::of_entry(data);
-            // The spec's own message: its text is pinned at the start, so here only a reference.
-            let own = match &pins.source {
-                Some((seq, reference)) if *seq == entry.seq => reference.as_str(),
-                _ => str_field(data, "text"),
-            };
-            let text = attachments::message_text(ds, own, &attached, image_input);
+            let text = attachments::message_text(ds, str_field(data, "text"), &attached, image_input);
             messages.push(attachments::user_message(text, &attached, image_input))
-        }
-        chatflow_kinds::SPEC => {
-            let version = pins.spec_versions.get(&entry.seq).copied().unwrap_or(0);
-            // A spec after the mark is not pinned yet: it is shown whole where it was made.
-            let text = if entry.seq > pins.settled { spec::whole_in_place(ds, version, data) } else { None };
-            messages.push(host_message(ds, &text.unwrap_or_else(|| spec::changed_text(ds, version, data))));
         }
         chatflow_kinds::PLAN => {
             if let Some(text) = plan::in_place(ds, entry, &pins.newest_plans, pins.settled) {
-                messages.push(host_message(ds, &text));
-            }
-        }
-        // An open design question: the ideas with what the host found for each (host words), then
-        // the options, which are the turn's answer (the model's own words).
-        chatflow_kinds::IDEATION if crate::ideation::is_answer(entry) => {
-            if let Some(text) = crate::ideation::render_options(ds, data) {
-                messages.push(ChatMessage::new("assistant", text));
-            }
-        }
-        chatflow_kinds::IDEATION => {
-            if let Some(text) = crate::ideation::render_ideas(ds, data) {
-                messages.push(host_message(ds, &text));
-            }
-        }
-        // A decision accepted after the mark is not pinned yet: it is shown where it was made.
-        chatflow_kinds::DECISION if entry.seq > pins.settled => {
-            if let Some(text) = spec::accepted_in_place(ds, data) {
                 messages.push(host_message(ds, &text));
             }
         }

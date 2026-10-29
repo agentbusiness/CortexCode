@@ -8,7 +8,7 @@ use cc_protocol::contracts::mesh::{
     CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
     topics,
 };
-use cc_protocol::contracts::model::ModelInfo;
+use cc_protocol::contracts::model::{ModelInfo, YieldParams};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use iroh::Endpoint;
@@ -43,6 +43,7 @@ pub const PROVIDES: &[&str] = &[
     methods::LINK,
     methods::CLAIM,
     methods::RELEASE,
+    methods::MODEL_YIELD,
 ];
 pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"];
 
@@ -101,6 +102,8 @@ pub struct Mesh {
     pub placements: crate::place::Placements,
     pub links: crate::projects::Links,
     pub claims: crate::claims::Claims,
+    /// Apps of this person on this machine, trusted while they run ([`crate::local`]).
+    pub local: Mutex<HashMap<String, crate::local::LocalPeer>>,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -147,6 +150,7 @@ impl Mesh {
             placements: crate::place::Placements::default(),
             links: crate::projects::Links::default(),
             claims: crate::claims::Claims::default(),
+            local: Mutex::new(HashMap::new()),
         }
     }
 
@@ -172,12 +176,66 @@ impl Mesh {
 
     // --- membership ----------------------------------------------------------------------------
 
+    /// The network's members and the apps on this machine (`local`).
     pub fn members(&self) -> BTreeMap<String, Member> {
-        lock(&self.log).members()
+        let mut members = lock(&self.log).members();
+        for peer in lock(&self.local).values() {
+            match members.get_mut(&peer.node) {
+                Some(member) => member.local = true,
+                None => {
+                    if let Some(member) = peer.member() {
+                        members.insert(peer.node.clone(), member);
+                    }
+                }
+            }
+        }
+        members
     }
 
     pub fn member(&self, node: &str) -> Option<Member> {
-        lock(&self.log).member(node)
+        self.members().remove(node)
+    }
+
+    /// A member in the signed log (not only an app on this machine).
+    pub fn in_log(&self, node: &str) -> bool {
+        lock(&self.log).is_member(node)
+    }
+
+    pub fn is_local(&self, node: &str) -> bool {
+        lock(&self.local).contains_key(node)
+    }
+
+    /// An app on this machine that is not in this network's log (its log is its own network's).
+    pub fn local_only(&self, node: &str) -> bool {
+        self.is_local(node) && !self.in_log(node)
+    }
+
+    /// Read the shared local folder again (and keep this node's file there); a local app that is
+    /// gone loses its connection.
+    pub fn refresh_local(&self) {
+        if let Some(endpoint) = self.endpoint.get() {
+            let addrs = crate::local::loopback(&endpoint.bound_sockets());
+            let home = self.home.display().to_string();
+            crate::local::announce(&crate::local::LocalPeer { node: self.me.hex(), software: crate::SOFTWARE.to_owned(), name: self.name(), home, pid: std::process::id(), addrs });
+        }
+        let found = crate::local::discover(&self.me.hex());
+        let gone: Vec<String> = {
+            let mut local = lock(&self.local);
+            if *local == found {
+                return;
+            }
+            let gone = local.keys().filter(|node| !found.contains_key(*node)).cloned().collect();
+            *local = found;
+            gone
+        };
+        for node in gone {
+            if !self.in_log(&node)
+                && let Some(connection) = lock(&self.conns).remove(&node)
+            {
+                connection.close(5u32.into(), b"gone");
+            }
+        }
+        self.notify("members");
     }
 
     /// A member's full id from a prefix (`cx` shows the first ten characters); the id itself when
@@ -197,7 +255,7 @@ impl Mesh {
     }
 
     pub fn is_member(&self, node: &str) -> bool {
-        lock(&self.log).is_member(node)
+        self.in_log(node) || self.is_local(node)
     }
 
     pub fn log_entries(&self) -> Vec<Entry> {
@@ -295,7 +353,7 @@ impl Mesh {
     /// This node leaves its network: a revoke of itself, told to the members, then nothing of
     /// the network kept here.
     pub async fn leave(&self) {
-        if self.is_member(&self.me.hex()) && self.members().len() > 1 {
+        if self.in_log(&self.me.hex()) && lock(&self.log).members().len() > 1 {
             let name = self.name();
             lock(&self.log).append(&self.me, "revoke", &self.me.hex(), &name, Vec::new());
             self.save_log();
@@ -307,7 +365,7 @@ impl Mesh {
     /// A member's copy of the log arrived.
     pub fn log_received(&self, entries: Vec<Entry>) -> Result<bool, String> {
         let changed = lock(&self.log).merge(entries)?;
-        if changed && !self.is_member(&self.me.hex()) {
+        if changed && !self.in_log(&self.me.hex()) {
             // Taken out by a member: this node is alone again.
             tracing::info!("this computer was removed from its network");
             self.forget_network();
@@ -387,7 +445,7 @@ impl Mesh {
         }
         let card = match self.ctx.get() {
             Some(ctx) => crate::card::build(ctx, &self.me.hex(), &self.name(), &self.home).await,
-            None => Card { node: self.me.hex(), name: self.name(), software: "cortexcode".to_owned(), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
+            None => Card { node: self.me.hex(), name: self.name(), software: crate::SOFTWARE.to_owned(), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
         };
         let mut card = card;
         // A model this computer does not lend is not shown to the members.
@@ -547,7 +605,7 @@ impl Mesh {
                 let params: PairJoinParams = parse_params(params)?;
                 let name = params.name.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| self.name());
                 // One network at a time: joining another means leaving this one.
-                if self.members().len() > 1 {
+                if lock(&self.log).members().len() > 1 {
                     self.leave().await;
                 }
                 self.join(&params.code, &name).await.map_err(RpcError::invalid_params)?;
@@ -563,6 +621,9 @@ impl Mesh {
                 params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
                 if params.node == self.me.hex() {
                     return Err(RpcError::invalid_params("this node cannot revoke itself; revoke it from another member"));
+                }
+                if !self.in_log(&params.node) {
+                    return Err(RpcError::invalid_params("an app on this machine is a member while it runs; quit it there"));
                 }
                 let member = self.member(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
                 lock(&self.log).append(&self.me, "revoke", &params.node, &member.name, Vec::new());
@@ -589,7 +650,7 @@ impl Mesh {
                 *lock(&self.name) = name.clone();
                 let _ = std::fs::create_dir_all(self.home.join("mesh"));
                 let _ = std::fs::write(self.home.join("mesh").join("name"), &name);
-                if self.is_member(&self.me.hex()) {
+                if self.in_log(&self.me.hex()) {
                     lock(&self.log).append(&self.me, "rename", &self.me.hex(), &name, Vec::new());
                     self.save_log();
                     self.push_log().await;
@@ -648,6 +709,10 @@ impl Mesh {
                 let params: ClaimParams = parse_params(params)?;
                 self.release(&params.session_id).await;
                 Ok(json!({}))
+            }
+            methods::MODEL_YIELD => {
+                let params: YieldParams = parse_params(params)?;
+                to_value(&self.ask_local_yield(&params.to_tag).await)
             }
             methods::LINK => {
                 let mut params: NodeParams = parse_params(params)?;

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
-pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "MANAGE", "PLAN", "IDEATE", "IMPLEMENT"];
+pub const ROUTES: &[&str] = &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "MANAGE", "PLAN", "IMPLEMENT"];
 pub const DECISIONS: &[&str] = &["MORE", "ANSWER", "DO", "DELEGATE", "PLAN"];
 
 /// The shape of a constrained output.
@@ -38,8 +38,6 @@ pub enum Shape {
 
 /// Placeholder enum value of a pick filled at run time (`"items": {"enum": ["@catalog"]}`).
 pub const CATALOG_PLACEHOLDER: &str = "@catalog";
-/// Placeholder of an enum of the spec's requirement ids (filled from the current spec).
-pub const REQUIREMENTS_PLACEHOLDER: &str = "@requirements";
 /// Placeholder of a pick of the code names the turn read or edited (KNOWLEDGE's `binds`: the host
 /// narrows what an item can bind to; an item never names code the turn did not see).
 pub const READS_PLACEHOLDER: &str = "@reads";
@@ -406,16 +404,14 @@ pub struct RouterDecision {
     /// routes `router.json` gates it to (the turn's first generation).
     #[serde(default)]
     pub skills: Vec<String>,
-    /// none | new | amend: what the latest message does to the session's spec.
-    #[serde(default)]
-    pub spec: String,
-    /// no | yes: the latest message settles a choice under discussion.
-    #[serde(default)]
-    pub settles: String,
     /// no | yes: the latest message states something durable about the project's world (a
     /// KNOWLEDGE stage proposes items after the answer; docs/PROJECT-KNOWLEDGE-PLAN.md P3).
     #[serde(default)]
     pub teaches: String,
+    /// no | yes: the latest message sets aside the direction the user gave earlier in the
+    /// conversation: the conversation's decisions in the project's knowledge are withdrawn.
+    #[serde(default)]
+    pub drops: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -480,36 +476,6 @@ pub struct Checks {
     pub checks: Vec<String>,
 }
 
-/// SPEC: the requirements of the message that became the spec.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct SpecExtract {
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub requirements: Vec<String>,
-    /// The request's own worked examples, copied: what the work is checked against.
-    #[serde(default)]
-    pub examples: Vec<String>,
-}
-
-/// SPEC_EDIT: how the latest message changes the spec's requirements.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct SpecEdit {
-    #[serde(default)]
-    pub add: Vec<String>,
-    #[serde(default)]
-    pub drop: Vec<String>,
-    #[serde(default)]
-    pub modify: Vec<Modified>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Modified {
-    pub id: String,
-    #[serde(default)]
-    pub text: String,
-}
-
 /// PLAN / PLAN_EDIT: a plan document and its task graph as the model writes them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PlanOutput {
@@ -540,6 +506,9 @@ pub struct PlanTaskOutput {
     pub title: String,
     #[serde(default)]
     pub brief: String,
+    /// What the conversation already established that the task needs.
+    #[serde(default)]
+    pub known: Vec<String>,
     /// The request's rules this task makes true, one line each, in the request's words.
     #[serde(default)]
     pub rules: Vec<String>,
@@ -550,148 +519,9 @@ pub struct PlanTaskOutput {
     pub touches: Vec<String>,
     #[serde(default)]
     pub checks: Vec<String>,
-    /// Requirement ids of the spec the task serves.
-    #[serde(default)]
-    pub covers: Vec<String>,
     /// Skills the task's implementation reads (`skill://<plugin>/<name>`, from the catalog).
     #[serde(default)]
     pub skills: Vec<String>,
-}
-
-/// IDEAS: an open design question framed, and one idea per generating principle.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct IdeasOutput {
-    #[serde(default)]
-    pub question: String,
-    #[serde(default)]
-    pub constraints: Vec<String>,
-    #[serde(default)]
-    pub criteria: Vec<String>,
-    #[serde(default)]
-    pub ideas: IdeaFields,
-}
-
-/// One idea per principle; the field names are the principles the model generates from.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct IdeaFields {
-    #[serde(default)]
-    pub first: IdeaOutput,
-    #[serde(default)]
-    pub two_choices_flipped: IdeaOutput,
-    #[serde(default)]
-    pub constraint_relaxed: IdeaOutput,
-    #[serde(default)]
-    pub inverted: IdeaOutput,
-    #[serde(default)]
-    pub component_removed: IdeaOutput,
-    #[serde(default)]
-    pub borrowed: IdeaOutput,
-    #[serde(default)]
-    pub prior_art: IdeaOutput,
-}
-
-impl IdeaFields {
-    /// `(principle, idea)` in the order written.
-    pub fn in_order(&self) -> [(&'static str, &IdeaOutput); 7] {
-        [
-            ("first", &self.first),
-            ("two_choices_flipped", &self.two_choices_flipped),
-            ("constraint_relaxed", &self.constraint_relaxed),
-            ("inverted", &self.inverted),
-            ("component_removed", &self.component_removed),
-            ("borrowed", &self.borrowed),
-            ("prior_art", &self.prior_art),
-        ]
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct IdeaOutput {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub mechanism: String,
-}
-
-/// OPTIONS: the ideas critiqued, the options chosen from them, a radical one, a recommendation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct OptionsOutput {
-    #[serde(default)]
-    pub critique: Vec<CritiqueOutput>,
-    #[serde(default)]
-    pub options: Vec<OptionOutput>,
-    #[serde(default)]
-    pub radical: RadicalOutput,
-    /// The idea number of the recommended option.
-    #[serde(default)]
-    pub recommend: String,
-    #[serde(default)]
-    pub because: String,
-    #[serde(default)]
-    pub would_change_if: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct CritiqueOutput {
-    #[serde(default)]
-    pub idea: String,
-    /// keep | drop
-    #[serde(default)]
-    pub verdict: String,
-    #[serde(default)]
-    pub why: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct OptionOutput {
-    #[serde(default)]
-    pub idea: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub mechanism: String,
-    #[serde(default)]
-    pub why: String,
-    /// Picked from what the host found for the ideas (absent when it found nothing).
-    #[serde(default)]
-    pub grounding: Vec<String>,
-    #[serde(default)]
-    pub prior_art: String,
-    #[serde(default)]
-    pub cost: String,
-    #[serde(default)]
-    pub risk: String,
-    #[serde(default)]
-    pub settle_by: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct RadicalOutput {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub drops: String,
-    #[serde(default)]
-    pub buys: String,
-    #[serde(default)]
-    pub wins_if: String,
-}
-
-/// DECISIONS: what the latest exchange settled.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Proposed {
-    #[serde(default)]
-    pub decisions: Vec<ProposedDecision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ProposedDecision {
-    #[serde(default)]
-    pub decided: String,
-    #[serde(default)]
-    pub because: String,
-    #[serde(default)]
-    pub rejected: String,
 }
 
 /// KNOWLEDGE: what the latest message stated about the project's world.

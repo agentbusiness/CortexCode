@@ -67,6 +67,11 @@ pub mod methods {
     pub const CLAIM: &str = "mesh.claim";
     /// [`super::ClaimParams`] -> `{}`: the use is over; the resource is free for the next run.
     pub const RELEASE: &str = "mesh.release";
+    /// [`crate::contracts::model::YieldParams`] -> [`super::YieldResult`]: one model per machine.
+    /// Called here (a model plugin about to load a model tagged `to_tag`): every member on this
+    /// machine whose model is not tagged `to_tag` is asked to unload it. Sent by a member on this
+    /// machine: forwarded to this frame's model plugin as `model.yield`.
+    pub const MODEL_YIELD: &str = "mesh.model.yield";
     /// [`super::LendParams`] -> [`super::MeshStatus`]: whether members may use this computer's
     /// model (off: its card shows no model and its claims are refused); this computer still uses
     /// theirs.
@@ -92,6 +97,10 @@ pub struct Member {
     /// without a lookup.
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// Another app of this person on this machine (same user, found in the shared local folder):
+    /// trusted without pairing while it runs, never written to the membership log.
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -376,6 +385,10 @@ pub struct ClaimParams {
     /// The work the call is for: only a model with this tag takes it.
     #[serde(default = "crate::contracts::model::default_tag")]
     pub tag: String,
+    /// The tags the call accepts, best first (`["coding", "office"]`); empty: `[tag]`. A model
+    /// counts when it has one of them, and a better-ranked tag wins before the other rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// A person waits for this use (a chat turn); on its own computer it does not wait for agent
     /// work, which the engine puts behind it.
     #[serde(default)]
@@ -392,6 +405,24 @@ pub struct ClaimParams {
 
 fn claim_waits() -> bool {
     true
+}
+
+impl ClaimParams {
+    /// The accepted tags, best first.
+    pub fn accepted(&self) -> Vec<String> {
+        if self.tags.is_empty() { vec![self.tag.clone()] } else { self.tags.clone() }
+    }
+}
+
+/// Result of [`methods::MODEL_YIELD`] called here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct YieldResult {
+    /// The members on this machine that were asked to unload their model.
+    #[serde(default)]
+    pub asked: Vec<String>,
+    /// Those that unloaded one.
+    #[serde(default)]
+    pub yielded: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -154,16 +154,8 @@ skills_per_turn = 3
 # PLAN, PLAN_EDIT), the previous turn's skills first. Either way ROUTE's message names the previous
 # turn's skills.
 skills_in_prefix = true
-# A user message whose text is longer than this (characters) becomes the session's spec when the
-# session has none yet. 0 = only when the router judges the message a spec. Off: a long
-# message is often a pasted log or stack trace, not a list of requirements.
-spec_min_chars = 0
-# Spec text pinned whole at most (characters): pasted text beyond it is referenced by its path.
-spec_max_chars = 24000
 # Tasks one plan may hold (the `depends_on` numbers its grammar offers).
 plan_max_tasks = 12
-# Decisions one DECISIONS stage may propose.
-decisions_per_turn = 3
 # Knowledge items one KNOWLEDGE stage may propose from the user's message (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
 knowledge_items_per_turn = 3
 # Knowledge items the host reads by meaning for a turn (ROUTE's `work`; 0 = none) and shows as one
@@ -252,20 +244,6 @@ rules = "ask"
 effort = "decided"
 sampling = "auto"
 
-# The session's spec: requirements extracted once from the message that became it.
-[stage.SPEC]
-rules = "spec"
-schema = "schemas/spec.json"
-effort = "none"
-sampling = "auto"
-
-# A message that changes the spec: added, dropped and changed requirement ids.
-[stage.SPEC_EDIT]
-rules = "spec_edit"
-schema = "schemas/spec_edit.json"
-effort = "none"
-sampling = "decision"
-
 # Plan mode: a plan document and a task graph, nothing changed.
 [stage.PLAN]
 rules = ["plan", "plan_fields", "check_rules"]
@@ -280,44 +258,12 @@ schema = "schemas/plan.json"
 effort = "none"
 sampling = "auto"
 
-# An open design question (route IDEATE). DISCOVER first: a tool loop that finds what the question
-# depends on (the documents, the code, how it behaves now) and replies with its findings, the last
-# message before IDEAS (outside the prefix: its rules are the step's own last message).
-[stage.DISCOVER]
-rules = "discover"
-effort = "decided"
-sampling = "auto"
-
-# Then two calls around a host step. IDEAS: the question,
-# its constraints and criteria, and one idea per generating principle (the schema's field names
-# are the principles, so the ideas differ by construction). The host then looks every idea up
-# (code graph, research notes, work elsewhere when online). OPTIONS: critique, the two or three
-# options with their grounding picked from what the host found, a radical one and a recommendation.
-[stage.IDEAS]
-rules = "ideas"
-schema = "schemas/ideas.json"
-effort = "none"
-sampling = "auto"
-
-[stage.OPTIONS]
-rules = "options"
-schema = "schemas/options.json"
-effort = "none"
-sampling = "auto"
-
-# Decisions the latest exchange settled, proposed for the user to accept.
 # The project's description, written once when a project is first used (and again when its
 # documents change): what the software is, no code. Stored in the graph, shown first in the brief.
 [stage.DESCRIBE]
 rules = "describe"
 effort = "none"
 sampling = "plain"
-
-[stage.DECISIONS]
-rules = "decisions"
-schema = "schemas/decisions.json"
-effort = "none"
-sampling = "decision"
 
 # Knowledge the latest message stated about the project's world, kept at once.
 [stage.KNOWLEDGE]

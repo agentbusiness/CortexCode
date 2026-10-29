@@ -128,7 +128,8 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
             languages.push(LanguageCard { id: description.id, version });
         }
     }
-    let model = match get::<ModelInfo>(ctx, "model.info", json!({})).await {
+    // A model borrowed from another app on this machine is that app's: not shown here.
+    let model = match get::<ModelInfo>(ctx, "model.info", json!({})).await.filter(|info| !info.borrowed()) {
         Some(info) => {
             let slots: Option<SlotsResult> = get(ctx, "model.slots", json!({})).await;
             let metrics: Option<LiveMetrics> = get(ctx, "model.metrics", json!({})).await;
@@ -174,7 +175,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
     Card {
         node: node.to_owned(),
         name: name.to_owned(),
-        software: "cortexcode".to_owned(),
+        software: crate::SOFTWARE.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         flows,
         chip: machine.chip,

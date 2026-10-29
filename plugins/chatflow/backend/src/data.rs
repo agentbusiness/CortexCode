@@ -44,11 +44,8 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/do.md", include_str!("../data/prompts/do.md")),
     ("prompts/task.md", include_str!("../data/prompts/task.md")),
     ("prompts/ask.md", include_str!("../data/prompts/ask.md")),
-    ("prompts/spec.md", include_str!("../data/prompts/spec.md")),
-    ("prompts/spec_edit.md", include_str!("../data/prompts/spec_edit.md")),
     ("prompts/plan.md", include_str!("../data/prompts/plan.md")),
     ("prompts/plan_edit.md", include_str!("../data/prompts/plan_edit.md")),
-    ("prompts/decisions.md", include_str!("../data/prompts/decisions.md")),
     ("prompts/describe.md", include_str!("../data/prompts/describe.md")),
     ("prompts/knowledge.md", include_str!("../data/prompts/knowledge.md")),
     ("prompts/learn.md", include_str!("../data/prompts/learn.md")),
@@ -58,22 +55,14 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
     ("prompts/manage.md", include_str!("../data/prompts/manage.md")),
-    ("prompts/discover.md", include_str!("../data/prompts/discover.md")),
-    ("prompts/ideas.md", include_str!("../data/prompts/ideas.md")),
-    ("prompts/options.md", include_str!("../data/prompts/options.md")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
     ("schemas/manage.json", include_str!("../data/schemas/manage.json")),
     ("schemas/router.json", include_str!("../data/schemas/router.json")),
     ("schemas/decide.json", include_str!("../data/schemas/decide.json")),
     ("schemas/checks.json", include_str!("../data/schemas/checks.json")),
-    ("schemas/spec.json", include_str!("../data/schemas/spec.json")),
-    ("schemas/spec_edit.json", include_str!("../data/schemas/spec_edit.json")),
     ("schemas/plan.json", include_str!("../data/schemas/plan.json")),
-    ("schemas/decisions.json", include_str!("../data/schemas/decisions.json")),
     ("schemas/knowledge.json", include_str!("../data/schemas/knowledge.json")),
     ("schemas/learn.json", include_str!("../data/schemas/learn.json")),
-    ("schemas/ideas.json", include_str!("../data/schemas/ideas.json")),
-    ("schemas/options.json", include_str!("../data/schemas/options.json")),
 ];
 
 /// Roles a session's system prompt is built for: `chat` (the foreground flow) and `agent` (a
@@ -82,25 +71,20 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "SPEC", "SPEC_EDIT", "PLAN", "PLAN_EDIT", "DECISIONS", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "MANAGE", "DISCOVER", "IDEAS", "OPTIONS"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "MANAGE"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
 const SCHEMA_NEEDS: &[SchemaNeed] = &[
-    ("ROUTE", &["work", "route"], Some(("route", &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "MANAGE", "PLAN", "IDEATE", "IMPLEMENT"]))),
+    ("ROUTE", &["work", "route"], Some(("route", &["ANSWER", "LOOKUP", "DO", "DELEGATE", "STATUS", "MANAGE", "PLAN", "IMPLEMENT"]))),
     ("DECIDE", &["missing", "route"], Some(("route", &["MORE", "ANSWER", "DO", "DELEGATE", "PLAN"]))),
     ("CHECKS", &["checks"], None),
-    ("SPEC", &["title", "requirements"], None),
-    ("SPEC_EDIT", &["add", "drop", "modify"], None),
     ("PLAN", &["goal", "tasks"], None),
     ("PLAN_EDIT", &["goal", "tasks"], None),
-    ("DECISIONS", &["decisions"], None),
     ("KNOWLEDGE", &["items"], None),
     ("LEARN", &["useful"], Some(("useful", &["no", "yes"]))),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
     ("MANAGE", &["actions", "replan"], Some(("replan", &["no", "yes"]))),
-    ("IDEAS", &["question", "ideas"], None),
-    ("OPTIONS", &["critique", "options", "recommend"], None),
 ];
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
@@ -278,19 +262,9 @@ pub struct Limits {
     /// message either way.
     #[serde(default = "skills_in_prefix")]
     pub skills_in_prefix: bool,
-    /// A message whose text is longer than this (characters) becomes the spec when none exists;
-    /// 0 = only by the router's judgement.
-    #[serde(default = "spec_min_chars")]
-    pub spec_min_chars: usize,
-    /// Spec text pinned whole at most (characters).
-    #[serde(default = "spec_max_chars")]
-    pub spec_max_chars: usize,
     /// Tasks one plan may hold.
     #[serde(default = "plan_max_tasks")]
     pub plan_max_tasks: usize,
-    /// Decisions one DECISIONS stage may propose.
-    #[serde(default = "decisions_per_turn")]
-    pub decisions_per_turn: usize,
     /// A workspace-wide diagnostics read before DECIDE lists at most this many per server (errors
     /// first, the rest counted).
     #[serde(default = "diagnostics_shown")]
@@ -326,17 +300,8 @@ pub struct Limits {
 }
 
 // Defaults for limits added after the first data sets (an older override stays valid).
-fn spec_min_chars() -> usize {
-    0
-}
-fn spec_max_chars() -> usize {
-    24000
-}
 fn plan_max_tasks() -> usize {
     12
-}
-fn decisions_per_turn() -> usize {
-    3
 }
 fn diagnostics_shown() -> u32 {
     12
@@ -610,7 +575,7 @@ impl Dataset {
             }
         }
         let limits = &raw.limits;
-        if limits.read_rounds == 0 || limits.check_rounds == 0 || limits.repeat_at < 2 || limits.reads_per_round == 0 || limits.answer_reserve_tokens == 0 || limits.plan_max_tasks == 0 || limits.spec_max_chars == 0 {
+        if limits.read_rounds == 0 || limits.check_rounds == 0 || limits.repeat_at < 2 || limits.reads_per_round == 0 || limits.answer_reserve_tokens == 0 || limits.plan_max_tasks == 0 {
             return Err("stages.toml: a limit is out of range".into());
         }
 

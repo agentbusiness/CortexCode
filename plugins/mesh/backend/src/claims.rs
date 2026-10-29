@@ -9,6 +9,10 @@
 //! A run's age is its first claim, kept until `mesh.place.end`, so a run that was building is still
 //! old when it calls again. A claim that finds nothing free waits at every model it could use
 //! (here, and `mesh.model.claim` on each member); the first grant wins, the others are withdrawn.
+//! A claim may list several tags, best first (`mesh.claim {tags: ["coding", "office"]}`): a model
+//! with an earlier tag wins before the other rules, and a claim with several tags takes models of
+//! any family. One model per machine: this computer's own model is not an option while another
+//! app on this machine offers one with a better tag (it would load a second model).
 //! A claim whose tag no model has yet waits for one: it looks again whenever the models change
 //! (a model plugin here starts or swaps, a member connects, goes or sends its card), keeping its
 //! age, so the oldest run of that tag is first when a tagged model comes up.
@@ -72,6 +76,9 @@ pub struct Claims {
 struct ModelOption {
     /// Empty: this computer.
     node: String,
+    /// The claim's tag this model has, and its place in the claim's list (0 best).
+    tag: String,
+    rank: usize,
     name: String,
     model_id: String,
     /// 0 this computer, 1 local network, 2 remote.
@@ -223,25 +230,32 @@ impl Mesh {
         info.file_bytes
     }
 
-    /// Every model tagged for `tag` the session could use, best first: the strongest, then the one
-    /// its prompt is cached on, then this computer, the local network, remote, then the faster.
+    /// Every model tagged for one of `tags` the session could use, best first: the better tag, the
+    /// strongest, then the one its prompt is cached on, then this computer, the local network,
+    /// remote, then the faster.
     /// A prompt of `tokens` goes only to a model whose conversation holds it (seen: an agent's
     /// 80k prompt sent to a member whose load holds 64k, and the run failed); when none does, to
     /// the largest.
-    async fn model_options(&self, session: &str, tag: &str, tokens: u32) -> Vec<ModelOption> {
+    async fn model_options(&self, session: &str, tags: &[String], tokens: u32) -> Vec<ModelOption> {
+        // The best of the claim's tags a model has: (position, tag).
+        let ranked = |own: &[String]| tags.iter().enumerate().find(|(_, tag)| own.contains(tag)).map(|(rank, tag)| (rank, tag.clone()));
         let mut options = Vec::new();
         let mut family = None;
         if let Some(ctx) = self.ctx.get()
             && !lock(&self.borrows).contains_key("model")
             && let Some(info) = ctx.call("model.info", json!({})).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok())
+            && !info.borrowed()
         {
             let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
             lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
-            if info.tags.iter().any(|own| own == tag) {
+            if let Some((rank, tag)) = ranked(&info.tags) {
                 let window = if info.ctx_native == 0 { info.ctx_total } else { info.ctx_total.min(info.ctx_native) };
-                options.push(ModelOption { node: String::new(), name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window });
+                options.push(ModelOption { node: String::new(), tag, rank, name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window });
             }
-            family = Some(info.family);
+            // A claim of one tag stays within this computer's family; one of several takes any.
+            if tags.len() == 1 {
+                family = Some(info.family);
+            }
         }
         let me = self.me.hex();
         let cards = lock(&self.cards).clone();
@@ -249,12 +263,20 @@ impl Mesh {
         for member in self.members().into_values().filter(|member| member.node != me) {
             let Some(connection) = conns.get(&member.node) else { continue };
             let Some(model) = cards.get(&member.node).and_then(|card| card.model.clone()) else { continue };
-            if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) || !model.tags.iter().any(|own| own == tag) {
+            if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) {
                 continue;
+            }
+            let Some((rank, tag)) = ranked(&model.tags) else { continue };
+            // One model per machine: another app here offers a better-tagged model than this
+            // computer's own, so this one's (which may not be loaded) is not an option.
+            if member.local
+                && let Some(own) = options.iter().position(|option| option.node.is_empty() && option.rank > rank)
+            {
+                options.remove(own);
             }
             let tier = if Self::path_of(connection).0 == "lan" { 1 } else { 2 };
             let weights = self.weights_of(&member.node, &model.model_id).await;
-            options.push(ModelOption { node: member.node.clone(), name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
+            options.push(ModelOption { node: member.node.clone(), tag, rank, name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
         }
         if tokens > 0 && options.iter().any(|option| option.window > 0) {
             let holds = |option: &ModelOption| option.window == 0 || option.window >= tokens;
@@ -267,8 +289,9 @@ impl Mesh {
         }
         let last = lock(&self.claims.last).get(session).cloned();
         options.sort_by(|a, b| {
-            b.weights
-                .cmp(&a.weights)
+            a.rank
+                .cmp(&b.rank)
+                .then(b.weights.cmp(&a.weights))
                 .then((Some(&b.node) == last.as_ref()).cmp(&(Some(&a.node) == last.as_ref())))
                 .then(a.tier.cmp(&b.tier))
                 .then(b.tok_s.partial_cmp(&a.tok_s).unwrap_or(std::cmp::Ordering::Equal))
@@ -310,13 +333,14 @@ impl Mesh {
         // A run's age starts with its first waiting claim; a claim that does not wait (a prompt
         // warm-up) is no run and leaves none behind.
         let since = if params.wait { *lock(&self.claims.ages).entry(session.clone()).or_insert_with(now_ms) } else { lock(&self.claims.ages).get(&session).copied().unwrap_or_else(now_ms) };
+        let tags = params.accepted();
         // No model with the tag anywhere yet: the claim waits for one (a claim that does not wait
         // hears `busy`).
         let options = loop {
             let changed = self.claims.models_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let options = self.model_options(&session, &params.tag, params.tokens).await;
+            let options = self.model_options(&session, &tags, params.tokens).await;
             if !options.is_empty() {
                 break options;
             }
@@ -330,7 +354,7 @@ impl Mesh {
         };
         let mut chosen = None;
         for (index, option) in options.iter().enumerate() {
-            if self.ask(&option.node, &session, &params.tag, since, params.foreground, false, CancellationToken::new()).await {
+            if self.ask(&option.node, &session, &option.tag, since, params.foreground, false, CancellationToken::new()).await {
                 chosen = Some(index);
                 break;
             }
@@ -345,7 +369,7 @@ impl Mesh {
                 let mesh = self.clone();
                 let node = option.node.clone();
                 let session = session.clone();
-                let tag = params.tag.clone();
+                let tag = option.tag.clone();
                 let stop = stop.clone();
                 Box::pin(async move { if mesh.ask(&node, &session, &tag, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
             });
