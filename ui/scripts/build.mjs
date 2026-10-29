@@ -48,11 +48,20 @@ function childEnv() {
   return env;
 }
 
-/** `npm ci` in a plugin's npm root when it has no install yet (offline-first from the npm cache). */
+/**
+ * `npm ci` in a plugin's npm root when it has no install yet, or when its lock file changed since
+ * the install (cortex-pack keeps the same record), offline-first from the npm cache.
+ */
 export function ensureInstalled(root) {
-  if (fs.existsSync(path.join(root, 'node_modules', '.package-lock.json'))) return false;
+  const lock = path.join(root, 'package-lock.json');
+  const record = path.join(root, 'node_modules', '.cortex-pack-lock.json');
+  const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file) : null);
+  const current = fs.existsSync(path.join(root, 'node_modules', '.package-lock.json'))
+    && (!fs.existsSync(lock) || read(lock).equals(read(record) ?? Buffer.alloc(0)));
+  if (current) return false;
   const result = spawnSync('npm', ['ci', '--prefer-offline'], { cwd: root, encoding: 'utf8', env: childEnv() });
   if (result.status !== 0) throw new Error(`npm ci in ${root} failed (${result.status}):\n${result.stdout}${result.stderr}`);
+  if (fs.existsSync(lock)) fs.copyFileSync(lock, record);
   return true;
 }
 
