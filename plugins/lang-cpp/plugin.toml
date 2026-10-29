@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-cpp"
 name = "C/C++"
-version = "0.1.4"
+version = "0.1.5"
 description = "Everything CortexCode knows about C and C++: the code graph's facts of C/C++ sources and headers and CMakeLists.txt, clangd diagnostics, definition, references and hover (pointed at the workspace's compile_commands.json), CMake / ctest / make verifiers and C/C++ skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

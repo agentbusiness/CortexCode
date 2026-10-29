@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-rust"
 name = "Rust"
-version = "0.1.4"
+version = "0.1.5"
 description = "Everything CortexCode knows about Rust: the code graph's facts of .rs files and Cargo.toml, rust-analyzer diagnostics, definition, references and hover, cargo check / test / clippy verifiers and Rust skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
