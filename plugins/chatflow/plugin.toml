@@ -7,7 +7,7 @@
 [plugin]
 id = "chatflow"
 name = "Chat flow"
-version = "0.1.16"
+version = "0.1.17"
 description = "The foreground flow: router, parallel host reads from the graph, missing-first decide, answer/do/delegate, and the coding agent loop with steering, follow-ups, cancellation and impact injection; the conversation, its composer, and its title and run state in the brand band."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
