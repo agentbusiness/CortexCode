@@ -62,6 +62,21 @@ pub async fn asset(client: &reqwest::Client, asset: &Asset, dir: &Path, mut prog
 }
 
 /// Unpack a `.tar.gz` (a frame release or a `.ccplugin`) into the new folder `dir`.
+/// The package's `manifest.json`, read from the archive without unpacking it.
+pub async fn manifest(archive: &Path) -> Result<serde_json::Value, String> {
+    let output = tokio::process::Command::new("tar")
+        .arg("-xzOf")
+        .arg(archive)
+        .arg("manifest.json")
+        .output()
+        .await
+        .map_err(|e| format!("cannot run tar: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("cannot read the manifest of {}: {}", archive.display(), String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("{}: manifest.json is not JSON: {e}", archive.display()))
+}
+
 pub async fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
     tokio::fs::create_dir_all(dir).await.map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let output = tokio::process::Command::new("tar")
