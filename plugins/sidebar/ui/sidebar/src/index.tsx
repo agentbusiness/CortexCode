@@ -1,8 +1,9 @@
 /**
  * workbench.sidebar@1 — projects, and under each project its conversations and its agents with
  * their live state. Everything listed runs in parallel; selecting a row only changes what the
- * other regions show. The projects are the whole network's: this computer's, then the joined
- * computers' (`mesh.projects`), each with its description; another computer's name is set in blue
+ * other regions show. The projects are this computer's, then the joined CortexCode instances'
+ * (`mesh.projects`, identified by `mesh.peers`), each with its description; another computer's
+ * name is set in blue
  * and its rows talk to that computer, where the project's sessions, files and memory live. An agent
  * whose model runs on another computer has its role in that blue. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
  * action dropped in). A notification CortexCode showed only here — because its window was in front,
@@ -147,6 +148,12 @@ interface NetworkProject {
   reachable: boolean;
 }
 
+/** The peer identity used to keep other Cortex apps out of this sidebar. */
+interface MeshPeer {
+  member: { node: string };
+  card?: { software: string } | null;
+}
+
 /** One project in the list: this computer's (`node` null) or a joined computer's. */
 interface ProjectRow {
   key: string;
@@ -190,6 +197,11 @@ function Sidebar() {
   const network = useQuery<NetworkProject[]>(
     'mesh.projects',
     async (c) => (await c.call<{ projects: NetworkProject[] }>('mesh.projects', {}))?.projects ?? [],
+    { topics: ['mesh.changed'] },
+  );
+  const peers = useQuery<{ peers: MeshPeer[] }>(
+    'mesh.peers',
+    (c) => c.call('mesh.peers', {}),
     { topics: ['mesh.changed'] },
   );
   // Every session once, for the order of the projects (a project with work going on is on top).
@@ -273,8 +285,13 @@ function Sidebar() {
 
   const [strip, setStrip] = useShared<boolean>('layout.sidebarCollapsed', false);
   const list = useMemo(
-    () => projectRows(orderProjects(projects.data ?? [], everything.data ?? []), network.data ?? []),
-    [projects.data, everything.data, network.data],
+    () => {
+      const codeNodes = new Set((peers.data?.peers ?? []).filter((peer) => peer.card?.software === 'cortexcode').map((peer) => peer.member.node));
+      // A remote project waits for its owner's card to identify it as CortexCode.
+      const visible = (network.data ?? []).filter((entry) => !entry.node || codeNodes.has(entry.node));
+      return projectRows(orderProjects(projects.data ?? [], everything.data ?? []), visible);
+    },
+    [projects.data, everything.data, network.data, peers.data],
   );
   /** A row is selected when both the project and its computer are. */
   function isSelected(row: ProjectRow): boolean {
