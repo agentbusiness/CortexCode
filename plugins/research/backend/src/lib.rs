@@ -7,6 +7,8 @@ pub mod config;
 pub mod deep;
 pub mod extract;
 pub mod fetch;
+pub mod graph;
+pub mod jobstore;
 pub mod net;
 pub mod notes;
 pub mod peers;

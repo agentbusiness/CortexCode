@@ -1,12 +1,12 @@
 //! The model variants this plugin serves and their installation: PrismML's Ternary Bonsai 2 GGUF
 //! files (alone, or with Qwen3.8's MTP draft layer added) on Hugging Face at a pinned revision, downloaded file by file with resume, each file
 //! verified against the hash Hugging Face publishes for it (SHA-256 `lfs.oid` for LFS files, the git
-//! blob SHA-1 `oid` for small files), recorded once per file. Installed variants are used offline.
+//! blob SHA-1 `oid` for small files), recorded once per file in the graph (`records`). Installed
+//! variants are used offline.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -177,104 +177,7 @@ pub fn expected_digest(file: &FileSpec) -> String {
     }
 }
 
-/// One verification record: the digest computed for a file at a size and modification time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct Verified {
-    bytes: u64,
-    modified_ns: u128,
-    /// SHA-256 hex (records written by earlier CortexCode plugins) or `gitsha1:<hex>`.
-    sha256: String,
-}
-
-/// Records of computed digests, so a multi-gigabyte file is hashed once, not on every start. The
-/// record lives in the models directory next to the files it describes; a record is valid only for
-/// the file's exact size and modification time.
-pub struct VerifyCache {
-    path: PathBuf,
-}
-
-pub const VERIFY_RECORD: &str = ".cortexcode-verified.json";
-
-fn modified_ns(path: &Path) -> Option<u128> {
-    std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|age| age.as_nanos())
-}
-
-/// Normalize a stored record to the `kind:hex` form (`sha256:` is implied for bare hex).
-fn normalized(stored: &str) -> String {
-    if stored.contains(':') { stored.to_owned() } else { format!("sha256:{stored}") }
-}
-
-impl VerifyCache {
-    pub fn new(models_dir: &Path) -> Self {
-        Self { path: models_dir.join(VERIFY_RECORD) }
-    }
-
-    fn load(&self) -> BTreeMap<String, Verified> {
-        std::fs::read(&self.path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
-    }
-
-    /// The recorded digest (`kind:hex`) of `path`, if computed for the file as it is now.
-    pub fn recorded(&self, path: &Path) -> Option<String> {
-        let entry = self.load().remove(&path.display().to_string())?;
-        let bytes = std::fs::metadata(path).ok()?.len();
-        (entry.bytes == bytes && Some(entry.modified_ns) == modified_ns(path)).then(|| normalized(&entry.sha256))
-    }
-
-    /// A cache whose record file is `path`.
-    pub fn at(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    /// The record file.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Record a digest (`kind:hex`) computed for `path` as it is now.
-    pub fn record_digest(&self, path: &Path, digest: &str) {
-        self.record(path, digest);
-    }
-
-    fn record(&self, path: &Path, digest: &str) {
-        let mut all = self.load();
-        if let (Ok(metadata), Some(modified)) = (std::fs::metadata(path), modified_ns(path)) {
-            // SHA-256 records keep the bare-hex form other plugins wrote, so they stay shared.
-            let stored = digest.strip_prefix("sha256:").unwrap_or(digest).to_owned();
-            all.insert(
-                path.display().to_string(),
-                Verified { bytes: metadata.len(), modified_ns: modified, sha256: stored },
-            );
-        }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(text) = serde_json::to_vec_pretty(&all) {
-            let temporary = self.path.with_extension(format!("json.{}.tmp", std::process::id()));
-            if std::fs::write(&temporary, text).is_ok() {
-                let _ = std::fs::rename(temporary, &self.path);
-            }
-        }
-    }
-
-    /// Hash the file (or reuse the record) and compare with the catalog. `on_progress(done, total)`.
-    pub fn verify(&self, file: &FileSpec, path: &Path, on_progress: &mut dyn FnMut(u64, u64)) -> Result<String, String> {
-        let expected = expected_digest(file);
-        let digest = match self.recorded(path).filter(|recorded| recorded.split(':').next() == expected.split(':').next())
-        {
-            Some(digest) => digest,
-            None => {
-                let digest = digest_file(path, file.sha256.is_some(), on_progress)?;
-                self.record(path, &digest);
-                digest
-            }
-        };
-        if digest == expected {
-            Ok(digest)
-        } else {
-            Err(format!("{} has {digest}, expected {expected}", path.display()))
-        }
-    }
-}
+pub use crate::records::VerifyCache;
 
 /// `sha256:<hex>` of the content, or `gitsha1:<hex>` (SHA-1 of `blob <len>\0<content>`, git's
 /// object id) for files Hugging Face stores in git directly.
@@ -328,11 +231,12 @@ pub struct Progress {
     pub detail: String,
 }
 
-/// Verify every file of an installed variant (cached records make this instant after the first time).
-pub async fn verify_installed(spec: &'static Spec, models_dir: &Path, cache_path: PathBuf) -> Result<(), String> {
+/// Verify every file of an installed variant (records make this instant after the first time).
+pub async fn verify_installed(spec: &'static Spec, models_dir: &Path, cache: &VerifyCache) -> Result<(), String> {
+    cache.wait().await;
     let dir = spec.local_dir(models_dir);
+    let cache = cache.clone();
     tokio::task::spawn_blocking(move || {
-        let cache = VerifyCache { path: cache_path };
         for file in spec.files {
             cache.verify(file, &dir.join(file.path), &mut |_, _| {})?;
         }
@@ -343,8 +247,7 @@ pub async fn verify_installed(spec: &'static Spec, models_dir: &Path, cache_path
 }
 
 /// Whether every file of the variant has a matching verification record (no hashing).
-pub fn verified_by_record(spec: &Spec, models_dir: &Path) -> bool {
-    let cache = VerifyCache::new(models_dir);
+pub fn verified_by_record(spec: &Spec, models_dir: &Path, cache: &VerifyCache) -> bool {
     let dir = spec.local_dir(models_dir);
     spec.files.iter().all(|file| cache.recorded(&dir.join(file.path)).as_deref() == Some(expected_digest(file).as_str()))
 }
@@ -384,10 +287,10 @@ pub async fn install_vision(
 }
 
 /// The variant's vision projector, when it is installed and verified (by record, no hashing).
-pub fn vision_installed(spec: &Spec, models_dir: &Path) -> Result<PathBuf, String> {
+pub fn vision_installed(spec: &Spec, models_dir: &Path, cache: &VerifyCache) -> Result<PathBuf, String> {
     let mmproj = spec.mmproj.ok_or("this model has no vision projector")?;
     let path = spec.local_dir(models_dir).join(mmproj.path);
-    if VerifyCache::new(models_dir).recorded(&path).as_deref() == Some(expected_digest(mmproj).as_str()) {
+    if cache.recorded(&path).as_deref() == Some(expected_digest(mmproj).as_str()) {
         Ok(path)
     } else {
         Err(format!("the vision projector is not installed yet ({}, {:.2} GB; it downloads with the model)", mmproj.path, mmproj.bytes as f64 / 1e9))
@@ -402,6 +305,7 @@ async fn install_files(
     cache: &VerifyCache,
     on_progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<PathBuf, String> {
+    cache.wait().await;
     let dir = spec.local_dir(models_dir);
     let total: u64 = files.iter().map(|file| file.bytes).sum();
     let mut before = 0u64;
@@ -422,11 +326,10 @@ async fn install_files(
             download(&spec.url_from(base, file), file, &target, &report).await?;
         }
         let path = target.clone();
-        let cache_path = cache.path.clone();
+        let cache = cache.clone();
         let file_spec = *file;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
         let task = tokio::task::spawn_blocking(move || {
-            let cache = VerifyCache { path: cache_path };
             let mut tick = |done: u64, _total: u64| {
                 let _ = tx.send(done);
             };

@@ -229,6 +229,8 @@ enum Phase {
 pub struct Runtime {
     pub paths: Paths,
     pub config: Config,
+    /// Model file digests (the memory plugin's graph).
+    pub verify: VerifyCache,
     publisher: Publisher,
     phase: watch::Sender<Phase>,
     switch: tokio::sync::Mutex<()>,
@@ -261,7 +263,7 @@ pub fn rendered_thinking(thinking: &Thinking) -> Thinking {
 impl Runtime {
     pub fn new(paths: Paths, config: Config, publisher: Publisher) -> Arc<Self> {
         let (phase, _) = watch::channel(Phase::Starting);
-        Arc::new(Self { paths, config, publisher, phase, switch: tokio::sync::Mutex::new(()) })
+        Arc::new(Self { verify: VerifyCache::new(&paths.models_dir), paths, config, publisher, phase, switch: tokio::sync::Mutex::new(()) })
     }
 
     fn publish(&self, topic: &str, data: Value) {
@@ -320,12 +322,12 @@ impl Runtime {
     /// Fetch the variant's vision projector beside the loaded model (its own download: the model
     /// serves meanwhile, and a failure, e.g. offline, leaves it text-only until the next start).
     fn install_vision_later(self: &Arc<Self>, spec: &'static Spec) {
-        if !self.vision_enabled() || spec.mmproj.is_none() || variants::vision_installed(spec, &self.paths.models_dir).is_ok() {
+        if !self.vision_enabled() || spec.mmproj.is_none() || variants::vision_installed(spec, &self.paths.models_dir, &self.verify).is_ok() {
             return;
         }
         let runtime = self.clone();
         tokio::spawn(async move {
-            let cache = VerifyCache::new(&runtime.paths.models_dir);
+            let cache = runtime.verify.clone();
             let progress = runtime.install_progress();
             match variants::install_vision(spec, &runtime.paths.models_dir, &cache, &progress).await {
                 Ok(path) => tracing::info!(path = %path.display(), "vision projector installed; images are accepted"),
@@ -345,7 +347,7 @@ impl Runtime {
         if loaded.engine.vision.is_none() {
             return Some("this model has no vision projector".into());
         }
-        variants::vision_installed(loaded.spec, &self.paths.models_dir).err()
+        variants::vision_installed(loaded.spec, &self.paths.models_dir, &self.verify).err()
     }
 
     /// The loaded model, once it has loaded (or switched).
@@ -418,7 +420,7 @@ impl Runtime {
         let dir = spec.local_dir(&self.paths.models_dir);
         if variants::installed(spec, &dir) || download {
             // Downloads only what is missing; verifies every file (records make this instant).
-            let cache = VerifyCache::new(&self.paths.models_dir);
+            let cache = self.verify.clone();
             let progress = self.install_progress();
             variants::install(spec, &self.paths.models_dir, &cache, &progress).await?;
         } else {
@@ -905,7 +907,7 @@ impl Runtime {
                     repo: Some(spec.repo.to_owned()),
                     revision: Some(spec.revision.to_owned()),
                     sha256: spec.weights().and_then(|file| file.sha256).map(str::to_owned),
-                    verified: installed.then(|| variants::verified_by_record(spec, &self.paths.models_dir)),
+                    verified: installed.then(|| variants::verified_by_record(spec, &self.paths.models_dir, &self.verify)),
                     bytes: Some(spec.total_bytes()),
                     mtp: Some(spec.drafts),
                 }
@@ -951,7 +953,7 @@ impl Runtime {
         }
         let spec = variants::find(variant).ok_or_else(|| RpcError::invalid_params(format!("unknown variant `{variant}`")))?;
         // Install before unloading, so a failed download leaves the current model serving.
-        let cache = VerifyCache::new(&self.paths.models_dir);
+        let cache = self.verify.clone();
         let progress = self.install_progress();
         variants::install(spec, &self.paths.models_dir, &cache, &progress)
             .await

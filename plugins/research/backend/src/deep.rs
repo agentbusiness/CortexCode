@@ -17,8 +17,9 @@
 //! 6. **report**: `docs/research/<topic-slug>.md` in the project, written from the synthesis and the
 //!    notes (sources with dates, confidence, open questions).
 //!
-//! The job's state is saved after every step (`<data>/jobs/<id>.json`); a job interrupted by a
-//! restart or cancelled resumes from it, and sources its notes cite are not read again.
+//! The job's state is saved after every step, in the memory plugin's graph (`jobstore`); a job
+//! interrupted by a restart or cancelled resumes from it, and sources its notes cite are not read
+//! again.
 
 use crate::config::Config;
 use crate::notes::Notes;
@@ -123,7 +124,9 @@ struct Worker {
 }
 
 pub struct Jobs {
-    dir: PathBuf,
+    store: crate::jobstore::JobStore,
+    /// Set once the jobs are read from the graph (tried again on each call until they are).
+    loaded: tokio::sync::OnceCell<()>,
     tools: Arc<dyn Tools>,
     notes: Arc<Notes>,
     config: Config,
@@ -138,54 +141,47 @@ fn phase_names() -> &'static [&'static str] {
 }
 
 impl Jobs {
-    pub fn new(dir: PathBuf, tools: Arc<dyn Tools>, notes: Arc<Notes>, config: Config, publish: Publish) -> Self {
-        Self { dir, tools, notes, config, publish, running: Mutex::new(HashMap::new()), handing_off: std::sync::atomic::AtomicBool::new(false) }
+    /// `legacy`: where an earlier version kept jobs as files (moved into the graph once).
+    pub fn new(graph: Arc<crate::graph::Graph>, legacy: PathBuf, tools: Arc<dyn Tools>, notes: Arc<Notes>, config: Config, publish: Publish) -> Self {
+        Self {
+            store: crate::jobstore::JobStore::new(graph, legacy),
+            loaded: tokio::sync::OnceCell::new(),
+            tools,
+            notes,
+            config,
+            publish,
+            running: Mutex::new(HashMap::new()),
+            handing_off: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    fn path(&self, job_id: &str) -> PathBuf {
-        self.dir.join(format!("{job_id}.json"))
+    /// The jobs, read from the graph once; jobs a previous process left running are interrupted.
+    pub async fn ready(&self) -> Result<(), RpcError> {
+        self.loaded
+            .get_or_try_init(|| async {
+                self.store.load().await?;
+                self.mark_interrupted();
+                Ok::<_, RpcError>(())
+            })
+            .await
+            .map(|_| ())
     }
 
     fn load(&self, job_id: &str) -> Option<JobState> {
-        let safe = job_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !safe {
-            return None;
-        }
-        serde_json::from_str(&std::fs::read_to_string(self.path(job_id)).ok()?).ok()
+        self.store.get(job_id)
     }
 
     fn save(&self, state: &JobState) {
-        let write = || -> Result<(), String> {
-            std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-            let tmp = self.dir.join(format!(".{}.tmp", state.job.job_id));
-            std::fs::write(&tmp, serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, self.path(&state.job.job_id)).map_err(|e| e.to_string())
-        };
-        if let Err(error) = write() {
-            tracing::warn!("research: cannot save job {}: {error}", state.job.job_id);
-        }
+        self.store.save(state);
     }
 
     fn all(&self) -> Vec<JobState> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
-        let mut jobs: Vec<JobState> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let id = name.strip_suffix(".json")?;
-                if id.starts_with('.') {
-                    return None;
-                }
-                self.load(id)
-            })
-            .collect();
-        jobs.sort_by(|a, b| b.job.started_ms.cmp(&a.job.started_ms));
-        jobs
+        self.store.all()
     }
 
     /// Jobs saved as running by a previous process are interrupted (call `research.deep` again on
     /// the topic to resume, or a successor resumes them after a hot swap).
-    pub fn mark_interrupted(&self) {
+    fn mark_interrupted(&self) {
         let Ok(running) = self.running.lock() else { return };
         for mut state in self.all() {
             if state.job.state == states::RUNNING && !running.contains_key(&state.job.job_id) {
@@ -214,21 +210,30 @@ impl Jobs {
         while !self.running_ids().is_empty() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        // The successor reads the jobs from the graph: their last checkpoints go there first.
+        self.store.flush(deadline.saturating_duration_since(tokio::time::Instant::now()).max(std::time::Duration::from_secs(1))).await;
         ids
     }
 
-    pub fn status(&self, job_id: &str) -> Result<Job, RpcError> {
-        self.load(job_id).map(|state| state.job).ok_or_else(|| RpcError::not_found(format!("no research job {job_id}")))
+    fn known(&self, job_id: &str) -> Result<Job, RpcError> {
+        self.load(job_id).map(|state| state.job).ok_or_else(|| RpcError::not_found(format!("no research job {job_id}; `research.jobs` lists them")))
     }
 
-    pub fn list(&self, project_id: Option<&str>) -> Vec<Job> {
-        self.all().into_iter().map(|state| state.job).filter(|job| project_id.is_none_or(|p| job.project_id == p)).collect()
+    pub async fn status(&self, job_id: &str) -> Result<Job, RpcError> {
+        self.ready().await?;
+        self.known(job_id)
     }
 
-    pub fn cancel(&self, job_id: &str) -> Result<Job, RpcError> {
+    pub async fn list(&self, project_id: Option<&str>) -> Result<Vec<Job>, RpcError> {
+        self.ready().await?;
+        Ok(self.all().into_iter().map(|state| state.job).filter(|job| project_id.is_none_or(|p| job.project_id == p)).collect())
+    }
+
+    pub async fn cancel(&self, job_id: &str) -> Result<Job, RpcError> {
+        self.ready().await?;
         // The same ownership guard serializes cancellation with spawn and worker checkpoints.
         let running = self.running.lock().map_err(|_| RpcError::internal("research job ownership unavailable"))?;
-        let mut state = self.load(job_id).ok_or_else(|| RpcError::not_found(format!("no research job {job_id}")))?;
+        let mut state = self.load(job_id).ok_or_else(|| RpcError::not_found(format!("no research job {job_id}; `research.jobs` lists them")))?;
         if let Some(worker) = running.get(job_id) {
             worker.cancel.cancel();
         }
@@ -242,13 +247,14 @@ impl Jobs {
     }
 
     /// Start a job, or resume the topic's unfinished one.
-    pub fn start(self: &Arc<Self>, params: DeepParams) -> Result<Job, RpcError> {
+    pub async fn start(self: &Arc<Self>, params: DeepParams) -> Result<Job, RpcError> {
         if params.project_id.trim().is_empty() || params.topic.trim().is_empty() {
             return Err(RpcError::invalid_params("research.deep needs project_id and topic"));
         }
         if let Some(bad) = params.sources.iter().find(|s| !sources::ALL.contains(&s.as_str())) {
             return Err(RpcError::invalid_params(format!("unknown source `{bad}`; sources: {}", sources::ALL.join(", "))));
         }
+        self.ready().await?;
         let topic_slug = crate::text::slug(&params.topic);
         let same_topic = |state: &JobState| state.job.project_id == params.project_id && crate::text::slug(&state.job.topic) == topic_slug;
         let previous = self.all().into_iter().filter(|s| same_topic(s)).collect::<Vec<_>>();
@@ -293,9 +299,19 @@ impl Jobs {
         self.spawn(state)
     }
 
-    /// Resume a job by id (after a hot swap).
-    pub fn resume(self: &Arc<Self>, job_id: &str) -> Option<Job> {
-        let mut state = self.load(job_id)?;
+    /// Resume a job by id (after a hot swap), as the predecessor left it in the graph.
+    pub async fn resume(self: &Arc<Self>, job_id: &str) -> Option<Job> {
+        if let Err(error) = self.ready().await {
+            tracing::warn!("research: cannot resume job {job_id}: {}", error.message);
+            return None;
+        }
+        let mut state = match self.store.reload(job_id).await {
+            Ok(state) => state?,
+            Err(error) => {
+                tracing::warn!("research: cannot read job {job_id} back from the graph ({}); resuming it from this process's copy", error.message);
+                self.load(job_id)?
+            }
+        };
         if !matches!(state.job.state.as_str(), states::RUNNING | states::INTERRUPTED) {
             return None;
         }
@@ -312,7 +328,7 @@ impl Jobs {
             let mut running = self.running.lock().map_err(|_| RpcError::internal("research job ownership unavailable"))?;
             if let Some(previous) = running.get(&state.job.job_id)
                 && !previous.cancel.is_cancelled() {
-                return self.status(&state.job.job_id);
+                return self.known(&state.job.job_id);
             }
             // Refresh after taking ownership: another worker may have checkpointed since the
             // caller read the saved job. Preserve the caller's new session and resume intent.

@@ -1,12 +1,32 @@
 # Mesh (`mesh`)
 
 This person's CortexCode instances joined together (`docs/MESH-IMPLEMENTATION-PLAN.md`). A node is
-one installation with one Ed25519 key (`<home>/mesh/node.key`); the key is its id and its address
+one installation with one Ed25519 key (in the Keychain: `CortexCode mesh identity`, account = the home); the key is its id and its address
 (iroh: QUIC with TLS 1.3 end to end, direct on the local network, hole-punched or relayed through
 n0's public relays elsewhere; a relay carries only encrypted traffic and holds nothing). A
 *cortex* is one person's set of nodes: a signed, append-only membership log every member holds
-(`<home>/mesh/members.jsonl`); a connection from a key the log does not hold is refused, and no
+(stream `mesh.members` in the app's graph); a connection from a key the log does not hold is refused, and no
 server can add a node.
+
+## What it keeps (`src/store.rs`)
+
+Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); no files.
+
+- stream `mesh.members`: the membership log's entries in order (`{"reset": true}` starts a new
+  chain when the node leaves or adopts another network); kept 3650 days.
+- `(:Member {key: node id, name*, added_ms, added_by, software})-[:IN]->(:Mesh {key: hash of the
+  first entry, founder, founded_ms})-[:ON]->(:Machine)` (WORKSPACE layer), built from the log: a
+  revoked member is retired (`revoked`), a mesh left behind is retired (`left`).
+- stream `mesh.served`: every call served to another app, `{at, node, method, ok, ms}`, 30 days.
+- settings `mesh.name`, `mesh.lend`, `mesh.shares` (service -> `{local, network}`).
+- **Start order**: the endpoint starts at once, so apps on this Mac link and lend before the
+  memory plugin answers; members of the network are let in, and the membership changed, only once
+  the log is read (methods that change it wait 10 s, then answer `unavailable`). The store is
+  retried every second; writes queue in order in memory until it takes them.
+- Files of earlier versions (`mesh/members.jsonl`, `served.jsonl`, `shares.json`, `name`,
+  `no-lend`) are moved in once, confirmed and deleted.
+- `~/.cortex-mesh/local/<software>-<node>.json` stays a file: plumbing (pid and loopback ports of
+  a running app, removed when it stops), how CortexCode and CortexTerm on one Mac find each other.
 
 Nothing to set. One invitation joins a computer; Remove takes it out. A project lives on its own
 computer, and every member's window works in it there; every member lends every other its model,

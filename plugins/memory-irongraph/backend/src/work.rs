@@ -5,7 +5,7 @@ use crate::db::{Graph, layer};
 use crate::params;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{
-    AgentRecord, BoardListParams, contract_change, BoardMessage, BoardPostParams, Contract, ContractCheck, Rule, RunRecordParams, StyleEntry, Task, TaskCreateParams,
+    AgentRecord, BoardListParams, contract_change, BoardMessage, BoardPostParams, Contract, ContractCheck, ContractRevision, Rule, RunRecordParams, StyleEntry, Task, TaskCreateParams,
     TaskUpdateParams,
 };
 use cc_protocol::contracts::now_ms;
@@ -178,7 +178,8 @@ impl WorkStore {
             created_ms: n(row, 12),
             updated_ms: n(row, 13),
             contract_hash: opt_s(row, 14),
-            // The lineage is kept as one JSON string property.
+            // The lineage is `ContractRevision` nodes (filled in by `complete`); an earlier version
+            // kept it as JSON text, read here until the task's next revision rewrites it.
             contract_revisions: opt_s(row, 15).and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default(),
         }
     }
@@ -206,6 +207,17 @@ impl WorkStore {
                 params! { "ids" => ids },
             )
             .await?;
+        let revisions = self
+            .run(&format!("{} UNWIND $ids AS i MATCH (t:Task {{id: i}})-[:REVISED]->(r:ContractRevision) RETURN i, r", layer::WORKSPACE_READ), params! { "ids" => ids })
+            .await?;
+        let mut lineage: HashMap<String, Vec<(u64, ContractRevision)>> = HashMap::new();
+        for row in &revisions.rows {
+            let Some(props) = row.get(1).and_then(|node| node.get("properties")).cloned() else { continue };
+            let position = props.get("position").and_then(Value::as_u64).unwrap_or(0);
+            if let Ok(revision) = serde_json::from_value::<ContractRevision>(props) {
+                lineage.entry(s(row, 0)).or_default().push((position, revision));
+            }
+        }
         let mut touch_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         for row in &touches.rows {
             let reference = s(row, 1);
@@ -213,6 +225,10 @@ impl WorkStore {
             touch_map.entry(s(row, 0)).or_default().insert(reference, current);
         }
         for task in tasks.iter_mut() {
+            if let Some(mut revisions) = lineage.remove(&task.id) {
+                revisions.sort_by_key(|(position, _)| *position);
+                task.contract_revisions = revisions.into_iter().map(|(_, revision)| revision).collect();
+            }
             if let Some(mut checks) = by_task.remove(&task.id) {
                 checks.sort_by_key(|(p, _)| *p);
                 task.contract = Contract { checks: checks.into_iter().map(|(_, c)| c).collect() };
@@ -257,12 +273,31 @@ impl WorkStore {
         set("session_id", p.session_id.map(Value::from));
         set("touches", p.touches.clone().map(|t| json!(t)));
         set("contract_hash", change.hash.clone().map(Value::from));
-        if let Some(revision) = &change.revision {
-            let mut lineage = current.contract_revisions.clone();
-            lineage.push(revision.clone());
-            set("contract_revisions", Some(Value::from(serde_json::to_string(&lineage).unwrap_or_default())));
+        if change.revision.is_some() {
+            sets.push("t.contract_revisions = null".into());
         }
         self.run(&format!("{} MATCH (t:Task {{id: $id}}) SET {}", layer::WORKSPACE_WRITE, sets.join(", ")), values).await?;
+        if let Some(revision) = &change.revision {
+            // The lineage so far (an earlier version's text included) as nodes, then the new one.
+            let mut lineage = current.contract_revisions.clone();
+            lineage.push(revision.clone());
+            for (position, revision) in lineage.iter().enumerate() {
+                let mut props = match serde_json::to_value(revision) {
+                    Ok(Value::Object(map)) => map,
+                    _ => continue,
+                };
+                props.insert("id".into(), json!(format!("{}#{position}", p.id)));
+                props.insert("task_id".into(), json!(p.id));
+                props.insert("position".into(), json!(position));
+                props.insert("first_ms".into(), json!(revision.ts_ms));
+                props.insert("last_ms".into(), json!(revision.ts_ms));
+                self.run(
+                    &format!("{} MATCH (t:Task {{id: $task}}) MERGE (r:ContractRevision {{id: $rid}}) SET r += $props MERGE (t)-[:REVISED]->(r)", layer::WORKSPACE_WRITE),
+                    params! { "task" => p.id, "rid" => format!("{}#{position}", p.id), "props" => props },
+                )
+                .await?;
+            }
+        }
         if let Some(contract) = &change.contract {
             self.write_contract(&p.id, contract).await?;
         }
@@ -487,15 +522,29 @@ impl WorkStore {
 
     pub async fn run_record(&self, p: RunRecordParams) -> Result<String, RpcError> {
         let id = new_id("run");
-        let metrics = serde_json::to_string(&p.metrics).unwrap_or_default();
+        let now = now_ms();
         self.run(
             &format!(
-                "{} CREATE (r:Run {{id: $id, name: $outcome, project_id: $project, session_id: $session, task_id: $task, outcome: $outcome, summary: $summary, touched: $touched, metrics: $metrics, ts_ms: $now}})",
+                "{} CREATE (r:Run {{id: $id, name: $outcome, project_id: $project, session_id: $session, task_id: $task, outcome: $outcome, summary: $summary, touched: $touched, ts_ms: $now, first_ms: $now, last_ms: $now}})",
                 layer::WORKSPACE_WRITE
             ),
-            params! { "id" => id, "project" => self.scope, "session" => p.session_id, "task" => p.task_id, "outcome" => p.outcome, "summary" => p.summary, "touched" => p.touched, "metrics" => metrics, "now" => now_ms() },
+            params! { "id" => id, "project" => self.scope, "session" => p.session_id, "task" => p.task_id, "outcome" => p.outcome, "summary" => p.summary, "touched" => p.touched, "now" => now },
         )
         .await?;
+        // The run's measures are its own properties (`turns`, `tool_calls`, …): scalars only.
+        let metrics: Map<String, Value> = p
+            .metrics
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(name, value)| !value.is_object() && !value.is_array() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .map(|(name, value)| (format!("metric_{name}"), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !metrics.is_empty() {
+            self.run(&format!("{} MATCH (r:Run {{id: $id}}) SET r += $metrics", layer::WORKSPACE_WRITE), params! { "id" => id, "metrics" => metrics }).await?;
+        }
         self.index("run_id", "Run", "id").await?;
         if let Some(task) = &p.task_id {
             self.run(&format!("{} MATCH (r:Run {{id: $id}}), (t:Task {{id: $task}}) CREATE (r)-[:FOR_TASK]->(t)", layer::WORKSPACE_WRITE), params! { "id" => id, "task" => task }).await?;

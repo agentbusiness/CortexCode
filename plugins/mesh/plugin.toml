@@ -6,7 +6,7 @@
 [plugin]
 id = "mesh"
 name = "Mesh"
-version = "0.1.15"
+version = "0.1.17"
 description = "This person's CortexCode instances linked together: pairing with a short code, a signed membership, encrypted connections over the local network or a relay, capability cards, and borrowing a member's model or hands through the frame's own contracts."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
@@ -26,7 +26,7 @@ provides = [
 ]
 subscribes = ["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"]
 publishes = ["mesh.changed"]
-uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "model.info", "model.slots", "model.metrics", "model.yield", "agents.scheduler", "container.list"]
+uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.session.list", "memory.knowledge.list", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.stream.append", "memory.stream.read", "memory.stream.topics", "memory.settings.get", "memory.settings.set", "model.info", "model.slots", "model.metrics", "model.yield", "agents.scheduler", "container.list"]
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]

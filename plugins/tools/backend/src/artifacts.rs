@@ -1,6 +1,14 @@
 //! Offloaded output: anything too large to show inline is stored byte-exact under
 //! `<CORTEX_HOME>/artifacts/<id>`; the model sees the head, the tail and the id, and reads any part
 //! back with `read artifact://<id>:<range>`. Nothing is dropped.
+//!
+//! ```text
+//! (:Artifact {key: id, path, kind: 'output' | 'job', bytes, created_ms})-[:ON]->(:Machine)
+//!     -[:FROM]->(:Session)
+//! ```
+//!
+//! The bytes stay the file; the node is its metadata. A job's output is written while the job
+//! runs: its node is put with the job's (see [`crate::jobs`]).
 
 use crate::read::parse_range;
 use crate::util;
@@ -9,10 +17,11 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::fd::{AsRawFd, FromRawFd};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Artifacts {
     dir: PathBuf,
     home: PathBuf,
+    graph: std::sync::Arc<crate::graph::Graph>,
 }
 
 /// Limits for inline output (bytes). Output above `inline` is offloaded; the inline view then
@@ -35,9 +44,34 @@ pub fn valid_id(id: &str) -> bool {
 }
 
 impl Artifacts {
-    pub fn new(home: &Path) -> Self {
+    pub fn new(home: &Path, graph: std::sync::Arc<crate::graph::Graph>) -> Self {
         let home = util::canonical_lenient(home);
-        Self { dir: home.join("artifacts"), home }
+        Self { dir: home.join("artifacts"), home, graph }
+    }
+
+    /// The node of artifact `id`.
+    pub fn batch(&self, id: &str, kind: &str, bytes: u64, created_ms: u64, session: Option<&str>) -> crate::graph::Batch {
+        use crate::graph;
+        let me = graph::gref("Artifact", id);
+        let node = graph::node(
+            "Artifact",
+            id,
+            graph::props(serde_json::json!({ "path": self.dir.join(id).to_string_lossy(), "kind": kind, "bytes": bytes, "created_ms": created_ms })),
+        );
+        let soft = session.map(|session| graph::edge(&me, "FROM", &graph::gref("Session", session))).into_iter().collect();
+        graph::Batch::workspace(vec![node], vec![graph::edge(&me, "ON", &graph::machine())], soft)
+    }
+
+    fn record(&self, id: &str, bytes: u64, session: Option<&str>) {
+        self.graph.put(self.batch(id, "output", bytes, util::now_ms(), session));
+    }
+
+    /// Remove an artifact's file; its node is retired.
+    pub fn remove(&self, id: &str) {
+        if let Some(path) = self.path(id) {
+            let _ = std::fs::remove_file(path);
+            self.graph.retire(vec![crate::graph::gref("Artifact", id)], "removed");
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -48,18 +82,22 @@ impl Artifacts {
         valid_id(id).then(|| self.dir.join(id))
     }
 
-    pub fn store(&self, bytes: &[u8]) -> std::io::Result<String> {
+    /// Keep `bytes` as an artifact of `session`'s.
+    pub fn store(&self, bytes: &[u8], session: Option<&str>) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
         let id = util::new_id("a");
         std::fs::write(self.dir.join(&id), bytes)?;
+        self.record(&id, bytes.len() as u64, session);
         Ok(id)
     }
 
     /// Adopt an already written file (e.g. a spooled command output) as an artifact.
-    pub fn adopt(&self, file: &Path) -> std::io::Result<String> {
+    pub fn adopt(&self, file: &Path, session: Option<&str>) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
         let id = util::new_id("a");
-        std::fs::rename(file, self.dir.join(&id))?;
+        let target = self.dir.join(&id);
+        std::fs::rename(file, &target)?;
+        self.record(&id, std::fs::metadata(&target).map(|meta| meta.len()).unwrap_or(0), session);
         Ok(id)
     }
 

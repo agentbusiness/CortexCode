@@ -64,8 +64,8 @@ tokenizes identically, and the load refuses the model if it does not on a fixed 
 (chat and tool-call markup, code, several scripts, whitespace, escapes, image tokens). Files are
 installed under `<models_dir>/<org>-<repo>/<revision>/` (default `$CORTEX_HOME/models`). A missing
 file is downloaded from Hugging Face at the pinned revision (resumable `.part` files) and checked
-against the published digest; records in `<models_dir>/.cortexcode-verified.json` make later
-checks instant. Nothing is downloaded at startup for a variant that is not installed.
+against the published digest; digest records in the memory plugin's graph
+(`(:ModelFile)-[:ON]->(:Machine)`, shared with the uzu plugin) make later checks instant. Nothing is downloaded at startup for a variant that is not installed.
 `cc-model-bonsai install bonsai2-27b-pq2-mtp` installs without a frame.
 
 ## Configuration (`[plugin.config]`)

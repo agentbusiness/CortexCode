@@ -9,7 +9,7 @@
 
 use crate::packages::{self, Package};
 use crate::service::Service;
-use crate::{backup, live, paths};
+use crate::{backup, live, paths, record};
 use cc_protocol::Ctx;
 use cc_protocol::contracts::frame::PluginUnit;
 use cc_protocol::contracts::source::UpdateResult;
@@ -133,7 +133,7 @@ fn quiet_for(service: &Service, files: &[String], quiet: Duration) -> bool {
 }
 
 /// Commit the files that changed and have settled, one commit per plugin.
-async fn commit_edits(service: &Arc<Service>) -> bool {
+pub async fn commit_edits(service: &Arc<Service>) -> bool {
     let Ok(changed) = service.git(live::changed_paths).await else { return false };
     if changed.is_empty() || !quiet_for(service, &changed, QUIET) {
         return false;
@@ -166,7 +166,17 @@ pub async fn run(service: Arc<Service>, ctx: Ctx, stop: tokio_util::sync::Cancel
         if !service.managed() || !live::is_managed(&service.live_dir) {
             continue;
         }
-        if commit_edits(&service).await {
+        let committed = commit_edits(&service).await;
+        // The commit's files and its record go into the graph, as do changes made elsewhere
+        // (updates, resets, restores, the first replay). In the background, so a memory plugin that
+        // does not serve never holds the loop; History records what is missing before it reads.
+        let recorder = service.clone();
+        tokio::spawn(async move {
+            if let Err(error) = record::sync(&recorder, false).await {
+                tracing::info!(error = %error.message, "the live folder's changes are not recorded in the graph yet; tried again");
+            }
+        });
+        if committed {
             service.changed(&ctx);
             backup::after_change(&service, &ctx).await;
         }

@@ -11,6 +11,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrameInfo {
     pub port: u16,
+    /// In frame.json only where there is no Keychain; on macOS it is read from the Keychain.
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub pid: u32,
@@ -40,7 +42,25 @@ pub fn read_frame_info(home: &Path) -> Result<FrameInfo, String> {
     }
     let path = home.join("run/frame.json");
     let text = std::fs::read_to_string(&path).map_err(|error| format!("the frame is not running ({}: {error})", path.display()))?;
-    serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))
+    let mut info: FrameInfo = serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))?;
+    if info.token.is_empty() {
+        info.token = keychain_token(home)?;
+    }
+    Ok(info)
+}
+
+/// The frame's API token from the macOS Keychain (the frame writes it there at every start),
+/// through `/usr/bin/security`, which made the item, so nothing asks.
+fn keychain_token(home: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "CortexCode frame token", "-a", &home.display().to_string(), "-w"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot read the frame's token from the Keychain: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("the frame's token is not in the Keychain: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_owned())
 }
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;

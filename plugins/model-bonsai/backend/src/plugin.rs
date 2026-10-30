@@ -77,6 +77,8 @@ impl ModelPlugin {
                     }
                 });
                 let runtime = Runtime::new(paths, config, publisher);
+                // The model file records are the memory plugin's, which starts after this one.
+                runtime.verify.attach(ctx.clone());
                 let starter = runtime.clone();
                 let asker = ctx.clone();
                 tokio::spawn(async move {

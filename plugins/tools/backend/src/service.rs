@@ -100,6 +100,7 @@ impl ToolsPlugin {
                     config = ctx.config();
                 }
                 let core = Core::new(&ctx.env.home, &ctx.env.data_dir, Config::from_value(&config));
+                core.graph.attach(Arc::new(CtxHost(ctx.clone())));
                 core.jobs.set_publisher(Arc::new(JobEnds { host: CtxHost(ctx.clone()), core: Arc::downgrade(&core) }));
                 core.steps.set_publisher(Arc::new(CtxHost(ctx.clone())));
                 core.jobs.adopt();
@@ -129,10 +130,13 @@ impl crate::jobs::Publisher for JobEnds {
             && !meta.cwd.is_empty()
         {
             let who = Attribution::session(&meta.session_id, "run", &meta.command);
-            let log = core.steps.open(std::path::Path::new(&meta.cwd));
+            let cwd = std::path::PathBuf::from(&meta.cwd);
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn_blocking(move || log.reconcile(&who));
-            } else {
+                runtime.spawn(async move {
+                    let log = core.steps.open(&cwd).await;
+                    let _ = tokio::task::spawn_blocking(move || log.reconcile(&who)).await;
+                });
+            } else if let Some(log) = core.steps.opened(&cwd) {
                 log.reconcile(&who);
             }
         }
@@ -325,7 +329,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let sink = items.clone();
             // The step log: what the command changes is the session's step (a check with side
             // effects at home, or a member's command in a copy kept here).
-            let steps = core.steps.open(&session.workspace);
+            let steps = core.steps.open(&session.workspace).await;
             steps.begin();
             let result = core
                 .shells
@@ -350,7 +354,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 failed: tests.failed,
                 names: tests.names,
             });
-            let (output, _, _) = exec::present_output(&core, run.output, core.config.run_limits);
+            let (output, _, _) = exec::present_output(&core, &context.session_id, run.output, core.config.run_limits);
             to_value(&RunResult { exit_code: run.exit_code, output, duration_ms: run.duration_ms, timed_out: run.timed_out, job_id: None, tests })
         }
         methods::JOB_STATUS => {
@@ -459,13 +463,13 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 .map_err(|error| RpcError::internal(error.to_string()))?
                 .map_err(|error| RpcError::new(error.code, error.message))?;
             // The workspace's automatic Python venv goes with it.
-            let _ = std::fs::remove_dir_all(&venv);
+            crate::pyenv::remove(&core.graph, &venv);
             Ok(json!({ "removed": true }))
         }
         methods::WORKSPACE_LIST => {
             let params: WorkspaceListParams =
                 if params.is_null() { WorkspaceListParams { project_id: None } } else { parse_params(params)? };
-            to_value(&WorkspaceListResult { workspaces: core.workspaces.list(params.project_id.as_deref()) })
+            to_value(&WorkspaceListResult { workspaces: core.workspaces.list(params.project_id.as_deref()).await })
         }
         methods::FILES => {
             let params: FilesParams = parse_params(params)?;
@@ -475,7 +479,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let params: SaveParams = parse_params(params)?;
             let (root, target) = workspace_path(&params.workspace, Some(&params.path))?;
             let before = std::fs::read(&target).ok();
-            let log = core.steps.open(&root);
+            let log = core.steps.open(&root).await;
             log.begin();
             let result = save(&core, &params);
             if let Ok(result) = &result {
@@ -489,7 +493,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::TIMELINE => {
             let params: TimelineParams = parse_params(params)?;
-            let log = core.steps.open(&util::expand_home(&params.workspace));
+            let log = core.steps.open(&util::expand_home(&params.workspace)).await;
             let result = tokio::task::spawn_blocking(move || {
                 log.reconcile(&Attribution::user("hand"));
                 log.timeline(&params)
@@ -500,14 +504,14 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::TIMELINE_DIFF => {
             let params: TimelineDiffParams = parse_params(params)?;
-            let log = core.steps.open(&util::expand_home(&params.workspace));
+            let log = core.steps.open(&util::expand_home(&params.workspace)).await;
             let result = tokio::task::spawn_blocking(move || log.diff(&params)).await.map_err(|error| RpcError::internal(error.to_string()))?;
             to_value(&result)
         }
         methods::UNDO => {
             let params: UndoParams = parse_params(params)?;
             let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
-            let log = core.steps.open(&workspace);
+            let log = core.steps.open(&workspace).await;
             let core = core.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
@@ -521,7 +525,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         methods::REDO => {
             let params: RedoParams = parse_params(params)?;
             let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
-            let log = core.steps.open(&workspace);
+            let log = core.steps.open(&workspace).await;
             let core = core.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let allowed = |path: &std::path::Path| util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path);
@@ -552,12 +556,13 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 return Err(RpcError::invalid_params("tools.cleanup needs workspace and session_id"));
             }
             let core = core.clone();
+            let workspace = util::expand_home(&workspace);
+            let log = core.steps.open(&workspace).await;
             let removed = tokio::task::spawn_blocking(move || {
-                let workspace = util::expand_home(&workspace);
-                let removed = crate::cleanup::turn_end(&core, &workspace, &session_id, since_ms);
+                let removed = crate::cleanup::turn_end(&core, &log, &workspace, &session_id, since_ms);
                 // What the turn's commands left and the host took away, and anything else the
                 // turn changed that no step recorded yet, is the session's last step of the turn.
-                core.steps.open(&workspace).reconcile(&Attribution::session(&session_id, "run", "end of turn"));
+                log.reconcile(&Attribution::session(&session_id, "run", "end of turn"));
                 removed
             })
             .await
@@ -843,10 +848,8 @@ pub async fn probe(core: &Arc<Core>, host: Arc<dyn Host>) -> ProbeReport {
     check("tree_sitter", started, if parsed { Ok("grammars load".into()) } else { Err("a grammar failed to load".into()) });
 
     core.shells.drop_session(&context.session_id).await;
-    if let Some(id) = big.artifact.as_deref()
-        && let Some(path) = core.artifacts.path(id)
-    {
-        let _ = std::fs::remove_file(path);
+    if let Some(id) = big.artifact.as_deref() {
+        core.artifacts.remove(id);
     }
     let _ = std::fs::remove_dir_all(&scratch);
     ProbeReport::from_checks(checks)
@@ -870,14 +873,14 @@ impl Plugin for ToolsPlugin {
         Box::pin(async move {
             let core = core.await;
             core.jobs.adopt();
-            // The approvals come from the store (or once from the file they were kept in); the
-            // store's plugin may start later, so this does not hold up serving.
+            // The approvals, the workspace clones and the venvs come from the graph; the memory
+            // plugin may start later, so this does not hold up serving.
             let loading = core.clone();
             tokio::spawn(async move {
-                let legacy = loading.data_dir.join("approvals.json");
-                if let Err(error) = loading.approvals.load(&ctx, Some(legacy)).await {
-                    tracing::error!(error = %error.message, "the approvals could not be read from the store");
-                }
+                loading.load_approvals().await;
+                loading.workspaces.import_files().await;
+                // The automatic venvs of workspaces that were deleted meanwhile go.
+                crate::pyenv::remove_orphans(&loading.graph, &loading.home).await;
             });
             Ok(())
         })
@@ -889,6 +892,8 @@ impl Plugin for ToolsPlugin {
         self.handed_off.store(true, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             let core = core.await;
+            // The successor reads the jobs and steps from the graph: what is queued is written first.
+            core.graph.flush(Duration::from_secs(5)).await;
             Ok(json!({ "read_state": core.read_state.export(), "skills_attached": core.read_state.export_skills() }))
         })
     }
@@ -921,7 +926,7 @@ impl Plugin for ToolsPlugin {
                 && let Some(root) = data.get("root").and_then(Value::as_str)
             {
                 // A commit, a checkout, a reset: what equals HEAD now leaves the step log.
-                let log = core.await.steps.open(std::path::Path::new(root));
+                let log = core.await.steps.open(std::path::Path::new(root)).await;
                 let _ = tokio::task::spawn_blocking(move || log.on_head_change()).await;
             } else if topic == frame_topics::SESSION_DELETED
                 && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data.clone())
@@ -930,7 +935,7 @@ impl Plugin for ToolsPlugin {
             } else if topic == frame_topics::PROJECT_DELETED
                 && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data)
             {
-                core.await.forget_project(&deleted.project_id, std::path::Path::new(&deleted.root));
+                core.await.forget_project(&deleted.project_id, std::path::Path::new(&deleted.root)).await;
             }
         })
     }
@@ -948,6 +953,7 @@ impl Plugin for ToolsPlugin {
                     core.jobs.kill(&job.job_id).await;
                 }
             }
+            core.graph.flush(Duration::from_secs(5)).await;
         })
     }
 }

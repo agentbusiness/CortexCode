@@ -36,8 +36,8 @@ it offers several. Below, the loaded model's facts (`model.info`).
 Installed under `<models_dir>/<org>-<repo>/<revision>/` (default `$CORTEX_HOME/models`). A missing
 file is downloaded from Hugging Face at the pinned revision (resumable `.part` files) and every file
 is checked against the digest Hugging Face publishes (SHA-256 `lfs.oid` for weights, the git blob
-SHA-1 for small files); records in `<models_dir>/.cortexcode-verified.json` make later checks
-instant. Nothing is ever downloaded at startup for a variant that is not installed; afterwards
+SHA-1 for small files); digest records in the memory plugin's graph (`(:ModelFile)-[:ON]->(:Machine)`,
+valid for the file's size and modification time) make later checks instant. Nothing is ever downloaded at startup for a variant that is not installed; afterwards
 everything runs offline. `cc-model-uzu install <variant> [--models-dir DIR]` installs without a frame.
 
 The 27B variant also has a vision tower (image input, see [Images](#images-vendor-patch-p7)): only
@@ -185,8 +185,9 @@ tower and feeds its output to the Mirai M language model.
   shard's header (its length is pinned; the tensor count, parameter count and contiguity are
   checked), one resumable range request fetches the bytes, and they are written as a standalone
   safetensors file with a sorted header, so the result is deterministic: its SHA-256
-  (`ad17b11c…f421ee`) is pinned, verified and recorded like every model file; `manifest.json`
-  records the source range and the shard's published SHA-256. `config.json` and
+  (`ad17b11c…f421ee`) is pinned, verified and recorded like every model file; an install record
+  in the graph (`(:VisionInstall)-[:ON]->(:Machine)`) holds the source range and the shard's
+  published SHA-256. `config.json` and
   `preprocessor_config.json` come whole (git blob ids pinned). A server that answers a range
   request with the whole file is refused.
 - **On demand** (`backend/src/engine.rs`, `backend/src/vision/worker.rs`): when a request has an

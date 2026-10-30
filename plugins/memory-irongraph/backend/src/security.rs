@@ -2,24 +2,32 @@
 //! report, with each finding's lifecycle (status, who moved it, its history).
 //!
 //! ```text
-//! (:Security:Finding {id, project, ...SecurityFinding fields, trace, quick_fix, history})
+//! (:Security:Finding {id, project, ...SecurityFinding's scalar fields})
 //! (:Security:Audit {id, project, ...SecurityAudit fields})
+//! (f)-[:HAS_STEP]->(:SecurityTraceStep {id, finding_id, position, kind, file, line, what})
+//! (f)-[:QUICK_FIX]->(:SecurityQuickFix {id, finding_id, kind, ecosystem, package, from, to, lockfile, commands})
+//! (f)-[:CHANGED]->(:SecurityStatusChange {id, finding_id, position, status, note, by, ms, session_id, commit})
 //! (f)-[:FOUND_BY]->(a:Audit)                     every audit that reported it
 //! (f)-[:AT {step, kind, what, line}]->(c:Code)   each trace step's innermost symbol, else its file
 //! (f)-[:IN_PACKAGE]->(d:Code:Dependency)         the package a quick fix upgrades
 //! (f)-[:FIXED_IN]->(s:Session)                   the session that fixes or fixed it
+//! stream `security.status`                     every status move, in order
 //! ```
 //!
-//! `trace`, `quick_fix` and `history` are JSON text on the node: nothing queries inside them, and
-//! the code they point at is reachable by the `AT` edges. A finding is identified by its
-//! fingerprint, so an audit that reports it again updates the node instead of adding one.
+//! A finding's trace, quick fix and lifecycle are nodes of their own, linked to it; the code the
+//! trace points at is reachable by the `AT` edges. A finding is identified by its fingerprint, so
+//! an audit that reports it again updates the node instead of adding one. Findings an earlier
+//! version wrote with these as JSON text are read from it and rewritten as nodes at their next
+//! write.
 
 use crate::db::{Graph, layer};
 use crate::params;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{
-    SecurityAudit, SecurityFinding, SecurityFindingDetail, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityStatusChange, SecuritySummary, SecurityTraceStep,
+    SecurityAudit, SecurityFinding, SecurityFindingDetail, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityQuickFix, SecurityStatusChange, SecuritySummary,
+    SecurityTraceStep,
 };
+use std::collections::HashMap;
 use cc_protocol::contracts::now_ms;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -69,6 +77,9 @@ const FINDING_FIELDS: [&str; 37] = [
     "updated_ms",
 ];
 
+/// The stream every status move is appended to.
+const STATUS_TOPIC: &str = "security.status";
+
 /// Audit properties, in the order `audit_from` reads them (the JSON field names of [`SecurityAudit`]).
 const AUDIT_FIELDS: [&str; 11] = ["id", "started_ms", "finished_ms", "units", "lines_judged", "findings", "leads", "hardening", "scope", "skill_version", "report_path"];
 
@@ -97,27 +108,40 @@ fn object(row: &[Value], fields: &[&str]) -> Map<String, Value> {
     fields.iter().zip(row).filter(|(_, value)| !value.is_null()).map(|(field, value)| ((*field).to_owned(), whole(value.clone()))).collect()
 }
 
-fn to_json<T: serde::Serialize>(value: &T) -> Result<String, RpcError> {
-    serde_json::to_string(value).map_err(|error| RpcError::internal(error.to_string()))
+/// The JSON text an earlier version kept in a property, parsed into its type.
+fn from_text<T: serde::de::DeserializeOwned>(object: &Map<String, Value>, field: &str) -> Option<T> {
+    object.get(field).and_then(|value| value.as_str()).and_then(|text| serde_json::from_str(text).ok())
 }
 
-/// A JSON text property parsed into its type; absent or unreadable text reads as the default.
-fn from_text<T: serde::de::DeserializeOwned + Default>(object: &Map<String, Value>, field: &str) -> T {
-    object.get(field).and_then(|value| value.as_str()).and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default()
+/// A finding's parts kept as nodes of their own.
+#[derive(Default)]
+struct Parts {
+    trace: Vec<SecurityTraceStep>,
+    quick_fix: Option<SecurityQuickFix>,
+    history: Vec<SecurityStatusChange>,
 }
 
-fn finding_from(row: &[Value]) -> Result<SecurityFinding, RpcError> {
+fn finding_from(row: &[Value], parts: Option<&Parts>) -> Result<SecurityFinding, RpcError> {
     let mut object = object(row, &FINDING_FIELDS);
-    let trace: Vec<SecurityTraceStep> = from_text(&object, "trace");
-    let quick_fix: Option<cc_protocol::contracts::memory::SecurityQuickFix> = from_text(&object, "quick_fix");
+    let empty = Parts::default();
+    let parts = parts.unwrap_or(&empty);
+    let trace = if parts.trace.is_empty() { from_text::<Vec<SecurityTraceStep>>(&object, "trace").unwrap_or_default() } else { parts.trace.clone() };
+    let quick_fix = parts.quick_fix.clone().or_else(|| from_text::<Option<SecurityQuickFix>>(&object, "quick_fix").flatten());
     object.insert("trace".into(), json!(trace));
     object.insert("quick_fix".into(), json!(quick_fix));
     object.remove("history");
     serde_json::from_value(Value::Object(object)).map_err(|error| RpcError::internal(format!("unreadable finding record: {error}")))
 }
 
-fn history_from(row: &[Value]) -> Vec<SecurityStatusChange> {
-    from_text(&object(row, &FINDING_FIELDS), "history")
+fn history_from(row: &[Value], parts: Option<&Parts>) -> Vec<SecurityStatusChange> {
+    match parts {
+        Some(parts) if !parts.history.is_empty() => parts.history.clone(),
+        _ => from_text(&object(row, &FINDING_FIELDS), "history").unwrap_or_default(),
+    }
+}
+
+fn props_of(node: &Value) -> Map<String, Value> {
+    node.get("properties").and_then(Value::as_object).cloned().unwrap_or_default().into_iter().map(|(k, v)| (k, whole(v))).collect()
 }
 
 fn audit_from(row: &[Value]) -> Result<SecurityAudit, RpcError> {
@@ -190,7 +214,9 @@ impl SecurityStore {
 
     pub async fn finding(&self, id: &str) -> Result<Option<SecurityFindingDetail>, RpcError> {
         let Some(row) = self.finding_row(id).await? else { return Ok(None) };
-        Ok(Some(SecurityFindingDetail { finding: finding_from(&row)?, history: history_from(&row) }))
+        let parts = self.parts(&[id.to_owned()]).await?;
+        let parts = parts.get(id);
+        Ok(Some(SecurityFindingDetail { finding: finding_from(&row, parts)?, history: history_from(&row, parts) }))
     }
 
     /// Write a finding's node and its edges; `history` is its whole lifecycle so far.
@@ -199,9 +225,10 @@ impl SecurityStore {
             Ok(Value::Object(map)) => map,
             _ => return Err(RpcError::internal("a finding record is an object")),
         };
-        props.insert("trace".into(), json!(to_json(&finding.trace)?));
-        props.insert("quick_fix".into(), json!(finding.quick_fix.as_ref().map(to_json).transpose()?));
-        props.insert("history".into(), json!(to_json(&history)?));
+        // The trace, quick fix and history are nodes of their own (an earlier version's text goes).
+        props.insert("trace".into(), Value::Null);
+        props.insert("quick_fix".into(), Value::Null);
+        props.insert("history".into(), Value::Null);
         props.insert("project".into(), json!(self.scope));
         props.insert("name".into(), json!(finding.title));
         props.insert("updated_ms".into(), json!(now));
@@ -216,6 +243,7 @@ impl SecurityStore {
             self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}}), (a:Security:Audit {{id: $audit}}) MERGE (f)-[:FOUND_BY]->(a)", layer::WORKSPACE_WRITE), params! { "id" => finding.id, "audit" => audit }).await?;
         }
         self.link_trace(finding).await?;
+        self.write_parts(finding, history, now).await?;
         self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[r:IN_PACKAGE]->() DELETE r", layer::WORKSPACE_WRITE), key.clone()).await?;
         if let Some(fix) = &finding.quick_fix
             && !fix.package.is_empty()
@@ -227,6 +255,100 @@ impl SecurityStore {
             .await?;
         }
         self.link_session(&finding.id, finding.session_id.as_deref()).await
+    }
+
+    /// The parts of findings: their trace steps, quick fix and status moves, by finding id.
+    async fn parts(&self, ids: &[String]) -> Result<HashMap<String, Parts>, RpcError> {
+        let mut out: HashMap<String, Parts> = HashMap::new();
+        let rows = self.run(&format!("{} UNWIND $ids AS i MATCH (f:Security:Finding {{id: i}})-[:HAS_STEP]->(t:SecurityTraceStep) RETURN i, t", layer::WORKSPACE_READ), params! { "ids" => ids }).await?;
+        let mut steps: HashMap<String, Vec<(u64, SecurityTraceStep)>> = HashMap::new();
+        for row in &rows.rows {
+            let (Some(id), Some(node)) = (row.first().and_then(Value::as_str), row.get(1)) else { continue };
+            let props = props_of(node);
+            let position = props.get("position").and_then(Value::as_u64).unwrap_or(0);
+            if let Ok(step) = serde_json::from_value::<SecurityTraceStep>(Value::Object(props)) {
+                steps.entry(id.to_owned()).or_default().push((position, step));
+            }
+        }
+        for (id, mut list) in steps {
+            list.sort_by_key(|(position, _)| *position);
+            out.entry(id).or_default().trace = list.into_iter().map(|(_, step)| step).collect();
+        }
+        let rows = self.run(&format!("{} UNWIND $ids AS i MATCH (f:Security:Finding {{id: i}})-[:QUICK_FIX]->(q:SecurityQuickFix) RETURN i, q", layer::WORKSPACE_READ), params! { "ids" => ids }).await?;
+        for row in &rows.rows {
+            let (Some(id), Some(node)) = (row.first().and_then(Value::as_str), row.get(1)) else { continue };
+            if let Ok(fix) = serde_json::from_value::<SecurityQuickFix>(Value::Object(props_of(node))) {
+                out.entry(id.to_owned()).or_default().quick_fix = Some(fix);
+            }
+        }
+        let rows = self.run(&format!("{} UNWIND $ids AS i MATCH (f:Security:Finding {{id: i}})-[:CHANGED]->(c:SecurityStatusChange) RETURN i, c", layer::WORKSPACE_READ), params! { "ids" => ids }).await?;
+        let mut moves: HashMap<String, Vec<(u64, SecurityStatusChange)>> = HashMap::new();
+        for row in &rows.rows {
+            let (Some(id), Some(node)) = (row.first().and_then(Value::as_str), row.get(1)) else { continue };
+            let props = props_of(node);
+            let position = props.get("position").and_then(Value::as_u64).unwrap_or(0);
+            if let Ok(change) = serde_json::from_value::<SecurityStatusChange>(Value::Object(props)) {
+                moves.entry(id.to_owned()).or_default().push((position, change));
+            }
+        }
+        for (id, mut list) in moves {
+            list.sort_by_key(|(position, _)| *position);
+            out.entry(id).or_default().history = list.into_iter().map(|(_, change)| change).collect();
+        }
+        Ok(out)
+    }
+
+    /// Write a finding's trace steps and quick fix (replacing the stored ones) and the status moves
+    /// not stored yet, which also go to the `security.status` stream.
+    async fn write_parts(&self, finding: &SecurityFinding, history: &[SecurityStatusChange], now: u64) -> Result<(), RpcError> {
+        let id = &finding.id;
+        self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[:HAS_STEP]->(t:SecurityTraceStep) DETACH DELETE t", layer::WORKSPACE_WRITE), params! { "id" => id }).await?;
+        for (position, step) in finding.trace.iter().enumerate() {
+            self.run(
+                &format!(
+                    "{} MATCH (f:Security:Finding {{id: $finding}}) CREATE (f)-[:HAS_STEP {{first_ms: $now, last_ms: $now}}]->(:SecurityTraceStep {{id: $id, finding_id: $finding, position: $position, kind: $kind, file: $file, line: $line, what: $what, first_ms: $now, last_ms: $now}})",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "finding" => id, "id" => format!("{id}#{position}"), "position" => position, "kind" => step.kind, "file" => step.file, "line" => step.line, "what" => step.what, "now" => now },
+            )
+            .await?;
+        }
+        self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[:QUICK_FIX]->(q:SecurityQuickFix) DETACH DELETE q", layer::WORKSPACE_WRITE), params! { "id" => id }).await?;
+        if let Some(fix) = &finding.quick_fix {
+            self.run(
+                &format!(
+                    "{} MATCH (f:Security:Finding {{id: $finding}}) CREATE (f)-[:QUICK_FIX {{first_ms: $now, last_ms: $now}}]->(:SecurityQuickFix {{id: $finding, finding_id: $finding, kind: $kind, ecosystem: $ecosystem, package: $package, from: $from, to: $to, lockfile: $lockfile, commands: $commands, first_ms: $now, last_ms: $now}})",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "finding" => id, "kind" => fix.kind, "ecosystem" => fix.ecosystem, "package" => fix.package, "from" => fix.from, "to" => fix.to, "lockfile" => fix.lockfile, "commands" => fix.commands, "now" => now },
+            )
+            .await?;
+        }
+        let stored = self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}})-[:CHANGED]->(c:SecurityStatusChange) RETURN count(c)", layer::WORKSPACE_READ), params! { "id" => id }).await?;
+        let known = stored.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let mut records = Vec::new();
+        for (position, change) in history.iter().enumerate().skip(known) {
+            self.run(
+                &format!(
+                    "{} MATCH (f:Security:Finding {{id: $finding}}) MERGE (c:SecurityStatusChange {{id: $id}}) SET c.finding_id = $finding, c.position = $position, c.status = $status, c.note = $note, c.by = $by, c.ms = $ms, c.session_id = $session, c.commit = $commit, c.first_ms = $ms, c.last_ms = $ms MERGE (f)-[:CHANGED]->(c)",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! {
+                    "finding" => id, "id" => format!("{id}#{position}"), "position" => position, "status" => change.status, "note" => change.note, "by" => change.by,
+                    "ms" => change.ms, "session" => change.session_id, "commit" => change.commit
+                },
+            )
+            .await?;
+            if let Ok(bytes) = serde_json::to_vec(&json!({ "at_ms": change.ms, "value": { "finding": id, "change": change } })) {
+                records.push(bytes);
+            }
+        }
+        if !records.is_empty()
+            && let Err(error) = self.graph.stream_append(&self.ig_id, STATUS_TOPIC, records).await
+        {
+            tracing::warn!(error = %error.message, "status moves not added to their stream");
+        }
+        Ok(())
     }
 
     /// Replace a finding's `AT` edges: one per trace step whose file and line are indexed code.
@@ -307,8 +429,10 @@ impl SecurityStore {
                     history = vec![SecurityStatusChange { status: "open".into(), by: "model".into(), ms: now, note: format!("found by audit {audit_name}"), session_id: None, commit: None }];
                 }
                 Some(row) => {
-                    let known = finding_from(&row)?;
-                    history = history_from(&row);
+                    let parts = self.parts(std::slice::from_ref(&finding.id)).await?;
+                    let parts = parts.get(&finding.id);
+                    let known = finding_from(&row, parts)?;
+                    history = history_from(&row, parts);
                     finding.status = known.status;
                     finding.status_note = known.status_note;
                     finding.status_by = known.status_by;
@@ -349,10 +473,12 @@ impl SecurityStore {
                 params! { "statuses" => statuses },
             )
             .await?;
+        let ids: Vec<String> = rows.column(0).filter_map(|id| id.as_str().map(str::to_owned)).collect();
+        let parts = self.parts(&ids).await?;
         let mut findings = rows
             .rows
             .iter()
-            .map(|row| finding_from(row))
+            .map(|row| finding_from(row, row.first().and_then(Value::as_str).and_then(|id| parts.get(id))))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .filter(|f| p.class.as_ref().is_none_or(|class| &f.class == class))
@@ -365,8 +491,10 @@ impl SecurityStore {
     /// A lifecycle move, refused when the lifecycle does not allow it.
     pub async fn finding_update(&self, p: SecurityFindingUpdateParams) -> Result<Option<SecurityFinding>, RpcError> {
         let Some(row) = self.finding_row(&p.id).await? else { return Ok(None) };
-        let mut finding = finding_from(&row)?;
-        let mut history = history_from(&row);
+        let parts = self.parts(std::slice::from_ref(&p.id)).await?;
+        let parts = parts.get(&p.id);
+        let mut finding = finding_from(&row, parts)?;
+        let mut history = history_from(&row, parts);
         let current = finding.status.clone();
         let moves = allowed_moves(&current);
         let recheck_only = current == "open" && p.status == "fixed" && p.by != "recheck";
@@ -397,7 +525,7 @@ impl SecurityStore {
         let rows = self.run(&format!("{} MATCH (f:Security:Finding) RETURN {}", layer::WORKSPACE_READ, columns("f", &FINDING_FIELDS)), Map::new()).await?;
         let mut summary = SecuritySummary::default();
         for row in &rows.rows {
-            let finding = finding_from(row)?;
+            let finding = finding_from(row, None)?;
             match finding.status.as_str() {
                 "open" => summary.open += 1,
                 "fixing" => summary.fixing += 1,
@@ -418,6 +546,9 @@ impl SecurityStore {
     pub async fn forget(&self, id: &str) -> Result<bool, RpcError> {
         if self.finding_row(id).await?.is_none() {
             return Ok(false);
+        }
+        for label in ["SecurityTraceStep", "SecurityQuickFix", "SecurityStatusChange"] {
+            self.run(&format!("{} MATCH (n:{label} {{finding_id: $id}}) DETACH DELETE n", layer::WORKSPACE_WRITE), params! { "id" => id }).await?;
         }
         self.run(&format!("{} MATCH (f:Security:Finding {{id: $id}}) DETACH DELETE f", layer::WORKSPACE_WRITE), params! { "id" => id }).await?;
         Ok(true)

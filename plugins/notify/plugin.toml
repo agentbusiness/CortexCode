@@ -7,7 +7,7 @@
 [plugin]
 id = "notify"
 name = "Notifications"
-version = "0.1.10"
+version = "0.1.11"
 description = "macOS notifications when a run finishes or fails, an approval is needed, an agent is blocked, a contract is verified or fails, a merge conflicts or a plugin swap rolls back; delivered through the app window when it is open and natively otherwise; clicks open the target."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
@@ -34,7 +34,7 @@ subscribes = ["journal.", "agents.changed", "plugin.swapped", "plugin.state", "t
 publishes = ["notify.posted", "notify.activate", "notify.changed"]
 # Calls it makes (all optional: a missing peer only removes names from the text, or switches the
 # preferences to the built-in defaults, which every notification then reports).
-uses = ["frame.session.get", "frame.project.get", "frame.ui.open", "memory.settings.list", "memory.settings.set", "memory.task.get", "agents.list", "tools.job.status"]
+uses = ["frame.session.get", "frame.project.get", "frame.ui.open", "memory.settings.list", "memory.settings.set", "memory.task.get", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.graph.machine", "memory.stream.append", "memory.queue.publish", "memory.queue.take", "memory.queue.ack", "agents.list", "tools.job.status"]
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]

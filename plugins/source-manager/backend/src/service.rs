@@ -1,7 +1,9 @@
-//! The plugin's shared state: where the live folder is, the persistent settings, the plugins'
-//! names, and one queue for git work on the live folder.
+//! The plugin's shared state: where the live folder is, the settings (kept in the graph, see
+//! [`crate::settings`]), the plugins' names, and one queue for git work on the live folder.
 
+use crate::graph::{self, Graph};
 use crate::live;
+use crate::record::Recorder;
 use crate::settings::{self, Settings};
 use cc_protocol::contracts::source::topics;
 use cc_protocol::{Ctx, RpcError};
@@ -12,9 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 pub struct Service {
-    /// The backup repository, shared pull requests and the last update's outcome. Kept in the
-    /// app's main store (see [`cc_protocol::stored`]).
-    pub stored_settings: cc_protocol::stored::Stored<Settings>,
+    /// The backup repository, shared pull requests and the last update's outcome, as the graph
+    /// keeps them.
+    settings: Mutex<Settings>,
+    /// Where the settings and the push outcomes are written.
+    pub graph: Graph,
     pub data_dir: PathBuf,
     pub home: PathBuf,
     /// The live folder (`CORTEX_LIVE`).
@@ -22,9 +26,10 @@ pub struct Service {
     config: RwLock<Value>,
     /// Plugin names by id, from the last listing of the installed plugins (commit summaries).
     names: RwLock<BTreeMap<String, String>>,
-    /// Serializes git work on the live folder (one writer at a time) and settings changes.
+    /// Serializes git work on the live folder (one writer at a time).
     git: tokio::sync::Mutex<()>,
-    state: Mutex<()>,
+    /// How far the live folder's changes are recorded in the graph ([`crate::record`]).
+    pub recorder: Recorder,
 }
 
 pub fn rpc(message: impl Into<String>) -> RpcError {
@@ -34,14 +39,15 @@ pub fn rpc(message: impl Into<String>) -> RpcError {
 impl Service {
     pub fn new(data_dir: PathBuf, home: PathBuf, live_dir: PathBuf) -> Self {
         Self {
-            stored_settings: cc_protocol::stored::Stored::new("source.settings"),
+            settings: Mutex::new(Settings::default()),
+            graph: Graph::new(),
             data_dir,
             home,
             live_dir,
             config: RwLock::new(Value::Null),
             names: RwLock::new(BTreeMap::new()),
             git: tokio::sync::Mutex::new(()),
-            state: Mutex::new(()),
+            recorder: Recorder::default(),
         }
     }
 
@@ -101,22 +107,29 @@ impl Service {
         tokio::task::spawn_blocking(move || work(&dir)).await.map_err(|error| rpc(format!("the git task failed: {error}")))?.map_err(rpc)
     }
 
-    /// Read the settings from the store (or once from the JSON file they were kept in), when the
-    /// plugin starts serving.
-    pub async fn load_stored(&self, ctx: &Ctx) -> Result<(), RpcError> {
-        self.stored_settings.load(ctx, Some(self.data_dir.join(settings::SETTINGS))).await
+    /// When the plugin starts serving: write through the graph, move the old setting into it
+    /// once, and read the settings back. Changes made meanwhile are written already (the read
+    /// follows them).
+    pub async fn load_settings(&self, ctx: &Ctx) -> Result<(), RpcError> {
+        self.graph.start(graph::ctx_caller(ctx));
+        settings::migrate(&self.graph, &self.data_dir).await;
+        self.graph.flush().await;
+        let stored = settings::read(&self.graph).await?;
+        *self.settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = stored;
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<Settings, RpcError> {
-        Ok(self.stored_settings.get())
+        Ok(self.settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
     }
 
+    /// Change the settings; what changed is written to the graph, in order.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<Settings, RpcError> {
-        let _guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(self.stored_settings.update(|settings| {
-            change(settings);
-            settings.clone()
-        }))
+        let mut settings = self.settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old = settings.clone();
+        change(&mut settings);
+        settings::write_changes(&self.graph, &old, &settings);
+        Ok(settings.clone())
     }
 
     /// Tell listeners (the settings panels, plugins reading live data) to refetch.

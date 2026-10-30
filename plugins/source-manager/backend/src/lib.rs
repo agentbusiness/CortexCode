@@ -7,10 +7,12 @@
 //! project. CortexCode's code is not here: it changes only with a new package.
 
 pub mod backup;
+pub mod graph;
 pub mod live;
 pub mod packages;
 pub mod paths;
 pub mod probe;
+pub mod record;
 pub mod release;
 pub mod service;
 pub mod settings;
@@ -38,4 +40,6 @@ pub const PROVIDES: &[&str] = &[
     methods::RELEASE_STATUS,
     methods::RELEASE_MERGE,
     methods::RELEASE_RESET,
+    methods::FILE_HISTORY,
+    methods::FILE_RESTORE,
 ];

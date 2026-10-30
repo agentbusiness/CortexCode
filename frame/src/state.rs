@@ -2,11 +2,11 @@
 //! (see [`crate::store`]): they are loaded from it when it first serves, held here while the frame
 //! runs, and every change is written through the store's outbox in the order it was made.
 //!
-//! A copy of the projects and sessions, and of the projects deleted, is kept in the frame's own
-//! file (`<home>/state/records.json`), written at every change: a store that comes back without
-//! records (a new database after an upgrade) gets them back from it at the next load, and a plugin
-//! that was not running when a project was deleted hears of it when it starts (`project.deleted`
-//! again, see `Frame::set_route`).
+//! The store is the only record: a deleted project stays there retired (`memory.app.deleted`), so a
+//! plugin that was not running when it was deleted hears of it when it starts (`project.deleted`
+//! again, see `Frame::set_route`). The file earlier frames kept a copy in
+//! (`<home>/state/records.json`) is read once, what the store lacks is written to it, and the file
+//! is removed.
 
 use crate::store::{Op, Outbox};
 use cc_protocol::contracts::frame::{
@@ -24,8 +24,8 @@ pub struct StateStore {
     outbox: Outbox,
     inner: Mutex<Inner>,
     ui_state: Mutex<UiStateDocument>,
-    /// The frame's copy of the records (`<home>/state/records.json`).
-    copy: PathBuf,
+    /// The copy earlier frames kept (`<home>/state/records.json`), read once and removed.
+    legacy: PathBuf,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -39,27 +39,13 @@ struct Inner {
 }
 
 impl StateStore {
-    /// Empty until [`StateStore::load`] fills it from the store (and the frame's copy).
-    pub fn open(outbox: Outbox, copy: PathBuf) -> StateStore {
+    /// Empty until [`StateStore::load`] fills it from the store.
+    pub fn open(outbox: Outbox, legacy: PathBuf) -> StateStore {
         StateStore {
             outbox,
             ui_state: Mutex::new(UiStateDocument { document: serde_json::Value::Object(serde_json::Map::new()), rev: 0, updated_ms: 0 }),
             inner: Mutex::new(Inner::default()),
-            copy,
-        }
-    }
-
-    /// Write the frame's copy of the records (atomically: a stopped write leaves the last one).
-    fn save(&self, inner: &Inner) {
-        let written = serde_json::to_vec(inner).map_err(|error| error.to_string()).and_then(|bytes| {
-            if let Some(dir) = self.copy.parent() {
-                std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-            }
-            let tmp = self.copy.with_extension("json.tmp");
-            std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &self.copy)).map_err(|error| error.to_string())
-        });
-        if let Err(error) = written {
-            tracing::warn!(path = %self.copy.display(), %error, "writing the frame's copy of the records failed");
+            legacy,
         }
     }
 
@@ -70,7 +56,7 @@ impl StateStore {
 
     /// The records the store holds, when it first serves. A record made before is kept (none is:
     /// calls on the records wait until this load is done, see `Frame::records_ready`).
-    pub fn load(&self, projects: Vec<Project>, sessions: Vec<Session>, ui_state: Option<UiStateDocument>) {
+    pub fn load(&self, projects: Vec<Project>, sessions: Vec<Session>, ui_state: Option<UiStateDocument>, deleted: Vec<ProjectDeleted>) {
         let mut inner = self.lock();
         for project in projects {
             inner.projects.entry(project.id.clone()).or_insert(project);
@@ -78,9 +64,14 @@ impl StateStore {
         for session in sessions {
             inner.sessions.entry(session.id.clone()).or_insert(session);
         }
-        // What the frame's copy has and the store lost goes back into the store; a session the
-        // copy has newer (its write was still on the way) wins.
-        let copy: Inner = std::fs::read(&self.copy).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        for project in deleted {
+            if !inner.projects.contains_key(&project.project_id) {
+                inner.deleted.insert(project.project_id.clone(), project);
+            }
+        }
+        // The copy an earlier frame kept: what it has and the store lacks goes into the store (a
+        // session it has newer wins), then the file goes.
+        let copy: Inner = std::fs::read(&self.legacy).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         let mut restored = 0usize;
         for (id, project) in copy.projects {
             if !inner.projects.contains_key(&id) && !inner.deleted.contains_key(&id) {
@@ -98,14 +89,24 @@ impl StateStore {
             }
         }
         for (id, deleted) in copy.deleted {
-            if !inner.projects.contains_key(&id) {
+            if !inner.projects.contains_key(&id) && !inner.deleted.contains_key(&id) {
+                // The store keeps a deleted project retired: put, then delete.
+                let name = std::path::Path::new(&deleted.root).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let _ = self.outbox.send(Op::PutProject(Project { id: id.clone(), root: deleted.root.clone(), name, created_ms: 0, flows: Vec::new() }));
+                let _ = self.outbox.send(Op::DeleteProject(id.clone()));
                 inner.deleted.insert(id, deleted);
+                restored += 1;
             }
         }
         if restored > 0 {
-            tracing::info!(restored, "records the store had lost were written back from the frame's copy");
+            tracing::info!(restored, "records only the frame's old copy had were written to the store");
         }
-        self.save(&inner);
+        if self.legacy.exists() {
+            match std::fs::remove_file(&self.legacy) {
+                Ok(()) => tracing::info!(path = %self.legacy.display(), "the frame's old copy of the records is in the store now; file removed"),
+                Err(error) => tracing::warn!(path = %self.legacy.display(), %error, "cannot remove the frame's old copy of the records"),
+            }
+        }
         drop(inner);
         if let Some(document) = ui_state {
             let mut state = self.ui_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -138,7 +139,6 @@ impl StateStore {
         self.outbox.send(Op::PutProject(project.clone()))?;
         inner.deleted.remove(&id);
         inner.projects.insert(id, project.clone());
-        self.save(&inner);
         Ok((project, true))
     }
 
@@ -190,7 +190,6 @@ impl StateStore {
         };
         self.outbox.send(Op::PutSession(session.clone()))?;
         inner.sessions.insert(session.id.clone(), session.clone());
-        self.save(&inner);
         Ok(session)
     }
 
@@ -230,7 +229,6 @@ impl StateStore {
         session.updated_ms = now_ms().max(previous.updated_ms);
         self.outbox.send(Op::PutSession(session.clone()))?;
         inner.sessions.insert(session.id.clone(), session.clone());
-        self.save(&inner);
         Ok(session)
     }
 
@@ -243,7 +241,6 @@ impl StateStore {
         let doomed = descendants(&inner.sessions, &[id.to_owned()]);
         self.outbox.send(Op::DeleteSessions(doomed.clone()))?;
         let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
-        self.save(&inner);
         Ok(removed)
     }
 
@@ -260,7 +257,6 @@ impl StateStore {
         let removed: Vec<Session> = doomed.iter().filter_map(|id| inner.sessions.remove(id)).collect();
         inner.projects.remove(id);
         inner.deleted.insert(project.id.clone(), ProjectDeleted { project_id: project.id.clone(), root: project.root.clone() });
-        self.save(&inner);
         Ok((project, removed))
     }
 

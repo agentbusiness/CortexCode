@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::deep::{Jobs, Publish, Tools};
 use crate::fetch::Fetcher;
+use crate::graph::Graph;
 use crate::net::Net;
 use crate::notes::Notes;
 use crate::peers::Peers;
@@ -48,7 +49,7 @@ pub const PROVIDES: &[&str] = &[
 pub const PUBLISHES: &[&str] = &[topics::PROGRESS, topics::JOB];
 
 /// Methods of other plugins this one calls.
-pub const USES: &[&str] = &["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list", "memory.knowledge.upsert"];
+pub const USES: &[&str] = &["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list", "memory.knowledge.upsert", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.stream.append"];
 
 pub struct Core {
     pub engine: Arc<Engine>,
@@ -99,19 +100,32 @@ impl Tools for PluginTools {
 }
 
 impl Core {
-    /// `home`: CORTEX_HOME (the fetch cache lives in `research/cache`); `data`: the plugin's data
-    /// directory (jobs, and the notes of an earlier version, imported into memory once).
+    /// `home`: CORTEX_HOME (the fetch cache's downloaded bytes live in `research/cache/blobs`);
+    /// `data`: the plugin's data directory (where an earlier version kept jobs and notes as files,
+    /// moved into memory once).
     pub fn new(config: Config, home: PathBuf, data: PathBuf, peers: Arc<dyn Peers>, env: EnvFn) -> Arc<Self> {
         let net = Arc::new(Net::new(config.clone()));
         let engine = Arc::new(Engine::new(net.clone(), peers.clone(), env));
-        let fetcher = Arc::new(Fetcher::new(net, home.join("research").join("cache")));
+        let graph = Arc::new(Graph::new(peers.clone()));
+        let fetcher = Arc::new(Fetcher::new(net, graph.clone(), home.join("research").join("cache")));
         let notes = Arc::new(Notes::new(peers.clone(), data.join("notes")));
         let tools: Arc<dyn Tools> = Arc::new(PluginTools { engine: engine.clone(), fetcher: fetcher.clone(), peers: peers.clone() });
         let publisher = peers.clone();
         let publish: Publish = Arc::new(move |topic: &str, data: Value| publisher.publish(topic, data));
-        let jobs = Arc::new(Jobs::new(data.join("jobs"), tools, notes.clone(), config.clone(), publish));
-        jobs.mark_interrupted();
+        let jobs = Arc::new(Jobs::new(graph, data.join("jobs"), tools, notes.clone(), config.clone(), publish));
         Arc::new(Self { engine, fetcher, notes, jobs, config })
+    }
+
+    /// Read the jobs from the graph and move an earlier version's files in, without waiting for
+    /// the first call.
+    pub fn warm(self: &Arc<Self>) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = core.jobs.ready().await {
+                tracing::warn!("research: the jobs are not read yet ({}); the next job call tries again", error.message);
+            }
+            core.fetcher.migrate().await;
+        });
     }
 
     pub async fn dispatch(&self, method: &str, params: Value, cancel: CancellationToken) -> Result<Value, RpcError> {
@@ -128,12 +142,12 @@ impl Core {
                 let p: NotesParams = parse_params(params)?;
                 to_value(&NotesResult { notes: self.notes.list(&p.project_id, p.topic.as_deref()).await?, pending: 0 })
             }
-            methods::DEEP => to_value(&self.jobs.start(parse_params::<DeepParams>(params)?)?),
-            methods::JOB_STATUS => to_value(&self.jobs.status(&parse_params::<JobParams>(params)?.job_id)?),
-            methods::JOB_CANCEL => to_value(&self.jobs.cancel(&parse_params::<JobParams>(params)?.job_id)?),
+            methods::DEEP => to_value(&self.jobs.start(parse_params::<DeepParams>(params)?).await?),
+            methods::JOB_STATUS => to_value(&self.jobs.status(&parse_params::<JobParams>(params)?.job_id).await?),
+            methods::JOB_CANCEL => to_value(&self.jobs.cancel(&parse_params::<JobParams>(params)?.job_id).await?),
             methods::JOBS => {
                 let p: JobsParams = parse_params(params)?;
-                to_value(&JobsResult { jobs: self.jobs.list(p.project_id.as_deref()) })
+                to_value(&JobsResult { jobs: self.jobs.list(p.project_id.as_deref()).await? })
             }
             methods::SOURCES => to_value(&SourcesResult { sources: self.engine.describe().await }),
             other => Err(RpcError::unknown_method(other)),

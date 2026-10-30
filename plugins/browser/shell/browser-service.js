@@ -203,13 +203,16 @@ function remoteText(arg) {
 export class BrowserService {
   /**
    * @param {{ window: import('electron').BrowserWindow, home: string,
-   *   publish: (topic: string, data: unknown) => void, log: (line: string) => void }} options
+   *   publish: (topic: string, data: unknown) => void, log: (line: string) => void,
+   *   record?: (file: { path: string, kind: string, bytes: number, mime: string, url: string, sessionId: string | null, width?: number, height?: number }) => void }} options
    */
   constructor(options) {
     this.window = options.window;
     this.home = options.home;
     this.publish = options.publish;
     this.log = options.log;
+    /** Records a file the browser wrote as an `Artifact` node in the graph (the bytes stay a file). */
+    this.record = options.record ?? (() => {});
     /** @type {Map<string, Tab>} */
     this.tabs = new Map();
     /** @type {string | null} */
@@ -222,7 +225,11 @@ export class BrowserService {
     // Pages the agent visits ask for nothing on this machine's behalf.
     profile.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
     profile.on('will-download', (_event, item) => {
-      item.setSavePath(path.join(this.home, 'artifacts', 'browser', 'downloads', `${Date.now()}-${item.getFilename()}`));
+      const file = path.join(this.home, 'artifacts', 'browser', 'downloads', `${Date.now()}-${item.getFilename()}`);
+      item.setSavePath(file);
+      item.once('done', (_done, state) => {
+        if (state === 'completed') this.record({ path: file, kind: 'download', bytes: item.getReceivedBytes(), mime: item.getMimeType(), url: item.getURL(), sessionId: null });
+      });
     });
   }
 
@@ -320,6 +327,7 @@ export class BrowserService {
         await fs.mkdir(dir, { recursive: true });
         const file = path.join(dir, `${tab.id}-${Date.now()}.png`);
         await fs.writeFile(file, bytes);
+        this.record({ path: file, kind: 'screenshot', bytes: bytes.length, mime: 'image/png', url: tab.wc.getURL(), sessionId: tab.sessionId, width, height });
         return { path: file, width, height };
       }
       case 'browser.console': {

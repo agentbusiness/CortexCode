@@ -4,9 +4,35 @@
 //! and focus gate -> history (dedup by key) -> delivery through the CortexCode notification app
 //! (clickable, shows the CortexCode icon) when macOS allows it; otherwise the notification stays in
 //! CortexCode's own list. The app asks macOS for permission when it starts.
+//!
+//! The notifications live in the app's graph (WORKSPACE layer); the newest [`history::CAPACITY`]
+//! are held in memory for dedup and the list, rebuilt from the graph when the plugin connects:
+//!
+//! ```text
+//! (:Notification {key: id, kind, title, body, dedup_key, subtitle, actions, session_id, project_id,
+//!                 ts_ms, delivery, detail, source, method, updates, updated_ms, activated_ms,
+//!                 activated_action, target_<name> for each scalar member of target})
+//!     -[:ABOUT]->(:Session)      when it has a session
+//!     -[:ABOUT]->(:Project)      else when it has a project
+//!     -[:ON]->(:Machine)         else
+//! stream `notifications`         every notification as posted (a dedup update too)
+//! ```
+//!
+//! An item that falls out of the newest [`history::CAPACITY`] is retired. The history kept before as
+//! one setting (`notify.history`) and before that in `history.json` is moved into the graph once,
+//! then deleted. Preferences stay settings (section `notify`).
+//!
+//! Clicks made while no plugin listens travel on the memory queue `notify.activations`
+//! ([`ACTIVATIONS_QUEUE`]). The separate notification app (Swift) runs without the app and cannot
+//! reach the queue, so it appends them to `activations.jsonl` (plumbing, not a record). At
+//! activation that spool is published to the queue and removed only once the queue took it, so a
+//! click survives the memory plugin being down ([`Notifier::drain_spool`]). The queue is consumed
+//! (consumer `notify`) only after the history is loaded, each message acked after it was handled;
+//! one naming a notification the loaded history does not know is acked with a log line.
 
 use crate::derive::{self, Context, Trigger};
-use crate::history::{History, Recorded, same_content};
+use crate::graph::{self, Graph};
+use crate::history::{self, History, Recorded, same_content};
 use crate::native::NativeDelivery;
 use crate::native::helper::NativeActivation;
 use crate::prefs::{self, Prefs, kind_info};
@@ -16,18 +42,20 @@ use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::methods as memory_methods;
 use cc_protocol::contracts::notify::{
     Activate, ActivatedParams, ActivatedResult, DelivererInfo, DelivererParams, DelivererResult, FocusState,
-    HistoryParams, HistoryResult, Notification, Posted, PostedEvent, PrefsResult, PrefsSetParams, StatusResult, delivery, kinds,
-    methods, topics,
+    HistoryParams, HistoryResult, Notification, Posted, PostedEvent, PrefsResult, PrefsSetParams, SpooledActivation, StatusResult, delivery, kinds,
+    methods, topics, ACTIVATIONS_QUEUE,
 };
+use cc_protocol::contracts::memory::{QueueTakeResult, methods as queue_methods};
 use cc_protocol::contracts::{agents, now_ms, tools};
 use cc_protocol::{BoxFuture, Ctx, RpcError, codes, parse_params, to_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 /// The entry a finished run's notification points at (structural: entry kinds and fields): for
 /// `done`, the run's last non-empty answer; for `failed`, its last `error` entry, else its last
@@ -203,6 +231,23 @@ enum Plan {
     Keep,
 }
 
+/// How long a stop waits for the graph to take the last changes.
+const FLUSH_WAIT: Duration = Duration::from_secs(5);
+/// The graph's label of a notification, and the stream of posts.
+const NOTIFICATION: &str = "Notification";
+const POSTS: &str = "notifications";
+/// The history's setting of earlier versions, and the file before it (moved into the graph once).
+const OLD_SETTING: &str = "notify.history";
+const OLD_FILE: &str = "history.json";
+/// The notification app's spool of clicks, and the suffix of a part taken for publishing.
+const SPOOL: &str = "activations.jsonl";
+const TAKEN: &str = ".draining";
+/// Who consumes [`ACTIVATIONS_QUEUE`], and how many messages at a time.
+const CONSUMER: &str = "notify";
+const TAKE_MAX: u32 = 50;
+/// Between two publish attempts while the memory plugin does not serve.
+const SPOOL_RETRY: Duration = Duration::from_secs(5);
+
 #[derive(Serialize, Deserialize)]
 struct Exported {
     history: History,
@@ -224,38 +269,16 @@ pub struct Notifier {
     delivering: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pending_activation: Mutex<Option<(Activate, Instant)>>,
     data_dir: PathBuf,
-    persist: watch::Sender<Option<(u64, String)>>,
-    file: Arc<HistoryFile>,
-}
-
-/// The history's place: the app's main store (`memory.settings` at `notify.history`). Snapshots
-/// carry a version taken under the history lock; a write never replaces a newer version, so the
-/// background writer and a final flush cannot reorder.
-struct HistoryFile {
-    /// The file the history was kept in before the store (read once, then removed).
-    path: PathBuf,
-    version: std::sync::atomic::AtomicU64,
-    written: Mutex<u64>,
-}
-
-/// The history's settings path in the store.
-const HISTORY_PATH: &str = "notify.history";
-
-impl HistoryFile {
-    /// Write a snapshot to the store unless a newer one is there already.
-    async fn write(&self, bus: &Arc<dyn Bus>, version: u64, snapshot: &str) {
-        if version <= *lock(&self.written) {
-            return;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { return };
-        match bus.call(cc_protocol::contracts::memory::methods::SETTINGS_SET, json!({ "path": HISTORY_PATH, "value": value, "by": "notify" })).await {
-            Ok(_) => {
-                let mut written = lock(&self.written);
-                *written = (*written).max(version);
-            }
-            Err(error) => tracing::warn!(error = %error.message, "notification history not saved"),
-        }
-    }
+    /// Where the notifications are kept.
+    graph: Graph,
+    /// Per item, the target members its node keeps (`target_<name>`), so a changed target removes
+    /// the ones gone.
+    targets: Mutex<HashMap<String, Vec<String>>>,
+    /// The history was read from the graph: queued clicks can be matched to their items.
+    loaded: AtomicBool,
+    /// One spool publisher and one queue consumer at a time.
+    spooling: tokio::sync::Mutex<()>,
+    consuming: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -270,40 +293,21 @@ impl Notifier {
     /// Create the notifier. Must run inside a Tokio runtime (it starts the history writer and the
     /// native activation listener).
     pub fn new(native: Arc<dyn NativeDelivery>, activations: mpsc::UnboundedReceiver<NativeActivation>, data_dir: PathBuf) -> Arc<Self> {
-        let history_file = data_dir.join("history.json");
-        let history = std::fs::read(&history_file)
-            .ok()
-            .and_then(|bytes| match serde_json::from_slice::<History>(&bytes) {
-                Ok(history) => Some(history),
-                Err(error) => {
-                    tracing::warn!(%error, file = %history_file.display(), "notification history unreadable; starting empty");
-                    None
-                }
-            })
-            .unwrap_or_default();
-        let (persist, mut persisted) = watch::channel::<Option<(u64, String)>>(None);
-        let file = Arc::new(HistoryFile { path: history_file.clone(), version: std::sync::atomic::AtomicU64::new(0), written: Mutex::new(0) });
         let notifier = Arc::new(Self {
             bus: OnceLock::new(),
             native,
-            history: Mutex::new(history),
+            history: Mutex::new(History::default()),
             prefs: tokio::sync::Mutex::new(PrefsState { prefs: Prefs::default(), source: Source::Defaults("not loaded yet".into()), problems: Vec::new(), loaded: None }),
             focus: Mutex::new(None),
             lease: Mutex::new(None),
             delivering: Mutex::new(HashMap::new()),
             pending_activation: Mutex::new(None),
             data_dir: data_dir.clone(),
-            persist,
-            file: file.clone(),
-        });
-        // The store gets the latest snapshot after changes (once the frame connection is there).
-        let writer = Arc::downgrade(&notifier);
-        tokio::spawn(async move {
-            while persisted.changed().await.is_ok() {
-                let Some((version, snapshot)) = persisted.borrow_and_update().clone() else { continue };
-                let Some(bus) = writer.upgrade().and_then(|notifier| notifier.bus.get().cloned()) else { continue };
-                file.write(&bus, version, &snapshot).await;
-            }
+            graph: Graph::new(),
+            targets: Mutex::new(HashMap::new()),
+            loaded: AtomicBool::new(false),
+            spooling: tokio::sync::Mutex::new(()),
+            consuming: tokio::sync::Mutex::new(()),
         });
         let weak = Arc::downgrade(&notifier);
         let mut activations = activations;
@@ -319,36 +323,130 @@ impl Notifier {
         notifier
     }
 
-    /// Connect to the system (once), then read the history from the store: a history kept there
-    /// replaces the one read at start; none there takes the old file's history, which is removed.
+    /// Connect to the system (once), then move the old history into the graph (once) and read
+    /// the notifications back. Items posted meanwhile stay as they are.
     pub fn attach(self: &Arc<Self>, bus: Arc<dyn Bus>) {
         if self.bus.set(bus.clone()).is_err() {
             return;
         }
-        let notifier = Arc::downgrade(self);
+        let caller = bus.clone();
+        self.graph.start(Arc::new(move |method: &str, params: Value| caller.call(method, params)));
+        let notifier = self.clone();
         tokio::spawn(async move {
-            let stored = loop {
-                match bus.call(cc_protocol::contracts::memory::methods::SETTINGS_GET, json!({ "path": HISTORY_PATH })).await {
-                    Ok(setting) => break setting.get("value").cloned().and_then(|value| serde_json::from_value::<History>(value).ok()),
-                    Err(error) if error.code == codes::NOT_FOUND => break None,
-                    Err(error) if error.code == codes::UNAVAILABLE || error.code == codes::CONNECTION_CLOSED => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error.message, "notification history not read from the store");
-                        return;
-                    }
-                }
-            };
-            let Some(notifier) = notifier.upgrade() else { return };
-            match stored {
-                Some(history) => *lock(&notifier.history) = history,
-                None => {
-                    notifier.save();
-                    let _ = std::fs::remove_file(&notifier.file.path);
-                }
-            }
+            notifier.migrate().await;
+            notifier.load().await;
         });
+    }
+
+    /// The history of earlier versions (the setting, and the file before it) into the graph,
+    /// once; both are deleted when the graph took it.
+    async fn migrate(&self) {
+        let file = self.data_dir.join(OLD_FILE);
+        let mut old = Vec::new();
+        let from_setting = match self.graph.ask::<Value>(memory_methods::SETTINGS_GET, json!({ "path": OLD_SETTING })).await {
+            Ok(setting) => {
+                match setting.get("value").cloned().map(serde_json::from_value::<History>) {
+                    Some(Ok(history)) => old.extend(history.items().cloned()),
+                    _ => tracing::warn!("the old notification history setting is unreadable; it is deleted"),
+                }
+                true
+            }
+            Err(error) if error.code == codes::NOT_FOUND => false,
+            Err(error) => {
+                tracing::warn!(error = %error.message, "the old notification history was not read; it is moved at the next start");
+                return;
+            }
+        };
+        let from_file = match std::fs::read(&file) {
+            Ok(bytes) => {
+                match serde_json::from_slice::<History>(&bytes) {
+                    Ok(history) => old.extend(history.items().cloned()),
+                    Err(error) => tracing::warn!(%error, file = %file.display(), "the old notification history file is unreadable; it is deleted"),
+                }
+                true
+            }
+            Err(_) => false,
+        };
+        if !from_setting && !from_file {
+            return;
+        }
+        let mut history = History::from_items(Vec::new());
+        history.merge(History::from_items(old));
+        history.drain_evicted();
+        for item in history.items() {
+            self.write_item(item);
+        }
+        self.graph.append(POSTS, history.items().filter_map(|item| to_value(item).ok()).collect(), None);
+        if !self.graph.flush().await {
+            tracing::warn!("the old notification history was not moved into the graph; it is kept and tried again at the next start");
+            return;
+        }
+        if from_setting && let Err(error) = self.graph.ask::<Value>(memory_methods::SETTINGS_DELETE, json!({ "path": OLD_SETTING })).await {
+            tracing::warn!(error = %error.message, "the old notification history setting was moved into the graph but not deleted");
+        }
+        if from_file {
+            let _ = std::fs::remove_file(&file);
+        }
+        tracing::info!(items = history.len(), "the notification history moved into the graph");
+    }
+
+    /// The notifications the graph keeps, into the list (and dedup), then the clicks queued for
+    /// them. Those past the capacity are retired.
+    async fn load(self: &Arc<Self>) {
+        self.graph.flush().await;
+        let cypher = format!("MATCH (n:{NOTIFICATION}) WHERE n.ended_ms IS NULL RETURN n ORDER BY n.ts_ms DESC");
+        let nodes = match self.graph.nodes(&cypher, serde_json::Map::new(), 5000).await {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                tracing::warn!(error = %error.message, "the notifications were not read from the graph; new ones are still kept");
+                return;
+            }
+        };
+        let items: Vec<_> = nodes.iter().filter_map(history::from_props).collect();
+        {
+            let mut targets = lock(&self.targets);
+            for item in &items {
+                targets.entry(item.id.clone()).or_insert_with(|| history::target_names(&item.notification.target));
+            }
+        }
+        lock(&self.history).merge(History::from_items(items));
+        self.retire_evicted();
+        self.loaded.store(true, Ordering::SeqCst);
+        self.consume().await;
+    }
+
+    /// Write an item's node with its edge.
+    fn write_item(&self, item: &Posted) {
+        let names = history::target_names(&item.notification.target);
+        let stale: Vec<String> = {
+            let mut targets = lock(&self.targets);
+            let before = targets.insert(item.id.clone(), names.clone()).unwrap_or_default();
+            before.into_iter().filter(|name| !names.contains(name)).collect()
+        };
+        let n = &item.notification;
+        let node = vec![graph::node(NOTIFICATION, &item.id, history::props(item, &stale))];
+        let on_machine = vec![graph::edge((NOTIFICATION, &item.id), "ON", graph::machine())];
+        let about = match (&n.session_id, &n.project_id) {
+            (Some(session), _) => graph::at("Session", session),
+            (None, Some(project)) => graph::at("Project", project),
+            (None, None) => return self.graph.put(node, on_machine),
+        };
+        // A session or project the graph does not know (a deleted one): the machine holds it.
+        self.graph.put_or(node, vec![graph::edge((NOTIFICATION, &item.id), "ABOUT", about)], on_machine);
+    }
+
+    /// Retire the items that fell out of the list.
+    fn retire_evicted(&self) {
+        let evicted = lock(&self.history).drain_evicted();
+        if evicted.is_empty() {
+            return;
+        }
+        let mut targets = lock(&self.targets);
+        for id in &evicted {
+            targets.remove(id);
+        }
+        drop(targets);
+        self.graph.retire(evicted.iter().map(|id| graph::at(NOTIFICATION, id)).collect(), "capacity");
     }
 
     fn publish(&self, topic: &str, data: Value) {
@@ -365,21 +463,10 @@ impl Notifier {
         }
     }
 
-    /// The history as JSON with its version (both taken under the history lock).
-    fn snapshot(&self) -> Option<(u64, String)> {
-        let history = lock(&self.history);
-        let json = serde_json::to_string(&*history).ok()?;
-        Some((self.file.version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1, json))
-    }
-
-    fn save(&self) {
-        if let Some(snapshot) = self.snapshot() {
-            self.persist.send_replace(Some(snapshot));
-        }
-    }
-
+    /// An item changed: its node is written, listeners are told.
     fn changed(&self, posted: &Posted) {
-        self.save();
+        self.write_item(posted);
+        self.retire_evicted();
         if let Ok(value) = to_value(posted) {
             self.publish(topics::CHANGED, value);
         }
@@ -451,6 +538,9 @@ impl Notifier {
             (posted.unwrap_or_else(|| recorded.posted().clone()), plan)
         };
         self.changed(&posted);
+        if let Ok(value) = to_value(&posted) {
+            self.graph.append(POSTS, vec![value], None);
+        }
         match plan {
             Plan::Deliver { replaces } => {
                 let work = self.clone().deliver(posted.clone(), replaces, note);
@@ -706,28 +796,108 @@ impl Notifier {
         Ok(ActivatedResult { routed: true, target: n.target.clone() })
     }
 
-    /// Activations macOS spooled while no plugin was listening (the notification app was launched
-    /// by a click). Read once at activation.
+    /// Clicks the notification app spooled while no plugin was listening (it was launched by a
+    /// click): published to [`ACTIVATIONS_QUEUE`] in the background, so activation does not wait
+    /// for the memory plugin.
     pub async fn drain_spool(self: &Arc<Self>) {
+        let notifier = self.clone();
+        tokio::spawn(async move { notifier.publish_spool().await });
+    }
+
+    /// Move the spool into the queue. The spool is first renamed to a part of its own (the app
+    /// starts a new file for later clicks), and the parts are removed only once the queue took
+    /// them: when the memory plugin does not serve, they stay and are tried again (and at the next
+    /// start). Returns whether every part went.
+    pub async fn publish_spool(self: &Arc<Self>) -> bool {
+        let _turn = self.spooling.lock().await;
         let spool = self.spool_path();
-        let draining = spool.with_extension("jsonl.draining");
-        if std::fs::rename(&spool, &draining).is_err() {
+        if spool.exists() {
+            let part = self.data_dir.join(format!("{SPOOL}.{}{TAKEN}", now_ms()));
+            if let Err(error) = std::fs::rename(&spool, &part) {
+                tracing::warn!(%error, "the spooled clicks could not be taken; they stay for the next start");
+                return false;
+            }
+        }
+        let mut parts: Vec<PathBuf> = std::fs::read_dir(&self.data_dir)
+            .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(SPOOL) && n.ends_with(TAKEN))).collect())
+            .unwrap_or_default();
+        if parts.is_empty() {
+            return true;
+        }
+        parts.sort();
+        let mut messages = Vec::new();
+        for part in &parts {
+            for line in std::fs::read_to_string(part).unwrap_or_default().lines().filter(|l| !l.trim().is_empty()) {
+                match serde_json::from_str::<SpooledActivation>(line) {
+                    Ok(click) if !click.id.is_empty() => messages.push(json!(click)),
+                    _ => tracing::info!(line, "an unreadable spooled click is dropped"),
+                }
+            }
+        }
+        if !messages.is_empty() {
+            loop {
+                match self.graph.ask::<Value>(queue_methods::QUEUE_PUBLISH, json!({"queue": ACTIVATIONS_QUEUE, "messages": messages})).await {
+                    Ok(_) => break,
+                    Err(error) if matches!(error.code.as_str(), codes::UNAVAILABLE | codes::CONNECTION_CLOSED | codes::DRAINING | codes::UNKNOWN_METHOD | codes::TIMEOUT) => {
+                        tracing::info!(error = %error.message, clicks = messages.len(), "the memory plugin does not take the spooled clicks yet; they stay spooled");
+                        tokio::time::sleep(SPOOL_RETRY).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error.message, "the memory queue refused the spooled clicks; they stay for the next start");
+                        return false;
+                    }
+                }
+            }
+            tracing::info!(clicks = messages.len(), "spooled clicks moved to the queue");
+        }
+        for part in &parts {
+            let _ = std::fs::remove_file(part);
+        }
+        drop(_turn);
+        self.consume().await;
+        true
+    }
+
+    /// Route the queued clicks, once the history is loaded: each message is acked after it was
+    /// handled; one whose notification the history does not know is acked with a log line. A
+    /// failed take or ack leaves the rest queued (an unacked message comes back after its lease).
+    pub async fn consume(self: &Arc<Self>) {
+        if !self.loaded.load(Ordering::SeqCst) {
             return;
         }
-        let text = std::fs::read_to_string(&draining).unwrap_or_default();
-        let _ = std::fs::remove_file(&draining);
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
-            let Some(id) = record.get("id").and_then(Value::as_str) else { continue };
-            let action = record.get("action").and_then(Value::as_str).map(str::to_owned);
-            if let Err(error) = self.activated(ActivatedParams { id: id.to_owned(), action, via: Some("helper".into()) }).await {
-                tracing::info!(%error, "a spooled click could not be routed");
+        let _turn = self.consuming.lock().await;
+        loop {
+            let taken: QueueTakeResult = match self.graph.ask(queue_methods::QUEUE_TAKE, json!({"queue": ACTIVATIONS_QUEUE, "consumer": CONSUMER, "max": TAKE_MAX})).await {
+                Ok(taken) => taken,
+                Err(error) => {
+                    tracing::warn!(error = %error.message, "the queued clicks could not be read; they wait in the queue");
+                    return;
+                }
+            };
+            if taken.messages.is_empty() {
+                return;
+            }
+            let mut ids = Vec::new();
+            for message in taken.messages {
+                match serde_json::from_value::<SpooledActivation>(message.value) {
+                    Ok(click) => {
+                        if let Err(error) = self.activated(ActivatedParams { id: click.id.clone(), action: click.action, via: Some("helper".into()) }).await {
+                            tracing::info!(%error, id = %click.id, "a queued click names no notification in the history; it is dropped");
+                        }
+                    }
+                    Err(error) => tracing::info!(%error, "an unreadable queued click is dropped"),
+                }
+                ids.push(message.id);
+            }
+            if let Err(error) = self.graph.ask::<Value>(queue_methods::QUEUE_ACK, json!({"queue": ACTIVATIONS_QUEUE, "consumer": CONSUMER, "ids": ids})).await {
+                tracing::warn!(error = %error.message, "the handled clicks were not acked; they may be routed again");
+                return;
             }
         }
     }
 
     pub fn spool_path(&self) -> PathBuf {
-        self.data_dir.join("activations.jsonl")
+        self.data_dir.join(SPOOL)
     }
 
     // ----- preferences -----
@@ -1047,7 +1217,14 @@ impl Notifier {
 
     pub fn import_state(&self, state: Value) {
         let Ok(exported) = serde_json::from_value::<Exported>(state) else { return };
+        {
+            let mut targets = lock(&self.targets);
+            for item in exported.history.items() {
+                targets.entry(item.id.clone()).or_insert_with(|| history::target_names(&item.notification.target));
+            }
+        }
         lock(&self.history).merge(exported.history);
+        self.retire_evicted();
         if let Some(focus) = exported.focus {
             let at = Instant::now().checked_sub(Duration::from_millis(exported.focus_age_ms)).unwrap_or_else(Instant::now);
             *lock(&self.focus) = Some((focus, at));
@@ -1056,13 +1233,13 @@ impl Notifier {
             let renewed = Instant::now().checked_sub(Duration::from_millis(age_ms)).unwrap_or_else(Instant::now);
             *lock(&self.lease) = Some(Lease { id, kind, ttl_ms, renewed, since: renewed });
         }
-        self.save();
     }
 
-    /// Write the history now (the background writer may still hold the last change).
+    /// Wait until the writes asked for so far reached the graph, for at most [`FLUSH_WAIT`] (the
+    /// memory plugin may be gone already).
     pub async fn flush(&self) {
-        if let (Some((version, snapshot)), Some(bus)) = (self.snapshot(), self.bus.get().cloned()) {
-            self.file.write(&bus, version, &snapshot).await;
+        if self.bus.get().is_some() && tokio::time::timeout(FLUSH_WAIT, self.graph.flush()).await.is_err() {
+            tracing::warn!("notifications not written to the graph before the stop");
         }
     }
 

@@ -8,6 +8,7 @@
 //! - [`sampler`], [`grammar`], [`constraint`]: sampling on the host, llguidance constraints.
 //! - [`vision`]: images, through the variant's vision projector on its own thread.
 //! - [`runtime`]: installing and loading variants, and the `model.*` request paths.
+//! - [`records`]: model file digests, in the memory plugin's graph.
 //! - [`template`], [`parse`], [`repeat`], [`progress`], [`metrics`], [`variants`], [`machine`]:
 //!   shared with the uzu plugin.
 // `cc_protocol::RpcError` (128 bytes) is the protocol's error type for every contract method.
@@ -22,6 +23,7 @@ pub mod metrics;
 pub mod parse;
 pub mod plugin;
 pub mod progress;
+pub mod records;
 pub mod repeat;
 pub mod runtime;
 pub mod sampler;

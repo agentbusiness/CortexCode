@@ -2,10 +2,12 @@
 //! what the two runs end in decides (counterfactual evidence, not one trajectory read after the
 //! fact).
 //!
-//! - **Snapshot at run start**: a run in a git workspace keeps its starting point in the plugin's
-//!   data folder: the commit (`HEAD`), the uncommitted diff (`git diff HEAD --binary`) and copies of
-//!   the untracked files git does not ignore. Only read-only git commands touch the repository; the
-//!   newest `KEPT` snapshots stay.
+//! - **Snapshot at run start**: a run in a git workspace keeps its starting point: the commit
+//!   (`HEAD`) and the untracked files' list in a `Snapshot` node, the uncommitted diff (`git diff
+//!   HEAD --binary`) and copies of the untracked files git does not ignore as bytes in the plugin's
+//!   data folder (`snapshots/<session>/<run>/diff.patch`, `untracked/`). Only read-only git
+//!   commands touch the repository; the newest `KEPT` snapshots stay, older ones are retired and
+//!   their bytes deleted.
 //! - **At idle** (no run in any session, nothing left to learn) one candidate is replayed: a live
 //!   lesson not replayed yet whose run has a snapshot, taking turns between INV (`tool:`,
 //!   `approach`: how the agent works) and DOM (`lang:`: what a language demands). Its run's message
@@ -17,10 +19,21 @@
 //! - **The runs' ends decide**: `with` done and `without` not is better (`helped`), the reverse is
 //!   worse (`hurt`, and the withdrawal rule applies), anything else is no observed effect. The
 //!   lesson gets a `replay://` evidence either way, so it is not replayed again; a user's turn
-//!   cancels a replay, which then decides nothing and is tried again later. Results go to
-//!   `replays/results.jsonl` for the night report; the replay's projects and sessions are then
-//!   deleted.
+//!   cancels a replay, which then decides nothing and is tried again later. The result is a
+//!   `Replay` node (for the night report) and a record in stream `replays`; the replay's projects
+//!   and sessions are then deleted.
+//!
+//! ```text
+//! (:Snapshot {key: '<session>/<run>', version, root, head, subdir, untracked, dir, created_ms})-[:OF]->(:Session)
+//! (:Replay {key: '<lesson>#<ts_ms>', ts_ms, lesson, name, text, dom, with_state, without_state, verdict, evidence, of})-[:FOR]->(:Session)
+//! stream `replays`: {ts_ms, lesson, name, text, dom, with, without, verdict, evidence, of}
+//! ```
+//!
+//! Files that stay: a snapshot's bytes (`diff.patch`, `untracked/`) and the replays' working copies
+//! (`replays/<stamp>-<arm>/`, deleted when the replay ends). Older versions kept `meta.json` and
+//! `replays/results.jsonl`; [`migrate`] moves them into the graph once.
 
+use crate::graph;
 use crate::host::Host;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::frame::{JournalEntry, ProjectListResult, SessionCreateParams, SessionKind, kinds, methods as frame_methods};
@@ -68,16 +81,29 @@ impl Paths {
         Path::new(workspace).starts_with(&self.replays)
     }
 
-    pub fn has_snapshot(&self, session_id: &str, run_id: &str) -> bool {
-        std::fs::read(self.snapshot(session_id, run_id).join("meta.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|meta| meta.get("version").and_then(Value::as_u64) == Some(SNAPSHOT_VERSION))
-    }
-
-    pub fn results(&self) -> PathBuf {
+    /// The results file older versions kept (migrated once).
+    fn results(&self) -> PathBuf {
         self.replays.join("results.jsonl")
     }
+}
+
+const SNAPSHOT: &str = "Snapshot";
+const REPLAY: &str = "Replay";
+/// The stream every replay's result is appended to.
+pub const STREAM: &str = "replays";
+
+fn snapshot_key(session_id: &str, run_id: &str) -> String {
+    format!("{session_id}/{run_id}")
+}
+
+/// A run's live snapshot node of the current version.
+async fn snapshot_node(host: &Host, session_id: &str, run_id: &str) -> Option<serde_json::Map<String, Value>> {
+    let found = graph::nodes(host, "MATCH (s:Snapshot {key: $key}) WHERE s.ended_ms IS NULL AND s.version = $version RETURN s", json!({"key": snapshot_key(session_id, run_id), "version": SNAPSHOT_VERSION}), 1).await;
+    found.ok()?.into_iter().next()
+}
+
+pub async fn has_snapshot(host: &Host, session_id: &str, run_id: &str) -> bool {
+    snapshot_node(host, session_id, run_id).await.is_some()
 }
 
 fn safe(id: &str) -> String {
@@ -124,7 +150,7 @@ fn remove_tree(path: &Path) -> Result<(), String> {
 
 /// Keep the run's starting point (see the module's doc). A workspace that is not in a git
 /// repository with a commit is not snapshotted.
-pub async fn snapshot(paths: &Paths, session_id: &str, run_id: &str, workspace: &str) -> Result<(), String> {
+pub async fn snapshot(host: &Host, paths: &Paths, session_id: &str, run_id: &str, workspace: &str) -> Result<(), String> {
     let workspace = Path::new(workspace);
     let root = String::from_utf8_lossy(&git(workspace, &["rev-parse", "--show-toplevel"]).await?).trim().to_owned();
     let root = PathBuf::from(root);
@@ -150,36 +176,43 @@ pub async fn snapshot(paths: &Paths, session_id: &str, run_id: &str, workspace: 
         copy_entry(&root.join(name), &dir.join("untracked").join(name))?;
     }
     let subdir = workspace.strip_prefix(&root).map(|rest| rest.to_string_lossy().into_owned()).unwrap_or_default();
-    let meta = json!({"version": SNAPSHOT_VERSION, "root": root, "head": head, "subdir": subdir, "untracked": untracked, "session_id": session_id, "run_id": run_id});
-    std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-    prune(paths);
+    let props = json!({"version": SNAPSHOT_VERSION, "root": root.to_string_lossy(), "head": head, "subdir": subdir, "untracked": untracked, "dir": dir.to_string_lossy(), "created_ms": now_ms()});
+    let node = graph::node(SNAPSHOT, &snapshot_key(session_id, run_id), graph::props(props));
+    if let Err(error) = graph::put_in_session(host, node, "OF", Some(session_id), None).await {
+        let _ = remove_tree(&dir);
+        return Err(format!("the snapshot was not recorded: {}", error.message));
+    }
+    prune(host).await;
     Ok(())
 }
 
-/// Keep the newest `KEPT` snapshots.
-fn prune(paths: &Paths) {
-    let mut all: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for session in std::fs::read_dir(&paths.snapshots).into_iter().flatten().flatten() {
-        for run in std::fs::read_dir(session.path()).into_iter().flatten().flatten() {
-            let modified = run.metadata().and_then(|meta| meta.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            all.push((modified, run.path()));
-        }
+/// Keep the newest `KEPT` snapshots: the others are retired and their bytes deleted.
+async fn prune(host: &Host) {
+    let Ok(rows) = graph::rows(host, "MATCH (s:Snapshot) WHERE s.ended_ms IS NULL RETURN s.key, s.dir, s.created_ms ORDER BY s.created_ms DESC", json!({}), 5000).await else { return };
+    let old: Vec<(String, String)> = rows
+        .into_iter()
+        .skip(KEPT)
+        .filter_map(|row| Some((row.first()?.as_str()?.to_owned(), row.get(1).and_then(Value::as_str).unwrap_or("").to_owned())))
+        .collect();
+    if old.is_empty() {
+        return;
     }
-    all.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, dir) in all.into_iter().skip(KEPT) {
-        let _ = std::fs::remove_dir_all(dir);
+    let keys = old.iter().map(|(key, _)| key.clone()).collect();
+    if let Err(error) = graph::retire(host, SNAPSHOT, keys, "pruned").await {
+        tracing::debug!(error = %error.message, "old snapshots were not retired");
+        return;
+    }
+    for (_, dir) in old.iter().filter(|(_, dir)| !dir.is_empty()) {
+        let _ = remove_tree(Path::new(dir));
     }
 }
 
 /// A fresh copy of a snapshot at `dest`; returns the workspace in it (the snapshot's subfolder).
-async fn materialize(paths: &Paths, session_id: &str, run_id: &str, dest: &Path) -> Result<PathBuf, String> {
-    let dir = paths.snapshot(session_id, run_id);
-    let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-    if meta.get("version").and_then(Value::as_u64) != Some(SNAPSHOT_VERSION) {
-        return Err("snapshot predates complete file and symlink capture".to_owned());
-    }
-    let root = PathBuf::from(str_field(&meta, "root"));
-    let head = str_field(&meta, "head");
+async fn materialize(host: &Host, session_id: &str, run_id: &str, dest: &Path) -> Result<PathBuf, String> {
+    let meta = snapshot_node(host, session_id, run_id).await.ok_or_else(|| "the run has no snapshot of the current version".to_owned())?;
+    let dir = PathBuf::from(graph::str_prop(&meta, "dir"));
+    let root = PathBuf::from(graph::str_prop(&meta, "root"));
+    let head = graph::str_prop(&meta, "head");
     remove_tree(dest)?;
     std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
     let tar = dest.join(".snapshot.tar");
@@ -208,7 +241,7 @@ async fn materialize(paths: &Paths, session_id: &str, run_id: &str, dest: &Path)
     for args in [&["init", "-q"][..], &["add", "-A"][..], &["-c", "user.name=replay", "-c", "user.email=replay@localhost", "commit", "-q", "--no-verify", "-m", "snapshot"][..]] {
         git(dest, args).await?;
     }
-    Ok(dest.join(str_field(&meta, "subdir")))
+    Ok(dest.join(graph::str_prop(&meta, "subdir")))
 }
 
 /// The arm a replay session runs (`with` or `without`), with the lesson's id and text.
@@ -269,7 +302,7 @@ fn run_message(entries: &[JournalEntry], seq: u64) -> Option<(String, String)> {
 
 /// The oldest live lesson not replayed yet whose run has a snapshot, of the kind (INV or DOM) not
 /// replayed last when there is one.
-async fn candidate(host: &Host, paths: &Paths, last_dom: Option<bool>) -> Option<Candidate> {
+async fn candidate(host: &Host, last_dom: Option<bool>) -> Option<Candidate> {
     let listed = host.get::<KnowledgeListResult>(memory_methods::KNOWLEDGE_LIST, json!({"kind": knowledge::LESSON})).await.ok()?;
     let mut items: Vec<KnowledgeItem> = listed.items.into_iter().filter(|item| !item.evidence.iter().any(|uri| uri.starts_with("replay://"))).collect();
     items.sort_by_key(|item| item.created_ms);
@@ -278,7 +311,7 @@ async fn candidate(host: &Host, paths: &Paths, last_dom: Option<bool>) -> Option
         let Some((session_id, seq)) = item.evidence.iter().find_map(|uri| uri.strip_prefix("journal://")?.split_once('/').and_then(|(session, seq)| Some((session.to_owned(), seq.parse::<u64>().ok()?)))) else { continue };
         let Ok(entries) = host.journal_read(&session_id, 0).await else { continue };
         let Some((run_id, message)) = run_message(&entries, seq) else { continue };
-        if !paths.has_snapshot(&session_id, &run_id) {
+        if !has_snapshot(host, &session_id, &run_id).await {
             continue;
         }
         let dom = is_dom(&item.name);
@@ -297,7 +330,7 @@ async fn run_arm(host: &Host, paths: &Paths, replayer: &dyn Replayer, c: &Candid
     let check = || if cancel.is_cancelled() { Err("cancelled".to_owned()) } else { Ok(()) };
     check()?;
     let dest = paths.replays.join(format!("{stamp}-{arm}"));
-    let workspace = materialize(paths, &c.session_id, &c.run_id, &dest).await?;
+    let workspace = materialize(host, &c.session_id, &c.run_id, &dest).await?;
     check()?;
     let project = host.call(frame_methods::PROJECT_OPEN, json!({"root": workspace})).await.map_err(|error| error.message)?;
     check()?;
@@ -333,7 +366,7 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
     let c = tokio::select! {
         biased;
         _ = guard.cancel.cancelled() => return None,
-        candidate = candidate(host, paths, last_dom) => candidate?,
+        candidate = candidate(host, last_dom) => candidate?,
     };
     let stamp = format!("{}-{}", now_ms(), safe(&c.item.id));
     tracing::info!(lesson = %c.item.name, "replaying a lesson with and without it");
@@ -377,12 +410,98 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
         let _ = host.call(memory_methods::KNOWLEDGE_WITHDRAW, json!({"id": c.item.id, "reason": "replayed: the run without it went better", "by": "replay"})).await;
     }
     let row = json!({"ts_ms": now_ms(), "lesson": c.item.id, "name": c.item.name, "text": c.item.text, "dom": c.dom, "with": with_state, "without": without_state, "verdict": verdict, "evidence": evidence, "of": format!("journal://{}/{}", c.session_id, c.run_id)});
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(paths.results()) {
-        use std::io::Write;
-        let _ = writeln!(file, "{row}");
+    if let Err(error) = record(host, &row).await {
+        tracing::warn!(error = %error.message, lesson = %c.item.name, "the replay's result was not recorded");
     }
     tracing::info!(lesson = %c.item.name, %with_state, %without_state, %verdict, "replayed a lesson");
     Some(c.dom)
+}
+
+/// A replay's result as a `Replay` node of the session it replayed, and a record in the stream.
+async fn record(host: &Host, row: &Value) -> Result<(), RpcError> {
+    put_replay(host, row).await?;
+    graph::append(host, STREAM, vec![row.clone()]).await
+}
+
+async fn put_replay(host: &Host, row: &Value) -> Result<(), RpcError> {
+    let ts_ms = row.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+    let lesson = str_field(row, "lesson");
+    let of = str_field(row, "of");
+    let session_id = of.strip_prefix("journal://").and_then(|rest| rest.split('/').next()).unwrap_or("");
+    let props = json!({
+        "ts_ms": ts_ms, "lesson": lesson, "name": str_field(row, "name"), "text": str_field(row, "text"),
+        "dom": row.get("dom").and_then(Value::as_bool).unwrap_or(false), "with_state": str_field(row, "with"), "without_state": str_field(row, "without"),
+        "verdict": str_field(row, "verdict"), "evidence": str_field(row, "evidence"), "of": of,
+    });
+    let node = graph::node(REPLAY, &format!("{lesson}#{ts_ms}"), graph::props(props));
+    let at_ms = (ts_ms > 0 && ts_ms <= now_ms()).then_some(ts_ms);
+    graph::put_in_session(host, node, "FOR", Some(session_id), at_ms).await
+}
+
+/// Move what older versions kept in files into the graph, once: each snapshot's `meta.json`
+/// (a snapshot of an older version is deleted: it cannot be replayed) and `replays/results.jsonl`.
+/// A file goes only after its records are in the graph.
+pub async fn migrate(host: &Host, paths: &Paths) {
+    for session in std::fs::read_dir(&paths.snapshots).into_iter().flatten().flatten() {
+        for run in std::fs::read_dir(session.path()).into_iter().flatten().flatten() {
+            let dir = run.path();
+            let file = dir.join("meta.json");
+            let Ok(bytes) = std::fs::read(&file) else { continue };
+            let meta: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            if meta.get("version").and_then(Value::as_u64) != Some(SNAPSHOT_VERSION) {
+                let _ = remove_tree(&dir);
+                continue;
+            }
+            let (session_id, run_id) = (str_field(&meta, "session_id"), str_field(&meta, "run_id"));
+            let created_ms = std::fs::metadata(&file).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or_else(now_ms);
+            let untracked: Vec<&str> = meta.get("untracked").and_then(Value::as_array).map(|list| list.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            let props = json!({"version": SNAPSHOT_VERSION, "root": str_field(&meta, "root"), "head": str_field(&meta, "head"), "subdir": str_field(&meta, "subdir"), "untracked": untracked, "dir": dir.to_string_lossy(), "created_ms": created_ms});
+            let node = graph::node(SNAPSHOT, &snapshot_key(session_id, run_id), graph::props(props));
+            match graph::put_in_session(host, node, "OF", Some(session_id), Some(created_ms.min(now_ms()))).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&file);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error.message, snapshot = %dir.display(), "the snapshot was not moved into the graph; tried again at the next start");
+                    return;
+                }
+            }
+        }
+    }
+    sweep(host, paths).await;
+    let results = paths.results();
+    let Ok(text) = std::fs::read_to_string(&results) else { return };
+    let rows: Vec<Value> = text.lines().filter_map(|row| serde_json::from_str::<Value>(row).ok()).collect();
+    for row in &rows {
+        if let Err(error) = put_replay(host, row).await {
+            tracing::warn!(error = %error.message, "replay results were not moved into the graph; tried again at the next start");
+            return;
+        }
+    }
+    if let Err(error) = graph::append(host, STREAM, rows).await {
+        tracing::warn!(error = %error.message, "replay results were not moved into the stream; tried again at the next start");
+        return;
+    }
+    let _ = std::fs::remove_file(&results);
+    tracing::info!("moved the replay results into the graph");
+}
+
+/// Delete snapshot bytes no live `Snapshot` node names (a stopped app's half-written snapshot, a
+/// retired one whose bytes stayed), when they are older than an hour (one being written now is
+/// not touched).
+async fn sweep(host: &Host, paths: &Paths) {
+    let Ok(rows) = graph::rows(host, "MATCH (s:Snapshot) WHERE s.ended_ms IS NULL RETURN s.dir", json!({}), 5000).await else { return };
+    let live: std::collections::HashSet<PathBuf> = rows.iter().filter_map(|row| row.first()?.as_str().map(PathBuf::from)).collect();
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for session in std::fs::read_dir(&paths.snapshots).into_iter().flatten().flatten() {
+        for run in std::fs::read_dir(session.path()).into_iter().flatten().flatten() {
+            let old = run.metadata().and_then(|meta| meta.modified()).is_ok_and(|modified| modified < hour_ago);
+            if old && !live.contains(&run.path()) {
+                let _ = remove_tree(&run.path());
+            }
+        }
+        let _ = std::fs::remove_dir(session.path());
+    }
 }
 
 pub fn now_ms() -> u64 {

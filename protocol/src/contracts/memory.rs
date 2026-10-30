@@ -16,7 +16,7 @@ pub const CONTRACT: &str = "memory@1";
 // The frame's records (projects, sessions, settings, old journals) are kept through this contract;
 // their methods and types live with the frame's interface (`contracts::records`).
 pub use super::records::{
-    AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult,
+    AppDeletedResult, AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult,
     JournalDropParams, JournalReadParams, JournalReadResult, SettingsGetParams, SettingsSetParams,
 };
 
@@ -197,6 +197,48 @@ pub mod methods {
     pub const ROUTINE_RUN_PUT: &str = "memory.routine.run.put";
     /// [`super::RoutineRunsParams`] -> [`super::RoutineRunsResult`]: a routine's runs, newest first.
     pub const ROUTINE_RUNS: &str = "memory.routine.runs";
+
+    // The terminal's graph (docs/GRAPH-MODEL.md): every plugin's data, in the main project's
+    // layers, as connected nodes and edges, plus streams and queues. CortexTerm's own methods.
+    /// [`super::GraphPutParams`] -> [`super::GraphPutResult`]: merge nodes by `(label, key)` and
+    /// edges by `(from, rel, to)`, in one batch. Every node and edge keeps `first_ms` and `last_ms`;
+    /// values under `temporal` are added to that property's history. A node with no edge, in the
+    /// batch or already stored, is refused (`Machine`, the root, excepted); so is an edge whose
+    /// end is neither in the batch nor stored. The whole batch is checked before anything is
+    /// written, so a refused batch writes nothing.
+    pub const GRAPH_PUT: &str = "memory.graph.put";
+    /// [`super::GraphRetireParams`] -> [`super::GraphRetireResult`]: mark nodes as gone
+    /// (`ended_ms`, `state: 'gone'`); the node, its edges and its history stay. A later put of the
+    /// node brings it back (both are cleared).
+    pub const GRAPH_RETIRE: &str = "memory.graph.retire";
+    /// [`super::GraphQueryParams`] -> [`super::GraphQueryResult`]: one read-only Cypher statement
+    /// over the main project's three layers, with parameters, time-limited. A statement that could
+    /// write, change the schema or name another project is refused.
+    pub const GRAPH_QUERY: &str = "memory.graph.query";
+    /// `{}` -> [`super::MachineInfo`]: this Mac's root node, `(:Machine {key, name, os})`, which
+    /// the plugin creates at start; what other nodes link to.
+    pub const GRAPH_MACHINE: &str = "memory.graph.machine";
+
+    /// [`super::StreamAppendParams`] -> [`super::StreamAppendResult`]: append records to a topic
+    /// (created on first use, with its retention), in order.
+    pub const STREAM_APPEND: &str = "memory.stream.append";
+    /// [`super::StreamReadParams`] -> [`super::StreamReadResult`]: a topic's records from an
+    /// offset and/or a time, in order. A topic that does not exist reads as empty.
+    pub const STREAM_READ: &str = "memory.stream.read";
+    /// [`super::StreamTopicsParams`] -> [`super::StreamTopicsResult`]: the topics of the main
+    /// project, with their record counts and retention.
+    pub const STREAM_TOPICS: &str = "memory.stream.topics";
+
+    /// [`super::QueuePublishParams`] -> [`super::QueuePublishResult`]: add messages to a work queue
+    /// (created on first use).
+    pub const QUEUE_PUBLISH: &str = "memory.queue.publish";
+    /// [`super::QueueTakeParams`] -> [`super::QueueTakeResult`]: lease the next messages for a
+    /// consumer. At least once: a message not acked within its lease is delivered again. Each
+    /// consumer name reads the whole queue; workers sharing a name share its messages.
+    pub const QUEUE_TAKE: &str = "memory.queue.take";
+    /// [`super::QueueAckParams`] -> [`super::QueueAckResult`]: a consumer is done with messages;
+    /// they are never delivered to it again.
+    pub const QUEUE_ACK: &str = "memory.queue.ack";
 }
 
 pub mod topics {
@@ -1895,4 +1937,282 @@ pub struct RoutineRunsParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RoutineRunsResult {
     pub runs: Vec<RoutineRun>,
+}
+
+// ---- The terminal's graph: nodes and edges, streams, queues ----
+
+/// The layer of the main project a [`GraphPutParams`] batch creates its nodes and edges in. A
+/// node keeps the layer it was created in; later puts from any layer update it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphLayer {
+    /// What CortexTerm saw: Runs, apps, packages, connections, devices, findings.
+    #[default]
+    Observed,
+    /// Curated facts: habits, lessons, advisories that affect this Mac. Each node needs a `name`
+    /// (its `key` when the props give none).
+    Knowledge,
+    /// The app's own records: projects, sessions, settings, queue offsets.
+    Workspace,
+}
+
+/// A node by identity: its label and key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GraphRef {
+    /// CamelCase: an ASCII capital, then letters and digits (`App`, `StartItem`).
+    pub label: String,
+    /// Unique within the label (a bundle id, a path, `ecosystem:name`…). At most 1024 bytes.
+    pub key: String,
+}
+
+/// One node of a [`GraphPutParams`] batch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphNode {
+    pub label: String,
+    pub key: String,
+    /// Ordinary properties, replaced by each put (a property not named is left as it is; `null`
+    /// removes one). Names are snake_case (`[a-z][a-z0-9_]*`); values are strings, numbers,
+    /// booleans, or lists of one scalar type. Maps are refused: structure is modelled as nodes and
+    /// edges, never as JSON text. `key`, `first_ms`, `last_ms`, `ended_ms`, `ended_reason` and
+    /// `created_at` are the plugin's.
+    #[serde(default)]
+    pub props: serde_json::Map<String, Value>,
+    /// Temporal properties: a value that differs from the current one is added to the
+    /// property's history at the batch's `at_ms` (so the history holds the changes, and repeating
+    /// a put adds nothing); the latest sample is the current value. A string, number or boolean, the same type every time
+    /// for one label's property (an integer is taken for a float property). A property is
+    /// temporal from its first use here: name it here from the first write, never under `props`
+    /// first.
+    #[serde(default)]
+    pub temporal: serde_json::Map<String, Value>,
+}
+
+/// One edge of a [`GraphPutParams`] batch, merged by `(from, rel, to)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphEdge {
+    pub from: GraphRef,
+    /// UPPER_SNAKE: an ASCII capital, then capitals, digits and `_` (`INSTALLED_ON`).
+    pub rel: String,
+    pub to: GraphRef,
+    /// As [`GraphNode::props`].
+    #[serde(default)]
+    pub props: serde_json::Map<String, Value>,
+    /// As [`GraphNode::temporal`], per relationship type.
+    #[serde(default)]
+    pub temporal: serde_json::Map<String, Value>,
+}
+
+/// [`methods::GRAPH_PUT`]: at most 5000 nodes and edges together per call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphPutParams {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub edges: Vec<GraphEdge>,
+    /// Where new nodes and edges are created; `observed` when absent.
+    #[serde(default)]
+    pub layer: GraphLayer,
+    /// When this was seen (epoch ms): the time of the temporal samples and of `first_ms` /
+    /// `last_ms`. Now when absent; never more than a minute ahead.
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphPutResult {
+    /// Distinct nodes written.
+    pub nodes: u32,
+    /// Distinct edges written.
+    pub edges: u32,
+}
+
+/// [`methods::GRAPH_RETIRE`]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphRetireParams {
+    pub refs: Vec<GraphRef>,
+    /// Why (`uninstalled`, `fixed`…), kept as `ended_reason`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// When it went (epoch ms); now when absent.
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphRetireResult {
+    /// Nodes found and not already retired.
+    pub retired: u32,
+}
+
+/// [`methods::GRAPH_QUERY`]: one statement, without `USE` (the plugin names the project and
+/// layers). A point-in-time read starts with `AT TIME <datetime>`; histories are read with
+/// `HISTORY n.prop FROM <datetime> TO <datetime> AS s` (`s.time` in epoch nanoseconds, `s.value`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphQueryParams {
+    pub cypher: String,
+    /// `$name` parameters: values are never written into the statement.
+    #[serde(default)]
+    pub params: serde_json::Map<String, Value>,
+    /// Rows returned at most: 200 when absent, 5000 at most.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphQueryResult {
+    pub columns: Vec<String>,
+    /// Plain JSON values; a node is `{id, labels, properties}`, a relationship `{id, type, start,
+    /// end, properties}`.
+    pub rows: Vec<Vec<Value>>,
+    /// More rows matched than `limit`.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// [`methods::GRAPH_MACHINE`]: this Mac's root node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MachineInfo {
+    /// The hardware UUID (`IOPlatformUUID`).
+    pub key: String,
+    /// The computer name.
+    pub name: String,
+    /// `macOS 26.1 (25B78)`.
+    pub os: String,
+}
+
+/// [`methods::STREAM_APPEND`]. Topic names: `[a-z0-9][a-z0-9._-]*`, at most 200 bytes; `queue.` and
+/// `session.` topics belong to the plugin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamAppendParams {
+    pub topic: String,
+    /// JSON values, in order; at most 5000 per call and 1 MB each.
+    pub records: Vec<Value>,
+    /// How long records are kept, applied when the topic is created: 30 days when absent, 1 to 3650.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamAppendResult {
+    /// The offset of the first record appended.
+    pub first_offset: u64,
+    pub count: u32,
+}
+
+/// [`methods::STREAM_READ`]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamReadParams {
+    pub topic: String,
+    /// The first offset to read (the last read's `next_offset`); the oldest kept when absent.
+    #[serde(default)]
+    pub from_offset: Option<u64>,
+    /// Only records appended at or after this time (epoch ms).
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+    /// Records returned at most: 500 when absent, 5000 at most.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One record of a topic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamEntry {
+    pub offset: u64,
+    /// When it was appended (epoch ms).
+    pub at_ms: u64,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamReadResult {
+    pub records: Vec<StreamEntry>,
+    /// Where the next read starts.
+    pub next_offset: u64,
+    /// Nothing follows (yet).
+    pub end: bool,
+}
+
+/// [`methods::STREAM_TOPICS`]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamTopicsParams {
+    /// Only topics whose name starts with this.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamTopic {
+    pub name: String,
+    /// Records kept now.
+    pub records: u64,
+    /// The offset after the last record.
+    pub next_offset: u64,
+    /// None: kept for good.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamTopicsResult {
+    pub topics: Vec<StreamTopic>,
+}
+
+/// [`methods::QUEUE_PUBLISH`]. Queue names: as topic names, at most 190 bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueuePublishParams {
+    pub queue: String,
+    /// JSON values, in order; at most 5000 per call and 1 MB each.
+    pub messages: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueuePublishResult {
+    pub count: u32,
+}
+
+/// [`methods::QUEUE_TAKE`]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueTakeParams {
+    pub queue: String,
+    /// Who reads: `[A-Za-z0-9._-]`, at most 100 bytes (a plugin's name, `notify`).
+    pub consumer: String,
+    /// Messages at most: 10 when absent, 1000 at most.
+    #[serde(default)]
+    pub max: Option<u32>,
+    /// How long the consumer has to ack before a message is delivered again: 60 s when absent,
+    /// 1 s to 24 h.
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+/// A message handed to a consumer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueMessage {
+    /// What [`methods::QUEUE_ACK`] takes.
+    pub id: u64,
+    pub value: Value,
+    /// When it was published (epoch ms).
+    pub at_ms: u64,
+    /// 1 on the first delivery, more when it is delivered again.
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueTakeResult {
+    /// Oldest first: redeliveries of expired leases, then new messages. Empty when none wait.
+    pub messages: Vec<QueueMessage>,
+}
+
+/// [`methods::QUEUE_ACK`]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueAckParams {
+    pub queue: String,
+    pub consumer: String,
+    pub ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QueueAckResult {
+    /// Messages that were waiting for this ack (acking one twice counts once).
+    pub acked: u32,
 }

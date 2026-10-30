@@ -152,7 +152,7 @@ pub async fn execute_in(
     let intent = canonical.args.get("intent").and_then(Value::as_str).unwrap_or("").to_owned();
     // The step log: an edit records itself with the text in hand; a command's effects are found
     // when it ends (the watcher leaves them alone meanwhile).
-    let steps = (canonical.tool != "read").then(|| core.steps.open(&session.workspace));
+    let steps = if canonical.tool != "read" { Some(core.steps.open(&session.workspace).await) } else { None };
     if let Some(steps) = &steps {
         steps.begin();
     }
@@ -261,11 +261,11 @@ pub async fn attach_code_skills(core: &Core, host: &dyn Host, session_id: &str, 
 }
 
 /// Offload model-facing text that exceeds the limit (full text kept as an artifact).
-fn offload_text(core: &Core, text: String, limits: InlineLimits) -> (String, Option<String>) {
+fn offload_text(core: &Core, session: &str, text: String, limits: InlineLimits) -> (String, Option<String>) {
     if text.len() <= limits.inline {
         return (text, None);
     }
-    match core.artifacts.store(text.as_bytes()) {
+    match core.artifacts.store(text.as_bytes(), Some(session)) {
         Ok(id) => (artifacts::inline_view(text.as_bytes(), &id, limits), Some(id)),
         Err(_) => (text, None),
     }
@@ -463,7 +463,7 @@ async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         }
         displays.push(out.display);
     }
-    let (text, artifact) = offload_text(core, std::mem::take(&mut combined.output), core.config.read_limits);
+    let (text, artifact) = offload_text(core, &session.context.session_id, std::mem::take(&mut combined.output), core.config.read_limits);
     combined.output = text;
     combined.artifact = artifact;
     combined.display = if displays.len() == 1 { displays.remove(0) } else { Value::Array(displays) };
@@ -1214,13 +1214,16 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     core.tree.reserve(&absolute, &session.workspace, &session.context.session_id);
     {
         let mode = std::fs::metadata(&absolute).ok().map(|meta| { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() & 0o777 }).unwrap_or(0o644);
-        core.steps.open(&session.workspace).record_edit(
-            &crate::undo::Attribution::session(&session.context.session_id, "edit", &display),
-            &display,
-            old.as_deref().map(str::as_bytes),
-            Some(new.as_bytes()),
-            mode,
-        );
+        // The edit tool opened the workspace's log before it started.
+        match core.steps.opened(&session.workspace) {
+            Some(log) => {
+                log.record_edit(&crate::undo::Attribution::session(&session.context.session_id, "edit", &display), &display, old.as_deref().map(str::as_bytes), Some(new.as_bytes()), mode);
+            }
+            None => {
+                let path = display.clone();
+                tracing::warn!(path, "the step log of the workspace is not open; the edit is not recorded");
+            }
+        }
     }
     let new_hash = util::content_hash(new.as_bytes());
     let doc = Doc::parse(&new);
@@ -1410,7 +1413,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
             && edit_format(session.context) != EditFormat::Whole
         {
             let view = read_target(core, host, session, &display, None, None, true, Default::default()).await;
-            let (text, artifact) = offload_text(core, view.output, core.config.read_limits);
+            let (text, artifact) = offload_text(core, &session.context.session_id, view.output, core.config.read_limits);
             let how = match edit_format(session.context) {
                 EditFormat::Replace => "with old/new replacements",
                 _ => "with anchored edits, one or two top-level definitions per call",
@@ -1443,7 +1446,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 // now seen), so the next call can send the whole new content or anchored edits
                 // without a separate read step.
                 let view = read_target(core, host, session, &display, None, None, true, Default::default()).await;
-                let (text, artifact) = offload_text(core, view.output, core.config.read_limits);
+                let (text, artifact) = offload_text(core, &session.context.session_id, view.output, core.config.read_limits);
                 let other = match edit_format(session.context) {
                     EditFormat::Hashline => ", or change it with anchored edits",
                     EditFormat::Replace => ", or change it with old/new",
@@ -1824,7 +1827,7 @@ async fn apply_patch(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'
                 let removed = util::remove_file_checked(&absolute, |path| util::is_inside(path, &session.workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&session.workspace, path));
                 if removed.is_ok() {
                     core.tree.reserve(&absolute, &session.workspace, &session.context.session_id);
-                    core.steps.open(&session.workspace).record_edit(&crate::undo::Attribution::session(&session.context.session_id, "edit", &display), &display, before.as_deref(), None, 0);
+                    core.steps.open(&session.workspace).await.record_edit(&crate::undo::Attribution::session(&session.context.session_id, "edit", &display), &display, before.as_deref(), None, 0);
                 }
                 match removed {
                 Ok(()) => {
@@ -1884,20 +1887,20 @@ pub fn identity(core: &Core, session: &Session<'_>, runtime: Option<&Runtime>) -
 }
 
 /// Model-facing text and artifact for captured command output.
-pub fn present_output(core: &Core, captured: Captured, limits: InlineLimits) -> (String, Option<String>, u64) {
+pub fn present_output(core: &Core, session: &str, captured: Captured, limits: InlineLimits) -> (String, Option<String>, u64) {
     match captured {
         Captured::Mem(bytes) => {
             let total = bytes.len() as u64;
             if bytes.len() <= limits.inline {
                 return (String::from_utf8_lossy(&bytes).into_owned(), None, total);
             }
-            match core.artifacts.store(&bytes) {
+            match core.artifacts.store(&bytes, Some(session)) {
                 Ok(id) => (artifacts::inline_view(&bytes, &id, limits), Some(id), total),
                 Err(_) => (String::from_utf8_lossy(&bytes).into_owned(), None, total),
             }
         }
         Captured::File { path, head, tail, total, newlines } => {
-            let id = core.artifacts.adopt(&path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            let id = core.artifacts.adopt(&path, Some(session)).unwrap_or_else(|_| path.to_string_lossy().into_owned());
             let head_text = String::from_utf8_lossy(&head[..head.len().min(limits.head)]).into_owned();
             let tail_start = tail.len().saturating_sub(limits.tail);
             let tail_text = String::from_utf8_lossy(&tail[tail_start..]).into_owned();
@@ -1918,7 +1921,7 @@ pub const TEST_VIEW_BYTES: u64 = 1 << 20;
 /// A failing test run shown in the form the model acts on (see [`crate::testout`]): its counts,
 /// one line per failing test, the first failure whole, and the whole output kept as an artifact
 /// for the rest. Any other output is `text` as given.
-fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
+fn test_view(core: &Core, session: &str, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
     let Some(whole) = whole else { return (text, artifact) };
     // Tests the runner could not reach: said last, passing run or not, since a run without them
     // reads as green (seen: the tests of the case being fixed never ran, and the fix was taken as done).
@@ -1938,7 +1941,7 @@ fn test_view(core: &Core, whole: Option<String>, text: String, artifact: Option<
     };
     let id = match artifact {
         Some(id) => id,
-        None => match core.artifacts.store(whole.as_bytes()) {
+        None => match core.artifacts.store(whole.as_bytes(), Some(session)) {
             Ok(id) => id,
             Err(_) => return (text, None),
         },
@@ -2389,8 +2392,8 @@ async fn run_in_container(
     let tests = whole.as_deref().and_then(crate::testout::summary);
     // A test command that found no tests: the host's done check reads it (a check that ran nothing).
     let no_tests = whole.as_deref().is_some_and(crate::testout::found_none);
-    let (text, artifact, bytes) = present_output(core, captured, core.config.run_limits);
-    let (mut text, artifact) = test_view(core, whole, text, artifact);
+    let (text, artifact, bytes) = present_output(core, &session.context.session_id, captured, core.config.run_limits);
+    let (mut text, artifact) = test_view(core, &session.context.session_id, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
@@ -2698,13 +2701,13 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let tests = whole.as_deref().and_then(crate::testout::summary);
     // A test command that found no tests: the host's done check reads it (a check that ran nothing).
     let no_tests = whole.as_deref().is_some_and(crate::testout::found_none);
-    let (text, artifact, bytes) = present_output(core, run.output, core.config.run_limits);
+    let (text, artifact, bytes) = present_output(core, &session.context.session_id, run.output, core.config.run_limits);
     let text = match &check_copy {
         Some(copy) => text.replace(&copy.path.to_string_lossy().into_owned(), &session.workspace.to_string_lossy()),
         None => text,
     };
     let text = util::relative_paths(&text, &session.workspace);
-    let (mut text, artifact) = test_view(core, whole, text, artifact);
+    let (mut text, artifact) = test_view(core, &session.context.session_id, whole, text, artifact);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }

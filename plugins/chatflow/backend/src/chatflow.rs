@@ -737,7 +737,7 @@ impl Chatflow {
             let (session_id, run) = (params.session_id.clone(), run_id.clone());
             tokio::spawn(async move {
                 let Ok(session) = snapshot_host.session_get(&session_id).await else { return };
-                if let Err(reason) = crate::replay::snapshot(&paths, &session_id, &run, &session.workspace).await {
+                if let Err(reason) = crate::replay::snapshot(&snapshot_host, &paths, &session_id, &run, &session.workspace).await {
                     tracing::debug!(%reason, session = %session_id, "no snapshot of the run's start");
                 }
             });
@@ -1187,9 +1187,18 @@ impl Chatflow {
         }
         let roots: Vec<PathBuf> = roots.into_iter().filter_map(|root| root.canonicalize().ok()).collect();
         let home = ctx.env.home.clone();
-        tokio::task::spawn_blocking(move || attachments::put(&home, &roots, params))
+        let session_id = params.session_id.clone();
+        let put = tokio::task::spawn_blocking(move || attachments::put(&home, &roots, params))
             .await
-            .map_err(|error| RpcError::internal(format!("the attachment task failed: {error}")))?
+            .map_err(|error| RpcError::internal(format!("the attachment task failed: {error}")))??;
+        // Its metadata in the graph, without holding up the message (memory may be starting).
+        let recorded = put.clone();
+        tokio::spawn(async move {
+            if let Err(error) = attachments::record(&host, session_id.as_deref(), &recorded).await {
+                tracing::warn!(error = %error.message, path = %recorded.path, "the attachment was not recorded in the graph");
+            }
+        });
+        Ok(put)
     }
 
     /// A deleted session: its run stops, its prefill ends, and its lock file goes.

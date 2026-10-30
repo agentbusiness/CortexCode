@@ -8,20 +8,43 @@
 //! outside everything the shadow tracks.
 //!
 //! A checkpoint is a commit in the shadow (chained to the previous one) kept reachable by
-//! `refs/checkpoints/<id>`; labels and times live in `checkpoints.json`. Operations on one root are
-//! serialized with an exclusive file lock, so concurrent plugin instances (hot-swap) cannot interleave.
+//! `refs/checkpoints/<id>`. What it is (label, time, commit) lives in the app's graph:
+//!
+//! ```text
+//! (:Checkpoint {key: id, label, ts_ms, commit, tree, root})-[:OF]->(:Workspace {key: canonical root})
+//! (:Checkpoint)-[:AFTER]->(:Checkpoint)          the one made before it in the same root
+//! (:Workspace)-[:ON]->(:Machine)
+//! stream `checkpoints`: {id, root, label, ts_ms, commit, tree}, one record per checkpoint
+//! ```
+//!
+//! The nodes are in the `workspace` layer and written through the plugin's queue; the checkpoints
+//! this process made are also kept in memory, so they list and restore while the graph is not
+//! serving. Roots inside the plugin's own data folder (the probe's scratch repositories) stay in
+//! memory only. The `checkpoints.json` earlier versions kept is moved into the graph once and
+//! removed.
+//!
+//! Files that stay: the shadow repository itself (git objects, refs, index: bytes) and
+//! `cortex.lock`, an OS lock that serializes operations on one root across plugin instances
+//! (hot-swap).
 
 use crate::git::{Cmd, Git};
+use crate::graph::{Graph, Wait, edge, machine_ref, node, node_ref, workspace_batch};
 use crate::repo::{canonical_root, discover};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::vcs::{Checkpoint, CheckpointsResult, RestoreResult};
 use cc_protocol::{RpcError, codes};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const IDENTITY_NAME: &str = "CortexCode checkpoint";
 const IDENTITY_EMAIL: &str = "checkpoint@cortexcode.invalid";
+/// The file earlier versions kept the checkpoints in, inside each shadow repository.
+const OLD_META: &str = "checkpoints.json";
+const TOPIC: &str = "checkpoints";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Meta {
@@ -32,18 +55,202 @@ struct Meta {
     tree: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// `checkpoints.json` of earlier versions.
+#[derive(Debug, Default, Deserialize)]
 struct MetaFile {
+    #[serde(default)]
     root: String,
+    #[serde(default)]
     checkpoints: Vec<Meta>,
+}
+
+impl Meta {
+    fn from_props(props: &Map<String, Value>) -> Option<Self> {
+        let text = |key: &str| props.get(key).and_then(Value::as_str).map(str::to_owned);
+        let ts_ms = props.get("ts_ms").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))?;
+        Some(Self { id: text("key")?, label: text("label").unwrap_or_default(), ts_ms, commit: text("commit")?, tree: text("tree").unwrap_or_default() })
+    }
+
+    fn record(&self, root: &str) -> Value {
+        json!({ "id": self.id, "root": root, "label": self.label, "ts_ms": self.ts_ms, "commit": self.commit, "tree": self.tree })
+    }
+}
+
+/// The batch that writes `checkpoints` of `root` (oldest first), each after `previous` and then
+/// after the one before it.
+fn batch(machine: &str, root: &str, previous: Option<&str>, checkpoints: &[Meta]) -> cc_protocol::contracts::memory::GraphPutParams {
+    let workspace = node_ref("Workspace", root);
+    let mut nodes = vec![node("Workspace", root, Map::new())];
+    let mut edges = vec![edge(workspace.clone(), "ON", machine_ref(machine))];
+    let mut before = previous.map(str::to_owned);
+    for meta in checkpoints {
+        let mut props = Map::new();
+        props.insert("label".into(), json!(meta.label));
+        props.insert("ts_ms".into(), json!(meta.ts_ms));
+        props.insert("commit".into(), json!(meta.commit));
+        props.insert("tree".into(), json!(meta.tree));
+        props.insert("root".into(), json!(root));
+        nodes.push(node("Checkpoint", &meta.id, props));
+        let this = node_ref("Checkpoint", &meta.id);
+        edges.push(edge(this.clone(), "OF", workspace.clone()));
+        if let Some(before) = &before {
+            edges.push(edge(this, "AFTER", node_ref("Checkpoint", before)));
+        }
+        before = Some(meta.id.clone());
+    }
+    workspace_batch(nodes, edges)
+}
+
+/// Checkpoint records: the graph, plus what this process made (by canonical root).
+pub struct Checkpoints {
+    graph: Arc<Graph>,
+    data_dir: PathBuf,
+    made: Mutex<HashMap<String, Vec<Meta>>>,
+}
+
+impl Checkpoints {
+    pub fn new(graph: Arc<Graph>, data_dir: &Path) -> Self {
+        Self { graph, data_dir: data_dir.to_path_buf(), made: Mutex::new(HashMap::new()) }
+    }
+
+    fn made(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<Meta>>> {
+        self.made.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A root inside the plugin's own data folder: a scratch repository, never written to the graph.
+    fn scratch(&self, root: &Path) -> bool {
+        root.starts_with(&self.data_dir)
+    }
+
+    /// The checkpoints of `root`, oldest first.
+    async fn of(&self, root: &str, scratch: bool) -> Result<Vec<Meta>, RpcError> {
+        let mut all: Vec<Meta> = self.made().get(root).cloned().unwrap_or_default();
+        if !scratch {
+            let cypher = "MATCH (c:Checkpoint)-[:OF]->(:Workspace {key: $root}) WHERE c.ended_ms IS NULL RETURN c ORDER BY c.ts_ms DESC LIMIT 5000";
+            match self.graph.nodes(cypher, json!({ "root": root }), Wait::Bounded).await {
+                Ok(found) => {
+                    for meta in found.iter().filter_map(Meta::from_props) {
+                        if !all.iter().any(|known| known.id == meta.id) {
+                            all.push(meta);
+                        }
+                    }
+                }
+                Err(error) if error.code == codes::UNAVAILABLE => {
+                    tracing::warn!(error = %error.message, root, "memory is not serving; listing only this run's checkpoints");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        all.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.id.cmp(&b.id)));
+        Ok(all)
+    }
+
+    /// Keep a new checkpoint: in memory now, in the graph and the stream through the queue.
+    fn keep(&self, root: &str, scratch: bool, previous: Option<&str>, meta: &Meta) {
+        self.made().entry(root.to_owned()).or_default().push(meta.clone());
+        if scratch {
+            return;
+        }
+        let (root_key, previous, entry) = (root.to_owned(), previous.map(str::to_owned), meta.clone());
+        self.graph.put_later(move |machine| batch(machine, &root_key, previous.as_deref(), std::slice::from_ref(&entry)));
+        self.graph.append_later(TOPIC, vec![meta.record(root)]);
+    }
+
+    /// Move one shadow repository's `checkpoints.json` into the graph, then remove it. The caller
+    /// holds the shadow's lock.
+    async fn migrate(&self, dir: &Path, wait: Wait) -> Result<(), RpcError> {
+        let path = dir.join(OLD_META);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io("cannot read the old checkpoints file", error)),
+        };
+        let old: MetaFile = serde_json::from_slice(&bytes)
+            .map_err(|e| RpcError::internal(format!("{} is not valid JSON ({e}); move or remove it", path.display())))?;
+        if !old.root.is_empty() && !old.checkpoints.is_empty() && !self.scratch(Path::new(&old.root)) {
+            let root = old.root.clone();
+            let checkpoints = old.checkpoints.clone();
+            for chunk in checkpoints.chunks(1000) {
+                let previous = checkpoints.iter().take_while(|m| m.id != chunk[0].id).last().map(|m| m.id.clone());
+                self.graph.put(|machine| batch(machine, &root, previous.as_deref(), chunk), wait).await?;
+            }
+            let ids: Vec<&str> = checkpoints.iter().map(|m| m.id.as_str()).collect();
+            let rows = self.graph.query("MATCH (c:Checkpoint) WHERE c.key IN $ids RETURN count(c)", json!({ "ids": ids }), wait).await?;
+            let stored = rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0);
+            if stored < ids.len() as u64 {
+                return Err(RpcError::internal(format!("memory kept {stored} of {} checkpoints from {}; the file stays", ids.len(), path.display())));
+            }
+            for chunk in checkpoints.chunks(1000) {
+                self.graph.append(TOPIC, chunk.iter().map(|m| m.record(&root)).collect(), wait).await?;
+            }
+            tracing::info!(root, count = ids.len(), "checkpoints moved into the graph");
+        }
+        remove_old_meta(dir);
+        Ok(())
+    }
+
+    /// Move every shadow repository's `checkpoints.json` into the graph (at start).
+    pub async fn migrate_all(&self) {
+        let Ok(entries) = std::fs::read_dir(self.data_dir.join("shadow")) else { return };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.join(OLD_META).exists() {
+                continue;
+            }
+            let outcome = async {
+                let _lock = lock_dir(&dir).await?;
+                self.migrate(&dir, Wait::Until).await
+            }
+            .await;
+            if let Err(error) = outcome {
+                tracing::error!(dir = %dir.display(), error = %error.message, "the old checkpoints file could not be moved into the graph");
+            }
+        }
+    }
+}
+
+/// Remove `checkpoints.json` and the temporary files its writes left.
+fn remove_old_meta(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == OLD_META || name.starts_with("checkpoints.json.") {
+            if let Err(error) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(file = %entry.path().display(), %error, "cannot remove the old checkpoints file");
+            }
+        }
+    }
+}
+
+/// Exclusive lock over a shadow repository for the duration of one operation.
+async fn lock_dir(dir: &Path) -> Result<std::fs::File, RpcError> {
+    std::fs::create_dir_all(dir).map_err(|e| io("cannot create the shadow repository", e))?;
+    let path = dir.join("cortex.lock");
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| io("cannot open the checkpoint lock", e))?;
+        file.lock().map_err(|e| io("cannot lock the shadow repository", e))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("lock task failed: {e}")))?
 }
 
 /// The shadow repository of one root.
 pub struct Shadow {
     git: Git,
+    store: Arc<Checkpoints>,
     root: PathBuf,
+    /// The canonical root: the `Workspace` key.
+    root_key: String,
     root_text: String,
     dir: PathBuf,
+    scratch: bool,
 }
 
 /// Directory of the shadow repository for a canonical root.
@@ -58,10 +265,12 @@ fn io(context: &str, error: std::io::Error) -> RpcError {
 }
 
 impl Shadow {
-    pub fn new(git: &Git, data_dir: &Path, root: &str) -> Result<Self, RpcError> {
+    pub fn new(git: &Git, store: &Arc<Checkpoints>, root: &str) -> Result<Self, RpcError> {
         let canonical = canonical_root(root)?;
-        let dir = shadow_dir(data_dir, &canonical);
-        Ok(Self { git: git.clone(), root: canonical, root_text: root.to_owned(), dir })
+        let dir = shadow_dir(&store.data_dir, &canonical);
+        let scratch = store.scratch(&canonical);
+        let root_key = canonical.to_string_lossy().into_owned();
+        Ok(Self { git: git.clone(), store: store.clone(), root: canonical, root_key, root_text: root.to_owned(), dir, scratch })
     }
 
     pub fn dir(&self) -> &Path {
@@ -102,47 +311,19 @@ impl Shadow {
         for (key, value) in [("core.bare", "false"), ("gc.auto", "6700"), ("core.logAllRefUpdates", "false")] {
             self.git.cmd(&self.dir).arg(format!("--git-dir={}", self.dir.display())).args(["config", key, value]).ok().await?;
         }
-        let meta = MetaFile { root: self.root.to_string_lossy().into_owned(), checkpoints: Vec::new() };
-        self.write_meta(&meta)?;
         Ok(())
     }
 
-    /// Exclusive lock over this shadow repository for the duration of one operation.
+    /// Exclusive lock over this shadow repository for the duration of one operation; the
+    /// checkpoints file of an earlier version is moved into the graph first.
     async fn lock(&self) -> Result<std::fs::File, RpcError> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| io("cannot create the shadow repository", e))?;
-        let path = self.dir.join("cortex.lock");
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)
-                .map_err(|e| io("cannot open the checkpoint lock", e))?;
-            file.lock().map_err(|e| io("cannot lock the shadow repository", e))?;
-            Ok(file)
-        })
-        .await
-        .map_err(|e| RpcError::internal(format!("lock task failed: {e}")))?
-    }
-
-    fn meta_path(&self) -> PathBuf {
-        self.dir.join("checkpoints.json")
-    }
-
-    fn read_meta(&self) -> Result<MetaFile, RpcError> {
-        match std::fs::read(self.meta_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| RpcError::internal(format!("corrupt {}: {e}", self.meta_path().display()))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MetaFile::default()),
-            Err(error) => Err(io("cannot read checkpoints", error)),
+        let file = lock_dir(&self.dir).await?;
+        if self.dir.join(OLD_META).exists()
+            && let Err(error) = self.store.migrate(&self.dir, Wait::Bounded).await
+        {
+            tracing::warn!(dir = %self.dir.display(), error = %error.message, "the old checkpoints file stays until memory takes it");
         }
-    }
-
-    fn write_meta(&self, meta: &MetaFile) -> Result<(), RpcError> {
-        let bytes = serde_json::to_vec_pretty(meta).map_err(|e| RpcError::internal(e.to_string()))?;
-        let tmp = self.dir.join(format!("checkpoints.json.{}", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&tmp, bytes).map_err(|e| io("cannot write checkpoints", e))?;
-        std::fs::rename(&tmp, self.meta_path()).map_err(|e| io("cannot write checkpoints", e))
+        Ok(file)
     }
 
     /// Mirror the user's `info/exclude` so the shadow ignores what the user's repository ignores
@@ -183,12 +364,12 @@ impl Shadow {
 
     async fn record(&self, label: &str) -> Result<Meta, RpcError> {
         let tree = self.snapshot_tree().await?;
-        let mut meta = self.read_meta()?;
-        meta.root = self.root.to_string_lossy().into_owned();
+        let known = self.store.of(&self.root_key, self.scratch).await?;
+        let previous = known.last();
         let ts_ms = now_ms();
         let id = format!("cp-{ts_ms}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let mut cmd = self.cmd().args(["commit-tree", tree.as_str()]);
-        if let Some(previous) = meta.checkpoints.last() {
+        if let Some(previous) = previous {
             cmd = cmd.args(["-p", previous.commit.as_str()]);
         }
         let message = format!("{label}\n\nCortexCode-Checkpoint: {id}\n");
@@ -197,8 +378,7 @@ impl Shadow {
         let reference = format!("refs/checkpoints/{id}");
         self.cmd().args(["update-ref", reference.as_str(), commit.as_str()]).ok().await?;
         let entry = Meta { id, label: label.to_owned(), ts_ms, commit, tree };
-        meta.checkpoints.push(entry.clone());
-        self.write_meta(&meta)?;
+        self.store.keep(&self.root_key, self.scratch, previous.map(|p| p.id.as_str()), &entry);
         // Keep the shadow compact; runs only past git's loose-object threshold.
         let _ = self.cmd().args(["gc", "--auto", "--quiet"]).output().await;
         Ok(entry)
@@ -217,8 +397,11 @@ impl Shadow {
 
     /// Newest first.
     pub async fn list(&self) -> Result<CheckpointsResult, RpcError> {
-        let meta = self.read_meta()?;
-        let mut checkpoints: Vec<Checkpoint> = meta.checkpoints.iter().map(|m| self.contract(m)).collect();
+        if self.dir.join(OLD_META).exists() {
+            drop(self.lock().await?);
+        }
+        let known = self.store.of(&self.root_key, self.scratch).await?;
+        let mut checkpoints: Vec<Checkpoint> = known.iter().map(|m| self.contract(m)).collect();
         checkpoints.reverse();
         Ok(CheckpointsResult { checkpoints })
     }
@@ -229,9 +412,8 @@ impl Shadow {
     pub async fn restore(&self, id: &str) -> Result<RestoreResult, RpcError> {
         let _lock = self.lock().await?;
         self.ensure().await?;
-        let meta = self.read_meta()?;
-        let target = meta
-            .checkpoints
+        let known = self.store.of(&self.root_key, self.scratch).await?;
+        let target = known
             .iter()
             .find(|m| m.id == id)
             .cloned()

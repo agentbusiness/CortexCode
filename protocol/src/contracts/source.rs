@@ -49,6 +49,58 @@ pub mod methods {
     /// to its package's data: the user's edits in it (committed or not) are dropped, the rest of
     /// the live folder stays.
     pub const RELEASE_RESET: &str = "source.release.reset";
+    /// [`super::FileHistoryParams`] -> [`super::FileHistory`]. Every version of one data file the
+    /// graph keeps (its `DataFile` node's temporal `hash` and `origin`), newest first.
+    pub const FILE_HISTORY: &str = "source.file.history";
+    /// [`super::FileRestoreParams`] -> [`super::FileRestoreResult`]. Write one data file back into
+    /// the live folder as the graph had it at a time (its temporal `body`), recorded as a change
+    /// of origin `restore`.
+    pub const FILE_RESTORE: &str = "source.file.restore";
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FileHistoryParams {
+    /// Relative to the live folder (`plugins/<id>/data/...`).
+    pub path: String,
+    /// Versions returned at most (newest first): 200 when absent.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileHistory {
+    pub path: String,
+    pub versions: Vec<FileVersion>,
+}
+
+/// One version of a data file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileVersion {
+    /// When it became this (epoch ms): what [`FileRestoreParams::at_ms`] takes.
+    pub at_ms: u64,
+    /// The git blob id of the content; empty when the file was deleted.
+    pub hash: String,
+    /// shipped | edit | update | revert | restore
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FileRestoreParams {
+    /// Relative to the live folder (`plugins/<id>/data/...`).
+    pub path: String,
+    /// The time whose version to restore (epoch ms), e.g. a [`FileVersion::at_ms`].
+    pub at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileRestoreResult {
+    pub path: String,
+    /// restored | deleted (the file did not exist then) | up_to_date
+    pub state: String,
+    /// The version written (empty when deleted).
+    pub hash: String,
+    /// The change that recorded it (the head when nothing changed).
+    pub commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

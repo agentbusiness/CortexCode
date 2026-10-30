@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 pub struct FrameInfo {
     pub pid: u32,
     pub port: u16,
-    pub token: String,
+    /// Only where there is no Keychain: on macOS the token is in the Keychain (`keychain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub socket: String,
     pub version: String,
 }
@@ -118,7 +120,7 @@ pub fn read_frame_info(path: &Path) -> Option<FrameInfo> {
     serde_json::from_str(&text).ok()
 }
 
-/// Write `frame.json` atomically with owner-only permissions (it carries the API token).
+/// Write `frame.json` atomically with owner-only permissions.
 pub fn write_frame_info(path: &Path, info: &FrameInfo) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     {

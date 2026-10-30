@@ -1,24 +1,41 @@
 //! `research.fetch`: download (size-limited, private addresses refused), extract readable text and
-//! cache both under `$CORTEX_HOME/research/cache`:
+//! keep both:
 //!
-//! - `urls/<sha256 of the URL>.json`: the URL's latest fetch (when, the content hash, the extracted
-//!   text and metadata, the extractor version);
-//! - `blobs/<sha256 of the content>`: the downloaded bytes, shared by every URL with the same content,
-//!   so a newer extractor re-extracts without the network.
+//! ```text
+//! (:WebPage {key: url, url, final_url, fetched_ms, content_sha256, content_type, kind, bytes,
+//!     download_truncated, extractor, title, text, published, authors, site_name, pages})-[:ON]->(:Machine)
+//! ```
+//!
+//! - the URL's latest fetch (when, the content hash, the extracted text and metadata, the extractor
+//!   version) as a `WebPage` node in the memory plugin's graph (workspace layer); a URL longer than
+//!   a key holds is keyed `sha256:<hex of the URL>`;
+//! - the downloaded bytes stay a file, `$CORTEX_HOME/research/cache/blobs/<sha256 of the content>`,
+//!   shared by every URL with the same content, so a newer extractor re-extracts without the network.
 //!
 //! A fresh entry (younger than `cache_ttl_hours`) is served without the network; an older one is
-//! fetched again, and returned marked `stale` when the network cannot be reached.
+//! fetched again, and returned marked `stale` when the network cannot be reached. While memory is
+//! away a lookup is a miss and a new entry is written once it serves.
+//!
+//! Entries an earlier version kept as files (`cache/urls/<sha256 of the URL>.json`) are written to
+//! the graph once and the files deleted.
 
 use crate::config::Config;
 use crate::extract::{self, EXTRACTOR_VERSION, Extracted};
+use crate::graph::{self, BRIEF, Graph, PATIENT, edge, gref, node};
 use crate::net::{Net, NetError, Request};
 use crate::text::{sha256_hex, skip_chars, take_chars};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::research::{FetchParams, FetchResult};
 use cc_protocol::{RpcError, codes};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+const PAGE: &str = "WebPage";
+/// Entries moved per put, and their text at most (bytes), when moving an earlier version's files.
+const MOVE_ENTRIES: usize = 200;
+const MOVE_BYTES: usize = 16 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
@@ -43,38 +60,165 @@ struct Entry {
     pages: Option<u32>,
 }
 
+impl Entry {
+    fn props(&self) -> Map<String, Value> {
+        let value = json!({
+            "url": self.url,
+            "final_url": self.final_url,
+            "fetched_ms": self.fetched_ms,
+            "content_sha256": self.content_sha256,
+            "content_type": self.content_type,
+            "kind": self.kind,
+            "bytes": self.bytes,
+            "download_truncated": self.download_truncated,
+            "extractor": self.extractor,
+            "title": self.title,
+            "text": self.text,
+            "published": graph::or_null(&self.published),
+            "authors": self.authors,
+            "site_name": graph::or_null(&self.site_name),
+            "pages": graph::or_null(&self.pages),
+        });
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+
+    fn from_props(p: &Map<String, Value>) -> Entry {
+        Entry {
+            url: graph::text(p, "url"),
+            final_url: graph::text(p, "final_url"),
+            fetched_ms: graph::number(p, "fetched_ms"),
+            content_sha256: graph::text(p, "content_sha256"),
+            content_type: graph::text(p, "content_type"),
+            kind: graph::text(p, "kind"),
+            bytes: graph::number(p, "bytes"),
+            download_truncated: graph::flag(p, "download_truncated"),
+            extractor: graph::number(p, "extractor") as u32,
+            title: graph::text(p, "title"),
+            text: graph::text(p, "text"),
+            published: graph::opt_text(p, "published"),
+            authors: graph::texts(p, "authors"),
+            site_name: graph::opt_text(p, "site_name"),
+            pages: graph::opt_number(p, "pages").map(|n| n as u32),
+        }
+    }
+}
+
 pub struct Fetcher {
     net: Arc<Net>,
+    graph: Arc<Graph>,
     dir: PathBuf,
 }
 
 impl Fetcher {
-    /// `dir`: `$CORTEX_HOME/research/cache`.
-    pub fn new(net: Arc<Net>, dir: PathBuf) -> Self {
-        Self { net, dir }
+    /// `dir`: `$CORTEX_HOME/research/cache` (the downloaded bytes, and an earlier version's entries).
+    pub fn new(net: Arc<Net>, graph: Arc<Graph>, dir: PathBuf) -> Self {
+        Self { net, graph, dir }
     }
 
     fn config(&self) -> &Config {
         self.net.config()
     }
 
-    fn entry_path(&self, url: &str) -> PathBuf {
-        self.dir.join("urls").join(format!("{}.json", sha256_hex(url.as_bytes())))
-    }
-
     fn blob_path(&self, hash: &str) -> PathBuf {
         self.dir.join("blobs").join(hash)
     }
 
-    fn load(&self, url: &str) -> Option<Entry> {
-        let text = std::fs::read_to_string(self.entry_path(url)).ok()?;
-        serde_json::from_str(&text).ok()
+    /// The URL's entry; none while memory is away (a miss, fetched again).
+    async fn load(&self, url: &str) -> Option<Entry> {
+        let rows = self
+            .graph
+            .query(&format!("MATCH (w:{PAGE}) WHERE w.key = $key AND w.ended_ms IS NULL RETURN w"), json!({ "key": graph::fit_key(url) }), 1, BRIEF)
+            .await
+            .map_err(|error| tracing::info!("research cache: no lookup of {url}: {}", error.message))
+            .ok()?;
+        let entry = Entry::from_props(&graph::props_of(rows.first()?.first()?));
+        (!entry.content_sha256.is_empty()).then_some(entry)
     }
 
     fn store(&self, entry: &Entry, body: &[u8]) -> Result<(), String> {
         write_atomic(&self.blob_path(&entry.content_sha256), body)?;
-        let json = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
-        write_atomic(&self.entry_path(&entry.url), &json)
+        self.store_entry(entry);
+        Ok(())
+    }
+
+    /// Write the entry to the graph in the background: when memory is away, once it serves.
+    fn store_entry(&self, entry: &Entry) {
+        let (graph, key, props, url) = (self.graph.clone(), graph::fit_key(&entry.url), entry.props(), entry.url.clone());
+        tokio::spawn(async move {
+            let written = async {
+                let machine = graph.machine().await?;
+                graph.put(vec![node(PAGE, &key, props)], vec![edge(gref(PAGE, &key), "ON", gref("Machine", &machine))], PATIENT).await
+            };
+            if let Err(error) = written.await {
+                tracing::warn!("research cache: cannot keep {url}: {}", error.message);
+            }
+        });
+    }
+
+    /// Move the entries an earlier version kept as files (`urls/*.json`) into the graph: a put per
+    /// group, each file deleted once its group is written. Files left by a failed put are moved on
+    /// the next start.
+    pub async fn migrate(&self) {
+        let dir = self.dir.join("urls");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let mut group: Vec<(PathBuf, Entry)> = Vec::new();
+        let mut size = 0;
+        for path in entries.flatten().map(|e| e.path()) {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if !name.ends_with(".json") {
+                continue;
+            }
+            // An entry that does not read is a cache miss: the URL is fetched again when asked.
+            let Some(entry) = std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str::<Entry>(&text).ok()) else {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            size += entry.text.len();
+            group.push((path, entry));
+            if group.len() >= MOVE_ENTRIES || size >= MOVE_BYTES {
+                if !self.move_group(std::mem::take(&mut group)).await {
+                    return;
+                }
+                size = 0;
+            }
+        }
+        if !group.is_empty() && !self.move_group(group).await {
+            return;
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    async fn move_group(&self, group: Vec<(PathBuf, Entry)>) -> bool {
+        let written = async {
+            let machine = gref("Machine", &self.graph.machine().await?);
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            for (_, entry) in &group {
+                let key = graph::fit_key(&entry.url);
+                nodes.push(node(PAGE, &key, entry.props()));
+                edges.push(edge(gref(PAGE, &key), "ON", machine.clone()));
+            }
+            self.graph.put(nodes, edges, PATIENT).await
+        };
+        match written.await {
+            Ok(()) => {
+                for (path, _) in group {
+                    let _ = std::fs::remove_file(&path);
+                }
+                true
+            }
+            Err(error) => {
+                tracing::warn!("research cache: cannot move the cached pages into the graph ({}); they move on the next start", error.message);
+                false
+            }
+        }
     }
 
     pub async fn fetch(&self, params: FetchParams) -> Result<FetchResult, RpcError> {
@@ -87,7 +231,7 @@ impl Fetcher {
             return Err(RpcError::invalid_params(format!("only http and https URLs are fetched, not {}:", parsed.scheme())));
         }
         let ttl_ms = self.config().cache_ttl_hours.saturating_mul(3_600_000);
-        let cached = self.load(&url);
+        let cached = self.load(&url).await;
         if !params.refresh
             && let Some(entry) = &cached
             && now_ms().saturating_sub(entry.fetched_ms) < ttl_ms
@@ -119,16 +263,11 @@ impl Fetcher {
         match extracted {
             Ok(Ok(extracted)) => {
                 let fresh = fill(entry.clone(), extracted, limit);
-                let _ = self.store_entry(&fresh);
+                self.store_entry(&fresh);
                 fresh
             }
             _ => entry,
         }
-    }
-
-    fn store_entry(&self, entry: &Entry) -> Result<(), String> {
-        let json = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
-        write_atomic(&self.entry_path(&entry.url), &json)
     }
 
     async fn download(&self, url: &str) -> Result<Entry, FetchError> {

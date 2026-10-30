@@ -90,6 +90,9 @@ impl Learner {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let again = tx.clone();
         tokio::spawn(async move {
+            // Records older versions kept in files move into the graph once.
+            crate::replay::migrate(&host, &paths).await;
+            crate::night::migrate(&host, &paths).await;
             // The kind (INV or DOM) of the lesson replayed last: replays take turns.
             let mut last_dom: Option<bool> = None;
             loop {
@@ -116,7 +119,7 @@ impl Learner {
                         let _ = again.send(Job::Backlog);
                     }
                     Ok(_) => {
-                        crate::night::report_if_due(&host, &paths).await;
+                        crate::night::report_if_due(&host).await;
                         if replayer.idle()
                             && let Some(dom) = crate::replay::replay_one(&host, &paths, replayer.as_ref(), last_dom).await
                         {

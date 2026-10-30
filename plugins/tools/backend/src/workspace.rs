@@ -2,6 +2,13 @@
 //! (the whole directory tree in one syscall, sharing data blocks until written), including untracked
 //! and ignored files, with its own git branch. Falls back to a plain recursive copy only when the
 //! volume cannot clone, and reports which method was used.
+//!
+//! ```text
+//! (:Clone {key: canonical path, path, name, source, branch, method, created_ms, project_id})
+//!     -[:OF]->(:Project)   -[:ON]->(:Machine)
+//! ```
+//!
+//! A removed clone is retired. The clone's folder is bytes and stays a folder.
 
 use crate::util;
 use cc_protocol::contracts::tools::Workspace;
@@ -13,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 pub struct Workspaces {
     root: PathBuf,
+    graph: std::sync::Arc<crate::graph::Graph>,
 }
 
 #[derive(Debug)]
@@ -91,17 +99,72 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 impl Workspaces {
-    pub fn new(home: &Path) -> Self {
-        Self { root: home.join("workspaces") }
+    pub fn new(home: &Path, graph: std::sync::Arc<crate::graph::Graph>) -> Self {
+        Self { root: home.join("workspaces"), graph }
+    }
+
+    fn key(path: &Path) -> String {
+        util::canonical_lenient(path).to_string_lossy().into_owned()
+    }
+
+    /// The clone's node.
+    fn batch(workspace: &Workspace) -> crate::graph::Batch {
+        use crate::graph;
+        let key = Self::key(Path::new(&workspace.path));
+        let me = graph::gref("Clone", &key);
+        let node = graph::node(
+            "Clone",
+            &key,
+            graph::props(serde_json::json!({
+                "path": workspace.path,
+                "name": workspace.name,
+                "source": workspace.source,
+                "branch": workspace.branch,
+                "method": workspace.method,
+                "created_ms": workspace.created_ms,
+                "project_id": workspace.project_id,
+            })),
+        );
+        let soft = vec![graph::edge(&me, "OF", &graph::gref("Project", &workspace.project_id))];
+        graph::Batch::workspace(vec![node], vec![graph::edge(&me, "ON", &graph::machine())], soft)
+    }
+
+    /// Clones earlier versions recorded as `<project>/.<name>.workspace.json`: written to the
+    /// graph, then the files removed.
+    pub async fn import_files(&self) {
+        let mut found = Vec::new();
+        let Ok(projects) = std::fs::read_dir(&self.root) else { return };
+        for project in projects.flatten() {
+            let Ok(entries) = std::fs::read_dir(project.path()) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".workspace.json") {
+                    continue;
+                }
+                match std::fs::read(entry.path()).ok().and_then(|bytes| serde_json::from_slice::<Workspace>(&bytes).ok()) {
+                    Some(workspace) if Path::new(&workspace.path).exists() => found.push((entry.path(), workspace)),
+                    // A record of a clone that is gone, or unreadable: nothing to keep.
+                    _ => {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        match self.graph.put_wait(found.iter().map(|(_, workspace)| Self::batch(workspace)).collect()).await {
+            Ok(()) => {
+                for (file, _) in found {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+            Err(error) => tracing::error!(error = %error.message, "the old workspace clone records were not written to the graph; their files are kept"),
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    fn meta_path(path: &Path) -> PathBuf {
-        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-        path.with_file_name(format!(".{name}.workspace.json"))
     }
 
     pub fn create(&self, project_id: &str, source: &str, name: &str, branch: Option<&str>) -> Result<Workspace, WorkspaceError> {
@@ -161,9 +224,7 @@ impl Workspaces {
             method: method.to_owned(),
             created_ms: util::now_ms(),
         };
-        if let Ok(bytes) = serde_json::to_vec_pretty(&workspace) {
-            let _ = util::atomic_write(&Self::meta_path(&target), &bytes);
-        }
+        self.graph.put(Self::batch(&workspace));
         Ok(workspace)
     }
 
@@ -179,37 +240,44 @@ impl Workspaces {
                 format!("{} is not a workspace under {}", path.display(), self.root.display()),
             ));
         }
+        let gone = vec![crate::graph::gref("Clone", &Self::key(&resolved))];
         if !resolved.exists() {
-            let _ = std::fs::remove_file(Self::meta_path(&resolved));
+            self.graph.retire(gone, "removed");
             return Err(WorkspaceError::new("not_found", format!("workspace {} does not exist", path.display())));
         }
         std::fs::remove_dir_all(&resolved).map_err(|error| WorkspaceError::new("internal", format!("{}: {error}", resolved.display())))?;
-        let _ = std::fs::remove_file(Self::meta_path(&resolved));
+        self.graph.retire(gone, "removed");
         Ok(())
     }
 
-    pub fn list(&self, project_id: Option<&str>) -> Vec<Workspace> {
-        let mut out = Vec::new();
-        let Ok(projects) = std::fs::read_dir(&self.root) else { return out };
-        for project in projects.flatten() {
-            let project_name = project.file_name().to_string_lossy().into_owned();
-            if project_id.is_some_and(|wanted| wanted != project_name) {
-                continue;
+    /// The clones that stand (of `project_id`, or all), oldest first.
+    pub async fn list(&self, project_id: Option<&str>) -> Vec<Workspace> {
+        let rows = match self
+            .graph
+            .query_all("MATCH (c:Clone) WHERE c.ended_ms IS NULL AND c.key > $after RETURN c, c.key AS k ORDER BY k LIMIT 5000", serde_json::json!({}), 20)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(error = %error.message, "the workspace clones could not be read from the graph");
+                return Vec::new();
             }
-            let Ok(entries) = std::fs::read_dir(project.path()) else { continue };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".workspace.json") {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(entry.path())
-                    && let Ok(workspace) = serde_json::from_slice::<Workspace>(&bytes)
-                    && Path::new(&workspace.path).exists()
-                {
-                    out.push(workspace);
-                }
-            }
-        }
+        };
+        let mut out: Vec<Workspace> = rows
+            .iter()
+            .filter_map(|row| row.first().and_then(crate::graph::properties))
+            .map(|props| Workspace {
+                name: crate::graph::text(props, "name"),
+                project_id: crate::graph::text(props, "project_id"),
+                path: crate::graph::text(props, "path"),
+                source: crate::graph::text(props, "source"),
+                branch: crate::graph::text(props, "branch"),
+                method: crate::graph::text(props, "method"),
+                created_ms: crate::graph::number(props, "created_ms"),
+            })
+            .filter(|workspace| project_id.is_none_or(|wanted| wanted == workspace.project_id))
+            .filter(|workspace| Path::new(&workspace.path).exists())
+            .collect();
         out.sort_by_key(|workspace| workspace.created_ms);
         out
     }
