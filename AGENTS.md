@@ -125,7 +125,8 @@ built to the same standard as CortexCode. The standard is:
   `terminal@1`, `chatflow@1`);
 - the mesh: ALPNs, pairing, membership log, card, claims, lending, `mesh.link`, `mesh.session.start`;
 - model and resource sharing: model tags (`coding`, `office`), one model per machine, the yield
-  handshake;
+  handshake, one models folder for every Cortex app (`~/.cortex-models`, `docs/SHARED-MODELS.md`;
+  `shared-models/`);
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
   `<category>.shares` declaration, where a call may come from, the caller, run options, jobs and
   read sizes, and the one-tool-per-service builder;

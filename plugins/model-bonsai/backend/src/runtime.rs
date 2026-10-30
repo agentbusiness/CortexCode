@@ -56,7 +56,7 @@ pub struct Config {
     /// Pixel budget per image; larger images are downscaled (default 2,400,000, about 2,340 tokens).
     #[serde(default)]
     pub max_image_pixels: Option<u64>,
-    /// Where variants are installed (default `$CORTEX_HOME/models`).
+    /// Where variants are installed (default `~/.cortex-models`, the folder the Cortex apps share).
     #[serde(default)]
     pub models_dir: Option<String>,
     /// Upper bound of the memory the plugin may plan for (operator limit; default: the fit's budget).
@@ -81,6 +81,24 @@ pub struct Paths {
     pub home: PathBuf,
     pub data_dir: PathBuf,
     pub models_dir: PathBuf,
+    /// The app's old models folder, moved into `models_dir` at every start.
+    pub moved_from: Option<PathBuf>,
+}
+
+impl Paths {
+    /// `models_dir` when one is set; else the models folder the Cortex apps share
+    /// (`~/.cortex-models`, `docs/SHARED-MODELS.md`), into which this app's old one
+    /// (`<home>/models`) is moved first, before any model is looked up.
+    pub fn new(home: PathBuf, data_dir: PathBuf, models_dir: Option<PathBuf>) -> Self {
+        match models_dir {
+            Some(models_dir) => Self { home, data_dir, models_dir, moved_from: None },
+            None => {
+                let (root, old) = (cc_shared_models::root(), home.join("models"));
+                cc_shared_models::move_in(&old, &root);
+                Self { home, data_dir, models_dir: root, moved_from: Some(old) }
+            }
+        }
+    }
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -263,7 +281,7 @@ pub fn rendered_thinking(thinking: &Thinking) -> Thinking {
 impl Runtime {
     pub fn new(paths: Paths, config: Config, publisher: Publisher) -> Arc<Self> {
         let (phase, _) = watch::channel(Phase::Starting);
-        Arc::new(Self { verify: VerifyCache::new(&paths.models_dir), paths, config, publisher, phase, switch: tokio::sync::Mutex::new(()) })
+        Arc::new(Self { verify: VerifyCache::new(&paths.models_dir, paths.moved_from.as_deref()), paths, config, publisher, phase, switch: tokio::sync::Mutex::new(()) })
     }
 
     fn publish(&self, topic: &str, data: Value) {

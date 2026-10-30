@@ -22,7 +22,7 @@
 
 use crate::variants;
 use crate::vision;
-use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryParams, GraphQueryResult, GraphRef, MachineInfo, methods};
+use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryParams, GraphQueryResult, GraphRef, GraphRetireParams, MachineInfo, methods};
 use cc_protocol::{Ctx, RpcError, codes};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -92,6 +92,10 @@ struct Link {
 
 struct Inner {
     models_dir: PathBuf,
+    /// The app's old models folder, whose files are moved into `models_dir` at every start.
+    moved_from: Option<PathBuf>,
+    /// Records of files that were moved, still under their old path: retired once written anew.
+    moved: Mutex<Vec<GraphRef>>,
     digests: Mutex<BTreeMap<String, Verified>>,
     /// Paths whose digest is not written yet.
     pending: Mutex<BTreeSet<String>>,
@@ -132,12 +136,16 @@ fn passing(error: &RpcError) -> bool {
 impl VerifyCache {
     /// Records kept in this process until [`VerifyCache::attach`] links them to the graph (the
     /// command-line installer never does: its digests are computed again by the app).
-    pub fn new(models_dir: &Path) -> Self {
+    /// `moved_from`: the old models folder moved into `models_dir` at every start
+    /// (`docs/SHARED-MODELS.md`); the records of its files follow them, so they are not hashed again.
+    pub fn new(models_dir: &Path, moved_from: Option<&Path>) -> Self {
         let (memory, _) = watch::channel(Memory::Waiting);
         let (waited, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 models_dir: models_dir.to_path_buf(),
+                moved_from: moved_from.map(Path::to_path_buf),
+                moved: Mutex::default(),
                 digests: Mutex::default(),
                 pending: Mutex::default(),
                 vision: Mutex::default(),
@@ -215,6 +223,7 @@ impl VerifyCache {
                 self.inner.memory.send_replace(Memory::Serving);
                 self.migrate().await;
                 self.flush().await;
+                self.retire_moved().await;
             }
             Err(error) => {
                 tracing::warn!(error = %error.message, "the memory plugin refused the model file records: digests are kept in this process only (update the memory plugin, then restart the app)");
@@ -230,7 +239,7 @@ impl VerifyCache {
         let _ = self.inner.machine.set(machine.key.clone());
         let files = self.query(&format!("MATCH (f:{FILE})-[:ON]->(m:Machine) WHERE m.key = $machine AND f.ended_ms IS NULL RETURN f"), &machine.key).await?;
         {
-            let pending = lock(&self.inner.pending);
+            let mut pending = lock(&self.inner.pending);
             let mut digests = lock(&self.inner.digests);
             for props in files {
                 let (Some(key), Some(bytes), Some(modified), Some(digest)) = (
@@ -241,16 +250,63 @@ impl VerifyCache {
                 ) else {
                     continue;
                 };
+                let verified = Verified { bytes, modified_ns: modified, digest: digest.to_owned() };
+                // A file moved from the old models folder keeps its record under its new path.
+                if let Some(moved) = self.moved_path(key)
+                    && std::fs::metadata(&moved).is_ok_and(|meta| meta.len() == bytes)
+                    && modified_ns(&moved) == Some(modified)
+                {
+                    let moved = moved.display().to_string();
+                    if !pending.contains(&moved) && !digests.contains_key(&moved) {
+                        digests.insert(moved.clone(), verified.clone());
+                        pending.insert(moved);
+                    }
+                    lock(&self.inner.moved).push(GraphRef { label: FILE.into(), key: key.to_owned() });
+                    continue;
+                }
                 // A digest computed in this process meanwhile is newer.
                 if !pending.contains(key) {
-                    digests.insert(key.to_owned(), Verified { bytes, modified_ns: modified, digest: digest.to_owned() });
+                    digests.insert(key.to_owned(), verified);
                 }
             }
         }
         let towers = self.query(&format!("MATCH (v:{VISION})-[:ON]->(m:Machine) WHERE m.key = $machine AND v.ended_ms IS NULL RETURN v"), &machine.key).await?;
         let mut vision = lock(&self.inner.vision);
-        vision.extend(towers.iter().filter_map(|props| props.get("key").and_then(Value::as_str)).map(str::to_owned));
+        for props in towers {
+            let Some(key) = props.get("key").and_then(Value::as_str).map(str::to_owned) else { continue };
+            // A tower moved from the old models folder keeps its record under its new folder.
+            if let Some(moved) = self.moved_path(&key)
+                && let Ok(mut record) = serde_json::from_value::<VisionInstall>(Value::Object(props))
+            {
+                record.dir = moved;
+                vision.insert(record.dir.display().to_string());
+                lock(&self.inner.pending_vision).push(record);
+                lock(&self.inner.moved).push(GraphRef { label: VISION.into(), key });
+                continue;
+            }
+            vision.insert(key);
+        }
         Ok(())
+    }
+
+    /// Where a file recorded under the old models folder is now, when this start moved it.
+    fn moved_path(&self, key: &str) -> Option<PathBuf> {
+        let rest = Path::new(key).strip_prefix(self.inner.moved_from.as_ref()?).ok()?;
+        let now = self.inner.models_dir.join(rest);
+        (!Path::new(key).exists() && now.exists()).then_some(now)
+    }
+
+    /// Retire the records left under the old paths of moved files, once their new ones are written.
+    async fn retire_moved(&self) {
+        let refs = std::mem::take(&mut *lock(&self.inner.moved));
+        if refs.is_empty() || !lock(&self.inner.pending).is_empty() || !lock(&self.inner.pending_vision).is_empty() {
+            lock(&self.inner.moved).extend(refs);
+            return;
+        }
+        let params = GraphRetireParams { refs, reason: Some("moved".into()), at_ms: None };
+        if let Err(error) = self.call(methods::GRAPH_RETIRE, serde_json::to_value(&params).unwrap_or(Value::Null)).await {
+            tracing::warn!(error = %error.message, "the records of moved model files keep their old paths too; retired at the next start");
+        }
     }
 
     /// The properties of the nodes a one-column query returns.

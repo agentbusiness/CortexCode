@@ -5,7 +5,6 @@ use std::path::Path;
 
 /// Plain names for the home's folders, in display order.
 const ITEMS: &[(&str, &str)] = &[
-    ("Models", "models"),
     ("Installed plugins", "plugins"),
     ("Plugin data (caches, saved model states)", "plugins-data"),
     ("Store (projects, conversations, settings, code graph)", "irongraph"),
@@ -26,6 +25,8 @@ fn size(path: &Path) -> u64 {
 pub fn measure(home: &Path, live: &Path) -> Storage {
     let item = |name: &str, path: &Path| StorageItem { name: name.into(), bytes: size(path), path: path.display().to_string() };
     let mut items: Vec<StorageItem> = ITEMS.iter().map(|(name, folder)| item(name, &home.join(folder))).collect();
+    // The models live outside the home, in the folder every Cortex app shares.
+    items.insert(0, item("Models (shared with the other Cortex apps)", &cc_shared_models::root()));
     items.insert(1, item("Live data (skills, prompts, texts)", live));
     Storage { home: home.display().to_string(), items }
 }

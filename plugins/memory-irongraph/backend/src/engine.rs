@@ -1,6 +1,7 @@
-//! IronGraph's embedding engine files, kept under `CORTEX_HOME` (never `~/.irongraph`):
-//! `<CORTEX_HOME>/irongraph-models` holds the embedding model, `<CORTEX_HOME>/irongraph-cache` the
-//! SDK's rebuildable passage-vector cache.
+//! IronGraph's embedding engine files (never `~/.irongraph`): the embedding model lives in the
+//! models folder the Cortex apps share (`~/.cortex-models`, `docs/SHARED-MODELS.md`),
+//! `<CORTEX_HOME>/irongraph-cache` holds the SDK's rebuildable passage-vector cache. The app's old
+//! model folder, `<CORTEX_HOME>/irongraph-models`, is moved into the shared one at every start.
 //!
 //! irongraph-sdk 0.1.8 downloads its default model (Bekko a8m) on first open when the model
 //! directory lacks it, but no longer verifies the files and reports no progress to embedders. The
@@ -8,7 +9,9 @@
 //! the size and digest Hugging Face publishes for the pinned revision (SHA-256 of the LFS object;
 //! git blob SHA-1 for the small non-LFS `config.json`), downloads resume from a `.part` file with an
 //! HTTP range request, progress is published as `memory.engine` events, and a file that fails
-//! verification is never handed to the SDK. Installed files are re-verified on every start.
+//! verification is never handed to the SDK. Installed files are re-verified on every start. All of
+//! it happens with the revision folder's download lock held, so another Cortex app wanting the
+//! same model waits and finds it there.
 
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::EngineStatus;
@@ -52,24 +55,28 @@ pub const ARTIFACTS: [Artifact; 3] = [
     Artifact { name: "tokenizer.json", size: 34_363_442, pin: Pin::Sha256("8bd47075711f75a143d1b78e01a41cc65c1c591b00d3cfeffc23db07adce1392") },
 ];
 
-/// Environment variable naming other model directories (colon-separated) whose verified files may
-/// be copied instead of downloaded.
-pub const MODEL_SOURCE_ENV: &str = "CORTEX_IRONGRAPH_MODEL_SOURCE";
-
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Engine directories under `CORTEX_HOME`.
+/// Engine directories: the database and vector cache under `CORTEX_HOME`, the model in the shared
+/// models folder.
 #[derive(Debug, Clone)]
 pub struct EnginePaths {
     pub data_dir: PathBuf,
     pub model_dir: PathBuf,
     pub cache_dir: PathBuf,
+    /// The app's old model folder, moved into `model_dir` before the model is looked up.
+    pub old_model_dir: PathBuf,
 }
 
 impl EnginePaths {
     pub fn under(home: &Path) -> Self {
-        Self { data_dir: home.join("irongraph"), model_dir: home.join("irongraph-models"), cache_dir: home.join("irongraph-cache") }
+        Self {
+            data_dir: home.join("irongraph"),
+            model_dir: cc_shared_models::root(),
+            cache_dir: home.join("irongraph-cache"),
+            old_model_dir: home.join("irongraph-models"),
+        }
     }
 
     /// The directory holding the pinned revision's files.
@@ -147,9 +154,9 @@ impl Engine {
         self.publish(&snapshot);
     }
 
-    /// Make the pinned model available in `model_dir`: re-verify installed files, else copy verified
-    /// files from another installation, else download (resuming a partial download). Returns only
-    /// when every file is present and matches its pin.
+    /// Make the pinned model available in `model_dir`: move the old model folder in, re-verify
+    /// installed files, else download (resuming a partial download). Returns only when every file
+    /// is present and matches its pin.
     pub async fn install(self: &Arc<Self>) -> Result<(), RpcError> {
         let started = Instant::now();
         self.update(true, |s| {
@@ -183,18 +190,23 @@ impl Engine {
     }
 
     async fn install_files(self: &Arc<Self>) -> Result<String, RpcError> {
-        let dir = EnginePaths::revision_dir(&self.paths.model_dir);
-        std::fs::create_dir_all(&dir).map_err(|e| io_error("cannot create", &dir, e))?;
-        std::fs::create_dir_all(&self.paths.cache_dir).map_err(|e| io_error("cannot create", &self.paths.cache_dir, e))?;
-        // One installer per model directory at a time (the SDK's own installer locks the same file).
-        let lock_path = dir.join(".install.lock");
-        let lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File, RpcError> {
-            let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).map_err(|e| io_error("cannot open", &lock_path, e))?;
-            file.lock().map_err(|e| io_error("cannot lock", &lock_path, e))?;
-            Ok(file)
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || {
+            cc_shared_models::move_in(&paths.old_model_dir, &paths.model_dir);
+            cc_shared_models::ensure_root(&paths.model_dir)
         })
         .await
-        .map_err(|e| RpcError::internal(format!("install lock task: {e}")))??;
+        .map_err(|e| RpcError::internal(format!("model folder task: {e}")))?
+        .map_err(|e| io_error("cannot create", &self.paths.model_dir, e))?;
+        let dir = EnginePaths::revision_dir(&self.paths.model_dir);
+        std::fs::create_dir_all(&self.paths.cache_dir).map_err(|e| io_error("cannot create", &self.paths.cache_dir, e))?;
+        // One installer per revision folder at a time, across the Cortex apps: what is there is
+        // looked at with the lock held, since another app may have just fetched it.
+        let lock_dir = dir.clone();
+        let lock = tokio::task::spawn_blocking(move || cc_shared_models::lock(&lock_dir))
+            .await
+            .map_err(|e| RpcError::internal(format!("install lock task: {e}")))?
+            .map_err(|e| io_error("cannot lock", &dir.join(cc_shared_models::LOCK), e))?;
 
         let mut origins = Vec::new();
         let mut done = 0u64;
@@ -206,13 +218,7 @@ impl Engine {
         }
         drop(lock);
         sync_directory(&dir);
-        Ok(if origins.iter().any(|o| matches!(o, Origin::Network)) {
-            "network".to_owned()
-        } else if let Some(Origin::Local(from)) = origins.iter().find(|o| matches!(o, Origin::Local(_))) {
-            format!("local:{}", from.display())
-        } else {
-            "installed".to_owned()
-        })
+        Ok(if origins.iter().any(|o| matches!(o, Origin::Network)) { "network" } else { "installed" }.to_owned())
     }
 
     async fn install_one(self: &Arc<Self>, dir: &Path, artifact: Artifact, base: u64) -> Result<Origin, RpcError> {
@@ -224,23 +230,6 @@ impl Engine {
             }
             tracing::warn!(file = %target.display(), "installed model file does not match its pinned digest; reinstalling");
             std::fs::remove_file(&target).map_err(|e| io_error("cannot remove", &target, e))?;
-        }
-        // Another verified installation (e.g. the default CORTEX_HOME): an APFS clone, no download.
-        for source in local_sources(&self.paths.model_dir) {
-            let candidate = EnginePaths::revision_dir(&source).join(artifact.name);
-            let Ok(meta) = std::fs::metadata(&candidate) else { continue };
-            if !meta.is_file() || meta.len() != artifact.size || !verify(&candidate, artifact).await? {
-                continue;
-            }
-            let staging = dir.join(format!("{}.cc-copy", artifact.name));
-            std::fs::copy(&candidate, &staging).map_err(|e| io_error("cannot copy model file to", &staging, e))?;
-            if !verify(&staging, artifact).await? {
-                let _ = std::fs::remove_file(&staging);
-                continue;
-            }
-            std::fs::rename(&staging, &target).map_err(|e| io_error("cannot install", &target, e))?;
-            tracing::info!(file = artifact.name, from = %source.display(), "embedding model file copied from a verified installation");
-            return Ok(Origin::Local(source));
         }
         // Network, resumable: a `.part` file keeps what earlier attempts (or processes) fetched.
         let part = dir.join(format!("{}.part", artifact.name));
@@ -353,21 +342,7 @@ impl Engine {
 
 enum Origin {
     Installed,
-    Local(PathBuf),
     Network,
-}
-
-/// Other model directories whose verified files can be copied: `CORTEX_IRONGRAPH_MODEL_SOURCE`
-/// (colon-separated), then the default CORTEX_HOME's (`~/.cortexcode/irongraph-models`).
-fn local_sources(own: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::env::var_os(MODEL_SOURCE_ENV).map(|v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect()).unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".cortexcode").join("irongraph-models"));
-    }
-    let own = std::fs::canonicalize(own).unwrap_or_else(|_| own.to_path_buf());
-    out.retain(|p| std::fs::canonicalize(p).map(|c| c != own).unwrap_or(false));
-    out.dedup();
-    out
 }
 
 /// Whether `path` has exactly the pinned size and digest (hashing on a blocking thread).
