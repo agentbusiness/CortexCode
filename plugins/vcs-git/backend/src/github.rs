@@ -1,9 +1,21 @@
 //! The GitHub connection, through GitHub's REST API with the user's own sign-in: the device flow
-//! (a code the user approves in the browser) or a personal access token. The token lives only in
-//! the macOS Keychain (on Linux: a file only the user can read, `github-token` in the plugin's data
-//! folder); the app's main store keeps the account and the dev folder (`vcs.github`; the
-//! `settings.json` it was kept in before is read once and removed). Nothing here contacts GitHub
-//! unless a method asks for it.
+//! (a code the user approves in the browser) or a personal access token. Nothing here contacts
+//! GitHub unless a method asks for it.
+//!
+//! The account and the dev folder live in the app's graph, in the `workspace` layer:
+//!
+//! ```text
+//! (:GitHubAccount {key: "github", login, name, avatar_url, method, scopes, dev_folder})-[:ON]->(:Machine)
+//! ```
+//!
+//! Disconnecting clears the account's properties and keeps `dev_folder`. Earlier versions kept the
+//! same record as the setting `vcs.github`, and before that in `settings.json`: either is moved into
+//! the graph once and removed.
+//!
+//! The token is a secret, never in the graph: on macOS a Keychain item (service "CortexCode
+//! GitHub", account "token") made and read through `/usr/bin/security`; on Linux the Secret Service
+//! through `secret-tool`, with the same attributes (the `github-token` file of earlier versions is
+//! moved there once and removed). It is read once per process and kept in memory.
 
 use cc_protocol::contracts::vcs::{Credential, DeviceCode, GithubPr, GithubStatus, Repo, Repos};
 use cc_protocol::{RpcError, codes};
@@ -11,8 +23,10 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use crate::graph::{Graph, Wait, edge, machine_ref, node, workspace_batch};
+use serde_json::Map;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://api.github.com";
@@ -23,7 +37,12 @@ const REPO_PAGES: u32 = 5;
 const FORK_READY_TRIES: u32 = 30;
 const FORK_READY_STEP: Duration = Duration::from_secs(2);
 
-/// What is kept in the store: never the token.
+/// The `GitHubAccount` node's key: one account per machine.
+const ACCOUNT_KEY: &str = "github";
+/// The setting earlier versions kept the account in.
+const OLD_SETTING: &str = "vcs.github";
+
+/// The account and the dev folder, as the `GitHubAccount` node keeps them: never the token.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
@@ -155,7 +174,7 @@ async fn keychain<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     tokio::task::spawn_blocking(work).await.map_err(|error| RpcError::internal(format!("keychain task: {error}")))
 }
 
-/// Where the token is kept: the macOS Keychain.
+/// Where the token is kept: the macOS Keychain, through `/usr/bin/security`.
 #[cfg(target_os = "macos")]
 mod secret {
     use std::path::Path;
@@ -164,69 +183,167 @@ mod secret {
     /// The Keychain item holding the token (a generic password).
     const SERVICE: &str = "CortexCode GitHub";
     const ACCOUNT: &str = "token";
-    /// `errSecItemNotFound`.
-    const NOT_FOUND: i32 = -25300;
 
-    pub fn get(_dir: &Path) -> Result<Option<Vec<u8>>, String> {
-        match security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.code() == NOT_FOUND => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
+    pub fn get(_dir: &Path) -> Result<Option<String>, String> {
+        crate::keychain::get(SERVICE, ACCOUNT)
     }
 
-    pub fn set(_dir: &Path, secret: &[u8]) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, secret).map_err(|error| error.to_string())
+    pub fn set(_dir: &Path, secret: &str) -> Result<(), String> {
+        crate::keychain::set(SERVICE, ACCOUNT, secret)
     }
 
     pub fn delete(_dir: &Path) -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
-            Err(error) if error.code() != NOT_FOUND => Err(error.to_string()),
-            _ => Ok(()),
-        }
+        crate::keychain::delete(SERVICE, ACCOUNT)
     }
 }
 
-/// Where the token is kept: `github-token` in the plugin's data folder, readable by the user only.
+/// Where the token is kept: the Secret Service, through `secret-tool` (libsecret).
 #[cfg(not(target_os = "macos"))]
 mod secret {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
+    use std::process::{Command, Output, Stdio};
 
-    pub const STORE: &str = "the token file";
-    const FILE: &str = "github-token";
+    pub const STORE: &str = "the Secret Service";
+    const TOOL: &str = "secret-tool";
+    const LABEL: &str = "--label=CortexCode GitHub";
+    /// The item's attributes: the same service and account as the macOS Keychain item.
+    const ATTRIBUTES: [&str; 4] = ["service", "CortexCode GitHub", "account", "token"];
+    /// The token file of earlier versions, in the plugin's data folder.
+    const OLD_FILE: &str = "github-token";
 
-    pub fn get(dir: &Path) -> Result<Option<Vec<u8>>, String> {
-        match std::fs::read(dir.join(FILE)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.to_string()),
+    /// `secret-tool <command> <args> <attributes>`, with `input` on stdin.
+    fn run(command: &str, args: &[&str], input: Option<&str>) -> Result<Output, String> {
+        let mut child = Command::new(TOOL)
+            .arg(command)
+            .args(args)
+            .args(ATTRIBUTES)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run {TOOL} ({error}); install libsecret-tools"))?;
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().ok_or("no stdin")?;
+            stdin.write_all(input.as_bytes()).map_err(|error| format!("{TOOL}: {error}"))?;
         }
+        child.wait_with_output().map_err(|error| format!("{TOOL}: {error}"))
     }
 
-    pub fn set(dir: &Path, secret: &[u8]) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-        let path = dir.join(FILE);
-        let _ = std::fs::remove_file(&path);
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(|error| error.to_string())?;
-        file.write_all(secret).map_err(|error| error.to_string())
+    fn failed(output: &Output) -> String {
+        format!("{TOOL}: {}", String::from_utf8_lossy(&output.stderr).trim())
+    }
+
+    /// `None` when there is no such item (`lookup` then exits 1 and says nothing).
+    fn lookup() -> Result<Option<String>, String> {
+        let output = run("lookup", &[], None)?;
+        if output.status.success() {
+            let text = String::from_utf8(output.stdout).map_err(|_| "the Secret Service item is not text".to_owned())?;
+            let text = text.trim_end_matches('\n');
+            return Ok((!text.is_empty()).then(|| text.to_owned()));
+        }
+        if output.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        Err(failed(&output))
+    }
+
+    pub fn get(dir: &Path) -> Result<Option<String>, String> {
+        if let Some(token) = lookup()? {
+            return Ok(Some(token));
+        }
+        // The token file of earlier versions: moved into the Secret Service once, then removed.
+        let path = dir.join(OLD_FILE);
+        let token = match std::fs::read_to_string(&path) {
+            Ok(text) => text.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
+        if token.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+        set(dir, &token)?;
+        if lookup()?.as_deref() != Some(token.as_str()) {
+            return Err(format!("the Secret Service did not keep the token from {}; the file stays", path.display()));
+        }
+        std::fs::remove_file(&path).map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+        Ok(Some(token))
+    }
+
+    pub fn set(_dir: &Path, secret: &str) -> Result<(), String> {
+        let output = run("store", &[LABEL], Some(secret))?;
+        if output.status.success() { Ok(()) } else { Err(failed(&output)) }
     }
 
     pub fn delete(dir: &Path) -> Result<(), String> {
-        match std::fs::remove_file(dir.join(FILE)) {
+        let output = run("clear", &[], None)?;
+        if !output.status.success() && !output.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Err(failed(&output));
+        }
+        match std::fs::remove_file(dir.join(OLD_FILE)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
             _ => Ok(()),
         }
     }
 }
 
+impl Settings {
+    fn from_props(props: &Map<String, Value>) -> Self {
+        let text = |key: &str| props.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_owned);
+        Self {
+            login: text("login"),
+            name: text("name"),
+            avatar_url: text("avatar_url"),
+            method: text("method"),
+            scopes: props
+                .get("scopes")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                .unwrap_or_default(),
+            dev_folder: text("dev_folder"),
+        }
+    }
+
+    /// The node's properties; a field that is not set removes its property.
+    fn props(&self) -> Map<String, Value> {
+        let text = |value: &Option<String>| value.as_ref().map_or(Value::Null, |v| Value::String(v.clone()));
+        let mut props = Map::new();
+        props.insert("login".into(), text(&self.login));
+        props.insert("name".into(), text(&self.name));
+        props.insert("avatar_url".into(), text(&self.avatar_url));
+        props.insert("method".into(), text(&self.method));
+        props.insert("scopes".into(), if self.scopes.is_empty() { Value::Null } else { json!(self.scopes) });
+        props.insert("dev_folder".into(), text(&self.dev_folder));
+        props
+    }
+}
+
+/// The batch that writes the account.
+fn account_batch(machine: &str, settings: &Settings) -> cc_protocol::contracts::memory::GraphPutParams {
+    workspace_batch(
+        vec![node("GitHubAccount", ACCOUNT_KEY, settings.props())],
+        vec![edge(crate::graph::node_ref("GitHubAccount", ACCOUNT_KEY), "ON", machine_ref(machine))],
+    )
+}
+
+/// The account as memory holds it, and whether it was read from the graph yet.
+#[derive(Default)]
+struct Held {
+    settings: Settings,
+    loaded: bool,
+    /// Changed before it was read from the graph: the change wins.
+    changed: bool,
+}
+
 pub struct Github {
     http: reqwest::Client,
+    /// `settings.json` of the earliest versions.
     settings_path: PathBuf,
-    /// The plugin's data folder (the token file on Linux).
+    /// The plugin's data folder (the old token file on Linux).
     data_dir: PathBuf,
-    settings: cc_protocol::stored::Stored<Settings>,
+    graph: Arc<Graph>,
+    held: Mutex<Held>,
     /// The GitHub app's client id for the device flow (`github_client_id`); empty: unavailable.
     client_id: Mutex<String>,
     device: Mutex<Option<Device>>,
@@ -235,7 +352,7 @@ pub struct Github {
 }
 
 impl Github {
-    pub fn new(data_dir: &Path) -> Result<Self, RpcError> {
+    pub fn new(data_dir: &Path, graph: Arc<Graph>) -> Result<Self, RpcError> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
         headers.insert("X-GitHub-Api-Version", HeaderValue::from_static("2022-11-28"));
@@ -250,7 +367,8 @@ impl Github {
             http,
             settings_path: data_dir.join("settings.json"),
             data_dir: data_dir.to_path_buf(),
-            settings: cc_protocol::stored::Stored::new("vcs.github"),
+            graph,
+            held: Mutex::new(Held::default()),
             client_id: Mutex::new(String::new()),
             device: Mutex::new(None),
             token: Mutex::new(None),
@@ -261,8 +379,12 @@ impl Github {
         *lock(&self.client_id) = client_id.unwrap_or("").trim().to_owned();
     }
 
+    fn settings(&self) -> Settings {
+        lock(&self.held).settings.clone()
+    }
+
     pub fn status(&self) -> GithubStatus {
-        let settings = self.settings.get();
+        let settings = self.settings();
         let pending = lock(&self.device).as_ref().is_some_and(|device| Instant::now() < device.expires);
         GithubStatus {
             connected: settings.login.is_some(),
@@ -284,7 +406,7 @@ impl Github {
 
     /// The folder new clones go into: the one chosen, else `~/DEV`; created when missing.
     pub fn dev_folder(&self) -> Option<PathBuf> {
-        let folder = self.settings.get().dev_folder.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("DEV")))?;
+        let folder = self.settings().dev_folder.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("DEV")))?;
         if !folder.is_dir()
             && let Err(error) = std::fs::create_dir_all(&folder)
         {
@@ -293,13 +415,76 @@ impl Github {
         Some(folder)
     }
 
-    /// Read the account and dev folder from the store (or once from the file they were kept in).
-    pub async fn load(&self, ctx: &cc_protocol::Ctx) -> Result<(), RpcError> {
-        self.settings.load(ctx, Some(self.settings_path.clone())).await
+    /// Read the account and dev folder from the graph; the setting or file an earlier version
+    /// kept them in is moved into the graph once and removed. Memory may start after this plugin:
+    /// this waits for it.
+    pub async fn load(&self) -> Result<(), RpcError> {
+        let found = self
+            .graph
+            .nodes("MATCH (a:GitHubAccount {key: $key}) RETURN a", json!({ "key": ACCOUNT_KEY }), Wait::Until)
+            .await?
+            .first()
+            .map(Settings::from_props);
+        let setting = match self.graph.call(cc_protocol::contracts::memory::methods::SETTINGS_GET, json!({ "path": OLD_SETTING }), Wait::Until).await {
+            Ok(answer) => answer.get("value").cloned(),
+            Err(error) if error.code == codes::NOT_FOUND => None,
+            Err(error) => return Err(error),
+        };
+        let file = std::fs::read(&self.settings_path).ok();
+        let settings = match found {
+            Some(settings) => settings,
+            None => {
+                let old = setting
+                    .clone()
+                    .and_then(|value| serde_json::from_value::<Settings>(value).ok())
+                    .or_else(|| file.as_deref().and_then(|bytes| serde_json::from_slice::<Settings>(bytes).ok()));
+                match old {
+                    Some(old) => {
+                        self.graph.put(|machine| account_batch(machine, &old), Wait::Until).await?;
+                        let back = self
+                            .graph
+                            .nodes("MATCH (a:GitHubAccount {key: $key}) RETURN a", json!({ "key": ACCOUNT_KEY }), Wait::Until)
+                            .await?;
+                        if back.first().map(Settings::from_props).is_none_or(|back| back.login != old.login || back.dev_folder != old.dev_folder) {
+                            return Err(RpcError::internal("the GitHub account was not confirmed in the graph; the old record stays"));
+                        }
+                        tracing::info!("the GitHub account moved into the graph");
+                        old
+                    }
+                    None => Settings::default(),
+                }
+            }
+        };
+        if setting.is_some() {
+            let params = json!({ "path": OLD_SETTING, "scope": "" });
+            if let Err(error) = self.graph.call(cc_protocol::contracts::memory::methods::SETTINGS_DELETE, params, Wait::Until).await {
+                tracing::warn!(error = %error.message, "cannot remove the old setting vcs.github");
+            }
+        }
+        if file.is_some()
+            && let Err(error) = std::fs::remove_file(&self.settings_path)
+        {
+            tracing::warn!(file = %self.settings_path.display(), %error, "cannot remove the old settings file");
+        }
+        let mut held = lock(&self.held);
+        if !held.changed {
+            held.settings = settings;
+        }
+        held.loaded = true;
+        Ok(())
     }
 
+    /// Change the account in memory and write it to the graph through the queue.
     fn update(&self, change: impl FnOnce(&mut Settings)) -> Result<(), RpcError> {
-        self.settings.update(change);
+        let settings = {
+            let mut held = lock(&self.held);
+            change(&mut held.settings);
+            if !held.loaded {
+                held.changed = true;
+            }
+            held.settings.clone()
+        };
+        self.graph.put_later(move |machine| account_batch(machine, &settings));
         Ok(())
     }
 
@@ -318,7 +503,7 @@ impl Github {
     /// The saved token: from memory, else from the secret store. A connection whose stored token is
     /// gone is forgotten.
     async fn token(&self) -> Result<String, RpcError> {
-        if self.settings.get().login.is_none() {
+        if self.settings().login.is_none() {
             return Err(not_connected());
         }
         if let Some(token) = lock(&self.token).clone() {
@@ -327,8 +512,7 @@ impl Github {
         let dir = self.data_dir.clone();
         let stored = keychain(move || secret::get(&dir)).await?;
         match stored {
-            Ok(Some(bytes)) => {
-                let token = String::from_utf8(bytes).map_err(|_| not_connected())?;
+            Ok(Some(token)) => {
                 *lock(&self.token) = Some(token.clone());
                 Ok(token)
             }
@@ -353,7 +537,7 @@ impl Github {
 
     pub async fn credential(&self) -> Result<Credential, RpcError> {
         let token = self.token().await?;
-        let login = self.settings.get().login.clone().ok_or_else(not_connected)?;
+        let login = self.settings().login.ok_or_else(not_connected)?;
         Ok(Credential { login, token })
     }
 
@@ -387,7 +571,7 @@ impl Github {
     async fn connect(&self, token: String, method: &str, granted: Vec<String>) -> Result<GithubStatus, RpcError> {
         let account = self.account(&token).await?;
         let (dir, value) = (self.data_dir.clone(), token.clone());
-        keychain(move || secret::set(&dir, value.as_bytes()))
+        keychain(move || secret::set(&dir, &value))
             .await?
             .map_err(|error| RpcError::internal(format!("{} did not keep the GitHub sign-in: {error}", secret::STORE)))?;
         *lock(&self.token) = Some(token);

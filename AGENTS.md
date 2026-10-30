@@ -60,13 +60,46 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   `plugins/lang-*/data/skills/`, general skills `plugins/skills-*/data/skills/`, the memory
   plugin's own skills `plugins/memory-irongraph/data/skills/`.
 
+## Where data lives
+
+**The graph is the only record.** Breaking this is a serious defect, not a style choice.
+
+- Everything the app keeps (projects, sessions, settings, tasks, runs, jobs, steps, checkpoints,
+  installs, updates, notifications, mesh members, research, reports) lives in IronGraph, owned by
+  the memory plugin and reached only through its contract methods (`memory.*`).
+- It is a planned graph: each thing is a node with its properties, linked to what it belongs to
+  and what it touches by named edges; nothing is stored unconnected (`Machine` is the root).
+  Every node and edge keeps `first_ms` and `last_ms`; a thing that is gone is retired
+  (`ended_ms`), not deleted; a value whose history matters is a temporal property. The model is
+  `docs/GRAPH-MODEL.md`: a new kind of record is added there first.
+- Plugins write with `memory.graph.put` (nodes and edges in one batch) and `memory.graph.retire`;
+  history and anything time-ordered (changes, events, served calls, update rounds) goes to a stream
+  (`memory.stream.*`), and work handed between plugins to a queue (`memory.queue.*`).
+- A property is a scalar or a list of scalars. No property holds JSON text or a map standing in
+  for nodes and edges.
+- No JSON, JSONL, TOML, SQLite or other data files and no marker files hold records, not even as a
+  copy or a cache.
+- The one exception is the chat flow history: session journals (`<home>/journal/<id>.jsonl`).
+- Bytes are not records and never go into the graph: model weights, packages and their install
+  folders, content blobs, artifacts, attachments, git objects, workspace clones, logs. They stay
+  files; the graph holds their metadata and links (an `Artifact` node names its file).
+- Runtime files are not records either: the home lock, `run/` (pid, socket, children of a dead
+  frame), OS file locks, and the frame's boot pointers (which installed version of each plugin and
+  of the frame runs, `<home>/plugins/<id>/.current` and its siblings, `frame/handover.json`): the
+  frame reads them before it can start the memory plugin, so they are part of the installation.
+- Secrets live in the macOS Keychain (on Linux, the Secret Service), never in a file or the graph.
+- Shipped data (prompts, texts, stages, schemas, skills in the live folder) is the app's source,
+  not records.
+
 ## Plugin boundaries
 
 - Plugins talk only through the contract methods in `protocol/src/contracts/`: a named question with
   typed parameters and a typed answer (`memory.callers {sid}`, `memory.files`). The frame routes a
   call by its method's prefix to the active plugin of that category.
-- No direct queries across plugins: no Cypher, SQL or other query text in a call. The store, its
-  query language and its schema belong to the plugin that owns them (IronGraph stays inside
+- No direct queries across plugins: no Cypher, SQL or other query text in a call, with one
+  exception: `memory.graph.query`, one read-only statement over the app's graph, refused by the
+  memory plugin when it could write. The store, its query language and its schema belong to the
+  plugin that owns them (IronGraph stays inside
   `plugins/memory-irongraph`), so a plugin can be replaced by another that implements the same
   contract.
 - A caller that needs something the contract lacks gets a new named method in the contract and in
@@ -96,6 +129,9 @@ built to the same standard as CortexCode. The standard is:
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
   `<category>.shares` declaration, where a call may come from, the caller, run options, jobs and
   read sizes, and the one-tool-per-service builder;
+- where data lives (the rule above) and the graph's contract: `memory.graph.*`, `memory.stream.*`,
+  `memory.queue.*`, settings and the app's records, with the memory plugin's `graphapi.rs`,
+  `streams.rs`, `settings.rs` and `app.rs` the same in both repositories, byte for byte;
 - the write sandbox, `sandbox-kit/`: the same code in both repositories, byte for byte.
 
 **Any change to the plugin architecture, the mesh, or model and resource sharing is made in both

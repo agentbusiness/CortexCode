@@ -22,8 +22,6 @@ pub mod hashline;
 pub mod host;
 #[cfg(feature = "release")]
 pub mod release;
-#[cfg(feature = "stored")]
-pub mod stored;
 
 pub use conn::{BoxFuture, CallStream, Connection, Handler, IncomingRequest, ItemSink, NoHandler, Responder};
 pub use envelope::{Message, RpcError, codes, parse_params, to_value};

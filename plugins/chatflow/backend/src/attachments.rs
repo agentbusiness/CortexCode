@@ -5,6 +5,12 @@
 //!   the project (its root or the session's workspace) is referenced as it is, never copied; a file
 //!   outside the project is copied into the attachment area (the model then reads a stable copy);
 //!   a folder is always referenced by its path. Nothing is ever written into the repository.
+//!   The bytes stay files; each stored attachment's metadata is a node ([`record`]):
+//!
+//!   ```text
+//!   (:Attachment {key: sha256, name, mime, bytes, ext, path, kind, width?, height?})-[:IN]->(:Session)
+//!   (:Attachment …)-[:ON]->(:Machine)        when no session is known
+//!   ```
 //! - When a message is journaled, [`prepare`] checks every attachment still exists, records a
 //!   folder's top-level listing (within a small budget) and an image's dimensions, and asks the
 //!   vision hook ([`vision_hook`]) for a description.
@@ -14,6 +20,7 @@
 //!   text says so.
 
 use crate::data::Dataset;
+use crate::graph;
 use crate::host::Host;
 use base64::Engine;
 use cc_protocol::contracts::chatflow::{Attachment, AttachmentPutParams, AttachmentPutResult, attachment_kinds, limits};
@@ -312,6 +319,16 @@ pub fn put(home: &Path, roots: &[PathBuf], params: AttachmentPutParams) -> Resul
             stored_result(home, &bytes, name, mime, thumb)
         }
     }
+}
+
+/// A stored attachment's metadata in the graph: in its session when one is known, else on the
+/// machine. An attachment referenced where it is (a project file, a folder) is not recorded.
+pub async fn record(host: &Host, session_id: Option<&str>, put: &AttachmentPutResult) -> Result<(), RpcError> {
+    let Some(sha) = put.sha256.as_deref().filter(|_| put.stored) else { return Ok(()) };
+    let ext = Path::new(&put.path).extension().map(|ext| ext.to_string_lossy().into_owned()).unwrap_or_default();
+    let props = json!({"name": put.name, "mime": put.mime, "bytes": put.size, "ext": ext, "path": put.path, "kind": put.kind, "width": put.width, "height": put.height});
+    let rel = if session_id.is_some_and(|id| !id.is_empty()) { "IN" } else { "ON" };
+    graph::put_in_session(host, graph::node("Attachment", sha, graph::props(props)), rel, session_id, None).await
 }
 
 /// Pasted text's line count and its preview: the first and last [`PREVIEW_LINES`] lines (all of it

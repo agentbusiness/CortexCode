@@ -10,6 +10,7 @@ pub mod codeskills;
 pub mod core;
 pub mod doc;
 pub mod exec;
+pub mod graph;
 pub mod guard;
 pub mod hashedit;
 pub mod host;

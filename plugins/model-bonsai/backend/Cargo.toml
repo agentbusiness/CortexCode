@@ -21,7 +21,7 @@ name = "cc_model_bonsai"
 path = "src/lib.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["model"] }
+cc-protocol = { path = "../../../protocol", features = ["model", "memory"] }
 cc-model-kit = { path = "../../../model-kit" }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 serde = { version = "1.0.228", features = ["derive"] }

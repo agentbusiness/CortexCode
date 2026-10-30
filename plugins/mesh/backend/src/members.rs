@@ -1,4 +1,5 @@
-//! The cortex: a signed, append-only membership log every member holds (`<home>/mesh/members.jsonl`).
+//! The cortex: a signed, append-only membership log every member holds (kept in the app's store as
+//! stream `mesh.members`, `crate::store`).
 //! Each entry names what changed (a member added or renamed, its addresses, a member revoked), who signed
 //! it and the hash of the entry before it. A node is a member when a valid chain says so; a
 //! connection from a key the chain does not hold is refused. No server can add a node: only a
@@ -50,6 +51,8 @@ pub struct Log {
 }
 
 impl Log {
+    /// A log an earlier version kept as a file (one entry per line), read once to move it into the
+    /// store.
     pub fn load(path: &Path) -> Log {
         let mut log = Log::default();
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -63,23 +66,6 @@ impl Log {
             tracing::warn!(%error, "the membership log is not valid; starting from the valid prefix");
         }
         log
-    }
-
-    pub fn save(&self, path: &Path) {
-        let mut text = String::new();
-        for entry in &self.entries {
-            if let Ok(line) = serde_json::to_string(entry) {
-                text.push_str(&line);
-                text.push('\n');
-            }
-        }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = path.with_extension("jsonl.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
     }
 
     /// The members as the chain stands: a map from node id to the member.
@@ -203,6 +189,7 @@ impl Log {
     }
 }
 
+/// Where an earlier version kept the log.
 pub fn log_path(home: &Path) -> PathBuf {
     home.join("mesh").join("members.jsonl")
 }

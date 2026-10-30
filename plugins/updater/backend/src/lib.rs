@@ -5,6 +5,7 @@
 //! bottom right), and stages a newer frame for the next start ("Restart to update").
 
 pub mod fetch;
+pub mod graph;
 pub mod service;
 
 use cc_protocol::contracts::update::methods;

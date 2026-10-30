@@ -10,6 +10,7 @@
 
 import { app, BrowserWindow, dialog, ipcMain, shell as electronShell } from 'electron';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +37,21 @@ function log(line) {
   process.stdout.write(`[cortex-ui] ${line}\n`);
 }
 
+/**
+ * The frame's API token from the macOS Keychain (the frame writes it there at every start; on
+ * other systems frame.json carries it). `/usr/bin/security` made the item, so nothing asks.
+ * @param {string} home
+ * @returns {string | null}
+ */
+function keychainToken(home) {
+  try {
+    const out = execFileSync('/usr/bin/security', ['find-generic-password', '-s', 'CortexCode frame token', '-a', home, '-w'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.replace(/\n$/, '') || null;
+  } catch {
+    return null;
+  }
+}
+
 /** @returns {{ url: string, token: string } | null} */
 function frameAddress() {
   if (process.env.CORTEX_FRAME_URL && process.env.CORTEX_FRAME_TOKEN) {
@@ -43,7 +59,8 @@ function frameAddress() {
   }
   try {
     const info = JSON.parse(fs.readFileSync(path.join(home, 'run', 'frame.json'), 'utf8'));
-    if (info && info.port && info.token) return { url: `http://127.0.0.1:${info.port}`, token: String(info.token) };
+    const token = info && (info.token || keychainToken(home));
+    if (info && info.port && token) return { url: `http://127.0.0.1:${info.port}`, token: String(token) };
   } catch {
     // Not running yet.
   }

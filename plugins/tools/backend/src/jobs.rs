@@ -1,7 +1,24 @@
 //! Background jobs: commands that run detached (own session and process group, output written
 //! straight to an artifact file), so they survive a hot-swap of this plugin. A monitor publishes a
 //! `tools.job` event when the job exits and, optionally, when its output matches a regex or has been
-//! silent for N seconds (wake rules). A successor instance adopts running jobs from disk.
+//! silent for N seconds (wake rules). A successor instance adopts running jobs from the graph.
+//!
+//! ```text
+//! (:Job {key: job id, command, cwd, pid, state*, exit_code, started_ms, finished_ms, wake_pattern,
+//!     wake_silence_s, note, wake_published, exit_published, session_id, project_id, artifact})
+//!     -[:FOR]->(:Session)   -[:IN]->(:Project)   -[:ON]->(:Machine)   -[:OUTPUT]->(:Artifact)
+//! stream `jobs`       start, match, silence, exit and kill of every job
+//! ```
+//!
+//! The jobs are held in memory while the plugin runs and every change is written through. `note`
+//! is why the job was stopped (set before it ends) and, once it ended, what its output ends with.
+//! `wake_published` and `exit_published` say a wake or the exit was published: the node is read
+//! before publishing, so a successor does not publish it again. Two instances that read the node
+//! in the same moment of a hot-swap can both publish; that rare double event is accepted.
+//!
+//! Files that remain, under `<home>/jobs/<id>/`: `cmd.sh` and `runner.sh` (what the detached
+//! process runs) and `status/exit` (the exit code the runner writes when the command ends: the
+//! hand-over from a process the plugin no longer owns). The output is the artifact file.
 
 use crate::util;
 use regex::bytes::Regex;
@@ -28,7 +45,7 @@ pub struct Wake {
     pub silence_s: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JobMeta {
     pub job_id: String,
     pub session_id: String,
@@ -50,6 +67,101 @@ pub struct JobMeta {
     /// Why the job was stopped, or what it left running (the host's note at the end of its output).
     #[serde(default)]
     pub note: Option<String>,
+    /// The wake match was published (by this instance or another).
+    #[serde(default)]
+    pub wake_published: bool,
+    /// The exit was published.
+    #[serde(default)]
+    pub exit_published: bool,
+}
+
+impl JobMeta {
+    /// The job's node with its edges, and its output's `Artifact`.
+    fn batch(&self, artifacts: &crate::artifacts::Artifacts, output_bytes: u64) -> crate::graph::Batch {
+        use crate::graph;
+        let me = graph::gref("Job", &self.job_id);
+        let mut node = graph::node(
+            "Job",
+            &self.job_id,
+            graph::props(json!({
+                "command": self.command,
+                "cwd": self.cwd,
+                "pid": self.pid,
+                "exit_code": self.exit_code,
+                "started_ms": self.started_ms,
+                "finished_ms": self.ended_ms,
+                "wake_pattern": self.wake.pattern,
+                "wake_silence_s": self.wake.silence_s,
+                "note": self.note,
+                "wake_published": self.wake_published,
+                "exit_published": self.exit_published,
+                "session_id": self.session_id,
+                "project_id": self.project_id,
+                "artifact": self.artifact,
+            })),
+        );
+        node.temporal.insert("state".to_owned(), json!(self.state));
+        let session = (!self.session_id.is_empty()).then_some(self.session_id.as_str());
+        let mut output = artifacts.batch(&self.artifact, "job", output_bytes, self.started_ms, session);
+        output.nodes.insert(0, node);
+        output.edges.push(graph::edge(&me, "ON", &graph::machine()));
+        output.edges.push(graph::edge(&me, "OUTPUT", &graph::gref("Artifact", &self.artifact)));
+        if let Some(session) = session {
+            output.soft.push(graph::edge(&me, "FOR", &graph::gref("Session", session)));
+        }
+        if !self.project_id.is_empty() {
+            output.soft.push(graph::edge(&me, "IN", &graph::gref("Project", &self.project_id)));
+        }
+        output
+    }
+
+    /// A job read back from its node.
+    fn from_node(props: &serde_json::Map<String, Value>) -> Option<JobMeta> {
+        use crate::graph::{number, text};
+        let job_id = text(props, "key");
+        if job_id.is_empty() {
+            return None;
+        }
+        let optional = |name: &str| props.get(name).and_then(Value::as_str).map(str::to_owned);
+        Some(JobMeta {
+            artifact: optional("artifact").unwrap_or_else(|| job_id.clone()),
+            job_id,
+            session_id: text(props, "session_id"),
+            project_id: text(props, "project_id"),
+            command: text(props, "command"),
+            cwd: text(props, "cwd"),
+            pid: props.get("pid").and_then(Value::as_i64).unwrap_or(0) as i32,
+            started_ms: number(props, "started_ms"),
+            ended_ms: props.get("finished_ms").and_then(Value::as_u64),
+            state: optional("state").unwrap_or_else(|| "lost".to_owned()),
+            exit_code: props.get("exit_code").and_then(Value::as_i64).map(|code| code as i32),
+            wake: Wake { pattern: optional("wake_pattern"), silence_s: props.get("wake_silence_s").and_then(Value::as_f64) },
+            note: optional("note"),
+            wake_published: props.get("wake_published").and_then(Value::as_bool).unwrap_or(false),
+            exit_published: props.get("exit_published").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// Fold in what another instance wrote: a job that ended stays ended, and what was published stays published.
+    fn merge(&mut self, other: JobMeta) {
+        if self.state == "running" && other.state != "running" {
+            self.state = other.state;
+            self.exit_code = other.exit_code;
+            self.ended_ms = other.ended_ms;
+        }
+        if self.note.is_none() {
+            self.note = other.note;
+        }
+        self.wake_published |= other.wake_published;
+        self.exit_published |= other.exit_published;
+    }
+}
+
+/// Which publication a job may make once.
+#[derive(Debug, Clone, Copy)]
+enum Once {
+    Wake,
+    Exit,
 }
 
 /// How a job is stopped.
@@ -121,6 +233,11 @@ pub trait Publisher: Send + Sync {
 
 pub struct Jobs {
     jobs_dir: PathBuf,
+    graph: Arc<crate::graph::Graph>,
+    /// Every job this instance knows (started here, or read from the graph).
+    metas: Mutex<HashMap<String, JobMeta>>,
+    /// Jobs of deleted sessions: retired, and not written again.
+    forgotten: Mutex<std::collections::HashSet<String>>,
     artifacts_dir: PathBuf,
     artifacts: crate::artifacts::Artifacts,
     /// Holds the `cx` link; kept on every job's PATH.
@@ -177,11 +294,14 @@ fn tail_of(artifacts: &crate::artifacts::Artifacts, id: &str, bytes: u64) -> Str
 }
 
 impl Jobs {
-    pub fn new(home: &Path, bash: PathBuf) -> Arc<Self> {
+    pub fn new(home: &Path, bash: PathBuf, graph: Arc<crate::graph::Graph>) -> Arc<Self> {
         Arc::new(Self {
             jobs_dir: home.join("jobs"),
             artifacts_dir: home.join("artifacts"),
-            artifacts: crate::artifacts::Artifacts::new(home),
+            artifacts: crate::artifacts::Artifacts::new(home, graph.clone()),
+            graph,
+            metas: Mutex::new(HashMap::new()),
+            forgotten: Mutex::new(Default::default()),
             bin_dir: home.join("bin"),
             bash,
             publisher: Mutex::new(None),
@@ -207,19 +327,82 @@ impl Jobs {
         self.jobs_dir.join(job_id)
     }
 
+    /// Keep `meta` and write it through.
     fn write_meta(&self, meta: &JobMeta) {
-        let dir = self.dir(&meta.job_id);
-        if let Ok(text) = serde_json::to_vec_pretty(meta) {
-            let _ = util::atomic_write(&dir.join("meta.json"), &text);
+        if self.forgotten.lock().is_ok_and(|forgotten| forgotten.contains(&meta.job_id)) {
+            return;
         }
+        if let Ok(mut metas) = self.metas.lock() {
+            metas.insert(meta.job_id.clone(), meta.clone());
+        }
+        self.graph.put(meta.batch(&self.artifacts, self.output_len(meta)));
+    }
+
+    /// A job event on the `jobs` stream.
+    fn event(&self, meta: &JobMeta, event: &str) {
+        self.graph.append(
+            "jobs",
+            vec![json!({
+                "job_id": meta.job_id,
+                "event": event,
+                "state": meta.state,
+                "exit_code": meta.exit_code,
+                "session_id": meta.session_id,
+                "project_id": meta.project_id,
+                "command": meta.command,
+            })],
+        );
     }
 
     pub fn meta(&self, job_id: &str) -> Option<JobMeta> {
-        if !crate::artifacts::valid_id(job_id) {
-            return None;
+        self.metas.lock().ok()?.get(job_id).cloned()
+    }
+
+    /// Claim a publication that is made once per job: false when this instance or another made it.
+    async fn claim(&self, job_id: &str, once: Once) -> bool {
+        let name = match once {
+            Once::Wake => "wake_published",
+            Once::Exit => "exit_published",
+        };
+        let Some(mut meta) = self.meta(job_id) else { return false };
+        let mine = match once {
+            Once::Wake => meta.wake_published,
+            Once::Exit => meta.exit_published,
+        };
+        if mine {
+            return false;
         }
-        let text = std::fs::read(self.dir(job_id).join("meta.json")).ok()?;
-        serde_json::from_slice(&text).ok()
+        let cypher = format!("MATCH (j:Job) WHERE j.key = $job RETURN j.{name} LIMIT 1");
+        if let Ok(found) = self.graph.query(&cypher, json!({ "job": job_id }), 1, 1).await
+            && found.rows.first().and_then(|row| row.first()).and_then(Value::as_bool) == Some(true)
+        {
+            return false;
+        }
+        match once {
+            Once::Wake => meta.wake_published = true,
+            Once::Exit => meta.exit_published = true,
+        }
+        self.write_meta(&meta);
+        true
+    }
+
+    /// A deleted session's jobs: retired, and not written again.
+    pub fn forget_session(&self, session: &str) {
+        let ids: Vec<String> = self.list(Some(session)).into_iter().map(|meta| meta.job_id).collect();
+        if let Ok(mut forgotten) = self.forgotten.lock() {
+            forgotten.extend(ids.iter().cloned());
+        }
+        if let Ok(mut metas) = self.metas.lock() {
+            for id in &ids {
+                metas.remove(id);
+            }
+        }
+        self.graph.retire_matching(
+            "Job",
+            "MATCH (j:Job) WHERE j.session_id = $session AND j.ended_ms IS NULL RETURN j.key LIMIT 5000",
+            json!({ "session": session }),
+            "session deleted",
+        );
     }
 
     pub fn output_path(&self, meta: &JobMeta) -> PathBuf {
@@ -306,8 +489,11 @@ impl Jobs {
             wake: request.wake,
             artifact,
             note: None,
+            wake_published: false,
+            exit_published: false,
         };
         self.write_meta(&meta);
+        self.event(&meta, "start");
         if let Ok(mut running) = self.running.lock() {
             running.insert(job_id.clone(), child);
         }
@@ -315,16 +501,99 @@ impl Jobs {
         Ok(meta)
     }
 
-    /// Adopt jobs left running by a previous instance (and finalize ones that ended meanwhile).
+    /// Adopt jobs left running by a previous instance (and finalize ones that ended meanwhile):
+    /// the jobs are read from the graph (once from the `meta.json` files earlier versions kept)
+    /// and the running ones watched. Runs in the background: the memory plugin may serve later.
     pub fn adopt(self: &Arc<Self>) {
+        let jobs = self.clone();
+        tokio::spawn(async move {
+            jobs.import_files().await;
+            match jobs
+                .graph
+                // `state` is temporal: a whole node leaves it out, so it is its own column.
+                .query_all("MATCH (j:Job) WHERE j.ended_ms IS NULL AND j.key > $after RETURN j, j.state AS state, j.key AS k ORDER BY k LIMIT 5000", json!({}), 60)
+                .await
+            {
+                Ok(rows) => {
+                    let found: Vec<JobMeta> = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let mut props = row.first().and_then(crate::graph::properties)?.clone();
+                            if let Some(state) = row.get(1).filter(|state| !state.is_null()) {
+                                props.insert("state".to_owned(), state.clone());
+                            }
+                            Some(props)
+                        })
+                        .filter_map(|props| JobMeta::from_node(&props))
+                        .collect();
+                    jobs.take_in(found);
+                }
+                Err(error) => tracing::error!(error = %error.message, "the background jobs could not be read from the graph"),
+            }
+        });
+    }
+
+    /// Hold `found` (merged with what this instance knows) and watch the running ones.
+    fn take_in(self: &Arc<Self>, found: Vec<JobMeta>) {
+        let mut running = Vec::new();
+        if let Ok(mut metas) = self.metas.lock() {
+            for meta in found {
+                let held = match metas.get_mut(&meta.job_id) {
+                    Some(held) => {
+                        held.merge(meta);
+                        held.clone()
+                    }
+                    None => {
+                        metas.insert(meta.job_id.clone(), meta.clone());
+                        meta
+                    }
+                };
+                if held.state == "running" {
+                    running.push(held);
+                }
+            }
+        }
+        for meta in running {
+            self.monitor(meta);
+        }
+    }
+
+    /// Jobs earlier versions kept as `<home>/jobs/<id>/meta.json` (with the `stop-note`,
+    /// `wake-match` and `published-exit` files beside it): written to the graph, then removed.
+    async fn import_files(self: &Arc<Self>) {
         let Ok(entries) = std::fs::read_dir(&self.jobs_dir) else { return };
+        let mut found = Vec::new();
         for entry in entries.flatten() {
             let id = entry.file_name().to_string_lossy().into_owned();
-            if let Some(meta) = self.meta(&id)
-                && meta.state == "running"
-            {
-                self.monitor(meta);
+            if id.starts_with('.') || !crate::artifacts::valid_id(&id) {
+                continue;
             }
+            let dir = entry.path();
+            let Some(mut meta) = std::fs::read(dir.join("meta.json")).ok().and_then(|bytes| serde_json::from_slice::<JobMeta>(&bytes).ok()) else { continue };
+            meta.wake_published |= dir.join("wake-match").exists();
+            meta.exit_published |= dir.join("published-exit").exists();
+            if meta.note.is_none() {
+                meta.note = std::fs::read_to_string(dir.join("stop-note")).ok().filter(|note| !note.trim().is_empty());
+            }
+            found.push(meta);
+        }
+        if found.is_empty() {
+            return;
+        }
+        let batches = found.iter().map(|meta| meta.batch(&self.artifacts, self.output_len(meta))).collect();
+        let written = self.graph.put_wait(batches).await;
+        let ids: Vec<String> = found.iter().map(|meta| meta.job_id.clone()).collect();
+        self.take_in(found);
+        match written {
+            Ok(()) => {
+                for id in ids {
+                    let dir = self.dir(&id);
+                    for name in ["meta.json", "wake-match", "published-exit", "stop-note"] {
+                        let _ = std::fs::remove_file(dir.join(name));
+                    }
+                }
+            }
+            Err(error) => tracing::error!(error = %error.message, "the old job records were not written to the graph; their files are kept"),
         }
     }
 
@@ -344,7 +613,7 @@ impl Jobs {
         let output_path = self.output_path(&meta);
         let pattern = meta.wake.pattern.as_deref().and_then(|pattern| Regex::new(pattern).ok());
         let silence = meta.wake.silence_s.filter(|seconds| *seconds > 0.0).map(Duration::from_secs_f64);
-        let mut matched = dir.join("wake-match").exists();
+        let mut matched = self.meta(&meta.job_id).is_some_and(|current| current.wake_published);
         let mut offset: u64 = 0;
         let mut partial = Vec::new();
         let mut last_output = tokio::time::Instant::now();
@@ -398,8 +667,9 @@ impl Jobs {
                     if let Some(line) = hit {
                         matched = true;
                         partial.clear();
-                        // Exclusive marker: only one instance publishes this wake.
-                        if std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("wake-match")).is_ok() {
+                        // Published once: by this instance or another.
+                        if self.claim(&meta.job_id, Once::Wake).await {
+                            self.event(&meta, "match");
                             self.publish(json!({
                                 "job_id": meta.job_id,
                                 "session_id": meta.session_id,
@@ -445,7 +715,7 @@ impl Jobs {
                     crate::guard::stop(meta.pid).await;
                     notes.push(format!("[it left {what} running after it ended; the host stopped that. Start a program that must keep running as the background job itself, not with `&` inside one.]"));
                 }
-                let stopped = std::fs::read_to_string(dir.join("stop-note")).ok().filter(|note| !note.trim().is_empty());
+                let stopped = current.note.clone().filter(|note| !note.trim().is_empty());
                 if let Some(note) = &stopped {
                     notes.insert(0, note.trim().to_owned());
                 }
@@ -457,6 +727,9 @@ impl Jobs {
                     }
                     meta.note = Some(text);
                 }
+                // What other writes changed (a published wake) stays.
+                meta.wake_published = current.wake_published;
+                meta.exit_published = current.exit_published;
                 meta.state = if current.state == "killed" || stopped.is_some() {
                     "killed".to_owned()
                 } else if exited.is_some() {
@@ -467,7 +740,8 @@ impl Jobs {
                 meta.exit_code = exited;
                 meta.ended_ms = Some(util::now_ms());
                 self.write_meta(&meta);
-                if std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("published-exit")).is_ok() {
+                self.event(&meta, "exit");
+                if self.claim(&meta.job_id, Once::Exit).await {
                     self.publish(json!({
                         "job_id": meta.job_id,
                         "session_id": meta.session_id,
@@ -490,6 +764,7 @@ impl Jobs {
                 && last_output.elapsed() >= limit
             {
                 silence_fired = true;
+                self.event(&meta, "silence");
                 self.publish(json!({
                     "job_id": meta.job_id,
                     "session_id": meta.session_id,
@@ -533,6 +808,7 @@ impl Jobs {
         if meta.state == "running" {
             meta.state = "killed".to_owned();
             self.write_meta(&meta);
+            self.event(&meta, "kill");
             crate::guard::stop(meta.pid).await;
             self.reap(job_id);
         }
@@ -542,11 +818,13 @@ impl Jobs {
     /// Stop a running job, with the note its output ends with (why, and what to do next). The job
     /// counts as killed once its processes are gone.
     pub async fn stop(&self, job_id: &str, note: &str, mode: StopMode) -> Option<JobMeta> {
-        let meta = self.meta(job_id)?;
+        let mut meta = self.meta(job_id)?;
         if meta.state != "running" && crate::guard::tree(meta.pid).is_empty() {
             return Some(meta);
         }
-        let _ = util::atomic_write(&self.dir(job_id).join("stop-note"), note.as_bytes());
+        meta.note = Some(note.to_owned());
+        self.write_meta(&meta);
+        self.event(&meta, "kill");
         match mode {
             StopMode::Escalate => crate::guard::stop(meta.pid).await,
             StopMode::Term => crate::guard::signal(meta.pid, &crate::guard::tree(meta.pid), libc::SIGTERM),
@@ -577,12 +855,8 @@ impl Jobs {
     }
 
     pub fn list(&self, session: Option<&str>) -> Vec<JobMeta> {
-        let Ok(entries) = std::fs::read_dir(&self.jobs_dir) else { return Vec::new() };
-        let mut out: Vec<JobMeta> = entries
-            .flatten()
-            .filter_map(|entry| self.meta(&entry.file_name().to_string_lossy()))
-            .filter(|meta| session.is_none_or(|session| meta.session_id == session))
-            .collect();
+        let Ok(metas) = self.metas.lock() else { return Vec::new() };
+        let mut out: Vec<JobMeta> = metas.values().filter(|meta| session.is_none_or(|session| meta.session_id == session)).cloned().collect();
         out.sort_by_key(|meta| meta.started_ms);
         out
     }

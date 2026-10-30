@@ -1,6 +1,7 @@
 //! Method dispatch for `vcs@1`.
 
-use crate::checkpoint::Shadow;
+use crate::checkpoint::{Checkpoints, Shadow};
+use crate::graph::Graph;
 use crate::git::{Git, find_executable};
 use crate::github::Github;
 use crate::repo::{Repo, require};
@@ -15,7 +16,7 @@ use cc_protocol::{RpcError, parse_params, to_value};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The git binary itself rather than a launcher in front of it: macOS's `/usr/bin/git` is an
 /// `xcrun` shim that adds several milliseconds to every invocation. `git --exec-path` names the
@@ -59,10 +60,13 @@ pub struct Vcs {
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     pub watches: Watches,
     pub github: Github,
+    pub checkpoints: Arc<Checkpoints>,
 }
 
 impl Vcs {
-    pub fn new(data_dir: PathBuf, config: &Config, publish: Publish) -> Result<Self, RpcError> {
+    /// `ctx` is the frame context, filled with the first call: records go to the memory plugin
+    /// through it.
+    pub fn new(data_dir: PathBuf, config: &Config, publish: Publish, ctx: Arc<OnceLock<cc_protocol::Ctx>>) -> Result<Self, RpcError> {
         let git_exe = find_executable(config.git.as_deref().unwrap_or("git"))
             .ok_or_else(|| RpcError::new(cc_protocol::codes::UNAVAILABLE, "git is not installed"))?;
         let git = Git::new(resolve_git(git_exe));
@@ -75,7 +79,9 @@ impl Vcs {
         let data_dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
         let gh = find_executable(config.gh.as_deref().unwrap_or("gh"));
         let scratch = data_dir.join("tmp");
-        let github = Github::new(&data_dir)?;
+        let graph = Graph::new(ctx);
+        let github = Github::new(&data_dir, graph.clone())?;
+        let checkpoints = Arc::new(Checkpoints::new(graph, &data_dir));
         github.set_client_id(config.github_client_id.as_deref());
         Ok(Self {
             watches: Watches::new(git.clone(), publish, data_dir.clone()),
@@ -85,6 +91,7 @@ impl Vcs {
             scratch,
             locks: Mutex::new(HashMap::new()),
             github,
+            checkpoints,
         })
     }
 
@@ -181,15 +188,15 @@ impl Vcs {
             }
             methods::CHECKPOINT => {
                 let p: CheckpointParams = parse_params(params)?;
-                to_value(&Shadow::new(git, &self.data_dir, &p.root)?.checkpoint(&p.label).await?)
+                to_value(&Shadow::new(git, &self.checkpoints, &p.root)?.checkpoint(&p.label).await?)
             }
             methods::CHECKPOINTS => {
                 let p: RootParams = parse_params(params)?;
-                to_value(&Shadow::new(git, &self.data_dir, &p.root)?.list().await?)
+                to_value(&Shadow::new(git, &self.checkpoints, &p.root)?.list().await?)
             }
             methods::RESTORE => {
                 let p: RestoreParams = parse_params(params)?;
-                to_value(&Shadow::new(git, &self.data_dir, &p.root)?.restore(&p.id).await?)
+                to_value(&Shadow::new(git, &self.checkpoints, &p.root)?.restore(&p.id).await?)
             }
             methods::MERGE => {
                 let p: MergeParams = parse_params(params)?;

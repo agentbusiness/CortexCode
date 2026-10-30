@@ -2,7 +2,8 @@
 
 use crate::borrow::Borrow;
 use crate::identity::Identity;
-use crate::members::{Entry, Log, log_path};
+use crate::members::{Entry, Log};
+use crate::store::{self, Write};
 use crate::pairing::JoinerRecord;
 use cc_protocol::contracts::mesh::{
     CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
@@ -18,7 +19,8 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +59,8 @@ const PAIRING_WINDOW: Duration = Duration::from_secs(3600);
 const PAIRING_ATTEMPTS: u32 = 3;
 /// How long a card is reused before it is built again.
 const CARD_TTL_MS: u64 = 20_000;
+/// How long a method that changes the membership waits for the log to be read from the store.
+const LOAD_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub relays: Vec<String>,
@@ -110,6 +114,12 @@ pub struct Mesh {
     pub local: Mutex<HashMap<String, crate::local::LocalPeer>>,
     /// The services this computer's plugins share, the person's switches, members' declarations.
     pub services: crate::services::Services,
+    /// Members may use this computer's model (`mesh.lend`).
+    lend: AtomicBool,
+    /// The app's store (`crate::store`) and the queue of its ordered writer.
+    pub store: OnceLock<(store::Caller, mpsc::UnboundedSender<Write>)>,
+    /// The membership log and the settings have been read from the store.
+    loaded: tokio::sync::watch::Sender<bool>,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,9 +144,15 @@ fn computer_name() -> String {
 
 impl Mesh {
     pub fn new(home: &Path) -> Mesh {
-        let me = Identity::load_or_create(home);
-        let log = Log::load(&log_path(home));
-        let name = std::fs::read_to_string(home.join("mesh").join("name")).map(|text| text.trim().to_owned()).ok().filter(|name| !name.is_empty()).unwrap_or_else(computer_name);
+        // Without its key the mesh cannot be this node: it stops, and the frame starts it again.
+        let me = Identity::load_or_create(home).unwrap_or_else(|error| {
+            tracing::error!(%error, "the mesh identity cannot be read");
+            eprintln!("cc-mesh: {error}");
+            std::process::exit(1)
+        });
+        // The log and the person's choices come from the store once it answers ([`Mesh::attach`]).
+        let log = Log::default();
+        let name = computer_name();
         Mesh {
             home: home.to_path_buf(),
             me,
@@ -158,12 +174,83 @@ impl Mesh {
             claims: crate::claims::Claims::default(),
             local: Mutex::new(HashMap::new()),
             services: crate::services::Services::default(),
+            lend: AtomicBool::new(true),
+            store: OnceLock::new(),
+            loaded: tokio::sync::watch::channel(false).0,
         }
     }
 
-    pub fn attach(&self, ctx: &Ctx) {
+    /// The frame's connection: the store is read (waiting for it as long as it takes), then its
+    /// writer starts on what changed meanwhile.
+    pub fn attach(self: &Arc<Self>, ctx: &Ctx) {
         if self.ctx.set(ctx.clone()).is_ok() {
             *lock(&self.config) = Config::from_value(&ctx.config());
+            self.use_store(store::caller_of(ctx.clone()));
+        }
+    }
+
+    /// Read the store and start its writer (the plugin's frame connection, or a test harness).
+    pub fn use_store(self: &Arc<Self>, call: store::Caller) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if self.store.set((call.clone(), tx)).is_err() {
+            return;
+        }
+        let mesh = self.clone();
+        tokio::spawn(async move {
+            let loaded = loop {
+                match store::load(&call, &mesh.home).await {
+                    Ok(loaded) => break loaded,
+                    Err(error) => {
+                        tracing::warn!(error = %error.message, "the mesh could not read its membership from the store; trying again in 30 s");
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }
+            };
+            let machine = loaded.machine.clone();
+            let persisted = loaded.entries.clone();
+            mesh.apply_loaded(loaded);
+            tokio::spawn(store::run_writer(call, machine, persisted, rx));
+            mesh.dial_all().await;
+        });
+    }
+
+    fn apply_loaded(&self, loaded: store::Loaded) {
+        if let Some(name) = loaded.name {
+            *lock(&self.name) = name;
+        }
+        self.lend.store(loaded.lend, Ordering::SeqCst);
+        *lock(&self.services.allowed) = Some(loaded.shares);
+        let mut log = Log { entries: loaded.entries };
+        if let Err(error) = log.validate() {
+            tracing::warn!(%error, "the membership log is not valid; starting from the valid prefix");
+        }
+        let members = log.members().len();
+        *lock(&self.log) = log;
+        tracing::info!(members, "the membership was read from the store");
+        let _ = self.loaded.send(true);
+        self.save_log();
+        *lock(&self.my_card) = None;
+        self.notify("members");
+    }
+
+    /// The log and the settings are read.
+    pub fn loaded(&self) -> bool {
+        *self.loaded.borrow()
+    }
+
+    /// Wait (bounded) for the membership: what changes it cannot be done before.
+    pub async fn wait_loaded(&self) -> Result<(), RpcError> {
+        let mut rx = self.loaded.subscribe();
+        match tokio::time::timeout(LOAD_WAIT, rx.wait_for(|loaded| *loaded)).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(RpcError::new(codes::UNAVAILABLE, "the mesh is still reading its membership from the memory plugin; try again in a moment")),
+        }
+    }
+
+    /// Queue a write for the store (kept in order until the store takes it).
+    pub fn write(&self, write: Write) {
+        if let Some((_, tx)) = self.store.get() {
+            let _ = tx.send(write);
         }
     }
 
@@ -269,8 +356,14 @@ impl Mesh {
         lock(&self.log).entries.clone()
     }
 
+    /// The log as it stands now, to the store (this node's software with it).
     fn save_log(&self) {
-        lock(&self.log).save(&log_path(&self.home));
+        if !self.loaded() {
+            return;
+        }
+        let entries = lock(&self.log).entries.clone();
+        self.write(Write::Log(entries));
+        self.write(Write::Software(self.me.hex(), crate::SOFTWARE.to_owned()));
     }
 
     /// This node founds its own cortex (the first member, with every grant) when it has none.
@@ -279,12 +372,16 @@ impl Mesh {
         if !log.founded() {
             let addrs = self.my_addr().map(|addr| serde_json::to_string(&addr).unwrap_or_default()).into_iter().collect();
             log.append(&self.me, "add", &self.me.hex(), &self.name(), addrs);
-            log.save(&log_path(&self.home));
+            drop(log);
+            self.save_log();
         }
     }
 
     /// The inviter's admission of a joiner: an `add` entry signed here, the whole log back.
     pub fn admit(&self, record: &JoinerRecord) -> Result<Vec<Entry>, String> {
+        if !self.loaded() {
+            return Err("this computer is still reading its membership".to_owned());
+        }
         self.ensure_founded();
         let mut log = lock(&self.log);
         if !log.is_member(&self.me.hex()) {
@@ -292,10 +389,10 @@ impl Mesh {
         }
         if !log.is_member(&record.node) {
             log.append(&self.me, "add", &record.node, &record.name, record.addrs.clone());
-            log.save(&log_path(&self.home));
         }
         let entries = log.entries.clone();
         drop(log);
+        self.save_log();
         self.notify("members");
         Ok(entries)
     }
@@ -314,8 +411,8 @@ impl Mesh {
                 return Err("this computer is already in a cortex with other members; revoke it there first".to_owned());
             }
             *log = candidate;
-            log.save(&log_path(&self.home));
         }
+        self.save_log();
         self.notify("members");
         Ok(())
     }
@@ -338,8 +435,8 @@ impl Mesh {
         {
             let mut log = lock(&self.log);
             *log = Log::default();
-            let _ = std::fs::remove_file(log_path(&self.home));
         }
+        self.save_log();
         let conns: Vec<(String, Connection)> = lock(&self.conns).drain().collect();
         for (_, connection) in conns {
             connection.close(4u32.into(), b"left");
@@ -371,6 +468,9 @@ impl Mesh {
 
     /// A member's copy of the log arrived.
     pub fn log_received(&self, entries: Vec<Entry>) -> Result<bool, String> {
+        if !self.loaded() {
+            return Err("this computer is still reading its membership".to_owned());
+        }
         let changed = lock(&self.log).merge(entries)?;
         if changed && !self.in_log(&self.me.hex()) {
             // Taken out by a member: this node is alone again.
@@ -425,6 +525,9 @@ impl Mesh {
     // --- cards and events ----------------------------------------------------------------------
 
     pub fn card_received(&self, node: &str, card: Card) {
+        if !card.software.is_empty() {
+            self.write(Write::Software(node.to_owned(), card.software.clone()));
+        }
         lock(&self.cards).insert(node.to_owned(), card);
         self.models_changed();
         self.notify("cards");
@@ -565,9 +668,9 @@ impl Mesh {
         }
     }
 
-    /// Members may use this computer's model (off while `<home>/mesh/no-lend` exists).
+    /// Members may use this computer's model (setting `mesh.lend`).
     pub fn lends(&self) -> bool {
-        !self.home.join("mesh").join("no-lend").exists()
+        self.lend.load(Ordering::SeqCst)
     }
 
     fn peers(&self) -> PeersResult {
@@ -598,6 +701,10 @@ impl Mesh {
     // --- dispatch ------------------------------------------------------------------------------
 
     pub async fn handle(self: &std::sync::Arc<Self>, method: &str, params: Value, items: ItemSink, cancel: CancellationToken) -> Result<Value, RpcError> {
+        // What changes the membership or the person's choices waits for them to be read.
+        if matches!(method, methods::PAIR_START | methods::PAIR_JOIN | methods::LEAVE | methods::REVOKE | methods::NAME | methods::LEND | methods::SHARES_SET) {
+            self.wait_loaded().await?;
+        }
         match method {
             methods::STATUS => to_value(&self.status()),
             methods::CARD => to_value(&self.my_card().await),
@@ -656,8 +763,7 @@ impl Mesh {
                     return Err(RpcError::invalid_params("a name is needed"));
                 }
                 *lock(&self.name) = name.clone();
-                let _ = std::fs::create_dir_all(self.home.join("mesh"));
-                let _ = std::fs::write(self.home.join("mesh").join("name"), &name);
+                self.write(Write::Setting(store::NAME_SETTING, json!(name)));
                 if self.in_log(&self.me.hex()) {
                     lock(&self.log).append(&self.me, "rename", &self.me.hex(), &name, Vec::new());
                     self.save_log();
@@ -669,13 +775,8 @@ impl Mesh {
             }
             methods::LEND => {
                 let params: LendParams = parse_params(params)?;
-                let marker = self.home.join("mesh").join("no-lend");
-                let written = if params.lend {
-                    std::fs::remove_file(&marker).or_else(|error| if error.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(error) })
-                } else {
-                    std::fs::create_dir_all(self.home.join("mesh")).and_then(|_| std::fs::write(&marker, ""))
-                };
-                written.map_err(|error| RpcError::internal(format!("cannot record the lending choice: {error}")))?;
+                self.lend.store(params.lend, Ordering::SeqCst);
+                self.write(Write::Setting(store::LEND_SETTING, json!(params.lend)));
                 *lock(&self.my_card) = None;
                 self.notify("members");
                 to_value(&self.status())
@@ -751,6 +852,9 @@ impl Mesh {
 
     /// Replace this member's recorded addresses (its endpoint address and relay URL).
     pub fn append_addrs(&self, node: &str, addrs: Vec<String>) {
+        if !self.loaded() {
+            return;
+        }
         let name = self.member(node).map(|member| member.name).unwrap_or_default();
         lock(&self.log).append(&self.me, "addrs", node, &name, addrs);
         self.save_log();

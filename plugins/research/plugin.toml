@@ -22,14 +22,14 @@ provides = [
   "research.deep", "research.job.status", "research.job.cancel", "research.jobs", "research.sources",
 ]
 publishes = ["research.progress", "research.job"]
-uses = ["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list"]
+uses = ["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list", "memory.knowledge.upsert", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.stream.append"]
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]
 timeout_ms = 20000                 # per HTTP request
 max_download_bytes = 26214400      # per fetch (25 MB); a larger PDF is refused with this name
 max_text_chars = 400000            # extracted text kept per document
-cache_ttl_hours = 168              # $CORTEX_HOME/research/cache entries are fresh this long
+cache_ttl_hours = 168              # cached pages (WebPage nodes) are fresh this long
 allow_private_hosts = false        # research.fetch never reads loopback / private / link-local addresses
 web_search = "auto"                # auto (DuckDuckGo HTML, then the built-in browser when blocked) | http | browser
 github = "auto"                    # auto (gh when installed and signed in, else REST) | gh | rest

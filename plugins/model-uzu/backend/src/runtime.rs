@@ -147,7 +147,7 @@ pub struct VisionSupport {
     pub idle_unload_s: u64,
     /// Why images are not accepted, when the configuration rules them out.
     pub disabled: Option<String>,
-    verify_cache: PathBuf,
+    verify: VerifyCache,
     config: std::sync::Mutex<Option<Arc<VisionConfig>>>,
 }
 
@@ -164,10 +164,10 @@ impl VisionSupport {
             return Err("this model has no vision tower".into());
         };
         let variant_dir = dir.parent().unwrap_or(dir);
-        if !vision::install::installed(tower, variant_dir) {
+        if !vision::install::installed(tower, variant_dir, &self.verify) {
             return Err("the vision tower is not installed (model.select installs it, or `cc-model-uzu install-vision`)".into());
         }
-        let cache = VerifyCache::at(self.verify_cache.clone());
+        let cache = &self.verify;
         let weights = dir.join(vision::WEIGHTS);
         let digest = match cache.recorded(&weights) {
             Some(digest) => digest,
@@ -204,7 +204,7 @@ impl VisionSupport {
         let (Some(tower), Some(dir)) = (self.tower, self.dir.as_ref()) else {
             return Err("this model has no vision tower".into());
         };
-        if !vision::install::installed(tower, dir.parent().unwrap_or(dir)) {
+        if !vision::install::installed(tower, dir.parent().unwrap_or(dir), &self.verify) {
             return Err("the vision tower is not installed (model.select installs it, or `cc-model-uzu install-vision`)".into());
         }
         Ok(())
@@ -296,6 +296,8 @@ enum Phase {
 pub struct Runtime {
     pub paths: Paths,
     pub config: Config,
+    /// Model file digests and vision installs (the memory plugin's graph).
+    pub verify: VerifyCache,
     publisher: Publisher,
     phase: watch::Sender<Phase>,
     switch: tokio::sync::Mutex<()>,
@@ -370,6 +372,7 @@ impl Runtime {
     pub fn new(paths: Paths, config: Config, publisher: Publisher) -> Arc<Self> {
         let (phase, _) = watch::channel(Phase::Starting);
         Arc::new(Self {
+            verify: VerifyCache::new(&paths.models_dir),
             paths,
             config,
             publisher,
@@ -486,7 +489,7 @@ impl Runtime {
             )
         })?;
         let dir = spec.local_dir(&self.paths.models_dir);
-        let cache = VerifyCache::new(&self.paths.models_dir);
+        let cache = self.verify.clone();
         let was_installed = variants::installed(spec, &dir);
         if was_installed || download {
             // Downloads only what is missing; verifies every file (records make this instant).
@@ -604,7 +607,7 @@ impl Runtime {
             max_pixels,
             idle_unload_s: self.config.vision_idle_unload_s.unwrap_or(vision::DEFAULT_IDLE_UNLOAD_S),
             disabled: (!enabled).then(|| "image input is switched off (plugin config `vision = \"off\"`)".to_owned()),
-            verify_cache: VerifyCache::new(&self.paths.models_dir).path().to_path_buf(),
+            verify: self.verify.clone(),
             config: std::sync::Mutex::new(None),
         })
     }
@@ -624,11 +627,12 @@ impl Runtime {
         if !self.vision_mode()? {
             return Ok(());
         }
+        self.verify.wait().await;
         let dir = spec.local_dir(&self.paths.models_dir);
-        if vision::install::installed(tower, &dir) {
+        if vision::install::installed(tower, &dir, &self.verify) {
             return Ok(());
         }
-        let cache = VerifyCache::new(&self.paths.models_dir);
+        let cache = self.verify.clone();
         let progress = self.install_progress();
         vision::install::install(tower, spec.id, &dir, &cache, &progress).await.map(|_| ())
     }
@@ -1119,7 +1123,7 @@ impl Runtime {
                     repo: Some(spec.repo.to_owned()),
                     revision: Some(spec.revision.to_owned()),
                     sha256: spec.weights().and_then(|file| file.sha256).map(str::to_owned),
-                    verified: installed.then(|| variants::verified_by_record(spec, &self.paths.models_dir)),
+                    verified: installed.then(|| variants::verified_by_record(spec, &self.paths.models_dir, &self.verify)),
                     bytes: Some(spec.total_bytes()),
                     mtp: None,
                 }
@@ -1165,7 +1169,7 @@ impl Runtime {
         }
         let spec = variants::find(variant).ok_or_else(|| RpcError::invalid_params(format!("unknown variant `{variant}`")))?;
         // Install before unloading, so a failed download leaves the current model serving.
-        let cache = VerifyCache::new(&self.paths.models_dir);
+        let cache = self.verify.clone();
         let progress = self.install_progress();
         variants::install(spec, &self.paths.models_dir, &cache, &progress)
             .await

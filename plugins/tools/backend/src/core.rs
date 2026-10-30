@@ -99,9 +99,11 @@ pub struct Core {
     /// One tree, many hands: file reservations, running commands, check copies (see [`crate::tree`]).
     pub tree: crate::tree::Tree,
     file_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-    /// What each session's user let its commands do, kept in the app's main store
-    /// (`tools.approvals`; see [`cc_protocol::stored`]).
-    pub approvals: cc_protocol::stored::Stored<HashMap<String, BTreeSet<String>>>,
+    /// What each session's user let its commands do: `Approval` nodes, held here while the plugin
+    /// runs (see [`Core::load_approvals`]).
+    pub approvals: Mutex<HashMap<String, BTreeSet<String>>>,
+    /// The plugin's records in the app's graph (see [`crate::graph`]).
+    pub graph: Arc<crate::graph::Graph>,
     /// Per session: edits of project files since its last run (an edit result names the next step).
     pub edits_since_run: Mutex<HashMap<String, usize>>,
     /// Per session: the files `edit` created in the running turn (cleared when it ends). The model
@@ -189,18 +191,20 @@ impl Core {
         }
         // CortexCode's code is not changed from its shells: the packer earlier versions put here goes.
         let _ = std::fs::remove_file(bin_dir.join("cortex-pack"));
+        let graph = crate::graph::Graph::new();
         let core = Arc::new(Core {
             home: home.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
             shells: Shells::new(ShellConfig { state_root: data_dir.join("shells"), bin_dir: Some(bin_dir), bash: bash.clone() }),
-            jobs: Jobs::new(home, bash),
-            artifacts: Artifacts::new(home),
-            workspaces: Workspaces::new(home),
-            steps: crate::undo::StepLog::new(data_dir),
+            jobs: Jobs::new(home, bash, graph.clone()),
+            artifacts: Artifacts::new(home, graph.clone()),
+            workspaces: Workspaces::new(home, graph.clone()),
+            steps: crate::undo::StepLog::new(data_dir, graph.clone()),
             tree: crate::tree::Tree::new(),
             read_state: ReadState::default(),
             file_locks: Mutex::new(HashMap::new()),
-            approvals: cc_protocol::stored::Stored::new("tools.approvals"),
+            approvals: Mutex::new(HashMap::new()),
+            graph,
             edits_since_run: Mutex::new(HashMap::new()),
             created: Mutex::new(HashMap::new()),
             originals: Mutex::new(HashMap::new()),
@@ -209,11 +213,8 @@ impl Core {
             config,
             cx,
         });
-        // Reap idle shells in the background (when running inside a Tokio runtime), and drop the
-        // automatic venvs of workspaces that were deleted meanwhile.
+        // Reap idle shells in the background (when running inside a Tokio runtime).
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let home = core.home.clone();
-            runtime.spawn_blocking(move || crate::pyenv::remove_orphans(&home));
             let weak = Arc::downgrade(&core);
             runtime.spawn(async move {
                 loop {
@@ -235,14 +236,80 @@ impl Core {
         locks.entry(path.to_path_buf()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
+    fn approvals(&self) -> std::sync::MutexGuard<'_, HashMap<String, BTreeSet<String>>> {
+        self.approvals.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn approve(&self, session: &str, classes: &[String]) -> Vec<String> {
-        self.approvals.update(|approvals| {
-            let entry = approvals.entry(session.to_owned()).or_default();
-            for class in classes {
-                entry.insert(class.clone());
+        let mut approvals = self.approvals();
+        let entry = approvals.entry(session.to_owned()).or_default();
+        let new: Vec<String> = classes.iter().filter(|class| entry.insert((*class).clone())).cloned().collect();
+        self.graph.put_many(new.iter().map(|class| approval_batch(session, class)).collect());
+        entry.iter().cloned().collect()
+    }
+
+    /// The approvals kept in the graph, and once those an earlier version kept in the settings
+    /// store (`tools.approvals`) or in `approvals.json`: written to the graph, then removed there.
+    pub async fn load_approvals(&self) {
+        let mut legacy: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let file = self.data_dir.join("approvals.json");
+        if let Some(old) = std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<HashMap<String, BTreeSet<String>>>(&bytes).ok()) {
+            legacy.extend(old);
+        }
+        let setting = self.graph.call_waiting(cc_protocol::contracts::memory::methods::SETTINGS_GET, serde_json::json!({ "path": LEGACY_APPROVALS })).await;
+        let had_setting = match setting {
+            Ok(value) => {
+                if let Some(old) = value.get("value").cloned().and_then(|value| serde_json::from_value::<HashMap<String, BTreeSet<String>>>(value).ok()) {
+                    for (session, classes) in old {
+                        legacy.entry(session).or_default().extend(classes);
+                    }
+                }
+                true
             }
-            entry.iter().cloned().collect()
-        })
+            Err(error) if error.code == cc_protocol::codes::NOT_FOUND => false,
+            Err(error) => {
+                tracing::error!(error = %error.message, "the approvals kept in the settings could not be read");
+                false
+            }
+        };
+        let imported = legacy.is_empty() || {
+            let batches = legacy.iter().flat_map(|(session, classes)| classes.iter().map(|class| approval_batch(session, class))).collect();
+            match self.graph.put_wait(batches).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&file);
+                    true
+                }
+                Err(error) => {
+                    tracing::error!(error = %error.message, "the old approvals were not written to the graph; they are kept where they were");
+                    false
+                }
+            }
+        };
+        if imported
+            && had_setting
+            && let Err(error) = self.graph.call_waiting(cc_protocol::contracts::memory::methods::SETTINGS_DELETE, serde_json::json!({ "path": LEGACY_APPROVALS })).await
+        {
+            tracing::warn!(error = %error.message, "the old approvals setting could not be removed");
+        }
+        let stored = self
+            .graph
+            .query_all("MATCH (a:Approval) WHERE a.ended_ms IS NULL AND a.key > $after RETURN a, a.key AS k ORDER BY k LIMIT 5000", serde_json::json!({}), 60)
+            .await;
+        let mut approvals = self.approvals();
+        for (session, classes) in legacy {
+            approvals.entry(session).or_default().extend(classes);
+        }
+        match stored {
+            Ok(rows) => {
+                for props in rows.iter().filter_map(|row| row.first().and_then(crate::graph::properties)) {
+                    let (session, class) = (crate::graph::text(props, "session_id"), crate::graph::text(props, "class"));
+                    if !session.is_empty() && !class.is_empty() {
+                        approvals.entry(session).or_default().insert(class);
+                    }
+                }
+            }
+            Err(error) => tracing::error!(error = %error.message, "the approvals could not be read from the graph"),
+        }
     }
 
     /// The sandbox and Python environment for commands of `session` in `workspace`. With
@@ -266,7 +333,7 @@ impl Core {
             let dir = crate::pyenv::auto_dir(&self.home, workspace);
             let lock = self.file_lock(&dir);
             let _guard = lock.lock().await;
-            match crate::pyenv::ensure_auto(&dir, workspace).await {
+            match crate::pyenv::ensure_auto(&self.graph, &dir, workspace).await {
                 Ok(_) => Some(crate::pyenv::PyEnv::Auto(dir)),
                 Err(error) => {
                     venv_error = Some(error);
@@ -300,22 +367,27 @@ impl Core {
         for job in self.jobs.list(Some(session)) {
             self.jobs.kill(&job.job_id).await;
         }
-        if self.approvals.get().contains_key(session) {
-            self.approvals.update(|approvals| approvals.remove(session));
-        }
+        self.approvals().remove(session);
+        self.graph.retire_matching(
+            "Approval",
+            "MATCH (a:Approval) WHERE a.session_id = $session AND a.ended_ms IS NULL RETURN a.key LIMIT 5000",
+            serde_json::json!({ "session": session }),
+            "session deleted",
+        );
+        self.jobs.forget_session(session);
         if inside(self.workspaces.root(), workspace) {
             self.forget_workspace(workspace);
         }
     }
 
     /// A deleted project: its workspace clones and the venv of its folder go (the folder stays).
-    pub fn forget_project(&self, project_id: &str, root: &Path) {
-        for workspace in self.workspaces.list(Some(project_id)) {
+    pub async fn forget_project(&self, project_id: &str, root: &Path) {
+        for workspace in self.workspaces.list(Some(project_id)).await {
             self.forget_workspace(Path::new(&workspace.path));
         }
         self.steps.forget(root);
         let _ = std::fs::remove_dir_all(self.workspaces.root().join(project_id));
-        let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, root));
+        crate::pyenv::remove(&self.graph, &crate::pyenv::auto_dir(&self.home, root));
     }
 
     fn forget_workspace(&self, workspace: &Path) {
@@ -323,19 +395,35 @@ impl Core {
         if let Err(error) = self.workspaces.remove(&workspace.to_string_lossy()) {
             tracing::debug!(workspace = %workspace.display(), error = %error.message, "removing a deleted session's workspace");
         }
-        let _ = std::fs::remove_dir_all(crate::pyenv::auto_dir(&self.home, workspace));
+        crate::pyenv::remove(&self.graph, &crate::pyenv::auto_dir(&self.home, workspace));
     }
 
     /// Use up a one-time approval (a repository change the user allowed once): true when it was
     /// given, and it is gone afterwards.
     pub fn take_approval(&self, session: &str, class: &str) -> bool {
-        if !self.approvals.get().get(session).is_some_and(|entry| entry.contains(class)) {
-            return false;
+        let taken = self.approvals().get_mut(session).is_some_and(|entry| entry.remove(class));
+        if taken {
+            self.graph.retire(vec![crate::graph::gref("Approval", &approval_key(session, class))], "used");
         }
-        self.approvals.update(|approvals| approvals.get_mut(session).is_some_and(|entry| entry.remove(class)))
+        taken
     }
 
     pub fn approved(&self, session: &str) -> BTreeSet<String> {
-        self.approvals.get().get(session).cloned().unwrap_or_default()
+        self.approvals().get(session).cloned().unwrap_or_default()
     }
+}
+
+/// Where earlier versions kept the approvals in the settings store.
+const LEGACY_APPROVALS: &str = "tools.approvals";
+
+fn approval_key(session: &str, class: &str) -> String {
+    format!("{session}#{class}")
+}
+
+/// `(:Approval {key: '<session>#<class>', class, session_id})-[:FOR]->(:Session)`
+fn approval_batch(session: &str, class: &str) -> crate::graph::Batch {
+    let key = approval_key(session, class);
+    let node = crate::graph::node("Approval", &key, crate::graph::props(serde_json::json!({ "class": class, "session_id": session })));
+    let edge = crate::graph::edge(&crate::graph::gref("Approval", &key), "FOR", &crate::graph::gref("Session", session));
+    crate::graph::Batch::workspace(vec![node], vec![edge], Vec::new())
 }

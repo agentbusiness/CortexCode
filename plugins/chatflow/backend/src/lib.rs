@@ -17,6 +17,7 @@ pub mod context;
 pub mod contract;
 pub mod data;
 pub mod fit;
+pub mod graph;
 pub mod flow;
 pub mod guides;
 pub mod host;

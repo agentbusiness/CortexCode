@@ -12,8 +12,10 @@ use crate::settings::Settings;
 use crate::work::WorkStore;
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{
+    GraphPutParams, GraphQueryParams, GraphRetireParams, GraphRetireResult, QueueAckParams, QueueAckResult, QueuePublishParams, QueuePublishResult, QueueTakeParams, QueueTakeResult,
+    StreamAppendParams, StreamAppendResult, StreamReadParams, StreamTopicsParams, StreamTopicsResult,
     ExtractProblem, LanguagePlugin, UncoveredFiles,
-    AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalDropParams, JournalReadParams, JournalReadResult,
+    AppDeletedResult, AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalDropParams, JournalReadParams, JournalReadResult,
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, FocusParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
@@ -55,6 +57,9 @@ pub struct Memory {
     global: OnceCell<Arc<WorkStore>>,
     settings: OnceCell<Arc<Settings>>,
     app: OnceCell<Arc<crate::app::AppStore>>,
+    /// The app's graph and its streams and queues, in the main project.
+    graph_store: OnceCell<Arc<crate::graphapi::GraphStore>>,
+    streams: OnceCell<Arc<crate::streams::StreamStore>>,
     projects: RwLock<HashMap<String, Arc<Project>>>,
     /// Serialises opening of each project.
     opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -152,6 +157,11 @@ pub const COMMANDS: &[&str] = &[
     methods::PATH,
     methods::OUTLINE,
     methods::PROJECT_LIST,
+    // The app's graph, read only: writes come from plugins, never from a model's command.
+    methods::GRAPH_QUERY,
+    methods::GRAPH_MACHINE,
+    methods::STREAM_READ,
+    methods::STREAM_TOPICS,
 ];
 
 /// Every method this plugin serves.
@@ -205,6 +215,7 @@ pub const PROVIDES: &[&str] = &[
     methods::SETTINGS_DELETE,
     methods::ENGINE_STATUS,
     methods::APP_PROJECTS,
+    methods::APP_DELETED,
     methods::APP_PROJECT_PUT,
     methods::APP_PROJECT_DELETE,
     methods::APP_SESSIONS,
@@ -234,6 +245,16 @@ pub const PROVIDES: &[&str] = &[
     methods::ROUTINE_REMOVE,
     methods::ROUTINE_RUN_PUT,
     methods::ROUTINE_RUNS,
+    methods::GRAPH_PUT,
+    methods::GRAPH_RETIRE,
+    methods::GRAPH_QUERY,
+    methods::GRAPH_MACHINE,
+    methods::STREAM_APPEND,
+    methods::STREAM_READ,
+    methods::STREAM_TOPICS,
+    methods::QUEUE_PUBLISH,
+    methods::QUEUE_TAKE,
+    methods::QUEUE_ACK,
 ];
 
 fn short_hash(text: &str) -> String {
@@ -263,6 +284,8 @@ impl Memory {
             global: OnceCell::new(),
             settings: OnceCell::new(),
             app: OnceCell::new(),
+            graph_store: OnceCell::new(),
+            streams: OnceCell::new(),
             projects: RwLock::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             task_owner: Mutex::new(HashMap::new()),
@@ -515,7 +538,24 @@ impl Memory {
 
     /// Open the database and create the main project (with its settings root) on first start.
     pub async fn ensure_main(&self) -> Result<(), RpcError> {
-        self.settings().await.map(|_| ())
+        self.settings().await?;
+        self.graph_store().await.map(|_| ())
+    }
+
+    /// The app's graph (see [`crate::graphapi`]); opening it writes this Mac's root node.
+    async fn graph_store(&self) -> Result<Arc<crate::graphapi::GraphStore>, RpcError> {
+        let global = self.global().await?;
+        self.graph_store
+            .get_or_try_init(|| async { Ok::<_, RpcError>(Arc::new(crate::graphapi::GraphStore::open(global.graph.clone(), global.ig_id.clone()).await?)) })
+            .await
+            .cloned()
+    }
+
+    /// Streams and queues (see [`crate::streams`]).
+    async fn streams(&self) -> Result<Arc<crate::streams::StreamStore>, RpcError> {
+        let store = self.graph_store().await?;
+        let graph = self.graph().await?;
+        self.streams.get_or_try_init(|| async { Ok::<_, RpcError>(Arc::new(crate::streams::StreamStore::new(graph, store))) }).await.cloned()
     }
 
     fn publish(&self, topic: &str, data: Value) {
@@ -1456,6 +1496,45 @@ impl Memory {
             }
             methods::ENGINE_STATUS => to_value(&self.engine.status()),
             methods::APP_PROJECTS => to_value(&AppProjectsResult { projects: self.app().await?.projects().await? }),
+            methods::GRAPH_PUT => {
+                let p: GraphPutParams = parse_params(params)?;
+                to_value(&self.graph_store().await?.put(p).await?)
+            }
+            methods::GRAPH_RETIRE => {
+                let p: GraphRetireParams = parse_params(params)?;
+                to_value(&GraphRetireResult { retired: self.graph_store().await?.retire(p).await? })
+            }
+            methods::GRAPH_QUERY => {
+                let p: GraphQueryParams = parse_params(params)?;
+                to_value(&self.graph_store().await?.query(p).await?)
+            }
+            methods::GRAPH_MACHINE => to_value(self.graph_store().await?.machine()),
+            methods::STREAM_APPEND => {
+                let p: StreamAppendParams = parse_params(params)?;
+                let first_offset = self.streams().await?.append(&p.topic, &p.records, p.retention_days).await?;
+                to_value(&StreamAppendResult { first_offset, count: p.records.len() as u32 })
+            }
+            methods::STREAM_READ => {
+                let p: StreamReadParams = parse_params(params)?;
+                to_value(&self.streams().await?.read(&p.topic, p.from_offset, p.since_ms, p.limit).await?)
+            }
+            methods::STREAM_TOPICS => {
+                let p: StreamTopicsParams = if params.is_null() { StreamTopicsParams::default() } else { parse_params(params)? };
+                to_value(&StreamTopicsResult { topics: self.streams().await?.topics(&p.prefix).await? })
+            }
+            methods::QUEUE_PUBLISH => {
+                let p: QueuePublishParams = parse_params(params)?;
+                to_value(&QueuePublishResult { count: self.streams().await?.publish(&p.queue, &p.messages).await? })
+            }
+            methods::QUEUE_TAKE => {
+                let p: QueueTakeParams = parse_params(params)?;
+                to_value(&QueueTakeResult { messages: self.streams().await?.take(&p.queue, &p.consumer, p.max, p.lease_ms).await? })
+            }
+            methods::QUEUE_ACK => {
+                let p: QueueAckParams = parse_params(params)?;
+                to_value(&QueueAckResult { acked: self.streams().await?.ack(&p.queue, &p.consumer, &p.ids).await? })
+            }
+            methods::APP_DELETED => to_value(&AppDeletedResult { projects: self.app().await?.deleted().await? }),
             methods::APP_PROJECT_PUT => {
                 let p: AppProjectPutParams = parse_params(params)?;
                 self.app().await?.put_project(&p.project).await?;

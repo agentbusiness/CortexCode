@@ -47,6 +47,22 @@ pub mod topics {
     pub const CHANGED: &str = "notify.changed";
 }
 
+/// The memory queue (`memory.queue.*`) clicks travel on: the notify plugin publishes the clicks
+/// its notification app spooled while no plugin listened, and consumes them (consumer `notify`)
+/// once the notification history is loaded. A message is [`SpooledActivation`].
+pub const ACTIVATIONS_QUEUE: &str = "notify.activations";
+
+/// One spooled click, as the notification app writes it and the queue carries it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpooledActivation {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// When it was clicked (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_ms: Option<u64>,
+}
+
 /// Notification kinds the plugin derives (structural mapping of event fields, see the plugin).
 pub mod kinds {
     pub const DONE: &str = "done";

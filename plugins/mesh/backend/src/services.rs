@@ -6,9 +6,9 @@
 //!   the card and is all that members may call (besides the model, which has its own sharing).
 //! - A member's call is taken when its method is declared, its verb's access is allowed for where
 //!   the member is (`read` from anywhere; `edit` and `run` only from an app on this machine), and
-//!   the person's switches for the service allow it (`<home>/mesh/shares.json`). The mesh stamps
+//!   the person's switches for the service allow it (setting `mesh.shares`). The mesh stamps
 //!   who asked into the params as `caller`.
-//! - Every call served for another app is a line in `<home>/mesh/served.jsonl` (kept 30 days).
+//! - Every call served for another app is a record of stream `mesh.served` (kept 30 days).
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{OfferedService, ServiceCallParams, ServiceCard, ServicesResult, ShareSetting, SharesResult, SharesSetParams};
@@ -16,22 +16,20 @@ use cc_protocol::contracts::service::{self as svc, Access, Allowed, Caller, Shar
 use cc_protocol::{Ctx, RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::Write as _;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// How long the record of served calls is kept.
-const KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const KEEP_MS: u64 = crate::store::SERVED_DAYS as u64 * 24 * 60 * 60 * 1000;
 
 #[derive(Default)]
 pub struct Services {
     /// `plugin_id@instance` -> what that plugin build shares.
     declared: Mutex<HashMap<String, Vec<Share>>>,
     /// The person's switches, by service.
-    allowed: Mutex<Option<HashMap<String, Allowed>>>,
+    pub(crate) allowed: Mutex<Option<HashMap<String, Allowed>>>,
     /// A member's full declarations, by node, with the card time they were read at.
     theirs: Mutex<HashMap<String, (u64, Vec<Share>)>>,
 }
@@ -41,14 +39,6 @@ fn now_ms() -> u64 {
 }
 
 impl Mesh {
-    fn shares_file(&self) -> PathBuf {
-        self.home.join("mesh").join("shares.json")
-    }
-
-    fn served_file(&self) -> PathBuf {
-        self.home.join("mesh").join("served.jsonl")
-    }
-
     /// What this computer's active plugins share (asked once per plugin build).
     pub async fn local_shares(&self) -> Vec<Share> {
         let Some(ctx) = self.ctx.get().cloned() else { return Vec::new() };
@@ -89,12 +79,8 @@ impl Mesh {
     }
 
     fn allowed_map(&self) -> HashMap<String, Allowed> {
-        let mut slot = lock(&self.services.allowed);
-        if slot.is_none() {
-            let read = std::fs::read(self.shares_file()).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-            *slot = Some(read);
-        }
-        slot.clone().unwrap_or_default()
+        // Read from the store at start; the defaults until then.
+        lock(&self.services.allowed).clone().unwrap_or_default()
     }
 
     pub fn allowed(&self, service: &str) -> Allowed {
@@ -140,31 +126,23 @@ impl Mesh {
 
     /// One served call, for the record.
     pub fn served(&self, node: &str, method: &str, ok: bool, ms: u64) {
-        let line = json!({"at": now_ms(), "node": node, "method": method, "ok": ok, "ms": ms});
-        let path = self.served_file();
-        let _ = std::fs::create_dir_all(self.home.join("mesh"));
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{line}");
-        }
-        // Old lines go once the file is big enough to be worth it.
-        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 4 << 20) {
-            let keep: Vec<String> = self.served_lines().into_iter().map(|value| value.to_string()).collect();
-            let _ = std::fs::write(&path, keep.join("\n") + "\n");
-        }
+        self.write(crate::store::Write::Served(json!({"at": now_ms(), "node": node, "method": method, "ok": ok, "ms": ms})));
     }
 
-    fn served_lines(&self) -> Vec<Value> {
-        let horizon = now_ms().saturating_sub(KEEP_MS);
-        std::fs::read_to_string(self.served_file())
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|value| value["at"].as_u64().unwrap_or(0) >= horizon)
-            .collect()
+    /// The served calls of the last 30 days, from the store (none while it is not read).
+    async fn served_lines(&self) -> Vec<Value> {
+        let Some((call, _)) = self.store.get() else { return Vec::new() };
+        if !self.loaded() {
+            return Vec::new();
+        }
+        crate::store::read_served(call, now_ms().saturating_sub(KEEP_MS)).await.unwrap_or_else(|error| {
+            tracing::debug!(error = %error.message, "served calls not read");
+            Vec::new()
+        })
     }
 
     pub async fn shares_result(&self) -> SharesResult {
-        let lines = self.served_lines();
+        let lines = self.served_lines().await;
         let allowed = self.allowed_map();
         let shares = self
             .local_shares()
@@ -182,9 +160,7 @@ impl Mesh {
     pub async fn set_shares(&self, params: SharesSetParams) -> Result<SharesResult, RpcError> {
         let mut map = self.allowed_map();
         map.insert(params.service, params.allowed);
-        let _ = std::fs::create_dir_all(self.home.join("mesh"));
-        let bytes = serde_json::to_vec_pretty(&map).map_err(|e| RpcError::internal(e.to_string()))?;
-        std::fs::write(self.shares_file(), bytes).map_err(|e| RpcError::internal(format!("cannot record the switches: {e}")))?;
+        self.write(crate::store::Write::Setting(crate::store::SHARES_SETTING, serde_json::to_value(&map).map_err(|e| RpcError::internal(e.to_string()))?));
         *lock(&self.services.allowed) = Some(map);
         self.notify("services");
         Ok(self.shares_result().await)

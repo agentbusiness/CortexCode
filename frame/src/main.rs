@@ -18,6 +18,7 @@ mod home;
 mod http;
 mod hub;
 mod journal;
+mod keychain;
 mod machine;
 mod package;
 mod power;
@@ -239,6 +240,14 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
         }
     });
 
+    // The token goes to the Keychain (scripts and `cx` read it there); frame.json keeps the plumbing.
+    #[cfg(target_os = "macos")]
+    let token = {
+        keychain::store(&home.root, &token);
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let token = Some(token);
     let info = FrameInfo {
         pid: std::process::id(),
         port,

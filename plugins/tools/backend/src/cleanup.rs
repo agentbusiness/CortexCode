@@ -2,7 +2,7 @@
 //! never the model): the scratch folder `tmp/` (one-off tries) and new untracked files the turn's
 //! commands made (build output, caches, logs; seen: a C++ `build/` folder in the change's diff).
 //!
-//! Who made a file is read from the step log on disk: a new untracked file goes only when the
+//! Who made a file is read from the step log: a new untracked file goes only when the
 //! newest step that touched it is a command of this session. Kept: what any `edit` wrote, what
 //! other sessions made (agents work in the same folder at the same time; seen: one agent's turn
 //! ending removed the new files of three others), what the log does not know, files git ignores
@@ -16,7 +16,7 @@ use std::time::UNIX_EPOCH;
 
 /// Remove what the turn of `session_id` that started at `since_ms` left behind in `workspace`;
 /// returns the removed paths, relative to the workspace.
-pub fn turn_end(core: &Core, workspace: &Path, session_id: &str, since_ms: u64) -> Vec<String> {
+pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, session_id: &str, since_ms: u64) -> Vec<String> {
     let mut removed = Vec::new();
     // The files this turn edited are free for other sessions now.
     core.tree.release_session(session_id);
@@ -40,7 +40,6 @@ pub fn turn_end(core: &Core, workspace: &Path, session_id: &str, since_ms: u64) 
     if core.approved(session_id).iter().any(|class| class.starts_with(cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX)) {
         return removed;
     }
-    let log = core.steps.open(workspace);
     for path in new_untracked(workspace, since_ms) {
         let relative = path.strip_prefix(workspace).map(Path::to_path_buf).unwrap_or_else(|_| path.clone());
         let name = relative.to_string_lossy();

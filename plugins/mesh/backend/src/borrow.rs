@@ -46,13 +46,26 @@ pub struct Client {
 #[derive(serde::Deserialize)]
 pub(crate) struct FrameInfo {
     pub port: u16,
+    #[serde(default)]
     pub token: String,
 }
 
+/// This node's frame: its port from `run/frame.json`; its token from `CORTEX_FRAME_TOKEN`, which
+/// the frame gives this plugin when it keeps the token out of the file (in the Keychain), else
+/// from the file.
 pub(crate) fn frame_info(home: &std::path::Path) -> Result<FrameInfo, String> {
     let path = home.join("run").join("frame.json");
     let text = std::fs::read_to_string(&path).map_err(|error| format!("the frame is not running ({}: {error})", path.display()))?;
-    serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))
+    let mut info: FrameInfo = serde_json::from_str(&text).map_err(|error| format!("{} is not valid: {error}", path.display()))?;
+    if let Ok(token) = std::env::var("CORTEX_FRAME_TOKEN")
+        && !token.is_empty()
+    {
+        info.token = token;
+    }
+    if info.token.is_empty() {
+        return Err("the frame gave the mesh no token".to_owned());
+    }
+    Ok(info)
 }
 
 impl Mesh {

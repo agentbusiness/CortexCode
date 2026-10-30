@@ -88,7 +88,7 @@ fn git_program() -> Option<std::path::PathBuf> {
 
 fn repository_id(root: &str) -> Option<String> {
     let git = git_program()?;
-    let output = std::process::Command::new(git).arg("-C").arg(root).args(["rev-list", "--max-parents=0", "HEAD"]).output().ok()?;
+    let output = std::process::Command::new(git).env_remove("CORTEX_FRAME_TOKEN").arg("-C").arg(root).args(["rev-list", "--max-parents=0", "HEAD"]).output().ok()?;
     if !output.status.success() {
         return None;
     }

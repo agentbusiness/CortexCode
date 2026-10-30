@@ -5,7 +5,7 @@ use cc_protocol::contracts::frame::{PluginUnit, topics as frame_topics};
 use cc_protocol::contracts::source::{BackupSetParams, DiffParams, HistoryParams, RestoreParams, RevertParams, RevertResult, ShareParams, Status, methods};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, parse_params, run_plugin, to_value};
 use cc_source::service::{Service, rpc};
-use cc_source::{PROVIDES, backup, live, probe, share, storage, watch};
+use cc_source::{PROVIDES, backup, live, probe, record, share, storage, watch};
 use git2::Oid;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -48,9 +48,17 @@ async fn revert(service: &Arc<Service>, ctx: &Ctx, params: RevertParams) -> Resu
     }
     let target = params.commit.clone();
     let (commit, _) = service.git(move |repo| live::revert(repo, &target)).await?;
+    record_now(service).await;
     service.changed(ctx);
     backup::after_change(service, ctx).await;
     Ok(RevertResult { commit: commit.to_string() })
+}
+
+/// Record a change in the graph before listeners refetch (the watch loop records it otherwise).
+async fn record_now(service: &Arc<Service>) {
+    if let Err(error) = record::sync(service, true).await {
+        tracing::warn!(error = %error.message, "the change is not recorded in the graph yet; the next look at the live folder records it");
+    }
 }
 
 async fn diff(service: &Arc<Service>, params: DiffParams) -> Result<Value, RpcError> {
@@ -73,7 +81,7 @@ impl Plugin for SourcePlugin {
                     if !live::is_managed(&service.live_dir) {
                         return to_value(&cc_protocol::contracts::source::History { changes: Vec::new() });
                     }
-                    let mut changes = service.git(move |repo| live::history(repo, limit)).await?;
+                    let mut changes = record::history(&service, limit).await?;
                     let shared = service.settings()?.shared;
                     for change in &mut changes {
                         change.shared = shared.iter().find(|s| s.commits.contains(&change.commit)).map(|s| s.url.clone());
@@ -108,6 +116,15 @@ impl Plugin for SourcePlugin {
                 methods::RELEASE_STATUS => to_value(&cc_source::release::status(&service, parse_params(call.params)?).await?),
                 methods::RELEASE_MERGE => to_value(&cc_source::release::merge(&service, &ctx, parse_params(call.params)?).await?),
                 methods::RELEASE_RESET => to_value(&cc_source::release::reset(&service, &ctx, parse_params(call.params)?).await?),
+                methods::FILE_HISTORY => to_value(&record::file_history(&service, parse_params(call.params)?).await?),
+                methods::FILE_RESTORE => {
+                    let restored = record::file_restore(&service, parse_params(call.params)?).await?;
+                    if restored.state != "up_to_date" {
+                        service.changed(&ctx);
+                        backup::after_change(&service, &ctx).await;
+                    }
+                    to_value(&restored)
+                }
                 other => Err(RpcError::new(codes::UNKNOWN_METHOD, format!("cc-source does not serve `{other}`"))),
             }
         })
@@ -125,8 +142,8 @@ impl Plugin for SourcePlugin {
         let (service, stop) = (self.service.clone(), self.stop.clone());
         Box::pin(async move {
             tokio::spawn(async move {
-                if let Err(error) = service.load_stored(&ctx).await {
-                    tracing::error!(%error.message, "the settings could not be read from the store");
+                if let Err(error) = service.load_settings(&ctx).await {
+                    tracing::error!(%error.message, "the settings could not be read from the graph; changes are still written");
                 }
                 // The start-up merge publishes `source.changed`: plugins that read live data (they
                 // started beside this one) read it again.

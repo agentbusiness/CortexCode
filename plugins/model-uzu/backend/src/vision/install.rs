@@ -7,12 +7,16 @@
 //!    contiguous byte range.
 //! 2. A new header with just those tensors (offsets rebased, keys sorted, so the file is
 //!    deterministic), then the tensor bytes appended by one range request, resumable from a
-//!    `.part` file.
+//!    `.part` file. A complete file already in place is kept.
 //! 3. The assembled file's SHA-256 is computed, compared with the pinned value when one is pinned,
-//!    and recorded (`.cortexcode-verified.json`) with a `manifest.json` describing the source.
-//!    `config.json` and `preprocessor_config.json` are fetched whole and checked by git blob id.
+//!    and recorded in the graph with an install record describing the source (`records`:
+//!    `(:VisionInstall)-[:ON]->(:Machine)`). `config.json` and `preprocessor_config.json` are
+//!    fetched whole and checked by git blob id.
+//!
+//! The tower's files are bytes and stay files; the install record is the graph's.
 
 use super::{DIR, SmallFile, TowerSpec, WEIGHTS};
+use crate::records::VisionInstall;
 use crate::variants::{self, FileSpec, HUGGING_FACE, Progress, VerifyCache};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -25,13 +29,15 @@ pub fn tower_dir(variant_dir: &Path) -> PathBuf {
     variant_dir.join(DIR)
 }
 
-/// Every file present at its expected size (verification is separate).
-pub fn installed(tower: &TowerSpec, variant_dir: &Path) -> bool {
+/// Every file present at its expected size, and the install recorded in the graph (verification
+/// is separate). While the graph has not been read (the memory plugin did not answer), the files
+/// decide.
+pub fn installed(tower: &TowerSpec, variant_dir: &Path, cache: &VerifyCache) -> bool {
     let dir = tower_dir(variant_dir);
     let sized = |name: &str, bytes: Option<u64>| {
         std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file() && bytes.is_none_or(|bytes| meta.len() == bytes))
     };
-    tower.files.iter().all(|file| sized(file.path, Some(file.bytes))) && sized(WEIGHTS, None) && sized("manifest.json", None)
+    tower.files.iter().all(|file| sized(file.path, Some(file.bytes))) && sized(WEIGHTS, None) && cache.vision_installed(&dir) != Some(false)
 }
 
 fn small_spec(file: &SmallFile) -> FileSpec {
@@ -169,6 +175,7 @@ pub async fn install_from(
     cache: &VerifyCache,
     on_progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<PathBuf, String> {
+    cache.wait().await;
     let dir = tower_dir(variant_dir);
     std::fs::create_dir_all(&dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let total = tower.data_bytes + tower.files.iter().map(|file| file.bytes).sum::<u64>();
@@ -192,17 +199,20 @@ pub async fn install_from(
         done += file.bytes;
     }
     let weights = dir.join(WEIGHTS);
-    if !weights.exists() || !dir.join("manifest.json").exists() {
-        fetch_tensors(base, tower, &dir, &|bytes, detail| report("download", WEIGHTS, done + bytes, detail)).await?;
-    }
+    // No install record (and the graph read): the source is fetched again; a complete file in
+    // place is kept, only its header is read.
+    let install = if !weights.exists() || cache.vision_installed(&dir) == Some(false) {
+        Some(fetch_tensors(base, tower, &dir, &|bytes, detail| report("download", WEIGHTS, done + bytes, detail)).await?)
+    } else {
+        None
+    };
     // Verify: the pinned digest when there is one (the record makes later checks instant).
     let digest = {
         let path = weights.clone();
-        let cache_path = cache.path().to_path_buf();
+        let cache = cache.clone();
         let data_bytes = tower.data_bytes;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
         let task = tokio::task::spawn_blocking(move || {
-            let cache = VerifyCache::at(cache_path);
             if let Some(recorded) = cache.recorded(&path) {
                 return Ok(recorded);
             }
@@ -225,18 +235,18 @@ pub async fn install_from(
         report("failed", WEIGHTS, done, message.clone());
         return Err(message);
     }
-    let manifest_path = dir.join("manifest.json");
-    let mut manifest: Value = std::fs::read(&manifest_path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(json!({}));
-    manifest["sha256"] = Value::String(digest.trim_start_matches("sha256:").to_owned());
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("cannot write {}: {error}", manifest_path.display()))?;
+    if let Some(mut install) = install {
+        install.sha256 = digest.trim_start_matches("sha256:").to_owned();
+        cache.record_vision(install);
+    }
     report("done", WEIGHTS, total, dir.display().to_string());
     Ok(dir)
 }
 
 /// Fetch the shard header, select the vision tensors and append their bytes to a resumable
-/// `.part` file that becomes `vision/model.safetensors`.
-async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn Fn(u64, String) + Send + Sync)) -> Result<(), String> {
+/// `.part` file that becomes `vision/model.safetensors` (a complete file in place is kept). The
+/// install record describes the source; its digest is added once verified.
+async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn Fn(u64, String) + Send + Sync)) -> Result<VisionInstall, String> {
     let client = client()?;
     let shard = url(base, tower, tower.shard);
     let length = u64::from_le_bytes(
@@ -249,14 +259,27 @@ async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn 
     let selection = select(tower, &header)?;
     let data_start = 8 + length + selection.data.0;
     let data_end = 8 + length + selection.data.1;
+    let install = VisionInstall {
+        dir: dir.to_path_buf(),
+        repo: tower.repo.to_owned(),
+        revision: tower.revision.to_owned(),
+        shard: tower.shard.to_owned(),
+        shard_bytes: tower.shard_bytes,
+        shard_sha256: tower.shard_sha256.to_owned(),
+        shard_range: [data_start, data_end],
+        prefix: tower.prefix.to_owned(),
+        tensors: selection.tensors as u64,
+        parameters: selection.parameters,
+        header_bytes: selection.prefix.len() as u64,
+        sha256: String::new(),
+    };
+    if starts_with(&dir.join(WEIGHTS), &selection.prefix, selection.prefix.len() as u64 + (data_end - data_start)) {
+        return Ok(install);
+    }
     let part = dir.join(format!("{WEIGHTS}.part"));
     // A part file is valid only when it starts with this exact header.
     let existing = std::fs::metadata(&part).ok().map(|metadata| metadata.len());
-    let reusable = existing.is_some_and(|len| len >= selection.prefix.len() as u64)
-        && std::fs::File::open(&part).ok().is_some_and(|mut file| {
-            let mut head = vec![0u8; selection.prefix.len()];
-            std::io::Read::read_exact(&mut file, &mut head).is_ok() && head == selection.prefix
-        });
+    let reusable = existing.is_some_and(|len| len >= selection.prefix.len() as u64) && starts_with(&part, &selection.prefix, 0);
     if !reusable {
         std::fs::write(&part, &selection.prefix).map_err(|error| format!("cannot write {}: {error}", part.display()))?;
     }
@@ -308,19 +331,17 @@ async fn fetch_tensors(base: &str, tower: &TowerSpec, dir: &Path, report: &(dyn 
             Err(error) => return Err(error),
         }
     }
-    let manifest = json!({
-        "repo": tower.repo,
-        "revision": tower.revision,
-        "shard": tower.shard,
-        "shard_bytes": tower.shard_bytes,
-        "shard_sha256": tower.shard_sha256,
-        "shard_range": [data_start, data_end],
-        "prefix": tower.prefix,
-        "tensors": selection.tensors,
-        "parameters": selection.parameters,
-        "header_bytes": selection.prefix.len(),
-    });
-    std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("cannot write the manifest: {error}"))?;
-    std::fs::rename(&part, dir.join(WEIGHTS)).map_err(|error| format!("cannot move {} into place: {error}", part.display()))
+    std::fs::rename(&part, dir.join(WEIGHTS)).map_err(|error| format!("cannot move {} into place: {error}", part.display()))?;
+    Ok(install)
+}
+
+/// Whether the file starts with `head` (and, when `bytes` is not 0, has exactly that size).
+fn starts_with(path: &Path, head: &[u8], bytes: u64) -> bool {
+    if bytes != 0 && std::fs::metadata(path).ok().map(|meta| meta.len()) != Some(bytes) {
+        return false;
+    }
+    std::fs::File::open(path).ok().is_some_and(|mut file| {
+        let mut start = vec![0u8; head.len()];
+        std::io::Read::read_exact(&mut file, &mut start).is_ok() && start == head
+    })
 }

@@ -1,7 +1,11 @@
-//! This node's key: one Ed25519 key per installation, made on first start and kept in
-//! `<home>/mesh/node.key`, readable by the owner only (like an SSH key: the home folder is the
-//! person's, and a file asks nobody; the Keychain would ask the person again at every version of
-//! this plugin, since each is another executable). The public key is the node's id and address.
+//! This node's key: one Ed25519 key per installation, made on first start. On macOS it is kept in
+//! the Keychain, a generic password of the service `<app> mesh identity` whose account is the
+//! home folder (two homes are two nodes). A `<home>/mesh/node.key` an older version left is moved
+//! into the Keychain once and deleted, so the node id stays the same. Elsewhere the key stays in
+//! that file, readable by the owner only.
+//!
+//! The item is made and read through `/usr/bin/security` ([`crate::keychain`]), so a new version
+//! of this plugin (another executable) does not make macOS ask the person again.
 
 use iroh::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
@@ -24,29 +28,83 @@ impl Identity {
         self.secret.sign(message).to_bytes().to_vec()
     }
 
-    /// Load the key, or make and keep one.
-    pub fn load_or_create(home: &Path) -> Identity {
+    /// Load the key, or make and keep one. An error when a kept key cannot be read: a new key
+    /// would be another node, so none is made then.
+    pub fn load_or_create(home: &Path) -> Result<Identity, String> {
         let file = key_file(home);
-        if let Ok(text) = std::fs::read_to_string(&file)
-            && let Ok(bytes) = hex::decode(text.trim())
-            && bytes.len() == 32
+        let from_file = std::fs::read_to_string(&file).ok().and_then(|text| parse(&text));
+        #[cfg(target_os = "macos")]
         {
-            let mut array = [0_u8; 32];
-            array.copy_from_slice(&bytes);
-            return Identity { secret: SecretKey::from_bytes(&array) };
+            let account = home.display().to_string();
+            match keychain::get(&account) {
+                Ok(Some(text)) => {
+                    let secret = parse(&text).ok_or("the mesh identity in the Keychain is not a key")?;
+                    // A file the move left behind (the same key) goes now.
+                    if from_file.as_ref().is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    Ok(Identity { secret })
+                }
+                Ok(None) => {
+                    let secret = from_file.unwrap_or_else(SecretKey::generate);
+                    let text = hex::encode(secret.to_bytes());
+                    keychain::set(&account, &text)?;
+                    // The file is deleted only once the Keychain gives the same key back.
+                    if keychain::get(&account).ok().flatten().as_deref() == Some(text.as_str()) {
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    Ok(Identity { secret })
+                }
+                // The person denied access, or the Keychain is locked: the old file still works.
+                Err(error) => from_file.map(|secret| Identity { secret }).ok_or(error),
+            }
         }
-        let secret = SecretKey::generate();
-        let _ = std::fs::create_dir_all(file.parent().unwrap_or(home));
-        if std::fs::write(&file, hex::encode(secret.to_bytes())).is_ok() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(secret) = from_file {
+                return Ok(Identity { secret });
+            }
+            let secret = SecretKey::generate();
+            let _ = std::fs::create_dir_all(file.parent().unwrap_or(home));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&file)
+                .and_then(|mut out| out.write_all(hex::encode(secret.to_bytes()).as_bytes()))
+                .map_err(|error| format!("cannot keep the mesh identity in {}: {error}", file.display()))?;
+            Ok(Identity { secret })
         }
-        Identity { secret }
     }
+}
+
+fn parse(text: &str) -> Option<SecretKey> {
+    let bytes = hex::decode(text.trim()).ok()?;
+    let array = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+    Some(SecretKey::from_bytes(&array))
 }
 
 fn key_file(home: &Path) -> PathBuf {
     home.join("mesh").join("node.key")
+}
+
+#[cfg(target_os = "macos")]
+mod keychain {
+    fn service() -> String {
+        format!("{} mesh identity", crate::APP)
+    }
+
+    /// `None` when there is no such item.
+    pub fn get(account: &str) -> Result<Option<String>, String> {
+        crate::keychain::get(&service(), account).map_err(|error| format!("cannot read the mesh identity from the Keychain: {error}"))
+    }
+
+    pub fn set(account: &str, secret: &str) -> Result<(), String> {
+        crate::keychain::set(&service(), account, secret).map_err(|error| format!("cannot keep the mesh identity in the Keychain: {error}"))
+    }
 }
 
 /// Verify an Ed25519 signature by a node id.

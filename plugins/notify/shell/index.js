@@ -13,6 +13,7 @@
  */
 
 import { app, dialog, nativeImage, shell as electronShell } from 'electron';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -28,6 +29,21 @@ const NOTIFICATION_SETTINGS = 'x-apple.systempreferences:com.apple.Notifications
 const NOTIFY_BUNDLE = 'dev.cortexcode.notify';
 
 /**
+ * The frame's API token from the macOS Keychain (the frame writes it there at every start; on
+ * other systems frame.json carries it). `/usr/bin/security` made the item, so nothing asks.
+ * @param {string} home
+ * @returns {string | null}
+ */
+function keychainToken(home) {
+  try {
+    const out = execFileSync('/usr/bin/security', ['find-generic-password', '-s', 'CortexCode frame token', '-a', home, '-w'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.replace(/\n$/, '') || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Where the frame is: the shell's environment, else <home>/run/frame.json (read on every attempt,
  * since a restarted frame has a new port and token).
  * @param {string} home
@@ -39,7 +55,8 @@ function frameAddress(home) {
     }
     try {
       const info = JSON.parse(fs.readFileSync(path.join(home, 'run', 'frame.json'), 'utf8'));
-      if (info?.port && info?.token) return { url: `http://127.0.0.1:${info.port}`, token: String(info.token) };
+      const token = info?.token || keychainToken(home);
+      if (info?.port && token) return { url: `http://127.0.0.1:${info.port}`, token: String(token) };
     } catch {
       // The frame is not up yet.
     }

@@ -4,6 +4,7 @@
 //! through the Electron shell when it is connected and natively from the backend otherwise.
 
 pub mod derive;
+pub mod graph;
 pub mod history;
 pub mod native;
 pub mod prefs;

@@ -13,8 +13,20 @@
 //! - A newer frame is downloaded and staged; it runs from the next start ("Restart to update").
 //! - A reset (`update.reset`, Settings > Plugins) puts every plugin back to the latest at once,
 //!   the user's own builds and changes included, after one confirmation.
+//!
+//! What it keeps lives in the app's graph (WORKSPACE layer), read back when it connects:
+//!
+//! ```text
+//! (:UpdateFailure {key: plugin, name, version, error, ms, seen, failed_under})-[:ON]->(:Machine)
+//!     a version that could not start; retired when the failure is over
+//! stream `updates`    every outcome {plugin, version, ms, outcome, detail}; the status shows the newest
+//! ```
+//!
+//! The `updater.json` file of earlier versions is moved into the graph once and deleted. Files that
+//! stay: downloaded packages under `work/` while they install (bytes, removed after).
 
 use crate::fetch;
+use crate::graph::{self, Graph};
 use cc_protocol::contracts::chatflow::{RunningResult, verbs as chatflow_verbs};
 use cc_protocol::contracts::frame::{
     BundledResult, InstallManyParams, InstallManyResult, InstallParams, PackageSwapResult, PluginListResult, UpdateStageParams,
@@ -31,7 +43,7 @@ use cc_protocol::contracts::update::{
 use cc_protocol::release::{self, Asset, Catalog, PluginEntry};
 use cc_protocol::{Ctx, RpcError, parse_params, to_value};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -47,8 +59,13 @@ const FIRST_CHECK: Duration = Duration::from_secs(30);
 const WAITING_CHECK: Duration = Duration::from_secs(60);
 /// Recent outcomes kept for the band.
 const RECENT: usize = 20;
-/// What the updater remembers between starts.
+/// The file earlier versions kept their state in (moved into the graph once, then deleted).
 const SAVED: &str = "updater.json";
+/// The graph's label of a version that could not start.
+const FAILURE: &str = "UpdateFailure";
+/// The stream of update outcomes, and how long it is kept.
+const UPDATES: &str = "updates";
+const UPDATES_DAYS: u32 = 365;
 /// The frame's row in the round.
 const FRAME: &str = "frame";
 
@@ -77,21 +94,20 @@ impl Config {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// The versions that could not start, as the graph keeps them (`UpdateFailure`).
+#[derive(Debug, Default, Clone)]
 struct Saved {
-    /// Plugin -> the release the user chose to stay off ("Keep mine", or a merge that clashed).
-    #[serde(default)]
-    kept: BTreeMap<String, String>,
-    /// Plugin -> the version the user chose to use (or merge), until it is applied.
-    #[serde(default)]
-    approved: BTreeMap<String, String>,
-    /// Plugin -> the version the user chose to use with their changes merged in, not dropped.
-    #[serde(default)]
-    merged: BTreeMap<String, String>,
     /// Plugin -> the version that could not start (not tried again under the same frame).
-    #[serde(default)]
     failed: BTreeMap<String, Failed>,
     /// Plugin -> the frame version that refused its failed version: another frame tries it again.
+    failed_under: BTreeMap<String, String>,
+}
+
+/// The state file of earlier versions (only what is moved into the graph).
+#[derive(Debug, Default, Deserialize)]
+struct OldSaved {
+    #[serde(default)]
+    failed: BTreeMap<String, Failed>,
     #[serde(default)]
     failed_under: BTreeMap<String, String>,
     #[serde(default)]
@@ -113,6 +129,8 @@ pub struct Updater {
     config: Mutex<Config>,
     status: Mutex<Status>,
     saved: Mutex<Saved>,
+    /// Where the failures and outcomes are kept.
+    graph: Graph,
     ctx: OnceLock<Ctx>,
     /// The last catalog lookup (or why it failed), so the status line in Settings > Plugins does
     /// not go to the network every time it is drawn.
@@ -141,13 +159,13 @@ fn now_ms() -> u64 {
 
 impl Updater {
     pub fn new(data_dir: PathBuf) -> Arc<Updater> {
-        let saved: Saved = std::fs::read(data_dir.join(SAVED)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let status = Status { enabled: true, state: "idle".into(), recent: saved.recent.clone(), failed: saved.failed.values().cloned().collect(), ..Status::default() };
+        let status = Status { enabled: true, state: "idle".into(), ..Status::default() };
         Arc::new(Updater {
             data_dir,
             config: Mutex::new(Config::from_value(&Value::Null)),
             status: Mutex::new(status),
-            saved: Mutex::new(saved),
+            saved: Mutex::new(Saved::default()),
+            graph: Graph::new(),
             ctx: OnceLock::new(),
             catalog: Mutex::new(None),
             checking: AtomicBool::new(false),
@@ -158,13 +176,108 @@ impl Updater {
         })
     }
 
-    /// The context and configuration arrive with the frame's hello acknowledgement.
-    pub fn attach(&self, ctx: &Ctx) {
+    /// The context and configuration arrive with the frame's hello acknowledgement; then what the
+    /// graph keeps is read back.
+    pub fn attach(self: &Arc<Self>, ctx: &Ctx) {
         if self.ctx.set(ctx.clone()).is_ok() {
             let config = Config::from_value(&ctx.config());
             self.with_status(|status| status.enabled = config.enabled);
             *self.config.lock().unwrap_or_else(|p| p.into_inner()) = config;
+            self.graph.start(graph::ctx_caller(ctx));
+            let updater = self.clone();
+            tokio::spawn(async move { updater.load().await });
         }
+    }
+
+    /// Move the old state file into the graph (once), then read the failures and the newest
+    /// outcomes back. What changed meanwhile in memory stays.
+    async fn load(&self) {
+        let path = self.data_dir.join(SAVED);
+        if let Ok(bytes) = std::fs::read(&path) {
+            match serde_json::from_slice::<OldSaved>(&bytes) {
+                Ok(old) => {
+                    for (plugin, failed) in &old.failed {
+                        self.put_failure(failed, old.failed_under.get(plugin).map(String::as_str).unwrap_or_default());
+                    }
+                    let outcomes = old.recent.iter().rev().filter_map(|applied| serde_json::to_value(applied).ok()).collect();
+                    self.graph.append(UPDATES, outcomes, Some(UPDATES_DAYS));
+                    if self.graph.flush().await {
+                        let _ = std::fs::remove_file(&path);
+                        let _ = std::fs::remove_file(self.data_dir.join(format!(".{SAVED}.tmp")));
+                        tracing::info!("the updater's state file moved into the graph");
+                    } else {
+                        tracing::warn!(file = %path.display(), "the updater's state file was not moved into the graph; it is kept and tried again at the next start");
+                    }
+                }
+                Err(error) => tracing::warn!(file = %path.display(), %error, "the updater's state file is not valid JSON; it is left as it is"),
+            }
+        }
+        // Changes made meanwhile are written first, so the read follows them.
+        self.graph.flush().await;
+        let cypher = format!("MATCH (f:{FAILURE}) WHERE f.ended_ms IS NULL RETURN f");
+        match self.graph.nodes(&cypher, serde_json::Map::new(), 5000).await {
+            Ok(nodes) => {
+                let all = self.with_saved(|saved| {
+                    for props in nodes {
+                        let plugin = graph::text(&props, "key");
+                        if plugin.is_empty() || saved.failed.contains_key(&plugin) {
+                            continue;
+                        }
+                        let failed = Failed {
+                            plugin: plugin.clone(),
+                            name: graph::text(&props, "name"),
+                            version: graph::text(&props, "version"),
+                            error: graph::text(&props, "error"),
+                            ms: graph::number(&props, "ms").unwrap_or_default(),
+                            seen: graph::flag(&props, "seen"),
+                        };
+                        saved.failed_under.insert(plugin.clone(), graph::text(&props, "failed_under"));
+                        saved.failed.insert(plugin, failed);
+                    }
+                    saved.failed.values().cloned().collect::<Vec<_>>()
+                });
+                self.with_status(|status| status.failed = all);
+            }
+            Err(error) => tracing::warn!(error = %error.message, "the failed updates were not read from the graph"),
+        }
+        match self.graph.newest(UPDATES, RECENT as u64).await {
+            Ok(entries) => self.with_status(|status| {
+                let known: BTreeSet<(String, String, u64)> = status.recent.iter().map(|a| (a.plugin.clone(), a.version.clone(), a.ms)).collect();
+                let older = entries
+                    .into_iter()
+                    .rev()
+                    .filter_map(|entry| serde_json::from_value::<Applied>(entry.value).ok())
+                    .filter(|a| !known.contains(&(a.plugin.clone(), a.version.clone(), a.ms)));
+                status.recent.extend(older);
+                status.recent.sort_by(|a, b| b.ms.cmp(&a.ms));
+                status.recent.truncate(RECENT);
+            }),
+            Err(error) => tracing::warn!(error = %error.message, "the recent updates were not read from the graph"),
+        }
+    }
+
+    /// Write a failure to the graph (a retired one comes back).
+    fn put_failure(&self, failed: &Failed, failed_under: &str) {
+        let props = graph::props([
+            ("name", json!(failed.name)),
+            ("version", json!(failed.version)),
+            ("error", json!(failed.error)),
+            ("ms", json!(failed.ms)),
+            ("seen", json!(failed.seen)),
+            ("failed_under", json!(failed_under)),
+        ]);
+        self.graph.put(vec![graph::node(FAILURE, &failed.plugin, props)], vec![graph::edge((FAILURE, &failed.plugin), "ON", graph::machine())]);
+    }
+
+    /// The failures of `plugins` are over: dropped from memory, retired in the graph.
+    fn failures_over(&self, plugins: &[String], reason: &str) -> Vec<Failed> {
+        let (gone, all) = self.with_saved(|saved| {
+            let gone: Vec<String> = plugins.iter().filter(|plugin| saved.failed.remove(*plugin).is_some()).cloned().collect();
+            saved.failed_under.retain(|plugin, _| saved.failed.contains_key(plugin));
+            (gone, saved.failed.values().cloned().collect::<Vec<_>>())
+        });
+        self.graph.retire(gone.iter().map(|plugin| graph::at(FAILURE, plugin)).collect(), reason);
+        all
     }
 
     fn config(&self) -> Config {
@@ -195,32 +308,19 @@ impl Updater {
     }
 
     fn with_saved<T>(&self, change: impl FnOnce(&mut Saved) -> T) -> T {
-        let (out, snapshot) = {
-            let mut saved = self.saved.lock().unwrap_or_else(|p| p.into_inner());
-            let out = change(&mut saved);
-            (out, saved.clone())
-        };
-        let path = self.data_dir.join(SAVED);
-        let tmp = self.data_dir.join(format!(".{SAVED}.tmp"));
-        let written = serde_json::to_vec_pretty(&snapshot)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| std::fs::write(&tmp, bytes))
-            .and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(error) = written {
-            tracing::warn!(%error, "cannot save the updater's state");
-        }
-        out
+        change(&mut self.saved.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     fn record(&self, plugin: &str, version: &str, outcome: &str, detail: impl Into<String>) -> Applied {
         let applied = Applied { plugin: plugin.into(), version: version.into(), ms: now_ms(), outcome: outcome.into(), detail: detail.into() };
         tracing::info!(plugin, version, outcome, detail = %applied.detail, "update");
-        let recent = self.with_saved(|saved| {
-            saved.recent.insert(0, applied.clone());
-            saved.recent.truncate(RECENT);
-            saved.recent.clone()
+        if let Ok(value) = serde_json::to_value(&applied) {
+            self.graph.append(UPDATES, vec![value], Some(UPDATES_DAYS));
+        }
+        self.with_status(|status| {
+            status.recent.insert(0, applied.clone());
+            status.recent.truncate(RECENT);
         });
-        self.with_status(|status| status.recent = recent);
         let state = match outcome {
             "failed" => "failed",
             "at_restart" => "at_restart",
@@ -290,12 +390,16 @@ impl Updater {
             }
             methods::DISMISS => {
                 let params: DismissParams = parse_params(params)?;
-                let failed = self.with_saved(|saved| {
-                    if let Some(failed) = saved.failed.get_mut(&params.plugin) {
+                let (seen, failed) = self.with_saved(|saved| {
+                    let seen = saved.failed.get_mut(&params.plugin).map(|failed| {
                         failed.seen = true;
-                    }
-                    saved.failed.values().cloned().collect::<Vec<_>>()
+                        (failed.clone(), saved.failed_under.get(&params.plugin).cloned().unwrap_or_default())
+                    });
+                    (seen, saved.failed.values().cloned().collect::<Vec<_>>())
                 });
+                if let Some((failed, under)) = seen {
+                    self.put_failure(&failed, &under);
+                }
                 self.with_status(|status| status.failed = failed);
                 to_value(&self.status())
             }
@@ -475,12 +579,8 @@ impl Updater {
                 outcomes.push(self.record(&id, &version, "failed", error));
                 continue;
             }
-            self.with_saved(|saved| {
-                saved.kept.remove(&id);
-                saved.approved.remove(&id);
-                saved.merged.remove(&id);
-                saved.failed.remove(&id);
-            });
+            let failed = self.failures_over(std::slice::from_ref(&id), "reset");
+            self.with_status(|status| status.failed = failed);
             if item.action == reset_actions::INSTALL {
                 packages.push((item, package));
             } else {
@@ -542,21 +642,9 @@ impl Updater {
         }
         match params.choice.as_str() {
             choices::KEEP => {
-                self.with_saved(|saved| saved.kept.insert(params.plugin.clone(), params.version.clone()));
                 self.record(&params.plugin, &params.version, "kept", "Your version stays; the next release asks again.");
             }
-            choices::USE => {
-                self.with_saved(|saved| {
-                    saved.approved.insert(params.plugin.clone(), params.version.clone());
-                    saved.merged.remove(&params.plugin);
-                });
-            }
-            choices::MERGE => {
-                self.with_saved(|saved| {
-                    saved.approved.insert(params.plugin.clone(), params.version.clone());
-                    saved.merged.insert(params.plugin.clone(), params.version.clone());
-                });
-            }
+            choices::USE | choices::MERGE => {}
             other => return Err(RpcError::invalid_params(format!("choice `{other}`: give `{}`, `{}` or `{}`", choices::USE, choices::KEEP, choices::MERGE))),
         }
         self.with_status(|status| status.pending.retain(|pending| pending.plugin != params.plugin));
@@ -780,11 +868,7 @@ impl Updater {
                 .collect()
         };
         if !stale.is_empty() {
-            let all = self.with_saved(|saved| {
-                saved.failed.retain(|plugin, _| !stale.contains(plugin));
-                saved.failed_under.retain(|plugin, _| saved.failed.contains_key(plugin));
-                saved.failed.values().cloned().collect::<Vec<_>>()
-            });
+            let all = self.failures_over(&stale, "over");
             self.with_status(|status| status.failed = all);
         }
         // Every plugin runs the latest release: whatever differs from it installs, every check (a
@@ -852,13 +936,9 @@ impl Updater {
     }
 
     fn installed(&self, plan: &Planned) {
-        self.with_saved(|saved| {
-            saved.approved.remove(&plan.id);
-            saved.merged.remove(&plan.id);
-            saved.failed.remove(&plan.id);
-        });
+        let failed = self.failures_over(std::slice::from_ref(&plan.id), "installed");
         self.record(&plan.id, &plan.version, "installed", "");
-        self.with_status(|status| status.failed.retain(|failed| failed.plugin != plan.id));
+        self.with_status(|status| status.failed = failed);
     }
 
     /// The frame keeps the package for its restart (a frame update is staged).
@@ -872,8 +952,8 @@ impl Updater {
     fn could_not_start(&self, plan: &Planned, error: String) {
         let failed = Failed { plugin: plan.id.clone(), name: plan.name.clone(), version: plan.version.clone(), error: error.clone(), ms: now_ms(), seen: false };
         let frame = self.running_frame();
+        self.put_failure(&failed, &frame);
         let all = self.with_saved(|saved| {
-            saved.approved.remove(&plan.id);
             saved.failed.insert(plan.id.clone(), failed);
             saved.failed_under.insert(plan.id.clone(), frame);
             saved.failed.values().cloned().collect::<Vec<_>>()

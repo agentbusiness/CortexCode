@@ -28,7 +28,7 @@ pub const UPSTREAM: &str = "refs/cortexcode/upstream";
 
 type Result<T> = std::result::Result<T, String>;
 
-fn err(error: git2::Error) -> String {
+pub(crate) fn err(error: git2::Error) -> String {
     error.message().to_owned()
 }
 
@@ -588,7 +588,7 @@ pub fn fetch(repo: &Repository, url: &str, credentials: Option<(&str, &str)>, re
 
 /// The shipped tree a branch's changes were made on: the `Shipped-Tree` trailer of its newest
 /// shipped, update or restore commit (first parents).
-fn shipped_base(repo: &Repository, tip: Oid) -> Result<Oid> {
+pub fn shipped_base(repo: &Repository, tip: Oid) -> Result<Oid> {
     let mut commit = repo.find_commit(tip).map_err(err)?;
     loop {
         let (_, trailers) = parse_message(commit.message().unwrap_or_default());

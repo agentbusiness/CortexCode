@@ -64,8 +64,15 @@ delivery, decided at delivery time from the latest fresh focus report:
 - **Activation**: a click comes back as `notify.activated` (from the shell or the notification
   app); cc-notify publishes `notify.activate {id, action, target, ...}` for the UI to open the
   target, and the shell module brings the window forward. A click while no UI is connected opens
-  the UI (`frame.ui.open`) and is handed to it once its deliverer attaches; a click while
-  CortexCode is not running is spooled by the notification app and routed at the next start.
+  the UI (`frame.ui.open`) and is handed to it once its deliverer attaches. A click while
+  CortexCode is not running is spooled by the notification app (`activations.jsonl` in the
+  plugin's data folder: the app runs without CortexCode and cannot reach the graph). At the next
+  start cc-notify publishes the spool to the memory queue `notify.activations` and removes it only
+  once the queue took it (while the memory plugin is down it stays and is tried again every 5 s,
+  and at the next start). The queue is consumed (consumer `notify`) only after the notification
+  history has been read from the graph, so a click always finds its item; each message is acked
+  after it was routed, and one naming a notification the history does not know is acked with a
+  log line.
 
 ## Delivering to macOS
 

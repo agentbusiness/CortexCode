@@ -19,7 +19,7 @@ name = "cc-updater"
 path = "src/main.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["chatflow", "release", "source", "update"] }
+cc-protocol = { path = "../../../protocol", features = ["chatflow", "memory", "release", "source", "update"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }

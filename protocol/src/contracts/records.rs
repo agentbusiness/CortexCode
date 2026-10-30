@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod methods {
-    /// Settings in the main project, as a node tree (Settings -> SettingsSection -> Setting).
+    /// Settings in the main project, as a node tree (Settings -> SettingSection -> Setting); an object
+    /// value is a section with one setting per member.
     /// Paths are dotted: sections, then the key (`model.variant`, `plugins.memory.depth`).
     pub const SETTINGS_GET: &str = "memory.settings.get";
     /// Create or update one setting; sections are created on demand. A value's JSON type is fixed
@@ -17,9 +18,12 @@ pub mod methods {
     pub const APP_PROJECTS: &str = "memory.app.projects";
     /// Create or replace one project record: `{project: Project}`.
     pub const APP_PROJECT_PUT: &str = "memory.app.project.put";
-    /// Delete one project record and its settings: `{id}`. Its sessions are deleted with
-    /// [`APP_SESSIONS_DELETE`] first.
+    /// Retire one project record and delete its settings: `{id}`. Its sessions are deleted with
+    /// [`APP_SESSIONS_DELETE`] first. The record stays, retired, until the project is opened again.
     pub const APP_PROJECT_DELETE: &str = "memory.app.project.delete";
+    /// The projects deleted (retired), for plugins that start after a deletion:
+    /// `{}` -> `{projects: [ProjectDeleted]}`.
+    pub const APP_DELETED: &str = "memory.app.deleted";
     /// The app's sessions (chats and agent runs), each linked to its project: `{sessions: [Session]}`.
     pub const APP_SESSIONS: &str = "memory.app.sessions";
     /// Create or replace one session record: `{session: Session}`.
@@ -67,6 +71,12 @@ pub struct AppProjectPutParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AppProjectsResult {
     pub projects: Vec<crate::contracts::frame::Project>,
+}
+
+/// [`methods::APP_DELETED`] result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AppDeletedResult {
+    pub projects: Vec<crate::contracts::frame::ProjectDeleted>,
 }
 
 /// [`methods::APP_PROJECT_DELETE`] parameters.

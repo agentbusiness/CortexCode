@@ -3,7 +3,9 @@
 //! Started by the frame. `cc-model-uzu install <variant> [--models-dir DIR]` installs a catalog
 //! variant with its vision tower (download with resume, digest verification) without a frame;
 //! `cc-model-uzu install-vision [variant] [--models-dir DIR]` fetches the variant's vision tower
-//! (only the vision tensors of the upstream checkpoint, by HTTP range requests).
+//! (only the vision tensors of the upstream checkpoint, by HTTP range requests). Without a frame
+//! there is no graph: the digests and the vision install record are not kept, so the app hashes
+//! the files once at its next start and records the install at its next vision install.
 // `cc_protocol::RpcError` (128 bytes) is the protocol's error type for every contract method; the
 // toolchain this plugin needs (1.99) lints large `Err` variants, the repository's (1.94) does not.
 #![allow(clippy::result_large_err)]

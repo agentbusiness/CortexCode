@@ -6,6 +6,13 @@
 //! Detection is structural: a direct child directory of the workspace holding `pyvenv.cfg` and an
 //! existing `bin/python` is a virtual environment (`.venv` is preferred: the uv/poetry/PEP 405
 //! convention for a project's own environment).
+//!
+//! ```text
+//! (:Venv {key: venv path, workspace, method, created_ms})-[:ON]->(:Machine)   an automatic venv
+//! ```
+//!
+//! The venv folder is bytes and stays. Its `.cortex-ready` file marks a finished install (the
+//! folder is usable), not a record.
 
 use crate::util;
 use std::path::{Path, PathBuf};
@@ -93,7 +100,7 @@ async fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
 /// bundled `ensurepip`; `uv venv` is tried in the workspace (honours `.python-version` and
 /// `requires-python`) and then without project discovery; `python3 -m venv` only when uv is missing
 /// or fails. Returns the method used.
-pub async fn ensure_auto(dir: &Path, workspace: &Path) -> Result<String, String> {
+pub async fn ensure_auto(graph: &crate::graph::Graph, dir: &Path, workspace: &Path) -> Result<String, String> {
     if ready(dir) {
         return Ok(std::fs::read_to_string(dir.join(READY)).unwrap_or_default().trim().to_owned());
     }
@@ -145,21 +152,78 @@ pub async fn ensure_auto(dir: &Path, workspace: &Path) -> Result<String, String>
             return Err(format!("venv created ({method}) but pip could not be installed: {error}"));
         }
     }
-    let _ = std::fs::write(dir.join(".cortex-workspace"), format!("{}\n", util::canonical_lenient(workspace).display()));
     std::fs::write(dir.join(READY), format!("{method}\n")).map_err(|error| format!("{}: {error}", dir.display()))?;
+    graph.put(venv_batch(dir, &util::canonical_lenient(workspace).to_string_lossy(), method, util::now_ms()));
     Ok(method.to_owned())
+}
+
+/// The venv's node.
+fn venv_batch(dir: &Path, workspace: &str, method: &str, created_ms: u64) -> crate::graph::Batch {
+    use crate::graph;
+    let key = dir.to_string_lossy();
+    let node = graph::node("Venv", &key, graph::props(serde_json::json!({ "workspace": workspace, "method": method, "created_ms": created_ms })));
+    graph::Batch::workspace(vec![node], vec![graph::edge(&graph::gref("Venv", &key), "ON", &graph::machine())], Vec::new())
+}
+
+/// Remove an automatic venv: the folder goes, its node is retired.
+pub fn remove(graph: &crate::graph::Graph, dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    graph.retire(vec![crate::graph::gref("Venv", &dir.to_string_lossy())], "removed");
+}
+
+/// The workspace file earlier versions wrote into each venv (`.cortex-workspace`): written to the
+/// graph as the venv's node, then removed.
+async fn import_markers(graph: &crate::graph::Graph, home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home.join("venvs")) else { return };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let marker = dir.join(".cortex-workspace");
+        let Ok(recorded) = std::fs::read_to_string(&marker) else { continue };
+        let method = std::fs::read_to_string(dir.join(READY)).unwrap_or_default().trim().to_owned();
+        let created_ms = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or_else(util::now_ms);
+        found.push((marker, venv_batch(&dir, recorded.trim_end_matches('\n'), &method, created_ms)));
+    }
+    if found.is_empty() {
+        return;
+    }
+    let batches = found.iter().map(|(_, batch)| batch.clone()).collect();
+    match graph.put_wait(batches).await {
+        Ok(()) => {
+            for (marker, _) in found {
+                let _ = std::fs::remove_file(marker);
+            }
+        }
+        Err(error) => tracing::error!(error = %error.message, "the old venv records were not written to the graph; their files are kept"),
+    }
 }
 
 /// Remove automatic venvs whose workspace no longer exists (workspaces deleted outside
 /// `tools.workspace.remove`). A venv without a recorded workspace is left alone.
-pub fn remove_orphans(home: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(home.join("venvs")) else { return 0 };
+pub async fn remove_orphans(graph: &crate::graph::Graph, home: &Path) -> usize {
+    import_markers(graph, home).await;
+    let rows = match graph
+        .query_all("MATCH (v:Venv) WHERE v.ended_ms IS NULL AND v.key > $after RETURN v, v.key AS k ORDER BY k LIMIT 5000", serde_json::json!({}), 60)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(error = %error.message, "the venvs could not be read from the graph");
+            return 0;
+        }
+    };
+    let venvs = home.join("venvs");
     let mut removed = 0;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let Ok(recorded) = std::fs::read_to_string(dir.join(".cortex-workspace")) else { continue };
-        let workspace = PathBuf::from(recorded.trim_end_matches('\n'));
-        if workspace.is_absolute() && !workspace.exists() && std::fs::remove_dir_all(&dir).is_ok() {
+    for props in rows.iter().filter_map(|row| row.first().and_then(crate::graph::properties)) {
+        let dir = PathBuf::from(crate::graph::text(props, "key"));
+        let workspace = PathBuf::from(crate::graph::text(props, "workspace"));
+        if dir.starts_with(&venvs) && workspace.is_absolute() && !workspace.exists() {
+            remove(graph, &dir);
             removed += 1;
         }
     }

@@ -1,7 +1,8 @@
 //! `cc-model-bonsai`: the CortexCode model plugin process (`model@1`) on PrismML's llama.cpp.
 //!
 //! Started by the frame. `cc-model-bonsai install <variant> [--models-dir DIR]` installs a catalog
-//! variant (download with resume, digest verification) without a frame.
+//! variant (download with resume, digest verification) without a frame. Without a frame there is
+//! no graph: the digests are not kept, so the app hashes the files once at its next start.
 
 use cc_model_bonsai::plugin::{ModelPlugin, PROVIDES};
 use cc_model_bonsai::runtime::expand_home;

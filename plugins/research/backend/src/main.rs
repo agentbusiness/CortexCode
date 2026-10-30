@@ -47,8 +47,11 @@ impl Plugin for ResearchPlugin {
     }
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
-        self.core(&ctx);
-        Box::pin(async { Ok(()) })
+        let core = self.core(&ctx);
+        Box::pin(async move {
+            core.warm();
+            Ok(())
+        })
     }
 
     /// Running deep jobs stop at their last saved step and are named for the successor.
@@ -57,15 +60,17 @@ impl Plugin for ResearchPlugin {
         Box::pin(async move { Ok(json!({ "running_jobs": core.jobs.hand_off(Duration::from_secs(10)).await })) })
     }
 
-    /// The predecessor's running jobs continue here.
+    /// The predecessor's running jobs continue here, read back from the graph (in the background:
+    /// the swap does not wait for memory).
     fn import_state(&self, ctx: Ctx, state: Value) -> BoxFuture<'static, Result<(), RpcError>> {
         let core = self.core(&ctx);
         Box::pin(async move {
-            for id in state.get("running_jobs").and_then(Value::as_array).cloned().unwrap_or_default() {
-                if let Some(id) = id.as_str() {
-                    core.jobs.resume(id);
+            let ids: Vec<String> = state.get("running_jobs").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            tokio::spawn(async move {
+                for id in ids {
+                    core.jobs.resume(&id).await;
                 }
-            }
+            });
             Ok(())
         })
     }

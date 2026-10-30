@@ -152,6 +152,15 @@ impl Graph {
 
     /// Run one statement against a project with named parameters.
     pub async fn run(&self, project: &str, cypher: &str, params: Map<String, Value>) -> Result<Rows, RpcError> {
+        self.run_with(project, cypher, params, OperationOptions::default()).await
+    }
+
+    /// [`Graph::run`] that the engine stops after `timeout_ms` (an error that says so).
+    pub async fn run_timed(&self, project: &str, cypher: &str, params: Map<String, Value>, timeout_ms: u64) -> Result<Rows, RpcError> {
+        self.run_with(project, cypher, params, OperationOptions { operation_id: None, timeout_ms: Some(timeout_ms) }).await
+    }
+
+    async fn run_with(&self, project: &str, cypher: &str, params: Map<String, Value>, options: OperationOptions) -> Result<Rows, RpcError> {
         let mut query = Query::new(cypher).with_project(project);
         for (key, value) in params {
             query = query.with_parameter(key, value);
@@ -159,7 +168,7 @@ impl Graph {
         let started = std::time::Instant::now();
         let head: String = cypher.chars().take(140).collect();
         tracing::debug!(statement = %head, "graph statement");
-        let result = self.db.query_with_options_async(query, OperationOptions::default()).await;
+        let result = self.db.query_with_options_async(query, options).await;
         let elapsed = started.elapsed();
         if elapsed.as_millis() > 2000 {
             tracing::warn!(ms = elapsed.as_millis() as u64, statement = %head, "slow graph statement");
@@ -187,13 +196,19 @@ impl Graph {
     /// Declare an equality index with IronGraph's idempotent form (`CREATE INDEX … IF NOT EXISTS`,
     /// irongraph 0.1.8): an existing name succeeds with zero updates and leaves the index unchanged;
     /// concurrent declarations of one name are resolved by the engine. Names this process already
-    /// declared skip the round trip.
+    /// declared skip the round trip. A label that does not exist yet is skipped (not an error).
     pub async fn ensure_index(&self, project: &str, name: &str, label: &str, property: &str) -> Result<(), RpcError> {
         let key = (project.to_owned(), name.to_owned());
         if self.declared.lock().await.contains(&key) {
             return Ok(());
         }
-        self.run(project, &format!("CREATE INDEX {name} IF NOT EXISTS FOR (n:{label}) ON (n.{property})"), Map::new()).await?;
+        match self.run(project, &format!("CREATE INDEX {name} IF NOT EXISTS FOR (n:{label}) ON (n.{property})"), Map::new()).await {
+            Ok(_) => {}
+            // A label no write has made yet cannot be indexed: the next declaration (the next
+            // start) makes the index, once the label exists.
+            Err(error) if error.message.contains("is not declared") => return Ok(()),
+            Err(error) => return Err(error),
+        }
         self.declared.lock().await.insert(key);
         Ok(())
     }
@@ -233,6 +248,44 @@ impl Graph {
             Err(error) if missing_topic(&error) => Ok((Vec::new(), offset, offset)),
             Err(error) => Err(ig_error(error)),
         }
+    }
+
+    /// [`Graph::stream_fetch`] with each record's append time (epoch ms, as the engine resolved it).
+    pub async fn stream_page(&self, project: &str, topic: &str, offset: u64, max_records: usize, max_bytes: usize) -> Result<(Vec<(u64, u64, Vec<u8>)>, u64, u64), RpcError> {
+        let request = StreamFetch { project_id: project.to_owned(), topic: topic.to_owned(), partition: 0, offset, max_records, max_bytes };
+        match self.db.stream_fetch_async(request, OperationOptions::default()).await {
+            Ok(page) => {
+                let records = page.records.into_iter().map(|(offset, payload)| (offset, payload.resolved_time_ms.max(0) as u64, payload.payload)).collect();
+                Ok((records, page.next_offset, page.high_watermark))
+            }
+            Err(error) if missing_topic(&error) => Ok((Vec::new(), offset, offset)),
+            Err(error) => Err(ig_error(error)),
+        }
+    }
+
+    /// Create a one-partition topic that keeps its records `retention_days` (for good when
+    /// `None`). One that exists already is left as it is.
+    pub async fn create_topic_kept(&self, project: &str, topic: &str, retention_days: Option<u32>) -> Result<(), RpcError> {
+        validate_topic(topic)?;
+        let retention = retention_days.map(|days| format!(" RETENTION {days} DAYS")).unwrap_or_default();
+        match self.run(project, &format!("CREATE TOPIC `{topic}` PARTITIONS 1{retention}"), Map::new()).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.message.to_lowercase().contains("exist") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Every topic of a project: name, record count, offset after the last record, retention (ms).
+    pub async fn topics(&self, project: &str) -> Result<Vec<(String, u64, u64, Option<u64>)>, RpcError> {
+        let rows = self.run(project, "SHOW TOPICS", Map::new()).await?;
+        let index = |name: &str| rows.columns.iter().position(|column| column == name);
+        let (Some(name), count, next, retention) = (index("name"), index("record_count"), index("next_offset"), index("retention_ms")) else { return Ok(Vec::new()) };
+        let number = |row: &[Value], at: Option<usize>| at.and_then(|at| row.get(at)).and_then(Value::as_u64);
+        Ok(rows
+            .rows
+            .iter()
+            .filter_map(|row| Some((row.get(name)?.as_str()?.to_owned(), number(row, count).unwrap_or(0), number(row, next).unwrap_or(0), number(row, retention))))
+            .collect())
     }
 
     /// The offset after the last record of a stream (0 when it does not exist).

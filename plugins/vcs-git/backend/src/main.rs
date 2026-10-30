@@ -38,11 +38,12 @@ impl Plugin for VcsPlugin {
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         self.remember(&ctx);
         let vcs = self.vcs.clone();
-        // The GitHub account comes from the store, whose plugin may start later.
+        // The GitHub account and the checkpoints live in the graph, whose plugin may start later.
         tokio::spawn(async move {
-            if let Err(error) = vcs.github.load(&ctx).await {
-                tracing::error!(error = %error.message, "the GitHub settings could not be read from the store");
+            if let Err(error) = vcs.github.load().await {
+                tracing::error!(error = %error.message, "the GitHub account could not be read from the graph");
             }
+            vcs.checkpoints.migrate_all().await;
         });
         Box::pin(async { Ok(()) })
     }
@@ -104,7 +105,7 @@ fn main() {
                 ctx.publish(topics::CHANGED, data);
             }
         });
-        let vcs = match Vcs::new(env.data_dir.clone(), &Config::default(), publish) {
+        let vcs = match Vcs::new(env.data_dir.clone(), &Config::default(), publish, ctx_slot.clone()) {
             Ok(vcs) => Arc::new(vcs),
             Err(error) => {
                 eprintln!("cc-vcs: {error}");

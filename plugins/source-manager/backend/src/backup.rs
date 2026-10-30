@@ -1,8 +1,10 @@
 //! Backup & Sync: the live folder's branch pushed to a repository the user picked on GitHub (branch
 //! `cortexcode`), and restored from it on a new Mac. The GitHub connection (vcs plugin) supplies the
-//! credentials; nothing is stored here but the repository's name.
+//! credentials; nothing is stored here but the repository's name. Every push's outcome also goes
+//! to the stream `source.pushes`.
 
 use crate::live;
+use crate::settings;
 use crate::service::{Service, rpc};
 use cc_protocol::contracts::source::{Backup, BackupSetParams, RestoreParams, RestoreResult};
 use cc_protocol::contracts::vcs::{Credential, methods as vcs_methods};
@@ -66,6 +68,8 @@ pub async fn push(service: &Arc<Service>, ctx: &Ctx) -> Result<Backup, RpcError>
         Err(error) => Err(error),
     };
     let now = cc_protocol::contracts::now_ms();
+    let error = outcome.as_ref().err().map(|error| error.message.clone());
+    service.graph.append(settings::PUSHES, vec![json!({"repo": repo, "ms": now, "ok": error.is_none(), "error": error})], Some(settings::PUSHES_DAYS));
     service.update_settings(|settings| match &outcome {
         Ok(()) => {
             settings.last_push_ms = Some(now);

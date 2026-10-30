@@ -477,6 +477,12 @@ async fn spawn_instance(frame: &Arc<Frame>, slot: &Arc<Slot>, spec: ExecSpec) ->
     if !frame.safe {
         command.env("CORTEX_PLUGIN_LIVE", frame.live.join("plugins").join(&spec.plugin));
     }
+    // The mesh connects to this frame as a client (borrowing, a member's window); it alone gets
+    // the API token, which is no longer in frame.json. Other plugins never do: their shells would
+    // inherit it.
+    if category == "mesh" {
+        command.env("CORTEX_FRAME_TOKEN", &frame.token);
+    }
     let mut child = command.spawn().map_err(|e| format!("cannot start {}: {e}", spec.exec.display()))?;
     let pid = child.id().unwrap_or(0);
     let (exit_tx, exit_rx) = watch::channel(None);
@@ -1221,7 +1227,7 @@ pub async fn start_all(frame: Arc<Frame>) {
 /// Load the projects, sessions and slot state from the memory plugin's store.
 async fn load_records(frame: &Arc<Frame>) {
     let load_frame = frame.clone();
-    let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui)| load_frame.state.load(projects, sessions, ui)) });
+    let loaded = tokio::spawn(async move { crate::store::load(&load_frame.memory).await.map(|(projects, sessions, ui, deleted)| load_frame.state.load(projects, sessions, ui, deleted)) });
     match tokio::time::timeout(Duration::from_secs(180), loaded).await {
         Ok(Ok(Ok(()))) => {
             tracing::info!(projects = frame.state.projects().len(), sessions = frame.state.sessions(None).len(), "records loaded from the store");

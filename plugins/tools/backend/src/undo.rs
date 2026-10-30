@@ -1,9 +1,20 @@
 //! The step log: what every step changed in a workspace, kept since the last commit, for undo.
 //!
-//! One log per workspace under `<plugin data>/undo/<hash of the workspace path>/`: `log.jsonl`
-//! (one record per line, append-only between commit boundaries), `blobs/<sha256>.zst` (the
-//! contents before and after each change, compressed, shared between records) and `meta.json`
-//! (the workspace and the commit the log stands on).
+//! ```text
+//! (:Workspace {key: canonical path, head, baselined})-[:ON]->(:Machine)
+//! (:Step {key: '<workspace hash>#<seq>', seq, ts_ms, actor, label, detail, undoes, session_id})
+//!     -[:IN]->(:Workspace)   -[:BY]->(:Session)   -[:UNDOES]->(:Step)
+//! (:StepFile {key: '<step key>#<path>', path, before, after, mode, added, removed, binary, bytes})-[:OF]->(:Step)
+//! stream `steps.<workspace hash>`     every step as it was recorded
+//! ```
+//!
+//! The nodes hold what undo still needs; the log of a workspace is read from them when it opens
+//! (its standing steps and their files) and kept in memory while the plugin runs. Each step is
+//! one put of its node, its files and their edges. Which steps are undone is derived when read
+//! ([`active_set`]), so a step node never changes after it is written.
+//!
+//! Files that remain: `<plugin data>/undo/<workspace hash>/blobs/<sha256>.zst`, the contents
+//! before and after each change, compressed and shared between steps (bytes, not records).
 //!
 //! Records come from three places. An edit made through this plugin (the edit tool, the editor's
 //! save) is recorded with the text it had in hand. A command's side effects and edits made by hand
@@ -15,13 +26,19 @@
 //! to go back to.
 //!
 //! The commit boundary: on a new HEAD, every path whose content now equals HEAD leaves the log
-//! (its entries are dropped, its blobs when nothing else needs them), so a full commit empties the
-//! log and a partial commit keeps what stays uncommitted.
+//! (its step files are retired, a step left with nothing is retired, its blobs go when nothing
+//! else needs them), so a full commit empties the log and a partial commit keeps what stays
+//! uncommitted.
 //!
 //! Undo and redo are records too (`undoes` names the steps they reverted), so the log is linear
 //! and append-only; which steps stand is derived ([`active_set`]). Nothing here holds a lock while
-//! waiting: the one mutex guards the in-memory state and file writes, which are short.
+//! waiting: the one mutex guards the in-memory state and blob writes, which are short.
+//!
+//! Sequence numbers never repeat in a workspace: a log continues after the highest step ever
+//! written, retired ones included. When the graph cannot be read at open, the log starts at the
+//! clock's milliseconds, so its steps cannot overwrite stored ones.
 
+use crate::graph::{self, Batch, Graph};
 use crate::util;
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::tools::{
@@ -32,7 +49,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -42,6 +58,7 @@ const TEXT_DIFF_LIMIT: usize = 2 * 1024 * 1024;
 /// A file-system event followed by this much quiet is one edit by hand.
 const HAND_SETTLE: Duration = Duration::from_millis(400);
 
+/// What the `Workspace` node holds (and the `meta.json` of logs kept in files before).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Meta {
     workspace: String,
@@ -91,7 +108,10 @@ struct State {
 /// The log of one workspace.
 pub struct ProjectLog {
     workspace: PathBuf,
+    /// The workspace path's hash: the prefix of its step keys, its stream and its blob folder.
+    hash: String,
     dir: PathBuf,
+    graph: Arc<Graph>,
     git: Option<PathBuf>,
     state: Mutex<State>,
     /// Commands and edits of this plugin in flight (their effects are recorded when they end, not
@@ -106,6 +126,7 @@ pub struct ProjectLog {
 /// Every workspace's log.
 pub struct StepLog {
     root: PathBuf,
+    graph: Arc<Graph>,
     git: Option<PathBuf>,
     logs: Mutex<HashMap<PathBuf, Arc<ProjectLog>>>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
@@ -197,8 +218,8 @@ struct Found {
 }
 
 impl StepLog {
-    pub fn new(data_dir: &Path) -> StepLog {
-        StepLog { root: data_dir.join("undo"), git: find_git(), logs: Mutex::new(HashMap::new()), publisher: Mutex::new(None) }
+    pub fn new(data_dir: &Path, graph: Arc<Graph>) -> StepLog {
+        StepLog { root: data_dir.join("undo"), graph, git: find_git(), logs: Mutex::new(HashMap::new()), publisher: Mutex::new(None) }
     }
 
     /// The git program the logs use, when one was found.
@@ -213,19 +234,32 @@ impl StepLog {
         }
     }
 
-    /// The log of `workspace`, opened on first use: its records are read, the commit boundary is
-    /// applied when HEAD moved since the log last looked, and changes made while nobody looked
-    /// are recorded as made by hand.
-    pub fn open(&self, workspace: &Path) -> Arc<ProjectLog> {
+    fn hash(workspace: &Path) -> String {
+        let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
+        digest.iter().take(12).map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The log of `workspace` when it is open already.
+    pub fn opened(&self, workspace: &Path) -> Option<Arc<ProjectLog>> {
+        lock(&self.logs).get(&util::canonical_lenient(workspace)).cloned()
+    }
+
+    /// The log of `workspace`, opened on first use: its standing steps are read from the graph,
+    /// the commit boundary is applied when HEAD moved since the log last looked, and changes made
+    /// while nobody looked are recorded as made by hand.
+    pub async fn open(&self, workspace: &Path) -> Arc<ProjectLog> {
         let workspace = util::canonical_lenient(workspace);
         if let Some(log) = lock(&self.logs).get(&workspace) {
             return log.clone();
         }
-        let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
-        let hex: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
-        let dir = self.root.join(hex);
+        let hash = Self::hash(&workspace);
+        let dir = self.root.join(&hash);
+        let (meta, records, next_seq) = load(&self.graph, &workspace, &hash, &dir).await;
+        if let Some(log) = lock(&self.logs).get(&workspace) {
+            return log.clone();
+        }
         let git = self.git.clone().filter(|_| workspace.join(".git").exists());
-        let log = Arc::new(ProjectLog::load(workspace.clone(), dir, git));
+        let log = Arc::new(ProjectLog::new(workspace.clone(), hash, dir, self.graph.clone(), git, meta, records, next_seq));
         *lock(&log.publisher) = lock(&self.publisher).clone();
         let existing = lock(&self.logs).entry(workspace).or_insert_with(|| log.clone()).clone();
         if Arc::ptr_eq(&existing, &log) {
@@ -235,32 +269,248 @@ impl StepLog {
         existing
     }
 
-    /// Forget a workspace that no longer exists (its log folder goes with it).
+    /// Forget a workspace that no longer exists: its nodes are retired, its blob folder goes.
     pub fn forget(&self, workspace: &Path) {
         let workspace = util::canonical_lenient(workspace);
-        if let Some(log) = lock(&self.logs).remove(&workspace) {
-            let _ = std::fs::remove_dir_all(&log.dir);
+        lock(&self.logs).remove(&workspace);
+        let hash = Self::hash(&workspace);
+        let _ = std::fs::remove_dir_all(self.root.join(&hash));
+        let key = workspace.to_string_lossy().into_owned();
+        self.graph.retire_matching(
+            "StepFile",
+            "MATCH (f:StepFile)-[:OF]->(:Step)-[:IN]->(w:Workspace) WHERE w.key = $workspace AND f.ended_ms IS NULL RETURN f.key LIMIT 5000",
+            json!({ "workspace": key }),
+            "forgotten",
+        );
+        self.graph.retire_matching(
+            "Step",
+            "MATCH (s:Step)-[:IN]->(w:Workspace) WHERE w.key = $workspace AND s.ended_ms IS NULL RETURN s.key LIMIT 5000",
+            json!({ "workspace": key }),
+            "forgotten",
+        );
+        self.graph.retire(vec![graph::gref("Workspace", &key)], "forgotten");
+    }
+}
+
+/// How many times opening a log asks the graph while the memory plugin does not serve yet.
+const LOAD_ATTEMPTS: u32 = 20;
+
+/// The log as the graph keeps it: the workspace's node, its standing steps with their files, and
+/// the highest sequence number ever written.
+async fn read_graph(graph: &Graph, workspace: &str) -> Result<(Option<Meta>, Vec<TimelineRecord>, u64), cc_protocol::RpcError> {
+    let params = json!({ "workspace": workspace });
+    let node = graph.query("MATCH (w:Workspace) WHERE w.key = $workspace AND w.ended_ms IS NULL RETURN w LIMIT 1", params.clone(), 1, LOAD_ATTEMPTS).await?;
+    let meta = node.rows.first().and_then(|row| row.first()).and_then(graph::properties).map(|props| Meta {
+        workspace: workspace.to_owned(),
+        head: props.get("head").and_then(Value::as_str).map(str::to_owned),
+        baselined: props.get("baselined").and_then(Value::as_bool).unwrap_or(false),
+    });
+    let highest = graph
+        .query("MATCH (s:Step)-[:IN]->(w:Workspace) WHERE w.key = $workspace RETURN s.seq AS seq ORDER BY seq DESC LIMIT 1", params.clone(), 1, LOAD_ATTEMPTS)
+        .await?
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let steps = graph
+        .query_all(
+            "MATCH (s:Step)-[:IN]->(w:Workspace) WHERE w.key = $workspace AND s.ended_ms IS NULL AND s.key > $after RETURN s, s.key AS k ORDER BY k LIMIT 5000",
+            params.clone(),
+            LOAD_ATTEMPTS,
+        )
+        .await?;
+    let mut by_key: HashMap<String, TimelineRecord> = HashMap::new();
+    for row in &steps {
+        let (Some(props), Some(key)) = (row.first().and_then(graph::properties), row.get(1).and_then(Value::as_str)) else { continue };
+        let session_id = props.get("session_id").and_then(Value::as_str).map(str::to_owned);
+        let undoes = props.get("undoes").and_then(Value::as_array).map(|seqs| seqs.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+        let record = TimelineRecord {
+            seq: graph::number(props, "seq"),
+            ts_ms: graph::number(props, "ts_ms"),
+            actor: graph::text(props, "actor"),
+            session_id,
+            label: graph::text(props, "label"),
+            detail: graph::text(props, "detail"),
+            files: Vec::new(),
+            undoes,
+            undone: false,
+        };
+        by_key.insert(key.to_owned(), record);
+    }
+    let files = graph
+        .query_all(
+            "MATCH (f:StepFile)-[:OF]->(s:Step)-[:IN]->(w:Workspace) WHERE w.key = $workspace AND f.ended_ms IS NULL AND s.ended_ms IS NULL AND f.key > $after \
+             RETURN f, s.key, f.key AS k ORDER BY k LIMIT 5000",
+            params,
+            LOAD_ATTEMPTS,
+        )
+        .await?;
+    for row in &files {
+        let (Some(props), Some(step)) = (row.first().and_then(graph::properties), row.get(1).and_then(Value::as_str)) else { continue };
+        let Some(record) = by_key.get_mut(step) else { continue };
+        let hash = |name: &str| props.get(name).and_then(Value::as_str).map(str::to_owned);
+        record.files.push(TimelineFile {
+            path: graph::text(props, "path"),
+            before: hash("before"),
+            after: hash("after"),
+            mode: graph::number(props, "mode") as u32,
+            added: graph::number(props, "added") as u32,
+            removed: graph::number(props, "removed") as u32,
+            binary: props.get("binary").and_then(Value::as_bool).unwrap_or(false),
+            bytes: graph::number(props, "bytes"),
+        });
+    }
+    let mut records: Vec<TimelineRecord> = by_key.into_values().collect();
+    for record in &mut records {
+        record.files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    records.sort_by_key(|record| record.seq);
+    Ok((meta, records, highest))
+}
+
+/// A log kept in files by earlier versions (`log.jsonl`, `meta.json`), if there is one.
+fn read_legacy(dir: &Path) -> Option<(Option<Meta>, Vec<TimelineRecord>)> {
+    let meta: Option<Meta> = std::fs::read(dir.join("meta.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let text = std::fs::read_to_string(dir.join("log.jsonl")).ok();
+    if meta.is_none() && text.is_none() {
+        return None;
+    }
+    let records = text.iter().flat_map(|text| text.lines()).filter_map(|line| serde_json::from_str::<TimelineRecord>(line).ok()).collect();
+    Some((meta, records))
+}
+
+/// The files of an imported log go once the graph holds its records (and the temporary siblings
+/// of their atomic writes with them).
+fn remove_legacy(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("log.jsonl"));
+    let _ = std::fs::remove_file(dir.join("meta.json"));
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".log.jsonl.") || name.starts_with(".meta.json.") {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
-impl ProjectLog {
-    fn load(workspace: PathBuf, dir: PathBuf, git: Option<PathBuf>) -> ProjectLog {
-        let _ = std::fs::create_dir_all(dir.join("blobs"));
-        let meta: Meta = std::fs::read(dir.join("meta.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let mut records: Vec<TimelineRecord> = Vec::new();
-        if let Ok(text) = std::fs::read_to_string(dir.join("log.jsonl")) {
-            for line in text.lines() {
-                if let Ok(record) = serde_json::from_str::<TimelineRecord>(line) {
-                    records.push(record);
-                }
-            }
+/// A workspace's log as it opens: from the graph, and once from the files an earlier version
+/// kept (written to the graph, then removed).
+async fn load(graph: &Arc<Graph>, workspace: &Path, hash: &str, dir: &Path) -> (Meta, Vec<TimelineRecord>, u64) {
+    let key = workspace.to_string_lossy().into_owned();
+    let stored = read_graph(graph, &key).await;
+    let legacy = read_legacy(dir);
+    let (mut meta, mut records, highest) = match stored {
+        Ok((meta, records, highest)) => (meta, records, Some(highest)),
+        Err(error) => {
+            tracing::error!(workspace = %key, error = %error.message, "the step log could not be read from the graph; it starts empty");
+            (None, Vec::new(), None)
         }
-        let next_seq = records.iter().map(|record| record.seq).max().unwrap_or(0) + 1;
-        let meta = Meta { workspace: workspace.to_string_lossy().into_owned(), ..meta };
+    };
+    if let Some((legacy_meta, legacy_records)) = legacy {
+        meta = meta.or(legacy_meta);
+        let mut by_seq: BTreeMap<u64, TimelineRecord> = records.into_iter().map(|record| (record.seq, record)).collect();
+        for record in &legacy_records {
+            by_seq.insert(record.seq, record.clone());
+        }
+        records = by_seq.into_values().collect();
+        let meta = Meta { workspace: key.clone(), ..meta.clone().unwrap_or_default() };
+        let mut batches = vec![workspace_batch(&meta)];
+        for record in &legacy_records {
+            batches.extend(step_batches(hash, &key, record));
+        }
+        let graph = graph.clone();
+        let dir = dir.to_path_buf();
+        tokio::spawn(async move {
+            match graph.put_wait(batches).await {
+                Ok(()) => remove_legacy(&dir),
+                Err(error) => tracing::error!(dir = %dir.display(), error = %error.message, "the step log files were not imported; they are kept"),
+            }
+        });
+    }
+    let meta = Meta { workspace: key, ..meta.unwrap_or_default() };
+    let kept_max = records.iter().map(|record| record.seq).max().unwrap_or(0);
+    let next_seq = match highest {
+        Some(highest) => highest.max(kept_max) + 1,
+        None => now_ms().max(kept_max + 1),
+    };
+    (meta, records, next_seq)
+}
+
+/// The workspace's node.
+fn workspace_batch(meta: &Meta) -> Batch {
+    // `head` is null in a repository without a commit: the property goes.
+    let mut props = serde_json::Map::new();
+    props.insert("head".to_owned(), json!(meta.head));
+    props.insert("baselined".to_owned(), json!(meta.baselined));
+    let node = graph::node("Workspace", &meta.workspace, props);
+    let me = graph::gref("Workspace", &meta.workspace);
+    Batch::observed(vec![node], vec![graph::edge(&me, "ON", &graph::machine())], Vec::new())
+}
+
+fn step_key(hash: &str, seq: u64) -> String {
+    format!("{hash}#{seq}")
+}
+
+fn file_key(hash: &str, seq: u64, path: &str) -> String {
+    format!("{hash}#{seq}#{path}")
+}
+
+/// A step's node with its edges, then each of its files with its edge (packed into puts by the writer).
+fn step_batches(hash: &str, workspace: &str, record: &TimelineRecord) -> Vec<Batch> {
+    let key = step_key(hash, record.seq);
+    let me = graph::gref("Step", &key);
+    let undoes = (!record.undoes.is_empty()).then(|| record.undoes.clone());
+    let node = graph::node(
+        "Step",
+        &key,
+        graph::props(json!({
+            "seq": record.seq,
+            "ts_ms": record.ts_ms,
+            "actor": record.actor,
+            "label": record.label,
+            "detail": record.detail,
+            "undoes": undoes,
+            "session_id": record.session_id,
+        })),
+    );
+    let mut soft: Vec<_> = record.undoes.iter().map(|seq| graph::edge(&me, "UNDOES", &graph::gref("Step", &step_key(hash, *seq)))).collect();
+    if let Some(session) = &record.session_id {
+        soft.push(graph::edge(&me, "BY", &graph::gref("Session", session)));
+    }
+    let mut batches = vec![Batch::observed(vec![node], vec![graph::edge(&me, "IN", &graph::gref("Workspace", workspace))], soft)];
+    for file in &record.files {
+        let file_key = file_key(hash, record.seq, &file.path);
+        let node = graph::node(
+            "StepFile",
+            &file_key,
+            graph::props(json!({
+                "path": file.path,
+                "before": file.before,
+                "after": file.after,
+                "mode": file.mode,
+                "added": file.added,
+                "removed": file.removed,
+                "binary": file.binary,
+                "bytes": file.bytes,
+            })),
+        );
+        batches.push(Batch::observed(vec![node], vec![graph::edge(&graph::gref("StepFile", &file_key), "OF", &me)], Vec::new()));
+    }
+    batches
+}
+
+impl ProjectLog {
+    #[allow(clippy::too_many_arguments)]
+    fn new(workspace: PathBuf, hash: String, dir: PathBuf, graph: Arc<Graph>, git: Option<PathBuf>, meta: Meta, records: Vec<TimelineRecord>, next_seq: u64) -> ProjectLog {
+        let _ = std::fs::create_dir_all(dir.join("blobs"));
+        // The node exists before the first step's edge to it.
+        graph.put(workspace_batch(&meta));
         ProjectLog {
             workspace,
+            hash,
             dir,
+            graph,
             git,
             state: Mutex::new(State { records, next_seq, meta, stats: HashMap::new() }),
             busy: Mutex::new(0),
@@ -307,28 +557,16 @@ impl ProjectLog {
     }
 
     fn write_meta(&self, meta: &Meta) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(meta) {
-            let _ = util::atomic_write(&self.dir.join("meta.json"), &bytes);
-        }
+        self.graph.put(workspace_batch(meta));
     }
 
-    fn append_line(&self, record: &TimelineRecord) {
-        if let Ok(line) = serde_json::to_string(record)
-            && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("log.jsonl"))
-        {
-            let _ = writeln!(file, "{line}");
+    /// A new step: its nodes in one put, the record on the workspace's stream.
+    fn write_step(&self, record: &TimelineRecord) {
+        let workspace = self.workspace.to_string_lossy();
+        self.graph.put_many(step_batches(&self.hash, &workspace, record));
+        if let Ok(value) = serde_json::to_value(record) {
+            self.graph.append(&format!("steps.{}", self.hash), vec![value]);
         }
-    }
-
-    fn rewrite_log(&self, records: &[TimelineRecord]) {
-        let mut text = String::new();
-        for record in records {
-            if let Ok(line) = serde_json::to_string(record) {
-                text.push_str(&line);
-                text.push('\n');
-            }
-        }
-        let _ = util::atomic_write(&self.dir.join("log.jsonl"), text.as_bytes());
     }
 
     /// Drop blobs no record names.
@@ -442,7 +680,7 @@ impl ProjectLog {
             undone: false,
         };
         state.next_seq += 1;
-        self.append_line(&record);
+        self.write_step(&record);
         state.records.push(record.clone());
         record
     }
@@ -591,15 +829,20 @@ impl ProjectLog {
         }
         let before = state.records.len();
         let mut touched = false;
+        let mut retired = Vec::new();
         for record in &mut state.records {
             let kept = record.files.len();
+            for file in record.files.iter().filter(|file| !dirty.contains(&file.path)) {
+                retired.push(graph::gref("StepFile", &file_key(&self.hash, record.seq, &file.path)));
+            }
             record.files.retain(|file| dirty.contains(&file.path));
             touched |= kept != record.files.len();
         }
         if !touched {
             return;
         }
-        let mut kept: Vec<TimelineRecord> = std::mem::take(&mut state.records).into_iter().filter(|record| !record.files.is_empty() || !record.undoes.is_empty()).collect();
+        let all = std::mem::take(&mut state.records);
+        let mut kept: Vec<TimelineRecord> = all.iter().filter(|record| !record.files.is_empty() || !record.undoes.is_empty()).cloned().collect();
         // An undo whose every target left the log is bookkeeping with nothing to undo; it goes
         // too, and so does an undo of it, until nothing more goes.
         loop {
@@ -610,7 +853,14 @@ impl ProjectLog {
                 break;
             }
         }
-        self.rewrite_log(&kept);
+        let seqs: BTreeSet<u64> = kept.iter().map(|record| record.seq).collect();
+        for record in &all {
+            if !seqs.contains(&record.seq) {
+                retired.extend(record.files.iter().map(|file| graph::gref("StepFile", &file_key(&self.hash, record.seq, &file.path))));
+                retired.push(graph::gref("Step", &step_key(&self.hash, record.seq)));
+            }
+        }
+        self.graph.retire(retired, "committed");
         self.collect_blobs(&kept);
         let changed = kept.len() != before;
         state.records = kept;

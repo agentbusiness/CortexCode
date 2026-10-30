@@ -5,8 +5,8 @@
 //! outbox and go out when one serves again. Session journals are the frame's own files
 //! ([`crate::journal`]); the store's journal streams are read here only to move them into files.
 
-use cc_protocol::contracts::frame::{JournalPatch, Project, Session, UiStateDocument};
-use cc_protocol::contracts::records::{methods, AppProjectsResult, AppSessionsResult, JournalReadResult};
+use cc_protocol::contracts::frame::{JournalPatch, Project, ProjectDeleted, Session, UiStateDocument};
+use cc_protocol::contracts::records::{methods, AppDeletedResult, AppProjectsResult, AppSessionsResult, JournalReadResult};
 use cc_protocol::{codes, Connection, RpcError};
 use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
@@ -151,8 +151,9 @@ fn request(op: Op) -> (&'static str, Value) {
     }
 }
 
-/// The records the store holds: projects, sessions and the slot state (None when never saved).
-pub async fn load(link: &MemoryLink) -> Result<(Vec<Project>, Vec<Session>, Option<UiStateDocument>), RpcError> {
+/// The records the store holds: projects, sessions, the slot state (None when never saved) and the
+/// projects deleted (none from a memory plugin that does not keep them yet).
+pub async fn load(link: &MemoryLink) -> Result<(Vec<Project>, Vec<Session>, Option<UiStateDocument>, Vec<ProjectDeleted>), RpcError> {
     let projects: AppProjectsResult = serde_json::from_value(link.call(methods::APP_PROJECTS, json!({})).await?).map_err(|error| RpcError::internal(error.to_string()))?;
     let sessions: AppSessionsResult = serde_json::from_value(link.call(methods::APP_SESSIONS, json!({})).await?).map_err(|error| RpcError::internal(error.to_string()))?;
     let ui_state = match link.call(methods::SETTINGS_GET, json!({ "path": UI_STATE })).await {
@@ -160,7 +161,12 @@ pub async fn load(link: &MemoryLink) -> Result<(Vec<Project>, Vec<Session>, Opti
         Err(error) if error.code == codes::NOT_FOUND => None,
         Err(error) => return Err(error),
     };
-    Ok((projects.projects, sessions.sessions, ui_state))
+    let deleted = match link.call(methods::APP_DELETED, json!({})).await {
+        Ok(value) => serde_json::from_value::<AppDeletedResult>(value).map_err(|error| RpcError::internal(error.to_string()))?.projects,
+        Err(error) if error.code == codes::UNKNOWN_METHOD => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    Ok((projects.projects, sessions.sessions, ui_state, deleted))
 }
 
 /// A session's whole journal as the store's stream holds it, in order (empty when it has none).
