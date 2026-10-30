@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-shell"
 name = "Shell"
-version = "0.1.5"
+version = "0.1.6"
 description = "Everything CortexCode knows about shell scripts: the code graph's facts of sh, bash and zsh scripts, bash-language-server with ShellCheck diagnostics, definition, references and hover, shellcheck / bash -n verifiers and shell skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

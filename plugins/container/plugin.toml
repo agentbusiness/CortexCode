@@ -5,7 +5,7 @@
 [plugin]
 id = "container"
 name = "Containers"
-version = "0.1.5"
+version = "0.1.6"
 description = "Projects whose commands run inside Docker while their files stay on the Mac: one container (the root bind-mounted at its workdir), a Docker Compose project (commands run in one service), or a devcontainer with features (built by the Dev Containers CLI); attach from parameters, .cortex/container.toml or devcontainer.json (build, pull, seed from the image, published ports, lifecycle commands), exec with streamed output, timeout and in-container kill, interactive shell argv for terminals, images, build, pull, logs, ps and ports."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

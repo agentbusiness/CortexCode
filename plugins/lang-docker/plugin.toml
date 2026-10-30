@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-docker"
 name = "Docker"
-version = "0.1.5"
+version = "0.1.6"
 description = "Everything CortexCode knows about Docker: the code graph's facts of Dockerfiles and Compose files, dockerfile-language-server and compose-language-service diagnostics, definition, references and hover, docker compose config / docker build --check / hadolint verifiers, the docker CLI on commands' PATH and Docker skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
