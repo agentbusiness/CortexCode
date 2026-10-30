@@ -1025,9 +1025,26 @@ enum Placed {
 }
 
 async fn install_many(ctx: &Ctx, packages: Vec<&Path>) -> Result<Placed, String> {
+    // A package of exactly the version that runs already is done (a batch that failed partway, or
+    // the frame installing it at start): installing it again would be refused as in use.
+    let running: BTreeMap<String, String> = call::<PluginListResult>(ctx, frame_methods::PLUGINS_LIST, json!({}))
+        .await
+        .map(|list| list.units.into_iter().map(|unit| (unit.id, unit.version)).collect())
+        .unwrap_or_default();
+    let mut rest = Vec::new();
+    for package in packages {
+        let manifest = fetch::manifest(package).await.unwrap_or(Value::Null);
+        let (id, version) = (manifest["plugin"]["id"].as_str().unwrap_or(""), manifest["plugin"]["version"].as_str().unwrap_or(""));
+        if id.is_empty() || running.get(id).is_none_or(|running| running != version) {
+            rest.push(package);
+        }
+    }
+    if rest.is_empty() {
+        return Ok(Placed::Now);
+    }
     let params = InstallManyParams {
         id: format!("update-{}", uuid::Uuid::new_v4().simple()),
-        paths: packages.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
+        paths: rest.iter().map(|path| path.to_string_lossy().into_owned()).collect(),
     };
     match call::<InstallManyResult>(ctx, frame_methods::PLUGINS_INSTALL_MANY, json!(params)).await {
         Ok(result) if result.ok => Ok(Placed::Now),
