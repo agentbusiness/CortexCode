@@ -1,15 +1,10 @@
 #!/bin/sh
-# Start CortexCode from this repository exactly as the macOS app starts: the app scripts/build-app.sh
-# builds into build/ (the frame, its Electron shell, every plugin built and packed with its data).
-# Its first start installs the packed plugins into ~/.cortexcode and makes the live folder
-# ~/.cortexcode/live from their data, as the downloaded app does.
+# Start CortexCode: the released app, exactly as `npx cortexcode` starts it (the installed app in
+# ~/.cortexcode/app/, downloaded once when there is none). The app runs the newest frame its updates
+# staged and keeps every plugin on the latest release by itself. There is no development build:
+# changes reach the app only through releases (scripts/release.sh).
 #
-# The start never waits for a build: when build/ holds an app, it starts at once and the build runs
-# beside it (`build-app.sh --live`, log in build/build.log). A changed plugin is swapped into the
-# running app as soon as it is packed (the window too: it is the workbench plugin's); a changed frame
-# or shell runs from the next start. Only the very first start, with nothing built yet, builds first.
-#
-# Usage: cortexcode [frame options, e.g. --headless or --safe]   (a link to this file works too)
+# Usage: cortexcode [app options, e.g. --headless or --safe]   (a link to this file works too)
 self="$0"
 # Follow links (e.g. ~/.local/bin/cortexcode) to this file in the repository.
 while [ -L "$self" ]; do
@@ -20,24 +15,5 @@ while [ -L "$self" ]; do
   esac
 done
 cd "$(dirname "$self")" || exit 1
-app=build/CortexCode.app/Contents/MacOS/CortexCode
-if [ -x "$app" ]; then
-  # A build a previous start left running is stopped (with the cargo and npm under it): this one
-  # starts from the current source.
-  stop_tree() {
-    for child in $(pgrep -P "$1"); do stop_tree "$child"; done
-    kill "$1" 2>/dev/null
-  }
-  previous="$(cat build/.build.pid 2>/dev/null)"
-  if [ -n "$previous" ] && ps -p "$previous" -o command= 2>/dev/null | grep -q 'build-app.sh'; then
-    stop_tree "$previous"
-  fi
-  # Its progress lines reach this terminal on fd 3; the rest goes to the log.
-  nohup scripts/build-app.sh build --live 3>&2 >build/build.log 2>&1 </dev/null &
-  echo $! > build/.build.pid
-else
-  scripts/build-app.sh build || exit 1
-fi
-# The development start runs this build, never a frame an update staged in ~/.cortexcode/frame.
-export CORTEX_NO_HANDOVER=1
-exec "$app" "$@"
+unset CORTEX_NO_HANDOVER
+exec node npm/cortexcode/bin/cortexcode.mjs "$@"
