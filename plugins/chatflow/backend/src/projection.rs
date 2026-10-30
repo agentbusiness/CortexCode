@@ -412,7 +412,12 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             tool if tool == "read" || tool == tools_methods::READ => {
                 let file = file_of(call)?;
                 let target = target_of(call).unwrap_or_else(|| file.clone());
-                if later(&edited_at, &file, result.seq) {
+                // The newest read of a part stays after an edit, with a note: hiding it sent the
+                // model to read the whole file again after every edit (seen: 58 re-reads in one
+                // run). Lines the edit did not change still match by their hash where they moved.
+                if later(&edited_at, &file, result.seq) && !later(&read_at, &target, result.seq) {
+                    Some(format!("{}\n{}", ds.text("read_before_edit", &[("path", &file)]), str_field(&result.data, "output")))
+                } else if later(&edited_at, &file, result.seq) {
                     Some(ds.text("read_superseded", &[("path", &file)]))
                 } else if later(&read_at, &target, result.seq) {
                     Some(ds.text("read_repeated", &[("path", &target)]))
@@ -453,8 +458,23 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // of them was; their reasoning, texts and outputs are not shown. Notes, plans, steers and host
     // reads stay.
     let steps_through = mark("steps_through");
+    // The newest read of each file part (its call and its result) stays through this layer, as file
+    // reads do through folding: compacting it away sent the model to read the file again (seen: 23
+    // re-reads after compactions in one run).
+    let kept_reads: HashSet<u64> = {
+        let mut newest: HashMap<String, (u64, u64)> = HashMap::new();
+        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && is_file_read(entry)) {
+            if let Some(call) = calls.get(str_field(&result.data, "call_id"))
+                && let Some(target) = target_of(call)
+            {
+                newest.insert(target, (call.seq, result.seq));
+            }
+        }
+        newest.into_values().flat_map(|(call, result)| [call, result]).collect()
+    };
     let stepped = |entry: &JournalEntry| -> bool {
         steps_through > 0
+            && !kept_reads.contains(&entry.seq)
             && entry.seq <= steps_through
             && !bool_field(&entry.data, "interrupted")
             && digests.of(entry, &calls).is_none()

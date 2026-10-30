@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub struct Tracker {
     /// path -> qualified name -> symbol, as last seen.
     outlines: HashMap<String, BTreeMap<String, SymbolRef>>,
+    /// The files whose calls this run's signature changes reached: errors there are this run's own.
+    pub reached: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +141,7 @@ impl Tracker {
             .await
             .ok()?;
         let sites = sites_outside(&impact.call_sites, &changes);
+        self.reached.extend(sites.iter().map(|site| site.path.clone()));
         if sites.is_empty() && impact.tests.is_empty() {
             return None;
         }

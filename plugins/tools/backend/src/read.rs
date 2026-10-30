@@ -343,15 +343,17 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
                 let _ = writeln!(out, "[{display} has {total} lines; line {} is past the end]", segment.start);
                 continue;
             }
+            // A range the model asks for shows up to four times a whole read, as a log does: at one
+            // read's size, asking for lines 295-789 gave 295-594, and the rest took more reads.
+            let most = config.outline_lines * 4;
             let (end, continued) = match segment.end {
-                // An explicit range shows at most `outline_lines` lines; the rest is one read away.
-                Some(end) if end.min(total) >= segment.start + config.outline_lines => {
-                    let end = segment.start + config.outline_lines - 1;
+                Some(end) if end.min(total) >= segment.start + most => {
+                    let end = segment.start + most - 1;
                     (end, Some(end + 1))
                 }
                 Some(end) => (end.min(total), None),
                 None => {
-                    let end = (segment.start + config.outline_lines - 1).min(total);
+                    let end = (segment.start + most - 1).min(total);
                     (end, (end < total).then_some(end + 1))
                 }
             };

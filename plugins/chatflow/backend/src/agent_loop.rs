@@ -405,6 +405,20 @@ async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str, team: Op
     Ok(())
 }
 
+/// Post `text` (an edit's impact) to each open teammate whose task changes one of the `reached`
+/// files: they build on the same code, so they learn of it from the host instead of finding a
+/// broken call an hour later. Best effort: a failed post only leaves them to find it.
+async fn tell_reached(env: &RunEnv, name: &str, team: &Team, reached: &HashSet<String>, text: &str) {
+    for task in team.others.values().filter(|task| !matches!(task.status.as_str(), "done" | "cancelled")) {
+        let Some(assignee) = task.assignee.as_deref() else { continue };
+        if !task.touches.iter().any(|touch| reached.contains(touch.trim_start_matches("./"))) {
+            continue;
+        }
+        let text = env.data.text("board_reached", &[("agent", name), ("text", text)]);
+        let _ = env.host.call(memory_methods::BOARD_POST, json!({"project_id": env.scope.project_id, "kind": "decision", "author": name, "text": text, "refs": [task.id], "to": assignee})).await;
+    }
+}
+
 /// Whether the research plugin is active (`frame.plugins.list`): the structural fact behind
 /// offering a lookup as a next step. A failure to ask counts as not available.
 async fn research_available(env: &RunEnv) -> bool {
@@ -857,7 +871,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             // writes the tasks still to do so that they do what the user asks now (seen: "fix all
             // the issues" answered eleven times with "task 1 is complete", the step message saying
             // "do this task only" after it at every step).
-            if spec.step.is_some() {
+            // An agent's messages (the session's, another agent's) are its next step inside the task
+            // it works on, not a new plan: replanning at each one restarted its reading every time
+            // (seen: sixteen plans and the same file read again after each message).
+            if spec.step.is_some() && !matches!(spec.kind, LoopKind::Agent { .. }) {
                 return Ok(outcome("steered", steers.join("\n\n"), turns, tool_calls, &changed, None));
             }
         }
@@ -1047,7 +1064,18 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             // Only tests that failed before the work fail, and a later task waits for this one
             // (the plan's last task fixes what failed before): this task is done.
-            if crate::checks::no_worse(journal, &report) && crate::checks::awaited(env, task).await {
+            // Or its errors are all outside what it changed (another task's part, seen: one agent's
+            // module removal failing every other agent's build check for hours).
+            let own: std::collections::HashSet<String> = changed.iter().map(|path| crate::impact::relative(&env.scope, path)).chain(tracker.reached.iter().cloned()).collect();
+            let awaited = crate::checks::awaited(env, task).await;
+            let not_its = awaited
+                && !crate::checks::no_worse(journal, &report)
+                && match contract::verify(&env.host, &task.id, &env.scope.workspace, &task.contract, &any).await {
+                    Ok((full, outputs)) => !full.ok && crate::checks::not_its_failures(&full, &outputs, &own, &env.scope.workspace),
+                    Err(error) if error.code == codes::CANCELLED => continue,
+                    Err(_) => false,
+                };
+            if awaited && (not_its || crate::checks::no_worse(journal, &report)) {
                 journal.note(&env.run_id, "verify", &env.data.text("checks_no_worse", &[]), false).await?;
                 // In the project itself it is done now; an agent's workspace waits for the merge
                 // steward, which judges it the same way after merging.
@@ -1104,7 +1132,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             if index > 0 {
                 journal.sync().await?;
             }
-            let steer_waiting = index > 0 && !journal.pending_steers("steer").is_empty();
+            // A waiting message skips the calls that would change something; reads already sent run,
+            // so the model does not send them again after the message (seen: 46 reads skipped and
+            // re-sent in one run).
+            let steer_waiting = index > 0 && call.name != "read" && !journal.pending_steers("steer").is_empty();
             if stopped || steer_waiting || env.stops.park.is_cancelled() || env.stops.cancel.is_cancelled() {
                 let why = if steer_waiting { env.data.text("skipped_steer", &[]) } else { env.data.text("skipped_stopped", &[]) };
                 journal
@@ -1206,7 +1237,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     journal.append(kinds::TOOL_RESULT, data).await?;
                     // A failure something was learned from before: what worked then, right under it,
                     // where the next step is decided.
-                    let refusal = outcome.error_kind.as_deref().filter(|kind| !outcome.ok && !kind.is_empty() && *kind != "nonzero_exit");
+                    // A refused edit's own message shows the current lines and what to send instead: that is
+                    // the step, and a lesson under it took its place (seen: "re-read the file to get fresh
+                    // anchors" under a refusal that showed them, then four reads).
+                    let refusal = outcome.error_kind.as_deref().filter(|kind| !outcome.ok && !kind.is_empty() && *kind != "nonzero_exit" && outcome.tool != "edit");
                     let failure = match (run_failed, refusal) {
                         (_, Some(kind)) => crate::learn::failure_key(&outcome.tool, kind, ""),
                         (Some(true), None) => crate::learn::failure_key("run", "", &outcome.output),
@@ -1263,7 +1297,14 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         edited = true;
                         changed.extend(outcome.changed_files.iter().cloned());
                         if let Some(text) = tracker.after_edit(&env.host, &env.scope, &outcome.changed_files, &env.data).await {
-                            journal.note(&env.run_id, "impact", &text, true).await?;
+                            let seq = journal.note(&env.run_id, "impact", &text, true).await?;
+                            // The merge steward reads which files this run's changes reached.
+                            journal.set(seq, "reached", json!(tracker.reached.iter().collect::<Vec<_>>())).await?;
+                            // The agents whose tasks change the code this reached hear it at once,
+                            // with what changed (their next board delivery shows it).
+                            if let (LoopKind::Agent { name }, Some(team)) = (&spec.kind, agent_team.as_ref()) {
+                                tell_reached(env, name, team, &tracker.reached, &text).await;
+                            }
                         }
                     }
                     if !outcome.changed_files.is_empty() {

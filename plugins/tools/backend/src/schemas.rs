@@ -223,6 +223,8 @@ Working with files:\n\
 3. The result shows each changed function as it is now{fresh}: your next edit uses that. Read the file again only after a command changed it.\n\
 4. Write whole with `content` only a new file, a file of empty stubs, or a probe in the scratch folder `tmp/` (`tmp/<name>`, as often as you like; git ignores it).\n\
 5. A refused edit wrote nothing: its message shows the current lines and what to send instead.\n\
+6. Keep every existing name (function, type, field, variable, module, file): other code and other agents' tasks use it. Rename, move or delete one only when the task asks for it, and then change every use listed by graph://used-by/<name> in the same turn.\n\
+7. Every edit and command is recorded and can be undone: `cx changed` lists your steps with their numbers, `cx undo --step N` puts back what step N changed. So try the change and run the check; a try that went wrong is one undo, not a reason to read more first.\n\
 \n\
 How results read:\n\
 - A file: `path:` and then its lines as N:hh|text.\n{anchors}\n  A long file shows only its definitions; ⋮ N-M marks lines left out: read path:N-M to see them.\n\
