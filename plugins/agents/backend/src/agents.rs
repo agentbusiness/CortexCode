@@ -235,6 +235,9 @@ struct Inner {
     cancellations: Mutex<HashMap<AgentKey, AgentCancellations>>,
     /// One merge into a project at a time.
     merge: tokio::sync::Mutex<()>,
+    /// Lead sessions this plugin checks on itself, because the scheduler could not take their
+    /// check-in routine (`schedule.add` failed: no scheduler running).
+    self_checked: Mutex<std::collections::HashSet<(String, String)>>,
     tasks: tokio_util::task::TaskTracker,
     park: CancellationToken,
 }
@@ -262,6 +265,7 @@ impl Agents {
                 efforts: Mutex::new(HashMap::new()),
                 cancellations: Mutex::new(HashMap::new()),
                 merge: tokio::sync::Mutex::new(()),
+                self_checked: Mutex::new(std::collections::HashSet::new()),
                 tasks: tokio_util::task::TaskTracker::new(),
                 park: CancellationToken::new(),
             }),
@@ -716,6 +720,7 @@ impl Agents {
         if let Some(from) = &params.from_session {
             host.journal_append(from, kinds::AGENT_SPAWNED, json!({"agent": name, "task_id": task.id, "session_id": session.id, "workspace": workspace_path}))
                 .await?;
+            self.check_in(&host, &project.id, from, &task.id, &params.mode).await;
         }
         let data = self.inner.data.get();
         let touches = if task.touches.is_empty() { String::new() } else { data.text("board_touches", &[("touches", &task.touches.join(", "))]) };
@@ -829,6 +834,80 @@ impl Agents {
         let start = lock(&self.inner.scheduler).set_limit(adjustment.to);
         for key in start {
             self.start(ctx.clone(), key);
+        }
+    }
+
+    /// The lead's check-in routine (docs/SCHEDULES-PLAN.md): a wake into MANAGE every
+    /// `check_every_ms` that watches the agent's task; the scheduler merges it into the lead's
+    /// routine when there is one and ends it when the watched work is finished. Without a
+    /// scheduler this plugin checks on the lead itself ([`Self::start_checks`]).
+    async fn check_in(&self, host: &Host, project_id: &str, lead: &str, task_id: &str, mode: &str) {
+        let every = self.inner.data.get().limits.check_every_ms;
+        if every == 0 {
+            return;
+        }
+        let when = if every % 60_000 == 0 { format!("every {}m", every / 60_000) } else { format!("every {}s", every.div_ceil(1000)) };
+        let params = cc_protocol::contracts::schedule::AddParams {
+            scope: Some(project_id.to_owned()),
+            kind: Some("wake".to_owned()),
+            when,
+            session_id: Some(lead.to_owned()),
+            watches: vec![task_id.to_owned()],
+            manage: true,
+            mode: Some(mode.to_owned()),
+            by: Some("agents".to_owned()),
+            ..Default::default()
+        };
+        let added = match serde_json::to_value(&params) {
+            Ok(value) => host.call(cc_protocol::contracts::schedule::methods::ADD, value).await.map(|_| ()),
+            Err(error) => Err(RpcError::internal(error.to_string())),
+        };
+        if let Err(error) = added {
+            tracing::info!(%error, lead, "no check-in routine; this plugin checks on the lead itself");
+            lock(&self.inner.self_checked).insert((project_id.to_owned(), lead.to_owned()));
+        }
+    }
+
+    /// Every `check_every_ms` while agents run or wait, the sessions that started them and have no
+    /// check-in routine check on them ([`events::CHECK`]).
+    fn start_checks(&self, ctx: &Ctx) {
+        let this = self.clone();
+        let ctx = ctx.clone();
+        let park = self.inner.park.clone();
+        self.inner.tasks.spawn(async move {
+            loop {
+                let every = this.inner.data.get().limits.check_every_ms;
+                let wait = Duration::from_millis(if every == 0 { 60_000 } else { every });
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = park.cancelled() => return,
+                }
+                if every > 0 {
+                    this.check_leads(&ctx).await;
+                }
+            }
+        });
+    }
+
+    async fn check_leads(&self, ctx: &Ctx) {
+        let host = Host::new(ctx.clone());
+        let keys: Vec<AgentKey> = {
+            let scheduler = lock(&self.inner.scheduler);
+            scheduler.running.iter().chain(scheduler.queued.iter()).cloned().collect()
+        };
+        let mut leads = BTreeSet::new();
+        for key in keys {
+            if let Ok(record) = agent(&host, &key.project_id, &key.name).await
+                && let Some(lead) = lead_session(&host, &record).await
+            {
+                leads.insert((key.project_id.clone(), lead));
+            }
+        }
+        let self_checked = lock(&self.inner.self_checked).clone();
+        for (project_id, lead) in leads {
+            if self_checked.contains(&(project_id.clone(), lead.clone())) {
+                supervise(ctx, Some(&lead), event_of(&project_id, events::CHECK, "", None, ""));
+            }
         }
     }
 
@@ -1055,7 +1134,17 @@ impl Agents {
             updated.tasks_done += 1;
             let updated = upsert(ctx, host, updated).await?;
             let data = self.inner.data.get();
-            let changed = if result.changed_files.is_empty() { String::new() } else { data.text("board_changed", &[("files", &result.changed_files.join(", "))]) };
+            // What the work left, from the project itself: a file it made and then deleted is named
+            // as removed (seen: a handoff listing a file that was gone, and the next agent looking
+            // for it nine times).
+            let (kept, removed): (Vec<&String>, Vec<&String>) = result.changed_files.iter().partition(|file| std::path::Path::new(&project.root).join(file).exists());
+            let mut changed = String::new();
+            if !kept.is_empty() {
+                changed.push_str(&data.text("board_changed", &[("files", &kept.iter().map(|file| file.as_str()).collect::<Vec<_>>().join(", "))]));
+            }
+            if !removed.is_empty() {
+                changed.push_str(&data.text("board_removed", &[("files", &removed.iter().map(|file| file.as_str()).collect::<Vec<_>>().join(", "))]));
+            }
             let post = data.text("board_done", &[("title", &task.title), ("summary", result.summary.trim()), ("changed", &changed)]);
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
             handoff_ended(host, &updated, task, "is done", &result.summary).await;
@@ -1556,6 +1645,9 @@ impl Agents {
             let Ok(agents) = agents_of(&host, &project.id).await else { continue };
             for record in agents.into_iter().filter(|agent| agent.status == "working") {
                 tracing::info!(agent = %record.name, project = %project.id, "re-adopting a working agent");
+                if let (Some(lead), Some(task_id)) = (lead_session(&host, &record).await, record.task_id.clone()) {
+                    self.check_in(&host, &project.id, &lead, &task_id, &record.mode).await;
+                }
                 self.enqueue(ctx.clone(), AgentKey { project_id: project.id.clone(), name: record.name }).await;
             }
         }
@@ -1827,6 +1919,7 @@ impl Plugin for Agents {
         Box::pin(async move {
             this.start_data(&ctx);
             this.start_control(&ctx);
+            this.start_checks(&ctx);
             tokio::spawn(async move {
                 if let Err(error) = this.readopt(ctx).await {
                     tracing::warn!(%error, "could not re-adopt working agents");

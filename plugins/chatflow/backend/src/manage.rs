@@ -87,22 +87,81 @@ pub fn repeated_failure(entries: &[JournalEntry], task_id: &str) -> bool {
     }
 }
 
+/// What an agent's current run did, from its journal (structural facts, no model): steps,
+/// edits and the files they changed, calls since its last edit, and how long ago it last moved.
+/// The host names what needs the session's attention: calls without an edit past
+/// `limits.manage_reading_calls`, or no step for `limits.manage_idle_minutes` (waiting for the model).
+pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
+    let Some(session_id) = agent.session_id.as_deref() else { return String::new() };
+    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return String::new() };
+    let entries = journal.entries_vec();
+    let Some(run_id) = entries.iter().rev().find(|entry| entry.kind == kinds::STATUS).map(|entry| str_field(&entry.data, "run_id").to_owned()) else {
+        return String::new();
+    };
+    let run: Vec<&JournalEntry> = entries.iter().filter(|entry| str_field(&entry.data, "run_id") == run_id).collect();
+    let ok: HashMap<&str, bool> = run
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT)
+        .map(|entry| (str_field(&entry.data, "call_id"), entry.data.get("ok").and_then(Value::as_bool).unwrap_or(false)))
+        .collect();
+    let steps = run.iter().filter(|entry| entry.kind == kinds::USAGE).count();
+    let mut edits = 0;
+    let mut since_edit = 0;
+    let mut files: Vec<String> = Vec::new();
+    for entry in run.iter().filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("host").and_then(Value::as_bool) != Some(true)) {
+        let edited = str_field(&entry.data, "tool") == "edit" && ok.get(str_field(&entry.data, "call_id")).copied().unwrap_or(false);
+        if edited {
+            edits += 1;
+            since_edit = 0;
+            let path = entry.data.get("args").and_then(|args| args.get("path")).and_then(Value::as_str).unwrap_or("");
+            if !path.is_empty() && !files.iter().any(|known| known == path) {
+                files.push(path.to_owned());
+            }
+        } else {
+            since_edit += 1;
+        }
+    }
+    let last_ms = run.iter().map(|entry| entry.ts_ms).max().unwrap_or(0);
+    let idle = cc_protocol::contracts::now_ms().saturating_sub(last_ms) / 60_000;
+    let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
+    let mut line = env.data.text(
+        "manage_progress",
+        &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("idle", &idle.to_string())],
+    );
+    let limits = &env.data.limits;
+    if limits.manage_reading_calls > 0 && since_edit >= limits.manage_reading_calls as usize {
+        line.push_str(&env.data.text("manage_flag_reading", &[("since", &since_edit.to_string())]));
+    }
+    if limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes {
+        line.push_str(&env.data.text("manage_flag_idle", &[("idle", &idle.to_string())]));
+    }
+    line
+}
+
+/// One line per open agent: its task, its state, what its run did and its task's last result.
+pub async fn work_lines_with_progress(env: &RunEnv, work: &[OpenWork]) -> String {
+    let mut lines = Vec::new();
+    for item in work {
+        lines.push(format!("{}{}", work_line(env, item), progress(env, &item.agent).await));
+    }
+    lines.join("\n")
+}
+
 /// One line per open agent: its task, its state and its task's last result.
 pub fn work_lines(env: &RunEnv, work: &[OpenWork]) -> String {
-    work.iter()
-        .map(|item| {
-            let result = item.task.result.as_deref().map(str::trim).filter(|result| !result.is_empty()).map(|result| {
-                let cut: String = result.chars().take(RESULT_CHARS).collect();
-                if cut.len() < result.len() { format!(": {cut}...") } else { format!(": {cut}") }
-            });
-            let repeated = if item.repeated { env.data.text("manage_repeat", &[]) } else { String::new() };
-            env.data.text(
-                "manage_line",
-                &[("agent", &item.agent.name), ("title", &item.task.title), ("state", &item.agent.status), ("detail", &format!("{}{repeated}", result.unwrap_or_default()))],
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    work.iter().map(|item| work_line(env, item)).collect::<Vec<_>>().join("\n")
+}
+
+fn work_line(env: &RunEnv, item: &OpenWork) -> String {
+    let result = item.task.result.as_deref().map(str::trim).filter(|result| !result.is_empty()).map(|result| {
+        let cut: String = result.chars().take(RESULT_CHARS).collect();
+        if cut.len() < result.len() { format!(": {cut}...") } else { format!(": {cut}") }
+    });
+    let repeated = if item.repeated { env.data.text("manage_repeat", &[]) } else { String::new() };
+    env.data.text(
+        "manage_line",
+        &[("agent", &item.agent.name), ("title", &item.task.title), ("state", &item.agent.status), ("detail", &format!("{}{repeated}", result.unwrap_or_default()))],
+    )
 }
 
 /// Cancel tasks (each with what waits for it) through the agents plugin, which stops their agents;
@@ -133,7 +192,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
     let shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
-    let live = env.data.text("manage_live", &[("work", &work_lines(env, &work))]);
+    let live = env.data.text("manage_live", &[("work", &work_lines_with_progress(env, &work).await)]);
     let (decision, _) = crate::flow::decide_json::<Manage>(env, journal, "MANAGE", &shape, &live).await?;
     let mut done = Vec::new();
     for action in &decision.actions {
@@ -167,7 +226,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
                 env.host
                     .call(agents_methods::STEER, json!({"project_id": env.scope.project_id, "agent": name, "text": text, "kind": kind}))
                     .await
-                    .map(|_| env.data.text("managed_message", &[("agent", name)]))
+                    .map(|_| env.data.text("managed_message", &[("agent", name), ("text", text)]))
             }
             _ => continue,
         };

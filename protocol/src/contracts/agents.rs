@@ -56,6 +56,9 @@ pub mod events {
     pub const NEED: &str = "need";
     /// Every task of the tree is done and verified.
     pub const TREE_DONE: &str = "tree_done";
+    /// A regular check-in while the session's agents work: the session looks at each agent's
+    /// progress (the host's facts from its journal) and keeps it on its task.
+    pub const CHECK: &str = "check";
 }
 
 /// Published on [`topics::SUPERVISE`].

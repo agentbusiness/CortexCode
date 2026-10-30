@@ -165,6 +165,14 @@ fn default_reply_think_tokens() -> u32 {
     2048
 }
 
+fn default_manage_reading_calls() -> u32 {
+    10
+}
+
+fn default_manage_idle_minutes() -> u64 {
+    10
+}
+
 fn default_reasoning_steps() -> u32 {
     0
 }
@@ -242,6 +250,13 @@ pub struct Limits {
     /// for the decided effort (16384 for xhigh, minutes of thinking before a word of the answer).
     #[serde(default = "default_reply_think_tokens")]
     pub reply_think_tokens: u32,
+    /// An agent that made this many calls since its last edit is named to its session as reading
+    /// without writing (MANAGE; 0 = never).
+    #[serde(default = "default_manage_reading_calls")]
+    pub manage_reading_calls: u32,
+    /// An agent with no step for this many minutes is named to its session as not moving (0 = never).
+    #[serde(default = "default_manage_idle_minutes")]
+    pub manage_idle_minutes: u64,
     /// Steps, newest first, whose reasoning the prompt still carries; older steps show their answer
     /// and calls only, as the model's own template renders earlier turns (seen: 4k tokens of
     /// thinking per step kept for 280 steps filled the window). The engine resumes from the

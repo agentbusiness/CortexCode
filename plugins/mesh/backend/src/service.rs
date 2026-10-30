@@ -44,6 +44,10 @@ pub const PROVIDES: &[&str] = &[
     methods::CLAIM,
     methods::RELEASE,
     methods::MODEL_YIELD,
+    methods::SERVICES,
+    methods::SERVICE_CALL,
+    methods::SHARES,
+    methods::SHARES_SET,
 ];
 pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"];
 
@@ -104,6 +108,8 @@ pub struct Mesh {
     pub claims: crate::claims::Claims,
     /// Apps of this person on this machine, trusted while they run ([`crate::local`]).
     pub local: Mutex<HashMap<String, crate::local::LocalPeer>>,
+    /// The services this computer's plugins share, the person's switches, members' declarations.
+    pub services: crate::services::Services,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -151,6 +157,7 @@ impl Mesh {
             links: crate::projects::Links::default(),
             claims: crate::claims::Claims::default(),
             local: Mutex::new(HashMap::new()),
+            services: crate::services::Services::default(),
         }
     }
 
@@ -448,6 +455,7 @@ impl Mesh {
             None => Card { node: self.me.hex(), name: self.name(), software: crate::SOFTWARE.to_owned(), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
         };
         let mut card = card;
+        card.services = Self::service_cards(&self.local_shares().await);
         // A model this computer does not lend is not shown to the members.
         if !self.lends() {
             card.model = None;
@@ -684,6 +692,24 @@ impl Mesh {
                 let outcome = self.call_member(&params.node, &params.method, params.params, Some(tx), cancel).await;
                 let _ = pump.await;
                 outcome
+            }
+            methods::SERVICES => to_value(&self.services().await),
+            methods::SERVICE_CALL => {
+                let params: cc_protocol::contracts::mesh::ServiceCallParams = parse_params(params)?;
+                let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+                let pump = tokio::spawn(async move {
+                    while let Some(item) = rx.recv().await {
+                        items.send(item);
+                    }
+                });
+                let outcome = self.service_call(params, tx, cancel).await;
+                let _ = pump.await;
+                outcome
+            }
+            methods::SHARES => to_value(&self.shares_result().await),
+            methods::SHARES_SET => {
+                let params: cc_protocol::contracts::mesh::SharesSetParams = parse_params(params)?;
+                to_value(&self.set_shares(params).await?)
             }
             methods::PLACE => {
                 let params: PlaceParams = parse_params(params)?;

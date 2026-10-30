@@ -43,6 +43,11 @@ default = "medium"
 [limits]
 # Graph context for planning: semantic search hits for the goal (no repository map; at most 10).
 search_limit = 5
+# How often a session that started agents checks on them while they work (ms): it reads each
+# agent's progress (steps, edits, reads since the last edit, waits) and steers it back to its task.
+# Without it the session heard only when an agent blocked or asked (seen: an hour of reading, and
+# an agent that never started, with nobody looking). 0 = only on their events.
+check_every_ms = 240000
 
 # Agents in flight (running, including those waiting on tools: an agent in a tool holds no model
 # slot, the chat flow hibernates its KV). A control loop moves the limit within [min, max] to the

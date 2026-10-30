@@ -16,9 +16,10 @@ use cc_protocol::contracts::memory::{
     AppProjectDeleteParams, AppProjectPutParams, AppProjectsResult, AppSessionPutParams, AppSessionsDeleteParams, AppSessionsResult, JournalAppendParams, JournalAppendResult, JournalDropParams, JournalReadParams, JournalReadResult,
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
-    NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
+    NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, FocusParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
     RunRecordResult, Scope, SearchParams, SecurityAuditPutParams, SecurityChanged, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecuritySummaryParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
     TaskListResult, TaskUpdateParams, UndescribedParams, WorkspaceParams, methods, topics,
+    Routine, RoutineListParams, RoutineListResult, RoutineRun, RoutineRunsParams, RoutineRunsResult,
 };
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, parse_params, to_value};
 use serde_json::{Map, Value, json};
@@ -169,6 +170,7 @@ pub const PROVIDES: &[&str] = &[
     methods::IMPACT,
     methods::PATH,
     methods::OUTLINE,
+    methods::FOCUS,
     methods::REPO_MAP,
     methods::FILES,
     methods::SKILLS,
@@ -226,6 +228,12 @@ pub const PROVIDES: &[&str] = &[
     methods::KNOWLEDGE_LINKED,
     methods::KNOWLEDGE_BRIEF,
     methods::KNOWLEDGE_COUNT,
+    methods::ROUTINE_PUT,
+    methods::ROUTINE_GET,
+    methods::ROUTINE_LIST,
+    methods::ROUTINE_REMOVE,
+    methods::ROUTINE_RUN_PUT,
+    methods::ROUTINE_RUNS,
 ];
 
 fn short_hash(text: &str) -> String {
@@ -1060,6 +1068,19 @@ impl Memory {
         self.publish(topics::KNOWLEDGE_CHANGED, json!({"project_id": item.project_id, "id": item.id, "kind": item.kind, "state": item.state, "action": action}));
     }
 
+    /// The store that holds a routine: every registered project's, then the global one.
+    async fn find_routine_store(&self, id: &str) -> Result<Arc<WorkStore>, RpcError> {
+        let mut scopes = self.registered_projects().await?;
+        scopes.push("global".to_owned());
+        for scope in scopes {
+            let Ok(store) = self.work(&scope).await else { continue };
+            if store.routine_get(id).await?.is_some() {
+                return Ok(store);
+            }
+        }
+        Err(RpcError::not_found(format!("routine {id} not found")))
+    }
+
     async fn find_task_store(&self, task_id: &str) -> Result<Arc<WorkStore>, RpcError> {
         if let Some(project) = self.task_owner.lock().await.get(task_id).cloned() {
             return self.work(&project).await;
@@ -1206,6 +1227,12 @@ impl Memory {
                 let path = relative(&tree.root, &p.path);
                 to_value(&tree.outline(&path).await?)
             }
+            methods::FOCUS => {
+                let p: FocusParams = parse_params(params)?;
+                let tree = self.tree(&p.scope).await?;
+                let path = relative(&tree.root, &p.path);
+                to_value(&tree.focus(&path, &p.text).await?)
+            }
             methods::LINES => {
                 let p: LinesParams = parse_params(params)?;
                 let tree = self.tree(&p.scope).await?;
@@ -1316,6 +1343,49 @@ impl Memory {
                 }
                 self.security_changed(&p.project_id, Some(&p.id), None);
                 to_value(&json!({}))
+            }
+            methods::ROUTINE_PUT => {
+                let routine: Routine = parse_params(params)?;
+                let scope = if routine.scope.is_empty() { "global".to_owned() } else { routine.scope.clone() };
+                self.refuse_reference(&scope, "routines").await?;
+                to_value(&self.work(&scope).await?.routine_put(routine).await?)
+            }
+            methods::ROUTINE_GET => {
+                let id = params.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let routine = self.find_routine_store(&id).await?.routine_get(&id).await?.ok_or_else(|| RpcError::not_found(format!("routine {id} not found")))?;
+                to_value(&routine)
+            }
+            methods::ROUTINE_LIST => {
+                let p: RoutineListParams = parse_params(params)?;
+                let scopes = match p.scope {
+                    Some(scope) => vec![scope],
+                    None => {
+                        let mut scopes = self.registered_projects().await?;
+                        scopes.push("global".to_owned());
+                        scopes
+                    }
+                };
+                let mut routines = Vec::new();
+                for scope in scopes {
+                    if let Ok(store) = self.work(&scope).await {
+                        routines.extend(store.routine_list().await?);
+                    }
+                }
+                to_value(&RoutineListResult { routines })
+            }
+            methods::ROUTINE_REMOVE => {
+                let id = params.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                self.find_routine_store(&id).await?.routine_remove(&id).await?;
+                to_value(&json!({}))
+            }
+            methods::ROUTINE_RUN_PUT => {
+                let run: RoutineRun = parse_params(params)?;
+                to_value(&self.find_routine_store(&run.routine_id).await?.routine_run_put(run).await?)
+            }
+            methods::ROUTINE_RUNS => {
+                let p: RoutineRunsParams = parse_params(params)?;
+                let runs = self.find_routine_store(&p.id).await?.routine_runs(&p.id, p.limit.unwrap_or(20)).await?;
+                to_value(&RoutineRunsResult { runs })
             }
             methods::BOARD_POST => {
                 let p: BoardPostParams = parse_params(params)?;

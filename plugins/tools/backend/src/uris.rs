@@ -226,6 +226,8 @@ pub async fn read(host: &dyn Host, scope: &Scope<'_>, uri: &str) -> Result<Strin
         "task" => task(host, scope, &decode(path), &params).await,
         "agent" => agent(host, scope, &decode(path)).await,
         "board" => board(host, scope, &params).await,
+        // Routines (docs/SCHEDULES-PLAN.md): the project's and the global ones, or one with its runs.
+        "schedule" => schedule(host, scope, &decode(path)).await,
         "rule" | "rules" => rules(host, scope).await,
         // Project knowledge (docs/PROJECT-KNOWLEDGE-PLAN.md P2): one item by id, or the live list.
         "knowledge" => knowledge(host, scope, &decode(path)).await,
@@ -240,7 +242,7 @@ pub async fn read(host: &dyn Host, scope: &Scope<'_>, uri: &str) -> Result<Strin
         other => Err(UriError::new(
             "bad_uri",
             format!(
-                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, rule://, knowledge://, skill://, research:// and trace:// (see read's `path`)"
+                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, schedule://, rule://, knowledge://, skill://, research:// and trace:// (see read's `path`)"
             ),
         )),
     }
@@ -421,10 +423,22 @@ async fn split_pair(host: &dyn Host, scope: &Scope<'_>, rest: &str) -> Result<(S
     }
 }
 
+/// The code graph's match of each definition and section of `path` with `text` (`memory.focus`):
+/// (start line, end line, score). None scored (no memory plugin, file not indexed): empty.
+pub async fn focus_scores(host: &dyn Host, scope: &Scope<'_>, path: &str, text: &str) -> Vec<(usize, usize, f64)> {
+    let request = merge(scope_params(scope), json!({ "path": path, "text": text }));
+    let Ok(value) = host.call("memory.focus", request).await else { return Vec::new() };
+    let Ok(result) = serde_json::from_value::<cc_protocol::contracts::memory::FocusResult>(value) else { return Vec::new() };
+    result.units.into_iter().map(|unit| (unit.start_line as usize, unit.end_line as usize, unit.score)).collect()
+}
+
 async fn lookup_symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<SymbolMatches, UriError> {
     let request = merge(scope_params(scope), json!({ "name": name }));
     parse(host.call("memory.symbol", request).await.map_err(|e| rpc(e, CODE_GRAPH))?, "memory.symbol")
 }
+
+/// At most this many definitions of one name are shown with their code; more are listed.
+const SYMBOL_CODE_MAX: usize = 3;
 
 async fn symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String, UriError> {
     if name.trim().is_empty() {
@@ -445,6 +459,17 @@ async fn symbol(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String
             return Err(UriError::new("not_found", format!("symbol://{name}: {} no longer has it. Search for it: graph://search/{name}", files.join(", "))));
         }
         return Err(UriError::new("not_found", format!("symbol://{name}: no such symbol (try graph://search/{name})")));
+    }
+    // A name many definitions share: one line each, with the range that reads it (seen: one
+    // name with 40 definitions read in full, 41k characters, none of them the one the work needed).
+    if result.matches.len() > SYMBOL_CODE_MAX {
+        let mut out = format!("symbol://{name}: {} definitions have this name. Read the one the work is about by its range:\n", result.matches.len());
+        for detail in &result.matches {
+            let symbol = &detail.symbol;
+            let head = symbol.signature.lines().next().map(str::trim).filter(|line| !line.is_empty()).unwrap_or(&symbol.qname);
+            let _ = writeln!(out, "{}:{}-{}  {head}", rel(scope, &symbol.path), symbol.start_line, symbol.end_line);
+        }
+        return Ok(out);
     }
     // Each match: its line, what it takes and returns, where it goes next (by name), its code.
     let mut out = String::new();
@@ -608,6 +633,20 @@ async fn task(host: &dyn Host, scope: &Scope<'_>, id: &str, params: &HashMap<Str
     let mut out = String::new();
     render_task(&mut out, &task);
     Ok(out)
+}
+
+/// `schedule://` lists this project's routines and the global ones; `schedule://<id>` shows one
+/// with its last runs. The scheduler writes the lines (`text`).
+async fn schedule(host: &dyn Host, scope: &Scope<'_>, id: &str) -> Result<String, UriError> {
+    let id = id.trim().trim_matches('/');
+    let answer = if id.is_empty() {
+        host.call("schedule.list", json!({"scope": scope.project_id, "with_global": true})).await
+    } else {
+        host.call("schedule.get", json!({"id": id})).await
+    }
+    .map_err(|error| rpc(error, "schedule"))?;
+    let text = answer.get("text").and_then(Value::as_str).unwrap_or("").trim_end();
+    Ok(format!("{text}\n"))
 }
 
 async fn agent(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String, UriError> {

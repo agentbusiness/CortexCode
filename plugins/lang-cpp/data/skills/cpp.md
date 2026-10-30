@@ -2,7 +2,7 @@ C and C++ here: get it right, build and test it, code that runs, common errors a
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: headers, sources, tests, docs and callers.
+1. **Pin down what the code must do.** Read the request and the header and source it changes. Callers only when a signature changes; then write.
    - Per function: parameters, return type, how it fails (exception type, return code, `std::optional`, `NULL` in C).
    - The request and the project decide, never a name alone. "whether" returns `bool`; "find" may return an empty `std::optional` or `end()`.
    - When there may be no answer and nothing names a value for it, the declared return type decides: `std::optional<T>` gives `std::nullopt`, an iterator gives `end()`, a pointer gives `nullptr`. Never a made-up sentinel such as `-1`.

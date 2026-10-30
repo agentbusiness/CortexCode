@@ -236,6 +236,8 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
             }
             "LOOKUP" | "ANSWER" => Stage::Explore,
             "MANAGE" if reply_finished(&run, last.seq) => Stage::Done,
+            // A regular check ends with what it did (the `managed` note the person sees): no reply.
+            "MANAGE" if note_after(&run, last.seq, "managed") && last.data.get("detail").and_then(|detail| detail.get("check")).and_then(Value::as_bool) == Some(true) => Stage::Done,
             "MANAGE" if note_after(&run, last.seq, "managed") => Stage::Reply,
             "MANAGE" => Stage::Manage,
             "STATUS" if reply_finished(&run, last.seq) => Stage::Done,
@@ -521,7 +523,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                     .iter()
                     .map(|file| file.trim())
                     .filter(|file| !file.is_empty() && std::path::Path::new(&env.scope.workspace).join(file).is_file())
-                    .map(|file| reads::file_read(&env.scope, &env.session_id, file))
+                    .map(|file| reads::file_read_for(&env.scope, &env.session_id, file, str_field(&detail, "work")))
                     .collect();
                 if !named.is_empty() {
                     let any = env.stops.any();
@@ -689,7 +691,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                     .touches
                                     .iter()
                                     .filter(|item| std::path::Path::new(&env.scope.workspace).join(item.as_str()).is_file() && !in_view(item))
-                                    .map(|file| reads::file_read(&env.scope, &env.session_id, file)),
+                                    .map(|file| reads::file_read_for(&env.scope, &env.session_id, file, &format!("{} {}", planned_task.title, planned_task.brief))),
                             );
                             // A function or class the task touches is read whole (a long file's read
                             // shows only its outline). A touch is a file name when it has a path
@@ -1350,6 +1352,9 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
     // they are done when they make nothing worse (`checks::awaited`), and it leaves every check
     // passing. Added once, before any task is made.
     let fix_title = env.data.text("baseline_task_title", &[]);
+    // Each other task hears what already fails and which task fixes it, so it neither tries to fix
+    // it nor stops on it (seen: an agent spent 17 steps on a contract the baseline already failed).
+    let mut already_failing = String::new();
     if current.tasks.iter().all(|task| task.task_id.is_none()) && current.tasks.last().is_some_and(|task| task.title != fix_title) {
         let failures = crate::checks::baseline_failures(journal, &env.run_id);
         if !failures.is_empty() {
@@ -1364,9 +1369,10 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                 })
                 .collect();
             let n = current.tasks.len() as u32 + 1;
+            already_failing = env.data.text("baseline_known", &[("failures", &lines), ("n", &n.to_string()), ("title", &fix_title)]);
             current.tasks.push(plan::PlanTask {
                 n,
-                title: fix_title,
+                title: fix_title.clone(),
                 brief: env.data.text("baseline_task_brief", &[("failures", &lines)]),
                 checks: failures.into_iter().map(|(command, _)| command).collect(),
                 depends_on: (1..n).collect(),
@@ -1392,7 +1398,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                     "project_id": env.scope.project_id,
                     "parent_id": root,
                     "title": task.title,
-                    "brief": plan::agent_brief(&env.data, current, &task),
+                    "brief": if task.title == fix_title { plan::agent_brief(&env.data, current, &task) } else { format!("{}{already_failing}{}", plan::agent_brief(&env.data, current, &task), missing_note(env, current, &task).await) },
                     "plan": "",
                     "contract": contract::contract_from(&checks),
                     "depends_on": depends,
@@ -1407,6 +1413,47 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
         journal.append(kinds::TASK_LINK, json!({"task_id": made.id, "title": made.title, "run_id": env.run_id, "parent_id": root, "plan_id": current.plan_id})).await?;
     }
     Ok(root)
+}
+
+/// The code names a task's brief relies on that the project does not have and that no task of the
+/// plan adds, looked up in the graph (structural): named in the brief, so the agent knows at its
+/// first step instead of finding out an hour in (seen: a task built on an engine call that did not
+/// exist, found by its agent after sixty minutes of reading). Empty when every name resolves.
+async fn missing_note(env: &RunEnv, plan: &plan::Plan, task: &plan::PlanTask) -> String {
+    let text = format!("{}\n{}", task.brief, task.known.join("\n"));
+    let mut names: Vec<String> = Vec::new();
+    for span in text.split('`').skip(1).step_by(2) {
+        let span = span.trim();
+        let span = span.strip_prefix("fn ").or_else(|| span.strip_prefix("def ")).or_else(|| span.strip_prefix("func ")).unwrap_or(span);
+        let name: String = span.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+        let name = name.trim_matches(':').to_owned();
+        // An identifier, not a path, a command or a value.
+        let identifier = name.len() > 3 && name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && (span.len() == name.len() || span[name.len()..].starts_with('('));
+        if identifier && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    // A name some task says it adds is planned, not missing.
+    let adds = |name: &str| {
+        plan.tasks.iter().any(|other| {
+            let brief = other.brief.to_lowercase();
+            ["add `", "adds `", "create `", "creates `", "new `", "define `", "defines `", "write `", "writes `", "introduce `"]
+                .iter()
+                .any(|verb| brief.split(verb).skip(1).any(|rest| rest.trim_start_matches("fn ").trim_start_matches("def ").starts_with(&name.to_lowercase())))
+        })
+    };
+    let mut missing = Vec::new();
+    for name in names {
+        if adds(&name) {
+            continue;
+        }
+        let found = env.host.get::<cc_protocol::contracts::memory::SymbolMatches>(memory_methods::SYMBOL, json!({"project_id": env.scope.project_id, "name": name})).await;
+        // Only a lookup that answered "none" counts; a failed lookup says nothing.
+        if found.is_ok_and(|found| found.matches.is_empty()) {
+            missing.push(format!("`{name}`"));
+        }
+    }
+    if missing.is_empty() { String::new() } else { env.data.text("plan_task_missing", &[("names", &missing.join(", "))]) }
 }
 
 /// `baseline`: run the plan's checks first (a skill's units check work that is not there yet, so

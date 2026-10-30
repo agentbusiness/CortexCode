@@ -89,11 +89,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-sandbox-kit"
+version = "0.1.0"
+dependencies = [
+ "cc-protocol",
+ "libc",
+ "regex",
+ "sha2",
+]
+
+[[package]]
 name = "cc-tools"
 version = "0.1.0"
 dependencies = [
  "base64",
  "cc-protocol",
+ "cc-sandbox-kit",
  "ignore",
  "libc",
  "notify",

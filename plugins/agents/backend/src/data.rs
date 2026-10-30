@@ -109,6 +109,14 @@ pub struct EffortConfig {
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     pub search_limit: u32,
+    /// How often a session that started agents checks on them while they work (ms; 0 = only on
+    /// their events).
+    #[serde(default = "default_check_every_ms")]
+    pub check_every_ms: u64,
+}
+
+fn default_check_every_ms() -> u64 {
+    240_000
 }
 
 /// One validated data set.

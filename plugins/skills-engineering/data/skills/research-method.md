@@ -1,4 +1,4 @@
-A question the repo can't answer: a domain's rules, a library choice, an outside error, prior art.
+Online research: papers, prior art, a library choice, an outside error, a domain's rules.
 
 ## 0. When to go online
 

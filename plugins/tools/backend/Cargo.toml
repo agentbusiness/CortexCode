@@ -23,6 +23,8 @@ path = "src/main.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["agents", "hashline", "lang", "memory", "mesh", "model", "skills", "stored", "tools", "vcs"] }
+# The write sandbox, shared with CortexTerm.
+cc-sandbox-kit = { path = "../../../sandbox-kit" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["full"] }

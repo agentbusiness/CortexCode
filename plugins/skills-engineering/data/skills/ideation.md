@@ -1,4 +1,4 @@
-An open design question (architecture, API, algorithm): weigh options and tradeoffs; not building.
+Ideas or an open design question (architecture, API, algorithm): options, tradeoffs; not building.
 
 Change nothing; output options for the user.
 
@@ -13,7 +13,7 @@ First, three lines:
 
 - This repo: `read graph://search/<words>`, then `graph://impact/<name>` of what each option changes.
 - A named repo: `graph://<project>/search/<words>`, `symbol://<project>/<name>`, `<project>:<path>`: its solution and cost.
-- Earlier findings: `research://notes/<topic>`. None, and the outside world matters: `skill://skills-engineering/research-method` first.
+- Earlier findings: `read research://notes/<topic>`. None, and the outside world matters: `skill://skills-engineering/research-method` first.
 
 ## 3. Generate from different principles
 
@@ -30,7 +30,7 @@ Same mechanism = one option. Under three mechanisms: use another generator.
 
 ## 4. Check what is known
 
-Per option: `read research://notes/<topic>?q=<mechanism words>`; online: `research://search/<mechanism words>?sources=github,arxiv,hackernews`. Write "known: <where>, with its reported problems", "variant of <X>" or "not found in N searches", never "novel". Known problems go into the critique.
+Per option: `read research://notes/<topic>?q=<mechanism words>`; online: `read research://search/<mechanism words>?sources=github,arxiv,hackernews`. Write "known: <where>, with its reported problems", "variant of <X>" or "not found in N searches", never "novel". Known problems go into the critique.
 
 ## 5. Critique
 

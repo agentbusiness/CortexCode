@@ -1,0 +1,22 @@
+[package]
+name = "cc-sandbox-kit"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "The write sandbox agent commands run in (macOS sandbox-exec, Linux Landlock), shared by CortexCode and CortexTerm."
+
+# Standalone: every plugin that confines commands is its own workspace and depends on this crate by path.
+[workspace]
+
+[lib]
+name = "cc_sandbox_kit"
+path = "src/lib.rs"
+
+[dependencies]
+# The approval class prefixes (`write_outside:`, `lift:`) stay one definition in the tools contract.
+cc-protocol = { path = "../protocol", features = ["tools"] }
+regex = "1.12"
+libc = "0.2.183"
+sha2 = "0.10"

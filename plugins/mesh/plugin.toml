@@ -6,7 +6,7 @@
 [plugin]
 id = "mesh"
 name = "Mesh"
-version = "0.1.14"
+version = "0.1.15"
 description = "This person's CortexCode instances linked together: pairing with a short code, a signed membership, encrypted connections over the local network or a relay, capability cards, and borrowing a member's model or hands through the frame's own contracts."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

@@ -223,12 +223,9 @@ pub fn plan(scope: &Scope, wanted: &Wanted<'_>, limits: &crate::data::Limits) ->
         });
     }
     for file in clean(wanted.files) {
-        reads.push(ReadReq {
-            tool: tools_methods::READ.into(),
-            args: file_read_args(scope, wanted.session_id, &file),
-            intent: format!("Read {file}"),
-            impact: false,
-        });
+        let mut req = file_read_for(scope, wanted.session_id, &file, wanted.work.unwrap_or(""));
+        req.intent = format!("Read {file}");
+        reads.push(req);
     }
     if let Some(how) = wanted.diagnostics {
         let named = diagnostics(scope, how.session_id, &[wanted.files, wanted.focus], how.languages);
@@ -272,6 +269,16 @@ pub fn graph_search(scope: &Scope, text: &str, limit: u32) -> ReadReq {
 /// A host read of `file` made as the session's own read (anchored and counted as read).
 pub fn file_read(scope: &Scope, session_id: &str, file: &str) -> ReadReq {
     ReadReq { tool: tools_methods::READ.into(), args: file_read_args(scope, session_id, file), intent: format!("Read {file}"), impact: false }
+}
+
+/// [`file_read`] for a purpose (the work, a task's statement): a big file then shows the parts
+/// that match it whole and the rest by their first line (the tools' focused read).
+pub fn file_read_for(scope: &Scope, session_id: &str, file: &str, purpose: &str) -> ReadReq {
+    let mut req = file_read(scope, session_id, file);
+    if !purpose.trim().is_empty() {
+        req.args["intent"] = json!(purpose.trim());
+    }
+    req
 }
 
 fn file_read_args(scope: &Scope, session_id: &str, file: &str) -> Value {

@@ -2,7 +2,7 @@ Python here: get it right, run and test it, code that runs, common errors and th
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, docstrings), its tests, docs and callers.
+1. **Pin down what the code must do.** Read the request and the code it changes (signatures, docstrings) and its tests. Callers only when a signature changes; then write.
    - Per function: what it takes, returns and raises.
    - The request and the project decide, never a name alone. "whether" returns a bool. "find" may return `None`. "compute X" returns X, not whether X exists.
    - When there may be no answer and nothing names a value for that case, do what the project already does (`None`, an exception, an empty result); in new code `None` is Python's "no result", not `False` or `-1`.

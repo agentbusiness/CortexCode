@@ -1,0 +1,20 @@
+/* pane.schedule@1 — routines as ruled rows; an open one shows its editor, its moves and its runs. */
+#cc .cx-schedule{flex:1;min-height:0;display:flex;flex-direction:column;}
+#cc .cx-schedule>.bar{padding-left:16px;gap:8px;}
+#cc .cx-schedule-scroll{flex:1;min-height:0;overflow:auto;padding:0 16px 24px 0;}
+#cc .cx-schedule .lst .t{font-size:14.5px;}
+#cc .cx-schedule .lst .r{display:flex;align-items:baseline;gap:8px;}
+#cc .cx-schedule .empty-line{padding-left:16px;max-width:64ch;}
+#cc .cx-schedule .inline-error{margin:0;}
+#cc .cx-routine-open{border-left:1px solid var(--rule-2);margin:0 0 12px 18px;padding:4px 0 12px 12px;display:flex;flex-direction:column;gap:8px;}
+#cc .cx-routine-form{display:flex;flex-direction:column;gap:6px;margin-left:16px;}
+#cc .cx-routine-open .cx-routine-form{margin-left:0;}
+#cc .cx-schedule-scroll>.cx-routine-form{padding:12px 0;border-bottom:1px solid var(--rule);}
+#cc .cx-routine-fields{display:flex;gap:6px;flex-wrap:wrap;align-items:center;}
+#cc .cx-routine-form input,#cc .cx-routine-form textarea{font:inherit;font-size:13.5px;color:var(--ink);background:transparent;border:1px solid var(--rule-2);border-radius:4px;padding:4px 8px;box-sizing:border-box;}
+#cc .cx-routine-fields input{flex:1 1 160px;min-width:0;}
+#cc .cx-routine-form textarea{width:100%;resize:vertical;line-height:1.5;}
+#cc .cx-routine-acts{display:flex;gap:4px;flex-wrap:wrap;align-items:center;}
+#cc .cx-routine-runs{list-style:none;margin:0;padding:0;}
+#cc .cx-routine-runs li{display:flex;align-items:baseline;gap:8px;padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-run-summary{flex:1;min-width:0;font-size:13px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}

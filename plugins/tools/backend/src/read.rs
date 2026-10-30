@@ -14,13 +14,16 @@ pub struct ReadConfig {
     pub outline_lines: usize,
     /// Files bigger than this (bytes) are shown as an outline when read without a range.
     pub outline_bytes: usize,
+    /// Files at least this big (bytes) read whole with an intent are shown focused on it
+    /// ([`Focus`]) when parts of them clearly match it.
+    pub focus_bytes: usize,
 }
 
 impl Default for ReadConfig {
     fn default() -> Self {
         // A whole read shows at most 400 lines (about 4-6k tokens); a bigger file gives its outline
         // and is read by range. A read never fills the model's context with one file.
-        Self { outline_lines: 300, outline_bytes: 24 * 1024 }
+        Self { outline_lines: 300, outline_bytes: 24 * 1024, focus_bytes: 6 * 1024 }
     }
 }
 
@@ -140,7 +143,159 @@ pub fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0) || std::str::from_utf8(bytes).is_err()
 }
 
-pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadConfig) -> Result<FileView, ReadError> {
+/// What a whole-file read is for: the names its intent writes (identifier-shaped words) and the
+/// code graph's match of each definition or section with the intent (`memory.focus`).
+#[derive(Debug, Clone, Default)]
+pub struct Focus {
+    pub names: Vec<String>,
+    /// (start line, end line, score), 1-based lines.
+    pub scores: Vec<(usize, usize, f64)>,
+    /// The intent says more than the file's name and one word ("Read lib.rs" does not).
+    pub specific: bool,
+}
+
+impl Focus {
+    /// The names in an intent: words shaped like code (`snake_case`, `CamelCase`, `a::b`, `x.y()`,
+    /// backticked), split into their parts; words of the file's own path are not names.
+    pub fn from_intent(intent: &str, display: &str, scores: Vec<(usize, usize, f64)>) -> Focus {
+        let path_words: BTreeSet<String> = display.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+        let mut names = Vec::new();
+        let mut other_words = 0usize;
+        for raw in intent.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '"' | '\'' | '[' | ']' | '{' | '}')) {
+            let backticked = raw.contains('`');
+            let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if token.is_empty() {
+                continue;
+            }
+            let lower = token.to_lowercase();
+            if path_words.contains(&lower) || display.to_lowercase().ends_with(&lower) {
+                continue;
+            }
+            let camel = token.chars().skip(1).any(char::is_uppercase) && token.chars().any(char::is_lowercase);
+            let shaped = backticked || token.contains('_') || token.contains("::") || token.contains('.') || camel;
+            if shaped {
+                for part in token.split("::").flat_map(|part| part.split('.')) {
+                    let part = part.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if part.chars().count() >= 3 && !names.iter().any(|name| name == part) {
+                        names.push(part.to_owned());
+                    }
+                }
+            } else {
+                other_words += 1;
+            }
+        }
+        Focus { specific: !names.is_empty() || other_words > 2, names, scores }
+    }
+}
+
+/// Whether `word` occurs in `text` as a whole identifier.
+fn has_name(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// A file read for one purpose: the frame (the lines before its first definition: imports, the
+/// module's own comment, a document's title), every definition or section that matches the
+/// purpose whole, and the others by their first line with their range. None when nothing clearly
+/// matches or the matches are most of the file (the usual view then serves better).
+fn render_focus(path: &Path, display: &str, text: &str, doc: &Doc, focus: &Focus) -> Option<String> {
+    let lang = Lang::detect(path, text)?;
+    let items = lang::outline(lang, text)?;
+    let total = doc.len();
+    let mut all: Vec<&lang::Item> = Vec::new();
+    fn walk<'a>(items: &'a [lang::Item], out: &mut Vec<&'a lang::Item>) {
+        for item in items {
+            out.push(item);
+            walk(&item.children, out);
+        }
+    }
+    walk(&items, &mut all);
+    // The code graph's score of each item: the scored unit whose span overlaps the item's most.
+    let mut scores: Vec<Option<f64>> = vec![None; all.len()];
+    for &(start, end, score) in &focus.scores {
+        let (start, end) = (start.saturating_sub(1), end.saturating_sub(1).max(start.saturating_sub(1)));
+        let overlap = |item: &lang::Item| -> f64 {
+            let from = start.max(item.start);
+            let to = end.min(item.end);
+            if to < from {
+                return 0.0;
+            }
+            let union = end.max(item.end) - start.min(item.start) + 1;
+            (to - from + 1) as f64 / union as f64
+        };
+        if let Some((index, best)) = all.iter().enumerate().map(|(index, item)| (index, overlap(item))).max_by(|a, b| a.1.total_cmp(&b.1))
+            && best > 0.5
+        {
+            scores[index] = Some(scores[index].map_or(score, |old: f64| old.max(score)));
+        }
+    }
+    let header_text = |item: &lang::Item| -> String { doc.lines[item.start..=item.header_end.min(item.end).min(total - 1)].join(" ") };
+    let mut chosen = vec![false; all.len()];
+    for (index, item) in all.iter().enumerate() {
+        let header = header_text(item);
+        if focus.names.iter().any(|name| has_name(&header, name)) {
+            chosen[index] = true;
+        }
+    }
+    // By meaning only when the intent says what it looks for and the scores clearly separate:
+    // the items in the upper half between the median and the best.
+    let mut known: Vec<f64> = scores.iter().flatten().copied().collect();
+    if focus.specific && known.len() >= 3 {
+        known.sort_by(|a, b| a.total_cmp(b));
+        let (median, best) = (known[known.len() / 2], known[known.len() - 1]);
+        if best - median >= 0.04 {
+            let bar = median + (best - median) / 2.0;
+            for (index, score) in scores.iter().enumerate() {
+                if score.is_some_and(|score| score >= bar) {
+                    chosen[index] = true;
+                }
+            }
+        }
+    }
+    if !chosen.contains(&true) {
+        return None;
+    }
+    let mut shown = BTreeSet::new();
+    let first = items.iter().map(|item| item.start).min().unwrap_or(0);
+    shown.extend(0..first.min(total));
+    lang::shown_rows(&items, &doc.lines, &mut shown);
+    for (index, item) in all.iter().enumerate() {
+        if chosen[index] {
+            // Its own lines: up to its first nested definition (that one is chosen on its own).
+            let own_end = item.children.first().map(|child| child.start.saturating_sub(1)).unwrap_or(item.end).max(item.start);
+            shown.extend(item.start..=own_end.min(total - 1));
+        }
+    }
+    let rows: Vec<usize> = shown.into_iter().filter(|row| *row < total).collect();
+    if rows.len() * 10 > total * 6 {
+        return None;
+    }
+    let hidden = |from: usize, to: usize| from < to && !doc.lines[from..to].iter().all(|line| line.trim().is_empty());
+    let mut body = String::new();
+    let mut example: Option<(usize, usize)> = None;
+    let mut next = 0usize;
+    for row in &rows {
+        if hidden(next, *row) {
+            let _ = writeln!(body, "   ⋮ {}-{}", next + 1, row);
+            example.get_or_insert((next + 1, *row));
+        }
+        body.push_str(&doc.render(row + 1, row + 1));
+        next = row + 1;
+    }
+    if hidden(next, total) {
+        let _ = writeln!(body, "   ⋮ {}-{}", next + 1, total);
+        example.get_or_insert((next + 1, total));
+    }
+    let (from, to) = example.unwrap_or((1, total));
+    Some(format!(
+        "{display}: {total} lines; the parts that match what this read is for are shown whole, the others by their first line (⋮ N-M marks lines left out). Read a left-out part by its range, e.g. {display}:{from}-{to}.\n{body}"
+    ))
+}
+
+pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadConfig, focus: Option<&Focus>) -> Result<FileView, ReadError> {
     let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => ReadError::new("not_found", format!("{display}: no such file.")),
         _ => ReadError::new("io_error", format!("{display}: {error}")),
@@ -218,6 +373,13 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
             return Err(ReadError::new("bad_range", out.trim_end().to_owned()));
         }
         return Ok(view(out, "range"));
+    }
+
+    if let Some(focus) = focus
+        && bytes.len() >= config.focus_bytes
+        && let Some(out) = render_focus(path, display, &text, &doc, focus)
+    {
+        return Ok(view(out, "focus"));
     }
 
     if total <= config.outline_lines && bytes.len() <= config.outline_bytes {

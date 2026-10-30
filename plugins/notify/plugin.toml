@@ -30,7 +30,7 @@ provides = [
   "notify.send", "notify.history", "notify.activated", "notify.deliverer",
   "notify.prefs.get", "notify.prefs.set", "notify.status",
 ]
-subscribes = ["journal.", "agents.changed", "plugin.swapped", "plugin.state", "tools.job", "notify.focus", "memory.settings.changed"]
+subscribes = ["journal.", "agents.changed", "plugin.swapped", "plugin.state", "tools.job", "schedule.ran", "notify.focus", "memory.settings.changed"]
 publishes = ["notify.posted", "notify.activate", "notify.changed"]
 # Calls it makes (all optional: a missing peer only removes names from the text, or switches the
 # preferences to the built-in defaults, which every notification then reports).

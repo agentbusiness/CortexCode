@@ -605,6 +605,11 @@ pub fn normalize(name: &str, arguments: &str) -> Result<Canonical, RepairError> 
                 return Err(RepairError::new("unknown_tool", "the tool call has no tool name; call read, edit, run or terminal"));
             }
             Some(family) => (raw_name.clone(), family),
+            // An unknown name whose arguments are read's (a `path` and nothing that writes or
+            // runs) is a read (seen: `research` with `{intent, path: "research://search/..."}`).
+            None if matches!(&payload, Payload::Object(map) if map.get("path").is_some_and(Value::is_string) && !["edits", "content", "command"].iter().any(|key| map.contains_key(*key))) => {
+                (raw_name.clone(), Family::Read)
+            }
             None => return Err(unknown_tool(&raw_name)),
         },
     };

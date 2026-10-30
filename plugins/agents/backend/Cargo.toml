@@ -19,7 +19,7 @@ name = "cc-agents"
 path = "src/bin/cc-agents.rs"
 
 [dependencies]
-cc-protocol = { path = "../../../protocol", features = ["agents", "chatflow", "checks", "host", "lang", "memory", "mesh", "model", "tools"] }
+cc-protocol = { path = "../../../protocol", features = ["agents", "chatflow", "checks", "host", "lang", "memory", "mesh", "model", "schedule", "tools"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["full"] }

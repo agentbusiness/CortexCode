@@ -25,6 +25,7 @@ use cc_protocol::contracts::chatflow::{
 use crate::{plan, proposal};
 use cc_protocol::contracts::tools::topics as tools_topics;
 use cc_protocol::contracts::agents::{Supervise, events as agent_events, topics as agents_topics};
+use cc_protocol::contracts::schedule::{Fired, topics as schedule_topics};
 use cc_protocol::contracts::frame::{
     JournalEntry, ProjectListResult, Session, SessionDeleted, SessionKind, SessionStatus, SessionUpdateParams, kinds, methods as frame_methods, topics as frame_topics,
 };
@@ -68,13 +69,14 @@ pub fn hello() -> Hello {
         .iter()
         .map(|verb| cc_protocol::contracts::frame::flows::method(FLOW, verb))
         .collect();
-    // Background jobs wake the session that started them; changed skills rebuild the prefixes; a
+    // Background jobs and due routines wake their session; changed skills rebuild the prefixes; a
     // merge of the live folder (the source manager's start-up update) reloads the data set. The
     // plugins a new conversation's block is built from coming up, a project opened and a new
     // project description each have that block prefilled again ([`Chatflow::warm_projects`]).
     hello.subscribes = vec![
         tools_topics::JOB_EVENT.to_owned(),
         agents_topics::SUPERVISE.to_owned(),
+        schedule_topics::FIRED.to_owned(),
         SKILLS_CHANGED.to_owned(),
         frame_topics::SESSION_DELETED.to_owned(),
         SOURCE_CHANGED.to_owned(),
@@ -1321,15 +1323,23 @@ impl Chatflow {
         }
         let set = self.inner.data.get();
         let vars = [("agent", event.agent.as_str()), ("title", event.title.as_str()), ("text", event.text.trim())];
+        let check = event.event == agent_events::CHECK;
         let text = match event.event.as_str() {
             agent_events::NEED => set.text("supervise_need", &vars),
             agent_events::TREE_DONE => set.text("supervise_tree_done", &vars),
+            agent_events::CHECK => set.text("supervise_check", &[]),
             _ => set.text("supervise_blocked", &vars),
         };
         let running = self.active(&session_id).is_some() || running_status(&journal).is_some();
-        journal
-            .append(kinds::NOTE, json!({"text": text, "purpose": "supervise", "host_message": true, "supervise_id": event.id, "supervise": event}))
-            .await?;
+        // A check while the session works waits for the next one; it leaves nothing behind (the
+        // MANAGE stage reads every agent's progress itself).
+        if check && running {
+            return Ok(());
+        }
+        let note = if check { json!({"text": "", "purpose": "supervise", "host_message": false, "supervise_id": event.id, "supervise": event}) } else {
+            json!({"text": text, "purpose": "supervise", "host_message": true, "supervise_id": event.id, "supervise": event})
+        };
+        journal.append(kinds::NOTE, note).await?;
         if running {
             return Ok(());
         }
@@ -1350,9 +1360,68 @@ impl Chatflow {
         let status_seq = journal
             .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "manage", "mode": mode, "kind": "turn", "data_version": set.version()}))
             .await?;
-        let detail = json!({"work": text, "route": "MANAGE", "effort": set.effort.default, "by": "host"});
+        let detail = json!({"work": text, "route": "MANAGE", "effort": set.effort.default, "by": "host", "check": check});
         journal
             .append(kinds::ROUTE, json!({"route": "MANAGE", "stage": "route", "detail": detail, "raw": "", "run_id": run_id}))
+            .await?;
+        let _ = host.session_status(&session_id, SessionStatus::Running).await;
+        let this = self.clone();
+        self.spawn(async move {
+            let outcome = this.drive_foreground(ctx, &session_id, run_id, status_seq, mode, stops, stage).await;
+            let _ = sender.send(Some(outcome.map(|_| empty_result("done"))));
+        });
+        Ok(())
+    }
+
+    /// A routine is due for a session (docs/SCHEDULES-PLAN.md). An agent check-in is a supervise
+    /// `check` (MANAGE decides); any other wake tells the session the routine's brief (once,
+    /// whichever instance hears it) and, when nothing runs in it, wakes it to do that.
+    async fn routine_due(&self, ctx: Ctx, fired: Fired) -> Result<(), RpcError> {
+        if fired.manage {
+            let event = Supervise {
+                id: fired.id.clone(),
+                session_id: fired.session_id.clone(),
+                project_id: fired.project_id.clone(),
+                event: agent_events::CHECK.to_owned(),
+                agent: String::new(),
+                task_id: String::new(),
+                title: String::new(),
+                text: String::new(),
+                failed_tests: None,
+            };
+            return self.supervise_event(ctx, event).await;
+        }
+        let session_id = fired.session_id.clone();
+        let host = Host::new(ctx.clone());
+        let mut journal = Journal::load(host.clone(), &session_id).await?;
+        if journal.entries().any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "routine_fire") == fired.id) {
+            return Ok(());
+        }
+        let set = self.inner.data.get();
+        // The routine's own words are the last line: they are the step.
+        let text = set.text("routine_due", &[("title", fired.title.as_str()), ("when", fired.when.as_str()), ("text", fired.text.trim())]);
+        let running = self.active(&session_id).is_some() || running_status(&journal).is_some();
+        journal.append(kinds::NOTE, json!({"text": text, "purpose": "routine", "host_message": true, "routine_fire": fired.id, "routine_id": fired.routine_id})).await?;
+        if running {
+            // The running loop reads it at its next step.
+            return Ok(());
+        }
+        let session = host.session_get(&session_id).await?;
+        if session.kind != SessionKind::Chat {
+            return Ok(());
+        }
+        // The session's own mode: a wake never acts with more freedom than the user gave it.
+        let mode = journal
+            .entries()
+            .filter(|entry| entry.kind == kinds::STATUS)
+            .filter_map(|entry| entry.data.get("mode").and_then(Value::as_str))
+            .last()
+            .unwrap_or("auto")
+            .to_owned();
+        let run_id = new_run_id();
+        let Some((stops, stage, sender)) = self.register(&session_id, &run_id) else { return Ok(()) };
+        let status_seq = journal
+            .append(kinds::STATUS, json!({"state": "running", "run_id": run_id, "stage": "act", "mode": mode, "kind": "wake", "data_version": set.version()}))
             .await?;
         let _ = host.session_status(&session_id, SessionStatus::Running).await;
         let this = self.clone();
@@ -1617,7 +1686,28 @@ fn usage_of(journal: &Journal, run_id: &str) -> Value {
 
 /// The first message of an agent session: the task as the planner wrote it.
 pub fn task_message(data: &Dataset, task: &Task) -> String {
-    let mut text = data.text("task", &[("title", task.title.trim()), ("brief", task.brief.trim())]);
+    // A plan task's brief ends with its next step (write the change): it moves to the very end,
+    // after the contract and the files, so the last line before the work is the step to take
+    // (seen: briefs ending on "Touches" and "read first" with agents reading for an hour).
+    let mut brief = task.brief.trim().to_owned();
+    let mut next = String::new();
+    for candidate in [data.text("plan_task_write", &[]), data.text("plan_task_write_files", &[("files", &task.touches.join(", "))])] {
+        let candidate = candidate.trim().to_owned();
+        if !candidate.is_empty() && brief.ends_with(&candidate) {
+            brief.truncate(brief.len() - candidate.len());
+            brief = brief.trim_end().to_owned();
+            next = candidate;
+            break;
+        }
+        // Skills follow the next step in a plan task's brief: the step is the line before them.
+        if let Some(at) = brief.find(&candidate) {
+            let rest = brief[at + candidate.len()..].to_owned();
+            brief = format!("{}{}", brief[..at].trim_end(), rest);
+            next = candidate;
+            break;
+        }
+    }
+    let mut text = data.text("task", &[("title", task.title.trim()), ("brief", brief.trim())]);
     if !task.plan.trim().is_empty() {
         text.push_str(&data.text("task_plan", &[("plan", task.plan.trim())]));
     }
@@ -1629,6 +1719,10 @@ pub fn task_message(data: &Dataset, task: &Task) -> String {
     }
     if !task.touches.is_empty() {
         text.push_str(&data.text("task_touches", &[("touches", &task.touches.join(", "))]));
+    }
+    if !next.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&next);
     }
     text
 }
@@ -1834,6 +1928,15 @@ impl Plugin for Chatflow {
                         }
                     }
                     Err(error) => tracing::warn!(%error, "an unreadable supervision event"),
+                }
+            } else if topic == schedule_topics::FIRED {
+                match serde_json::from_value::<Fired>(data) {
+                    Ok(fired) => {
+                        if let Err(error) = this.routine_due(ctx, fired).await {
+                            tracing::warn!(%error, "could not wake a session for its routine");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "an unreadable routine event"),
                 }
             } else if topic == frame_topics::SESSION_DELETED
                 && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data)

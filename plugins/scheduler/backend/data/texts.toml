@@ -1,0 +1,20 @@
+# Every short model-facing text of cc-scheduler. `{name}` is filled in by the host; each text must
+# keep exactly the placeholders it is shipped with (checked on load).
+
+# ---- answers (what `cx schedule ...` prints) ---------------------------------------------------
+added = "Scheduled {id} \"{title}\": {kind}, {when}.{note} Next: {next}."
+existing = "Already scheduled as {id} \"{title}\": {kind}, {when}. Next: {next}."
+edited = "{id} \"{title}\" now runs {when}.{note} Next: {next}."
+paused = "{id} \"{title}\" is paused. Resume it with `cx schedule resume {id}`."
+resumed = "{id} \"{title}\" runs again. Next: {next}."
+removed = "{id} \"{title}\" is removed."
+run_now = "{id} \"{title}\" runs now."
+no_next = "never again"
+none = "No routines."
+line = "{id}  [{state}]  {when}  {kind}  \"{title}\"  next: {next}"
+
+# ---- what a run reads ----------------------------------------------------------------------------
+# A handoff run's brief: the routine's brief, then what the last good run found.
+since = "\n\nThe last run ({date}) found:\n{summary}\nReport what is new since then."
+# A command that failed: the session that owns the routine is woken with this.
+command_failed = "The command `{command}` exited {code}. Its output ends:\n{tail}\nFind out why and fix what it reports."

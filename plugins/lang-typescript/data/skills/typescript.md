@@ -2,7 +2,7 @@ TypeScript and JavaScript here: get it right, run and test it, code that runs, e
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, JSDoc, types), its tests, docs and callers.
+1. **Pin down what the code must do.** Read the request and the code it changes (signatures, JSDoc, types) and its tests. Callers only when a signature changes; then write.
    - Per function or class: what it takes, returns (a value or a `Promise`) and throws.
    - The request and the project decide, never a name alone. "whether" returns a boolean. "find" may return `undefined` or `null`, as the project does. "count" returns a number.
    - When there may be no answer and nothing names a value for it, the declared return type decides (`T | undefined` or `T | null`); without one, `undefined` is JavaScript's "no value" (`find`, `Map.get`). Not `false`, `-1` or `[]`.

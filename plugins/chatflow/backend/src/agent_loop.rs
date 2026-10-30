@@ -32,6 +32,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// A read shorter than this is shown again even when it repeats one in view: its pointer would
+/// save little.
+const UNCHANGED_MIN_CHARS: usize = 400;
+
 /// How long a parking instance lets an in-flight tool call finish before cancelling it. The frame
 /// gives `plugin.shutdown` 5 s, so parking (this grace plus journaling) must fit inside that.
 pub const PARK_GRACE: Duration = Duration::from_secs(3);
@@ -1184,6 +1188,21 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     // A failing test (a test report in the result) repeats for another reason than a
                     // compile error: its note speaks of the test, not of a declaration.
                     let test_run = data.get("display").and_then(|display| display.get("tests")).is_some_and(|tests| !tests.is_null());
+                    // A read that shows exactly what an earlier read still in the conversation shows
+                    // (the file unchanged since): a pointer to it instead of the text again (seen: a
+                    // third of a run's reads were files it had already read, a fifth of what it read).
+                    if outcome.tool == "read" && outcome.ok && outcome.output.len() >= UNCHANGED_MIN_CHARS {
+                        let entries = journal.entries_vec();
+                        let earlier = entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT && str_field(&entry.data, "output") == outcome.output).map(|entry| entry.seq);
+                        if let Some(earlier) = earlier
+                            && crate::projection::project(&entries, &env.data).iter().any(|message| message.content.contains(outcome.output.as_str()))
+                        {
+                            let path = outcome.args.get("path").and_then(Value::as_str).unwrap_or("the file");
+                            data["output"] = json!(env.data.text("read_unchanged", &[("path", path)]));
+                            data["unchanged"] = json!(true);
+                            data["repeat_of"] = json!(earlier);
+                        }
+                    }
                     journal.append(kinds::TOOL_RESULT, data).await?;
                     // A failure something was learned from before: what worked then, right under it,
                     // where the next step is decided.

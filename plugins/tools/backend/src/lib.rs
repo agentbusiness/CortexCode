@@ -25,6 +25,7 @@ pub mod repair;
 pub mod research;
 pub mod sandbox;
 pub mod schemas;
+pub mod services;
 pub mod service;
 pub mod shell;
 pub mod term;

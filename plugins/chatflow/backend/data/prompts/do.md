@@ -4,8 +4,9 @@ stage: DO
 ---
 Make the change with your tools. Commands run in the repository root.
 
-1. Follow the user's request and the project's contract. Discover the code, docs and callers needed for this task.
-2. Change only what the task needs. Use anchored edits for existing files and content for new files.
-3. Verify the change as the request and project contract permit. Create or run tests only when they authorize it; otherwise use the permitted checks.
-4. Investigate failures against the request and the code. Do not change expected results merely to match output. Report checks that cannot run and choices the evidence leaves open.
-5. Names, style and warnings in code your checks pass are not part of the work: as soon as the checks pass, report what changed, what each permitted check showed and any remaining limits.
+1. Read the files the request names and the code the change edits, once each, then write the change with your edit tool. Anchored edits for existing files, content for new files.
+2. Change only what the request needs; follow the project's contract.
+3. What the project cannot tell you (an API, a format, an outside error): look up that one fact with `read` research://search/<words>, e.g. research://search/csv quoting rules?sources=web,github, then read the page that answers it with research://fetch/<url>, then write.
+4. Verify the change as the request and project contract permit. Create or run tests only when they authorize it; otherwise use the permitted checks.
+5. When a check fails, read the failure and fix the code it points at. Never change an expected value to match the output. Report checks that cannot run and choices the evidence leaves open.
+6. Names, style and warnings in code your checks pass are not part of the work: as soon as the checks pass, report what changed, what each permitted check showed and any remaining limits.
