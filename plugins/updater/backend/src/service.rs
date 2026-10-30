@@ -787,34 +787,17 @@ impl Updater {
             });
             self.with_status(|status| status.failed = all);
         }
-        let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let (mut auto, mut pending) = (Vec::new(), Vec::new());
+        // Every plugin runs the latest release: whatever differs from it installs, every check (a
+        // failure is tried again at the next one). The user's data changes are merged in.
+        let mut auto = Vec::new();
         for (item, package) in items {
             let Some(package) = package else { continue };
-            // Updates only go forward: a version newer than the release (a local build) stays; a reset
-            // is what puts the release back.
-            if item.action != reset_actions::INSTALL || is_own_build(&item.installed) || release::is_newer(&item.installed, &item.release) {
+            if item.action != reset_actions::INSTALL {
                 continue;
             }
-            if saved.kept.get(&item.plugin) == Some(&item.release) || saved.failed.get(&item.plugin).is_some_and(|failed| failed.version == item.release) {
-                continue;
-            }
-            let approved = saved.approved.get(&item.plugin) == Some(&item.release);
-            if !item.files.is_empty() && !approved {
-                pending.push(Pending {
-                    plugin: item.plugin.clone(),
-                    name: item.name.clone(),
-                    version: item.release.clone(),
-                    from: item.from.clone(),
-                    installed: item.installed.clone(),
-                    files: item.files.clone(),
-                });
-                continue;
-            }
-            let merge = saved.merged.get(&item.plugin) == Some(&item.release);
-            auto.push(Planned { id: item.plugin, name: item.name, version: item.release, package, drop_changes: approved && !merge });
+            auto.push(Planned { id: item.plugin, name: item.name, version: item.release, package, drop_changes: false });
         }
-        (auto, pending)
+        (auto, Vec::new())
     }
 
     /// Get the package, put its data in, install: every planned plugin.
@@ -848,15 +831,14 @@ impl Updater {
                 self.step(&[&id], "installing", None, format!("Installing {id} {version}"));
                 self.merge_data(ctx, &id, &version, &package, &work).await
             };
+            // Changes that do not merge give way to the release's data: the plugin updates all the same.
+            let data = match data {
+                Err(_) if !plan.drop_changes => self.reset_data(ctx, &id, &version, &package, &work).await,
+                other => other,
+            };
             match data {
                 Ok(()) => set.push((plan, package)),
                 Err(error) => {
-                    // A clash asks no more for this version; the user sees why.
-                    self.with_saved(|saved| {
-                        saved.approved.remove(&id);
-                        saved.merged.remove(&id);
-                        saved.kept.insert(id.clone(), version.clone());
-                    });
                     self.record(&id, &version, "failed", error);
                 }
             }
@@ -1030,11 +1012,6 @@ fn same_version(a: &str, b: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => a == b,
     }
-}
-
-/// A build of the user's own (`cortex-pack build --install`): `0.1.0+dev.20261027.004548`.
-fn is_own_build(version: &str) -> bool {
-    version.split('+').nth(1).is_some_and(|tag| tag.starts_with("dev."))
 }
 
 /// The frame's answer when a frame update is staged: it keeps the packages for the restart.
