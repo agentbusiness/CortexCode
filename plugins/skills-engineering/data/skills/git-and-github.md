@@ -2,14 +2,16 @@ Git and GitHub: commit, branch, resolve conflicts, undo or recover, review a dif
 
 ## 1. Only when the user asks
 
-Any git command that changes the repository (commit, add, checkout, restore, reset, stash, branch, merge, rebase, clean, push, tag) runs only when the user asked for it: the user approves each one before it runs. Reading (`status`, `diff`, `log`, `show`, `blame`) runs at once. A file's committed text: `git show HEAD:<path>`, then edit.
+The user's request is permission for ordinary Git work. When asked to commit, inspect the changes, stage the intended files and commit. When asked to push, push normally. Do not ask again or add `permission` for these commands. Only commit or push when requested. Reading (`status`, `diff`, `log`, `show`, `blame`) runs at once. A file's committed text: `git show HEAD:<path>`, then edit.
+
+Destructive actions need separate confirmation: discarding edits, deleting branches or tags, rewriting history (including amend), and force or deletion pushes. The host asks before running them in every mode.
 
 Never on your own, even when asked to tidy up:
 
 - `reset --hard`, `clean -fd`
 - `restore` or `checkout --` on files you did not change
 - `stash drop`/`clear`, `branch -D`, deleting tags
-- any `push`; rebasing or amending pushed commits or commits not yours
+- force or deletion pushes; rebasing or amending pushed commits or commits not yours
 - `--no-verify`, `git config`
 - history rewrites (`filter-repo`, `filter-branch`)
 - merging a PR; posting a PR, review or comment
@@ -69,7 +71,7 @@ Then run fresh: the decision's checks, build, lint, touched modules' tests. `rea
 
 ```bash
 git log --oneline -10            # copy the project's message style (prefixes, tense, issue refs)
-git add <the paths you changed>  # never -A or . (scratch files, build output, secrets)
+git add <the intended paths>    # use -A only when the user requested all changes and you reviewed them
 git diff --cached --stat         # exactly the intended files
 git commit -m "<imperative summary, under 72 chars>" -m "<why, and how it was verified>"
 ```

@@ -2,8 +2,10 @@
 //! command with tree-sitter-bash and inspecting each simple command structurally (program name,
 //! subcommand, literal arguments, redirection targets). No text search over the command string.
 //!
-//! Classes:
-//! - `git_push`: `git push` (and `git send-email`).
+//! Ordinary git pushes are authorized by the user's request; destructive git operations have a
+//! separate confirmation gate in every mode (see `git_destructive`).
+//!
+//! Ask-mode classes:
 //! - `publish`: package/registry publishing and GitHub mutations (`npm publish`, `cargo publish`,
 //!   `gh pr merge`, `gh release create`, `gh api`, ...).
 //! - `network`: network clients (curl, wget, ssh, scp, rsync to a host, nc, ...) talking to a host
@@ -434,7 +436,6 @@ fn classify(words: &[Option<String>], context: &Context, depth: usize, out: &mut
         "git" => {
             let sub = git_subcommand(&args);
             match sub.as_deref() {
-                Some("push") => out.push(Concern { path: None, class: "git_push", detail: format!("git {}", literal_args().join(" ")) }),
                 Some("send-email") => out.push(Concern { path: None, class: "network", detail: "git send-email".to_owned() }),
                 _ => {}
             }
@@ -579,45 +580,128 @@ const GIT_READS: &[&str] = &[
     "diff-tree", "diff-files", "diff-index", "help", "version",
 ];
 
-/// The first `git` command of a script that would change the repository (commit, checkout,
-/// restore, reset, branch, stash, merge, rebase, clean, ...), as written; None when every git
-/// command only reads. Repository changes are the user's to make, never the model's: a model's
-/// `git checkout <file>` once threw away twenty minutes of its own work. Programs run through
-/// wrappers (`env`, `timeout`, `xargs`) and `bash -c` scripts are looked into.
-pub fn git_change(script: &str) -> Option<String> {
-    git_change_in(script, 0)
+/// The first git command that needs separate confirmation: it can discard work, delete refs,
+/// rewrite history or change repository settings. The user's request already authorizes ordinary
+/// staging, commits and pushes. Inspect every command, including wrappers and nested shell scripts,
+/// so a routine command before a destructive one does not hide it.
+pub fn git_destructive(script: &str) -> Option<String> {
+    git_destructive_in(script, 0)
 }
 
-fn git_change_in(script: &str, depth: usize) -> Option<String> {
+fn git_destructive_in(script: &str, depth: usize) -> Option<String> {
     if depth > 3 {
-        return None;
+        return Some("deeply nested shell command".to_owned());
     }
     for words in simple_commands(script) {
-        let mut words: &[Option<String>] = &words;
-        while let Some((index, _)) = unwrap(words) {
-            words = words.get(index..).unwrap_or(&[]);
+        let mut words = words;
+        while let Some((index, dynamic_args)) = unwrap(&words) {
+            words = words.get(index..).unwrap_or(&[]).to_vec();
+            if dynamic_args {
+                words.push(None);
+            }
         }
         let Some(Some(first)) = words.first() else { continue };
         let program = program_name(first);
         let args = &words[1..];
         if matches!(program, "bash" | "sh" | "zsh" | "dash" | "ksh")
-            && let Some(position) = args.iter().position(|arg| arg.as_deref().is_some_and(|a| a.starts_with('-') && a.contains('c') && !a.starts_with("--")))
+            && let Some(position) =
+                args.iter().position(|arg| arg.as_deref().is_some_and(|a| a.starts_with('-') && a.contains('c') && !a.starts_with("--")))
             && let Some(Some(inner)) = args.get(position + 1)
-            && let Some(found) = git_change_in(inner, depth + 1)
+            && let Some(found) = git_destructive_in(inner, depth + 1)
         {
             return Some(found);
         }
         if program != "git" {
             continue;
         }
-        let Some(sub) = git_subcommand(args) else { continue };
-        let after: Vec<&str> = args.iter().flatten().map(String::as_str).skip_while(|arg| *arg != sub).skip(1).collect();
-        let only = |allowed: &[&str]| after.iter().all(|arg| allowed.contains(arg) || arg.starts_with("--format") || arg.starts_with("--sort"));
-        let reads = GIT_READS.contains(&sub.as_str())
-            || match sub.as_str() {
-                // Listing forms only: a name after them creates, deletes or moves.
-                "branch" => only(&["-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "-l", "--show-current", "--no-color", "--color"]),
-                "tag" => only(&["-l", "--list", "-n"]),
+        let Some(index) = git_subcommand_index(args) else { continue };
+        let Some(sub) = args[index].as_deref() else { continue };
+        let operands = &args[index + 1..];
+        let after: Vec<&str> = operands.iter().flatten().map(String::as_str).collect();
+        // Options with values must not interpret a commit/tag message as a destructive flag.
+        let values: &[&str] = match sub {
+            "commit" => &[
+                "-m",
+                "--message",
+                "-F",
+                "--file",
+                "-C",
+                "--reuse-message",
+                "-c",
+                "--reedit-message",
+                "--author",
+                "--date",
+                "--template",
+                "-t",
+            ],
+            "tag" => &["-m", "--message", "-F", "--file", "-u", "--local-user", "--format", "--sort"],
+            "branch" => &["--format", "--sort", "--contains", "--no-contains", "--merged", "--no-merged"],
+            "switch" | "restore" => &["--conflict", "--source", "-s"],
+            "merge" | "cherry-pick" | "revert" => &["-m", "--mainline", "--message", "-s", "--strategy", "-X", "--strategy-option"],
+            _ => &[],
+        };
+        let options = git_options(operands, values);
+        // Per-command configuration can change the meaning of a push (e.g. remote mirror mode).
+        let configured =
+            sub == "push" && args[..index].iter().flatten().any(|arg| arg.starts_with("-c") || arg.starts_with("--config-env"));
+        let routine = !configured
+            && options.as_ref().is_some_and(|options| match sub {
+                "add" | "init" | "clone" => true,
+                "commit" => !git_risky_option(options, &["--amend"], &[]),
+                "merge" | "cherry-pick" | "revert" => !git_risky_option(options, &["--abort", "--quit", "--skip"], &[]),
+                "stash" => {
+                    after.is_empty()
+                        || matches!(
+                            after.first(),
+                            Some(&"push") | Some(&"save") | Some(&"apply") | Some(&"pop") | Some(&"branch") | Some(&"list") | Some(&"show")
+                        )
+                }
+                "remote" => matches!(after.first(), Some(&"add") | Some(&"get-url") | Some(&"show")),
+                "worktree" => matches!(after.first(), Some(&"add") | Some(&"list")),
+                "rm" => options.contains(&"--cached"),
+                "clean" => options.iter().any(|arg| matches!(*arg, "--dry-run" | "-n")),
+                "pull" => options.contains(&"--ff-only") && !git_risky_option(options, &["--rebase", "--force"], &['r', 'f']),
+                "push" => {
+                    !after.iter().any(|arg| arg.starts_with('+') || arg.starts_with(':'))
+                        && options.iter().all(|arg| {
+                            matches!(
+                                *arg,
+                                "-u" | "--set-upstream"
+                                    | "--all"
+                                    | "--branches"
+                                    | "--tags"
+                                    | "--follow-tags"
+                                    | "--atomic"
+                                    | "-n"
+                                    | "--dry-run"
+                                    | "--porcelain"
+                                    | "-v"
+                                    | "--verbose"
+                                    | "-q"
+                                    | "--quiet"
+                                    | "--progress"
+                                    | "--no-progress"
+                                    | "-4"
+                                    | "--ipv4"
+                                    | "-6"
+                                    | "--ipv6"
+                            )
+                        })
+                }
+                "fetch" => {
+                    !after.iter().any(|arg| arg.starts_with('+'))
+                        && !git_risky_option(options, &["--prune", "--prune-tags", "--force"], &['p', 'P', 'f'])
+                }
+                "branch" => !git_risky_option(options, &["--delete", "--force", "--move", "--copy"], &['d', 'D', 'f', 'm', 'M', 'c', 'C']),
+                "tag" => !git_risky_option(options, &["--delete", "--force"], &['d', 'f']),
+                "switch" => !git_risky_option(options, &["--discard-changes", "--force", "--force-create", "--merge"], &['f', 'C', 'm']),
+                "restore" => {
+                    options.iter().any(|arg| matches!(*arg, "--staged" | "-S")) && !git_risky_option(options, &["--worktree"], &['W'])
+                }
+                _ => false,
+            });
+        let reads = GIT_READS.contains(&sub)
+            || match sub {
                 "stash" => matches!(after.first(), Some(&"list") | Some(&"show")),
                 "remote" => after.is_empty() || matches!(after.first(), Some(&"-v") | Some(&"show") | Some(&"get-url")),
                 "config" => after.iter().any(|arg| matches!(*arg, "--get" | "--get-all" | "--get-regexp" | "--list" | "-l")),
@@ -625,7 +709,7 @@ fn git_change_in(script: &str, depth: usize) -> Option<String> {
                 "worktree" => after.first() == Some(&"list"),
                 _ => false,
             };
-        if !reads {
+        if !reads && !routine {
             let shown: Vec<&str> = words.iter().flatten().map(String::as_str).collect();
             return Some(shown.join(" "));
         }
@@ -633,7 +717,47 @@ fn git_change_in(script: &str, depth: usize) -> Option<String> {
     None
 }
 
+/// Options before `--`, skipping their values; an unresolved option/operand needs confirmation.
+fn git_options<'a>(args: &'a [Option<String>], takes_value: &[&str]) -> Option<Vec<&'a str>> {
+    let mut options = Vec::new();
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let arg = arg.as_deref()?;
+        if arg == "--" {
+            // Push refspecs after `--` can still delete or force a ref.
+            if args[index + 1..].iter().any(Option::is_none) {
+                return None;
+            }
+            break;
+        }
+        if arg.starts_with('-') {
+            options.push(arg);
+            if takes_value.contains(&arg) {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    Some(options)
+}
+
+/// Git accepts abbreviated long options and bundled short flags; both need the same guard.
+fn git_risky_option(options: &[&str], long: &[&str], short: &[char]) -> bool {
+    options.iter().any(|option| {
+        if option.starts_with("--") {
+            let name = option.split('=').next().unwrap_or(option);
+            long.iter().any(|full| full.starts_with(name))
+        } else {
+            option[1..].chars().any(|flag| short.contains(&flag))
+        }
+    })
+}
+
 fn git_subcommand(args: &[Option<String>]) -> Option<String> {
+    args.get(git_subcommand_index(args)?)?.clone()
+}
+
+fn git_subcommand_index(args: &[Option<String>]) -> Option<usize> {
     let mut index = 0;
     while let Some(arg) = args.get(index) {
         let arg = arg.as_deref()?;
@@ -645,7 +769,7 @@ fn git_subcommand(args: &[Option<String>]) -> Option<String> {
             index += 1;
             continue;
         }
-        return Some(arg.to_owned());
+        return Some(index);
     }
     None
 }
