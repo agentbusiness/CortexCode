@@ -417,7 +417,9 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
     // A refused call and the next call of the same tool that worked, once per tool and refusal.
     let mut seen_refusals: HashSet<(String, String)> = HashSet::new();
     for (index, step) in steps.iter().enumerate() {
-        if step.ok || step.error_kind.is_empty() || step.error_kind == "nonzero_exit" || !seen_refusals.insert((step.tool.clone(), step.error_kind.clone())) {
+        // An edit's refusal names its own next step (the current lines, what to send): nothing to learn
+        // beyond it, and lessons made from it said "re-read the file".
+        if step.ok || step.error_kind.is_empty() || step.error_kind == "nonzero_exit" || step.tool == "edit" || !seen_refusals.insert((step.tool.clone(), step.error_kind.clone())) {
             continue;
         }
         // The call that did what the refused one meant: the same tool on the same path when there is

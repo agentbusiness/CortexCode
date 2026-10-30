@@ -81,9 +81,10 @@ same_error_edits = 3
 # them, so `fix_cycles` misses them). High on purpose: debugging needs a run of traces, prints and
 # reruns; seen stuck: 97 calls on one case. 0 = no limit.
 stall_runs = 20
-# Once the task has changed a file, each step is a fix: this short budget (the full one above is
-# for designing and writing the first change).
-fix_think_tokens = 384
+# Once the task has changed a file, each step may think this much; 0 keeps the task's own budget.
+# 0: at 384, 310 of one agent's 424 steps were cut off mid-thought, and after a cut 61% of its
+# calls were reads (it read to rebuild the plan it could not finish thinking).
+fix_think_tokens = 0
 # Any other agent loop's step (a question, a follow-up). Every step has a budget: the model plugin's
 # own table (4096 for medium) never applies (seen: a loop without a plan step ran 4k thoughts for
 # two hours).

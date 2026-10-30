@@ -15,11 +15,12 @@ cx timeline --limit 20   # every session's and the user's steps
 ```bash
 cx undo --step 42     # put back what step 42 changed (refused when a later step touched the same files)
 cx undo --step 42 --cascade   # ...with those later steps too
-cx undo --to 40       # everything after step 40, in one go
+cx undo --to 40       # everything after step 40, every session's: other agents' steps too
 cx redo               # take the last undo back
 ```
 
-A step number comes from `cx changed`. After an undo the result lists the files put back; read
+A step number comes from `cx changed`. Agents share the project folder: undo your own steps with
+`--step`, never `--to` while other agents work. After an undo the result lists the files put back; read
 one again before editing it, since your earlier reads show the undone version.
 
 Use undo for a wrong turn (a refactor that failed its checks, a file rewritten by mistake), not for

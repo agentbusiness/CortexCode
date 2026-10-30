@@ -26,6 +26,7 @@ use cc_protocol::contracts::frame::{JournalEntry, kinds};
 use cc_protocol::codes;
 use cc_protocol::contracts::memory::{Contract, Task, methods as memory_methods};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
@@ -251,6 +252,51 @@ pub fn no_worse(journal: &Journal, report: &VerifyReport) -> bool {
                 .last();
             before.is_some_and(|before| now.iter().all(|name| before.iter().any(|known| known.as_str() == Some(name.as_str()))))
         })
+}
+
+/// The files a check's output names in its error lines (`src/a.rs:12:5: error[E0425]`, `a.ts(3,1):
+/// error TS2304`, `--> src/a.rs:12:5` under an `error` line, `./a.go:7:2: undefined: x`), relative
+/// to `workspace`. Warnings and notes do not count. None when no error line names a file: the
+/// failure (a test that failed, a crash) cannot be placed by its files.
+pub fn error_files(output: &str, workspace: &str) -> Option<HashSet<String>> {
+    let mut files = HashSet::new();
+    let mut in_error = false;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("error") {
+            in_error = true;
+        } else if lower.starts_with("warning") || lower.starts_with("note") || lower.starts_with("help") {
+            in_error = false;
+        }
+        let (located, rest) = match trimmed.strip_prefix("--> ") {
+            Some(rest) if in_error => (true, rest),
+            _ => (false, trimmed),
+        };
+        let path: String = rest.chars().take_while(|c| !matches!(c, ':' | '(' | ' ')).collect();
+        let after = &rest[path.len()..];
+        let has_line = (after.starts_with(':') || after.starts_with('(')) && after[1..].starts_with(|c: char| c.is_ascii_digit());
+        let file_like = path.rsplit('/').next().is_some_and(|name| name.contains('.') && !name.ends_with('.')) && !path.contains("://");
+        if !(has_line && file_like) {
+            continue;
+        }
+        let message = after.to_ascii_lowercase();
+        if located || (!message.contains("warning") && !message.contains(" note:")) {
+            let path = path.strip_prefix(workspace).map(|rest| rest.trim_start_matches('/')).unwrap_or(&path).trim_start_matches("./").to_owned();
+            files.insert(path);
+        }
+    }
+    (!files.is_empty()).then_some(files)
+}
+
+/// Whether every failed check of a report fails only outside `own` (the files this task changed
+/// and those its changed signatures reached): each failed check's full output (`outputs`, in the
+/// report's order) names its errors' files, and none of them is the task's. Such errors belong to
+/// another task's part, and the plan's last task makes every check pass; a failure that names no
+/// file is never decided this way.
+pub fn not_its_failures(report: &VerifyReport, outputs: &[String], own: &HashSet<String>, workspace: &str) -> bool {
+    let failed: Vec<(&cc_protocol::contracts::agents::CheckResult, &String)> = report.checks.iter().zip(outputs).filter(|(check, _)| !check.ok && !check.indeterminate).collect();
+    !failed.is_empty() && failed.iter().all(|(_, output)| error_files(output, workspace).is_some_and(|files| files.iter().all(|file| !own.contains(file))))
 }
 
 /// Whether a later task of the same plan still waits for `task`: such a task is done when it made

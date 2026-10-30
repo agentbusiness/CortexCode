@@ -105,6 +105,11 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
         .map(|entry| (str_field(&entry.data, "call_id"), entry.data.get("ok").and_then(Value::as_bool).unwrap_or(false)))
         .collect();
     let steps = run.iter().filter(|entry| entry.kind == kinds::USAGE).count();
+    // The session's last message to it: calls are counted from it too, so an agent is not told
+    // again before it could act on what it was told (seen: one agent told the same thing five
+    // times in a minute, and "hold" and "write it now" in turns every few minutes).
+    let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER);
+    let told_at = told.map(|entry| entry.ts_ms).unwrap_or(0);
     let mut edits = 0;
     let mut since_edit = 0;
     let mut files: Vec<String> = Vec::new();
@@ -117,7 +122,9 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
             if !path.is_empty() && !files.iter().any(|known| known == path) {
                 files.push(path.to_owned());
             }
-        } else {
+        // Calls that did not run (skipped for a message, an edit refused by another agent's lock)
+        // are not reading.
+        } else if entry.ts_ms >= told_at && ok.get(str_field(&entry.data, "call_id")).copied().unwrap_or(false) {
             since_edit += 1;
         }
     }
@@ -135,7 +142,50 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
     if limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes {
         line.push_str(&env.data.text("manage_flag_idle", &[("idle", &idle.to_string())]));
     }
+    // Both ways: what the session last told it, and what it last said (its answer, its question).
+    if let Some(told) = told {
+        let ago = cc_protocol::contracts::now_ms().saturating_sub(told.ts_ms) / 60_000;
+        line.push_str(&env.data.text("manage_told", &[("ago", &ago.to_string()), ("text", &short(str_field(&told.data, "text"), SAID_CHARS))]));
+    }
+    if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
+        line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
+    }
     line
+}
+
+/// Characters of an agent's last words, and of the session's last message to it, shown per agent.
+const SAID_CHARS: usize = 300;
+
+fn short(text: &str, chars: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = text.chars().take(chars).collect();
+    if cut.len() < text.len() { format!("{cut}...") } else { cut }
+}
+
+/// The plan the background work carries out, task by task with where each stands (done, worked on
+/// by an agent, waiting for the tasks it needs), so each check compares the work with the whole
+/// plan, not each agent with its own task alone. Empty without a plan being carried out.
+pub async fn plan_lines(env: &RunEnv, entries: &[JournalEntry], work: &[OpenWork]) -> String {
+    let Some((_, plan)) = crate::plan::latest(entries).filter(|(_, plan)| plan.status == cc_protocol::contracts::chatflow::plan_status::IMPLEMENTING) else { return String::new() };
+    let mut lines = String::new();
+    for task in &plan.tasks {
+        let record = match &task.task_id {
+            Some(id) => env.host.get::<Task>(memory_methods::TASK_GET, json!({"id": id})).await.ok(),
+            None => None,
+        };
+        let status = record.as_ref().map(|record| record.status.as_str()).unwrap_or("pending");
+        let agent = work.iter().find(|item| Some(&item.task.id) == task.task_id.as_ref()).map(|item| item.agent.name.as_str());
+        let waiting: Vec<String> = task.depends_on.iter().map(u32::to_string).collect();
+        let state = match (status, agent) {
+            ("done", _) => env.data.text("manage_task_done", &[]),
+            ("cancelled", _) => env.data.text("manage_task_cancelled", &[]),
+            (_, Some(agent)) => env.data.text("manage_task_agent", &[("agent", agent)]),
+            _ if !waiting.is_empty() => env.data.text("manage_task_waits", &[("tasks", &waiting.join(", "))]),
+            _ => env.data.text("manage_task_pending", &[]),
+        };
+        lines.push_str(&env.data.text("manage_task", &[("n", &task.n.to_string()), ("title", &task.title), ("state", &state)]));
+    }
+    env.data.text("manage_plan", &[("goal", plan.doc.goal.trim()), ("tasks", &lines)])
 }
 
 /// One line per open agent: its task, its state, what its run did and its task's last result.
@@ -162,6 +212,18 @@ fn work_line(env: &RunEnv, item: &OpenWork) -> String {
         "manage_line",
         &[("agent", &item.agent.name), ("title", &item.task.title), ("state", &item.agent.status), ("detail", &format!("{}{repeated}", result.unwrap_or_default()))],
     )
+}
+
+/// Whether the session's last message to `agent` says `text` (spacing aside) and the agent edited
+/// nothing since.
+async fn told_already(env: &RunEnv, agent: &AgentRecord, text: &str) -> bool {
+    let Some(session_id) = agent.session_id.as_deref() else { return false };
+    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return false };
+    let entries = journal.entries_vec();
+    let Some(told) = entries.iter().rev().find(|entry| entry.kind == kinds::STEER) else { return false };
+    let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
+    same(str_field(&told.data, "text"), text)
+        && !entries.iter().any(|entry| entry.seq > told.seq && entry.kind == kinds::TOOL_CALL && str_field(&entry.data, "tool") == "edit")
 }
 
 /// Cancel tasks (each with what waits for it) through the agents plugin, which stops their agents;
@@ -192,7 +254,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
     let shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
-    let live = env.data.text("manage_live", &[("work", &work_lines_with_progress(env, &work).await)]);
+    let live = format!("{}{}", plan_lines(env, &entries, &work).await, env.data.text("manage_live", &[("work", &work_lines_with_progress(env, &work).await)]));
     let (decision, _) = crate::flow::decide_json::<Manage>(env, journal, "MANAGE", &shape, &live).await?;
     let mut done = Vec::new();
     for action in &decision.actions {
@@ -221,6 +283,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
                     Err(error) => Err(error),
                 }
             }
+            // The same words again, before the agent edited anything since: it has them already.
+            "message" if !text.is_empty() && told_already(env, &item.agent, text).await => Ok(env.data.text("managed_repeat", &[("agent", name)])),
             "message" if !text.is_empty() => {
                 let kind = if item.agent.status == "working" { "steer" } else { "followup" };
                 env.host

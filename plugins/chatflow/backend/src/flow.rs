@@ -1218,6 +1218,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
     }
+    wait_where_tasks_meet(env, &mut tasks).await;
     // Tasks are small parts, each checked on its own (the planner's call); parts that change the
     // same files wait for each other.
     let mut made = match (&mode, &previous) {
@@ -1258,6 +1259,33 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         cancel_replaced_tasks(env, previous, &made).await;
     }
     Ok(())
+}
+
+/// Each task's dependencies completed from the code graph (structural, [`plan::wait_where_tasks_meet`]):
+/// the definitions in the files it changes and the files whose code calls into them. A file that
+/// does not exist yet has neither; a failed lookup only leaves the planner's own dependencies.
+async fn wait_where_tasks_meet(env: &RunEnv, tasks: &mut [plan::PlanTask]) {
+    if tasks.len() < 2 {
+        return;
+    }
+    let mut names: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut callers: HashMap<u32, HashSet<String>> = HashMap::new();
+    for task in tasks.iter() {
+        let files: Vec<String> = plan::touched_files(task).into_iter().filter(|path| std::path::Path::new(&env.scope.workspace).join(path).is_file()).collect();
+        let mut defined: Vec<String> = Vec::new();
+        for path in &files {
+            if let Ok(outline) = env.host.get::<cc_protocol::contracts::memory::OutlineResult>(memory_methods::OUTLINE, crate::impact::scope_args(&env.scope, json!({"path": path}))).await {
+                defined.extend(outline.symbols.into_iter().filter(|symbol| !matches!(symbol.kind.as_str(), "file" | "module" | "variable")).map(|symbol| symbol.name));
+            }
+        }
+        names.insert(task.n, plan::names_of(task, &defined));
+        if !files.is_empty()
+            && let Ok(impact) = env.host.get::<cc_protocol::contracts::memory::ImpactResult>(memory_methods::IMPACT, crate::impact::scope_args(&env.scope, json!({"sids": [], "paths": files, "depth": 1}))).await
+        {
+            callers.insert(task.n, impact.call_sites.into_iter().map(|site| site.path).filter(|path| !files.contains(path)).collect());
+        }
+    }
+    plan::wait_where_tasks_meet(tasks, &names, &callers);
 }
 
 /// The task records of `previous` that its next version `made` does not carry are cancelled: a
@@ -1354,9 +1382,30 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
     let fix_title = env.data.text("baseline_task_title", &[]);
     // Each other task hears what already fails and which task fixes it, so it neither tries to fix
     // it nor stops on it (seen: an agent spent 17 steps on a contract the baseline already failed).
+    // The last task also owns what the other tasks leave failing outside their own files (each of
+    // them is judged by the errors in what it changed, `checks::not_its_failures`), so it is there
+    // whenever the plan has checks, and its contract is every check of the plan.
     let mut already_failing = String::new();
     if current.tasks.iter().all(|task| task.task_id.is_none()) && current.tasks.last().is_some_and(|task| task.title != fix_title) {
         let failures = crate::checks::baseline_failures(journal, &env.run_id);
+        let mut every_check: Vec<String> = Vec::new();
+        for check in current.tasks.iter().flat_map(|task| &task.checks).chain(failures.iter().map(|(command, _)| command)) {
+            if !every_check.contains(check) {
+                every_check.push(check.clone());
+            }
+        }
+        if failures.is_empty() && !every_check.is_empty() {
+            let n = current.tasks.len() as u32 + 1;
+            current.tasks.push(plan::PlanTask {
+                n,
+                title: fix_title.clone(),
+                brief: env.data.text("final_task_brief", &[("checks", &every_check.iter().map(|command| format!("- `{command}`\n")).collect::<String>())]),
+                checks: every_check.clone(),
+                depends_on: (1..n).collect(),
+                ..Default::default()
+            });
+            journal.set(plan_seq, "tasks", serde_json::to_value(&current.tasks)?).await?;
+        }
         if !failures.is_empty() {
             let lines: String = failures
                 .iter()
@@ -1374,7 +1423,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                 n,
                 title: fix_title.clone(),
                 brief: env.data.text("baseline_task_brief", &[("failures", &lines)]),
-                checks: failures.into_iter().map(|(command, _)| command).collect(),
+                checks: every_check,
                 depends_on: (1..n).collect(),
                 ..Default::default()
             });

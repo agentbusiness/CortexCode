@@ -1116,7 +1116,7 @@ impl Agents {
         // The agent's work is in the project's tree as it happens; done means the task's frozen
         // contract passes there now.
         frozen_intact(task)?;
-        let (report, _) = contract::verify(host, &task.id, &project.root, &task.contract, &CancellationToken::new()).await?;
+        let (report, outputs) = contract::verify(host, &task.id, &project.root, &task.contract, &CancellationToken::new()).await?;
         record_verification(host, task, &report, &[&session_id]).await;
         let parent = host.session_get(&session_id).await.ok().and_then(|session| session.parent);
         if let Some(parent) = &parent {
@@ -1128,7 +1128,7 @@ impl Agents {
             return Err(RpcError::cancelled());
         }
         let mut updated = fresh;
-        if report.ok || no_worse_and_awaited(host, &session_id, task, &report).await {
+        if report.ok || no_worse_and_awaited(host, &session_id, task, &report, &outputs, &result.changed_files, &project.root).await {
             update_task(host, json!({"id": task.id, "status": "done", "result": format!("verified in the project: {}", result.summary)})).await?;
             updated.status = "done".into();
             updated.tasks_done += 1;
@@ -1721,13 +1721,23 @@ fn checks_text(data: &Dataset, contract: &Contract) -> String {
 /// known) while a later task of its plan still waits for it: then it is done, and what failed
 /// before is the waiting task's work (the plan's last task fixes it). The worker's loop judges
 /// the same way.
-async fn no_worse_and_awaited(host: &Host, session_id: &str, task: &Task, report: &VerifyReport) -> bool {
+/// Also done while awaited: every failed check's errors are in files outside the task's own (the
+/// files it changed and those its changed signatures reached, the session's `impact` notes):
+/// another task's part, which the plan's last task makes pass.
+async fn no_worse_and_awaited(host: &Host, session_id: &str, task: &Task, report: &VerifyReport, outputs: &[String], changed: &[String], root: &str) -> bool {
     let failed: Vec<_> = report.checks.iter().filter(|check| !check.ok).collect();
     if failed.is_empty() || session_id.is_empty() {
         return false;
     }
     let Ok(entries) = host.journal_read(session_id, 1).await else { return false };
-    let no_worse = failed.iter().all(|check| {
+    let mut own: std::collections::HashSet<String> = changed.iter().map(|path| path.strip_prefix(root).map(|rest| rest.trim_start_matches('/')).unwrap_or(path).trim_start_matches("./").to_owned()).collect();
+    for note in entries.iter().filter(|entry| entry.kind == kinds::NOTE && entry.data.get("purpose").and_then(Value::as_str) == Some("impact")) {
+        own.extend(note.data.get("reached").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+    }
+    let not_its = report.checks.iter().zip(outputs).filter(|(check, _)| !check.ok && !check.indeterminate).all(|(_, output)| {
+        error_files(output, root).is_some_and(|files| files.iter().all(|file| !own.contains(file)))
+    });
+    let no_worse = not_its || failed.iter().all(|check| {
         let (Some(now), Some(spec)) = (&check.failed_tests, report.contract.checks.iter().find(|spec| spec.name == check.name)) else { return false };
         let before = entries
             .iter()
@@ -1742,6 +1752,39 @@ async fn no_worse_and_awaited(host: &Host, session_id: &str, task: &Task, report
     let Some(parent) = &task.parent_id else { return false };
     let Ok(list) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": task.project_id, "parent_id": parent})).await else { return false };
     list.tasks.iter().any(|other| other.id != task.id && other.depends_on.contains(&task.id) && !matches!(other.status.as_str(), "done" | "cancelled" | "failed"))
+}
+
+/// The files a check's output names in its error lines (warnings and notes do not count); None
+/// when no error line names a file. The worker's loop reads them the same way
+/// (`chatflow::checks::error_files`).
+fn error_files(output: &str, workspace: &str) -> Option<std::collections::HashSet<String>> {
+    let mut files = std::collections::HashSet::new();
+    let mut in_error = false;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("error") {
+            in_error = true;
+        } else if lower.starts_with("warning") || lower.starts_with("note") || lower.starts_with("help") {
+            in_error = false;
+        }
+        let (located, rest) = match trimmed.strip_prefix("--> ") {
+            Some(rest) if in_error => (true, rest),
+            _ => (false, trimmed),
+        };
+        let path: String = rest.chars().take_while(|c| !matches!(c, ':' | '(' | ' ')).collect();
+        let after = &rest[path.len()..];
+        let has_line = (after.starts_with(':') || after.starts_with('(')) && after[1..].starts_with(|c: char| c.is_ascii_digit());
+        let file_like = path.rsplit('/').next().is_some_and(|name| name.contains('.') && !name.ends_with('.')) && !path.contains("://");
+        if !(has_line && file_like) {
+            continue;
+        }
+        let message = after.to_ascii_lowercase();
+        if located || (!message.contains("warning") && !message.contains(" note:")) {
+            files.insert(path.strip_prefix(workspace).map(|rest| rest.trim_start_matches('/')).unwrap_or(&path).trim_start_matches("./").to_owned());
+        }
+    }
+    (!files.is_empty()).then_some(files)
 }
 
 async fn record_verification(host: &Host, task: &Task, report: &VerifyReport, sessions: &[&str]) {

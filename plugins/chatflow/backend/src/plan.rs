@@ -447,6 +447,80 @@ pub fn user_edit(current: &Plan, edit: &PlanEditParams) -> Result<Plan, String> 
 /// title of a task of `previous` that names no dependency gets that task's, mapped by title to the
 /// new numbers (earlier tasks only). A version is written whole, and the planner was seen dropping
 /// a kept task's dependency the change did not touch.
+/// The files a task changes (its `touches` that look like paths), repository-relative.
+pub fn touched_files(task: &PlanTask) -> Vec<String> {
+    task.touches.iter().map(|item| item.trim().trim_start_matches("./").to_owned()).filter(|item| item.contains('.') || item.contains('/')).collect()
+}
+
+/// The names that point at what a task changes, for finding the tasks that build on it: each
+/// file's path, its file name, and the module or type it is named after (`persistent_state.rs`:
+/// `persistent_state`, `PersistentState`), its symbol touches, and `defined` (the definitions the
+/// code graph has in its files).
+pub fn names_of(task: &PlanTask, defined: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: String| {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    for path in touched_files(task) {
+        let file = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let stem = file.split('.').next().unwrap_or("").to_owned();
+        // Registration files (`lib.rs`, `mod.rs`, `index.ts`) name no part of their own.
+        if stem.len() > 4 && !matches!(stem.as_str(), "index" | "__init__" | "main") {
+            let camel: String = stem.split(['_', '-']).filter(|part| !part.is_empty()).map(|part| {
+                let mut chars = part.chars();
+                chars.next().map(|first| first.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+            }).collect();
+            add(stem);
+            add(camel);
+        }
+        add(file);
+        add(path);
+    }
+    for item in task.touches.iter().map(|item| item.trim()).filter(|item| !item.contains('.') && !item.contains('/')) {
+        add(item.rsplit("::").next().unwrap_or(item).to_owned());
+    }
+    // A definition counts when its name is distinctive (`configure_core`, `LanguageBrain`), not a
+    // common word (`new`, `update`) that any brief may use.
+    for name in defined {
+        let distinctive = name.len() > 4 && (name.contains('_') || name.chars().skip(1).any(char::is_uppercase));
+        if distinctive {
+            add(name.clone());
+        }
+    }
+    names
+}
+
+/// Later tasks wait for the earlier tasks their work meets, so no agent builds on another's
+/// half-written code (seen: four tasks of one refactor started at once; one called a type another
+/// had not written yet, one took out modules the others' files used, and every check broke for
+/// all of them). Two tasks meet when they change a file in common, when the later one's brief
+/// names what the earlier one changes (`names`, from [`names_of`]), or when the code graph has
+/// calls between their files (`callers`: per task, the files whose code calls into the files it
+/// changes). Tasks that meet nowhere still run at the same time.
+pub fn wait_where_tasks_meet(tasks: &mut [PlanTask], names: &HashMap<u32, Vec<String>>, callers: &HashMap<u32, HashSet<String>>) {
+    let words = |text: &str| -> HashSet<String> { text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|word| !word.is_empty()).map(str::to_owned).collect() };
+    let snapshot: Vec<PlanTask> = tasks.to_vec();
+    for later in tasks.iter_mut() {
+        let text = format!("{}\n{}\n{}\n{}", later.brief, later.known.join("\n"), later.rules.join("\n"), later.touches.join("\n"));
+        let said = words(&text);
+        let files: HashSet<String> = touched_files(later).into_iter().collect();
+        for earlier in snapshot.iter().filter(|earlier| earlier.n < later.n) {
+            let shared = touched_files(earlier).iter().any(|path| files.contains(path));
+            let named = names.get(&earlier.n).is_some_and(|names| {
+                names.iter().any(|name| if name.contains('.') || name.contains('/') { text.contains(name.as_str()) } else { said.contains(name) })
+            });
+            let calls = callers.get(&earlier.n).is_some_and(|paths| paths.iter().any(|path| files.contains(path)))
+                || callers.get(&later.n).is_some_and(|paths| touched_files(earlier).iter().any(|path| paths.contains(path)));
+            if (shared || named || calls) && !later.depends_on.contains(&earlier.n) {
+                later.depends_on.push(earlier.n);
+            }
+        }
+        later.depends_on.sort_unstable();
+    }
+}
+
 pub fn keep_dependencies(previous: &Plan, tasks: &mut [PlanTask]) {
     let numbers: HashMap<String, u32> = tasks.iter().map(|task| (task.title.trim().to_lowercase(), task.n)).collect();
     for task in tasks.iter_mut().filter(|task| task.depends_on.is_empty()) {
@@ -606,7 +680,17 @@ pub fn render_compact(ds: &Dataset, plan: &Plan) -> String {
 /// rules, and the plan's goal and approach.
 pub fn task_brief(ds: &Dataset, plan: &Plan, task: &PlanTask) -> String {
     let mut text = task_focus(ds, task);
-    text.push_str(&ds.text("plan_task_context", &[("plan_id", &plan.plan_id), ("goal", &plan.doc.goal), ("approach", &plan.doc.approach)]));
+    // Every task by its title and what it waits for: the agent sees where its part sits in the
+    // whole, and which tasks build on what it makes.
+    let tasks: String = plan
+        .tasks
+        .iter()
+        .map(|other| {
+            let after = if other.depends_on.is_empty() { String::new() } else { ds.text("plan_task_after", &[("numbers", &other.depends_on.iter().map(u32::to_string).collect::<Vec<_>>().join(", "))]) };
+            ds.text("plan_task_compact", &[("number", &other.n.to_string()), ("title", &format!("{}{after}", other.title))])
+        })
+        .collect();
+    text.push_str(&ds.text("plan_task_context", &[("plan_id", &plan.plan_id), ("goal", &plan.doc.goal), ("n", &task.n.to_string()), ("tasks", &tasks)]));
     text.push_str(&write_step(ds, task));
     text
 }
