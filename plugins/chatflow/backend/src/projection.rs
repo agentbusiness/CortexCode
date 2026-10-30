@@ -370,8 +370,15 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         let raw = args.get("path").or_else(|| args.get("target")).and_then(Value::as_str)?;
         (!raw.contains("://")).then(|| raw.trim().trim_start_matches("./").to_owned())
     };
+    // A command is named by what it runs, without its output filters (`cargo clippy | grep error`
+    // and `cargo clippy | tail -5` are one check): a later run of it replaces the earlier views
+    // (seen: twenty filtered views of one clippy run kept whole side by side, each a reason to run
+    // it again with another filter).
     let command_of = |call: &JournalEntry| -> Option<String> {
-        call.data.get("args")?.get("command").and_then(Value::as_str).map(|command| command.trim().to_owned())
+        call.data.get("args")?.get("command").and_then(Value::as_str).map(|command| {
+            let base = crate::repetition::base_command(command);
+            if base.is_empty() { command.trim().to_owned() } else { base }
+        })
     };
     let mut edited_at: HashMap<String, u64> = HashMap::new();
     let mut read_at: HashMap<String, u64> = HashMap::new();
@@ -537,8 +544,25 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         state
     };
 
+    // A baseline whose checks stand since (a later settled `checks` note of its run) is shown in
+    // its short form: its outputs served the CHECKS decision.
+    let short_baselines: HashSet<u64> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "baseline" && !str_field(&entry.data, "short").is_empty())
+        .filter(|baseline| {
+            entries.iter().any(|entry| {
+                entry.seq > baseline.seq
+                    && entry.kind == kinds::NOTE
+                    && str_field(&entry.data, "purpose") == "checks"
+                    && str_field(&entry.data, "run_id") == str_field(&baseline.data, "run_id")
+                    && bool_field(&entry.data, "settled")
+            })
+        })
+        .map(|entry| entry.seq)
+        .collect();
     let mut messages: Vec<ChatMessage> = Vec::new();
     let pins = Pins {
+        short_baselines,
         newest_plans: plan::newest_versions(settled),
         settled: settled_through,
     };
@@ -686,6 +710,8 @@ struct Pins {
     newest_plans: HashMap<String, u64>,
     /// The `settled_through` mark: in-place changes count up to it.
     settled: u64,
+    /// Baseline notes shown in their short form (their checks stand).
+    short_baselines: HashSet<u64>,
 }
 
 /// How a host read is named to the model: the target its own `read` would take, or what it is.
@@ -736,6 +762,9 @@ fn emit_other(
             }
         }
         kinds::ROUTE => messages.push(host_message(ds, &describe_decision(ds, data))),
+        kinds::NOTE if bool_field(data, "host_message") && pins.short_baselines.contains(&entry.seq) && str_field(data, "purpose") == "baseline" => {
+            messages.push(host_message(ds, str_field(data, "short")))
+        }
         kinds::NOTE if bool_field(data, "host_message") => messages.push(host_message(ds, str_field(data, "text"))),
         kinds::TOOL_RESULT if is_host(entry) => {
             let call_id = str_field(data, "call_id");

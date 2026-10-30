@@ -12,8 +12,8 @@
 //!   one-line description and each method with its description and a JSON schema of its params,
 //!   written for people and models alike (the host turns them into model tools).
 //! - Where a call may come from: `read` from any member; `edit` and `run` only from apps on the
-//!   same machine (a session runs where its project is, so its calls are local there). The person
-//!   narrows this per service in Settings > Mesh ([`Allowed`]).
+//!   same machine (a session runs where its project is, so its calls are local there). There is
+//!   nothing to set: what a plugin declares is always shared under these rules.
 //! - Every shared call carries who asked ([`Caller`], stamped by the mesh, never taken from the
 //!   caller's word); a run carries [`RunOptions`]; long work answers a [`Job`]; data comes back in
 //!   the [`Size`] the caller asks for.
@@ -219,26 +219,6 @@ pub struct NeedsApproval {
     /// The risk engine's label (`destructive`, `network`, `privileged`, ...).
     pub risk: String,
     pub reason: String,
-}
-
-/// The person's switches for one service: which kinds of call it takes from apps on this machine
-/// and from other machines. `edit` and `run` from other machines are never taken, whatever is set.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Allowed {
-    pub local: Vec<Access>,
-    pub network: Vec<Access>,
-}
-
-impl Default for Allowed {
-    fn default() -> Self {
-        Allowed { local: vec![Access::Read, Access::Edit, Access::Run], network: vec![Access::Read] }
-    }
-}
-
-impl Allowed {
-    pub fn takes(&self, access: Access, local: bool) -> bool {
-        if local { self.local.contains(&access) } else { access == Access::Read && self.network.contains(&access) }
-    }
 }
 
 /// A service as one model tool: its name is the service's second word (`schedule`), `action`

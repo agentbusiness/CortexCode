@@ -88,16 +88,20 @@ pub fn repeated_failure(entries: &[JournalEntry], task_id: &str) -> bool {
 }
 
 /// What an agent's current run did, from its journal (structural facts, no model): steps,
-/// edits and the files they changed, calls since its last edit, and how long ago it last moved.
-/// The host names what needs the session's attention: calls without an edit past
-/// `limits.manage_reading_calls`, or no step for `limits.manage_idle_minutes` (waiting for the model).
-pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
-    let Some(session_id) = agent.session_id.as_deref() else { return String::new() };
-    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return String::new() };
+/// edits and the files they changed, reads and check runs since its last edit, and how long ago it
+/// last moved. The host names what needs the session's attention: reads without an edit past
+/// `limits.manage_reading_calls`, or no step for `limits.manage_idle_minutes` (waiting for the
+/// model); the flag is true when one of them holds and the session has not told it anything since
+/// its last edit. A run of one of `checks` (its task's check commands, by the command they run) is a
+/// check run, not reading (seen: an agent named reading while it ran its checks between edits).
+pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (String, bool) {
+    let Some(session_id) = agent.session_id.as_deref() else { return (String::new(), false) };
+    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return (String::new(), false) };
     let entries = journal.entries_vec();
     let Some(run_id) = entries.iter().rev().find(|entry| entry.kind == kinds::STATUS).map(|entry| str_field(&entry.data, "run_id").to_owned()) else {
-        return String::new();
+        return (String::new(), false);
     };
+    let check_bases: Vec<String> = checks.iter().map(|command| crate::repetition::base_command(command)).filter(|base| !base.is_empty()).collect();
     let run: Vec<&JournalEntry> = entries.iter().filter(|entry| str_field(&entry.data, "run_id") == run_id).collect();
     let ok: HashMap<&str, bool> = run
         .iter()
@@ -112,12 +116,16 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
     let told_at = told.map(|entry| entry.ts_ms).unwrap_or(0);
     let mut edits = 0;
     let mut since_edit = 0;
+    let mut checks_since = 0;
+    let mut edited_at = 0;
     let mut files: Vec<String> = Vec::new();
     for entry in run.iter().filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("host").and_then(Value::as_bool) != Some(true)) {
         let edited = str_field(&entry.data, "tool") == "edit" && ok.get(str_field(&entry.data, "call_id")).copied().unwrap_or(false);
         if edited {
             edits += 1;
             since_edit = 0;
+            checks_since = 0;
+            edited_at = entry.ts_ms;
             let path = entry.data.get("args").and_then(|args| args.get("path")).and_then(Value::as_str).unwrap_or("");
             if !path.is_empty() && !files.iter().any(|known| known == path) {
                 files.push(path.to_owned());
@@ -125,7 +133,13 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
         // Calls that did not run (skipped for a message, an edit refused by another agent's lock)
         // are not reading.
         } else if entry.ts_ms >= told_at && ok.get(str_field(&entry.data, "call_id")).copied().unwrap_or(false) {
-            since_edit += 1;
+            let command = entry.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str).unwrap_or("");
+            let base = crate::repetition::base_command(command);
+            if str_field(&entry.data, "tool") == "run" && !base.is_empty() && check_bases.contains(&base) {
+                checks_since += 1;
+            } else {
+                since_edit += 1;
+            }
         }
     }
     let last_ms = run.iter().map(|entry| entry.ts_ms).max().unwrap_or(0);
@@ -133,15 +147,19 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
     let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
     let mut line = env.data.text(
         "manage_progress",
-        &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("idle", &idle.to_string())],
+        &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("checks", &checks_since.to_string()), ("idle", &idle.to_string())],
     );
     let limits = &env.data.limits;
-    if limits.manage_reading_calls > 0 && since_edit >= limits.manage_reading_calls as usize {
+    let reading = limits.manage_reading_calls > 0 && since_edit >= limits.manage_reading_calls as usize;
+    let still = limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes;
+    if reading {
         line.push_str(&env.data.text("manage_flag_reading", &[("since", &since_edit.to_string())]));
     }
-    if limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes {
+    if still {
         line.push_str(&env.data.text("manage_flag_idle", &[("idle", &idle.to_string())]));
     }
+    // Told something it has not acted on with an edit yet: it is working on that.
+    let told_since_edit = told.is_some_and(|told| told.ts_ms > edited_at);
     // Both ways: what the session last told it, and what it last said (its answer, its question).
     if let Some(told) = told {
         let ago = cc_protocol::contracts::now_ms().saturating_sub(told.ts_ms) / 60_000;
@@ -150,7 +168,7 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord) -> String {
     if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
         line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
     }
-    line
+    (line, (reading || still) && !told_since_edit)
 }
 
 /// Characters of an agent's last words, and of the session's last message to it, shown per agent.
@@ -188,13 +206,18 @@ pub async fn plan_lines(env: &RunEnv, entries: &[JournalEntry], work: &[OpenWork
     env.data.text("manage_plan", &[("goal", plan.doc.goal.trim()), ("tasks", &lines)])
 }
 
-/// One line per open agent: its task, its state, what its run did and its task's last result.
-pub async fn work_lines_with_progress(env: &RunEnv, work: &[OpenWork]) -> String {
+/// One line per open agent: its task, its state, what its run did and its task's last result;
+/// and whether one of them needs the session (a progress flag it was not told about since its last
+/// edit; a blocked agent or a question wakes the session with its own event).
+pub async fn work_lines_with_progress(env: &RunEnv, work: &[OpenWork]) -> (String, bool) {
     let mut lines = Vec::new();
+    let mut needs_session = false;
     for item in work {
-        lines.push(format!("{}{}", work_line(env, item), progress(env, &item.agent).await));
+        let (progress, flagged) = progress(env, &item.agent, &crate::contract::commands(&item.task.contract)).await;
+        needs_session |= flagged;
+        lines.push(format!("{}{progress}", work_line(env, item)));
     }
-    lines.join("\n")
+    (lines.join("\n"), needs_session)
 }
 
 /// One line per open agent: its task, its state and its task's last result.
@@ -214,16 +237,15 @@ fn work_line(env: &RunEnv, item: &OpenWork) -> String {
     )
 }
 
-/// Whether the session's last message to `agent` says `text` (spacing aside) and the agent edited
-/// nothing since.
-async fn told_already(env: &RunEnv, agent: &AgentRecord, text: &str) -> bool {
-    let Some(session_id) = agent.session_id.as_deref() else { return false };
-    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return false };
+/// The session's last message to `agent` when the agent has edited nothing since (it is still
+/// working on what it was told); None when it was never told or edited after.
+async fn told_since_edit(env: &RunEnv, agent: &AgentRecord) -> Option<String> {
+    let session_id = agent.session_id.as_deref()?;
+    let journal = Journal::load(env.host.clone(), session_id).await.ok()?;
     let entries = journal.entries_vec();
-    let Some(told) = entries.iter().rev().find(|entry| entry.kind == kinds::STEER) else { return false };
-    let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
-    same(str_field(&told.data, "text"), text)
-        && !entries.iter().any(|entry| entry.seq > told.seq && entry.kind == kinds::TOOL_CALL && str_field(&entry.data, "tool") == "edit")
+    let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER)?;
+    let edited = entries.iter().any(|entry| entry.seq > told.seq && entry.kind == kinds::TOOL_CALL && str_field(&entry.data, "tool") == "edit");
+    (!edited).then(|| str_field(&told.data, "text").to_owned())
 }
 
 /// Cancel tasks (each with what waits for it) through the agents plugin, which stops their agents;
@@ -252,9 +274,24 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         let text = env.data.text("manage_none", &[]);
         return journal.note(&env.run_id, "managed", &text, true).await.map(|_| ());
     }
+    // A routine check-in (not an agent's need or block) when no agent needs the session: nothing to
+    // decide, so no model call (seen: 52 check-ins in four hours, most of them telling a working
+    // agent again what it was told minutes before).
+    let check = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == env.run_id)
+        .and_then(|entry| entry.data.get("detail").and_then(|detail| detail.get("check")).and_then(Value::as_bool))
+        == Some(true);
+    let (lines, attention) = work_lines_with_progress(env, &work).await;
+    if check && !attention {
+        // Transcript only: the session's conversation does not fill with check-ins that did nothing.
+        let text = env.data.text("managed_nothing", &[]);
+        return journal.note(&env.run_id, "managed", &text, false).await.map(|_| ());
+    }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
     let shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
-    let live = format!("{}{}", plan_lines(env, &entries, &work).await, env.data.text("manage_live", &[("work", &work_lines_with_progress(env, &work).await)]));
+    let live = format!("{}{}", plan_lines(env, &entries, &work).await, env.data.text("manage_live", &[("work", &lines)]));
     let (decision, _) = crate::flow::decide_json::<Manage>(env, journal, "MANAGE", &shape, &live).await?;
     let mut done = Vec::new();
     for action in &decision.actions {
@@ -265,6 +302,13 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         let outcome = match action.action.as_str() {
             "stop" => match env.host.get::<CancelResult>(agents_methods::CANCEL, json!({"project_id": env.scope.project_id, "task_id": item.task.id})).await {
                 Ok(result) => Ok(env.data.text("managed_stop", &[("agent", name), ("count", &result.tasks.len().to_string())])),
+                Err(error) => Err(error),
+            },
+            // The session takes the task as done: the agent stops now and the steward judges its
+            // work (a message saying "stop" left the agent's own checks to put it back to work).
+            "finish" => match env.host.call(agents_methods::FINISH, params.clone()).await {
+                Ok(result) if result.get("verified").and_then(Value::as_bool) == Some(true) => Ok(env.data.text("managed_finish", &[("agent", name)])),
+                Ok(_) => Ok(env.data.text("managed_finish_failing", &[("agent", name)])),
                 Err(error) => Err(error),
             },
             "restart" if item.repeated => Ok(env.data.text("managed_restart_refused", &[("agent", name)])),
@@ -283,8 +327,15 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
                     Err(error) => Err(error),
                 }
             }
-            // The same words again, before the agent edited anything since: it has them already.
-            "message" if !text.is_empty() && told_already(env, &item.agent, text).await => Ok(env.data.text("managed_repeat", &[("agent", name)])),
+            // One message per agent until it edits: a check-in sends nothing to an agent still working
+            // on what it was told (seen: "READING WITHOUT WRITING" sent eight times to one agent, once
+            // at 30 edits and one call since its last edit); a need or a block may answer at once,
+            // but not with the same words again.
+            "message" if !text.is_empty()
+                && told_since_edit(env, &item.agent).await.is_some_and(|told| check || told.split_whitespace().eq(text.split_whitespace())) =>
+            {
+                Ok(env.data.text("managed_repeat", &[("agent", name)]))
+            }
             "message" if !text.is_empty() => {
                 let kind = if item.agent.status == "working" { "steer" } else { "followup" };
                 env.host

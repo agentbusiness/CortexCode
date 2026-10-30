@@ -193,7 +193,20 @@ fn resolve(doc: &Doc, view: Option<&View>, reference: LineRef, op: usize, reloca
                     relocations.push(format!("{anchor} -> line {}", other + 1));
                     Ok(Resolved::Line(other))
                 }
-                (false, None) => Err(Problem::Stale { op, anchor: anchor.to_string(), line: anchor.line }),
+                // The file changed outside this session's view (another agent's edit, a command):
+                // a line whose tag is the anchor's and the only such line of the file is the line
+                // the anchor named, moved; the edit goes there with a note instead of failing (seen:
+                // eleven refused edits in one run, each costing a read for fresh anchors).
+                (false, None) => {
+                    let mut tagged = (0..doc.len()).filter(|index| doc.tag(*index).as_bytes() == anchor.tag);
+                    match (tagged.next(), tagged.next()) {
+                        (Some(only), None) => {
+                            relocations.push(format!("{anchor} -> line {} (the file changed; found by its tag)", only + 1));
+                            Ok(Resolved::Line(only))
+                        }
+                        _ => Err(Problem::Stale { op, anchor: anchor.to_string(), line: anchor.line }),
+                    }
+                }
             }
         }
     }

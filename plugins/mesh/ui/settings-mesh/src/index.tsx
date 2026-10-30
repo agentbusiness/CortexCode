@@ -2,8 +2,8 @@
  * settings.mesh@1 — joining computers. Nothing to set: an invitation (one hour, used once) to copy
  * for another computer, a box to paste one into, and the joined computers with Remove. What runs
  * where (a session's model, an agent, a command) is decided by the host from what each computer
- * reports; the list shows it as it happens. Under them, the services this computer's plugins
- * share, with what each takes from apps on this computer and from other computers (`mesh.shares`).
+ * reports; the list shows it as it happens. Each member has one switch: whether it may work on
+ * this computer (`mesh.allow`); one that may not is offered nothing here.
  */
 
 import { useState } from 'react';
@@ -17,10 +17,11 @@ interface Peer { member: Member; card?: Card | null; reachable: boolean; path: s
 interface PairCode { code: string; expires_ms: number; invitation: string }
 interface Placed { session_id: string; node: string; name: string }
 interface Network { id: string; founder: string; founded_ms: number; members: number }
-type Access = 'read' | 'edit' | 'run';
-interface Allowed { local: Access[]; network: Access[] }
-interface ShareSetting { share: { service: string; title: string; description: string; methods: { method: string }[] }; allowed: Allowed; served: number }
-interface Status { node: string; name: string; members: number; reachable: number; network?: Network | null; pairing?: PairCode | null; serving: [string, string][]; placed: Placed[] }
+interface Status { node: string; name: string; members: number; reachable: number; network?: Network | null; pairing?: PairCode | null; serving: [string, string][]; placed: Placed[]; allowed: string[] }
+
+/** What a member allowed by `mesh.allow` may do on this computer. */
+const ALLOW_LABEL = 'Projects';
+const ALLOW_TEXT = 'may see the projects on this computer';
 
 function gb(bytes: number): string {
   const value = bytes / (1024 * 1024 * 1024);
@@ -44,7 +45,6 @@ function MeshPanel() {
   const host = useHost();
   const status = useQuery<Status>('mesh.status', (c) => c.call('mesh.status', {}), { topics: ['mesh.changed', 'plugin.swapped'] });
   const peers = useQuery<{ peers: Peer[] }>('mesh.peers', (c) => c.call('mesh.peers', {}), { topics: ['mesh.changed'] });
-  const shares = useQuery<{ shares: ShareSetting[] }>('mesh.shares', (c) => c.call('mesh.shares', {}), { topics: ['mesh.changed', 'plugin.swapped'] });
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [token, setToken] = useState('');
@@ -140,6 +140,7 @@ function MeshPanel() {
             const member = peer.member;
             const card = peer.card;
             const placedHere = data.placed.filter((placed) => placed.node === member.node).length;
+            const allowed = data.allowed.includes(member.node);
             return (
               <li key={member.node} data-node={member.node} className="cx-mesh-grid">
                 <span className="cx-mesh-name">
@@ -147,6 +148,9 @@ function MeshPanel() {
                   <span className={`ap ${peer.reachable ? 'live' : 'faint'}`}>{peer.reachable ? `${where(peer.path)}${peer.rtt_ms ? ` · ${peer.rtt_ms} ms` : ''}` : 'not reachable now'}</span>
                 </span>
                 <button type="button" className="detent tiny warn" data-action="revoke" disabled={busy !== null} onClick={() => void run('revoke', async () => { await client.call('mesh.revoke', { node: member.node }); return `${member.name} removed`; })}>Remove</button>
+                <span className="ap">{ALLOW_LABEL}</span>
+                <span className="v">{ALLOW_TEXT}</span>
+                <button type="button" className="sw" data-action="allow" aria-pressed={allowed} aria-label={`${member.name} ${ALLOW_TEXT}`} disabled={busy !== null} onClick={() => void run('allow', async () => { await client.call('mesh.allow', { node: member.node, allowed: !allowed }); })} />
                 {card && <>
                   <span className="ap">Computer</span>
                   <span className="v">{[card.chip, `${gb(card.memory_bytes)}, ${gb(card.free_memory_bytes)} free`, card.on_mains ? 'on mains' : 'on battery', card.docker ? 'Docker' : '', card.user_active ? 'in use' : ''].filter(Boolean).join(' · ')}</span>
@@ -169,38 +173,6 @@ function MeshPanel() {
             );
           })}
         </ul>
-      )}
-
-      {(shares.data?.shares.length ?? 0) > 0 && (
-        <div className="cx-mesh-grid cx-mesh-shares">
-          <span className="ap">Shared services</span>
-          <span className="cx-mesh-note">What other apps may ask of this computer. Apps on this computer may look, change and run; other computers may only look: work runs on the computer its project is on.</span>
-          <span />
-          {shares.data!.shares.map((setting) => {
-            const set = (scope: 'local' | 'network', access: Access, on: boolean) => void run('shares', async () => {
-              const list = setting.allowed[scope].filter((a) => a !== access);
-              await client.call('mesh.shares.set', { service: setting.share.service, allowed: { ...setting.allowed, [scope]: on ? [...list, access] : list } });
-              await shares.refresh();
-            });
-            const swatch = (scope: 'local' | 'network', access: Access) => {
-              const on = setting.allowed[scope].includes(access);
-              return (
-                <span key={`${scope}-${access}`} className="cx-mesh-sw">
-                  <span className="ap">{access}</span>
-                  <button type="button" className="sw" aria-pressed={on} aria-label={`${setting.share.title}: ${access} from ${scope === 'local' ? 'apps on this computer' : 'other computers'}`} disabled={busy !== null} onClick={() => set(scope, access, !on)} />
-                </span>
-              );
-            };
-            return (
-              <div key={setting.share.service} className="cx-mesh-share" data-service={setting.share.service}>
-                <span className="t">{setting.share.title}</span>
-                <span className="v">{setting.share.description}{setting.served > 0 ? ` · ${setting.served} call${setting.served === 1 ? '' : 's'} served in 30 days` : ''}</span>
-                <span className="cx-mesh-cell"><span className="ap faint">This computer</span>{(['read', 'edit', 'run'] as Access[]).map((access) => swatch('local', access))}</span>
-                <span className="cx-mesh-cell"><span className="ap faint">Other computers</span>{swatch('network', 'read')}</span>
-              </div>
-            );
-          })}
-        </div>
       )}
 
       {error && <p className="inline-error">{error}</p>}

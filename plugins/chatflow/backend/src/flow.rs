@@ -428,6 +428,15 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 if plan::open(&entries).is_none() {
                     route_shape = route_shape.without("route", "IMPLEMENT");
                 }
+                // The session's background work still going, next to the decision: a question about
+                // it is answered from where it stands (seen: "how is it going?" answered with a
+                // greeting while eight agents worked).
+                let open = crate::manage::open_work(env, &entries).await;
+                let skills_live = if open.is_empty() {
+                    skills_live
+                } else {
+                    joined(&[env.data.text("route_open_work", &[("work", &crate::manage::work_lines(env, &open))]), skills_live])
+                };
                 let routed = decide_json::<RouterDecision>(env, journal, "ROUTE", &route_shape, &skills_live).await;
                 let (decision, raw) = match routed {
                     Ok(pair) => pair,
@@ -590,9 +599,13 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             }
             Stage::Reply => {
                 set_stage(env, journal, status_seq, "reply").await?;
+                // An answer in a session with background work going says where that work stands
+                // from its records, not from memory of the conversation.
+                let open = crate::manage::open_work(env, &entries).await;
+                let reply_live = if open.is_empty() { String::new() } else { env.data.text("reply_open_work", &[("work", &crate::manage::work_lines(env, &open))]) };
                 let messages = crate::fit::fitted(env, journal, |entries| {
                     let mut messages = base_messages(env, entries);
-                    messages.push(prompts::stage_message(&env.data, &env.prefix.role, "REPLY", ""));
+                    messages.push(prompts::stage_message(&env.data, &env.prefix.role, "REPLY", &reply_live));
                     messages
                 })
                 .await?;
@@ -1209,14 +1222,43 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             .unwrap_or_default(),
     };
     let parallel = if free > 0 && !auto { env.data.text("plan_parallel", &[("count", &free.to_string())]) } else { String::new() };
+    // The work earlier plans of this conversation finished: the new plan builds on it (a replan
+    // keeps its own done tasks itself).
+    let done = if matches!(mode, PlanMode::Replan { .. }) { Vec::new() } else { done_earlier(env, &entries).await };
+    let done_live = if done.is_empty() {
+        String::new()
+    } else {
+        let items: String = done
+            .iter()
+            .map(|(title, files)| env.data.text("plan_done_item", &[("title", title), ("files", &if files.is_empty() { "-".to_owned() } else { files.join(", ") })]))
+            .collect();
+        env.data.text("plan_done_live", &[("items", &items)])
+    };
     // Each task's `skills` choose from the catalog, shown last.
     let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
-    let live = joined(&[open_live, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    let live = joined(&[done_live, open_live, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
+    }
+    // A task that redoes finished work (the same title, or the same files as a done task) is not
+    // done twice (seen: a second plan wrote the adapter, its SGD and the transport again, and three
+    // agents redid what three others had finished).
+    if !done.is_empty() {
+        let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+        let redone: HashSet<u32> = tasks
+            .iter()
+            .filter(|task| {
+                let files: HashSet<String> = plan::touched_files(task).into_iter().collect();
+                done.iter().any(|(title, done_files)| same(title, &task.title) || (!files.is_empty() && files == done_files.iter().cloned().collect::<HashSet<String>>()))
+            })
+            .map(|task| task.n)
+            .collect();
+        if !redone.is_empty() && redone.len() < tasks.len() {
+            tasks = plan::drop_tasks(tasks, &redone);
+        }
     }
     wait_where_tasks_meet(env, &mut tasks).await;
     // Tasks are small parts, each checked on its own (the planner's call); parts that change the
@@ -1259,6 +1301,25 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         cancel_replaced_tasks(env, previous, &made).await;
     }
     Ok(())
+}
+
+/// The tasks earlier plans of this conversation made that are done now, each once: its title and
+/// the files it changes. Asked of memory (a task's status is its record's).
+async fn done_earlier(env: &RunEnv, entries: &[JournalEntry]) -> Vec<(String, Vec<String>)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut done = Vec::new();
+    for earlier in plan::all(entries) {
+        for task in earlier.tasks {
+            let Some(id) = task.task_id.clone() else { continue };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if env.host.get::<Task>(memory_methods::TASK_GET, json!({"id": id})).await.is_ok_and(|record| record.status == "done") {
+                done.push((task.title.clone(), plan::touched_files(&task)));
+            }
+        }
+    }
+    done
 }
 
 /// Each task's dependencies completed from the code graph (structural, [`plan::wait_where_tasks_meet`]):
@@ -1404,6 +1465,24 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                 depends_on: (1..n).collect(),
                 ..Default::default()
             });
+            journal.set(plan_seq, "tasks", serde_json::to_value(&current.tasks)?).await?;
+        }
+        // A check that fails without naming failing tests did not get as far as running them: the
+        // project does not build. Every task waits for one that makes it build, first (seen: four
+        // agents started on a crate with 62 compile errors; none could run its own work, so they
+        // read instead, for hours, while the fix waited as the last task).
+        let broken: Vec<&String> = failures.iter().filter(|(_, tests)| tests.as_ref().is_none_or(Vec::is_empty)).map(|(command, _)| command).collect();
+        if !broken.is_empty() && current.tasks.first().is_some_and(|task| task.title != env.data.text("build_task_title", &[])) {
+            let commands: String = broken.iter().map(|command| format!("- `{command}`\n")).collect();
+            plan::put_first(
+                &mut current.tasks,
+                plan::PlanTask {
+                    title: env.data.text("build_task_title", &[]),
+                    brief: env.data.text("build_task_brief", &[("checks", &commands)]),
+                    checks: broken.iter().map(|command| (*command).clone()).collect(),
+                    ..Default::default()
+                },
+            );
             journal.set(plan_seq, "tasks", serde_json::to_value(&current.tasks)?).await?;
         }
         if !failures.is_empty() {

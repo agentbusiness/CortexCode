@@ -5,10 +5,12 @@
 //!   for the `repeat_at`-th time (data, shipped as 3) since the last correction is a repetition;
 //! - the same failing contract report for the third time is a repetition;
 //! - a generation the model plugin stopped as repeating itself (`finish_reason = repeated`) is one.
-//! - the same command (its first command, without output filters and redirections) ending with the
-//!   same exit status for the `repeat_at`-th time with no edit in between is a rerun: told once
-//!   per edit-free stretch that it cannot show anything new (seen: a passing test run again eight
-//!   times, each with another `| grep`), never a stop.
+//! - the same command (its first command, without output filters and redirections) run for the
+//!   `repeat_at`-th time or more with no edit in between is a rerun, whatever its filters show and
+//!   however they end (a `| grep` that matches nothing exits 1): told at each such run that it
+//!   cannot show anything new (seen: a passing test run again eight times, each with another
+//!   `| grep`; clippy run twenty times between two edits, each filter keyed apart by its exit
+//!   status), never a stop.
 //!
 //! The first repetition earns a corrective replanning message; a repetition after that stops the
 //! run with an honest status. A repeated read never stops it: reading a file again changes
@@ -33,14 +35,6 @@ pub fn base_command(command: &str) -> String {
         .map(|part| part.split('|').next().unwrap_or("").split_whitespace().take_while(|word| !word.contains('>') && !word.starts_with('<')).collect::<Vec<_>>().join(" "))
         .find(|part| !part.is_empty() && !["cd", "echo", "sleep", "printf"].contains(&part.split(' ').next().unwrap_or("")))
         .unwrap_or_default()
-}
-
-/// How a command's output ended: its last `[exit …]`, timeout or no-status line (the tools
-/// plugin's), or the whole output when it has none.
-fn ending(output: &str) -> u64 {
-    let last = output.lines().rev().find(|line| line.starts_with('[')).unwrap_or(output);
-    // `[exit 0, 12s]` and `[exit 0]` end the same way.
-    fingerprint(last.split(',').next().unwrap_or(last))
 }
 
 /// FNV-1a 64: a stable fingerprint (mechanical; equality of bytes, not meaning).
@@ -81,8 +75,8 @@ pub enum Verdict {
     /// The same read with the same result for the `READ_REPEAT_AT`-th time: told once that the
     /// content is above (a reread is harmless; it never escalates or stops the run).
     Reread(String),
-    /// The same command with the same exit status for the `repeat_at`-th time with no edit in
-    /// between: told once per edit-free stretch (never escalates or stops the run).
+    /// The same command for the `repeat_at`-th time or more with no edit in between: told at each
+    /// such run (never escalates or stops the run).
     Rerun(String),
 }
 
@@ -97,8 +91,8 @@ pub struct Detector {
     read_corrected: bool,
     /// How many identical (call, result) pairs make a repetition (data: `limits.repeat_at`).
     repeat_at: u32,
-    /// Base command and exit status of the runs since the last edit, with their count.
-    runs: HashMap<(String, u64), u32>,
+    /// Base command of the runs since the last edit, with their count.
+    runs: HashMap<String, u32>,
 }
 
 impl Detector {
@@ -130,9 +124,9 @@ impl Detector {
             if base.is_empty() {
                 return Verdict::Fine;
             }
-            let count = self.runs.entry((base.clone(), ending(output))).or_insert(0);
+            let count = self.runs.entry(base.clone()).or_insert(0);
             *count += 1;
-            if *count == self.repeat_at {
+            if *count >= self.repeat_at {
                 return Verdict::Rerun(format!("`{}`", base.chars().take(300).collect::<String>()));
             }
             return Verdict::Fine;

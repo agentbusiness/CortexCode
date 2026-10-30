@@ -60,6 +60,25 @@ pub fn report_text(data: &Dataset, heading: &str, report: &VerifyReport) -> Stri
     text
 }
 
+/// The baseline once the checks stand: each check's command and whether it passes, with its
+/// failing tests when the runner named them. The outputs served the CHECKS decision; after it they
+/// only sat in front of the work (seen: 18 KB of baseline output before an agent's first step).
+pub fn short_report(data: &Dataset, report: &VerifyReport) -> String {
+    let mut text = data.text("baseline_short", &[]);
+    for check in &report.checks {
+        let spec = report.contract.checks.iter().find(|spec| spec.name == check.name).map(|spec| spec.spec.as_str()).unwrap_or("");
+        if check.ok {
+            text.push_str(&data.text("baseline_short_pass", &[("command", spec)]));
+            continue;
+        }
+        let exit = check.exit_code.map(|code| code.to_string()).unwrap_or_else(|| "none".into());
+        let tests = check.failed_tests.as_ref().filter(|names| !names.is_empty()).map(|names| names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let key = if tests.is_empty() { "baseline_short_fail" } else { "baseline_short_tests" };
+        text.push_str(&data.text(key, &[("command", spec), ("exit", &exit), ("tests", &tests)]));
+    }
+    text
+}
+
 fn describe(data: &Dataset, contract: &Contract) -> String {
     if contract.checks.is_empty() {
         return data.text("checks_none", &[]);
@@ -144,6 +163,7 @@ pub async fn refine(env: &RunEnv, journal: &mut Journal, proposed: &Contract) ->
                 kinds::NOTE,
                 json!({
                     "text": report_text(&env.data, "baseline", &report),
+                    "short": short_report(&env.data, &report),
                     "purpose": "baseline",
                     "run_id": env.run_id,
                     "host_message": true,

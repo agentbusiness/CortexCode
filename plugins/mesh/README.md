@@ -18,7 +18,7 @@ Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); 
   first entry, founder, founded_ms})-[:ON]->(:Machine)` (WORKSPACE layer), built from the log: a
   revoked member is retired (`revoked`), a mesh left behind is retired (`left`).
 - stream `mesh.served`: every call served to another app, `{at, node, method, ok, ms}`, 30 days.
-- settings `mesh.name`, `mesh.lend`, `mesh.shares` (service -> `{local, network}`).
+- settings `mesh.name`, `mesh.lend`, `mesh.allowed` (the members that may work here, `mesh.allow`). Shared services have no switches: always on (`read` from any member, `edit` and `run` from apps on this machine).
 - **Start order**: the endpoint starts at once, so apps on this Mac link and lend before the
   memory plugin answers; members of the network are let in, and the membership changed, only once
   the log is read (methods that change it wait 10 s, then answer `unavailable`). The store is
@@ -28,7 +28,11 @@ Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); 
 - `~/.cortex-mesh/local/<software>-<node>.json` stays a file: plumbing (pid and loopback ports of
   a running app, removed when it stops), how CortexCode and CortexTerm on one Mac find each other.
 
-Nothing to set. One invitation joins a computer; Remove takes it out. A project lives on its own
+Nothing to set. One invitation joins a computer; Remove takes it out. Apps on one Mac join each
+other's network by themselves: one in no network is taken in by one that is in a network with
+other computers (`mesh.local.join`), unless it left that network or was removed from it before. Each member row has one switch: whether
+that member may see its projects. A member not switched on gets no projects in this computer's card and its
+window is refused. A project lives on its own
 computer, and every member's window works in it there; every member lends every other its model,
 for the work the model is tagged for. What runs where is decided by the host from what each computer
 reports, never by the model; the model is told one number when it plans (how many other computers

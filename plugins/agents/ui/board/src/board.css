@@ -13,8 +13,30 @@
 #cc .cx-contract li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
 #cc .cx-contract code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-3);flex-basis:100%;overflow-wrap:anywhere;}
 #cc .cx-check-name{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
-#cc .cx-agent-row{padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
-#cc .cx-agent-row .r{display:flex;align-items:baseline;gap:8px;}
-#cc .cx-agent-acts{display:flex;gap:4px;flex-wrap:wrap;}
+/* Agents: one ruled line each — a state pip, the name, its state in the state's colour, the task, counts,
+   age, then the actions. Running is the rubric (pulsing), waiting the lift (hollow), blocked and failed
+   the lift and the deep rubric (filled), done the counter, stopped the third ink. */
+#cc .cx-agent-list{list-style:none;margin:0;padding:0;}
+#cc .cx-agent-row{display:flex;align-items:center;gap:10px;min-width:0;height:32px;padding:0 0 0 16px;border-bottom:1px solid var(--rule);--state:var(--ink-3);}
+#cc .cx-agent-row:hover{background:var(--rubric-wash);}
+#cc .cx-agent-row[data-state="running"]{--state:var(--rubric);}
+#cc .cx-agent-row[data-state="waiting"]{--state:var(--rubric-lift);}
+#cc .cx-agent-row[data-state="blocked"]{--state:var(--rubric-lift);}
+#cc .cx-agent-row[data-state="failed"]{--state:var(--rubric-deep);}
+#cc .cx-agent-row[data-state="done"]{--state:var(--counter);}
+#cc .cx-agent-pip{width:7px;height:7px;flex:0 0 auto;background:var(--state);}
+#cc .cx-agent-row[data-state="waiting"] .cx-agent-pip{background:transparent;box-shadow:inset 0 0 0 1px var(--state);}
+#cc .cx-agent-row[data-state="stopped"] .cx-agent-pip{background:transparent;box-shadow:inset 0 0 0 1px var(--ink-3);}
+#cc .cx-agent-row[data-state="running"] .cx-agent-pip{animation:cx-agent-pulse 1.4s ease-in-out infinite;}
+@keyframes cx-agent-pulse{50%{opacity:.25;}}
+#cc .cx-agent-row .cx-at{flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;color:var(--ink);}
+#cc .cx-agent-state{flex:0 0 132px;white-space:nowrap;color:var(--state);}
+#cc .cx-agent-row[data-state="done"] .cx-agent-state,#cc .cx-agent-row[data-state="stopped"] .cx-agent-state{opacity:.85;}
+#cc .cx-agent-task{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-reading);font-size:13px;color:var(--ink-2);}
+#cc .cx-agent-row:not([data-state="running"]):not([data-state="waiting"]):not([data-state="blocked"]) .cx-agent-task{color:var(--ink-3);}
+#cc .cx-agent-count,#cc .cx-agent-ago{flex:0 0 auto;white-space:nowrap;}
+#cc .cx-agent-ago{min-width:64px;text-align:right;}
+#cc .cx-agent-acts{flex:0 0 auto;display:flex;gap:4px;}
+#cc .cx-agent-acts .detent.tiny{height:20px;padding:0 7px;}
 #cc .cx-board .reg-log{padding:0 0 0 16px;}
 #cc .cx-board-post{margin:12px 0 0 16px;}

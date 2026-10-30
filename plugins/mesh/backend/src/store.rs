@@ -10,8 +10,8 @@
 //!   this node is no longer in is retired (`left`), with its members.
 //! - **Served calls**: stream `mesh.served`, one record per call served to another app:
 //!   `{at, node, method, ok, ms}`, kept 30 days.
-//! - **The person's choices**: `memory.settings` (global scope) `mesh.name` (string), `mesh.lend`
-//!   (boolean) and `mesh.shares` (an object: service -> `{local, network}`).
+//! - **The person's choices**: `memory.settings` (global scope) `mesh.name` (string),
+//!   `mesh.lend` (boolean) and `mesh.allowed` (the node ids of the members that may work here).
 //!
 //! **Start order.** The memory plugin may answer later than the mesh starts. Until it does, the
 //! mesh runs on what it holds in memory: the network endpoint starts at once, so apps on this
@@ -30,7 +30,7 @@ use crate::members::{Entry, Log};
 use cc_protocol::contracts::memory::methods;
 use cc_protocol::{BoxFuture, RpcError, codes};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +43,7 @@ pub const SERVED_TOPIC: &str = "mesh.served";
 /// Settings paths (global scope).
 pub const NAME_SETTING: &str = "mesh.name";
 pub const LEND_SETTING: &str = "mesh.lend";
-pub const SHARES_SETTING: &str = "mesh.shares";
+pub const ALLOWED_SETTING: &str = "mesh.allowed";
 
 /// How long served calls are kept (days).
 pub const SERVED_DAYS: u32 = 30;
@@ -93,7 +93,7 @@ pub struct Loaded {
     pub machine: String,
     pub name: Option<String>,
     pub lend: bool,
-    pub shares: HashMap<String, cc_protocol::contracts::service::Allowed>,
+    pub allowed: Vec<String>,
     /// The log as the stream replays (before validation: what the stream holds).
     pub entries: Vec<Entry>,
 }
@@ -134,19 +134,9 @@ pub async fn load(call: &Caller, home: &Path) -> Result<Loaded, RpcError> {
             lend
         }
     };
-    let shares = match get_setting(call, SHARES_SETTING).await? {
-        Some(value) => serde_json::from_value(value).unwrap_or_default(),
-        None => {
-            let file = dir.join("shares.json");
-            let old: HashMap<String, cc_protocol::contracts::service::Allowed> =
-                std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-            if !old.is_empty() {
-                set_confirmed(call, SHARES_SETTING, serde_json::to_value(&old).unwrap_or(Value::Null)).await?;
-            }
-            remove(&file);
-            old
-        }
-    };
+    let allowed: Vec<String> = get_setting(call, ALLOWED_SETTING).await?.and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+    // Sharing has no switches any more: an earlier version's file of them goes.
+    remove(&dir.join("shares.json"));
 
     // The membership log: the stream, else the old file's chain (appended, read back, then the
     // file goes).
@@ -191,7 +181,7 @@ pub async fn load(call: &Caller, home: &Path) -> Result<Loaded, RpcError> {
     // The folder of earlier versions goes once it is empty.
     let _ = std::fs::remove_dir(&dir);
 
-    Ok(Loaded { machine, name, lend, shares, entries })
+    Ok(Loaded { machine, name, lend, allowed, entries })
 }
 
 fn remove(file: &Path) {
@@ -282,12 +272,6 @@ pub async fn read_log(call: &Caller) -> Result<Vec<Entry>, RpcError> {
         }
     }
     Ok(entries)
-}
-
-/// Served calls since `since_ms` (by the time they were served), oldest first.
-pub async fn read_served(call: &Caller, since_ms: u64) -> Result<Vec<Value>, RpcError> {
-    let records = read_all(call, SERVED_TOPIC, Some(since_ms), 200_000).await?;
-    Ok(records.into_iter().filter(|value| value["at"].as_u64().unwrap_or(0) >= since_ms).collect())
 }
 
 // --- the writer --------------------------------------------------------------------------------

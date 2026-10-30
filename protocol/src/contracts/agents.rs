@@ -19,6 +19,10 @@ pub mod methods {
     pub const LIST: &str = "agents.list";
     pub const STEER: &str = "agents.steer";
     pub const STOP: &str = "agents.stop";
+    /// [`super::AgentRefParams`] -> `{finished, verified}`: the session takes an agent's task as
+    /// done as it stands: its run ends now (no further step, no check of its own), the merge
+    /// steward judges the work in the project, and the tasks waiting for it start when it passes.
+    pub const FINISH: &str = "agents.finish";
     /// [`super::AgentRefParams`] -> [`crate::contracts::memory::AgentRecord`]: a blocked or stopped
     /// agent works on its task again, in its own session (a run cut off resumes; an ended one
     /// continues from what it did).

@@ -116,7 +116,7 @@ export function segments(blocks: readonly Block[]): Segment[] {
  * line carries the turn's cost; once the turn is done, a card lists what it edited.
  */
 export const TurnView = memo(function TurnView({ turn, actions, live, progress = '', liveLines = [] }: { turn: Turn; actions: TurnActions; live: boolean; progress?: string; liveLines?: string[] }) {
-  const route = turn.routes.map((entry) => str(entry.data.route)).filter(Boolean).join(' → ');
+  const route = turn.routes.map((entry) => str(entry.data.route)).filter(Boolean).join(' → ');
   const last = turn.routes.at(-1);
   const routeDetail = last ? routeText(last) : '';
   const parts = segments(turn.blocks);

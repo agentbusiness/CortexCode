@@ -6,7 +6,8 @@
 #cc .cx-mesh-grid .t{font-family:var(--font-reading);font-size:15px;line-height:22px;color:var(--ink);}
 #cc .cx-mesh-grid .v{font-family:var(--font-reading);font-size:13px;line-height:22px;color:var(--ink-2);min-width:0;overflow-wrap:anywhere;}
 #cc .cx-mesh-grid .v.faint{color:var(--ink-3);}
-#cc .cx-mesh-grid .detent{justify-self:end;}
+#cc .cx-mesh-grid .detent,#cc .cx-mesh-grid > .sw{justify-self:end;}
+#cc .cx-mesh-grid > .sw{align-self:center;}
 #cc .cx-mesh-cell{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:22px;}
 #cc .cx-mesh-cell .detent{justify-self:auto;}
 #cc .cx-mesh-note{font-family:var(--font-reading);font-size:12px;line-height:18px;color:var(--ink-3);margin-top:-4px;}
@@ -22,9 +23,3 @@
 /* Beside reading text the eye centres on its lowercase body, 1.5px below a capital label's middle:
    such labels sit that much lower. Labels beside buttons and fields (capitals too) stay. */
 #cc .cx-mesh-grid > .ap:is(:has(+ .v),:has(+ .t)),#cc .cx-mesh-name .t + .ap{position:relative;top:1.5px;}
-/* Shared services: each a block of title, description and its switches (the theme's `.sw`). */
-#cc .cx-mesh-shares{border-top:1px solid var(--rule);padding-top:14px;}
-#cc .cx-mesh-share{grid-column:1 / 4;display:flex;flex-direction:column;gap:2px;padding:6px 0 8px 134px;}
-#cc .cx-mesh-share .cx-mesh-cell{gap:14px;}
-#cc .cx-mesh-sw{display:inline-flex;align-items:center;gap:6px;}
-#cc .cx-mesh-share .ap.faint{min-width:112px;color:var(--ink-3);}

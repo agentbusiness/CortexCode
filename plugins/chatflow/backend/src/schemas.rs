@@ -481,7 +481,7 @@ pub struct Manage {
 pub struct ManageAction {
     #[serde(default)]
     pub agent: String,
-    /// stop | restart | message
+    /// finish | stop | restart | message
     #[serde(default)]
     pub action: String,
     #[serde(default)]

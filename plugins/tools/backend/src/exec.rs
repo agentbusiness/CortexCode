@@ -1546,7 +1546,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 // Anchors mapped through the session's own edits are journaled, not told.
                 if !applied.relocations.is_empty() {
                     notes
-                        .push(format!("anchors from your earlier read, mapped through your own edits: {}", applied.relocations.join(", ")));
+                        .push(format!("anchors from your earlier read, placed where those lines are now: {}", applied.relocations.join(", ")));
                 }
                 let new = applied.doc.to_text();
                 let retry = (absolute.clone(), display.clone(), current.as_ref().map(|_| text.clone()), notes.clone());
