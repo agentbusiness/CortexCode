@@ -62,9 +62,11 @@ MLX pack on rMLX had no prefix reuse, grammar or vision (`docs/BONSAI-ENGINE-PLA
 is offered. The variant also takes `tokenizer.json` from `Qwen/Qwen3.8-27B@1d4bf0f`: the GGUF vocab
 tokenizes identically, and the load refuses the model if it does not on a fixed set of probes
 (chat and tool-call markup, code, several scripts, whitespace, escapes, image tokens). Files are
-installed under `<models_dir>/<org>-<repo>/<revision>/` (default `$CORTEX_HOME/models`). A missing
-file is downloaded from Hugging Face at the pinned revision (resumable `.part` files) and checked
-against the published digest; digest records in the memory plugin's graph
+installed under `<models_dir>/<org>-<repo>/<revision>/` (default `~/.cortex-models`, the models
+folder the Cortex apps share; `docs/SHARED-MODELS.md`), into which the app's old `$CORTEX_HOME/models`
+is moved at every start. A missing file is downloaded from Hugging Face at the pinned revision with
+the revision folder's `.download.lock` held, into a resumable `.part` file that is checked against
+the published digest before it is renamed into place; digest records in the memory plugin's graph
 (`(:ModelFile)-[:ON]->(:Machine)`, shared with the uzu plugin) make later checks instant. Nothing is downloaded at startup for a variant that is not installed.
 `cc-model-bonsai install bonsai2-27b-pq2-mtp` installs without a frame.
 
@@ -73,7 +75,7 @@ against the published digest; digest records in the memory plugin's graph
 | key | default | meaning |
 |---|---|---|
 | `variant` | `bonsai2-27b-pq2-mtp` | catalog id |
-| `models_dir` | `$CORTEX_HOME/models` | where variants live |
+| `models_dir` | `~/.cortex-models` | where variants live (another folder: no move, no sharing) |
 | `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total` | measured | operator limits and overrides |
 
 ## Memory fit (`backend/src/fit.rs`)

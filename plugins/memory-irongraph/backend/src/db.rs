@@ -1,6 +1,7 @@
 //! The embedded IronGraph instance: one per process, exclusive owner of `<CORTEX_HOME>/irongraph`.
-//! Its embedding model and vector cache live in `<CORTEX_HOME>/irongraph-models` and
-//! `<CORTEX_HOME>/irongraph-cache` (see `engine`); nothing is read from or written to `~/.irongraph`.
+//! Its embedding model lives in the models folder the Cortex apps share (`~/.cortex-models`) and its
+//! vector cache in `<CORTEX_HOME>/irongraph-cache` (see `engine`); nothing is read from or written
+//! to `~/.irongraph`.
 //!
 //! Every statement names its layers explicitly (see the `layer` constants): a statement without a
 //! `USE LAYER` reads the default view, which silently excludes WORKSPACE.

@@ -70,8 +70,7 @@ impl ModelPlugin {
                     tracing::info!(keys = ?config.other.keys().collect::<Vec<_>>(), "ignoring configuration keys this plugin does not use");
                 }
                 let home = ctx.env.home.clone();
-                let models_dir = config.models_dir.as_deref().map(expand_home).unwrap_or_else(|| home.join("models"));
-                let paths = Paths { home, data_dir: ctx.env.data_dir.clone(), models_dir };
+                let paths = Paths::new(home, ctx.env.data_dir.clone(), config.models_dir.as_deref().map(expand_home));
                 let publisher: Publisher = Arc::new(move |topic: &str, data: Value| {
                     if let Ok(slot) = shared.lock()
                         && let Some(ctx) = slot.as_ref()

@@ -237,6 +237,7 @@ version = "0.1.0"
 dependencies = [
  "cc-model-kit",
  "cc-protocol",
+ "cc-shared-models",
  "futures",
  "futures-util",
  "half",
@@ -273,6 +274,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cc-shared-models"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

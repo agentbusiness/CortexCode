@@ -1,0 +1,18 @@
+[package]
+name = "cc-shared-models"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "The models folder every Cortex app shares (~/.cortex-models): its layout, the download lock, and the move of an app's own old model folders into it."
+
+# Standalone: the model plugins and the memory plugin depend on this crate by path.
+[workspace]
+
+[lib]
+name = "cc_shared_models"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1.44"

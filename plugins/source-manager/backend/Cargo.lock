@@ -55,10 +55,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-shared-models"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "cc-source"
 version = "0.1.0"
 dependencies = [
  "cc-protocol",
+ "cc-shared-models",
  "git2",
  "serde",
  "serde_json",

@@ -5,9 +5,10 @@
 //! no graph: the digests are not kept, so the app hashes the files once at its next start.
 
 use cc_model_bonsai::plugin::{ModelPlugin, PROVIDES};
-use cc_model_bonsai::runtime::expand_home;
+use cc_model_bonsai::runtime::{Paths, expand_home};
 use cc_model_bonsai::variants::{self, VerifyCache};
 use cc_protocol::contracts::lifecycle::{Hello, SwapPolicy};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
@@ -60,8 +61,8 @@ async fn install(args: &[String]) -> i32 {
     };
     let option = |name: &str| args.iter().position(|arg| arg == name).and_then(|at| args.get(at + 1)).map(|value| expand_home(value));
     let home = std::env::var("CORTEX_HOME").map(|home| expand_home(&home)).unwrap_or_else(|_| expand_home("~/.cortexcode"));
-    let models_dir = option("--models-dir").unwrap_or_else(|| home.join("models"));
-    let cache = VerifyCache::new(&models_dir);
+    let models_dir = Paths::new(home, PathBuf::new(), option("--models-dir")).models_dir;
+    let cache = VerifyCache::new(&models_dir, None);
     let report = |progress: variants::Progress| {
         eprintln!("{}", serde_json::to_string(&progress).unwrap_or_default());
     };

@@ -270,6 +270,7 @@ dependencies = [
  "cc-lang-typescript",
  "cc-lang-web",
  "cc-protocol",
+ "cc-shared-models",
  "ignore",
  "irongraph-sdk",
  "notify",
@@ -297,6 +298,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cc-shared-models"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

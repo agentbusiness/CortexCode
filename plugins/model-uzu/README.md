@@ -33,10 +33,14 @@ it offers several. Below, the loaded model's facts (`model.info`).
 | `qwen3.8-27b-m` (default) | `trymirai/Qwen3.8-27B-M@8b878f5` | Mirai M 4-bit, DFlash speculator |
 | `qwen3.5-4b-m` (tests) | `trymirai/Qwen3.5-4B-M@c04a485` | no speculator; not listed by `model.variants` unless it is the running variant |
 
-Installed under `<models_dir>/<org>-<repo>/<revision>/` (default `$CORTEX_HOME/models`). A missing
-file is downloaded from Hugging Face at the pinned revision (resumable `.part` files) and every file
-is checked against the digest Hugging Face publishes (SHA-256 `lfs.oid` for weights, the git blob
-SHA-1 for small files); digest records in the memory plugin's graph (`(:ModelFile)-[:ON]->(:Machine)`,
+Installed under `<models_dir>/<org>-<repo>/<revision>/` (default `~/.cortex-models`, the models
+folder every Cortex app on this Mac shares, CortexCode and CortexTerm among them; `docs/SHARED-MODELS.md`). At every
+start, before any model is looked up, the app's old `$CORTEX_HOME/models` is moved in (a revision
+the shared folder lacks is renamed there; a same-size duplicate is deleted) and the digest records
+follow the moved files. A missing file is downloaded from Hugging Face at the pinned revision with
+the revision folder's `.download.lock` held (another app wanting the same model waits, then finds
+it), into a resumable `.part` file that is checked against the digest Hugging Face publishes (SHA-256 `lfs.oid` for weights, the git blob
+SHA-1 for small files) before it is renamed into place; digest records in the memory plugin's graph (`(:ModelFile)-[:ON]->(:Machine)`,
 valid for the file's size and modification time) make later checks instant. Nothing is ever downloaded at startup for a variant that is not installed; afterwards
 everything runs offline. `cc-model-uzu install <variant> [--models-dir DIR]` installs without a frame.
 
@@ -56,7 +60,7 @@ Mirai ships it only as its own prebuilt server binary.
 | key | default | meaning |
 |---|---|---|
 | `variant` | `qwen3.8-27b-m` | catalog id |
-| `models_dir` | `$CORTEX_HOME/models` | where variants live |
+| `models_dir` | `~/.cortex-models` | where variants live (another folder: no move, no sharing) |
 | `speculative` | `auto` | `auto` (draft with the model's speculator when it has one) or `off` |
 | `slots` | none | operator cap on resident conversations; by default as many are resident as the shared pool holds |
 | `memory_limit_bytes`, `min_context_per_slot` (32768), `ctx_total`, `prefill_chunk` (1024) | measured | operator limits and overrides |

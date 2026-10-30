@@ -260,8 +260,9 @@ pub fn verified_by_record(spec: &Spec, models_dir: &Path, cache: &VerifyCache) -
     spec.files.iter().all(|file| cache.recorded(&dir.join(file.path)).as_deref() == Some(expected_digest(file).as_str()))
 }
 
-/// Make `spec` present and verified under `models_dir`: download missing files (resuming partial
-/// `.part` files), check every digest against the catalog, and move files into place.
+/// Make `spec` present and verified under `models_dir`: with the revision folder's download lock
+/// held, download missing files (resuming partial `.part` files), check every digest against the
+/// catalog, and move files into place.
 pub async fn install(
     spec: &'static Spec,
     models_dir: &Path,
@@ -282,6 +283,10 @@ pub async fn install_from(
     cache.wait().await;
     let dir = spec.local_dir(models_dir);
     let total = spec.total_bytes();
+    let waiting = |detail: String| {
+        on_progress(Progress { variant: spec.id.to_owned(), phase: "download".into(), file: String::new(), bytes: 0, total, detail })
+    };
+    let _lock = lock_revision(&dir, &waiting).await?;
     let mut before = 0u64;
     for file in spec.files {
         let target = dir.join(file.path);
@@ -295,34 +300,18 @@ pub async fn install_from(
                 detail,
             })
         };
+        // Looked at with the lock held: another app may have just fetched the file.
         let present = std::fs::metadata(&target).map(|meta| meta.len() == file.bytes).unwrap_or(false);
-        if !present {
-            download(&spec.url_from(base, file), file, &target, &report).await?;
-        }
-        let path = target.clone();
-        let cache = cache.clone();
-        let file_spec = *file;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-        let task = tokio::task::spawn_blocking(move || {
-            let mut tick = |done: u64, _total: u64| {
-                let _ = tx.send(done);
-            };
-            cache.verify(&file_spec, &path, &mut tick)
-        });
-        while let Some(done) = rx.recv().await {
-            report("verify", done, String::new());
-        }
-        match task.await.map_err(|error| format!("verification task failed: {error}"))? {
-            Ok(_) => {}
-            Err(error) => {
-                // A file this call downloaded is discarded so the next attempt fetches it again. A
-                // file that was already there is never touched: it is reported, not deleted.
-                if !present {
-                    let _ = std::fs::remove_file(&target);
-                }
-                report("failed", 0, error.clone());
-                return Err(error);
-            }
+        let checked = if present {
+            // A file that was already there is never touched: a mismatch is reported, not deleted.
+            let (cache, path, file_spec) = (cache.clone(), target.clone(), *file);
+            hashed(move |tick| cache.verify(&file_spec, &path, tick), &report).await
+        } else {
+            fetch(&spec.url_from(base, file), file, &target, cache, &report).await
+        };
+        if let Err(error) = checked {
+            report("failed", 0, error.clone());
+            return Err(error);
         }
         before += file.bytes;
     }
@@ -337,12 +326,13 @@ pub async fn install_from(
     Ok(dir)
 }
 
+/// Download `file` into `<target>.part` (resuming what is there) and return its path at full size.
 pub(crate) async fn download(
     url: &str,
     file: &FileSpec,
     target: &Path,
     report: &(dyn Fn(&str, u64, String) + Send + Sync),
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     use futures_util::StreamExt;
     let parent = target.parent().ok_or("model path has no directory")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -415,6 +405,63 @@ pub(crate) async fn download(
             Err(error) => return Err(error),
         }
     }
-    // The digest is checked by the caller on the final path; move into place only at full size.
-    std::fs::rename(&part, target).map_err(|error| format!("cannot move {} into place: {error}", part.display()))
+    Ok(part)
+}
+
+/// Download `file` to `<target>.part`, check its digest, move it into place and record the digest.
+/// A download that does not match is discarded, so the next attempt fetches it again.
+pub(crate) async fn fetch(
+    url: &str,
+    file: &FileSpec,
+    target: &Path,
+    cache: &VerifyCache,
+    report: &(dyn Fn(&str, u64, String) + Send + Sync),
+) -> Result<String, String> {
+    let part = download(url, file, target, report).await?;
+    let (path, file_spec) = (part.clone(), *file);
+    let checked = hashed(
+        move |tick| {
+            let digest = digest_file(&path, file_spec.sha256.is_some(), tick)?;
+            let expected = expected_digest(&file_spec);
+            if digest == expected { Ok(digest) } else { Err(format!("{} has {digest}, expected {expected}", path.display())) }
+        },
+        report,
+    )
+    .await;
+    let digest = checked.inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })?;
+    std::fs::rename(&part, target).map_err(|error| format!("cannot move {} into place: {error}", part.display()))?;
+    cache.record_digest(target, &digest);
+    Ok(digest)
+}
+
+/// Run a hashing step on a blocking thread, reporting its progress as `verify`.
+async fn hashed(
+    work: impl FnOnce(&mut dyn FnMut(u64, u64)) -> Result<String, String> + Send + 'static,
+    report: &(dyn Fn(&str, u64, String) + Send + Sync),
+) -> Result<String, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let task = tokio::task::spawn_blocking(move || {
+        let mut tick = |done: u64, _total: u64| {
+            let _ = tx.send(done);
+        };
+        work(&mut tick)
+    });
+    while let Some(done) = rx.recv().await {
+        report("verify", done, String::new());
+    }
+    task.await.map_err(|error| format!("verification task failed: {error}"))?
+}
+
+/// Hold the revision folder's download lock (`~/.cortex-models` is shared by the Cortex apps),
+/// waiting while another app downloads into it.
+pub(crate) async fn lock_revision(dir: &Path, waiting: &(dyn Fn(String) + Send + Sync)) -> Result<std::fs::File, String> {
+    let failed = |error: std::io::Error| format!("cannot lock {}: {error}", dir.join(cc_shared_models::LOCK).display());
+    if let Some(lock) = cc_shared_models::try_lock(dir).map_err(failed)? {
+        return Ok(lock);
+    }
+    waiting("waiting while another Cortex app downloads this model".into());
+    let owned = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || cc_shared_models::lock(&owned)).await.map_err(|error| format!("lock task failed: {error}"))?.map_err(failed)
 }

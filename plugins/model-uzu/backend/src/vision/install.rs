@@ -7,7 +7,8 @@
 //!    contiguous byte range.
 //! 2. A new header with just those tensors (offsets rebased, keys sorted, so the file is
 //!    deterministic), then the tensor bytes appended by one range request, resumable from a
-//!    `.part` file. A complete file already in place is kept.
+//!    `.part` file. A complete file already in place is kept. All of it happens with the variant's
+//!    revision folder's download lock held (`~/.cortex-models` is shared by the Cortex apps).
 //! 3. The assembled file's SHA-256 is computed, compared with the pinned value when one is pinned,
 //!    and recorded in the graph with an install record describing the source (`records`:
 //!    `(:VisionInstall)-[:ON]->(:Machine)`). `config.json` and `preprocessor_config.json` are
@@ -182,17 +183,23 @@ pub async fn install_from(
     let report = |phase: &str, file: &str, bytes: u64, detail: String| {
         on_progress(Progress { variant: label.to_owned(), phase: phase.into(), file: format!("{DIR}/{file}"), bytes, total, detail })
     };
+    // The tower lives in the variant's revision folder: its download lock covers it, and what is
+    // there is looked at with the lock held.
+    let _lock = variants::lock_revision(variant_dir, &|detail| report("download", "", 0, detail)).await?;
     // The small files, whole, checked by git blob id.
     let mut done = 0u64;
     for file in &tower.files {
         let target = dir.join(file.path);
         let spec = small_spec(file);
-        if !std::fs::metadata(&target).is_ok_and(|meta| meta.len() == file.bytes) {
+        let checked = if std::fs::metadata(&target).is_ok_and(|meta| meta.len() == file.bytes) {
+            cache.verify(&spec, &target, &mut |_, _| {}).inspect_err(|_| {
+                let _ = std::fs::remove_file(&target);
+            })
+        } else {
             let progress = |phase: &str, bytes: u64, detail: String| report(phase, file.path, done + bytes, detail);
-            variants::download(&url(base, tower, file.path), &spec, &target, &progress).await?;
-        }
-        if let Err(error) = cache.verify(&spec, &target, &mut |_, _| {}) {
-            let _ = std::fs::remove_file(&target);
+            variants::fetch(&url(base, tower, file.path), &spec, &target, cache, &progress).await
+        };
+        if let Err(error) = checked {
             report("failed", file.path, done, error.clone());
             return Err(error);
         }
