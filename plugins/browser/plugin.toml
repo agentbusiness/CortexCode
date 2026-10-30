@@ -7,7 +7,7 @@
 [plugin]
 id = "browser"
 name = "Browser"
-version = "0.1.6"
+version = "0.1.7"
 description = "The agent browser (browser@1): served from Electron's main process by the shell module (WebContentsView tabs driven through CDP on a persistent profile), laid over the right pane's Browser view."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
