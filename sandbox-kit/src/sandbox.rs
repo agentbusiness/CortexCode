@@ -24,7 +24,9 @@
 //! Inside CORTEX_HOME a few paths stay read-only for commands because writing them would grant
 //! authority outside the sandbox: the approvals file, the frame's plugin store (executables the frame
 //! runs unsandboxed), its run directory (token, socket, lock), the session journals, and background
-//! job metadata (the plugin signals the process group named there).
+//! job metadata (the plugin signals the process group named there). Outside it, the models folder
+//! every Cortex app shares (`~/.cortex-models`) stays read-only too, so no command replaces model
+//! weights.
 //!
 //! The sandbox reports nothing to the parent process, so a refused write shows up as the OS error
 //! EPERM ("Operation not permitted") in the command's own output; [`mentions_eperm`] recognizes that
@@ -330,7 +332,8 @@ impl Policy {
         let data = real(data_dir);
         // The main store (projects, conversations, settings, approvals) is the app's, never a
         // command's to write.
-        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph"), home.join("plugins-data/cc-source")];
+        let mut protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph"), home.join("plugins-data/cc-source")];
+        protected_subpaths.extend(user_home().map(|user| real(&user.join(".cortex-models"))));
         let mut protected_literals = vec![home.clone(), home.join("plugins-data"), data.clone(), home.join("jobs")];
         protected_literals.extend(protected_subpaths.iter().cloned());
         let protected_regexes = regex_escape(&home.join("jobs"))
