@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-terminal"
 name = "Terminal skills"
-version = "0.1.5"
+version = "0.1.6"
 description = "Terminal know-how for the model in any project: commands, processes and services, packages, Linux administration and text processing, and interactive programs."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

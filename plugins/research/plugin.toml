@@ -5,7 +5,7 @@
 [plugin]
 id = "research"
 name = "Research"
-version = "0.1.7"
+version = "0.1.8"
 description = "Research that needs the world, online only when a network exists: search arXiv, Semantic Scholar, GitHub (through gh when signed in), Reddit, Hacker News and the web (DuckDuckGo's HTML page, the built-in browser when blocked); fetch pages (readability) and PDFs as clean text with a content cache; cited notes by topic, kept by the memory plugin in IronGraph's knowledge layer (global, searchable by meaning); deep research as a background map-reduce job with the local model that writes docs/research/<topic>.md. No cloud models, no paid APIs, no keys required; offline is reported plainly."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

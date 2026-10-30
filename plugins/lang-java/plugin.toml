@@ -7,7 +7,7 @@
 [plugin]
 id = "lang-java"
 name = "Java"
-version = "0.1.5"
+version = "0.1.6"
 description = "Everything CortexCode knows about Java: the code graph's facts of .java files, pom.xml and build.gradle(.kts), Eclipse JDT LS diagnostics, definition, references and hover (on a JDK 21 installed into the toolchains directory when the system has none), Gradle / Maven verifiers and Java skills."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

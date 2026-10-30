@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-security"
 name = "Security skills"
-version = "0.1.5"
+version = "0.1.6"
 description = "Security know-how for the model: a whole-codebase security audit (map the stack, hunt each attack class, verify, record and report), a security review of a change, and the triage of a reported vulnerability; with the bundled secaudit tool that maps the project, lists suspicious lines by attack class, checks finding records and writes the report."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
