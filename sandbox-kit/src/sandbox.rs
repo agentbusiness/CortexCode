@@ -1,0 +1,872 @@
+//! The write sandbox every agent command runs in (macOS `sandbox-exec`, Linux Landlock).
+//!
+//! The profile is structural: it names directories, never commands. Reads, process execution and
+//! the network stay as they are; a write (create, modify, delete, rename, chmod, xattr, times) is
+//! allowed only under:
+//! - the session workspace (and, when the workspace is a linked git worktree, its git directories);
+//! - CORTEX_HOME and this plugin's data directory;
+//! - temp dirs: /private/tmp, /private/var/tmp, /private/var/folders (holds $TMPDIR and the per-user
+//!   cache dir), and $TMPDIR itself wherever it points;
+//! - package caches: cargo's registry, git checkouts and lock/cache files, ~/.npm, the uv cache, the
+//!   pip cache, node-gyp's, yarn's, pnpm's, bun's and Go's module/build caches;
+//! - the session's Python venv;
+//! - directories the user approved for the session (`write_outside:<dir>` approvals) and any listed
+//!   in the plugin's `sandbox_write_paths` config;
+//! - /dev (terminals, /dev/null, /dev/fd; device nodes are guarded by their own permissions).
+//!
+//! A workspace holding a `.cortex-offline` file is offline: its commands get no outbound network
+//! but localhost and unix sockets (a project its owner keeps offline).
+//!
+//! A command the user let past the sandbox (`lift:<command>` approvals, asked for by the model with
+//! `run`'s `permission`) runs without it: macOS refuses a sandbox inside a sandbox, and installers
+//! such as Homebrew apply their own.
+//!
+//! Inside CORTEX_HOME a few paths stay read-only for commands because writing them would grant
+//! authority outside the sandbox: the approvals file, the frame's plugin store (executables the frame
+//! runs unsandboxed), its run directory (token, socket, lock), the session journals, and background
+//! job metadata (the plugin signals the process group named there).
+//!
+//! The sandbox reports nothing to the parent process, so a refused write shows up as the OS error
+//! EPERM ("Operation not permitted") in the command's own output; [`mentions_eperm`] recognizes that
+//! fixed `strerror(EPERM)` text (a mechanical rule, not a judgement) so the model can be told why.
+//!
+//! On Linux the same policy is a Landlock ruleset (`crate::landlock`), applied in the child before
+//! it runs the shell. Landlock over bubblewrap: it needs no user namespaces (Ubuntu 24.04 restricts
+//! unprivileged ones through AppArmor, and container seccomp profiles refuse them), no extra program
+//! on the machine, and it keeps the network and localhost as they are; it needs Linux 5.13 with
+//! Landlock enabled, and without it commands are not run. Where it differs from macOS:
+//! - Landlock only grants, never denies, and grants whole trees. A root holding a protected path
+//!   (CORTEX_HOME, the plugin-data folder, the jobs folder) is granted child by child, so nothing new
+//!   can be made directly in it; the reads of the frame credential (`control_paths`) are kept out the
+//!   same way, so a file or folder made directly in an ancestor of those (`/`, the home folder,
+//!   CORTEX_HOME) after the shell started cannot be read by it until the shell restarts.
+//! - The rules are a snapshot when the shell or job starts: a root missing then gets no rule (the
+//!   package caches under the home folder are made first so commands can fill them, as on macOS where
+//!   a rule names a path before it exists); a protected file that does not exist yet stays
+//!   unwritable because its folder is never granted whole.
+//! - The git entries of the workspace (its `.git`, a linked worktree's pointer files) stay writable:
+//!   protecting them would leave the workspace root without the right to make files. The git
+//!   directories a session may write are pinned when it starts and checked against their back
+//!   links, so a rewritten pointer never widens the sandbox.
+//! - Landlock does not cover chmod, chown, extended attributes or times, nor truncate(2) before
+//!   Linux 6.2; a move or link across folders is refused before Linux 5.19 (EXDEV, which `mv` turns
+//!   into copy and delete).
+//! - The frame's unix socket stays connectable (Landlock cannot refuse a connect by socket path);
+//!   the credential it needs is unreadable, and another process's memory and environment
+//!   (/proc/<pid>/environ) are out of reach of a Landlock-confined process.
+//! - Commands run with no-new-privileges: a setuid program (sudo, su) starts without its rights.
+//! - An offline workspace gets no IP sockets at all, localhost included (a seccomp filter on
+//!   `socket(2)`; Landlock can refuse TCP only by port, not by address); unix sockets stay.
+//! - A caller-supplied `sandbox-exec` profile cannot be honoured, so such a wrapped command is
+//!   refused rather than run with less confinement than it asked for.
+//! - A refused write is EACCES ("Permission denied"), which [`mentions_eperm`] also recognizes.
+
+use crate::util;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// The OS error text of a write the sandbox refused, as command output shows it.
+#[cfg(not(target_os = "linux"))]
+pub const REFUSED_TEXT: &str = "Operation not permitted";
+#[cfg(target_os = "linux")]
+pub const REFUSED_TEXT: &str = "Permission denied";
+/// Approval classes that widen the sandbox for a session: `write_outside:<absolute dir>`.
+pub const WRITE_CLASS_PREFIX: &str = cc_protocol::contracts::tools::approval_classes::WRITE_OUTSIDE_PREFIX;
+
+/// Approval class that lets one command past the sandbox: `lift:<command>`.
+pub const LIFT_CLASS_PREFIX: &str = cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX;
+
+/// The approval class that lets `command` past the sandbox.
+pub fn lift_class(command: &str) -> String {
+    format!("{LIFT_CLASS_PREFIX}{}", command.trim())
+}
+
+/// The file whose presence makes a workspace offline (see the module doc).
+pub const OFFLINE_MARKER: &str = ".cortex-offline";
+
+/// The rules of an offline workspace (none otherwise): no outbound network but localhost (the
+/// frame, language servers, local services) and unix sockets.
+pub fn network_rules(workspace: &Path) -> String {
+    if !workspace.join(OFFLINE_MARKER).exists() {
+        return String::new();
+    }
+    "(deny network-outbound)\n(allow network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote unix-socket))\n".to_owned()
+}
+
+/// How one shell or job is confined: `sandbox-exec [-D key=value]... -p <profile> <program>`.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub exec: PathBuf,
+    pub profile: String,
+    pub params: Vec<(String, String)>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Sandbox {
+    /// `program` confined: run through `sandbox-exec`.
+    pub fn command(&self, program: &Path) -> std::io::Result<std::process::Command> {
+        let mut command = std::process::Command::new(&self.exec);
+        command.args(self.args()).arg(program);
+        Ok(command)
+    }
+
+    /// Arguments for `sandbox-exec` before the confined program.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for (key, value) in &self.params {
+            args.push("-D".to_owned());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("-p".to_owned());
+        args.push(self.profile.clone());
+        args
+    }
+
+    /// Identity of the confinement (a shell started under another one must be restarted).
+    pub fn key(&self) -> String {
+        let mut text = self.profile.clone();
+        for (key, value) in &self.params {
+            text.push_str(&format!("\n-D {key}={value}"));
+        }
+        util::content_hash(text.as_bytes())
+    }
+}
+
+/// How one shell or job is confined: a Landlock ruleset applied in the child (see the module doc).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox(crate::landlock::Rules);
+
+#[cfg(target_os = "linux")]
+impl Sandbox {
+    /// `program` confined: the ruleset is applied in the child before it runs.
+    pub fn command(&self, program: &Path) -> std::io::Result<std::process::Command> {
+        self.0.command(program)
+    }
+
+    /// Identity of the confinement (a shell started under another one must be restarted).
+    pub fn key(&self) -> String {
+        self.0.key()
+    }
+}
+
+/// The machine-wide part of the policy, computed once per plugin instance.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// `sandbox-exec`, when this system has it.
+    #[cfg(not(target_os = "linux"))]
+    pub exec: Option<PathBuf>,
+    /// The kernel's Landlock ABI version, or what is missing.
+    #[cfg(target_os = "linux")]
+    landlock: Result<i32, String>,
+    /// `<CORTEX_HOME>/jobs` (its jobs' metadata and scripts are protected).
+    #[cfg(target_os = "linux")]
+    jobs: PathBuf,
+    /// Directories writable for every session (home, data dir, temp, caches, configured extras).
+    pub roots: Vec<PathBuf>,
+    /// Single files writable for every session (cargo's lock and cache databases).
+    pub files: Vec<PathBuf>,
+    /// Paths that stay read-only even inside a writable root.
+    pub protected_subpaths: Vec<PathBuf>,
+    pub protected_literals: Vec<PathBuf>,
+    /// Regex rules (already escaped) for protected files with variable names.
+    pub protected_regexes: Vec<String>,
+    control_read_paths: Vec<PathBuf>,
+    socket: Arc<Mutex<Option<PathBuf>>>,
+    /// Resolved once before the session runs code; workspace-controlled pointer files never widen it.
+    git_dirs: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>,
+}
+
+/// Real path of `path` (through symlinks of its existing ancestors): the sandbox matches the
+/// resolved path, so every rule names the resolved form.
+fn real(path: &Path) -> PathBuf {
+    util::canonical_lenient(&util::normalize(path))
+}
+
+/// Every on-disk copy of the privileged frame credential that command tools must not expose.
+pub fn control_paths(home: &Path) -> Vec<PathBuf> {
+    let home = real(home);
+    vec![home.join("run"), home.join("plugins-data/ui/electron")]
+}
+
+pub fn control_read_path(home: &Path, path: &Path) -> bool {
+    let path = real(path);
+    control_paths(home).iter().any(|root| path.starts_with(root))
+}
+
+/// Whether `path` is the frame credential of the app running this code (`CORTEX_HOME`), or, with
+/// no `CORTEX_HOME`, of either app that shares this kit (CortexCode, CortexTerm).
+pub fn host_control_read_denied(path: &Path) -> bool {
+    match env_path("CORTEX_HOME") {
+        Some(home) => control_read_path(&home, path),
+        None => user_home().is_some_and(|home| [".cortexcode", ".cortexterm"].iter().any(|app| control_read_path(&home.join(app), path))),
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+fn user_home() -> Option<PathBuf> {
+    env_path("HOME")
+}
+
+/// Package-cache locations of the common toolchains, honouring each tool's documented override
+/// variable as the plugin's environment sets it (the model's shell cannot move them).
+fn cache_roots(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut roots = Vec::new();
+    let mut files = Vec::new();
+    let cargo = env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    roots.push(cargo.join("registry"));
+    roots.push(cargo.join("git"));
+    for name in [".package-cache", ".package-cache-mutate", ".global-cache"] {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            files.push(cargo.join(format!("{name}{suffix}")));
+        }
+    }
+    roots.push(env_path("npm_config_cache").or_else(|| env_path("NPM_CONFIG_CACHE")).unwrap_or_else(|| home.join(".npm")));
+    let xdg_cache = env_path("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
+    roots.push(env_path("UV_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("uv")));
+    #[cfg(not(target_os = "linux"))]
+    {
+        roots.push(env_path("PIP_CACHE_DIR").unwrap_or_else(|| home.join("Library/Caches/pip")));
+        let caches = home.join("Library/Caches");
+        for name in ["node-gyp", "Yarn", "pnpm", "go-build", "uv"] {
+            roots.push(caches.join(name));
+        }
+        roots.push(home.join("Library/pnpm/store"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        roots.push(env_path("PIP_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pip")));
+        for name in ["node-gyp", "yarn", "pnpm", "go-build"] {
+            roots.push(xdg_cache.join(name));
+        }
+        roots.push(env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")).join("pnpm/store"));
+    }
+    roots.push(home.join(".bun/install/cache"));
+    if let Some(gocache) = env_path("GOCACHE") {
+        roots.push(gocache);
+    }
+    let gopath = env_path("GOPATH").unwrap_or_else(|| home.join("go"));
+    roots.push(env_path("GOMODCACHE").unwrap_or_else(|| gopath.join("pkg/mod")));
+    (roots, files)
+}
+
+fn temp_roots() -> Vec<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
+    let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/private/var/tmp"), PathBuf::from("/private/var/folders")];
+    #[cfg(target_os = "linux")]
+    let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+    roots.push(std::env::temp_dir());
+    if let Some(tmp) = env_path("TMPDIR") {
+        roots.push(tmp);
+    }
+    roots
+}
+
+/// Escape a path for an SBPL regex literal (structural: every regex metacharacter gets a backslash).
+fn regex_escape(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    if text.contains('"') {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if ".^$*+?()[]{}|\\".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// An SBPL string literal, or None for paths the profile language cannot carry safely.
+fn sbpl_string(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    if text.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    paths.into_iter().filter(|path| seen.insert(path.clone())).collect()
+}
+
+/// Drop roots inside other roots (a project venv inside the workspace, the automatic venv inside
+/// CORTEX_HOME): the profile, and so the shell, stays the same when only the venv changes.
+fn outermost(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let paths = dedup(paths);
+    paths.iter().filter(|path| !paths.iter().any(|other| other != *path && path.starts_with(other))).cloned().collect()
+}
+
+impl Policy {
+    pub fn new(cortex_home: &Path, data_dir: &Path, extra: &[String]) -> Policy {
+        #[cfg(not(target_os = "linux"))]
+        let exec = Path::new(SANDBOX_EXEC).is_file().then(|| PathBuf::from(SANDBOX_EXEC));
+        let mut roots = vec![cortex_home.to_path_buf(), data_dir.to_path_buf()];
+        roots.extend(temp_roots());
+        let mut files = Vec::new();
+        if let Some(home) = user_home() {
+            let (cache_dirs, cache_files) = cache_roots(&home);
+            roots.extend(cache_dirs);
+            files.extend(cache_files);
+        }
+        for entry in extra {
+            let path = util::expand_home(entry.trim());
+            if path.is_absolute() {
+                roots.push(path);
+            }
+        }
+        let roots = dedup(roots.iter().map(|path| real(path)).collect());
+        let files = dedup(files.iter().map(|path| real(path)).collect());
+        let home = real(cortex_home);
+        let data = real(data_dir);
+        // The main store (projects, conversations, settings, approvals) is the app's, never a
+        // command's to write.
+        let protected_subpaths = vec![home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph"), home.join("plugins-data/cc-source")];
+        let mut protected_literals = vec![home.clone(), home.join("plugins-data"), data.clone(), home.join("jobs")];
+        protected_literals.extend(protected_subpaths.iter().cloned());
+        let protected_regexes = regex_escape(&home.join("jobs"))
+            .map(|jobs| vec![format!("^{jobs}/[^/]+/(meta\\.json|cmd\\.sh|runner\\.sh)$")])
+            .unwrap_or_default();
+        Policy {
+            #[cfg(not(target_os = "linux"))]
+            exec,
+            #[cfg(target_os = "linux")]
+            landlock: crate::landlock::abi(),
+            #[cfg(target_os = "linux")]
+            jobs: home.join("jobs"),
+            roots,
+            files,
+            protected_subpaths,
+            protected_literals: dedup(protected_literals),
+            protected_regexes,
+            control_read_paths: control_paths(&home),
+            socket: Arc::new(Mutex::new(None)),
+            git_dirs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn set_socket(&self, socket: &Path) {
+        if let Ok(mut path) = self.socket.lock() {
+            *path = Some(real(socket));
+        }
+    }
+
+    pub fn control_read_denied(&self, path: &Path) -> bool {
+        self.control_read_paths.iter().any(|root| real(path).starts_with(root))
+    }
+
+    fn linked_dirs(&self, workspace: &Path) -> Vec<PathBuf> {
+        let workspace = real(workspace);
+        let Ok(mut pinned) = self.git_dirs.lock() else { return Vec::new() };
+        pinned.entry(workspace.clone()).or_insert_with(|| linked_git_dirs(&workspace)).clone()
+    }
+
+    fn git_controls(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut controls = vec![real(workspace)];
+        if workspace.join(".git").exists() { controls.push(real(&workspace.join(".git"))); }
+        for dir in self.linked_dirs(workspace) {
+            controls.extend([dir.clone(), dir.join("commondir"), dir.join("gitdir")]);
+            // A linked record's parent can otherwise be renamed as a way to replace its pointers.
+            if dir.parent().is_some_and(|parent| parent.file_name().is_some_and(|name| name == "worktrees")) {
+                controls.push(dir.parent().unwrap().to_path_buf());
+            }
+        }
+        controls
+    }
+
+    /// The paths commands may neither read nor write (the frame credential).
+    pub fn hidden_paths(&self) -> &[PathBuf] {
+        &self.control_read_paths
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn available(&self) -> bool {
+        self.exec.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn available(&self) -> bool {
+        self.landlock.is_ok()
+    }
+
+    /// Why commands cannot be confined here (None when they can), naming what is missing.
+    pub fn unavailable(&self) -> Option<String> {
+        #[cfg(not(target_os = "linux"))]
+        let missing = self.exec.is_none().then(|| format!("{SANDBOX_EXEC}, which this system does not have"));
+        #[cfg(target_os = "linux")]
+        let missing = self.landlock.as_ref().err().cloned();
+        missing.map(|missing| format!("the write sandbox needs {missing}"))
+    }
+
+    /// Writable roots of one session: the base roots plus its workspace, git dirs, venv and grants.
+    pub fn session_roots(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Vec<PathBuf> {
+        let mut roots = vec![real(workspace)];
+        roots.extend(self.linked_dirs(workspace));
+        if let Some(venv) = venv {
+            roots.push(real(venv));
+        }
+        roots.extend(grants.iter().map(|path| real(path)));
+        roots.extend(self.roots.iter().cloned());
+        outermost(roots)
+    }
+
+    /// Whether `path` is one of the paths that stay read-only for commands whatever is approved.
+    pub fn protected(&self, path: &Path) -> bool {
+        let path = real(path);
+        self.control_read_denied(&path) || self.protected_subpaths.iter().any(|protected| path.starts_with(protected))
+            || self.protected_literals.contains(&path)
+            || self
+                .protected_regexes
+                .iter()
+                .any(|pattern| regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(&path.to_string_lossy())))
+    }
+
+    pub fn git_control_write_denied(&self, workspace: &Path, path: &Path) -> bool {
+        self.git_controls(workspace).contains(&real(path))
+    }
+
+    /// Whether the sandbox of this session lets commands write `path` (protected paths excluded).
+    pub fn writable(&self, path: &Path, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> bool {
+        if self.protected(path) || self.git_controls(workspace).contains(&real(path)) {
+            return false;
+        }
+        let path = real(path);
+        if self.files.contains(&path) {
+            return true;
+        }
+        let roots = self.session_roots(workspace, venv, grants);
+        #[cfg(target_os = "linux")]
+        return crate::landlock::Rules::new(self, 0, roots, self.jobs.clone(), false).covers(&path);
+        #[cfg(not(target_os = "linux"))]
+        roots.iter().any(|root| path.starts_with(root))
+    }
+
+    /// The deny rules of the profile (without the `(version 1)(allow default)` header).
+    pub fn rules(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> String {
+        let mut allowed = String::from("      (subpath \"/dev\")\n");
+        for root in self.session_roots(workspace, venv, grants) {
+            if let Some(text) = sbpl_string(&root) {
+                allowed.push_str(&format!("      (subpath {text})\n"));
+            }
+        }
+        for file in &self.files {
+            if let Some(text) = sbpl_string(file) {
+                allowed.push_str(&format!("      (literal {text})\n"));
+            }
+        }
+        let mut protected = String::new();
+        for path in &self.protected_subpaths {
+            if let Some(text) = sbpl_string(path) {
+                protected.push_str(&format!("  (subpath {text})\n"));
+            }
+        }
+        let mut literals = self.protected_literals.clone();
+        literals.extend(self.git_controls(workspace));
+        for path in &literals {
+            if let Some(text) = sbpl_string(path) {
+                protected.push_str(&format!("  (literal {text})\n"));
+            }
+        }
+        for regex in &self.protected_regexes {
+            protected.push_str(&format!("  (regex #\"{regex}\")\n"));
+        }
+        let mut control = String::from("(deny process-info*)\n(allow process-info* (target self))\n(deny sysctl-read (sysctl-name \"kern.procargs2\"))\n");
+        for root in &self.control_read_paths {
+            let root = sbpl_string(root).unwrap_or_else(|| "\"/\"".to_owned());
+            control.push_str(&format!("(deny file-read* file-write* (subpath {root}))\n"));
+        }
+        if let Some(socket) = self.socket.lock().ok().and_then(|socket| socket.clone())
+            && let Some(socket) = sbpl_string(&socket)
+        {
+            control.push_str(&format!("(deny network-outbound (remote unix-socket (path-literal {socket})))\n"));
+        }
+        format!("(deny file-write*\n  (require-not\n    (require-any\n{allowed}    )))\n(deny file-write*\n{protected})\n{control}")
+    }
+
+    /// The complete profile for a session's shell or job.
+    #[cfg(not(target_os = "linux"))]
+    pub fn sandbox(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
+        let exec = self.exec.clone()?;
+        let profile = format!("(version 1)\n(allow default)\n{}{}", network_rules(workspace), self.rules(workspace, venv, grants));
+        Some(Sandbox { exec, profile, params: Vec::new() })
+    }
+
+    /// The Landlock rules for a session's shell or job. The machine-wide roots under the home
+    /// folder (package caches) are made first: a rule can only name a path that exists.
+    #[cfg(target_os = "linux")]
+    pub fn sandbox(&self, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
+        let abi = *self.landlock.as_ref().ok()?;
+        if let Some(home) = user_home().map(|home| real(&home)) {
+            for root in self.roots.iter().filter(|root| root.starts_with(&home) && !root.exists() && !self.protected(root)) {
+                let _ = std::fs::create_dir_all(root);
+            }
+        }
+        let offline = workspace.join(OFFLINE_MARKER).exists();
+        let roots = self.session_roots(workspace, venv, grants);
+        Some(Sandbox(crate::landlock::Rules::new(self, abi, roots, self.jobs.clone(), offline)))
+    }
+
+    /// A caller-supplied profile: SBPL means nothing to Landlock, and running the command with less
+    /// confinement than it asked for is not safe ([`unwrap_sandbox_exec`] refuses it first).
+    #[cfg(target_os = "linux")]
+    pub fn compose(&self, _inner: &InnerProfile, _workspace: &Path, _venv: Option<&Path>, _grants: &[PathBuf]) -> Option<Sandbox> {
+        None
+    }
+
+    /// A caller-supplied profile (from a `sandbox-exec -p ...` wrapper) intersected with the session's
+    /// write rules: their rules first, ours last (in SBPL the last matching rule wins).
+    #[cfg(not(target_os = "linux"))]
+    pub fn compose(&self, inner: &InnerProfile, workspace: &Path, venv: Option<&Path>, grants: &[PathBuf]) -> Option<Sandbox> {
+        let exec = self.exec.clone()?;
+        let mut profile = String::new();
+        if !inner.has_version {
+            profile.push_str("(version 1)\n");
+        }
+        for form in &inner.forms {
+            profile.push_str(form);
+            profile.push('\n');
+        }
+        profile.push_str(&network_rules(workspace));
+        profile.push_str(&self.rules(workspace, venv, grants));
+        Some(Sandbox { exec, profile, params: inner.params.clone() })
+    }
+}
+
+/// Git directories of a linked worktree workspace (`.git` is a file `gitdir: <dir>`): git writes
+/// the worktree's HEAD and index there and objects/refs in the common dir.
+fn linked_git_dirs(workspace: &Path) -> Vec<PathBuf> {
+    let dot_git = workspace.join(".git");
+    if !dot_git.is_file() {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(&dot_git) else { return Vec::new() };
+    let Some(pointer) = text.trim().strip_prefix("gitdir:").map(str::trim).filter(|text| !text.is_empty() && !text.contains('\n')) else {
+        return Vec::new();
+    };
+    let gitdir = real(&util::resolve(workspace, pointer));
+    let Some(records) = gitdir.parent().filter(|parent| parent.file_name().is_some_and(|name| name == "worktrees")) else {
+        return Vec::new();
+    };
+    let Some(common) = records.parent().map(real) else { return Vec::new() };
+    let Ok(common_pointer) = std::fs::read_to_string(gitdir.join("commondir")) else { return Vec::new() };
+    if real(&util::resolve(&gitdir, common_pointer.trim())) != common {
+        return Vec::new();
+    }
+    let Ok(backlink) = std::fs::read_to_string(gitdir.join("gitdir")) else { return Vec::new() };
+    if real(&util::resolve(&gitdir, backlink.trim())) != real(&dot_git) {
+        return Vec::new();
+    }
+    if !gitdir.join("HEAD").is_file()
+        || !common.join("objects").is_dir()
+        || !common.join("HEAD").is_file()
+        || !(common.join("refs").is_dir() || common.join("packed-refs").is_file())
+    {
+        return Vec::new();
+    }
+    vec![gitdir, common]
+}
+
+/// Paths granted by `write_outside:<dir>` approvals.
+pub fn grants(approved: &BTreeSet<String>) -> Vec<PathBuf> {
+    approved
+        .iter()
+        .filter_map(|class| class.strip_prefix(WRITE_CLASS_PREFIX))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
+/// The approval class for writing under `path`.
+pub fn write_class(path: &Path) -> String {
+    format!("{WRITE_CLASS_PREFIX}{}", real(path).display())
+}
+
+/// The OS error texts (lowercase) of a write the sandbox refused: `strerror(EPERM)` from macOS's
+/// sandbox; `strerror(EACCES)` from Landlock, and `strerror(EXDEV)` for a move across folders it
+/// refused.
+#[cfg(not(target_os = "linux"))]
+const REFUSED_NEEDLES: &[&str] = &["operation not permitted"];
+#[cfg(target_os = "linux")]
+const REFUSED_NEEDLES: &[&str] = &["permission denied", "invalid cross-device link"];
+
+/// Whether command output contains the OS error text of a refused write ([`REFUSED_NEEDLES`]),
+/// which is what a refused write looks like from inside the sandbox (mechanical match of the OS
+/// error message, any case).
+pub fn mentions_eperm(bytes: &[u8]) -> bool {
+    REFUSED_NEEDLES.iter().any(|needle| bytes.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle.as_bytes())))
+}
+
+/// Whether the plugin itself may write `path` (or, when it does not exist, its nearest existing
+/// folder): on Linux "Permission denied" is also the file permissions' answer, which is not the
+/// sandbox's doing.
+#[cfg(target_os = "linux")]
+fn owner_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(existing) = path.ancestors().find(|path| path.symlink_metadata().is_ok()) else { return false };
+    let Ok(text) = std::ffi::CString::new(existing.as_os_str().as_bytes()) else { return false };
+    // SAFETY: `text` is a valid NUL-terminated path.
+    unsafe { libc::access(text.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// The absolute paths (`/x`, `~/x`) on the lines of command output that report a refused write
+/// ([`REFUSED_NEEDLES`]): what a write the sandbox refused names. Structural: the OS error text,
+/// then the path-shaped words of that line (split at whitespace, quotes, `:` and `,`).
+pub fn eperm_paths(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut paths = Vec::new();
+    for line in text.lines().filter(|line| {
+        let line = line.to_ascii_lowercase();
+        REFUSED_NEEDLES.iter().any(|needle| line.contains(needle))
+    }) {
+        for word in line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ':' | ',' | '(' | ')')) {
+            let path = if let Some(rest) = word.strip_prefix("~/") {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
+            } else {
+                word.starts_with('/').then(|| PathBuf::from(word))
+            };
+            #[cfg(target_os = "linux")]
+            let path = path.filter(|path| owner_writable(path));
+            if let Some(path) = path
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+// ---------------------------------------------------------------------------------------------
+// Caller-supplied profiles (`sandbox-exec -p <profile> <command...>` run through `tools.run`).
+// A sandboxed process cannot apply a second sandbox, so such a wrapper is unwrapped and its profile
+// intersected with the session's rules. The profile is accepted only when it is plain rules: a
+// tokenizer that mirrors SBPL's lexical syntax splits it into top-level forms; only `version`,
+// `allow`, `deny` and `debug` forms are allowed, and no form may bind or evaluate anything (which
+// could redefine the rule constructors used after it).
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InnerProfile {
+    pub forms: Vec<String>,
+    pub has_version: bool,
+    pub params: Vec<(String, String)>,
+}
+
+/// A `sandbox-exec` invocation split into its profile and the confined command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wrapped {
+    pub profile: InnerProfile,
+    pub argv: Vec<String>,
+}
+
+const FORBIDDEN_ATOMS: &[&str] = &[
+    "define",
+    "define-syntax",
+    "define-macro",
+    "defmacro",
+    "macro",
+    "set!",
+    "lambda",
+    "let",
+    "let*",
+    "letrec",
+    "letrec*",
+    "named-lambda",
+    "begin",
+    "eval",
+    "import",
+    "load",
+    "apply",
+    "call/cc",
+    "call-with-current-continuation",
+];
+
+/// Split an SBPL profile into validated top-level forms.
+pub fn parse_profile(text: &str) -> Result<(Vec<String>, bool), String> {
+    let bytes = text.as_bytes();
+    let mut forms = Vec::new();
+    let mut has_version = false;
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut head_expected = false;
+    let mut top_head: Option<String> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b';' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                if depth == 0 {
+                    start = i;
+                    top_head = None;
+                }
+                depth += 1;
+                head_expected = true;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    return Err("unbalanced `)`".to_owned());
+                }
+                depth -= 1;
+                head_expected = false;
+                i += 1;
+                if depth == 0 {
+                    let head = top_head.take().unwrap_or_default();
+                    match head.as_str() {
+                        "version" => has_version = true,
+                        "allow" | "deny" | "debug" => {}
+                        other => return Err(format!("top-level form `{other}` is not a rule")),
+                    }
+                    forms.push(text[start..i].to_owned());
+                }
+            }
+            b'"' => {
+                if depth == 0 {
+                    return Err("a string outside any form".to_owned());
+                }
+                i += 1;
+                loop {
+                    match bytes.get(i) {
+                        None => return Err("unterminated string".to_owned()),
+                        Some(b'\\') => i += 2,
+                        Some(b'"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                head_expected = false;
+            }
+            b'#' => {
+                if depth == 0 {
+                    return Err("`#` outside any form".to_owned());
+                }
+                match bytes.get(i + 1) {
+                    Some(b'"') => {
+                        i += 2;
+                        loop {
+                            match bytes.get(i) {
+                                None => return Err("unterminated regex".to_owned()),
+                                Some(b'\\') if bytes.get(i + 1) == Some(&b'"') => {
+                                    return Err("escaped quote inside a regex literal".to_owned());
+                                }
+                                Some(b'"') => {
+                                    i += 1;
+                                    break;
+                                }
+                                Some(_) => i += 1,
+                            }
+                        }
+                    }
+                    Some(b't') | Some(b'f') if !bytes.get(i + 2).is_some_and(|b| is_atom_byte(*b)) => i += 2,
+                    _ => return Err("unsupported `#` syntax".to_owned()),
+                }
+                head_expected = false;
+            }
+            b'\'' | b'`' | b',' | b'|' | b'[' | b']' | b'{' | b'}' => return Err(format!("unsupported character `{}`", c as char)),
+            _ => {
+                if depth == 0 {
+                    return Err("an atom outside any form".to_owned());
+                }
+                let begin = i;
+                while i < bytes.len() && is_atom_byte(bytes[i]) {
+                    i += 1;
+                }
+                if i == begin {
+                    return Err(format!("unexpected byte {c:#x}"));
+                }
+                let atom = &text[begin..i];
+                if FORBIDDEN_ATOMS.contains(&atom) {
+                    return Err(format!("`{atom}` is not allowed in a command's sandbox profile"));
+                }
+                if head_expected && depth == 1 {
+                    top_head = Some(atom.to_owned());
+                }
+                head_expected = false;
+            }
+        }
+    }
+    if depth != 0 {
+        return Err("unbalanced `(`".to_owned());
+    }
+    Ok((forms, has_version))
+}
+
+fn is_atom_byte(b: u8) -> bool {
+    !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';' | b'\'' | b'`' | b',' | b'#' | b'|' | b'[' | b']' | b'{' | b'}')
+}
+
+/// Recognize `sandbox-exec [-f file | -p profile] [-D key=value]... command...` (argv already split
+/// into literal words). A relative `-f` path resolves against `cwd`.
+pub fn unwrap_sandbox_exec(argv: &[String], cwd: &Path) -> Option<Result<Wrapped, String>> {
+    let program = argv.first()?;
+    if program.rsplit('/').next() != Some("sandbox-exec") {
+        return None;
+    }
+    if cfg!(target_os = "linux") {
+        return Some(Err("`sandbox-exec` profiles are macOS-only; run the command without the wrapper (it runs in the write sandbox)".to_owned()));
+    }
+    let mut profile_text: Option<String> = None;
+    let mut params = Vec::new();
+    let mut index = 1;
+    let take_value = |index: &mut usize, flag: &str, attached: &str| -> Result<String, String> {
+        if !attached.is_empty() {
+            return Ok(attached.to_owned());
+        }
+        *index += 1;
+        argv.get(*index).cloned().ok_or_else(|| format!("sandbox-exec {flag} needs a value"))
+    };
+    while index < argv.len() {
+        let word = &argv[index];
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if !word.starts_with('-') || word.len() < 2 {
+            break;
+        }
+        let (flag, attached) = word.split_at(2);
+        let result = match flag {
+            "-p" => take_value(&mut index, flag, attached).map(|value| profile_text = Some(value)),
+            "-f" => take_value(&mut index, flag, attached).and_then(|value| {
+                let path = util::resolve(cwd, &value);
+                std::fs::read_to_string(&path)
+                    .map(|text| profile_text = Some(text))
+                    .map_err(|error| format!("sandbox-exec -f {}: {error}", path.display()))
+            }),
+            "-D" => take_value(&mut index, flag, attached).and_then(|value| match value.split_once('=') {
+                Some((key, val)) if !key.is_empty() => {
+                    params.push((key.to_owned(), val.to_owned()));
+                    Ok(())
+                }
+                _ => Err(format!("sandbox-exec -D {value}: expected key=value")),
+            }),
+            other => Err(format!("sandbox-exec option {other} is not supported inside the write sandbox")),
+        };
+        if let Err(error) = result {
+            return Some(Err(error));
+        }
+        index += 1;
+    }
+    let Some(text) = profile_text else { return Some(Err("sandbox-exec without -p or -f".to_owned())) };
+    let rest: Vec<String> = argv[index..].to_vec();
+    if rest.is_empty() {
+        return Some(Err("sandbox-exec without a command".to_owned()));
+    }
+    Some(parse_profile(&text).map(|(forms, has_version)| Wrapped { profile: InnerProfile { forms, has_version, params }, argv: rest }))
+}

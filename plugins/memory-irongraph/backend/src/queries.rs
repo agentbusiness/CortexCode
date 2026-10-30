@@ -7,7 +7,7 @@ use crate::params;
 use crate::tree::CodeTree;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{
-    CallSite, EdgesResult, FilesResult, ImpactResult, LineEntry, LinesResult, OutlineResult, ParamInfo, PathResult, PathStep, RepoMapResult, SearchHit,
+    CallSite, EdgesResult, FilesResult, FocusResult, FocusUnit, ImpactResult, LineEntry, LinesResult, OutlineResult, ParamInfo, PathResult, PathStep, RepoMapResult, SearchHit,
     SearchResult, SymbolDetail, SymbolMatches, SymbolRef,
 };
 use serde::{Deserialize, Serialize};
@@ -386,6 +386,36 @@ impl CodeTree {
         }
         symbols.sort_by(|a, b| (a.start_line, std::cmp::Reverse(a.end_line), &a.qname).cmp(&(b.start_line, std::cmp::Reverse(b.end_line), &b.qname)));
         Ok(OutlineResult { path: path.to_owned(), language, symbols })
+    }
+
+    /// The definitions and sections of one file ranked by IronGraph's embedding index against
+    /// `text` (bind the file's nodes first, then rank). Nodes not embedded yet are left out.
+    pub async fn focus(&self, path: &str, text: &str) -> Result<FocusResult, RpcError> {
+        let count = self.run(&format!("{} MATCH (n:Code {{path: $p}}) WHERE n:Sym OR n:Section RETURN count(n)", layer::OBSERVED_READ), params! { "p" => path }).await?;
+        let k = count.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0);
+        if k == 0 || text.trim().is_empty() {
+            return Ok(FocusResult::default());
+        }
+        let rows = self
+            .run(
+                &format!(
+                    "{} MATCH (n:Code {{path: $p}}) WHERE n:Sym OR n:Section WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN n.start_line, n.end_line, n.name, score",
+                    layer::CODE_READ
+                ),
+                params! { "p" => path, "text" => text, "k" => k },
+            )
+            .await?;
+        let units = rows
+            .rows
+            .iter()
+            .map(|row| FocusUnit {
+                start_line: row.first().and_then(Value::as_u64).unwrap_or(0) as u32,
+                end_line: row.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+                name: row.get(2).and_then(Value::as_str).unwrap_or("").to_owned(),
+                score: row.get(3).and_then(Value::as_f64).unwrap_or(0.0),
+            })
+            .collect();
+        Ok(FocusResult { units })
     }
 
     /// Line-level index of a file from the line store.

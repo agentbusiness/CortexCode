@@ -76,6 +76,17 @@ pub mod methods {
     /// model (off: its card shows no model and its claims are refused); this computer still uses
     /// theirs.
     pub const LEND: &str = "mesh.lend";
+    /// `{}` -> [`super::ServicesResult`]: every shared service this computer and its members offer
+    /// (`crate::contracts::service`), with what each takes from this computer.
+    pub const SERVICES: &str = "mesh.services";
+    /// [`super::ServiceCallParams`] -> the method's result (stream items pass through): one call
+    /// of a shared service. `edit` and `run` go to this machine's provider (this app, or another
+    /// app on this machine); `read` goes to `node`, or the first provider found.
+    pub const SERVICE_CALL: &str = "mesh.service.call";
+    /// `{}` -> [`super::SharesResult`]: what this computer's services take, per service.
+    pub const SHARES: &str = "mesh.shares";
+    /// [`super::SharesSetParams`] -> [`super::SharesResult`]: the person's switches for one service.
+    pub const SHARES_SET: &str = "mesh.shares.set";
 }
 
 pub mod topics {
@@ -142,6 +153,9 @@ pub struct Card {
     /// is known to behave exactly as the borrower's.
     #[serde(default)]
     pub plugins: Vec<PluginCard>,
+    /// The services this computer shares (`crate::contracts::service`), their methods by name.
+    #[serde(default)]
+    pub services: Vec<ServiceCard>,
     /// Language plugins present, with the version of the language's toolchain when known.
     #[serde(default)]
     pub languages: Vec<LanguageCard>,
@@ -452,4 +466,65 @@ pub struct Placement {
     /// `local` | `lan` | `remote`.
     #[serde(default)]
     pub tier: String,
+}
+
+/// A shared service on a card: its name, version and methods (the full declaration, with
+/// descriptions and schemas, is asked of its computer with `mesh.services`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ServiceCard {
+    pub service: String,
+    pub version: u32,
+    pub title: String,
+    pub methods: Vec<String>,
+}
+
+/// One service offered on the network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OfferedService {
+    /// The computer that offers it, and whether it is this one or on this machine.
+    pub node: String,
+    pub name: String,
+    pub here: bool,
+    pub local: bool,
+    pub reachable: bool,
+    pub share: crate::contracts::service::Share,
+    /// What a call from this computer may do there: `read`, and `edit`/`run` when on this machine
+    /// (the provider's switches decide in the end).
+    pub access: Vec<crate::contracts::service::Access>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ServicesResult {
+    pub services: Vec<OfferedService>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ServiceCallParams {
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+    /// The computer to ask; empty: this machine's provider (for `read`, any provider).
+    #[serde(default)]
+    pub node: String,
+}
+
+/// This computer's services and the person's switches for each.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SharesResult {
+    pub shares: Vec<ShareSetting>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ShareSetting {
+    pub share: crate::contracts::service::Share,
+    pub allowed: crate::contracts::service::Allowed,
+    /// Calls served for others in the last 30 days.
+    #[serde(default)]
+    pub served: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SharesSetParams {
+    pub service: String,
+    pub allowed: crate::contracts::service::Allowed,
 }

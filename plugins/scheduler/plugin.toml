@@ -1,0 +1,44 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend,
+# data, UI packages and README together, separable into its own repository (only cc-protocol and
+# @cortex/sdk come from outside). `cortex-pack` builds the folder and packs it into a portable
+# .ccplugin; the frame runs it only as an installed package.
+# Paths are relative to this folder.
+
+[plugin]
+id = "scheduler"
+name = "Schedule"
+version = "0.1.0"
+description = "Routines: recurring and timed work that wakes a session, hands a brief to an agent or runs a command, on a clock; per project and global, with the card's schedule section and the Schedule pane."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame (its own Cargo workspace).
+[backend]
+category = "schedule"
+contract = "schedule@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-scheduler"
+
+# UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
+# <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
+[ui]
+dir = "ui"
+build = ["npm", "run", "build"]
+
+# The card section below the board: the next routines.
+[[ui.package]]
+dir = "ui/card"
+id = "scheduler.card"
+slot = "card.schedule@1"
+
+# The Schedule tab of the right pane: every routine of the project and the global ones.
+[[ui.package]]
+dir = "ui/pane"
+id = "scheduler.pane"
+slot = "pane.schedule@1"
+
+# The plugin's data (texts): packed at the same path; the app reads and edits it live in the live
+# folder (<home>/live/plugins/scheduler/backend/data).
+[data]
+dirs = ["backend/data"]

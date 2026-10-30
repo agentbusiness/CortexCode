@@ -5,7 +5,7 @@
 [plugin]
 id = "tools"
 name = "Tools"
-version = "0.1.15"
+version = "0.1.16"
 description = "The agent's hands: hashline read/edit/write, search, shell runs in a write sandbox with a per-workspace Python venv, background jobs, tool-call repair and ask-mode approval."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

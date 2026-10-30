@@ -91,6 +91,12 @@ loop_think_tokens = 1024
 # A reply's thinking (REPLY): the answer is written from what the turn read, so it needs a plan of
 # the answer, not a re-derivation. Without it the model plugin's table applied (16384 at xhigh).
 reply_think_tokens = 2048
+# What the session that started agents is told about each when it checks on them (MANAGE): an
+# agent with this many calls since its last edit is named as reading without writing (seen: 103
+# reads and no edit in 90 minutes), one with no step for this many minutes as not moving (seen: an
+# agent that waited 82 minutes for the model).
+manage_reading_calls = 10
+manage_idle_minutes = 10
 # Steps whose reasoning stays in the prompt (newest first); older steps keep their answer and calls
 # only, as the model's template renders earlier turns. 0 (none): the engine then resumes every step
 # from the checkpoint at the end of the previous prompt and re-reads only the answer and the new

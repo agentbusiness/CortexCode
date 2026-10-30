@@ -109,6 +109,25 @@ pub fn format_json(value: &Value) -> String {
     }
 }
 
+/// Answers that carry the line the model reads (`schedule.*`): that line.
+fn format_text(value: &Value) -> String {
+    let text = s(value, "text").trim_end();
+    if text.is_empty() { format_json(value) } else { format!("{text}\n") }
+}
+
+fn routine_id_command(path: &'static str, method: &'static str, summary: &'static str) -> Command {
+    Command {
+        path,
+        method,
+        summary,
+        positional: &["id"],
+        schema: schema(json!({"id": string("Routine id (r-…), from `cx schedule list`.")}), &["id"]),
+        prepare: Prepare::None,
+        build: plain_args,
+        format: format_text,
+    }
+}
+
 fn task_line(task: &Value) -> String {
     let assignee = task.get("assignee").and_then(Value::as_str).map(|a| format!("  @{a}")).unwrap_or_default();
     format!("{}  [{}]  {}{}", s(task, "id"), s(task, "status"), s(task, "title"), assignee)
@@ -1089,6 +1108,83 @@ pub fn commands() -> Vec<Command> {
             build: plain_args,
             format: format_research_sources,
         },
+        Command {
+            path: "schedule add",
+            method: "schedule.add",
+            summary: "Schedule work: wake this session, hand a brief to an agent, or run a command, on a clock.",
+            positional: &["brief"],
+            schema: schema(
+                json!({
+                    "brief": string("What to do when it runs, in full (wake, handoff)."),
+                    "when": string("every 5m | every 2h | every day at 09:00 | every mon,thu at 09:00 | weekdays at 8am | once at 2026-11-02 09:00 | in 20m | cron 0 9 * * 1"),
+                    "kind": string("wake (default: wakes this session with the brief) | handoff (an agent does the brief in its own session) | command (runs --command; wakes you only when it fails)."),
+                    "command": string("The command line (kind command)."),
+                    "title": string("A short name (default: the brief's first line)."),
+                    "until": string("done (ends when the agents you started finish) or a date (2026-12-01)."),
+                    "max_runs": integer("End after this many runs."),
+                    "global": boolean("Not tied to this project.")
+                }),
+                &["when"],
+            ),
+            prepare: Prepare::None,
+            build: |context, mut args| {
+                let global = args.remove("global").and_then(|v| v.as_bool()).unwrap_or(false);
+                if let Some(session) = &context.session_id {
+                    args.entry("session_id").or_insert(json!(session));
+                }
+                if global {
+                    args.insert("scope".to_owned(), json!("global"));
+                } else if let Some(project) = &context.project_id {
+                    args.insert("scope".to_owned(), json!(project));
+                }
+                Ok(Value::Object(args))
+            },
+            format: format_text,
+        },
+        Command {
+            path: "schedule list",
+            method: "schedule.list",
+            summary: "This project's routines and the global ones (--all: every project's).",
+            positional: &[],
+            schema: schema(json!({"all": boolean("Every project's routines.")}), &[]),
+            prepare: Prepare::None,
+            build: |context, mut args| {
+                let all = args.remove("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !all && let Some(project) = &context.project_id {
+                    args.insert("scope".to_owned(), json!(project));
+                    args.insert("with_global".to_owned(), json!(true));
+                }
+                Ok(Value::Object(args))
+            },
+            format: format_text,
+        },
+        routine_id_command("schedule show", "schedule.get", "A routine with what it does and its last runs."),
+        Command {
+            path: "schedule edit",
+            method: "schedule.edit",
+            summary: "Change a routine: when it runs, its brief or command, its title, its end.",
+            positional: &["id"],
+            schema: schema(
+                json!({
+                    "id": string("Routine id (r-…)."),
+                    "when": string("The new schedule (every 1h, every mon at 09:00, …)."),
+                    "brief": string("The new brief."),
+                    "command": string("The new command line."),
+                    "kind": string("wake | handoff | command."),
+                    "title": string("The new title."),
+                    "until": string("A date (2026-12-01); empty clears it."),
+                    "max_runs": integer("End after this many runs; 0 clears it.")
+                }),
+                &["id"],
+            ),
+            prepare: Prepare::None,
+            build: plain_args,
+            format: format_text,
+        },
+        routine_id_command("schedule pause", "schedule.pause", "Pause a routine (it keeps its schedule)."),
+        routine_id_command("schedule resume", "schedule.resume", "Run a paused routine again from its next time."),
+        routine_id_command("schedule run", "schedule.run_now", "Run a routine once now; its schedule stays."),
+        routine_id_command("schedule remove", "schedule.remove", "Remove a routine and its run history."),
         Command {
             path: "job list",
             method: "tools.job.list",

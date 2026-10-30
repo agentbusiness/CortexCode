@@ -5,9 +5,10 @@
 //!
 //! Each computer decides who uses its own model next ([`Lending`]): one run's call at a time
 //! (a person's call on this computer's model only waits for another person's: the engine puts a
-//! person's request before agent work), and a freed model goes to the oldest run waiting for it.
-//! A run's age is its first claim, kept until `mesh.place.end`, so a run that was building is still
-//! old when it calls again. A claim that finds nothing free waits at every model it could use
+//! person's request before agent work), and a freed model goes to the call that has waited longest
+//! (`since`: when this call began to wait). Ordering by a run's age (its first claim) starved the
+//! youngest run, since older runs call again after every tool step (seen: an agent that waited 82
+//! minutes and never ran). A claim that finds nothing free waits at every model it could use
 //! (here, and `mesh.model.claim` on each member); the first grant wins, the others are withdrawn.
 //! A claim may list several tags, best first (`mesh.claim {tags: ["coding", "office"]}`): a model
 //! with an earlier tag wins before the other rules, and a claim with several tags takes models of
@@ -15,7 +16,7 @@
 //! app on this machine offers one with a better tag (it would load a second model).
 //! A claim whose tag no model has yet waits for one: it looks again whenever the models change
 //! (a model plugin here starts or swaps, a member connects, goes or sends its card), keeping its
-//! age, so the oldest run of that tag is first when a tagged model comes up.
+//! place, so the longest waiting call of that tag is first when a tagged model comes up.
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
@@ -62,8 +63,6 @@ pub struct Claims {
     freed: Notify,
     /// The models of the network changed: claims waiting for a tag no model has look again.
     models_changed: Notify,
-    /// session -> when its run first claimed (its age), until `mesh.place.end`.
-    ages: Mutex<HashMap<String, u64>>,
     /// session -> the computer whose model its current call holds (empty: this one).
     held: Mutex<HashMap<String, String>>,
     /// session -> the computer its last call ran on: its prompt is cached there.
@@ -330,9 +329,8 @@ impl Mesh {
         }
         // A use still held (a call that never gave it back) is over now.
         self.release(&session).await;
-        // A run's age starts with its first waiting claim; a claim that does not wait (a prompt
-        // warm-up) is no run and leaves none behind.
-        let since = if params.wait { *lock(&self.claims.ages).entry(session.clone()).or_insert_with(now_ms) } else { lock(&self.claims.ages).get(&session).copied().unwrap_or_else(now_ms) };
+        // The call's place in the line: when it began to wait.
+        let since = now_ms();
         let tags = params.accepted();
         // No model with the tag anywhere yet: the claim waits for one (a claim that does not wait
         // hears `busy`).
@@ -425,10 +423,9 @@ impl Mesh {
         }
     }
 
-    /// The run is over: its age and its cached-prompt preference go.
+    /// The run is over: its cached-prompt preference goes.
     pub async fn claims_end(&self, session: &str) {
         self.release(session).await;
-        lock(&self.claims.ages).remove(session);
         lock(&self.claims.last).remove(session);
     }
 }

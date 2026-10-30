@@ -22,3 +22,9 @@
 /* Beside reading text the eye centres on its lowercase body, 1.5px below a capital label's middle:
    such labels sit that much lower. Labels beside buttons and fields (capitals too) stay. */
 #cc .cx-mesh-grid > .ap:is(:has(+ .v),:has(+ .t)),#cc .cx-mesh-name .t + .ap{position:relative;top:1.5px;}
+/* Shared services: each a block of title, description and its switches (the theme's `.sw`). */
+#cc .cx-mesh-shares{border-top:1px solid var(--rule);padding-top:14px;}
+#cc .cx-mesh-share{grid-column:1 / 4;display:flex;flex-direction:column;gap:2px;padding:6px 0 8px 134px;}
+#cc .cx-mesh-share .cx-mesh-cell{gap:14px;}
+#cc .cx-mesh-sw{display:inline-flex;align-items:center;gap:6px;}
+#cc .cx-mesh-share .ap.faint{min-width:112px;color:var(--ink-3);}

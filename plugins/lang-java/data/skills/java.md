@@ -2,7 +2,7 @@ Java here: get it right, build and test it, code that runs, compiler and runtime
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, Javadoc), its tests, docs and callers.
+1. **Pin down what the code must do.** Read the request and the code it changes (signatures, Javadoc) and its tests. Callers only when a signature changes; then write.
    - Per method or class: what it takes, returns and throws (exception type and message).
    - The request and the project decide, never a name alone. "whether" returns a `boolean`. "find" may return `null` or an `Optional`, as the project does. "returns the sorted list" means a new list, not a sorted argument.
    - When there may be no answer and nothing names a value for it, the declared return type decides: `Optional<T>` gives `Optional.empty()`, an object type gives `null`. Not `-1` or an empty collection unless the project does that.

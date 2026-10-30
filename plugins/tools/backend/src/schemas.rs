@@ -39,7 +39,7 @@ const READ_PATH: &str = "What to read: a file or folder relative to the workspac
 Find code by meaning: graph://search/<words>.\n\
 One function or class, by its name: symbol://<name> (its code, what it takes and returns), graph://used-by/<name> (every place that uses it), graph://uses/<name> (everything it uses), graph://impact/<name> (what a change to it reaches), graph://path/<name>/<name> (how two relate), outline://<path> (what a file contains).\n\
 Language server, at path:line:col: definition://<path:line:col>, references://<path:line:col> (every use), hover://<path:line:col> (type and docs), diagnostics://<path> (errors; diagnostics:// for every file).\n\
-Host: artifact://<id> (a saved long output; may end in :range), task://<id> and agent://<name> (background agents and their tasks), board:// (messages between agents), rule:// (project rules), skill://<plugin>/<name> (a how-to).\n\
+Host: artifact://<id> (a saved long output; may end in :range), task://<id> and agent://<name> (background agents and their tasks), board:// (messages between agents), schedule:// (routines: what runs on a clock), rule:// (project rules), skill://<plugin>/<name> (a how-to).\n\
 {online}\n\
 Another repository, read-only (<project>: its name or path): <project>:<path>, graph://<project>/search/<words>, symbol://<project>/<name>, outline://<project>/<path>.";
 
@@ -57,7 +57,14 @@ fn read_path(offline: bool) -> String {
 pub fn read_spec(offline: bool) -> ToolSpec {
     ToolSpec {
         name: "read".to_owned(),
-        description: "See a file or folder, or find code by meaning or name. For exact text, use run with grep -rn.".to_owned(),
+        // Online reads named in the description: a model that wants to go online picks its tool by
+        // what the tools say they do (seen: a call named `research` with read's arguments).
+        description: if offline {
+            "See a file or folder, or find code by meaning or name. For exact text, use run with grep -rn."
+        } else {
+            "See a file or folder, find code by meaning or name, search online. Exact text: run grep -rn."
+        }
+        .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -189,7 +196,12 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
     let network = if offline {
         "This project has no network: commands cannot reach the internet, research://search and research://fetch do not answer, and nothing can be installed or downloaded. To find out how something works, use the project's files."
     } else {
-        "To find out how something works (the code, an API, a tool), look in the project first: its files, docs and tests, graph://search. Go online (research://search, research://fetch, documentation) only when the project cannot answer."
+        "To find out how something works (the code, an API, a tool), look in the project first: its files, docs and tests, graph://search. Go online only when the project cannot answer: read research://search/<words>, then read research://fetch/<url> for the page that answers it."
+    };
+    let read_for = if offline {
+        "to see a file or folder, and to find code by meaning or by name (below)"
+    } else {
+        "to see a file or folder, to find code by meaning or by name (below), and to search and read online (research://search/<words>, research://fetch/<url>)"
     };
     let (how, fresh) = match format {
         EditFormat::Hashline => ("by anchors", ", with new anchors"),
@@ -197,7 +209,7 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
     };
     format!(
         "Which tool:\n\
-1. read: to see a file or folder, and to find code by meaning or by name (below).\n\
+1. read: {read_for}.\n\
 2. edit: to change or write a file (below).\n\
 3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Checks of your work are tests in the project (a project without tests gets them), run whole: no `| tail` or `| grep`, the result shows each failure; a one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\

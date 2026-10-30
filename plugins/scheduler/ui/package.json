@@ -1,0 +1,14 @@
+{
+  "name": "@cortex-plugin/scheduler-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The scheduler plugin's UI packages (one npm workspace; each package builds its own dist/ with manifest.json).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "npm run build --workspaces --if-present"
+  },
+  "workspaces": [
+    "card",
+    "pane"
+  ]
+}

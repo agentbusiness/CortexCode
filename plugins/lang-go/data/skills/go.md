@@ -2,7 +2,7 @@ Go here: get it right, build and test it, code that runs, common errors and thei
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, doc comments), its `_test.go` files, docs and callers.
+1. **Pin down what the code must do.** Read the request and the code it changes (signatures, doc comments) and its `_test.go` file. Callers only when a signature changes; then write.
    - Per function: what it takes and returns, and which `error` when (a sentinel such as `ErrInvalid`; `nil` on success).
    - The request and the project decide, never a name alone. "whether" returns `bool`.
    - When there may be no answer and nothing names a value for it, the signature decides: `(T, error)` returns the zero value and a non-nil `error`; `(T, bool)` returns the zero value and `false`. Never a made-up sentinel such as `-1`.

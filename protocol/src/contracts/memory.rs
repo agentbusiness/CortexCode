@@ -53,6 +53,9 @@ pub mod methods {
     pub const IMPACT: &str = "memory.impact";
     pub const PATH: &str = "memory.path";
     pub const OUTLINE: &str = "memory.outline";
+    /// [`super::FocusParams`] -> [`super::FocusResult`]: the definitions and document sections of
+    /// one file, each scored by how well it matches a text (what a read is for).
+    pub const FOCUS: &str = "memory.focus";
     pub const REPO_MAP: &str = "memory.repo_map";
     /// [`super::FilesParams`] -> [`super::FilesResult`]: the repository-relative paths of every
     /// indexed file (code, documents, text and binary), sorted.
@@ -178,6 +181,22 @@ pub mod methods {
     pub const SECURITY_SUMMARY: &str = "memory.security.summary";
     /// Delete a finding and its history (the user's explicit delete): `{project_id, id}` -> `{}`.
     pub const SECURITY_FORGET: &str = "memory.security.forget";
+
+    // Routines (the scheduler plugin's recurring and timed work, docs/SCHEDULES-PLAN.md):
+    /// Create or replace a routine: [`super::Routine`] -> the routine as stored (its scope's store:
+    /// a project id or `global`).
+    pub const ROUTINE_PUT: &str = "memory.routine.put";
+    /// One routine by id: `{id}` -> [`super::Routine`].
+    pub const ROUTINE_GET: &str = "memory.routine.get";
+    /// [`super::RoutineListParams`] -> [`super::RoutineListResult`]: a scope's routines (absent:
+    /// every registered project's and the global ones).
+    pub const ROUTINE_LIST: &str = "memory.routine.list";
+    /// Remove a routine and its runs: `{id}` -> `{}`.
+    pub const ROUTINE_REMOVE: &str = "memory.routine.remove";
+    /// Create or replace a run of a routine: [`super::RoutineRun`] -> the run as stored.
+    pub const ROUTINE_RUN_PUT: &str = "memory.routine.run.put";
+    /// [`super::RoutineRunsParams`] -> [`super::RoutineRunsResult`]: a routine's runs, newest first.
+    pub const ROUTINE_RUNS: &str = "memory.routine.runs";
 }
 
 pub mod topics {
@@ -553,6 +572,30 @@ pub struct OutlineResult {
     pub path: String,
     pub language: String,
     pub symbols: Vec<SymbolRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FocusParams {
+    #[serde(flatten)]
+    pub scope: Scope,
+    pub path: String,
+    /// What the reader looks for (a read's intent, a task statement).
+    pub text: String,
+}
+
+/// One definition or section of the file and its match with the text (higher is closer).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FocusUnit {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub name: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FocusResult {
+    /// Every scored unit of the file; empty when the file has none indexed or embedded.
+    pub units: Vec<FocusUnit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1738,4 +1781,118 @@ pub struct EngineStatus {
     pub open_ms: Option<u64>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// A routine: recurring or timed work (docs/SCHEDULES-PLAN.md). The scheduler plugin owns its
+/// meaning; memory keeps it in its scope's store (`scope`: a project id or `global`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Routine {
+    pub id: String,
+    pub scope: String,
+    pub title: String,
+    /// wake | handoff | command
+    pub kind: String,
+    /// What to do, in the creator's words (wake and handoff).
+    #[serde(default)]
+    pub brief: String,
+    /// The command line (command).
+    #[serde(default)]
+    pub command: String,
+    /// The schedule as written (`every 5m`, `every mon at 09:00`).
+    pub when: String,
+    /// The schedule as the scheduler reads it (its own JSON).
+    #[serde(default)]
+    pub schedule: Value,
+    #[serde(default)]
+    pub next_ms: Option<u64>,
+    #[serde(default)]
+    pub last_due_ms: Option<u64>,
+    /// active | paused | ended
+    pub state: String,
+    #[serde(default)]
+    pub state_reason: String,
+    /// The session a wake goes to.
+    #[serde(default)]
+    pub report_to: Option<String>,
+    /// The session whose children a handoff or command routine's runs are.
+    #[serde(default)]
+    pub home_session: Option<String>,
+    /// Where it was made: the session and the model run.
+    #[serde(default)]
+    pub created_session: Option<String>,
+    #[serde(default)]
+    pub created_run: Option<String>,
+    /// Task ids the routine exists for: when all are finished, it ends.
+    #[serde(default)]
+    pub watches: Vec<String>,
+    /// A wake that is an agent check-in (the session decides in MANAGE).
+    #[serde(default)]
+    pub manage: bool,
+    #[serde(default)]
+    pub until_ms: Option<u64>,
+    #[serde(default)]
+    pub max_runs: Option<u32>,
+    #[serde(default)]
+    pub run_count: u32,
+    #[serde(default)]
+    pub fail_streak: u32,
+    #[serde(default)]
+    pub last_outcome: String,
+    #[serde(default)]
+    pub last_summary: String,
+    #[serde(default)]
+    pub last_ok_ms: Option<u64>,
+    /// The approval mode its runs use (`auto` | `ask`).
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// model | user | agents
+    #[serde(default)]
+    pub by: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
+/// One firing of a routine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RoutineRun {
+    pub id: String,
+    pub routine_id: String,
+    pub due_ms: u64,
+    pub started_ms: u64,
+    #[serde(default)]
+    pub ended_ms: Option<u64>,
+    /// running | done | failed | skipped | woke
+    pub outcome: String,
+    #[serde(default)]
+    pub summary: String,
+    /// The session the run worked in (a handoff's agent session, the woken session).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RoutineListParams {
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RoutineListResult {
+    pub routines: Vec<Routine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutineRunsParams {
+    pub id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RoutineRunsResult {
+    pub runs: Vec<RoutineRun>,
 }

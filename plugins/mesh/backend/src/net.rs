@@ -5,7 +5,7 @@
 //! closed at once. On `cortex/frame/1` every request is its own bidirectional stream carrying the
 //! frame's own envelopes ([`cc_protocol::envelope::Message`]): the requester writes one `Req`, the
 //! serving side answers with `Item`s and one `Res`, and a `Cancel` or a closed stream cancels the
-//! forwarded call. What a member may ask is fixed ([`lendable`]: the model and traces); the serving side
+//! forwarded call. What a member may ask is fixed ([`lendable`]: the model; and the services the plugins declare); the serving side
 //! forwards such a call to its own frame (`ctx.call_stream`) and nothing else.
 //!
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
@@ -42,11 +42,11 @@ pub const FRAME_ALPN: &[u8] = b"cortex/frame/1";
 /// How long a dial may take before the member counts as unreachable for now.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// What every member lends every other: its model, and its traces (`system.trace.*`, `system.traces`:
-/// a trace only observes a process, it never changes one). Everything else is private to the node,
+/// What every member lends every other as a whole category: its model. The services the plugins
+/// share are lent method by method (`crate::services`); everything else is private to the node,
 /// never forwarded (a member's window reaches this frame's projects through `mesh.window` instead).
 pub fn lendable(method: &str) -> bool {
-    cc_protocol::contracts::category_of(method) == "model" || method == "system.traces" || method.starts_with("system.trace.")
+    cc_protocol::contracts::category_of(method) == "model"
 }
 
 // --- accepting ---------------------------------------------------------------------------------
@@ -220,6 +220,13 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             // The rest of the stream is a connection of the member's window to this frame.
             crate::projects::serve_window(&mesh.home, &mut send, &mut recv).await?;
         }
+        "mesh.shares" => {
+            // What this computer shares, in full (descriptions and schemas): a member reads it to
+            // offer the services to its own apps and model.
+            let shares = mesh.local_shares().await;
+            let message = answer(Ok(json!({"shares": shares})));
+            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
         "mesh.card" => {
             let card = mesh.my_card().await;
             let message = answer(serde_json::to_value(card).map_err(|e| RpcError::internal(e.to_string())));
@@ -251,11 +258,25 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             drop(rx);
         }
         _ => {
-            if !lendable(&method) || !mesh.lends() {
+            let shared = !lendable(&method);
+            let params = if shared {
+                match mesh.accept_call(&node, &method, params).await {
+                    Ok(params) => params,
+                    Err(error) => {
+                        mesh.served(&node, &method, false, 0);
+                        let message = answer(Err(error));
+                        write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                }
+            } else if mesh.lends() {
+                params
+            } else {
                 let message = answer(Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{method}` is not lent to this member"))));
                 write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                 return Ok(());
-            }
+            };
+            let started = std::time::Instant::now();
             let ctx = mesh.ctx().map_err(|e| e.message)?;
             let mut call = match ctx.call_stream(&method, params) {
                 Ok(call) => call,
@@ -291,6 +312,9 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                         }
                         None => {
                             let outcome = call.finish().await;
+                            if shared {
+                                mesh.served(&node, &method, outcome.is_ok(), started.elapsed().as_millis() as u64);
+                            }
                             let message = answer(outcome);
                             let _ = write_message(&mut send, &message).await;
                             break;

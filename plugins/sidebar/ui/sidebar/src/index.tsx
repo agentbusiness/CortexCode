@@ -680,8 +680,9 @@ function StatePip({ status }: { status: string }) {
   return <span className={`cx-pip cx-pip-${status}`} aria-hidden />;
 }
 
-function isStopped(status: string): boolean {
-  return status === 'stopped' || status === 'cancelled';
+/** Stopped and finished agents leave the list; failed ones stay so the person sees them. */
+function leavesList(status: string): boolean {
+  return status === 'stopped' || status === 'cancelled' || status === 'done';
 }
 
 function isActive(status: string): boolean {
@@ -737,8 +738,7 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms });
     }
   }
-  // A stopped agent leaves the list.
-  return [...rows.values()].filter((row) => !isStopped(row.status)).sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
+  return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
 }
 
 export default definePlugin({ slot: 'workbench.sidebar@1', component: SidebarRoot });

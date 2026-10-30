@@ -391,10 +391,54 @@ fn contract_section(data: &Dataset, root: &Path) -> String {
         if text.is_empty() {
             continue;
         }
-        let cut: String = text.chars().take(data.limits.contract_chars).collect();
-        return data.text("section_contract", &[("file", &file), ("text", cut.trim())]);
+        let fitted = fit_sections(text, data.limits.contract_chars, &file);
+        return data.text("section_contract", &[("file", &file), ("text", fitted.trim())]);
     }
     String::new()
+}
+
+/// A document within `limit` characters, cut at its headings instead of at its end: its sections
+/// in order, each whole while it fits, and every one that does not by its heading with how to read
+/// it (`AGENTS.md#Heading`), so no part of it is silently gone. One file given as several (`@`
+/// lines) is read by the first's name.
+fn fit_sections(text: &str, limit: usize, file: &str) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let file = file.split(", ").next().unwrap_or(file);
+    // Sections start at a `#` heading outside a fenced code block; the text before the first one
+    // is a section of its own.
+    let mut sections: Vec<String> = vec![String::new()];
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if !fenced && trimmed.starts_with('#') && !sections.last().is_some_and(String::is_empty) {
+            sections.push(String::new());
+        }
+        let current = sections.last_mut().expect("one section");
+        current.push_str(line);
+        current.push('\n');
+    }
+    let mut out = String::new();
+    let mut left = limit;
+    for section in sections.iter().filter(|section| !section.trim().is_empty()) {
+        let size = section.chars().count();
+        if size <= left {
+            out.push_str(section);
+            left -= size;
+            continue;
+        }
+        let heading = section.lines().next().unwrap_or("").trim();
+        let name = heading.trim_start_matches('#').trim();
+        let pointer = if heading.starts_with('#') { format!("{heading}\n(read it: {file}#{name})\n") } else { format!("(the start: read {file}:1-40)\n") };
+        let pointer_size = pointer.chars().count();
+        out.push_str(&pointer);
+        left = left.saturating_sub(pointer_size);
+    }
+    out
 }
 
 /// What the description is written from: the top of the repository (names only), its languages,

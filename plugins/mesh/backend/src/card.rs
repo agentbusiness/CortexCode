@@ -189,6 +189,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
         user_active,
         model,
         plugins: plugin_cards,
+        services: Vec::new(),
         languages,
         docker,
         sessions_running: running,

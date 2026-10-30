@@ -42,6 +42,8 @@ pub enum Trigger {
     Crash { plugin_id: String, category: String, version: String, restarts: u64 },
     /// `tools.job` with a final state (exited, killed).
     Job { job_id: String, session_id: Option<String>, state: String, exit_code: Option<i32> },
+    /// `schedule.ran`: a routine's run ended (`paused`: the routine was paused for it).
+    Routine { routine_id: String, title: String, kind: String, scope: String, outcome: String, summary: String, paused: Option<String>, session_id: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +63,7 @@ impl Trigger {
             | Trigger::Verification { session_id, .. }
             | Trigger::Spawned { session_id, .. }
             | Trigger::Conflict { session_id, .. } => Some(session_id),
-            Trigger::Job { session_id, .. } | Trigger::AgentBlocked { session_id, .. } => session_id.as_deref(),
+            Trigger::Job { session_id, .. } | Trigger::AgentBlocked { session_id, .. } | Trigger::Routine { session_id, .. } => session_id.as_deref(),
             Trigger::Swap { .. } | Trigger::Crash { .. } => None,
         }
     }
@@ -86,6 +88,7 @@ impl Trigger {
             Trigger::Swap { .. } => "plugin.swapped".into(),
             Trigger::Crash { category, .. } => format!("plugin.state:{category}"),
             Trigger::Job { job_id, .. } => format!("tools.job:{job_id}"),
+            Trigger::Routine { routine_id, .. } => format!("schedule.ran:{routine_id}"),
         }
     }
 }
@@ -271,6 +274,29 @@ pub fn from_job(data: &Value) -> Option<Trigger> {
         session_id: str_of(data, "session_id"),
         state,
         exit_code: data.get("exit_code").and_then(Value::as_i64).map(|c| c as i32),
+    })
+}
+
+/// A trigger from `schedule.ran` (`{routine, run}`): a failed run, a routine paused after
+/// failures, and a handoff's finished run; a command that passed or a wake says nothing.
+pub fn from_routine_ran(data: &Value) -> Option<Trigger> {
+    let routine = data.get("routine")?;
+    let run = data.get("run")?;
+    let paused = (str_of(routine, "state").as_deref() == Some("paused")).then(|| str_of(routine, "state_reason").unwrap_or_default());
+    let outcome = str_of(run, "outcome")?;
+    let kind = str_of(routine, "kind").unwrap_or_default();
+    if paused.is_none() && outcome != "failed" && !(outcome == "done" && kind == "handoff") {
+        return None;
+    }
+    Some(Trigger::Routine {
+        routine_id: str_of(routine, "id")?,
+        title: str_of(routine, "title").unwrap_or_default(),
+        kind,
+        scope: str_of(routine, "scope").unwrap_or_default(),
+        outcome,
+        summary: str_of(run, "summary").unwrap_or_default(),
+        paused,
+        session_id: str_of(run, "session_id").or_else(|| str_of(routine, "home_session")),
     })
 }
 
@@ -602,6 +628,24 @@ fn compose(trigger: &Trigger, ctx: &Context, prefs: &Prefs) -> Option<Notificati
             let body = ctx.job_output_tail.as_deref().and_then(last_line).unwrap_or_else(|| format!("Background job {job_id}."));
             let target = json!({"open": "job", "project_id": ctx.project_id, "session_id": session_id, "job_id": job_id});
             base(kinds::JOB, title, body, format!("job:{job_id}"), ctx, session_id.as_deref(), target)
+        }
+        Trigger::Routine { routine_id, title, kind: _, scope, outcome, summary, paused, session_id } => {
+            let (kind, heading) = match (paused, outcome.as_str()) {
+                (Some(_), _) => (kinds::FAILED, format!("Routine paused: {title}")),
+                (None, "failed") => (kinds::FAILED, format!("Routine failed: {title}")),
+                _ => (kinds::REPORT, format!("Routine finished: {title}")),
+            };
+            let body = match paused {
+                Some(reason) if !reason.is_empty() => format!("{reason}. The Schedule pane has Resume."),
+                _ => last_line(summary).unwrap_or_else(|| "Its run ended.".to_owned()),
+            };
+            let project_id = (scope != "global").then(|| scope.clone());
+            let target = json!({"open": "session", "project_id": project_id, "session_id": session_id, "view": "schedule", "routine_id": routine_id});
+            let mut n = base(kind, heading, body, format!("routine:{routine_id}:{outcome}"), ctx, session_id.as_deref(), target);
+            if n.project_id.is_none() {
+                n.project_id = project_id;
+            }
+            n
         }
     })
 }

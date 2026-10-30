@@ -137,6 +137,7 @@ fn error_text(error: &cc_protocol::RpcError, method: &str) -> String {
         ("unavailable" | "unknown_method", "browser") => " (the browser is served by the CortexCode window; it is not running)",
         ("unavailable" | "unknown_method", "agents") => " (the agents plugin is not running)",
         ("unavailable" | "unknown_method", "memory") => " (the memory plugin is not running)",
+        ("unavailable" | "unknown_method", "schedule") => " (the scheduler plugin is not running)",
         _ => "",
     };
     format!("cx: {}: {}{hint}\n", error.code, error.message)

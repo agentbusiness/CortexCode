@@ -362,6 +362,14 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // counts). Each becomes one line; the history the model continues from stays the current
     // state, not every version of it (seen: the same file read 37 times and edited 90 times, all
     // kept whole, filled the window).
+    // What a read showed: its path with its line range. Only the same read again replaces an older
+    // one; a read of other lines of the file does not (seen: lines 1-107 replaced by a later read of
+    // 108-320 as "your latest read shows the file", and read again six times).
+    let target_of = |call: &JournalEntry| -> Option<String> {
+        let args = call.data.get("args")?;
+        let raw = args.get("path").or_else(|| args.get("target")).and_then(Value::as_str)?;
+        (!raw.contains("://")).then(|| raw.trim().trim_start_matches("./").to_owned())
+    };
     let command_of = |call: &JournalEntry| -> Option<String> {
         call.data.get("args")?.get("command").and_then(Value::as_str).map(|command| command.trim().to_owned())
     };
@@ -378,9 +386,10 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
                     *at = (*at).max(result.seq);
                 }
             }
-            tool if ok && (tool == "read" || tool == tools_methods::READ) => {
-                if let Some(file) = file_of(call) {
-                    let at = read_at.entry(file).or_insert(0);
+            // A read answered by a pointer to the earlier one (`unchanged`) does not replace it.
+            tool if ok && (tool == "read" || tool == tools_methods::READ) && !bool_field(&result.data, "unchanged") => {
+                if let Some(target) = target_of(call) {
+                    let at = read_at.entry(target).or_insert(0);
                     *at = (*at).max(result.seq);
                 }
             }
@@ -402,10 +411,11 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         match str_field(&call.data, "tool") {
             tool if tool == "read" || tool == tools_methods::READ => {
                 let file = file_of(call)?;
+                let target = target_of(call).unwrap_or_else(|| file.clone());
                 if later(&edited_at, &file, result.seq) {
                     Some(ds.text("read_superseded", &[("path", &file)]))
-                } else if later(&read_at, &file, result.seq) {
-                    Some(ds.text("read_repeated", &[("path", &file)]))
+                } else if later(&read_at, &target, result.seq) {
+                    Some(ds.text("read_repeated", &[("path", &target)]))
                 } else {
                     None
                 }
@@ -422,10 +432,16 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             _ => None,
         }
     };
-    let render_output = |result: &JournalEntry| -> String {
+    // A file's current read is what the work is built on: folding it made the model read it again
+    // (seen: "The host keeps folding my reads", 103 reads and no edit). Outputs of commands fold.
+    let is_file_read = |result: &JournalEntry| {
+        calls.get(str_field(&result.data, "call_id")).is_some_and(|call| matches!(str_field(&call.data, "tool"), tool if tool == "read" || tool == tools_methods::READ) && target_of(call).is_some())
+            && bool_field(&result.data, "ok")
+    };
+    let render_base = |result: &JournalEntry| -> String {
         if let Some(pointer) = superseded(result) {
             pointer
-        } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) {
+        } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) && !is_file_read(result) {
             folded_text(ds, result)
         } else {
             str_field(&result.data, "output").to_owned()
@@ -443,6 +459,18 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             && !bool_field(&entry.data, "interrupted")
             && digests.of(entry, &calls).is_none()
             && (step_key(entry).is_some() || (entry.kind == kinds::TOOL_RESULT && !is_host(entry)))
+    };
+    // A read answered by a pointer to an identical earlier read (`unchanged`, `repeat_of`): once a
+    // compaction no longer shows that earlier read whole, this one shows the text itself.
+    let results_by_seq: HashMap<u64, &JournalEntry> = entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| (entry.seq, entry)).collect();
+    let render_output = |result: &JournalEntry| -> String {
+        if bool_field(&result.data, "unchanged")
+            && let Some(earlier) = result.data.get("repeat_of").and_then(Value::as_u64).and_then(|seq| results_by_seq.get(&seq))
+            && (stepped(earlier) || digests.of(earlier, &calls).is_some() || render_base(earlier) != str_field(&earlier.data, "output"))
+        {
+            return str_field(&earlier.data, "output").to_owned();
+        }
+        render_base(result)
     };
     let failed_calls: HashSet<&str> = entries
         .iter()

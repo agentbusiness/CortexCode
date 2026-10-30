@@ -1,5 +1,5 @@
-//! Traces of the commands `run` runs, recorded by the CortexTerm on this Mac (its `system.trace.*`,
-//! lent over the mesh; docs/STANDARD-CHANGES.md). While a command runs, CortexTerm follows the
+//! Traces of the commands `run` runs, recorded by the CortexTerm on this Mac (its shared service
+//! `system.trace`, called through `mesh.service.call`; docs/STANDARD-CHANGES.md). While a command runs, CortexTerm follows the
 //! session shell's process tree: CPU, memory, GPU, disk writes, the processes that came and went,
 //! files, connections and ports. A command that ran long enough gets one line in its result and a
 //! `trace://<id>` the model reads for the summary. Without a CortexTerm on this Mac nothing
@@ -16,18 +16,17 @@ use std::time::Duration;
 pub const WORTH_MS: u64 = 4_000;
 const ASK: Duration = Duration::from_secs(3);
 
-/// The CortexTerm on this Mac: a local member whose card has a `system` plugin.
+/// The CortexTerm on this Mac: an app on this machine that shares `system.trace`.
 async fn recorder(host: &dyn Host) -> Option<String> {
-    let peers = tokio::time::timeout(ASK, host.call("mesh.peers", json!({}))).await.ok()?.ok()?;
-    peers["peers"].as_array()?.iter().find_map(|peer| {
-        let local = peer["member"]["local"].as_bool().unwrap_or(false) && peer["reachable"].as_bool().unwrap_or(false);
-        let system = peer["card"]["plugins"].as_array().is_some_and(|plugins| plugins.iter().any(|p| p["id"] == "system" && p["active"].as_bool().unwrap_or(true)));
-        (local && system).then(|| peer["member"]["node"].as_str().map(str::to_owned)).flatten()
+    let services = tokio::time::timeout(ASK, host.call("mesh.services", json!({}))).await.ok()?.ok()?;
+    services["services"].as_array()?.iter().find_map(|offer| {
+        let fits = offer["share"]["service"] == "system.trace" && offer["local"].as_bool().unwrap_or(false) && offer["reachable"].as_bool().unwrap_or(false);
+        fits.then(|| offer["node"].as_str().map(str::to_owned)).flatten()
     })
 }
 
 async fn ask(host: &dyn Host, node: &str, method: &str, params: Value, limit: Duration) -> Option<Value> {
-    let call = host.call("mesh.call", json!({"node": node, "method": method, "params": params}));
+    let call = host.call("mesh.service.call", json!({"node": node, "method": method, "params": params}));
     tokio::time::timeout(limit, call).await.ok()?.ok()
 }
 
@@ -41,7 +40,7 @@ pub struct Recording {
 pub async fn start(host: &dyn Host, pid: i32, command: &str) -> Option<Recording> {
     let node = recorder(host).await?;
     let label: String = command.chars().take(200).collect();
-    let info = ask(host, &node, "system.trace.start", json!({"pid": pid, "label": label, "asked_by": "cortexcode"}), ASK).await?;
+    let info = ask(host, &node, "system.trace.run", json!({"pid": pid, "label": label}), ASK).await?;
     Some(Recording { node, id: info["id"].as_str()?.to_owned() })
 }
 
@@ -68,7 +67,7 @@ pub async fn finish(host: &dyn Host, recording: Recording, duration_ms: u64, wor
         return None;
     }
     ask(host, &node, "system.trace.stop", json!({"id": id}), ASK).await?;
-    let summary = ask(host, &node, "system.trace.summary", json!({"id": id}), Duration::from_secs(10)).await?;
+    let summary = ask(host, &node, "system.trace.read", json!({"id": id, "size": "summary"}), Duration::from_secs(10)).await?;
     Some(line(&summary, &id, workspace))
 }
 
@@ -123,7 +122,7 @@ pub async fn read(host: &dyn Host, id: &str, workspace: &Path) -> Result<String,
     let Some(node) = recorder(host).await else {
         return Err(UriError::new("unavailable", "no CortexTerm on this Mac: traces are recorded and kept there"));
     };
-    let call = host.call("mesh.call", json!({"node": node, "method": "system.trace.summary", "params": {"id": id}}));
+    let call = host.call("mesh.service.call", json!({"node": node, "method": "system.trace.read", "params": {"id": id, "size": "summary"}}));
     match tokio::time::timeout(Duration::from_secs(10), call).await {
         Ok(Ok(summary)) => Ok(crate::util::relative_paths(summary["text"].as_str().unwrap_or(""), workspace)),
         Ok(Err(error)) => Err(UriError::new("not_found", format!("trace://{id}: {}", error.message))),

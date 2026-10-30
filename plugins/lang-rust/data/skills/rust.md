@@ -2,7 +2,7 @@ Rust here: get it right, build and test it, code that runs, common errors and th
 
 ## 1. Get it right
 
-1. **Pin down what the code must do.** Read the request, then what the project already says about it: the code it touches (signatures, `///` docs), `mod tests`, `tests/`, docs and callers.
+1. **Pin down what the code must do.** Read the request and the code it changes (signatures, `///` docs) and its `mod tests`. Callers only when a signature changes; then write.
    - Per function: argument types, return type, how it fails (`Err` variant, `None`, panic).
    - The request and the project decide, never a name alone. "whether" returns `bool`. "find" may return `Option`. A named error is an `Err(...)`, not a panic.
    - When there may be no answer and nothing names a value for it, the signature decides: `Option<T>` gives `None`, `Result<T, E>` gives `Err(...)`. Never a sentinel such as `-1`, `0` or an empty value in their place.

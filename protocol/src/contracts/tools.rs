@@ -329,6 +329,9 @@ pub struct ReadParams {
     pub target: String,
     #[serde(default)]
     pub range: Option<String>,
+    /// What the read is for: a whole read of a big file then shows the parts that match it.
+    #[serde(default)]
+    pub intent: Option<String>,
     /// The session the read is made for (a host reading ahead for its model). The result then
     /// carries the skills of the diagnostic codes it shows, once per session like the model's own
     /// `read` (the text the first time, a pointer afterwards). None: no skills.

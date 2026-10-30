@@ -97,6 +97,10 @@ pub async fn execute_in(
 ) -> ToolOutcome {
     let started = Instant::now();
     let ExecuteParams { context, call } = params;
+    // A shared service of this machine offered as a tool (`services`).
+    if let Some(outcome) = crate::services::execute(host.as_ref(), &context, &call, started).await {
+        return outcome;
+    }
     let session = Session { workspace: util::canonical_lenient(&util::expand_home(&context.workspace)), context: &context, python_env };
     let mut canonical = match repair::normalize(&call.name, &call.arguments) {
         Ok(canonical) => canonical,
@@ -276,6 +280,7 @@ pub async fn read_target(
     session: &Session<'_>,
     target: &str,
     range: Option<&str>,
+    intent: Option<&str>,
     record: bool,
     diagnostics: crate::langs::DiagnosticsRead,
 ) -> Out {
@@ -367,7 +372,19 @@ pub async fn read_target(
     if core.sandbox.control_read_denied(&absolute) {
         return Out::fail("denied", format!("{display}: not readable from this workspace. Work from the files in the workspace."));
     }
-    match read::read_file(&absolute, &display, range.as_deref(), &core.config.read) {
+    // A whole read of a big project file made for a purpose: the code graph scores its definitions
+    // and sections against that purpose, and the read shows the ones that match (read::Focus).
+    let mut focus = None;
+    if range.is_none()
+        && qualified.is_none()
+        && let Some(intent) = intent.map(str::trim).filter(|intent| !intent.is_empty())
+        && std::fs::metadata(&absolute).is_ok_and(|meta| meta.is_file() && meta.len() as usize >= core.config.read.focus_bytes)
+    {
+        let scope = uris::Scope { project_id: &session.context.project_id, workspace: &session.workspace };
+        let scores = uris::focus_scores(host.as_ref(), &scope, &display, intent).await;
+        focus = Some(read::Focus::from_intent(intent, &display, scores));
+    }
+    match read::read_file(&absolute, &display, range.as_deref(), &core.config.read, focus.as_ref()) {
         Ok(view) => {
             if record && let Some(hash) = &view.hash {
                 core.read_state.record_read(&session.context.session_id, &util::canonical_lenient(&absolute), hash, &view.lines);
@@ -423,6 +440,7 @@ const MISSING_FILE_ENTRIES: usize = 30;
 
 async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<String, Value>) -> Out {
     let range = args.get("range").and_then(Value::as_str);
+    let intent = args.get("intent").and_then(Value::as_str);
     let targets: Vec<String> = match (args.get("path"), args.get("paths")) {
         (Some(Value::String(path)), _) => vec![path.clone()],
         (_, Some(Value::Array(paths))) => paths.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
@@ -431,7 +449,7 @@ async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
     let mut combined = Out::ok(String::new());
     let mut displays = Vec::new();
     for (index, target) in targets.iter().enumerate() {
-        let out = read_target(core, host, session, target, range, true, Default::default()).await;
+        let out = read_target(core, host, session, target, range, intent, true, Default::default()).await;
         if index > 0 {
             combined.output.push('\n');
         }
@@ -1391,7 +1409,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
             && !is_skeleton(&absolute, existing)
             && edit_format(session.context) != EditFormat::Whole
         {
-            let view = read_target(core, host, session, &display, None, true, Default::default()).await;
+            let view = read_target(core, host, session, &display, None, None, true, Default::default()).await;
             let (text, artifact) = offload_text(core, view.output, core.config.read_limits);
             let how = match edit_format(session.context) {
                 EditFormat::Replace => "with old/new replacements",
@@ -1424,7 +1442,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 // The refusal carries the read: the file's current content (which this session has
                 // now seen), so the next call can send the whole new content or anchored edits
                 // without a separate read step.
-                let view = read_target(core, host, session, &display, None, true, Default::default()).await;
+                let view = read_target(core, host, session, &display, None, None, true, Default::default()).await;
                 let (text, artifact) = offload_text(core, view.output, core.config.read_limits);
                 let other = match edit_format(session.context) {
                     EditFormat::Hashline => ", or change it with anchored edits",

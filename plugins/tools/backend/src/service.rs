@@ -165,7 +165,13 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 .as_deref()
                 .filter(|workspace| !workspace.is_empty())
                 .is_some_and(|workspace| util::canonical_lenient(&util::expand_home(workspace)).join(crate::sandbox::OFFLINE_MARKER).exists());
-            to_value(&schemas::schemas(EditFormat::parse(params.edit_format.as_deref()), offline))
+            let mut result = schemas::schemas(EditFormat::parse(params.edit_format.as_deref()), offline);
+            // The services this machine's apps share, one tool each.
+            for spec in crate::services::specs(host.as_ref()).await {
+                result.versions[spec.name.as_str()] = json!("service@1");
+                result.tools.push(spec);
+            }
+            to_value(&result)
         }
         methods::EXECUTE => {
             let params: ExecuteParams = parse_params(params)?;
@@ -226,7 +232,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 }
             }
             let diagnostics = crate::langs::DiagnosticsRead { wait_ms: params.wait_ms, shown: params.shown.map(|n| n as usize) };
-            let mut out = exec::read_target(&core, &host, &session, &params.target, params.range.as_deref(), for_session, diagnostics).await;
+            let mut out = exec::read_target(&core, &host, &session, &params.target, params.range.as_deref(), params.intent.as_deref(), for_session, diagnostics).await;
             // A read for a session (the host reading ahead for its model, e.g. `diagnostics://`)
             // carries the skills of the codes it shows like the model's own read, under the same
             // per-session memory: whichever of the two comes first inlines the text.
