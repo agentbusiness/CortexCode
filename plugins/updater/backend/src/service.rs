@@ -756,9 +756,9 @@ impl Updater {
     /// Split what differs from the latest: what applies now, and what asks the user. A build of
     /// the user's own, a version the user keeps, and one that could not start are left alone.
     fn plan(&self, items: Vec<(ResetItem, Option<Package>)>) -> (Vec<Planned>, Vec<Pending>) {
-        // A failure is over when a newer version came, when that version runs after all (the
-        // frame installs the app's packages at start by itself), or when another frame runs (a
-        // newer frame may take what this one refused).
+        // A failure is over when a newer version came, when that version or a newer one runs after
+        // all (the frame installs the app's packages at start by itself), or when another frame runs
+        // (a newer frame may take what this one refused).
         let frame = self.running_frame();
         let stale: Vec<String> = {
             let saved = self.saved.lock().unwrap_or_else(|p| p.into_inner());
@@ -770,7 +770,11 @@ impl Updater {
                         || items
                             .iter()
                             .find(|(item, _)| item.plugin == **plugin)
-                            .is_none_or(|(item, _)| item.release != failed.version || same_version(&item.installed, &failed.version))
+                            .is_none_or(|(item, _)| {
+                                item.release != failed.version
+                                    || same_version(&item.installed, &failed.version)
+                                    || release::is_newer(&item.installed, &failed.version)
+                            })
                 })
                 .map(|(plugin, _)| plugin.clone())
                 .collect()
@@ -787,7 +791,9 @@ impl Updater {
         let (mut auto, mut pending) = (Vec::new(), Vec::new());
         for (item, package) in items {
             let Some(package) = package else { continue };
-            if item.action != reset_actions::INSTALL || is_own_build(&item.installed) {
+            // Updates only go forward: a version newer than the release (a local build) stays; a reset
+            // is what puts the release back.
+            if item.action != reset_actions::INSTALL || is_own_build(&item.installed) || release::is_newer(&item.installed, &item.release) {
                 continue;
             }
             if saved.kept.get(&item.plugin) == Some(&item.release) || saved.failed.get(&item.plugin).is_some_and(|failed| failed.version == item.release) {
