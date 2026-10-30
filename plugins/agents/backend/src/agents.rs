@@ -60,6 +60,7 @@ pub fn hello() -> Hello {
         methods::LIST,
         methods::STEER,
         methods::STOP,
+        methods::FINISH,
         methods::RESTART,
         methods::CANCEL,
         methods::VERIFY,
@@ -71,7 +72,7 @@ pub fn hello() -> Hello {
     .map(|method| (*method).to_owned())
     .collect();
     // What a session's shell may call through `cx`: the session controls the agents it started.
-    hello.commands = [methods::HANDOFF, methods::LIST, methods::STEER, methods::STOP, methods::RESTART, methods::CANCEL, methods::SCHEDULER]
+    hello.commands = [methods::HANDOFF, methods::LIST, methods::STEER, methods::STOP, methods::FINISH, methods::RESTART, methods::CANCEL, methods::SCHEDULER]
         .iter()
         .map(|method| (*method).to_owned())
         .collect();
@@ -1311,6 +1312,45 @@ impl Agents {
         Ok(json!({"stopped": true, "was_queued": was_queued, "cancelled": result.tasks, "agents": result.agents}))
     }
 
+    /// The session takes an agent's task as done as it stands: the run ends now, without the run's
+    /// own checks (seen: an agent told "task 4 is done, stop" answered "acknowledged", then the
+    /// checks it ran at the end of its turn put it back to work on another task's failures, twice).
+    /// The merge steward judges the work in the project, by the files the agent changed; a pass
+    /// starts the tasks waiting for it, a failure reaches the session as a blocked agent.
+    async fn finish(&self, ctx: Ctx, params: AgentRefParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx.clone());
+        let record = agent(&host, &params.project_id, &params.agent).await?;
+        let task_id = record.task_id.clone().ok_or_else(|| RpcError::invalid_params(format!("{} has no task", record.name)))?;
+        let session_id = record.session_id.clone().unwrap_or_default();
+        let record = self.halt(&ctx, &host, record).await?;
+        let key = AgentKey { project_id: params.project_id.clone(), name: params.agent.clone() };
+        let cancel = self.manual_cancellation(&key);
+        let _operation = cancel.clone().drop_guard();
+        let host = Host::with_cancel(ctx.clone(), cancel);
+        let task = task(&host, &task_id).await?;
+        if finished(&task.status) {
+            return Ok(json!({"finished": true, "verified": task.status == "done"}));
+        }
+        // What the agent changed, from its session's tool results.
+        let mut changed_files: Vec<String> = Vec::new();
+        if let Ok(entries) = host.journal_read(&session_id, 1).await {
+            for entry in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT) {
+                for file in entry.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                    if !changed_files.iter().any(|known| known == file) {
+                        changed_files.push(file.to_owned());
+                    }
+                }
+            }
+        }
+        let summary = self.inner.data.get().text("finished_by_session", &[]);
+        let result = AgentRunResult { outcome: "done".into(), summary, turns: 0, tool_calls: 0, changed_files, usage: Value::Null };
+        let verified = matches!(self.steward(&ctx, &host, &record, &task, &result, true).await?, Stewarded::Verified);
+        if verified && !session_id.is_empty() {
+            self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
+        }
+        Ok(json!({"finished": true, "verified": verified}))
+    }
+
     /// Cancel a task with its subtasks and the tasks waiting for it; their agents stop.
     async fn cancel(&self, ctx: Ctx, params: CancelParams) -> Result<CancelResult, RpcError> {
         let host = Host::new(ctx.clone());
@@ -1942,6 +1982,7 @@ impl Plugin for Agents {
                 }
                 methods::STEER => this.steer(ctx, parse_params(params)?).await,
                 methods::STOP => this.stop(ctx, parse_params(params)?).await,
+                methods::FINISH => this.finish(ctx, parse_params(params)?).await,
                 methods::RESTART => to_value(&this.restart(ctx, parse_params(params)?).await?),
                 methods::CANCEL => to_value(&this.cancel(ctx, parse_params(params)?).await?),
                 methods::VERIFY => to_value(&this.verify(ctx, parse_params(params)?).await?),

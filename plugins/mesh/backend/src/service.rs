@@ -6,7 +6,7 @@ use crate::members::{Entry, Log};
 use crate::store::{self, Write};
 use crate::pairing::JoinerRecord;
 use cc_protocol::contracts::mesh::{
-    CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
+    CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, AllowParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
     topics,
 };
 use cc_protocol::contracts::model::{ModelInfo, YieldParams};
@@ -48,8 +48,6 @@ pub const PROVIDES: &[&str] = &[
     methods::MODEL_YIELD,
     methods::SERVICES,
     methods::SERVICE_CALL,
-    methods::SHARES,
-    methods::SHARES_SET,
 ];
 pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"];
 
@@ -116,6 +114,8 @@ pub struct Mesh {
     pub services: crate::services::Services,
     /// Members may use this computer's model (`mesh.lend`).
     lend: AtomicBool,
+    /// The members that may work on this computer (`mesh.allow`).
+    allowed: Mutex<Vec<String>>,
     /// The app's store (`crate::store`) and the queue of its ordered writer.
     pub store: OnceLock<(store::Caller, mpsc::UnboundedSender<Write>)>,
     /// The membership log and the settings have been read from the store.
@@ -175,6 +175,7 @@ impl Mesh {
             local: Mutex::new(HashMap::new()),
             services: crate::services::Services::default(),
             lend: AtomicBool::new(true),
+            allowed: Mutex::new(Vec::new()),
             store: OnceLock::new(),
             loaded: tokio::sync::watch::channel(false).0,
         }
@@ -219,7 +220,7 @@ impl Mesh {
             *lock(&self.name) = name;
         }
         self.lend.store(loaded.lend, Ordering::SeqCst);
-        *lock(&self.services.allowed) = Some(loaded.shares);
+        *lock(&self.allowed) = loaded.allowed;
         let mut log = Log { entries: loaded.entries };
         if let Err(error) = log.validate() {
             tracing::warn!(%error, "the membership log is not valid; starting from the valid prefix");
@@ -227,7 +228,7 @@ impl Mesh {
         let members = log.members().len();
         *lock(&self.log) = log;
         tracing::info!(members, "the membership was read from the store");
-        let _ = self.loaded.send(true);
+        self.loaded.send_replace(true);
         self.save_log();
         *lock(&self.my_card) = None;
         self.notify("members");
@@ -397,6 +398,23 @@ impl Mesh {
         Ok(entries)
     }
 
+    /// An app on this machine joins this node's network without a code: being on this machine
+    /// (`crate::local`) is the proof, and the connection is its key. Taken only while this node is
+    /// in a network with other computers, and only for an app that was never in it (one that left
+    /// or was removed comes back by an invitation).
+    pub fn admit_local(&self, node: &str, name: &str, addrs: Vec<String>) -> Result<Vec<Entry>, String> {
+        if !self.is_local(node) {
+            return Err("only an app on this machine joins without an invitation".to_owned());
+        }
+        if self.network().is_none() {
+            return Err("this app is in no network".to_owned());
+        }
+        if lock(&self.log).entries.iter().any(|entry| entry.node == node) {
+            return Err("this app was in the network before; it comes back by an invitation".to_owned());
+        }
+        self.admit(&JoinerRecord { node: node.to_owned(), name: name.to_owned(), addrs, sig: String::new() })
+    }
+
     /// A joiner takes the inviter's log as its own cortex.
     pub fn adopt_log(&self, entries: Vec<Entry>) -> Result<(), String> {
         let mut candidate = Log { entries };
@@ -538,6 +556,20 @@ impl Mesh {
         *lock(&self.my_card) = None;
     }
 
+    /// Whether a member may work on this computer (`mesh.allow`).
+    pub fn may_work(&self, node: &str) -> bool {
+        lock(&self.allowed).iter().any(|allowed| allowed == node)
+    }
+
+    /// This computer's card as one member gets it: no projects for a member that may not work here.
+    pub async fn card_for(&self, node: &str) -> Card {
+        let mut card = self.my_card().await;
+        if !self.may_work(node) {
+            card.projects.clear();
+        }
+        card
+    }
+
     pub async fn my_card(&self) -> Card {
         let cached = lock(&self.my_card).clone();
         if let Some(mut card) = cached
@@ -665,6 +697,7 @@ impl Mesh {
             serving,
             placed: self.placed(),
             lend: self.lends(),
+            allowed: lock(&self.allowed).clone(),
         }
     }
 
@@ -702,7 +735,7 @@ impl Mesh {
 
     pub async fn handle(self: &std::sync::Arc<Self>, method: &str, params: Value, items: ItemSink, cancel: CancellationToken) -> Result<Value, RpcError> {
         // What changes the membership or the person's choices waits for them to be read.
-        if matches!(method, methods::PAIR_START | methods::PAIR_JOIN | methods::LEAVE | methods::REVOKE | methods::NAME | methods::LEND | methods::SHARES_SET) {
+        if matches!(method, methods::PAIR_START | methods::PAIR_JOIN | methods::LEAVE | methods::REVOKE | methods::NAME | methods::LEND | methods::ALLOW) {
             self.wait_loaded().await?;
         }
         match method {
@@ -781,6 +814,23 @@ impl Mesh {
                 self.notify("members");
                 to_value(&self.status())
             }
+            methods::ALLOW => {
+                let params: AllowParams = parse_params(params)?;
+                let node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
+                let list = {
+                    let mut allowed = lock(&self.allowed);
+                    allowed.retain(|allowed| *allowed != node);
+                    if params.allowed {
+                        allowed.push(node.clone());
+                    }
+                    allowed.clone()
+                };
+                self.write(Write::Setting(store::ALLOWED_SETTING, json!(list)));
+                // Its sidebar shows this computer's projects, or loses them, now.
+                self.push_card_to(&node).await;
+                self.notify("members");
+                to_value(&self.status())
+            }
             methods::CALL => {
                 let mut params: CallParams = parse_params(params)?;
                 params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
@@ -806,11 +856,6 @@ impl Mesh {
                 let outcome = self.service_call(params, tx, cancel).await;
                 let _ = pump.await;
                 outcome
-            }
-            methods::SHARES => to_value(&self.shares_result().await),
-            methods::SHARES_SET => {
-                let params: cc_protocol::contracts::mesh::SharesSetParams = parse_params(params)?;
-                to_value(&self.set_shares(params).await?)
             }
             methods::PLACE => {
                 let params: PlaceParams = parse_params(params)?;

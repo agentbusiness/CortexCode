@@ -168,6 +168,11 @@ fn parse(entry: &JournalEntry) -> Option<Plan> {
     (entry.kind == chatflow_kinds::PLAN).then(|| serde_json::from_value::<Plan>(entry.data.clone()).ok()).flatten()
 }
 
+/// Every plan version of the session, oldest first.
+pub fn all(entries: &[JournalEntry]) -> Vec<Plan> {
+    entries.iter().filter_map(parse).collect()
+}
+
 /// The newest plan version of the session.
 pub fn latest(entries: &[JournalEntry]) -> Option<(u64, Plan)> {
     entries.iter().rev().find_map(|entry| parse(entry).map(|plan| (entry.seq, plan)))
@@ -519,6 +524,34 @@ pub fn wait_where_tasks_meet(tasks: &mut [PlanTask], names: &HashMap<u32, Vec<St
         }
         later.depends_on.sort_unstable();
     }
+}
+
+/// `tasks` without the ones numbered in `drop`, renumbered in order; a dependency on a dropped task
+/// goes (that work is done), the others follow the new numbers.
+pub fn drop_tasks(tasks: Vec<PlanTask>, drop: &HashSet<u32>) -> Vec<PlanTask> {
+    let numbers: HashMap<u32, u32> = tasks.iter().filter(|task| !drop.contains(&task.n)).enumerate().map(|(index, task)| (task.n, index as u32 + 1)).collect();
+    tasks
+        .into_iter()
+        .filter(|task| !drop.contains(&task.n))
+        .map(|mut task| {
+            task.n = numbers[&task.n];
+            task.depends_on = task.depends_on.iter().filter_map(|n| numbers.get(n).copied()).filter(|n| *n < task.n).collect();
+            task
+        })
+        .collect()
+}
+
+/// `first` becomes task 1 and every other task waits for it: the others move up one number, and
+/// their dependencies with them.
+pub fn put_first(tasks: &mut Vec<PlanTask>, mut first: PlanTask) {
+    for task in tasks.iter_mut() {
+        task.n += 1;
+        task.depends_on = task.depends_on.iter().map(|n| n + 1).collect();
+        task.depends_on.insert(0, 1);
+    }
+    first.n = 1;
+    first.depends_on.clear();
+    tasks.insert(0, first);
 }
 
 pub fn keep_dependencies(previous: &Plan, tasks: &mut [PlanTask]) {

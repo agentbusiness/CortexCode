@@ -110,8 +110,13 @@ impl ProtocolHandler for PairHandler {
             Ok(record) => {
                 tracing::info!(name = %record.name, "a computer joined the cortex");
                 self.0.pairing_done();
+                // The members hear of the joiner at once (else they refuse its connection), and it
+                // is dialed.
                 let mesh = self.0.clone();
-                tokio::spawn(async move { mesh.dial_all().await });
+                tokio::spawn(async move {
+                    mesh.push_log().await;
+                    mesh.dial_all().await;
+                });
             }
             Err(reason) => {
                 tracing::info!(%reason, "a pairing attempt failed");
@@ -150,6 +155,20 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let outcome = if !mesh.local_only(&node) { mesh.log_received(entries).map(|changed| json!({"changed": changed})).map_err(RpcError::invalid_params) } else { Ok(json!({"changed": false})) };
             let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+        }
+        "mesh.local.join" => {
+            // An app on this machine in no network asks into this one (`Mesh::admit_local`); the
+            // members hear of it at once.
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            let addrs: Vec<String> = serde_json::from_value(params.get("addrs").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+            let admitted = mesh.admit_local(&node, &name, addrs);
+            let outcome = admitted.as_ref().map(|entries| json!({"entries": entries})).map_err(|reason| RpcError::new(codes::CONTRACT_VIOLATION, reason.clone()));
+            let message = answer(outcome);
+            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
+            if admitted.is_ok() {
+                tracing::info!(%name, "an app on this machine joined the network");
+                mesh.push_log().await;
+            }
         }
         "mesh.provides" => {
             let category = params.get("category").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -213,11 +232,16 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.window.ticket" => {
-            let message = answer(crate::projects::ticket(&mesh.home));
+            let outcome = if mesh.may_work(&node) { crate::projects::ticket(&mesh.home) } else { Err(RpcError::new(codes::CONTRACT_VIOLATION, "this computer does not let you work on it")) };
+            let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.window" => {
-            // The rest of the stream is a connection of the member's window to this frame.
+            // The rest of the stream is a connection of the member's window to this frame, for a
+            // member that may work here only.
+            if !mesh.may_work(&node) {
+                return Err("a member that may not work here asked for a window".to_owned());
+            }
             crate::projects::serve_window(&mesh.home, &mut send, &mut recv).await?;
         }
         "mesh.shares" => {
@@ -228,7 +252,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.card" => {
-            let card = mesh.my_card().await;
+            let card = mesh.card_for(&node).await;
             let message = answer(serde_json::to_value(card).map_err(|e| RpcError::internal(e.to_string())));
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
@@ -378,6 +402,7 @@ impl Mesh {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 mesh.refresh_local();
                 mesh.dial_all().await;
+                mesh.join_local().await;
                 mesh.push_card().await;
                 mesh.auto_place().await;
             }
@@ -480,7 +505,7 @@ impl Mesh {
     }
 
     pub async fn push_card_to(&self, node: &str) {
-        let card = self.my_card().await;
+        let card = self.card_for(node).await;
         let _ = self.call_member(node, "mesh.card.push", serde_json::to_value(card).unwrap_or(Value::Null), None, CancellationToken::new()).await;
     }
 

@@ -36,6 +36,75 @@ use tokio_util::sync::CancellationToken;
 /// save little.
 const UNCHANGED_MIN_CHARS: usize = 400;
 
+/// A read target split into its file and line range: `src/a.rs:40-80` is `src/a.rs` with lines 40
+/// to 80, `src/a.rs:40+10` lines 40 to 49, `src/a.rs:40` line 40 on (no end); a target without a
+/// range (or a URI) has none.
+fn read_lines(target: &str) -> (String, Option<(usize, Option<usize>)>) {
+    let target = target.trim().trim_start_matches("./");
+    let Some((file, range)) = target.rsplit_once(':').filter(|(file, range)| {
+        !file.contains("://") && !range.is_empty() && range.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+'))
+    }) else {
+        return (target.to_owned(), None);
+    };
+    let number = |text: &str| text.trim().parse::<usize>().ok();
+    let lines = if let Some((start, count)) = range.split_once('+') {
+        number(start).zip(number(count)).filter(|(_, count)| *count > 0).map(|(start, count)| (start, Some(start + count - 1)))
+    } else if let Some((start, end)) = range.split_once('-') {
+        number(start).map(|start| (start, if end.trim().is_empty() { None } else { number(end) }))
+    } else {
+        number(range).map(|start| (start, None))
+    };
+    (file.to_owned(), lines)
+}
+
+/// What a read call reads: its `path`, with its `range` argument joined as `path:range` when the
+/// call gave one apart.
+fn read_target(args: &Value) -> String {
+    let path = args.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    match args.get("range").and_then(Value::as_str).map(str::trim).filter(|range| !range.is_empty()) {
+        Some(range) if !path.contains("://") => format!("{path}:{}", range.trim_start_matches(':')),
+        _ => path.to_owned(),
+    }
+}
+
+/// The newest earlier successful read (its result seq and output) that shows every line `target`
+/// (a ranged read) asks for, with no change to the file since: a whole read of it (`mode: file`)
+/// or a range that contains the asked one. None for a read without a range, or when the file
+/// changed after that read.
+fn covered_by_earlier_read(entries: &[JournalEntry], target: &str) -> Option<(u64, String)> {
+    let (file, Some((start, end))) = read_lines(target) else { return None };
+    let end = end?;
+    let calls: HashMap<&str, &JournalEntry> =
+        entries.iter().filter(|entry| entry.kind == kinds::TOOL_CALL).map(|entry| (str_field(&entry.data, "call_id"), entry)).collect();
+    // Called before the read's own result is journaled: every result here is an earlier one.
+    for result in entries.iter().rev().filter(|entry| entry.kind == kinds::TOOL_RESULT) {
+        let changed = result.data.get("changed_files").and_then(Value::as_array).is_some_and(|files| {
+            files.iter().filter_map(Value::as_str).any(|path| path.trim_start_matches("./") == file || path.ends_with(&format!("/{file}")))
+        });
+        if changed {
+            return None;
+        }
+        let Some(call) = calls.get(str_field(&result.data, "call_id")) else { continue };
+        if str_field(&call.data, "tool") != "read" || !result.data.get("ok").and_then(Value::as_bool).unwrap_or(false) || result.data.get("unchanged").is_some() {
+            continue;
+        }
+        let earlier_target = call.data.get("args").map(read_target).unwrap_or_default();
+        let (earlier_file, earlier_lines) = read_lines(&earlier_target);
+        if earlier_file != file {
+            continue;
+        }
+        let covers = match earlier_lines {
+            None => result.data.get("display").and_then(|display| display.get("mode")).and_then(Value::as_str) == Some("file"),
+            Some((from, Some(to))) => from <= start && end <= to,
+            Some((_, None)) => false,
+        };
+        if covers {
+            return Some((result.seq, str_field(&result.data, "output").to_owned()));
+        }
+    }
+    None
+}
+
 /// How long a parking instance lets an in-flight tool call finish before cancelling it. The frame
 /// gives `plugin.shutdown` 5 s, so parking (this grace plus journaling) must fit inside that.
 pub const PARK_GRACE: Duration = Duration::from_secs(3);
@@ -345,12 +414,16 @@ const ASKING_KINDS: &[&str] = &["need", "question", "decision", "proposal"];
 /// code); from outside its team, only a claim on code it touches. A newer message from the same
 /// author about the same task replaces the older one.
 async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str, team: Option<&Team>) -> Result<(), RpcError> {
+    // The first delivery starts at the session's start: what the board said before the agent
+    // existed is earlier plans' history (seen: thirty "was cancelled" notices from replaced plans
+    // in front of every new agent's first step).
+    let session_start = journal.entries().next().map(|entry| entry.ts_ms).unwrap_or(0);
     let since = journal
         .entries()
         .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "board")
         .filter_map(|entry| entry.data.get("board_ts").and_then(Value::as_u64))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(session_start);
     let Ok(list) = env
         .host
         .get::<BoardListResult>(memory_methods::BOARD_LIST, json!({"project_id": env.scope.project_id, "since_ms": since + 1, "to": name}))
@@ -374,8 +447,9 @@ async fn deliver_board(journal: &mut Journal, env: &RunEnv, name: &str, team: Op
                             .is_ok_and(|task| task.touches.iter().any(|touch| team.me.touches.contains(touch))),
                         None => false,
                     },
-                    // The lead and the user speak to the whole team.
-                    None => matches!(message.author.as_str(), "lead" | "user" | "chat"),
+                    // The lead and the user speak to the whole team; a post about a task outside
+                    // the agent's tree (another plan's) is not for it.
+                    None => (message.refs.is_empty() || message.refs.contains(&team.me.id)) && matches!(message.author.as_str(), "lead" | "user" | "chat"),
                 }
             }
         };
@@ -689,6 +763,13 @@ async fn resolve_pending_approvals(env: &RunEnv, journal: &mut Journal) -> Resul
     Ok(true)
 }
 
+/// Whether a lesson's text pipes a command's output into a filter (`| grep`, `| tail`, `| head`,
+/// or says to pipe to one): structural, the shell syntax and the filter's name.
+fn filters_output(text: &str) -> bool {
+    let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    ["grep", "tail", "head"].iter().any(|filter| compact.contains(&format!("| {filter}")) || compact.contains(&format!("|{filter}")) || compact.contains(&format!("pipe to `{filter}")) || compact.contains(&format!("pipe to {filter}")) || compact.contains(&format!("pipe it to `{filter}")) || compact.contains(&format!("pipe it to {filter}")))
+}
+
 /// Verify a task's contract: through `agents.verify` (which records the report and the task's
 /// status), or with the shared contract runner when no agents plugin serves.
 /// The note under a failure with `key`: the lessons and this project's facts learned from it
@@ -702,7 +783,11 @@ async fn failure_note(env: &RunEnv, journal: &mut Journal, key: &str, shown: &mu
         .iter()
         .filter_map(|language| language.as_str().map(str::to_owned))
         .collect();
-    let found = crate::learn::at_failure(&env.host, &env.data, &env.scope.project_id, key, &languages, shown).await;
+    let mut found = crate::learn::at_failure(&env.host, &env.data, &env.scope.project_id, key, &languages, shown).await;
+    // A lesson that cuts a command's output down teaches the filtered reruns the run result already
+    // makes needless (seen: "pipe cargo check to grep" under every failure, then twenty filtered
+    // runs of one check).
+    found.retain(|(item, _)| !filters_output(&item.text));
     if found.is_empty() {
         return Ok(());
     }
@@ -856,6 +941,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // The compacted conversation being prefilled while the step's tools run (crate::fit::prepare).
     let mut prewarm: Option<crate::fit::Prewarm> = None;
     let mut steps_since_settle = 0u32;
+    // An agent's session spoke and the agent has not called a tool since.
+    let mut answering_session = false;
     loop {
         if env.stops.park.is_cancelled() {
             return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
@@ -867,6 +954,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         let steers = deliver_steers(journal).await?;
         if !steers.is_empty() {
             detector.reset();
+            answering_session = matches!(spec.kind, LoopKind::Agent { .. });
             // A plan task is one part of a plan: a message during it goes to the planner, which
             // writes the tasks still to do so that they do what the user asks now (seen: "fix all
             // the issues" answered eleven times with "task 1 is complete", the step message saying
@@ -982,6 +1070,14 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 continue;
             }
             let summary = result.content.trim().to_owned();
+            // An agent that answered its session's message in words and ended its turn does what
+            // the session said: the run ends here, and the merge steward judges the work. The
+            // run's own checks would put it back to work against the session's word (seen: "task 4
+            // is done, stop" answered "acknowledged", then the failing checks of another task's
+            // files sent it on for twenty more steps).
+            if answering_session {
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
+            }
             if checked_nothing && !told_checked_nothing {
                 told_checked_nothing = true;
                 journal.note(&env.run_id, "no_tests", &env.data.text("done_without_tests", &[]), true).await?;
@@ -1102,6 +1198,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             continue;
         }
 
+        answering_session = false;
         // Journal the model's calls as written, then execute them in order.
         let mut call_seqs = Vec::new();
         for call in &result.tool_calls {
@@ -1134,8 +1231,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             // A waiting message skips the calls that would change something; reads already sent run,
             // so the model does not send them again after the message (seen: 46 reads skipped and
-            // re-sent in one run).
-            let steer_waiting = index > 0 && call.name != "read" && !journal.pending_steers("steer").is_empty();
+            // re-sent in one run). An agent's calls all run and its session's message comes with
+            // their results: skipping them threw away edits it had decided (seen: two prepared edits
+            // lost twice to the session's "keep going" messages). A stop reaches it as a real stop.
+            let steer_waiting = index > 0 && call.name != "read" && !matches!(spec.kind, LoopKind::Agent { .. }) && !journal.pending_steers("steer").is_empty();
             if stopped || steer_waiting || env.stops.park.is_cancelled() || env.stops.cancel.is_cancelled() {
                 let why = if steer_waiting { env.data.text("skipped_steer", &[]) } else { env.data.text("skipped_stopped", &[]) };
                 journal
@@ -1230,6 +1329,20 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         {
                             let path = outcome.args.get("path").and_then(Value::as_str).unwrap_or("the file");
                             data["output"] = json!(env.data.text("read_unchanged", &[("path", path)]));
+                            data["unchanged"] = json!(true);
+                            data["repeat_of"] = json!(earlier);
+                        }
+                    }
+                    // A range of a file whose lines an earlier read still in view shows, the file
+                    // unchanged since: a pointer to that read (seen: one file read in fifteen ranges
+                    // after a whole read, some ranges twice).
+                    if outcome.tool == "read" && outcome.ok && data.get("unchanged").is_none() {
+                        let entries = journal.entries_vec();
+                        let path = read_target(&outcome.args);
+                        if let Some((earlier, earlier_output)) = covered_by_earlier_read(&entries, &path)
+                            && crate::projection::project(&entries, &env.data).iter().any(|message| message.content.contains(earlier_output.as_str()))
+                        {
+                            data["output"] = json!(env.data.text("read_in_view", &[]));
                             data["unchanged"] = json!(true);
                             data["repeat_of"] = json!(earlier);
                         }

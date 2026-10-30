@@ -6,10 +6,14 @@
 //! endpoint listens on. The others read it, skip files whose process is gone, and take those
 //! nodes as members marked `local`, dialed straight over loopback (no relay, no lookup).
 //!
-//! The trust lives only here, never in the signed membership log: each app keeps its own log (and
-//! may be in a network with other computers), a log entry would admit the node on every member
-//! computer too, and logs of two networks cannot merge. Being able to write into this user's
-//! folder is the proof; the trust ends when the file or its process goes.
+//! The trust lives here, apart from the signed membership log: each app keeps its own log (and
+//! may be in a network with other computers), and logs of two networks cannot merge. Being able to
+//! write into this user's folder is the proof; the trust ends when the file or its process goes.
+//!
+//! One step crosses into the log: an app in no network asks the others on this machine to take it
+//! into theirs (`Mesh::join_local`, every 15 s), and one in a network with other computers adds it
+//! (`Mesh::admit_local`), so it is a member on every computer of that network too. An app that left
+//! the network or was removed from it is not taken back without an invitation.
 
 use cc_protocol::contracts::mesh::Member;
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
@@ -125,6 +129,36 @@ pub fn loopback(bound: &[std::net::SocketAddr]) -> Vec<String> {
 }
 
 impl crate::service::Mesh {
+    /// While this node is in no network, ask each connected app on this machine to take it into
+    /// its own network; the first in a network with other computers does (`Mesh::admit_local`).
+    pub async fn join_local(self: &std::sync::Arc<Self>) {
+        if !self.loaded() || self.network().is_some() {
+            return;
+        }
+        let locals: Vec<String> = crate::service::lock(&self.local).keys().cloned().collect();
+        let nodes: Vec<String> = locals.into_iter().filter(|node| self.connection(node).is_some()).collect();
+        let addrs: Vec<String> = self.my_addr().and_then(|addr| serde_json::to_string(&addr).ok()).into_iter().collect();
+        for node in nodes {
+            let params = serde_json::json!({"name": self.name(), "addrs": addrs});
+            let asked = self.call_member(&node, "mesh.local.join", params, None, tokio_util::sync::CancellationToken::new()).await;
+            let entries: Vec<crate::members::Entry> = match asked {
+                Ok(answer) => serde_json::from_value(answer.get("entries").cloned().unwrap_or_default()).unwrap_or_default(),
+                Err(error) => {
+                    tracing::debug!(node = %&node[..node.len().min(10)], error = %error.message, "an app on this machine did not take this one into its network");
+                    continue;
+                }
+            };
+            match self.adopt_log(entries) {
+                Ok(()) => {
+                    tracing::info!("joined the network of an app on this machine");
+                    self.dial_all().await;
+                    return;
+                }
+                Err(reason) => tracing::warn!(%reason, "the network of an app on this machine was not taken"),
+            }
+        }
+    }
+
     /// One model per machine, asked by this frame's model plugin before it loads a model tagged
     /// `to_tag`: every app on this machine whose model is not tagged so unloads it. Each is
     /// reached directly (dialed now when not connected yet: the apps may have started together)

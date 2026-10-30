@@ -161,6 +161,32 @@ function Tasks({ projectId }: { projectId: string }) {
   );
 }
 
+/** What an agent is doing right now, as the board shows it: the record's status read with the scheduler's lists. */
+type AgentState = 'running' | 'waiting' | 'blocked' | 'failed' | 'done' | 'stopped';
+
+const STATE_LABEL: Record<AgentState, string> = {
+  running: 'running',
+  waiting: 'waiting for a slot',
+  blocked: 'blocked',
+  failed: 'failed',
+  done: 'done',
+  stopped: 'stopped',
+};
+
+/** Active agents first (running, then waiting, then blocked), the rest after; newest first inside each. */
+const STATE_RANK: Record<AgentState, number> = { running: 0, waiting: 1, blocked: 2, failed: 3, done: 4, stopped: 5 };
+
+function agentState(agent: AgentRecord, running: readonly string[], queued: readonly string[]): AgentState {
+  if (agent.status === 'working' || agent.status === 'running') {
+    if (running.includes(agent.name)) return 'running';
+    return queued.includes(agent.name) ? 'waiting' : 'running';
+  }
+  if (agent.status === 'blocked') return 'blocked';
+  if (agent.status === 'failed') return 'failed';
+  if (agent.status === 'done') return 'done';
+  return 'stopped';
+}
+
 function Agents({ projectId, onOpen }: { projectId: string; onOpen: (sessionId: string) => void }) {
   const client = useClient();
   const now = useNow(30_000, true);
@@ -170,6 +196,16 @@ function Agents({ projectId, onOpen }: { projectId: string; onOpen: (sessionId: 
     `agents.list:${projectId}`,
     async (c) => (await c.call<{ agents: AgentRecord[] }>('agents.list', { project_id: projectId }))?.agents ?? [],
     { topics: ['agents.changed'] },
+  );
+  const scheduler = useQuery<{ running: string[]; queued: string[]; max_parallel: number }>(
+    'agents.scheduler',
+    (c) => c.call('agents.scheduler', {}),
+    { topics: ['agents.changed'] },
+  );
+  const tasks = useQuery<Task[]>(
+    `memory.task.list:${projectId}`,
+    async (c) => (await c.call<{ tasks: Task[] }>('memory.task.list', { project_id: projectId }))?.tasks ?? [],
+    { topics: ['memory.task.changed', 'agents.changed'] },
   );
   const act = async (key: string, method: string, params: Record<string, unknown>) => {
     setBusy(key);
@@ -186,52 +222,54 @@ function Agents({ projectId, onOpen }: { projectId: string; onOpen: (sessionId: 
   if (agents.error && !agents.data) return <ServiceProblem service="agents" state={agents} className="inline-error" />;
   if (!agents.data) return <p className="empty-line">Reading agents…</p>;
   if (agents.data.length === 0) return <p className="empty-line">No agents in this project yet.</p>;
+  const running = scheduler.data?.running ?? [];
+  const queued = scheduler.data?.queued ?? [];
+  const titles = new Map((tasks.data ?? []).map((task) => [task.id, task.title]));
+  const rows = agents.data
+    .map((agent) => ({ agent, state: agentState(agent, running, queued) }))
+    .sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || b.agent.updated_ms - a.agent.updated_ms);
   return (
     <>
       {error && <p className="inline-error" role="alert">{error}</p>}
-      <ul className="lst cx-agent-list">
-        {agents.data.map((agent) => {
-          const working = agent.status === 'working' || agent.status === 'running' || agent.status === 'blocked';
+      <ul className="cx-agent-list">
+        {rows.map(({ agent, state }) => {
+          const working = state === 'running' || state === 'waiting' || state === 'blocked';
+          const title = agent.task_id ? titles.get(agent.task_id) ?? agent.task_id : null;
           return (
-            <li key={agent.name} data-agent={agent.name} data-status={agent.status}>
-              <div className="cx-agent-row">
-                <div className="t"><span className="cx-at">@{agent.name}</span> <span className="ap faint">{agent.role}</span></div>
-                <div className="r">
-                  <span className={`ap ${working ? 'live' : 'faint'}`}>{agent.status}</span>
-                  {agent.task_id && <span className="ap faint">{agent.task_id}</span>}
-                  <span className="ap faint">{agent.tasks_done ?? 0} done · {agent.tasks_failed ?? 0} failed</span>
-                  <span className="grow" />
-                  <span className="ap faint">{ago(agent.updated_ms, now)}</span>
-                </div>
-                {agent.charter && <p className="cx-task-brief">{agent.charter}</p>}
-                <div className="cx-agent-acts">
-                  <button className="detent" type="button" disabled={!agent.session_id} onClick={() => agent.session_id && onOpen(agent.session_id)}>Open session</button>
-                  {agent.task_id && (
-                    <button className="detent" type="button" disabled={busy !== null}
-                      onClick={() => void act(`verify:${agent.name}`, 'agents.verify', { task_id: agent.task_id })}>
-                      {busy === `verify:${agent.name}` ? 'Verifying…' : 'Verify'}
-                    </button>
-                  )}
-                  {!working && agent.workspace && (
-                    <button className="detent" type="button" disabled={busy !== null}
-                      onClick={() => void act(`merge:${agent.name}`, 'agents.merge', { project_id: projectId, agent: agent.name })}>
-                      {busy === `merge:${agent.name}` ? 'Merging…' : 'Merge'}
-                    </button>
-                  )}
-                  {working && (
-                    <button className="detent warn" type="button" disabled={busy !== null}
-                      onClick={() => void act(`stop:${agent.name}`, 'agents.stop', { project_id: projectId, agent: agent.name })}>
-                      {busy === `stop:${agent.name}` ? 'Stopping…' : 'Stop'}
-                    </button>
-                  )}
-                  {(agent.status === 'blocked' || agent.status === 'stopped') && agent.session_id && agent.task_id && (
-                    <button className="detent" type="button" disabled={busy !== null}
-                      onClick={() => void act(`restart:${agent.name}`, 'agents.restart', { project_id: projectId, agent: agent.name })}>
-                      {busy === `restart:${agent.name}` ? 'Restarting…' : 'Restart'}
-                    </button>
-                  )}
-                </div>
-              </div>
+            <li key={agent.name} className="cx-agent-row" data-agent={agent.name} data-state={state} title={agent.charter ?? undefined}>
+              <i className="cx-agent-pip" aria-hidden />
+              <span className="cx-at">@{agent.name}</span>
+              <span className="ap cx-agent-state">{STATE_LABEL[state]}</span>
+              <span className="cx-agent-task" title={title ?? undefined}>{title ?? agent.role}</span>
+              <span className="ap faint cx-agent-count">{agent.tasks_done ?? 0}✓ {agent.tasks_failed ?? 0}✗</span>
+              <span className="ap faint cx-agent-ago">{ago(agent.updated_ms, now)}</span>
+              <span className="cx-agent-acts">
+                <button className="detent tiny" type="button" disabled={!agent.session_id} onClick={() => agent.session_id && onOpen(agent.session_id)}>Open</button>
+                {agent.task_id && (
+                  <button className="detent tiny" type="button" disabled={busy !== null}
+                    onClick={() => void act(`verify:${agent.name}`, 'agents.verify', { task_id: agent.task_id })}>
+                    {busy === `verify:${agent.name}` ? 'Verifying…' : 'Verify'}
+                  </button>
+                )}
+                {!working && agent.workspace && (
+                  <button className="detent tiny" type="button" disabled={busy !== null}
+                    onClick={() => void act(`merge:${agent.name}`, 'agents.merge', { project_id: projectId, agent: agent.name })}>
+                    {busy === `merge:${agent.name}` ? 'Merging…' : 'Merge'}
+                  </button>
+                )}
+                {(agent.status === 'blocked' || agent.status === 'stopped') && agent.session_id && agent.task_id && (
+                  <button className="detent tiny" type="button" disabled={busy !== null}
+                    onClick={() => void act(`restart:${agent.name}`, 'agents.restart', { project_id: projectId, agent: agent.name })}>
+                    {busy === `restart:${agent.name}` ? 'Restarting…' : 'Restart'}
+                  </button>
+                )}
+                {working && (
+                  <button className="detent tiny warn" type="button" disabled={busy !== null}
+                    onClick={() => void act(`stop:${agent.name}`, 'agents.stop', { project_id: projectId, agent: agent.name })}>
+                    {busy === `stop:${agent.name}` ? 'Stopping…' : 'Stop'}
+                  </button>
+                )}
+              </span>
             </li>
           );
         })}
@@ -267,7 +305,7 @@ function Messages({ projectId }: { projectId: string }) {
       setBusy(false);
     }
   };
-  const messages = [...(board.data ?? [])].sort((a, b) => a.ts_ms - b.ts_ms);
+  const messages = [...(board.data ?? [])].sort((a, b) => b.ts_ms - a.ts_ms).slice(0, 20);
   return (
     <>
       {board.error && !board.data && <ServiceProblem service="memory" state={board} className="inline-error" />}

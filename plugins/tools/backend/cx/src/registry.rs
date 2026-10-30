@@ -720,6 +720,21 @@ pub fn commands() -> Vec<Command> {
             format: format_cancelled,
         },
         Command {
+            path: "agent finish",
+            method: "agents.finish",
+            summary: "Take an agent's task as done as it stands: it stops now and its work is checked in the project.",
+            positional: &["agent"],
+            schema: schema(json!({"agent": name("Agent name (@name works too).")}), &["agent"]),
+            prepare: Prepare::None,
+            build: |context, mut args| {
+                if let Some(Value::String(agent)) = args.get_mut("agent") {
+                    *agent = agent.trim_start_matches('@').to_owned();
+                }
+                Ok(with(args, json!({"project_id": context.project()?})))
+            },
+            format: format_json,
+        },
+        Command {
             path: "agent restart",
             method: "agents.restart",
             summary: "Put a blocked or stopped agent back on its task.",

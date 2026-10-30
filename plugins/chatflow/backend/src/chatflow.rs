@@ -1741,10 +1741,13 @@ fn touch_reads(scope: &Scope, session_id: &str, touches: &[String], limits: &cra
     let mut files = Vec::new();
     let mut symbols = Vec::new();
     for touch in touches {
-        // Structural: an existing path in the workspace is a file.
-        if std::path::Path::new(&scope.workspace).join(touch).is_file() {
-            files.push(touch.clone());
-        } else {
+        let path = std::path::Path::new(&scope.workspace).join(touch.trim());
+        // Structural: an existing file or folder of the workspace is read (a folder is listed);
+        // a path that does not exist yet (`src/new.rs`, `tests/`) is the task's to make and is not
+        // looked up; any other name is a symbol (seen: `src/` and `tests/` looked up as symbols).
+        if path.is_file() || path.is_dir() {
+            files.push(touch.trim().trim_end_matches('/').to_owned());
+        } else if !touch.contains('/') && std::path::Path::new(touch.trim()).extension().is_none() {
             symbols.push(touch.clone());
         }
     }

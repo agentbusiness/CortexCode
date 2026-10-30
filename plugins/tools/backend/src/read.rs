@@ -10,9 +10,9 @@ use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct ReadConfig {
-    /// Files longer than this (lines) are shown as an outline when read without a range.
+    /// Files longer than twice this (lines) are shown as an outline when read without a range.
     pub outline_lines: usize,
-    /// Files bigger than this (bytes) are shown as an outline when read without a range.
+    /// Files bigger than twice this (bytes) are shown as an outline when read without a range.
     pub outline_bytes: usize,
     /// Files at least this big (bytes) read whole with an intent are shown focused on it
     /// ([`Focus`]) when parts of them clearly match it.
@@ -21,8 +21,9 @@ pub struct ReadConfig {
 
 impl Default for ReadConfig {
     fn default() -> Self {
-        // A whole read shows at most 400 lines (about 4-6k tokens); a bigger file gives its outline
-        // and is read by range. A read never fills the model's context with one file.
+        // A whole read shows up to twice these (600 lines, 48 KB: about 8-12k tokens); a bigger file
+        // gives its outline or its focused view and is read by name or range. A read never fills
+        // the model's context with one file.
         Self { outline_lines: 300, outline_bytes: 24 * 1024, focus_bytes: 6 * 1024 }
     }
 }
@@ -275,23 +276,19 @@ fn render_focus(path: &Path, display: &str, text: &str, doc: &Doc, focus: &Focus
     }
     let hidden = |from: usize, to: usize| from < to && !doc.lines[from..to].iter().all(|line| line.trim().is_empty());
     let mut body = String::new();
-    let mut example: Option<(usize, usize)> = None;
     let mut next = 0usize;
     for row in &rows {
         if hidden(next, *row) {
             let _ = writeln!(body, "   ⋮ {}-{}", next + 1, row);
-            example.get_or_insert((next + 1, *row));
         }
         body.push_str(&doc.render(row + 1, row + 1));
         next = row + 1;
     }
     if hidden(next, total) {
         let _ = writeln!(body, "   ⋮ {}-{}", next + 1, total);
-        example.get_or_insert((next + 1, total));
     }
-    let (from, to) = example.unwrap_or((1, total));
     Some(format!(
-        "{display}: {total} lines; the parts that match what this read is for are shown whole, the others by their first line (⋮ N-M marks lines left out). Read a left-out part by its range, e.g. {display}:{from}-{to}.\n{body}"
+        "{display}: {total} lines; the parts that match what this read is for are shown whole, the others by their first line (⋮ N-M marks lines left out). Read a function whole by its name, e.g. {display}#<name>, or the whole file with {display}:1-.\n{body}"
     ))
 }
 
@@ -377,14 +374,19 @@ pub fn read_file(path: &Path, display: &str, range: Option<&str>, config: &ReadC
         return Ok(view(out, "range"));
     }
 
-    if let Some(focus) = focus
+    // A file up to twice a whole read's size is shown whole, whatever the read is for: a partial
+    // view of it sent the model back for each left-out part (seen: a 453-line file read in fifteen
+    // ranges, some of them twice, and read again with another intent to see other parts).
+    let whole = total <= config.outline_lines * 2 && bytes.len() <= config.outline_bytes * 2;
+    if !whole
+        && let Some(focus) = focus
         && bytes.len() >= config.focus_bytes
         && let Some(out) = render_focus(path, display, &text, &doc, focus)
     {
         return Ok(view(out, "focus"));
     }
 
-    if total <= config.outline_lines && bytes.len() <= config.outline_bytes {
+    if whole {
         let mut out = format!("{display}:\n");
         out.push_str(&doc.render(1, total));
         // The whole file, as it is on disk now: the current, complete view.
@@ -463,7 +465,7 @@ pub fn render_outline(path: &Path, display: &str, text: &str, doc: &Doc, hint: b
             Some((row, following)) => format!("{display}:{}-{following}", row + 1),
             None => format!("{display}:1-{}", total.min(100)),
         };
-        let _ = write!(out, " Read one definition by its name, e.g. {display}#<name>, or a range, e.g. {example}.");
+        let _ = write!(out, " Read one definition by its name, e.g. {display}#<name>, a range, e.g. {example}, or the whole file with {display}:1-.");
     }
     out.push('\n');
     out.push_str(&body);

@@ -76,6 +76,10 @@ pub mod methods {
     /// model (off: its card shows no model and its claims are refused); this computer still uses
     /// theirs.
     pub const LEND: &str = "mesh.lend";
+    /// [`super::AllowParams`] -> [`super::MeshStatus`]: whether one member may work on this
+    /// computer (CortexCode: see its projects; CortexTerm: open a session). A member not allowed is
+    /// offered nothing here (its card from this computer has no projects) and its window refused.
+    pub const ALLOW: &str = "mesh.allow";
     /// `{}` -> [`super::ServicesResult`]: every shared service this computer and its members offer
     /// (`crate::contracts::service`), with what each takes from this computer.
     pub const SERVICES: &str = "mesh.services";
@@ -83,10 +87,6 @@ pub mod methods {
     /// of a shared service. `edit` and `run` go to this machine's provider (this app, or another
     /// app on this machine); `read` goes to `node`, or the first provider found.
     pub const SERVICE_CALL: &str = "mesh.service.call";
-    /// `{}` -> [`super::SharesResult`]: what this computer's services take, per service.
-    pub const SHARES: &str = "mesh.shares";
-    /// [`super::SharesSetParams`] -> [`super::SharesResult`]: the person's switches for one service.
-    pub const SHARES_SET: &str = "mesh.shares.set";
 }
 
 pub mod topics {
@@ -303,6 +303,9 @@ pub struct MeshStatus {
     /// Members may use this computer's model (`mesh.lend`).
     #[serde(default = "lends_by_default")]
     pub lend: bool,
+    /// The members that may work on this computer (`mesh.allow`), by node id.
+    #[serde(default)]
+    pub allowed: Vec<String>,
 }
 
 fn lends_by_default() -> bool {
@@ -312,6 +315,12 @@ fn lends_by_default() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct LendParams {
     pub lend: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AllowParams {
+    pub node: String,
+    pub allowed: bool,
 }
 
 /// A network: the computers joined together, named by the computer that started it.
@@ -508,23 +517,3 @@ pub struct ServiceCallParams {
     pub node: String,
 }
 
-/// This computer's services and the person's switches for each.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct SharesResult {
-    pub shares: Vec<ShareSetting>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ShareSetting {
-    pub share: crate::contracts::service::Share,
-    pub allowed: crate::contracts::service::Allowed,
-    /// Calls served for others in the last 30 days.
-    #[serde(default)]
-    pub served: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct SharesSetParams {
-    pub service: String,
-    pub allowed: crate::contracts::service::Allowed,
-}

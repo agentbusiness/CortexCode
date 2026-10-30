@@ -1,18 +1,17 @@
 //! Shared services (`cc_protocol::contracts::service`): what this computer's plugins share, which
 //! calls of a member are taken, a record of what was served, and where a call of this computer
-//! goes.
+//! goes. Sharing is always on; there is nothing to set.
 //!
 //! - Each active plugin is asked `<category>.shares` once per build; what it declares is shown on
 //!   the card and is all that members may call (besides the model, which has its own sharing).
-//! - A member's call is taken when its method is declared, its verb's access is allowed for where
-//!   the member is (`read` from anywhere; `edit` and `run` only from an app on this machine), and
-//!   the person's switches for the service allow it (setting `mesh.shares`). The mesh stamps
-//!   who asked into the params as `caller`.
+//! - A member's call is taken when its method is declared and its verb's access is allowed for
+//!   where the member is (`read` from anywhere; `edit` and `run` only from an app on this
+//!   machine). The mesh stamps who asked into the params as `caller`.
 //! - Every call served for another app is a record of stream `mesh.served` (kept 30 days).
 
 use crate::service::{Mesh, lock};
-use cc_protocol::contracts::mesh::{OfferedService, ServiceCallParams, ServiceCard, ServicesResult, ShareSetting, SharesResult, SharesSetParams};
-use cc_protocol::contracts::service::{self as svc, Access, Allowed, Caller, Share, ShareList};
+use cc_protocol::contracts::mesh::{OfferedService, ServiceCallParams, ServiceCard, ServicesResult};
+use cc_protocol::contracts::service::{self as svc, Access, Caller, Share, ShareList};
 use cc_protocol::{Ctx, RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -21,15 +20,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// How long the record of served calls is kept.
-const KEEP_MS: u64 = crate::store::SERVED_DAYS as u64 * 24 * 60 * 60 * 1000;
-
 #[derive(Default)]
 pub struct Services {
     /// `plugin_id@instance` -> what that plugin build shares.
     declared: Mutex<HashMap<String, Vec<Share>>>,
-    /// The person's switches, by service.
-    pub(crate) allowed: Mutex<Option<HashMap<String, Allowed>>>,
     /// A member's full declarations, by node, with the card time they were read at.
     theirs: Mutex<HashMap<String, (u64, Vec<Share>)>>,
 }
@@ -78,15 +72,6 @@ impl Mesh {
             .collect()
     }
 
-    fn allowed_map(&self) -> HashMap<String, Allowed> {
-        // Read from the store at start; the defaults until then.
-        lock(&self.services.allowed).clone().unwrap_or_default()
-    }
-
-    pub fn allowed(&self, service: &str) -> Allowed {
-        self.allowed_map().remove(service).unwrap_or_default()
-    }
-
     /// Whether a member's call of `method` is taken; its params with `caller` stamped in.
     pub async fn accept_call(&self, node: &str, method: &str, mut params: Value) -> Result<Value, RpcError> {
         let refuse = |why: String| RpcError::new(codes::CONTRACT_VIOLATION, why);
@@ -103,9 +88,6 @@ impl Mesh {
                 "`{method}` {}s on this machine only for apps on this machine: work runs where its project is",
                 access.as_str()
             )));
-        }
-        if !self.allowed(service).takes(access, local) {
-            return Err(refuse(format!("this computer does not take `{}` calls of {service} from {}", access.as_str(), if local { "apps on it" } else { "other computers" })));
         }
         let card = lock(&self.cards).get(node).cloned();
         let theirs: Caller = params.get("caller").cloned().and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
@@ -127,43 +109,6 @@ impl Mesh {
     /// One served call, for the record.
     pub fn served(&self, node: &str, method: &str, ok: bool, ms: u64) {
         self.write(crate::store::Write::Served(json!({"at": now_ms(), "node": node, "method": method, "ok": ok, "ms": ms})));
-    }
-
-    /// The served calls of the last 30 days, from the store (none while it is not read).
-    async fn served_lines(&self) -> Vec<Value> {
-        let Some((call, _)) = self.store.get() else { return Vec::new() };
-        if !self.loaded() {
-            return Vec::new();
-        }
-        crate::store::read_served(call, now_ms().saturating_sub(KEEP_MS)).await.unwrap_or_else(|error| {
-            tracing::debug!(error = %error.message, "served calls not read");
-            Vec::new()
-        })
-    }
-
-    pub async fn shares_result(&self) -> SharesResult {
-        let lines = self.served_lines().await;
-        let allowed = self.allowed_map();
-        let shares = self
-            .local_shares()
-            .await
-            .into_iter()
-            .map(|share| {
-                let prefix = format!("{}.", share.service);
-                let served = lines.iter().filter(|line| line["method"].as_str().is_some_and(|m| m.starts_with(&prefix))).count() as u64;
-                ShareSetting { allowed: allowed.get(&share.service).cloned().unwrap_or_default(), share, served }
-            })
-            .collect();
-        SharesResult { shares }
-    }
-
-    pub async fn set_shares(&self, params: SharesSetParams) -> Result<SharesResult, RpcError> {
-        let mut map = self.allowed_map();
-        map.insert(params.service, params.allowed);
-        self.write(crate::store::Write::Setting(crate::store::SHARES_SETTING, serde_json::to_value(&map).map_err(|e| RpcError::internal(e.to_string()))?));
-        *lock(&self.services.allowed) = Some(map);
-        self.notify("services");
-        Ok(self.shares_result().await)
     }
 
     /// A member's full declarations (asked of it when its card changed).
