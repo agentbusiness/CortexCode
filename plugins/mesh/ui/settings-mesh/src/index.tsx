@@ -12,7 +12,7 @@ import './mesh.css';
 
 interface Member { node: string; name: string; added_ms: number; by: string }
 interface ModelCard { model_id: string; variant: string; family: string; tags?: string[]; slots: number; slots_busy: number; queued: number; tok_s: number }
-interface Card { chip: string; memory_bytes: number; free_memory_bytes: number; on_mains: boolean; user_active: boolean; model?: ModelCard | null; languages: { id: string; version: string }[]; docker: boolean; agents_running: number }
+interface Card { software: string; chip: string; memory_bytes: number; free_memory_bytes: number; on_mains: boolean; user_active: boolean; model?: ModelCard | null; languages: { id: string; version: string }[]; docker: boolean; agents_running: number }
 interface Peer { member: Member; card?: Card | null; reachable: boolean; path: string; rtt_ms: number; serving: string[] }
 interface PairCode { code: string; expires_ms: number; invitation: string }
 interface Placed { session_id: string; node: string; name: string }
@@ -31,6 +31,13 @@ function gb(bytes: number): string {
 /** A toolchain's version number out of its tool's own line ("Apple clangd version 21.0.0 (…)" -> 21.0.0). */
 function shortVersion(version: string): string {
   return /\d+(?:\.\d+)+/.exec(version)?.[0] ?? '';
+}
+
+/** The app identifies itself in its card; model tags do not identify the app. */
+function softwareName(software?: string): string {
+  if (software === 'cortexcode') return 'CortexCode';
+  if (software === 'cortexterm') return 'CortexTerm';
+  return software || 'unknown';
 }
 
 function where(path: string): string {
@@ -148,6 +155,9 @@ function MeshPanel() {
                   <span className={`ap ${peer.reachable ? 'live' : 'faint'}`}>{peer.reachable ? `${where(peer.path)}${peer.rtt_ms ? ` · ${peer.rtt_ms} ms` : ''}` : 'not reachable now'}</span>
                 </span>
                 <button type="button" className="detent tiny warn" data-action="revoke" disabled={busy !== null} onClick={() => void run('revoke', async () => { await client.call('mesh.revoke', { node: member.node }); return `${member.name} removed`; })}>Remove</button>
+                <span className="ap">Software</span>
+                <span className="v">{softwareName(card?.software)}</span>
+                <span />
                 <span className="ap">{ALLOW_LABEL}</span>
                 <span className="v">{ALLOW_TEXT}</span>
                 <button type="button" className="sw" data-action="allow" aria-pressed={allowed} aria-label={`${member.name} ${ALLOW_TEXT}`} disabled={busy !== null} onClick={() => void run('allow', async () => { await client.call('mesh.allow', { node: member.node, allowed: !allowed }); })} />

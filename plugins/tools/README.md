@@ -12,6 +12,13 @@ CORTEX_HOME, temp, package caches) and, for Python projects without their own en
 automatic per-workspace `uv` venv under `CORTEX_HOME/venvs` (`pyenv`), so nothing reaches the
 system Python or Homebrew.
 
+A user's request to commit or push authorizes the ordinary Git steps, including staging; there is
+no additional approval prompt in Auto or Ask mode. Destructive Git operations (discarding work,
+deleting refs, rewriting history, force pushes) still need a one-time confirmation in either mode.
+`approval::git_destructive` inspects every command in a shell script before any of it runs. Plain
+pushes use `vcs.push`, including the GitHub connection from Settings. This is a source change for
+the next tools release after 0.1.18; it requires installing that release to affect the running app.
+
 One self-contained plugin folder, separable into its own repository (only `cc-protocol` comes from
 outside):
 

@@ -21,6 +21,8 @@ pub mod browser;
 pub mod chatflow;
 #[cfg(feature = "container")]
 pub mod container;
+#[cfg(feature = "filebrowser")]
+pub mod filebrowser;
 #[cfg(feature = "lang")]
 pub mod lang;
 #[cfg(feature = "memory")]
@@ -57,6 +59,8 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("tools", "tools@1"),
     ("vcs", "vcs@1"),
     ("terminal", "terminal@1"),
+    ("filebrowser", "filebrowser@1"),
+    ("filebrowser-native", "filebrowser-native@1"),
     ("agents", "agents@1"),
     ("browser", "browser@1"),
     ("source", "source@1"),

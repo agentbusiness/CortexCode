@@ -398,7 +398,7 @@ impl Core {
         crate::pyenv::remove(&self.graph, &crate::pyenv::auto_dir(&self.home, workspace));
     }
 
-    /// Use up a one-time approval (a repository change the user allowed once): true when it was
+    /// Use up a one-time approval (a destructive git action the user allowed once): true when it was
     /// given, and it is gone afterwards.
     pub fn take_approval(&self, session: &str, class: &str) -> bool {
         let taken = self.approvals().get_mut(session).is_some_and(|entry| entry.remove(class));

@@ -215,6 +215,7 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
 5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through.\n\
 6. {network}\n\
+7. Git: a commit or push request is permission for its normal steps, including staging. Use run without `permission`; do not ask again. Only commit or push when requested. Destructive actions (discard edits, delete refs, rewrite history, force push) get a separate confirmation before running.\n\
 Give every call a short `intent` first.\n\
 \n\
 Working with files:\n\

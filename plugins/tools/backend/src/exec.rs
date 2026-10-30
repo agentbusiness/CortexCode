@@ -2489,40 +2489,41 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let venv_path = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
     let writable = |path: &Path| core.sandbox.writable(path, &session.workspace, venv_path.as_deref(), &runtime.grants);
     let session_id = &session.context.session_id;
-    // Platform rule: the repository's state (commits, branches, files git restores) changes only on
-    // the user's word, never on the model's decision. Each such command waits for the user's
-    // approval of that exact command, in every mode; reading history runs at once (seen: a model's
-    // `git checkout <file>` threw away twenty minutes of its own work).
-    if let Some(git) = crate::approval::git_change(command) {
+    // A user's commit/push request authorizes the routine steps. Only operations that can
+    // discard work, remove refs or rewrite history need a separate confirmation in every mode.
+    if let Some(git) = crate::approval::git_destructive(command) {
         let class = format!("git_change:{git}");
         // An approval runs the command once; the next one is asked again.
         if !core.take_approval(session_id, &class) {
             let mut out = Out::fail(
                 "needs_approval",
                 format!(
-                    "Not run: `{git}` changes the repository, which only the user decides; they have been asked about this command. Meanwhile read with git (status, diff, log, show, blame) and keep working with edit; a file's committed text is `git show HEAD:<path>`."
+                    "Not run: `{git}` can discard work or change existing history, refs or repository settings. Confirm this action before it runs."
                 ),
             );
             out.needs_approval = true;
-            out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false } });
+            out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": true } });
             return out;
         }
-        // An approved plain push goes through the git plugin, the same push as the app's Push
-        // button: the repository's own setup first, else the GitHub sign-in from Settings.
-        if let Some((remote, branch)) = plain_push(command) {
-            let params = json!({ "root": effective_cwd.display().to_string(), "remote": remote, "branch": branch });
-            return match host.call(cc_protocol::contracts::vcs::methods::PUSH, params).await {
-                Ok(result) => {
-                    let text = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
-                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                        Out::ok(format!("Pushed {} to {}. {}", text("branch"), text("remote"), text("detail")).trim_end().to_owned())
-                    } else {
-                        Out::fail("push_failed", format!("Push failed: {}", text("detail")))
-                    }
-                }
-                Err(error) => Out::fail("push_failed", format!("Push failed: {}", error.message)),
-            };
+    }
+    // A requested plain push goes through the git plugin, the same push as the app's Push
+    // button: the repository's own setup first, else the GitHub sign-in from Settings.
+    if let Some((remote, branch)) = plain_push(command) {
+        if session.workspace.join(crate::sandbox::OFFLINE_MARKER).exists() {
+            return Out::fail("offline", "Not run: this workspace is offline. Push from a workspace with network access.".to_owned());
         }
+        let params = json!({ "root": effective_cwd.display().to_string(), "remote": remote, "branch": branch });
+        return match host.call(cc_protocol::contracts::vcs::methods::PUSH, params).await {
+            Ok(result) => {
+                let text = |key: &str| result.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Out::ok(format!("Pushed {} to {}. {}", text("branch"), text("remote"), text("detail")).trim_end().to_owned())
+                } else {
+                    Out::fail("push_failed", format!("Push failed: {}", text("detail")))
+                }
+            }
+            Err(error) => Out::fail("push_failed", format!("Push failed: {}", error.message)),
+        };
     }
     // Past the sandbox: the model asks with `permission` (why the command needs it); the user decides
     // in every mode, and the approved command runs without the sandbox.

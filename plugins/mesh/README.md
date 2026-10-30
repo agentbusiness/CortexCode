@@ -117,3 +117,9 @@ This computer's name and the network it is on (who started it, when), with Leave
 the invitation; Join (paste an invitation); the joined computers: where they are (this network,
 remote), what they have (model and its tags, free or busy, languages, Docker), what they do for this computer
 right now, and Remove.
+
+
+Mesh 0.1.18 (source update; not built or released): each joined computer has a **Software** row
+showing **CortexCode** or **CortexTerm** from its capability card's existing `software` field.
+An unavailable card shows `unknown`; other software names are shown as reported. This display
+change is mirrored in both apps; the wire contract is unchanged.

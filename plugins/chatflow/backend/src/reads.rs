@@ -10,16 +10,16 @@ use crate::journal::Journal;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::frame::kinds;
 use cc_protocol::contracts::memory::{
-    CallSite, EdgesResult, ImpactResult, KnowledgeLinkedResult, OutlineResult, RepoMapResult, SearchResult, SymbolMatches, SymbolRef,
+    BoardListResult, CallSite, EdgesResult, ImpactResult, KnowledgeLinkedResult, OutlineResult, RepoMapResult, SearchResult, SymbolMatches, SymbolRef, TaskListResult,
     methods as memory_methods,
 };
-use cc_protocol::contracts::agents::methods as agents_methods;
+use cc_protocol::contracts::agents::{ListResult as AgentsListResult, methods as agents_methods};
 use cc_protocol::contracts::lang::{self, LanguageInfo};
 use cc_protocol::contracts::tools::{ReadResult, methods as tools_methods};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -495,6 +495,37 @@ fn site_line(site: &CallSite) -> String {
 /// Render a read's JSON result as text for the model. Unknown shapes are shown as JSON.
 pub fn render(tool: &str, value: &Value) -> String {
     let rendered = match tool {
+        memory_methods::TASK_LIST => serde_json::from_value::<TaskListResult>(value.clone()).ok().map(|result| {
+            if result.tasks.is_empty() {
+                return "No tasks.".to_owned();
+            }
+            result.tasks.iter().map(|task| format!("[{}] {}", task.status, task.title)).collect::<Vec<_>>().join("\n")
+        }),
+        memory_methods::BOARD_LIST => serde_json::from_value::<BoardListResult>(value.clone()).ok().map(|result| {
+            let mut latest = BTreeMap::new();
+            for message in &result.messages {
+                let previous = latest.entry(&message.author).or_insert(message);
+                if (message.ts_ms, &message.id) > (previous.ts_ms, &previous.id) {
+                    *previous = message;
+                }
+            }
+            if latest.is_empty() {
+                return "No board messages.".to_owned();
+            }
+            latest.values().map(|message| format!("{} ({}): {}", message.author, message.kind, message.text)).collect::<Vec<_>>().join("\n\n")
+        }),
+        agents_methods::LIST => serde_json::from_value::<AgentsListResult>(value.clone()).ok().map(|result| {
+            if result.agents.is_empty() {
+                return "No agents.".to_owned();
+            }
+            result.agents.iter().map(|agent| {
+                if matches!(agent.status.as_str(), "working" | "blocked") {
+                    serde_json::to_string_pretty(agent).unwrap_or_default()
+                } else {
+                    format!("{}: {}", agent.name, agent.status)
+                }
+            }).collect::<Vec<_>>().join("\n")
+        }),
         memory_methods::SEARCH => serde_json::from_value::<SearchResult>(value.clone()).ok().map(|result| {
             if result.hits.is_empty() {
                 return "Nothing found. Search again with other words.".to_owned();
