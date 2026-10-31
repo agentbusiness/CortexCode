@@ -299,6 +299,13 @@ export interface TermSnapshot {
   text: string;
   cursor_row: number;
   cursor_col: number;
+  cols?: number;
+  rows?: number;
+  alive?: boolean;
+  alternate_screen?: boolean;
+  /** Only when requested by a renderer; agent snapshots stay plain text. */
+  restore?: { data: string; offset: number } | null;
+  input_base64?: boolean;
 }
 
 // ─── browser ────────────────────────────────────────────────────────────────

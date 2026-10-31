@@ -1300,14 +1300,13 @@ impl Agents {
         let key = AgentKey { project_id: params.project_id.clone(), name: params.agent.clone() };
         let was_queued = lock(&self.inner.scheduler).dequeue(&key);
         let mut result = CancelResult::default();
-        match &record.task_id {
-            Some(task_id) => {
-                let first = task(&host, task_id).await?;
-                self.cancel_tree(&ctx, &host, &first, &mut result).await?;
-            }
-            None => {
-                self.halt(&ctx, &host, record).await?;
-            }
+        // The controller can still be verifying or merging after its task was marked done.
+        // Stop it before walking tasks: finished tasks are deliberately skipped by cancel_tree.
+        let record = self.halt(&ctx, &host, record).await?;
+        result.agents.push(record.name.clone());
+        if let Some(task_id) = &record.task_id {
+            let first = task(&host, task_id).await?;
+            self.cancel_tree(&ctx, &host, &first, &mut result).await?;
         }
         Ok(json!({"stopped": true, "was_queued": was_queued, "cancelled": result.tasks, "agents": result.agents}))
     }
@@ -1369,11 +1368,13 @@ impl Agents {
         // The run is cancelled while its caller is still there: the controller's end drops the
         // `agent_run` call, and a run whose caller went away parks (no end status, so it would
         // still read as running).
-        if let Some(session_id) = &record.session_id {
-            host.call(&flow_method(host, session_id, chatflow_verbs::CANCEL).await, json!({"session_id": session_id})).await?;
-        }
+        let stopped = match &record.session_id {
+            Some(session_id) => host.call(&flow_method(host, session_id, chatflow_verbs::CANCEL).await, json!({"session_id": session_id})).await.map(|_| ()),
+            None => Ok(()),
+        };
         self.cancel_agent(&key);
         lock(&self.inner.scheduler).dequeue(&key);
+        stopped?;
         if record.status != "done" {
             record.status = "stopped".into();
         }
@@ -1400,9 +1401,14 @@ impl Agents {
                 if lead.is_none() {
                     lead = lead_session(host, &record).await;
                 }
-                let record = self.halt(ctx, host, record).await?;
+                let record = if result.agents.contains(&record.name) {
+                    record
+                } else {
+                    let record = self.halt(ctx, host, record).await?;
+                    result.agents.push(record.name.clone());
+                    record
+                };
                 let stopped = data.text("progress_cancelled_agent", &[("agent", &record.name)]);
-                result.agents.push(record.name.clone());
                 progress(host, lead.as_deref(), &data.text("progress_cancelled", &[("title", &current.title), ("agent", &stopped)]), &record).await;
             }
             update_task(host, json!({"id": current.id, "status": "cancelled"})).await?;

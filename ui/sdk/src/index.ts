@@ -75,3 +75,5 @@ export { byOrder, contributions, pluginLabel, slotName } from './contrib';
 export type { Contribution } from './contrib';
 export { DEFAULT_MODEL_VARIANT, installLine, plural, useModelState } from './model';
 export type { InstallProgress, ModelInfoData, ModelPhase, ModelSlotsData, ModelState } from './model';
+
+export { connectTerminal } from './terminal';

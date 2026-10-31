@@ -9,10 +9,12 @@
 //! down) hangs up the shell's process group and the foreground job, then kills whatever ignored it.
 
 pub mod probe;
+mod screen;
+use screen::ScreenState;
 
 use base64::Engine;
 use cc_protocol::contracts::terminal::{
-    ExitEvent, ListResult, OpenParams, OutputEvent, ResizeParams, Snapshot, TermInfo, TermParams, WriteParams, topics,
+    ExitEvent, ListResult, OpenParams, OutputEvent, ResizeParams, Snapshot, SnapshotParams, TermInfo, TermParams, WriteParams, topics,
 };
 use cc_protocol::{RpcError, codes, to_value};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -28,9 +30,6 @@ use tokio::sync::{mpsc, watch};
 pub const COALESCE: Duration = Duration::from_millis(16);
 /// A batch this large is published immediately instead of waiting for the window to end.
 const FLUSH_BYTES: usize = 1 << 20;
-/// The emulator keeps no scrollback: snapshots are the visible screen (the contract), and every
-/// byte of output is delivered in `terminal.output` events, where the UI keeps its own history.
-const SCROLLBACK: usize = 0;
 /// Largest screen accepted. The emulator allocates every cell up front, so an absurd size from a
 /// caller (e.g. 65535x65535, four billion cells) would exhaust memory instead of drawing anything.
 const MAX_CELLS: u32 = 4_000_000;
@@ -62,7 +61,7 @@ struct Term {
     size: Mutex<(u16, u16)>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<ScreenState>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     exit: watch::Receiver<Option<Exit>>,
 }
@@ -289,7 +288,7 @@ impl Terminals {
         let writer = pair.master.take_writer().map_err(|e| RpcError::internal(format!("pty writer: {e}")))?;
 
         let id = format!("term-{}", uuid::Uuid::new_v4().simple());
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(params.rows, params.cols, SCROLLBACK)));
+        let parser = Arc::new(Mutex::new(ScreenState::new(params.rows, params.cols)));
         let (exit_tx, exit_rx) = watch::channel(None);
         let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -333,7 +332,12 @@ impl Terminals {
             return Err(RpcError::new(codes::CONFLICT, format!("terminal `{}` has exited", params.term_id)));
         }
         let writer = term.writer.clone();
-        let data = params.data.into_bytes();
+        let data = if params.base64 {
+            base64::engine::general_purpose::STANDARD.decode(&params.data)
+                .map_err(|_| RpcError::invalid_params("terminal input is not valid base64"))?
+        } else {
+            params.data.into_bytes()
+        };
         // A full PTY input buffer blocks the write until the program reads; keep that off the runtime.
         tokio::task::spawn_blocking(move || -> Result<(), RpcError> {
             let mut guard = lock(&writer);
@@ -355,7 +359,7 @@ impl Terminals {
                 .resize(PtySize { rows: params.rows, cols: params.cols, pixel_width: 0, pixel_height: 0 })
                 .map_err(|e| RpcError::internal(format!("resize failed: {e}")))?;
         }
-        lock(&term.parser).screen_mut().set_size(params.rows, params.cols);
+        lock(&term.parser).set_size(params.rows, params.cols);
         *lock(&term.size) = (params.cols, params.rows);
         Ok(term.info())
     }
@@ -374,6 +378,10 @@ impl Terminals {
     }
 
     pub fn snapshot(&self, term_id: &str) -> Result<Snapshot, RpcError> {
+        self.screen_snapshot(term_id, false)
+    }
+
+    fn screen_snapshot(&self, term_id: &str, restore: bool) -> Result<Snapshot, RpcError> {
         let term = self.get(term_id)?;
         let parser = lock(&term.parser);
         let screen = parser.screen();
@@ -388,6 +396,8 @@ impl Terminals {
             rows,
             alive: term.exit.borrow().is_none(),
             alternate_screen: screen.alternate_screen(),
+            restore: if restore { parser.restore() } else { None },
+            input_base64: true,
         })
     }
 
@@ -420,8 +430,8 @@ impl Terminals {
             }
             methods::LIST => to_value(&self.list()),
             methods::SNAPSHOT => {
-                let p: TermParams = parse_params(params)?;
-                to_value(&self.snapshot(&p.term_id)?)
+                let p: SnapshotParams = parse_params(params)?;
+                to_value(&self.screen_snapshot(&p.term_id, p.restore)?)
             }
             other => Err(RpcError::unknown_method(other)),
         }
@@ -431,7 +441,7 @@ impl Terminals {
 fn spawn_reader(
     id: &str,
     mut reader: Box<dyn Read + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<ScreenState>>,
     chunks: mpsc::UnboundedSender<Vec<u8>>,
 ) -> Result<(), RpcError> {
     std::thread::Builder::new()
@@ -464,6 +474,7 @@ fn spawn_reader(
 async fn pump(id: String, mut chunks: mpsc::UnboundedReceiver<Vec<u8>>, mut exit: watch::Receiver<Option<Exit>>, emit: Emit) {
     let engine = base64::engine::general_purpose::STANDARD;
     let mut seq = 0u64;
+    let mut offset = 0u64;
     let mut pending: Vec<u8> = Vec::new();
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut reader_done = false;
@@ -474,7 +485,8 @@ async fn pump(id: String, mut chunks: mpsc::UnboundedReceiver<Vec<u8>>, mut exit
             return;
         }
         seq += 1;
-        let event = OutputEvent { term_id: id.clone(), data: engine.encode(&pending[..]), seq };
+        offset += pending.len() as u64;
+        let event = OutputEvent { term_id: id.clone(), data: engine.encode(&pending[..]), seq, offset: Some(offset) };
         if let Ok(value) = serde_json::to_value(&event) {
             emit(topics::OUTPUT, value);
         }

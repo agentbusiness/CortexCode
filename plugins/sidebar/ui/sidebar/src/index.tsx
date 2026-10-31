@@ -583,7 +583,6 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
                         </div>
                       </button>
                       <DeleteButton what="agent" verb="Stop" detail="its run ends and its task is cancelled; what it changed stays in the files"
-                        confirm={{ title: `Stop @${row.name}?`, body: `@${row.name}'s run ends and its task is cancelled, with the tasks waiting for it. What it already changed stays in the files.`, action: 'Stop agent', busy: 'Stopping…' }}
                         onDelete={async () => {
                           await onStopAgent(row.name);
                           await Promise.all([agents.refresh(), sessions.refresh()]);
@@ -638,8 +637,8 @@ interface Confirm {
   busy?: string;
 }
 
-/** An × shown on hover; a click asks in the theme's confirm dialog, and its action there runs. */
-function DeleteButton({ what, verb = 'Delete', detail, confirm, onDelete }: { what: string; verb?: string; detail: string; confirm: Confirm; onDelete: () => Promise<void> }) {
+/** An × shown on hover; destructive actions supply a confirmation, Stop runs on the click. */
+function DeleteButton({ what, verb = 'Delete', detail, confirm, onDelete }: { what: string; verb?: string; detail: string; confirm?: Confirm; onDelete: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [asking, setAsking] = useState(false);
   const run = async () => {
@@ -658,11 +657,12 @@ function DeleteButton({ what, verb = 'Delete', detail, confirm, onDelete }: { wh
       <button type="button" className="cx-del" data-action={`${verb.toLowerCase()}-${what}`} aria-label={`${verb} ${what}`} title={`${verb} this ${what}: ${detail}`} disabled={busy}
         onClick={(event) => {
           event.stopPropagation();
-          setAsking(true);
+          if (confirm) setAsking(true);
+          else void run();
         }}>
         ×
       </button>
-      {asking && <ConfirmDialog confirm={confirm} busy={busy} onConfirm={() => void run()} onCancel={() => setAsking(false)} />}
+      {asking && confirm && <ConfirmDialog confirm={confirm} busy={busy} onConfirm={() => void run()} onCancel={() => setAsking(false)} />}
     </>
   );
 }
@@ -744,10 +744,12 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
     const name = session.agent ?? session.title;
     const existing = rows.get(name);
     if (existing) {
+      // An agent name can have older sessions. Only its current session supplies live state.
+      if (existing.sessionId && existing.sessionId !== session.id) continue;
       existing.sessionId = existing.sessionId ?? session.id;
       existing.title = session.title || existing.title;
-      // The session's own state is the live one while it runs.
-      if (session.status === 'running') existing.status = 'running';
+      // A persisted running session must not resurrect an agent its controller already ended.
+      if (session.status === 'running' && !leavesList(existing.status)) existing.status = 'running';
       // Its run was stopped from its session: the agent is stopped too, unless it had finished.
       else if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
       existing.updated = Math.max(existing.updated, session.updated_ms);

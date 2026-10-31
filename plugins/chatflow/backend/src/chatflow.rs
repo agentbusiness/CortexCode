@@ -1215,10 +1215,10 @@ impl Chatflow {
     }
 
     async fn cancel(&self, ctx: Ctx, params: SessionParams) -> Result<Value, RpcError> {
-        if let Some((run_id, stops, _, mut done)) = self.active(&params.session_id) {
+        if let Some((run_id, stops, _, _)) = self.active(&params.session_id) {
             stops.cancel.cancel();
-            // Wait (briefly) for the run to acknowledge, so the caller sees the final status.
-            let _ = tokio::time::timeout(Duration::from_secs(2), done.wait_for(|value| value.is_some())).await;
+            // Acknowledge the signal now. In particular, agents.stop must also cancel its
+            // controller's verify/merge calls without waiting for the worker's cleanup.
             return Ok(json!({"cancelled": true, "run_id": run_id}));
         }
         let host = Host::new(ctx.clone());
