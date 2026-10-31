@@ -104,6 +104,8 @@ impl ToolsPlugin {
                 core.jobs.set_publisher(Arc::new(JobEnds { host: CtxHost(ctx.clone()), core: Arc::downgrade(&core) }));
                 core.steps.set_publisher(Arc::new(CtxHost(ctx.clone())));
                 core.jobs.adopt();
+                // Commands CortexTerm was running for a predecessor: how each ended.
+                core.delegated.adopt(Arc::new(CtxHost(ctx.clone())));
                 crate::guard::Guard::start(core.jobs.clone(), core.shells.groups.clone());
                 core
             })
@@ -360,6 +362,9 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         methods::JOB_STATUS => {
             check_command_job(&core, &params)?;
             let params: JobParams = parse_params(params)?;
+            if let Some(meta) = core.delegated.get(&params.job_id) {
+                return to_value(&delegated_status(&meta));
+            }
             to_value(&job_status(&core, &params.job_id)?)
         }
         methods::JOB_KILL => {
@@ -368,6 +373,12 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             // output ends saying the user did it; without a mode (`cx job kill`) it escalates.
             let mode = params.get("mode").and_then(Value::as_str).map(str::to_owned);
             let params: JobParams = parse_params(params)?;
+            // A job CortexTerm runs is stopped there.
+            if let Some(stopped) = crate::delegate::stop(&core.delegated, host.as_ref(), &params.job_id).await {
+                stopped.map_err(RpcError::internal)?;
+                let meta = core.delegated.get(&params.job_id).unwrap_or_default();
+                return to_value(&delegated_status(&meta));
+            }
             let found = match mode.as_deref() {
                 Some("stop") => core.jobs.stop(&params.job_id, "[stopped by the user]", crate::jobs::StopMode::Term).await,
                 Some("kill") => core.jobs.stop(&params.job_id, "[killed by the user]", crate::jobs::StopMode::Kill).await,
@@ -406,6 +417,19 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                     object.insert("project_id".into(), json!(meta.project_id));
                     object.insert("memory_bytes".into(), json!(memory));
                     object.insert("note".into(), json!(meta.note));
+                }
+                jobs.push(entry);
+            }
+            // The background jobs CortexTerm runs for these sessions.
+            for meta in core.delegated.running(params.session_id.as_deref()).into_iter().filter(|meta| project.as_deref().is_none_or(|project| meta.project_id == project)) {
+                let mut entry = to_value(&delegated_status(&meta))?;
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("command".into(), json!(meta.command));
+                    object.insert("cwd".into(), json!(meta.cwd));
+                    object.insert("session_id".into(), json!(meta.session_id));
+                    object.insert("project_id".into(), json!(meta.project_id));
+                    object.insert("memory_bytes".into(), json!(0));
+                    object.insert("note".into(), json!(format!("runs in CortexTerm: read cmd://{}", meta.id)));
                 }
                 jobs.push(entry);
             }
@@ -592,10 +616,20 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
     }
 }
 
+/// A job CortexTerm runs, in the shape of this plugin's own.
+fn delegated_status(meta: &crate::delegate::CommandMeta) -> JobStatus {
+    let state = match meta.state.as_str() {
+        "done" | "failed" => "exited",
+        "stopped" => "killed",
+        other => other,
+    };
+    JobStatus { job_id: meta.id.clone(), state: state.to_owned(), exit_code: meta.exit_code, output_tail: meta.text.clone(), started_ms: meta.started_ms }
+}
+
 fn check_command_job(core: &Core, params: &Value) -> Result<(), RpcError> {
     if let Some(session) = params.get("_command_session").and_then(Value::as_str) {
         let id = params.get("job_id").and_then(Value::as_str).unwrap_or_default();
-        if !core.jobs.list(Some(session)).iter().any(|job| job.job_id == id) {
+        if !core.jobs.list(Some(session)).iter().any(|job| job.job_id == id) && core.delegated.get(id).is_none_or(|meta| meta.session_id != session) {
             return Err(RpcError::not_found("no background job in this command's session"));
         }
     }
@@ -920,6 +954,7 @@ impl Plugin for ToolsPlugin {
             crate::langs::forget(category);
         }
         // A deleted session or project: this plugin's own data about it goes.
+        let host = CtxHost(ctx.clone());
         let core = self.core(&ctx);
         Box::pin(async move {
             if topic == cc_protocol::contracts::vcs::topics::CHANGED
@@ -933,9 +968,24 @@ impl Plugin for ToolsPlugin {
             {
                 core.await.forget_session(&deleted.session_id, std::path::Path::new(&deleted.workspace)).await;
             } else if topic == frame_topics::PROJECT_DELETED
-                && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data)
+                && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data.clone())
             {
                 core.await.forget_project(&deleted.project_id, std::path::Path::new(&deleted.root)).await;
+            } else if topic.starts_with("terminal.command.") {
+                // A command CortexTerm ran for a session here ended or matched its watch.
+                let core = core.await;
+                let publish = |topic: &str, data: Value| crate::host::Host::publish(&host, topic, data);
+                crate::delegate::on_event(&core.delegated, &publish, &topic, &data);
+                // What a background command changed in its workspace becomes that session's step.
+                if topic == cc_protocol::contracts::service::topics::COMMAND_ENDED
+                    && let Some(meta) = data.get("id").and_then(Value::as_str).and_then(|id| core.delegated.get(id))
+                    && meta.background
+                    && !meta.cwd.is_empty()
+                {
+                    let who = Attribution::session(&meta.session_id, "run", &meta.command);
+                    let log = core.steps.open(std::path::Path::new(&meta.cwd)).await;
+                    let _ = tokio::task::spawn_blocking(move || log.reconcile(&who)).await;
+                }
             }
         })
     }

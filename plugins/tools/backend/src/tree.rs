@@ -36,6 +36,8 @@ pub struct Reservation {
 struct Verifiers {
     /// The first words of every verifier command (`cargo test`, `npm run build`, `pytest`).
     prefixes: Vec<Vec<String>>,
+    /// Each prefix's verifier kind (`build`, `test`, `lint`, ...), in the same order.
+    kinds: Vec<String>,
     caches: Vec<String>,
 }
 
@@ -130,6 +132,7 @@ impl Tree {
                     let words: Vec<String> = verifier.command.iter().take(2).filter(|word| !word.starts_with('{')).cloned().collect();
                     if !words.is_empty() && !found.prefixes.contains(&words) {
                         found.prefixes.push(words);
+                        found.kinds.push(verifier.kind.clone());
                     }
                 }
                 for cache in &description.caches {
@@ -145,9 +148,15 @@ impl Tree {
 
     /// Whether `command` is one of the project's checks: its first words are a verifier's.
     pub async fn is_check(&self, host: &dyn Host, command: &str) -> bool {
-        let Some(argv) = crate::approval::simple_argv(command) else { return false };
+        self.check_kind(host, command).await.is_some()
+    }
+
+    /// The kind of the project's check `command` is (`build`, `test`, `lint`, ...), if it is one.
+    pub async fn check_kind(&self, host: &dyn Host, command: &str) -> Option<String> {
+        let argv = crate::approval::simple_argv(command)?;
         let verifiers = self.verifiers(host).await;
-        verifiers.prefixes.iter().any(|prefix| prefix.len() <= argv.len() && prefix.iter().zip(argv.iter()).all(|(a, b)| a == b))
+        let at = verifiers.prefixes.iter().position(|prefix| prefix.len() <= argv.len() && prefix.iter().zip(argv.iter()).all(|(a, b)| a == b))?;
+        Some(verifiers.kinds.get(at).cloned().unwrap_or_default())
     }
 
     /// The cache directories the language plugins declare.

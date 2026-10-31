@@ -1894,6 +1894,13 @@ pub struct Routine {
     pub by: String,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// The app on this machine that keeps a command routine's clock (its mesh node), when
+    /// CortexTerm does; empty when the scheduler does.
+    #[serde(default)]
+    pub provider: String,
+    /// That app's schedule id (`system.schedule`).
+    #[serde(default)]
+    pub provider_schedule: String,
 }
 
 /// One firing of a routine.
@@ -1914,6 +1921,9 @@ pub struct RoutineRun {
     pub session_id: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// The provider's run (its trace id), when CortexTerm ran it.
+    #[serde(default)]
+    pub provider_run: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

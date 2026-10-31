@@ -1,0 +1,22 @@
+[package]
+name = "cc-service-kit"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "The caller's side of shared services (find the provider on this machine, call it, read the Job) and the text a model reads, shared by CortexCode and CortexTerm."
+
+# Standalone: every plugin that calls shared services is its own workspace and depends on this crate by path.
+[workspace]
+
+[lib]
+name = "cc_service_kit"
+path = "src/lib.rs"
+
+[dependencies]
+cc-protocol = { path = "../protocol", features = ["mesh", "service"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }

@@ -357,6 +357,21 @@ impl Policy {
         }
     }
 
+    /// The same policy for a command another app on this machine asked for: that app's home
+    /// (`~/.cortexcode` for a CortexCode caller) is protected as this app's own is (its store and
+    /// job files read-only, its frame credential unreadable). Its home is not made writable: a
+    /// folder the command must write there (a venv) comes as a grant.
+    pub fn for_caller(&self, caller_home: &Path) -> Policy {
+        let home = real(caller_home);
+        let mut policy = self.clone();
+        let subpaths = [home.join("plugins"), home.join("run"), home.join("journal"), home.join("irongraph"), home.join("plugins-data/cc-source"), home.join("jobs")];
+        policy.protected_subpaths = dedup(policy.protected_subpaths.into_iter().chain(subpaths.iter().cloned()).collect());
+        let literals = [home.clone(), home.join("plugins-data")];
+        policy.protected_literals = dedup(policy.protected_literals.into_iter().chain(literals).chain(subpaths).collect());
+        policy.control_read_paths = dedup(policy.control_read_paths.into_iter().chain(control_paths(&home)).collect());
+        policy
+    }
+
     pub fn set_socket(&self, socket: &Path) {
         if let Ok(mut path) = self.socket.lock() {
             *path = Some(real(socket));

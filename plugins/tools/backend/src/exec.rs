@@ -326,6 +326,11 @@ pub async fn read_target(
                     Err(message) => Err(uris::UriError::new("not_covered", message)),
                 }
             }
+            // A command the CortexTerm on this Mac ran: what it keeps of it.
+            None if uris::split_uri(target).is_some_and(|(scheme, _, _)| scheme == "cmd") => match uris::split_uri(target) {
+                Some((_, path, params)) => crate::delegate::read(&core.delegated, host.as_ref(), &uris::decode(path), &params, &session.workspace).await,
+                None => Err(uris::UriError::new("bad_uri", format!("`{target}` is not a URI"))),
+            },
             None => uris::read(host.as_ref(), &scope, target).await,
         };
         return match result {
@@ -2491,10 +2496,12 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let session_id = &session.context.session_id;
     // A user's commit/push request authorizes the routine steps. Only operations that can
     // discard work, remove refs or rewrite history need a separate confirmation in every mode.
+    let mut person_approved = false;
     if let Some(git) = crate::approval::git_destructive(command) {
         let class = format!("git_change:{git}");
         // An approval runs the command once; the next one is asked again.
-        if !core.take_approval(session_id, &class) {
+        person_approved = core.take_approval(session_id, &class);
+        if !person_approved {
             let mut out = Out::fail(
                 "needs_approval",
                 format!(
@@ -2590,8 +2597,39 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     // The language plugins' installed toolchains (Go, a JDK, shellcheck ...) on the command's PATH.
     let toolchain = crate::langs::toolchain(host.as_ref()).await;
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+    // The CortexTerm on this Mac runs it when there is one (`crate::delegate`): a fresh shell, the
+    // same sandbox, traced when it is a code run. A command that calls a shell function this
+    // session defined stays here: a fresh shell would not have it.
+    let provider = if crate::delegate::uses_session_function(core.shells.saved_functions(session_id).as_deref(), command) {
+        None
+    } else {
+        crate::delegate::provider(host.as_ref()).await
+    };
+    if crate::delegate::came_back() {
+        let (delegated, host) = (core.delegated.clone(), host.clone());
+        tokio::spawn(async move { delegated.resolve(host.as_ref()).await });
+    }
+    let delegation = |purpose: &'static str, timeout_ms: u64, watch: Option<cc_protocol::contracts::service::Watch>, cwd: &Path| {
+        let approved = person_approved || lifted || take_provider_approval(core, session_id, command);
+        delegate_request(core, session, &runtime, &toolchain, command, cwd, purpose, timeout_ms, !lifted, approved, background, watch)
+    };
     if background {
         let wake = args.get("wake").and_then(|wake| serde_json::from_value::<Wake>(wake.clone()).ok()).unwrap_or_default();
+        if let Some(provider) = &provider {
+            let watch = (wake.pattern.is_some() || wake.silence_s.is_some())
+                .then(|| cc_protocol::contracts::service::Watch { pattern: wake.pattern.clone(), silence_s: wake.silence_s.map(|s| s.ceil() as u64) });
+            let request = delegation("server", 24 * 3600 * 1000, watch, &effective_cwd);
+            match crate::delegate::start(&core.delegated, host.as_ref(), provider, &request).await {
+                crate::delegate::Outcome::Started { line } => {
+                    let mut out = Out::ok(line);
+                    out.display = json!({ "background": true, "provider": "cortexterm" });
+                    return out;
+                }
+                crate::delegate::Outcome::Refused { risk, reason } => return provider_refusal(command, &risk, &reason),
+                crate::delegate::Outcome::Failed(message) => return Out::fail("provider_error", message),
+                _ => {}
+            }
+        }
         let env_file = core.shells.saved_env(&session.context.session_id);
         let identity_env = vec![
             ("CORTEX_SESSION_ID".to_owned(), identity.session_id.clone()),
@@ -2653,29 +2691,67 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         }
     }
     let repeats = stop_repeats(core, session_id, &effective_cwd, command).await;
-    let sink = items.clone();
     core.tree.begin_run(&session.workspace, session_id);
-    // The CortexTerm on this Mac, if there is one, records what the command does.
-    let tracing = crate::trace::begin(host.clone(), core.shells.groups.clone(), session_id.to_owned(), command.to_owned());
-    let result = core
-        .shells
-        .run(&identity, RunRequest { command, cwd, env: Vec::new(), toolchain, timeout }, cancel, move |chunk: &[u8]| {
+    // In CortexTerm when it is here (not a check on a copy of the tree: the copy is this app's).
+    let mut delegated = None;
+    if let Some(provider) = provider.as_ref().filter(|_| check_copy.is_none()) {
+        let purpose = match core.tree.check_kind(host.as_ref(), command).await.as_deref() {
+            Some("build") => "build",
+            Some(_) => "check",
+            None => "shell",
+        };
+        let request = delegation(purpose, timeout_ms, None, cwd.as_deref().unwrap_or(&session.workspace));
+        let sink = items.clone();
+        let outcome = crate::delegate::run(&core.delegated, host.as_ref(), provider, &request, cancel.clone(), move |chunk: &[u8]| {
             if !chunk.is_empty() {
                 sink.send(json!({ "kind": "output", "text": String::from_utf8_lossy(chunk) }));
             }
         })
         .await;
-    core.tree.end_run(&session.workspace, session_id);
-    let run = match result {
-        Ok(run) => run,
-        Err(error) => {
-            tracing.abort();
-            return Out::fail("shell_error", format!("could not run the command: {error}"));
+        match outcome {
+            crate::delegate::Outcome::Ran { run, line } => delegated = Some((run, line)),
+            crate::delegate::Outcome::Refused { risk, reason } => {
+                core.tree.end_run(&session.workspace, session_id);
+                return provider_refusal(command, &risk, &reason);
+            }
+            crate::delegate::Outcome::Failed(message) => {
+                core.tree.end_run(&session.workspace, session_id);
+                return Out::fail("provider_error", message);
+            }
+            _ => {}
         }
-    };
-    let traced = match tracing.await.ok().flatten() {
-        Some(recording) => crate::trace::finish(host.as_ref(), recording, run.duration_ms, &session.workspace).await,
-        None => None,
+    }
+    let (run, traced) = match delegated {
+        Some((run, line)) => {
+            core.tree.end_run(&session.workspace, session_id);
+            (run, (!line.is_empty()).then_some(line))
+        }
+        None => {
+            let sink = items.clone();
+            // The CortexTerm on this Mac, if there is one, records what the command does.
+            let tracing = crate::trace::begin(host.clone(), core.shells.groups.clone(), session_id.to_owned(), command.to_owned());
+            let result = core
+                .shells
+                .run(&identity, RunRequest { command, cwd, env: Vec::new(), toolchain, timeout }, cancel, move |chunk: &[u8]| {
+                    if !chunk.is_empty() {
+                        sink.send(json!({ "kind": "output", "text": String::from_utf8_lossy(chunk) }));
+                    }
+                })
+                .await;
+            core.tree.end_run(&session.workspace, session_id);
+            let run = match result {
+                Ok(run) => run,
+                Err(error) => {
+                    tracing.abort();
+                    return Out::fail("shell_error", format!("could not run the command: {error}"));
+                }
+            };
+            let traced = match tracing.await.ok().flatten() {
+                Some(recording) => crate::trace::finish(host.as_ref(), recording, run.duration_ms, &session.workspace).await,
+                None => None,
+            };
+            (run, traced)
+        }
     };
     // EPERM names a path. A program file there could not start: macOS never lets a sandboxed
     // command start a program that takes more rights (setuid tools such as `ps` and `top`), whatever
@@ -2793,6 +2869,106 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         },
     });
     out
+}
+
+/// The approval class of a command CortexTerm's risk check stopped: its risk and the command's
+/// digest, so the person's yes runs this command once and no other.
+fn provider_class(command: &str, risk: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(command.as_bytes());
+    let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("provider_risk:{risk}:{short}")
+}
+
+/// Whether the person approved this command after CortexTerm stopped it (used once).
+fn take_provider_approval(core: &Core, session: &str, command: &str) -> bool {
+    let suffix = provider_class(command, "").rsplit(':').next().unwrap_or("").to_owned();
+    let class = core.approved(session).into_iter().find(|class| class.starts_with("provider_risk:") && class.ends_with(&format!(":{suffix}")));
+    class.is_some_and(|class| core.take_approval(session, &class))
+}
+
+/// CortexTerm's risk check stopped the command: the person is asked here, and their yes runs it.
+fn provider_refusal(command: &str, risk: &str, reason: &str) -> Out {
+    let class = provider_class(command, risk);
+    let mut out = Out::fail(
+        "needs_approval",
+        format!("Not run: CortexTerm's risk check stopped it ({risk}: {reason}). The user has been asked; continue with other work or wait for their answer.\n"),
+    );
+    out.needs_approval = true;
+    out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false, "reason": reason } });
+    out
+}
+
+/// A command as CortexTerm runs it: a fresh bash with what this session's shell would give it.
+#[allow(clippy::too_many_arguments)]
+fn delegate_request<'a>(
+    core: &Core,
+    session: &'a Session<'_>,
+    runtime: &Runtime,
+    toolchain: &crate::shell::Toolchain,
+    command: &'a str,
+    cwd: &Path,
+    purpose: &'a str,
+    timeout_ms: u64,
+    sandboxed: bool,
+    approved: bool,
+    background: bool,
+    watch: Option<cc_protocol::contracts::service::Watch>,
+) -> crate::delegate::Request<'a> {
+    let session_id = &session.context.session_id;
+    let workspace = &session.workspace;
+    let venv = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
+    let mut env = crate::delegate::saved_exports(core.shells.saved_env(session_id).as_deref());
+    let mut set = |key: &str, value: String| {
+        env.retain(|(name, _)| name != key);
+        env.push((key.to_owned(), value));
+    };
+    set("CORTEX_SESSION_ID", session_id.clone());
+    set("CORTEX_PROJECT_ID", session.context.project_id.clone());
+    set("CORTEX_HOME", core.home.to_string_lossy().into_owned());
+    set("CORTEX_WORKSPACE", workspace.to_string_lossy().into_owned());
+    set("CORTEX_COMMAND_URL", runtime.command_access.url.clone());
+    set("CORTEX_COMMAND_TOKEN", runtime.command_access.token.clone());
+    set("PYTHONPATH", workspace.to_string_lossy().into_owned());
+    set("NODE_PATH", workspace.join("node_modules").to_string_lossy().into_owned());
+    set("PAGER", "cat".into());
+    set("GIT_PAGER", "cat".into());
+    set("GIT_TERMINAL_PROMPT", "0".into());
+    for (key, value) in util::project_env(workspace).into_iter().chain(toolchain.env.iter().cloned()) {
+        set(&key, value);
+    }
+    if let Some(venv) = &venv {
+        set("VIRTUAL_ENV", venv.to_string_lossy().into_owned());
+        set("CORTEX_VENV", venv.to_string_lossy().into_owned());
+    }
+    let mut path: Vec<String> = Vec::new();
+    if let Some(venv) = &venv {
+        path.push(venv.join("bin").to_string_lossy().into_owned());
+    }
+    path.extend(toolchain.path.iter().cloned());
+    if let Some(bin) = core.shells.bin_dir() {
+        path.push(bin.to_string_lossy().into_owned());
+    }
+    let mut writable: Vec<String> = vec![workspace.to_string_lossy().into_owned(), util::scratch_dir(workspace).to_string_lossy().into_owned()];
+    writable.extend(venv.iter().map(|venv| venv.to_string_lossy().into_owned()));
+    writable.extend(runtime.grants.iter().map(|grant| grant.to_string_lossy().into_owned()));
+    writable.dedup();
+    crate::delegate::Request {
+        session_id,
+        project_id: &session.context.project_id,
+        command,
+        cwd: cwd.to_path_buf(),
+        env,
+        path,
+        sandboxed,
+        writable,
+        purpose,
+        timeout_ms,
+        approved,
+        background,
+        watch,
+        spill_dir: core.home.join("artifacts"),
+    }
 }
 
 /// The declared diagnostic codes in a command's output when the command runs one of the language

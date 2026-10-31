@@ -120,6 +120,8 @@ pub struct Core {
     pub cx: Option<PathBuf>,
     /// The write sandbox's machine-wide policy.
     pub sandbox: crate::sandbox::Policy,
+    /// Commands the CortexTerm on this Mac ran for this plugin's sessions.
+    pub delegated: Arc<crate::delegate::Commands>,
 }
 
 /// How a session's commands run: its sandbox, its Python environment and the writes approved for it.
@@ -204,6 +206,7 @@ impl Core {
             read_state: ReadState::default(),
             file_locks: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
+            delegated: crate::delegate::Commands::new(graph.clone()),
             graph,
             edits_since_run: Mutex::new(HashMap::new()),
             created: Mutex::new(HashMap::new()),

@@ -99,12 +99,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-service-kit"
+version = "0.1.0"
+dependencies = [
+ "cc-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "cc-tools"
 version = "0.1.0"
 dependencies = [
  "base64",
  "cc-protocol",
  "cc-sandbox-kit",
+ "cc-service-kit",
  "ignore",
  "libc",
  "notify",

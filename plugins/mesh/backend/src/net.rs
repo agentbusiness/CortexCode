@@ -145,6 +145,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
         "mesh.card.push" => {
             if let Ok(card) = serde_json::from_value::<Card>(params) {
                 mesh.card_received(&node, card);
+                mesh.listen_services(&node);
             }
             let message = answer(Ok(json!({})));
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
@@ -258,7 +259,20 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
         }
         "mesh.events" => {
             let prefixes: Vec<String> = serde_json::from_value(params.get("prefixes").cloned().unwrap_or(Value::Null)).unwrap_or_default();
-            let prefixes: Vec<String> = prefixes.into_iter().filter(|prefix| lendable(&format!("{}x", prefix.trim_end_matches('.').to_owned() + "."))).collect();
+            // The model's events for any member; an app on this machine also gets the events of a
+            // service this computer shares (`terminal.command.`), only those naming it.
+            let services: Vec<String> = if mesh.is_local(&node) { mesh.local_shares().await.into_iter().map(|share| format!("{}.", share.service)).collect() } else { Vec::new() };
+            let prefixes: Vec<String> = prefixes
+                .into_iter()
+                .map(|prefix| prefix.trim_end_matches('.').to_owned() + ".")
+                .filter(|prefix| lendable(&format!("{prefix}x")) || services.contains(prefix))
+                .collect();
+            let wanted: Vec<String> = prefixes.iter().filter(|prefix| services.contains(prefix)).cloned().collect();
+            if !wanted.is_empty()
+                && let Some(ctx) = mesh.ctx.get()
+            {
+                let _ = ctx.call(cc_protocol::contracts::frame::methods::SUBSCRIBE, json!({"topics": wanted})).await;
+            }
             let (tx, mut rx) = mpsc::unbounded_channel::<(String, Value)>();
             mesh.subscribe_events(&node, prefixes, tx);
             loop {

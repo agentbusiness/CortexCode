@@ -10,6 +10,9 @@
 //!    agent (`agents.handoff`) or runs a command (`tools.run`).
 //! 4. Culling uses structural facts only: a run's final status in a journal, the watched tasks'
 //!    states, deleted sessions and projects, failures in a row, `until` and `max_runs`.
+//! 5. A command routine whose time the CortexTerm on this Mac can say runs on CortexTerm's clock
+//!    ([`crate::provider`]): this plugin keeps the schedule there in step with the routine, records
+//!    its runs from `system.schedule.done`, and takes the clock back when CortexTerm is gone.
 
 use crate::data::Texts;
 use crate::when::{self, Schedule};
@@ -53,6 +56,8 @@ pub fn hello() -> Hello {
         memory_topics::TASK_CHANGED.to_owned(),
         frame_topics::SESSION_DELETED.to_owned(),
         frame_topics::PROJECT_DELETED.to_owned(),
+        // Runs and changes of this app's schedules in the CortexTerm on this Mac (relayed by the mesh).
+        "system.schedule.".to_owned(),
     ];
     hello
 }
@@ -202,16 +207,186 @@ impl Scheduler {
         routine.state = "ended".to_owned();
         routine.state_reason = reason.to_owned();
         routine.next_ms = None;
-        if let Err(error) = self.save(ctx, host, routine, "ended").await {
-            tracing::warn!(%error, "could not end a routine");
+        match self.save(ctx, host, routine, "ended").await {
+            Ok(routine) => {
+                self.sync(ctx, routine).await;
+            }
+            Err(error) => tracing::warn!(%error, "could not end a routine"),
         }
     }
 
     async fn pause_with(&self, ctx: &Ctx, host: &Host, mut routine: Routine, reason: &str) {
         routine.state = "paused".to_owned();
         routine.state_reason = reason.to_owned();
-        if let Err(error) = self.save(ctx, host, routine, "paused").await {
-            tracing::warn!(%error, "could not pause a routine");
+        match self.save(ctx, host, routine, "paused").await {
+            Ok(routine) => {
+                self.sync(ctx, routine).await;
+            }
+            Err(error) => tracing::warn!(%error, "could not pause a routine"),
+        }
+    }
+
+    // ---- CortexTerm's clock (crate::provider) ---------------------------------------------------
+
+    /// The folder a command routine runs in: its project's root.
+    async fn command_root(&self, ctx: &Ctx, host: &Host, routine: &Routine) -> Option<String> {
+        let project_id = self.run_project(ctx, host, routine).await.ok()?;
+        Some(host.project_get(&project_id).await.ok()?.root)
+    }
+
+    /// Keep a command routine's schedule in the CortexTerm on this Mac in step with it: put it
+    /// there when CortexTerm can say its time, send it again after a change, delete it when the
+    /// routine ends or its time can no longer be said there. Without CortexTerm nothing changes.
+    async fn sync(&self, ctx: &Ctx, routine: Routine) -> Routine {
+        if routine.kind != "command" && routine.provider_schedule.is_empty() {
+            return routine;
+        }
+        let Some(provider) = crate::provider::provider(ctx).await else { return routine };
+        let host = Host::new(ctx.clone());
+        let when = if routine.kind == "command" && routine.state != "ended" { schedule_of(&routine).and_then(|schedule| crate::provider::when_of(&schedule)) } else { None };
+        let mut routine = routine;
+        let before = (routine.provider.clone(), routine.provider_schedule.clone());
+        match (when, routine.provider_schedule.is_empty()) {
+            (Some(when), placed) => {
+                let Some(root) = self.command_root(ctx, &host, &routine).await else { return routine };
+                let kept = !placed && crate::provider::edit(ctx, &provider, &routine, &when, &root).await.is_ok();
+                if !kept {
+                    match crate::provider::create(ctx, &provider, &routine, &when, &root).await {
+                        Ok(id) => {
+                            routine.provider = provider.node.clone();
+                            routine.provider_schedule = id;
+                        }
+                        Err(error) => {
+                            tracing::info!(%error, routine = %routine.id, "CortexTerm did not take the routine; it stays on this clock");
+                            routine.provider.clear();
+                            routine.provider_schedule.clear();
+                        }
+                    }
+                }
+            }
+            (None, false) => {
+                if let Err(error) = crate::provider::delete(ctx, &provider, &routine.provider_schedule, Some(&routine)).await {
+                    tracing::info!(%error, routine = %routine.id, "could not delete the routine's schedule in CortexTerm");
+                }
+                routine.provider.clear();
+                routine.provider_schedule.clear();
+            }
+            (None, true) => {}
+        }
+        if (routine.provider.clone(), routine.provider_schedule.clone()) == before {
+            return routine;
+        }
+        match self.save(ctx, &host, routine.clone(), "edited").await {
+            Ok(saved) => saved,
+            Err(error) => {
+                tracing::warn!(%error, "could not record where a routine runs");
+                routine
+            }
+        }
+    }
+
+    /// A run of one of this app's schedules in CortexTerm: recorded as the routine's run (once),
+    /// with the routine's counts, failure pause, end and the failure's wake as for its own runs.
+    async fn provider_run(&self, ctx: &Ctx, done: cc_protocol::contracts::service::ScheduleDone, tell: bool) {
+        let host = Host::new(ctx.clone());
+        let _ = self.ensure_loaded(&host).await;
+        let found = lock(&self.inner.routines).values().find(|routine| routine.provider_schedule == done.schedule_id).cloned();
+        let Some(mut routine) = found else {
+            // A schedule of this app no routine keeps any more (the clock was taken back while
+            // CortexTerm was away): it goes.
+            if let Some(provider) = crate::provider::provider(ctx).await {
+                let _ = crate::provider::delete(ctx, &provider, &done.schedule_id, None).await;
+            }
+            return;
+        };
+        let job = done.run;
+        if self.runs_of(&host, &routine.id, 100).await.iter().any(|run| !job.id.is_empty() && run.provider_run == job.id) {
+            return;
+        }
+        let ok = job.state == "done" && job.exit_code == Some(0);
+        let summary = if job.text.trim().is_empty() { tail(&job.tail.join("\n"), 20) } else { job.text.trim().to_owned() };
+        let started = if job.started > 0 { job.started } else { now_ms() };
+        let run = RoutineRun {
+            id: format!("{}:{}", routine.id, started),
+            routine_id: routine.id.clone(),
+            due_ms: started,
+            started_ms: started,
+            ended_ms: job.ended,
+            outcome: "running".to_owned(),
+            summary: summary.clone(),
+            session_id: None,
+            task_id: None,
+            provider_run: job.id.clone(),
+        };
+        routine.last_due_ms = Some(started);
+        routine.run_count += 1;
+        let exhausted = routine.max_runs.is_some_and(|max| routine.run_count >= max) || routine.until_ms.is_some_and(|until| routine.next_ms.is_some_and(|next| next > until));
+        let routine = match self.save(ctx, &host, routine, "ran").await {
+            Ok(routine) => routine,
+            Err(error) => {
+                tracing::warn!(%error, "could not record a CortexTerm run");
+                return;
+            }
+        };
+        if tell
+            && !ok
+            && let Some(session) = routine.report_to.clone()
+            && host.session_get(&session).await.is_ok()
+        {
+            let code = job.exit_code.map(|code| code.to_string()).unwrap_or_else(|| job.state.clone());
+            let project_id = if routine.scope == "global" { String::new() } else { routine.scope.clone() };
+            let text = self.text(ctx, "command_failed", &[("command", &routine.command), ("code", &code), ("tail", &summary)]);
+            let fired = Fired { id: run.id.clone(), routine_id: routine.id.clone(), session_id: session, project_id, title: routine.title.clone(), when: routine.when.clone(), text, manage: false };
+            ctx.publish(topics::FIRED, serde_json::to_value(&fired).unwrap_or(Value::Null));
+        }
+        self.finish(ctx, &host, &routine.id, run, ok).await;
+        if exhausted && let Some(routine) = self.get(&routine.id) {
+            self.end(ctx, &host, routine, "reached its end").await;
+        }
+    }
+
+    /// The person paused, resumed or removed one of this app's schedules in CortexTerm: the
+    /// routine follows.
+    async fn provider_changed(&self, ctx: &Ctx, changed: cc_protocol::contracts::service::ScheduleChanged) {
+        let host = Host::new(ctx.clone());
+        let _ = self.ensure_loaded(&host).await;
+        let found = lock(&self.inner.routines).values().find(|routine| routine.provider_schedule == changed.schedule_id).cloned();
+        let Some(mut routine) = found else { return };
+        match changed.change.as_str() {
+            "paused" if routine.state == "active" => self.pause_with(ctx, &host, routine, "paused in CortexTerm").await,
+            "resumed" if routine.state == "paused" => {
+                routine.state = "active".to_owned();
+                routine.state_reason.clear();
+                routine.fail_streak = 0;
+                let _ = self.save(ctx, &host, routine, "resumed").await;
+            }
+            "deleted" if routine.state != "ended" => {
+                routine.provider.clear();
+                routine.provider_schedule.clear();
+                self.end(ctx, &host, routine, "removed in CortexTerm").await;
+            }
+            _ => {}
+        }
+    }
+
+    /// At start: command routines go to CortexTerm's clock where they can, and the runs CortexTerm
+    /// made while this app was closed are recorded (it keeps a week of them).
+    async fn catch_up(&self, ctx: &Ctx) {
+        let Some(provider) = crate::provider::provider(ctx).await else { return };
+        let routines: Vec<Routine> = lock(&self.inner.routines).values().filter(|routine| routine.kind == "command" && routine.state != "ended").cloned().collect();
+        for routine in routines {
+            let routine = self.sync(ctx, routine).await;
+            if routine.provider_schedule.is_empty() {
+                continue;
+            }
+            let mut runs = crate::provider::runs(ctx, &provider, &routine).await;
+            runs.reverse();
+            let last = runs.len().saturating_sub(1);
+            for (at, run) in runs.into_iter().enumerate() {
+                let done = cc_protocol::contracts::service::ScheduleDone { schedule_id: routine.provider_schedule.clone(), name: routine.title.clone(), owner: None, run };
+                // Only the newest failure wakes anyone; the older ones are history.
+                self.provider_run(ctx, done, at == last).await;
+            }
         }
     }
 
@@ -368,11 +543,14 @@ impl Scheduler {
             by: params.by.clone().unwrap_or_else(|| "model".to_owned()),
             created_ms: now,
             updated_ms: now,
+            provider: String::new(),
+            provider_schedule: String::new(),
         };
         if routine.next_ms.is_none() {
             return Err(RpcError::invalid_params(format!("`{}` has no time in the future", routine.when)));
         }
         let routine = self.save(ctx, &host, routine, "added").await?;
+        let routine = self.sync(ctx, routine).await;
         Ok(self.answer(ctx, routine, "added", read.note, false))
     }
 
@@ -436,6 +614,7 @@ impl Scheduler {
             routine.state_reason.clear();
         }
         let routine = self.save(ctx, &host, routine, "edited").await?;
+        let routine = self.sync(ctx, routine).await;
         Ok(self.answer(ctx, routine, "edited", note, false))
     }
 
@@ -445,6 +624,7 @@ impl Scheduler {
         routine.state = "paused".to_owned();
         routine.state_reason = "paused".to_owned();
         let routine = self.save(ctx, &host, routine, "paused").await?;
+        let routine = self.sync(ctx, routine).await;
         Ok(self.answer(ctx, routine, "paused", None, false))
     }
 
@@ -464,12 +644,18 @@ impl Scheduler {
             return Err(RpcError::invalid_params(format!("`{}` has no time in the future: give it a new one with `cx schedule edit {} --when ...`", routine.when, routine.id)));
         }
         let routine = self.save(ctx, &host, routine, "resumed").await?;
+        let routine = self.sync(ctx, routine).await;
         Ok(self.answer(ctx, routine, "resumed", None, false))
     }
 
     async fn remove(&self, ctx: &Ctx, params: IdParams) -> Result<RoutineAnswer, RpcError> {
         let host = Host::new(ctx.clone());
         let routine = self.find(&host, &params.id).await?;
+        if !routine.provider_schedule.is_empty()
+            && let Some(provider) = crate::provider::provider(ctx).await
+        {
+            let _ = crate::provider::delete(ctx, &provider, &routine.provider_schedule, Some(&routine)).await;
+        }
         host.call(memory_methods::ROUTINE_REMOVE, json!({"id": routine.id})).await?;
         lock(&self.inner.routines).remove(&routine.id);
         ctx.publish(topics::CHANGED, json!({"routine": routine, "change": "removed"}));
@@ -567,6 +753,19 @@ impl Scheduler {
     /// Claim a due routine (its next time written first, so it fires once) and fire it.
     async fn claim_and_fire(&self, ctx: &Ctx, mut routine: Routine, now: u64) {
         let host = Host::new(ctx.clone());
+        // CortexTerm keeps this one's clock: only the shown next time moves. When CortexTerm is
+        // gone, this clock takes it back and runs it.
+        if !routine.provider_schedule.is_empty() {
+            if crate::provider::provider(ctx).await.is_some() {
+                routine.next_ms = schedule_of(&routine).and_then(|schedule| when::next_after(&schedule, now));
+                if let Err(error) = self.save(ctx, &host, routine, "edited").await {
+                    tracing::warn!(%error, "could not move a routine's next time");
+                }
+                return;
+            }
+            routine.provider.clear();
+            routine.provider_schedule.clear();
+        }
         let due = routine.next_ms.unwrap_or(now);
         // Whatever was missed fires once; the next time counts from now.
         routine.last_due_ms = Some(due);
@@ -605,7 +804,16 @@ impl Scheduler {
             summary: String::new(),
             session_id: None,
             task_id: None,
+            provider_run: String::new(),
         };
+        // Run now, for a routine on CortexTerm's clock: CortexTerm runs it, and its run comes back
+        // as `system.schedule.done`.
+        if !routine.provider_schedule.is_empty()
+            && let Some(provider) = crate::provider::provider(ctx).await
+            && crate::provider::run_now(ctx, &provider, &routine).await.is_ok()
+        {
+            return;
+        }
         if lock(&self.inner.running).contains_key(&routine.id) {
             run.outcome = "skipped".to_owned();
             run.summary = "the last run still runs".to_owned();
@@ -975,6 +1183,7 @@ impl Plugin for Scheduler {
                 let host = Host::new(ctx.clone());
                 if adopt.ensure_loaded(&host).await.is_ok() {
                     adopt.readopt(&host).await;
+                    adopt.catch_up(&ctx).await;
                 }
             });
             Ok(())
@@ -998,9 +1207,17 @@ impl Plugin for Scheduler {
                     this.session_deleted(&ctx, deleted).await;
                 }
             } else if topic == frame_topics::PROJECT_DELETED
-                && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data)
+                && let Ok(deleted) = serde_json::from_value::<ProjectDeleted>(data.clone())
             {
                 this.project_deleted(&ctx, deleted).await;
+            } else if topic == cc_protocol::contracts::service::topics::SCHEDULE_DONE
+                && let Ok(done) = serde_json::from_value(data.clone())
+            {
+                this.provider_run(&ctx, done, true).await;
+            } else if topic == cc_protocol::contracts::service::topics::SCHEDULE_CHANGED
+                && let Ok(changed) = serde_json::from_value(data)
+            {
+                this.provider_changed(&ctx, changed).await;
             }
         })
     }
