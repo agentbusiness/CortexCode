@@ -2,6 +2,13 @@
 
 PTY terminals running the user's login shell: `terminal.open`, `terminal.write`, `terminal.resize`, `terminal.close`, `terminal.list`, `terminal.snapshot` (VT-parsed screen text) and `terminal.output` events. The UI package is the right pane's Terminal tab (xterm.js with WebGL).
 
+## Terminal application compatibility (source only)
+
+The shared `terminal@1` additions provide binary input and formatted screen restoration with byte
+offsets. Both apps' terminal panes use one SDK transport for ordered input, mouse bytes, resize and
+reconnect. See [shared contract and release targets](../../docs/SHARED-TERMINAL.md).
+No build, install or live app verification was performed for this change.
+
 One self-contained plugin folder, separable into its own repository (only `cc-protocol` and `@cortex/sdk` come from outside):
 
 | Path | What |

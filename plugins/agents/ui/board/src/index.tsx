@@ -4,7 +4,7 @@
  * person leave messages (`memory.board.*`).
  */
 
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 import {
   Menu,
   ago,
@@ -23,6 +23,7 @@ import {
   ServiceProblem,
 } from '@cortex/sdk';
 import './board.css';
+import { TaskText } from './TaskText';
 
 type View = 'tasks' | 'agents' | 'board';
 
@@ -87,15 +88,15 @@ function Scheduler() {
   if (!scheduler.data) return null;
   const { running, queued, max_parallel } = scheduler.data;
   return (
-    <span className="ap faint" title={`running: ${running.join(', ') || 'none'}\nqueued: ${queued.join(', ') || 'none'}`}>
-      {running.length} of {max_parallel} slots busy{queued.length ? ` · ${queued.length} queued` : ''}
+    <span className="cx-board-scheduler" title={`running: ${running.join(', ') || 'none'}\nqueued: ${queued.join(', ') || 'none'}`}>
+      {max_parallel > 0 ? `${running.length} / ${max_parallel} slots busy` : 'No agent slots'}{queued.length ? ` · ${queued.length} queued` : ''}
     </span>
   );
 }
 
 function Tasks({ projectId }: { projectId: string }) {
-  const [focus] = useShared<string | null>('board.focus', null);
-  const [openIds, setOpenIds] = useSlotState<string[]>('openTasks', []);
+  const [focus, setFocus] = useShared<string | null>('board.focus', null);
+  const [openIds, setOpenIds] = useSlotState<string[]>(`openTasks:${projectId}`, []);
   const tasks = useQuery<Task[]>(
     `memory.task.list:${projectId}`,
     async (c) => (await c.call<{ tasks: Task[] }>('memory.task.list', { project_id: projectId }))?.tasks ?? [],
@@ -105,59 +106,102 @@ function Tasks({ projectId }: { projectId: string }) {
   if (!tasks.data) return <p className="empty-line">Reading tasks…</p>;
   if (tasks.data.length === 0) return <p className="empty-line">No tasks yet. Larger goals become task trees when the conversation delegates them.</p>;
   const rows = taskTree(tasks.data);
+  const byId = new Map(tasks.data.map((task) => [task.id, task]));
+  const children = new Map<string, number>();
+  for (const task of tasks.data) {
+    if (task.parent_id && byId.has(task.parent_id)) children.set(task.parent_id, (children.get(task.parent_id) ?? 0) + 1);
+  }
+  const work = tasks.data.filter((task) => !children.has(task.id));
+  const done = work.filter((task) => task.status === 'done').length;
+  const active = work.filter((task) => task.status === 'in_progress' || task.status === 'verifying').length;
+  const hasOpen = rows.some(({ task }) => openIds.includes(task.id) || focus === task.id);
   return (
-    <ul className="lst cx-tasks">
+    <>
+    <div className="cx-tasks-toolbar">
+      <p className="cx-tasks-summary">{done} of {work.length} tasks done{active > 0 && <span> · {active} active</span>}</p>
+      <div className="cx-tasks-actions">
+        <button className="detent" type="button" onClick={() => setOpenIds(rows.map(({ task }) => task.id))}>Expand all</button>
+        <button className="detent" type="button" disabled={!hasOpen} onClick={() => { setFocus(null); setOpenIds([]); }}>Collapse all</button>
+      </div>
+    </div>
+    <ul className="cx-tasks" aria-label="Project tasks">
       {rows.map(({ task, depth }) => {
         const open = openIds.includes(task.id) || focus === task.id;
+        const childCount = children.get(task.id) ?? 0;
+        const waitingFor = (task.depends_on ?? []).filter((id) => byId.get(id)?.status !== 'done');
+        const state = task.status === 'pending' && waitingFor.length > 0 ? 'blocked' : task.status;
+        const panelId = `cx-task-${task.id}`;
         return (
-          <li key={task.id} className={focus === task.id ? 'sel' : undefined} data-task={task.id} data-status={task.status}>
-            <button type="button" style={{ paddingLeft: 18 + depth * 16 }} aria-expanded={open}
-              onClick={() => setOpenIds((list) => (list.includes(task.id) ? list.filter((id) => id !== task.id) : [...list, task.id]))}>
-              <div className="t">{task.title}</div>
-              <div className="r">
-                <span className={`ap ${task.status === 'in_progress' || task.status === 'verifying' ? 'live' : task.status === 'failed' ? 'hot' : 'faint'}`}>{task.status.replace(/_/g, ' ')}</span>
-                {task.assignee && <span className="ap origin">@{task.assignee}</span>}
-                {(task.contract?.checks.length ?? 0) > 0 && <span className="ap faint">{task.contract!.checks.length} check{task.contract!.checks.length === 1 ? '' : 's'}</span>}
-                <span className="grow" />
-                <span className="ap faint">{ago(task.updated_ms)}</span>
-              </div>
+          <li key={task.id} className="cx-task-row" data-task={task.id} data-status={state} data-selected={focus === task.id}
+            style={{ '--task-indent': `${Math.min(depth, 3) * 12}px` } as CSSProperties}>
+            <button className="cx-task-toggle" type="button" aria-expanded={open} aria-controls={panelId}
+              onClick={() => {
+                if (focus === task.id) setFocus(null);
+                setOpenIds((list) => open ? list.filter((id) => id !== task.id) : [...list, task.id]);
+              }}>
+              <svg className="cx-task-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m6 4 4 4-4 4" stroke="currentColor" strokeWidth="1.5" /></svg>
+              <span className="cx-task-heading">
+                <span className="cx-task-title">{task.title}</span>
+                <span className="cx-task-meta">
+                  {task.assignee && <span className="cx-task-assignee">@{task.assignee}</span>}
+                  {childCount > 0 && <span>{childCount} subtask{childCount === 1 ? '' : 's'}</span>}
+                  {(task.contract?.checks.length ?? 0) > 0 && <span>{task.contract!.checks.length} check{task.contract!.checks.length === 1 ? '' : 's'}</span>}
+                  <span>Updated {ago(task.updated_ms)}</span>
+                </span>
+              </span>
+              <span className="cx-task-status"><i aria-hidden="true" />{state.replace(/_/g, ' ')}</span>
             </button>
             {open && (
-              <div className="cx-task-open" style={{ marginLeft: 18 + depth * 16 }}>
-                {task.brief && <p className="cx-task-brief">{task.brief}</p>}
+              <div id={panelId} className="cx-task-open">
+                {task.result && (
+                  <details className="cx-task-section" open>
+                    <summary>Result</summary>
+                    <TaskText text={task.result} />
+                  </details>
+                )}
+                {task.brief && (
+                  <details className="cx-task-section">
+                    <summary>Task brief</summary>
+                    <TaskText text={task.brief} />
+                  </details>
+                )}
                 {task.plan && (
-                  <>
-                    <span className="ap faint">Plan</span>
-                    <pre className="cx-task-plan">{task.plan}</pre>
-                  </>
+                  <details className="cx-task-section">
+                    <summary>Plan</summary>
+                    <TaskText text={task.plan} />
+                  </details>
                 )}
                 {(task.contract?.checks.length ?? 0) > 0 && (
-                  <>
-                    <span className="ap faint">Contract</span>
+                  <details className="cx-task-section">
+                    <summary>Checks <span>{task.contract!.checks.length}</span></summary>
                     <ul className="cx-contract">
-                      {task.contract!.checks.map((check) => (
-                        <li key={check.name}>
-                          <span className="ap">{check.kind}</span>
+                      {task.contract!.checks.map((check, index) => (
+                        <li key={`${check.name}:${index}`}>
                           <span className="cx-check-name">{check.name}</span>
-                          <code>{check.spec}</code>
+                          <span className="cx-check-kind">{check.kind}</span>
+                          <TaskText text={check.spec} />
+                          {check.expect && <div className="cx-check-expect"><span>Expected</span><TaskText text={check.expect} /></div>}
                         </li>
                       ))}
                     </ul>
-                  </>
+                  </details>
                 )}
-                {task.result && (
-                  <>
-                    <span className="ap faint">Result</span>
-                    <p className="cx-task-brief">{task.result}</p>
-                  </>
+                {(task.depends_on?.length ?? 0) > 0 && (
+                  <details className="cx-task-section">
+                    <summary>Dependencies <span>{task.depends_on!.length}</span></summary>
+                    <ul className="cx-task-dependencies">
+                      {task.depends_on!.map((id) => <li key={id}>{byId.get(id)?.title ?? id}<span>{byId.get(id)?.status.replace(/_/g, ' ') ?? 'Unavailable'}</span></li>)}
+                    </ul>
+                  </details>
                 )}
-                {(task.depends_on?.length ?? 0) > 0 && <p className="ap faint">Waits for {task.depends_on!.join(', ')}</p>}
+                {!task.brief && !task.plan && !task.result && !task.contract?.checks.length && !task.depends_on?.length && <p className="cx-task-no-details">No details yet.</p>}
               </div>
             )}
           </li>
         );
       })}
     </ul>
+    </>
   );
 }
 
@@ -320,7 +364,7 @@ function Messages({ projectId }: { projectId: string }) {
               <span className="grow" />
               <span className="off">{clock(message.ts_ms)}</span>
             </div>
-            <p>{message.text}</p>
+            <div className="cx-board-message"><TaskText text={message.text} /></div>
           </div>
         ))}
       </div>
