@@ -5,6 +5,7 @@
 //! the clock, loaded on activation, so it can be hot-swapped at any time.
 
 pub mod data;
+pub mod provider;
 pub mod service;
 pub mod when;
 

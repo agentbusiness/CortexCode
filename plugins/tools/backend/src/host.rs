@@ -6,6 +6,10 @@ use serde_json::Value;
 pub trait Host: Send + Sync {
     fn call(&self, method: &str, params: Value) -> BoxFuture<'static, Result<Value, RpcError>>;
     fn publish(&self, topic: &str, data: Value);
+    /// The frame connection, for calls whose stream items matter (shared services).
+    fn link(&self) -> Option<Ctx> {
+        None
+    }
 }
 
 /// Host backed by the frame connection.
@@ -21,6 +25,10 @@ impl Host for CtxHost {
 
     fn publish(&self, topic: &str, data: Value) {
         self.0.publish(topic, data);
+    }
+
+    fn link(&self) -> Option<Ctx> {
+        Some(self.0.clone())
     }
 }
 

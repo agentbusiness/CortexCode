@@ -8,6 +8,7 @@ pub mod baseline;
 pub mod cleanup;
 pub mod codeskills;
 pub mod core;
+pub mod delegate;
 pub mod doc;
 pub mod exec;
 pub mod graph;

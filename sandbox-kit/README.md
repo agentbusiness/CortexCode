@@ -14,3 +14,6 @@ Use it by path (`cc-sandbox-kit = { path = "../../../sandbox-kit" }`):
 2. `policy.sandbox(workspace, venv, grants)` for a session, where `grants` comes from
    `sandbox::grants(&approved_classes)`.
 3. `sandbox.command(program)` gives the confined `std::process::Command`.
+
+For a command another app on this machine asked for (CortexTerm's `terminal.command`), use
+`policy.for_caller(caller_home)`: the asking app's home is protected as the serving app's own is.

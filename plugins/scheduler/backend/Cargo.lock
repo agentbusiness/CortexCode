@@ -72,6 +72,7 @@ name = "cc-scheduler"
 version = "0.1.0"
 dependencies = [
  "cc-protocol",
+ "cc-service-kit",
  "chrono",
  "serde",
  "serde_json",
@@ -81,6 +82,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "cc-service-kit"
+version = "0.1.0"
+dependencies = [
+ "cc-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

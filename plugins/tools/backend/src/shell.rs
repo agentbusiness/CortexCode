@@ -249,6 +249,17 @@ impl Shells {
     }
 
     /// The session shell's saved environment file, if any.
+    /// The folder of the `cx` link, put in front of PATH.
+    pub fn bin_dir(&self) -> Option<&Path> {
+        self.config.bin_dir.as_deref()
+    }
+
+    /// The shell functions the session defined (`declare -f`, saved after every command).
+    pub fn saved_functions(&self, session: &str) -> Option<PathBuf> {
+        let path = self.state_dir(session).join("functions");
+        path.exists().then_some(path)
+    }
+
     pub fn saved_env(&self, session: &str) -> Option<PathBuf> {
         let path = self.state_dir(session).join("env");
         path.exists().then_some(path)

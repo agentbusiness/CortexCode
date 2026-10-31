@@ -22,6 +22,8 @@ fn main() {
             cc_protocol::contracts::frame::topics::SESSION_DELETED.to_owned(),
             cc_protocol::contracts::frame::topics::PROJECT_DELETED.to_owned(),
             cc_protocol::contracts::vcs::topics::CHANGED.to_owned(),
+            // Commands the CortexTerm on this Mac runs for these sessions (relayed by the mesh).
+            "terminal.command.".to_owned(),
         ];
         cc_protocol::run_plugin(hello, Arc::new(ToolsPlugin::new())).await
     });

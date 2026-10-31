@@ -242,7 +242,7 @@ pub async fn read(host: &dyn Host, scope: &Scope<'_>, uri: &str) -> Result<Strin
         other => Err(UriError::new(
             "bad_uri",
             format!(
-                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, schedule://, rule://, knowledge://, skill://, research:// and trace:// (see read's `path`)"
+                "unknown URI scheme `{other}://`; read takes graph://, symbol://, outline://, definition://, references://, hover://, diagnostics://, artifact://, task://, agent://, board://, schedule://, rule://, knowledge://, skill://, research://, trace:// and cmd:// (see read's `path`)"
             ),
         )),
     }

@@ -5,10 +5,11 @@
 //! (:Routine {id, scope, title, kind, brief, command, when, schedule_kind, every_ms, days, minutes,
 //!            at_ms, cron, next_ms, last_due_ms, state, state_reason, report_to, home_session,
 //!            created_session, created_run, manage, until_ms, max_runs, run_count, fail_streak,
-//!            last_outcome, last_summary, last_ok_ms, mode, flow, by, created_ms, updated_ms})
+//!            last_outcome, last_summary, last_ok_ms, mode, flow, by, created_ms, updated_ms,
+//!            provider, provider_schedule})
 //! (:Routine)-[:WATCHES]->(:Task)          the tasks a tethered routine exists for
 //! (:Routine)-[:FIRED]->(:RoutineRun {id, routine_id, due_ms, started_ms, ended_ms, outcome,
-//!                                    summary, session_id, task_id})
+//!                                    summary, session_id, task_id, provider_run})
 //! ```
 //!
 //! The schedule is the routine's own properties (`schedule_kind`: `interval` | `calendar` |
@@ -26,10 +27,10 @@ use serde_json::{Map, Value, json};
 const ROUTINE_FIELDS: &[&str] = &[
     "id", "scope", "title", "kind", "brief", "command", "when", "next_ms", "last_due_ms", "state", "state_reason", "report_to", "home_session", "created_session",
     "created_run", "manage", "until_ms", "max_runs", "run_count", "fail_streak", "last_outcome", "last_summary", "last_ok_ms", "mode", "flow", "by", "created_ms",
-    "updated_ms",
+    "updated_ms", "provider", "provider_schedule",
 ];
 const SCHEDULE_FIELDS: &[&str] = &["schedule_kind", "every_ms", "days", "minutes", "at_ms", "cron"];
-const RUN_FIELDS: &[&str] = &["id", "routine_id", "due_ms", "started_ms", "ended_ms", "outcome", "summary", "session_id", "task_id"];
+const RUN_FIELDS: &[&str] = &["id", "routine_id", "due_ms", "started_ms", "ended_ms", "outcome", "summary", "session_id", "task_id", "provider_run"];
 
 /// A record's fields as properties (absent ones as null, which removes them).
 fn fields<T: serde::Serialize>(record: &T, names: &[&str]) -> Result<Map<String, Value>, RpcError> {

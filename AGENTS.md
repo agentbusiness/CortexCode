@@ -135,6 +135,8 @@ built to the same standard as CortexCode. The standard is:
   `memory.queue.*`, settings and the app's records, with the memory plugin's `graphapi.rs`,
   `streams.rs`, `settings.rs` and `app.rs` the same in both repositories, byte for byte;
 - the write sandbox, `sandbox-kit/`: the same code in both repositories, byte for byte.
+- the caller's side of shared services and their text for a model, `service-kit/`: the same code
+  in both repositories, byte for byte.
 
 **Any change to the plugin architecture, the mesh, or model and resource sharing is made in both
 CortexCode and CortexTerm**, in the same piece of work, and listed in both repositories' docs with the
@@ -142,6 +144,10 @@ version it lands in. A change to anything outside the standard stays in its own 
 
 ## Checking a change
 
+- **Absolutely no building and no running until the owner asks for it specifically.** No `cargo
+  build`, `cargo check`, `npm run build`, `cortex-pack`, release scripts, starting the app or a
+  frame, and no background builds. Write the change and stop; build or run only when the owner's
+  own message asks for it, and only what it asks for.
 - No tests, test harnesses or benchmarks in this repository: no unit tests (`#[cfg(test)]`,
   `*.test.*`), no `tests/` folders, no verify or check scripts, no eval or bench folders. Check a
   change by using the real app on a real project.

@@ -533,6 +533,7 @@ impl Mesh {
             conns.remove(node);
             drop(conns);
             lock(&self.event_subs).retain(|sub| sub.node != node);
+            self.stop_listening(node);
             self.member_gone(node);
             self.requester_gone(node);
             self.models_changed();
@@ -603,12 +604,16 @@ impl Mesh {
         lock(&self.event_subs).push(EventSub { node: node.to_owned(), prefixes, tx });
     }
 
-    /// An event of this frame: to every member subscribed to its prefix.
+    /// An event of this frame: to every member subscribed to its prefix. A shared service's event
+    /// (anything but the model's) goes only to the member its `node` or `owner.node` names: the
+    /// app that asked for the run, or that owns the schedule.
     pub fn event(&self, topic: &str, data: &Value) {
+        let model = crate::net::lendable(topic);
+        let to = data.get("node").or_else(|| data.get("owner").and_then(|owner| owner.get("node"))).and_then(Value::as_str);
         let mut subs = lock(&self.event_subs);
         subs.retain(|sub| !sub.tx.is_closed());
         for sub in subs.iter() {
-            if crate::net::event_matches(&sub.prefixes, topic) {
+            if crate::net::event_matches(&sub.prefixes, topic) && (model || to == Some(sub.node.as_str())) {
                 let _ = sub.tx.send((topic.to_owned(), data.clone()));
             }
         }

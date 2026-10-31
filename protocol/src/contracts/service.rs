@@ -169,6 +169,25 @@ pub struct RunOptions {
     /// `jobs.get`); otherwise the call answers when it ends.
     #[serde(default)]
     pub background: bool,
+    /// What kind of work it is, as the caller decides: `check` (tests, linters, type checks),
+    /// `build`, `server` (stays up), `shell` (anything else). Lists group by it; empty is `shell`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+    /// For a background run: tell the caller ([`topics::COMMAND_MATCHED`]) when its output
+    /// matches or falls silent. Refused without `background`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<Watch>,
+}
+
+/// When a background run's caller wants to hear about it before it ends.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Watch {
+    /// A regular expression over its output lines (at most one event per 5 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// No output for this many seconds (once per silent stretch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_s: Option<u64>,
 }
 
 /// How much of what a service keeps comes back: the caller asks for the smallest that will do.
@@ -190,7 +209,8 @@ pub enum Size {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
-    /// waiting | running | done | failed | stopped | refused
+    /// waiting | running | done | failed | stopped | refused | lost (the provider stopped while it
+    /// ran: its result is unknown, its output up to then is kept)
     pub state: String,
     pub started: u64,
     #[serde(default)]
@@ -210,6 +230,123 @@ pub struct Job {
     /// Set when it did not run because it needs the person's approval.
     #[serde(default)]
     pub needs_approval: Option<NeedsApproval>,
+    /// Two to four lines a model reads as they are, written by the provider: the state, exit code
+    /// and time; the peak CPU and memory when traced; the first error; how to read more (and, for
+    /// an old job, what is no longer kept).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// When `jobs.get` was asked a `size` or an `at` and the job was traced: the trace in that
+    /// size, or what was happening at that moment ([`Moment`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
+}
+
+/// A traced process tree at one moment (`system.trace.read {id, at}`, `jobs.get {id, at}`),
+/// rebuilt from the trace's records.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Moment {
+    /// Unix milliseconds.
+    pub at: u64,
+    #[serde(default)]
+    pub processes: Vec<MomentProcess>,
+    /// Bytes, the whole tree.
+    #[serde(default)]
+    pub memory_total: u64,
+    /// Files open then (50 at most).
+    #[serde(default)]
+    pub open: Vec<MomentFile>,
+    /// Connections and listening ports then: `host:port` or `listen :port`.
+    #[serde(default)]
+    pub connections: Vec<String>,
+    /// The last output lines before that moment (20 at most).
+    #[serde(default)]
+    pub last_output: Vec<String>,
+    /// A few lines a model reads as they are.
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MomentProcess {
+    pub pid: u32,
+    pub name: String,
+    /// Percent of one core.
+    #[serde(default)]
+    pub cpu: f64,
+    /// Bytes.
+    #[serde(default)]
+    pub memory: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MomentFile {
+    pub pid: u32,
+    pub path: String,
+    /// read | write | rw
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// Events of shared services a member hears through `mesh.events`: the serving mesh sends each
+/// only to the app named by `node` or `owner.node` (and only on the same machine).
+pub mod topics {
+    /// [`super::CommandEnded`]: a `terminal.command` run ended (also a `lost` one, when its caller
+    /// is back).
+    pub const COMMAND_ENDED: &str = "terminal.command.ended";
+    /// [`super::CommandMatched`]: a background run's output matched its watch or fell silent.
+    pub const COMMAND_MATCHED: &str = "terminal.command.matched";
+    /// [`super::ScheduleDone`]: a scheduled job ran.
+    pub const SCHEDULE_DONE: &str = "system.schedule.done";
+    /// [`super::ScheduleChanged`]: a scheduled job was created, changed, paused or removed.
+    pub const SCHEDULE_CHANGED: &str = "system.schedule.changed";
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommandEnded {
+    pub id: String,
+    /// The asking app's mesh node, from its caller; the mesh sends the event to it only.
+    #[serde(default)]
+    pub node: String,
+    /// The caller's session (from its `caller`).
+    #[serde(default)]
+    pub session_id: String,
+    pub job: Job,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommandMatched {
+    pub id: String,
+    /// The asking app's mesh node, from its caller; the mesh sends the event to it only.
+    #[serde(default)]
+    pub node: String,
+    #[serde(default)]
+    pub session_id: String,
+    /// pattern | silence
+    pub why: String,
+    /// The line that matched; the last line before the silence.
+    #[serde(default)]
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScheduleDone {
+    pub schedule_id: String,
+    pub name: String,
+    /// The app that created it (its `caller` then); only that app may change it.
+    #[serde(default)]
+    pub owner: Option<Caller>,
+    /// The run: its id is its trace's, read again with `system.schedule.runs.read`.
+    pub run: Job,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScheduleChanged {
+    pub schedule_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub owner: Option<Caller>,
+    /// created | edited | paused | resumed | deleted
+    pub change: String,
 }
 
 /// The provider's own risk check stopped a run: the asking app's window shows this to the person

@@ -8,6 +8,9 @@
 //!   where the member is (`read` from anywhere; `edit` and `run` only from an app on this
 //!   machine). The mesh stamps who asked into the params as `caller`.
 //! - Every call served for another app is a record of stream `mesh.served` (kept 30 days).
+//! - Events: from each app on this machine that shares services, this mesh asks for those
+//!   services' events (`mesh.events`) and publishes them on this frame as they come; that app's
+//!   mesh sends only the events that name this app (`node`, `owner.node`).
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{OfferedService, ServiceCallParams, ServiceCard, ServicesResult};
@@ -26,6 +29,9 @@ pub struct Services {
     declared: Mutex<HashMap<String, Vec<Share>>>,
     /// A member's full declarations, by node, with the card time they were read at.
     theirs: Mutex<HashMap<String, (u64, Vec<Share>)>>,
+    /// The services' events heard from each app on this machine: the prefixes asked, and the
+    /// stream's stop.
+    listening: Mutex<HashMap<String, (Vec<String>, CancellationToken)>>,
 }
 
 fn now_ms() -> u64 {
@@ -109,6 +115,60 @@ impl Mesh {
     /// One served call, for the record.
     pub fn served(&self, node: &str, method: &str, ok: bool, ms: u64) {
         self.write(crate::store::Write::Served(json!({"at": now_ms(), "node": node, "method": method, "ok": ok, "ms": ms})));
+    }
+
+    /// Hear the events of the services an app on this machine shares (asked again when its card
+    /// changes what it shares; stopped when it goes).
+    pub fn listen_services(self: &std::sync::Arc<Self>, node: &str) {
+        if !self.is_local(node) {
+            return;
+        }
+        let mesh = self.clone();
+        let node = node.to_owned();
+        tokio::spawn(async move {
+            let mut prefixes: Vec<String> = mesh.member_shares(&node).await.into_iter().map(|share| format!("{}.", share.service)).collect();
+            prefixes.sort();
+            prefixes.dedup();
+            let stop = CancellationToken::new();
+            {
+                let mut listening = lock(&mesh.services.listening);
+                if listening.get(&node).is_some_and(|(asked, token)| *asked == prefixes && !token.is_cancelled()) {
+                    return;
+                }
+                if let Some((_, old)) = listening.remove(&node) {
+                    old.cancel();
+                }
+                if prefixes.is_empty() {
+                    return;
+                }
+                listening.insert(node.clone(), (prefixes.clone(), stop.clone()));
+            }
+            let (items_tx, mut items_rx) = mpsc::unbounded_channel::<Value>();
+            let forward = {
+                let ctx = mesh.ctx.get().cloned();
+                tokio::spawn(async move {
+                    while let Some(item) = items_rx.recv().await {
+                        if let (Some(ctx), Some(topic), Some(data)) = (&ctx, item.get("topic").and_then(Value::as_str), item.get("data")) {
+                            ctx.publish(topic, data.clone());
+                        }
+                    }
+                })
+            };
+            let _ = mesh.call_member(&node, "mesh.events", json!({"prefixes": prefixes}), Some(items_tx), stop.clone()).await;
+            forward.abort();
+            // The stream ended: the next card asks again. (One asked anew has other prefixes.)
+            let mut listening = lock(&mesh.services.listening);
+            if listening.get(&node).is_some_and(|(asked, _)| *asked == prefixes) {
+                listening.remove(&node);
+            }
+        });
+    }
+
+    /// An app that went: stop hearing its services' events.
+    pub fn stop_listening(&self, node: &str) {
+        if let Some((_, stop)) = lock(&self.services.listening).remove(node) {
+            stop.cancel();
+        }
     }
 
     /// A member's full declarations (asked of it when its card changed).
