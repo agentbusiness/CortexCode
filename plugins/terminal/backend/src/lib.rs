@@ -351,6 +351,8 @@ impl Terminals {
     pub fn resize(&self, params: ResizeParams) -> Result<TermInfo, RpcError> {
         check_size(params.cols, params.rows)?;
         let term = self.get(&params.term_id)?;
+        // SIGWINCH can trigger a redraw immediately. Hold the parser until its size is updated.
+        let mut parser = lock(&term.parser);
         {
             let master = lock(&term.master);
             let master = master.as_ref().ok_or_else(|| RpcError::new(codes::CONFLICT, "terminal is closed"))?;
@@ -359,8 +361,9 @@ impl Terminals {
                 .resize(PtySize { rows: params.rows, cols: params.cols, pixel_width: 0, pixel_height: 0 })
                 .map_err(|e| RpcError::internal(format!("resize failed: {e}")))?;
         }
-        lock(&term.parser).set_size(params.rows, params.cols);
+        parser.set_size(params.rows, params.cols);
         *lock(&term.size) = (params.cols, params.rows);
+        drop(parser);
         Ok(term.info())
     }
 

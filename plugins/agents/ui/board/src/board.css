@@ -1,18 +1,83 @@
-/* pane.board@1 — tasks as a ruled tree, agents as rows with their controls, the board as the design's register. */
-#cc .cx-board{flex:1;min-height:0;display:flex;flex-direction:column;}
+/* pane.board@1 — compact task disclosures, agents and the project register. */
+#cc .cx-board{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;container-type:inline-size;}
 #cc .cx-board>.bar{padding-left:16px;}
 #cc .cx-board-scroll{flex:1;min-height:0;overflow:auto;padding:0 16px 24px 0;}
-#cc .cx-board .lst .t{font-size:14.5px;}
-#cc .cx-board .lst .r{align-items:center;}
+#cc .cx-board-scheduler{font:400 11px/1.5 var(--font-apparatus);color:var(--ink-2);}
 #cc .cx-board .empty-line{padding-left:16px;}
 #cc .cx-board .inline-error{margin-left:16px;}
-#cc .cx-task-open{border-left:1px solid var(--rule-2);padding:4px 0 12px 12px;margin-bottom:12px;display:flex;flex-direction:column;gap:8px;}
-#cc .cx-task-brief{margin:0;font-size:14px;line-height:1.5;color:var(--ink-2);max-width:64ch;white-space:pre-wrap;}
-#cc .cx-task-plan{margin:0;font-family:var(--font-mono);font-size:12px;line-height:1.5;color:var(--ink-2);white-space:pre-wrap;}
+#cc .cx-tasks-toolbar{position:sticky;top:0;z-index:1;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;padding:12px 0 12px 16px;background:var(--ground);border-bottom:1px solid var(--rule-2);}
+#cc .cx-tasks-summary{margin:0;color:var(--ink);font:500 12px/1.5 var(--font-apparatus);font-variant-numeric:tabular-nums;}
+#cc .cx-tasks-summary span{color:var(--ink-2);font-weight:400;}
+#cc .cx-tasks-actions{display:flex;flex-wrap:wrap;gap:8px;}
+#cc .cx-tasks-actions .detent{min-height:28px;height:auto;font-size:10px;letter-spacing:.04em;text-transform:none;}
+#cc .cx-tasks{list-style:none;margin:0;padding:0;}
+#cc .cx-task-row{border-bottom:1px solid var(--rule);--task-state:var(--ink-2);}
+#cc .cx-task-row[data-status="in_progress"],#cc .cx-task-row[data-status="verifying"],#cc .cx-task-row[data-status="failed"]{--task-state:var(--rubric);}
+#cc .cx-task-row[data-status="blocked"],#cc .cx-task-row[data-status="indeterminate"]{--task-state:var(--rubric-lift);}
+#cc .cx-task-row[data-status="done"]{--task-state:var(--counter);}
+#cc .cx-task-toggle{width:100%;display:grid;grid-template-columns:16px minmax(0,1fr) minmax(104px,max-content);align-items:start;gap:12px;padding:16px 8px 16px calc(16px + var(--task-indent));border:0;background:transparent;color:var(--ink);text-align:left;cursor:pointer;}
+#cc .cx-task-toggle:hover,#cc .cx-task-row[data-selected="true"]>.cx-task-toggle{background:var(--rubric-wash);}
+#cc .cx-task-toggle:focus-visible{outline-offset:-2px;}
+#cc .cx-task-chevron{width:16px;height:16px;margin-top:2px;color:var(--ink-2);transition:transform .15s ease-out;}
+#cc .cx-task-toggle[aria-expanded="true"]>.cx-task-chevron{transform:rotate(90deg);}
+#cc .cx-task-heading{min-width:0;display:flex;flex-direction:column;gap:8px;}
+#cc .cx-task-title{font:500 14px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
+#cc .cx-task-meta{display:flex;flex-wrap:wrap;gap:4px 12px;color:var(--ink-2);font:400 11px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
+#cc .cx-task-assignee{color:var(--counter);}
+#cc .cx-task-status{display:flex;align-items:center;gap:8px;padding-top:2px;color:var(--task-state);font:500 12px/1.5 var(--font-apparatus);}
+#cc .cx-task-status i{width:6px;height:6px;flex:none;background:currentColor;}
+#cc .cx-task-row[data-status="pending"] .cx-task-status i,#cc .cx-task-row[data-status="cancelled"] .cx-task-status i{background:transparent;border:1px solid currentColor;}
+#cc .cx-task-open{min-width:0;margin:0 8px 16px calc(44px + var(--task-indent));}
+#cc .cx-task-section{min-width:0;border-top:1px solid var(--rule);}
+#cc .cx-task-section>summary{padding:12px 4px;color:var(--ink-2);font:500 12px/1.5 var(--font-apparatus);cursor:pointer;overflow-wrap:anywhere;}
+#cc .cx-task-section>summary:hover,#cc .cx-task-section[open]>summary{color:var(--ink);}
+#cc .cx-task-section>summary::marker{color:var(--ink-3);font-size:10px;}
+#cc .cx-task-section>summary>span{margin-left:8px;color:var(--ink-2);font-weight:400;}
+#cc .cx-task-text{min-width:0;max-width:72ch;padding:4px 4px 16px;color:var(--ink);font:400 14px/1.65 var(--font-reading);overflow-wrap:anywhere;}
+#cc .cx-task-text>:first-child{margin-top:0;}
+#cc .cx-task-text>:last-child{margin-bottom:0;}
+#cc .cx-task-text p{margin:0 0 12px;white-space:pre-wrap;}
+#cc .cx-task-text :is(h1,h2,h3,h4,h5,h6){margin:24px 0 8px;font:600 14px/1.5 var(--font-apparatus);color:var(--ink);}
+#cc .cx-task-text h1{font-size:18px;}
+#cc .cx-task-text h2{font-size:16px;}
+#cc .cx-task-text :is(ul,ol){margin:8px 0 16px;padding-left:24px;}
+#cc .cx-task-text li{margin:4px 0;}
+#cc .cx-task-text li>p{margin-bottom:4px;}
+#cc .cx-task-text :is(ul,ol) :is(ul,ol){margin:4px 0;}
+#cc .cx-task-text a{color:var(--counter);text-decoration:underline;text-underline-offset:3px;}
+#cc .cx-task-text a:hover{color:var(--ink);}
+#cc .cx-task-text code{font-family:var(--font-mono);font-size:12px;color:var(--ink);background:var(--rubric-wash);padding:2px 4px;}
+#cc .cx-task-text pre{max-width:100%;margin:12px 0;padding:12px;background:var(--rubric-wash);overflow:auto;white-space:pre;}
+#cc .cx-task-text pre code{padding:0;background:transparent;font-size:12px;line-height:1.6;}
+#cc .cx-task-text blockquote{margin:16px 0;padding-left:16px;border-left:1px solid var(--rule-2);color:var(--ink-2);}
+#cc .cx-task-text hr{margin:16px 0;border:0;border-top:1px solid var(--rule);}
+#cc .cx-task-table{max-width:100%;overflow:auto;margin:12px 0;}
+#cc .cx-task-table table{border-collapse:collapse;width:100%;font:400 12px/1.5 var(--font-apparatus);}
+#cc .cx-task-table :is(th,td){padding:8px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule);}
+#cc .cx-task-table th{font-weight:600;}
+#cc .cx-task-image{color:var(--ink-2);}
 #cc .cx-contract{list-style:none;margin:0;padding:0;}
-#cc .cx-contract li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:4px 0;border-top:1px solid var(--rule);}
-#cc .cx-contract code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink-3);flex-basis:100%;overflow-wrap:anywhere;}
-#cc .cx-check-name{font-family:var(--font-mono);font-size:12px;color:var(--ink);}
+#cc .cx-contract>li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;padding:12px 4px;border-top:1px solid var(--rule);}
+#cc .cx-contract>li>.cx-task-text{flex-basis:100%;padding:4px 0;}
+#cc .cx-check-name{font:500 12px/1.5 var(--font-apparatus);color:var(--ink);overflow-wrap:anywhere;}
+#cc .cx-check-kind{font:400 11px/1.5 var(--font-apparatus);color:var(--ink-2);overflow-wrap:anywhere;}
+#cc .cx-check-expect{flex-basis:100%;min-width:0;}
+#cc .cx-check-expect>span{font:500 11px/1.5 var(--font-apparatus);color:var(--ink-2);}
+#cc .cx-check-expect>.cx-task-text{padding:4px 0;}
+#cc .cx-task-dependencies{list-style:none;margin:0;padding:0 4px 12px;}
+#cc .cx-task-dependencies li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;padding:8px 0;font:400 12px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
+#cc .cx-task-dependencies li>span{color:var(--ink-2);}
+#cc .cx-task-no-details{margin:0;padding:8px 0;color:var(--ink-2);font-size:13px;}
+@container (max-width:520px){
+  #cc .cx-task-toggle{grid-template-columns:16px minmax(0,1fr);gap:8px 12px;padding-left:calc(12px + var(--task-indent));}
+  #cc .cx-task-heading{display:contents;}
+  #cc .cx-task-title{grid-column:2;grid-row:1;}
+  #cc .cx-task-status{grid-column:2;grid-row:2;padding-top:0;}
+  #cc .cx-task-meta{grid-column:2;grid-row:3;}
+  #cc .cx-task-open{margin-left:calc(40px + var(--task-indent));}
+  #cc .cx-tasks-toolbar{padding-left:12px;}
+}
+@media (prefers-reduced-motion:reduce){#cc .cx-task-chevron{transition:none;}}
 /* Agents: one ruled line each — a state pip, the name, its state in the state's colour, the task, counts,
    age, then the actions. Running is the rubric (pulsing), waiting the lift (hollow), blocked and failed
    the lift and the deep rubric (filled), done the counter, stopped the third ink. */
@@ -39,4 +104,5 @@
 #cc .cx-agent-acts{flex:0 0 auto;display:flex;gap:4px;}
 #cc .cx-agent-acts .detent.tiny{height:20px;padding:0 7px;}
 #cc .cx-board .reg-log{padding:0 0 0 16px;}
+#cc .cx-board-message .cx-task-text{max-width:66ch;padding:0;font-size:15.5px;line-height:1.5;}
 #cc .cx-board-post{margin:12px 0 0 16px;}

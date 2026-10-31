@@ -165,6 +165,8 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
   const host = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const transportRef = useRef<ReturnType<typeof connectTerminal> | null>(null);
+  const [problem, setProblem] = useState('');
   const exitRef = useRef(onExit);
   exitRef.current = onExit;
   const linkRef = useRef(onLink);
@@ -208,9 +210,10 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
       try { fit.fit(); } catch { /* Not laid out yet. */ }
     };
     const transport = connectTerminal(client, term, termId, {
-      onReady: () => { resize(); if (activeRef.current) term.focus(); },
-      onError: (message) => { element.dataset.terminalError = message; },
+      onReady: () => { setProblem(''); resize(); if (activeRef.current) term.focus(); },
+      onError: setProblem,
     });
+    transportRef.current = transport;
     const offExit = client.on('terminal.exit', (_topic, data) => {
       const event = data as { term_id?: string; exit_code?: number | null };
       if (event?.term_id === termId) exitRef.current(event.exit_code ?? null);
@@ -235,6 +238,7 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     return () => {
       transport.dispose();
+      transportRef.current = null;
       offExit();
       observer.disconnect();
       themeObserver.disconnect();
@@ -257,7 +261,10 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
     });
   }, [active]);
 
-  return <div className="cx-xterm" ref={host} data-term-id={termId} />;
+  return <>
+    {problem && <p className="cx-terminal-error" role="status">{problem} <button type="button" className="detent" onClick={() => transportRef.current?.refresh()}>Retry</button></p>}
+    <div className="cx-xterm" ref={host} data-term-id={termId} />
+  </>;
 }
 
 export default definePlugin({ slot: 'pane.terminal@1', component: TerminalPane });
