@@ -7,7 +7,7 @@
 [plugin]
 id = "scheduler"
 name = "Schedule"
-version = "0.1.2"
+version = "0.1.3"
 description = "Routines: recurring and timed work that wakes a session, hands a brief to an agent or runs a command, on a clock; per project and global, with the card's schedule section and the Schedule pane."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

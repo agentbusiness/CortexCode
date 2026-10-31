@@ -164,10 +164,17 @@ function ComposerPlugin() {
   const stop = async () => {
     if (!sessionId) return;
     setStopping(true);
+    setError(null);
     try {
-      await client.call(`${FLOW}.cancel`, { session_id: sessionId });
+      if (projectId && agentName) {
+        await client.call('agents.stop', { project_id: projectId, agent: agentName });
+      } else {
+        const result = await client.call<{ cancelled: boolean; reason?: string }>(`${FLOW}.cancel`, { session_id: sessionId });
+        if (!result.cancelled) throw new Error(result.reason ?? 'The run could not be stopped.');
+      }
     } catch (cause) {
       setError(errorMessage(cause));
+    } finally {
       setStopping(false);
     }
   };

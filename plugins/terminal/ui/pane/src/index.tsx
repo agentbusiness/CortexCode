@@ -22,7 +22,7 @@ import {
   useSelection,
   useSlotState,
   type TermInfo,
-  type TermSnapshot,
+  connectTerminal,
 } from '@cortex/sdk';
 
 /** xterm's palette for the ground on screen, from the active theme plugin. */
@@ -182,6 +182,7 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
       lineHeight: 1.25,
       cursorBlink: true,
       cursorStyle: 'block',
+      macOptionIsMeta: true,
       allowProposedApi: true,
       scrollback: 10_000,
       theme: palette(),
@@ -202,51 +203,17 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
       // WebGL unavailable: xterm keeps its DOM renderer.
       element.dataset.renderer = 'dom';
     }
-    let lastSize = '';
     const resize = () => {
       if (!element.offsetWidth || !element.offsetHeight) return;
-      try {
-        fit.fit();
-      } catch {
-        return;
-      }
-      const size = `${term.cols}x${term.rows}`;
-      if (size === lastSize) return;
-      lastSize = size;
-      void client.call('terminal.resize', { term_id: termId, cols: term.cols, rows: term.rows }).catch(() => undefined);
+      try { fit.fit(); } catch { /* Not laid out yet. */ }
     };
-    // Repaint what is on the screen now, then follow the live output.
-    let live = false;
-    const queued: Uint8Array[] = [];
-    const offOutput = client.on('terminal.output', (_topic, data) => {
-      const event = data as { term_id?: string; data?: string };
-      if (event?.term_id !== termId || typeof event.data !== 'string') return;
-      const bytes = decodeBase64(event.data);
-      if (live) term.write(bytes);
-      else queued.push(bytes);
+    const transport = connectTerminal(client, term, termId, {
+      onReady: () => { resize(); if (activeRef.current) term.focus(); },
+      onError: (message) => { element.dataset.terminalError = message; },
     });
     const offExit = client.on('terminal.exit', (_topic, data) => {
       const event = data as { term_id?: string; exit_code?: number | null };
       if (event?.term_id === termId) exitRef.current(event.exit_code ?? null);
-    });
-    client.call<TermSnapshot>('terminal.snapshot', { term_id: termId })
-      .then((snapshot) => {
-        // A screen snapshot is plain text: written as lines, then the cursor goes where it was.
-        if (snapshot?.text) {
-          term.write(snapshot.text.replace(/\n/g, '\r\n'));
-          term.write(`\x1b[${snapshot.cursor_row + 1};${snapshot.cursor_col + 1}H`);
-        }
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        live = true;
-        for (const bytes of queued.splice(0)) term.write(bytes);
-      });
-    const input = term.onData((data) => {
-      void client.call('terminal.write', { term_id: termId, data }).catch(() => undefined);
-    });
-    const binary = term.onBinary((data) => {
-      void client.call('terminal.write', { term_id: termId, data }).catch(() => undefined);
     });
     const observer = new ResizeObserver(() => resize());
     observer.observe(element);
@@ -267,10 +234,8 @@ function XTerm({ termId, active, onExit, onLink }: { termId: string; active: boo
     const themeObserver = new MutationObserver(restyle);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     return () => {
-      offOutput();
+      transport.dispose();
       offExit();
-      input.dispose();
-      binary.dispose();
       observer.disconnect();
       themeObserver.disconnect();
       offTheme();

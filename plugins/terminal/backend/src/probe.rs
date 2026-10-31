@@ -77,7 +77,7 @@ pub async fn run() -> ProbeReport {
     let started = Instant::now();
     let echoed = async {
         terms
-            .write(WriteParams { term_id: id.clone(), data: "echo cc-probe-$((6*7))\n".into() })
+            .write(WriteParams { term_id: id.clone(), data: "echo cc-probe-$((6*7))\n".into(), base64: false })
             .await
             .map_err(|e| e.to_string())?;
         wait_screen(&terms, &id, "cc-probe-42").await?;
@@ -100,7 +100,7 @@ pub async fn run() -> ProbeReport {
     let resized = async {
         terms.resize(ResizeParams { term_id: id.clone(), cols: 101, rows: 33 }).map_err(|e| e.to_string())?;
         terms
-            .write(WriteParams { term_id: id.clone(), data: "stty size\n".into() })
+            .write(WriteParams { term_id: id.clone(), data: "stty size\n".into(), base64: false })
             .await
             .map_err(|e| e.to_string())?;
         wait_screen(&terms, &id, "33 101").await.map(|_| "stty size: 33 101".to_owned())
