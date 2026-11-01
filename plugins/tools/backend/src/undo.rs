@@ -5,7 +5,6 @@
 //! (:Step {key: '<workspace hash>#<seq>', seq, ts_ms, actor, label, detail, undoes, session_id})
 //!     -[:IN]->(:Workspace)   -[:BY]->(:Session)   -[:UNDOES]->(:Step)
 //! (:StepFile {key: '<step key>#<path>', path, before, after, mode, added, removed, binary, bytes})-[:OF]->(:Step)
-//! stream `steps.<workspace hash>`     every step as it was recorded
 //! ```
 //!
 //! The nodes hold what undo still needs; the log of a workspace is read from them when it opens
@@ -560,14 +559,10 @@ impl ProjectLog {
         self.graph.put(workspace_batch(meta));
     }
 
-    /// A new step: its nodes in one put, the record on the workspace's stream.
+    /// A new step: its nodes in one put.
     fn write_step(&self, record: &TimelineRecord) {
         let workspace = self.workspace.to_string_lossy();
         self.graph.put_many(step_batches(&self.hash, &workspace, record));
-        if let Ok(value) = serde_json::to_value(record) {
-            // Kept as long as the memory plugin keeps anything: undo and history read it.
-            self.graph.append_kept(&format!("steps.{}", self.hash), vec![value], 3650);
-        }
     }
 
     /// Drop blobs no record names.

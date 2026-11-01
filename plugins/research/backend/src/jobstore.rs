@@ -15,7 +15,6 @@
 //!     -[:SUPPORTED_BY]->(:Note {id})   (one per note the finding cites)
 //! * temporal: `state` and `phase` keep their history (a whole node leaves them out, so a read
 //!   names them as their own columns)
-//! stream `research.jobs`: {job_id, state, phase, round, at} for every change of state or phase
 //! ```
 //!
 //! A question keeps its node after its round is searched (`pending: false`); a new round's
@@ -49,7 +48,6 @@ const JOB: &str = "ResearchJob";
 const QUESTION: &str = "ResearchQuestion";
 const SOURCE: &str = "ResearchSource";
 const FINDING: &str = "ResearchFinding";
-pub const STREAM: &str = "research.jobs";
 
 /// Where a job's questions stand: the position of its first pending question, and how many it
 /// has had in all.
@@ -69,7 +67,6 @@ struct Batch {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     retire: Vec<GraphRef>,
-    event: Option<Value>,
     /// Findings' `SUPPORTED_BY` edges to their notes, written after the checkpoint on their own: a
     /// note that is gone fails only these, never the checkpoint.
     supports: Vec<GraphEdge>,
@@ -230,15 +227,8 @@ impl JobStore {
             // The graph's copy is newer when an earlier move wrote it but could not delete the file.
             if !loaded.contains_key(&state.job.job_id) {
                 let questions = Questions { base: 0, total: state.pending.len() as u32 };
-                let Batch { nodes, edges, event, supports, .. } = batch(None, &state, questions);
-                let written = async {
-                    self.graph.put(nodes, edges, PATIENT).await?;
-                    if let Some(event) = event {
-                        self.graph.append(STREAM, vec![event], PATIENT).await?;
-                    }
-                    Ok::<_, RpcError>(())
-                };
-                if let Err(error) = written.await {
+                let Batch { nodes, edges, supports, .. } = batch(None, &state, questions);
+                if let Err(error) = self.graph.put(nodes, edges, PATIENT).await {
                     tracing::warn!("research: cannot move job {} into the graph ({}); its file stays until the next start", state.job.job_id, error.message);
                     continue;
                 }
@@ -303,9 +293,6 @@ async fn write_loop(graph: Arc<Graph>, mut receiver: mpsc::UnboundedReceiver<Wri
                 let outcome = async {
                     graph.put(batch.nodes.clone(), batch.edges.clone(), PATIENT).await?;
                     graph.retire(batch.retire.clone(), "replaced", PATIENT).await?;
-                    if let Some(event) = &batch.event {
-                        graph.append(STREAM, vec![event.clone()], PATIENT).await?;
-                    }
                     Ok::<_, RpcError>(())
                 }
                 .await;
@@ -385,8 +372,7 @@ fn desired(state: &JobState, questions: Questions) -> BTreeMap<GraphRef, Map<Str
 }
 
 /// The writes from one checkpoint to the next: the whole job node, its changed children,
-/// questions searched since (`pending: false`), children it no longer has (retired), and an event
-/// when the state or phase moved.
+/// questions searched since (`pending: false`) and children it no longer has (retired).
 fn batch(previous: Option<(&JobState, Questions)>, state: &JobState, questions: Questions) -> Batch {
     let id = &state.job.job_id;
     let job_ref = gref(JOB, id);
@@ -424,9 +410,7 @@ fn batch(previous: Option<(&JobState, Questions)>, state: &JobState, questions: 
             retire.push(at.clone());
         }
     }
-    let moved = previous.is_none_or(|(s, _)| s.job.state != state.job.state || s.job.phase != state.job.phase);
-    let event = moved.then(|| json!({ "job_id": id, "state": state.job.state, "phase": state.job.phase, "round": state.job.round, "at": state.job.updated_ms }));
-    Batch { nodes, edges, retire, event, supports }
+    Batch { nodes, edges, retire, supports }
 }
 
 fn into_map(value: Value) -> Map<String, Value> {

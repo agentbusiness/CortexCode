@@ -87,7 +87,7 @@ pub const SCHEDULER_TOPIC: &str = "agents.scheduler";
 /// Stream of every concurrency-limit change with the metrics behind it (`memory.stream.*`).
 const ADJUSTMENTS_STREAM: &str = "agents.adjustments";
 /// Days the adjustments stream keeps a change.
-const ADJUSTMENTS_RETENTION_DAYS: u32 = 365;
+const ADJUSTMENTS_RETENTION_DAYS: u32 = 30;
 /// Changes the scheduler state shows (the newest).
 const ADJUSTMENTS_SHOWN: usize = 200;
 

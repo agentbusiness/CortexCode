@@ -9,9 +9,7 @@
 //! (:Session)-[:CHILD_OF]->(:Session)          a session started from another (an agent's run)
 //! (:Session)-[:IN]->(:Workspace {key})        its workspace, when that node exists (never made here)
 //! (:Project)-[:HAS_SETTINGS]->(:Settings)     its settings (see `settings`)
-//! stream `app.sessions`                       every change of a session: {at_ms, value: its fields
-//!                                             as written}, or {at_ms, value: {id, project_id, deleted: true}}
-//! topic `session.<id>`                        journal patches of frames before journals moved into files
+//! topic `session.<id>`                       journal patches of frames before journals moved into files
 //! ```
 //!
 //! Every node and edge keeps `first_ms` and `last_ms`. `task_id` stays a property: tasks live in
@@ -35,8 +33,6 @@ use std::sync::Arc;
 const PAGE: usize = 2000;
 /// Bytes read per call at most.
 const PAGE_BYTES: usize = 32 << 20;
-/// The stream of session changes.
-pub const SESSIONS_TOPIC: &str = "app.sessions";
 
 const PROJECT_FIELDS: &[&str] = &["id", "root", "name", "created_ms", "flows"];
 const SESSION_FIELDS: &[&str] = &["id", "project_id", "kind", "title", "agent", "parent", "workspace", "task_id", "status", "created_ms", "updated_ms", "model", "flow"];
@@ -245,46 +241,23 @@ impl AppStore {
     }
 
     pub async fn put_session(&self, session: &Session) -> Result<(), RpcError> {
-        self.write_session(session).await?;
-        let record = json!({ "at_ms": now_ms(), "value": fields(session, SESSION_FIELDS)? });
-        if let Ok(bytes) = serde_json::to_vec(&record)
-            && let Err(error) = self.graph.stream_append(&self.ig_id, SESSIONS_TOPIC, vec![bytes]).await
-        {
-            tracing::warn!(error = %error.message, "a session change was not added to its stream");
-        }
-        Ok(())
+        self.write_session(session).await
     }
 
     /// Retire sessions, with their edges kept (what other plugins linked to them stays linked),
-    /// drop their old journal topics and add each deletion to the `app.sessions` stream.
+    /// and drop their old journal topics.
     pub async fn delete_sessions(&self, ids: &[String]) -> Result<(), RpcError> {
         for id in ids {
             self.graph.drop_topic(&self.ig_id, &topic(id)).await?;
         }
-        let now = now_ms();
-        let rows = self
-            .run(
-                &format!(
-                    "{} UNWIND $ids AS id MATCH (s:Session {{id: id}}) WHERE s.ended_ms IS NULL SET s.ended_ms = $now, s.ended_reason = 'deleted', s.state = 'gone', s.last_ms = $now RETURN s.id, s.project_id",
-                    layer::WORKSPACE_WRITE
-                ),
-                params! { "ids" => ids, "now" => now },
-            )
-            .await?;
-        let records: Vec<Vec<u8>> = rows
-            .rows
-            .iter()
-            .filter_map(|row| {
-                let id = row.first().and_then(Value::as_str)?;
-                let project = row.get(1).and_then(Value::as_str).unwrap_or("");
-                serde_json::to_vec(&json!({ "at_ms": now, "value": { "id": id, "project_id": project, "deleted": true } })).ok()
-            })
-            .collect();
-        if !records.is_empty()
-            && let Err(error) = self.graph.stream_append(&self.ig_id, SESSIONS_TOPIC, records).await
-        {
-            tracing::warn!(error = %error.message, "session deletions were not added to their stream");
-        }
+        self.run(
+            &format!(
+                "{} UNWIND $ids AS id MATCH (s:Session {{id: id}}) WHERE s.ended_ms IS NULL SET s.ended_ms = $now, s.ended_reason = 'deleted', s.state = 'gone', s.last_ms = $now",
+                layer::WORKSPACE_WRITE
+            ),
+            params! { "ids" => ids, "now" => now_ms() },
+        )
+        .await?;
         Ok(())
     }
 

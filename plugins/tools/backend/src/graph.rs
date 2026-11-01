@@ -1,6 +1,6 @@
 //! The plugin's records in the app's graph (`memory@1`, `docs/GRAPH-MODEL.md`): steps, jobs,
-//! workspace clones, artifacts, venvs and approvals are nodes and edges; step and job events are
-//! streams. Nothing of them is kept in a file.
+//! workspace clones, artifacts, venvs and approvals are nodes and edges. Nothing of them is kept
+//! in a file.
 //!
 //! Writes go through one queue, in order, so a node is written before the edges that need it. A
 //! write the memory plugin cannot take yet (it starts after this plugin, or is being swapped) is
@@ -12,7 +12,7 @@
 
 use crate::host::Host;
 use cc_protocol::contracts::memory::{
-    GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryParams, GraphQueryResult, GraphRef, GraphRetireParams, MachineInfo, StreamAppendParams,
+    GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryParams, GraphQueryResult, GraphRef, GraphRetireParams, MachineInfo,
     methods,
 };
 use cc_protocol::{RpcError, codes};
@@ -59,7 +59,6 @@ enum Op {
     /// Retire every node whose key the query's first column returns (it filters retired ones out,
     /// so it is asked again until it returns none).
     RetireMatching { label: String, cypher: String, params: Map<String, Value>, reason: String },
-    Append { topic: String, records: Vec<Value>, retention_days: Option<u32> },
     Flush(oneshot::Sender<()>),
 }
 
@@ -156,20 +155,6 @@ impl Graph {
         let _ = self.tx.send(Op::RetireMatching { label: label.to_owned(), cypher: cypher.to_owned(), params, reason: reason.to_owned() });
     }
 
-    /// Append records to a stream; the memory plugin's default retention applies to a new topic.
-    pub fn append(&self, topic: &str, records: Vec<Value>) {
-        if !records.is_empty() {
-            let _ = self.tx.send(Op::Append { topic: topic.to_owned(), records, retention_days: None });
-        }
-    }
-
-    /// Append records to a stream kept `retention_days` (applied when the topic is created).
-    pub fn append_kept(&self, topic: &str, records: Vec<Value>, retention_days: u32) {
-        if !records.is_empty() {
-            let _ = self.tx.send(Op::Append { topic: topic.to_owned(), records, retention_days: Some(retention_days) });
-        }
-    }
-
     /// Wait until what was queued before is written, at most `limit` (before a successor takes over).
     pub async fn flush(&self, limit: Duration) {
         let (done, flushed) = oneshot::channel();
@@ -253,14 +238,6 @@ async fn write(host: Arc<dyn Host>, mut rx: mpsc::UnboundedReceiver<Op>) {
         match op {
             Op::Flush(done) => {
                 let _ = done.send(());
-            }
-            Op::Append { topic, records, retention_days } => {
-                for chunk in records.chunks(MAX_ITEMS) {
-                    let params = json!(StreamAppendParams { topic: topic.clone(), records: chunk.to_vec(), retention_days });
-                    if let Err(error) = call(&host, methods::STREAM_APPEND, params).await {
-                        tracing::error!(topic, error = %error.message, "the step or job event was not kept");
-                    }
-                }
             }
             Op::Retire { refs, reason } => retire(&host, refs, &reason).await,
             Op::RetireMatching { label, cypher, params, reason } => {

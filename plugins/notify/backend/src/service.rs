@@ -15,7 +15,6 @@
 //!     -[:ABOUT]->(:Session)      when it has a session
 //!     -[:ABOUT]->(:Project)      else when it has a project
 //!     -[:ON]->(:Machine)         else
-//! stream `notifications`         every notification as posted (a dedup update too)
 //! ```
 //!
 //! An item that falls out of the newest [`history::CAPACITY`] is retired. The history kept before as
@@ -233,11 +232,8 @@ enum Plan {
 
 /// How long a stop waits for the graph to take the last changes.
 const FLUSH_WAIT: Duration = Duration::from_secs(5);
-/// The graph's label of a notification, and the stream of posts.
+/// The graph's label of a notification.
 const NOTIFICATION: &str = "Notification";
-const POSTS: &str = "notifications";
-/// How long the stream of posts is kept (applied when the topic is created).
-const POSTS_DAYS: u32 = 365;
 /// The history's setting of earlier versions, and the file before it (moved into the graph once).
 const OLD_SETTING: &str = "notify.history";
 const OLD_FILE: &str = "history.json";
@@ -378,7 +374,6 @@ impl Notifier {
         for item in history.items() {
             self.write_item(item);
         }
-        self.graph.append(POSTS, history.items().filter_map(|item| to_value(item).ok()).collect(), Some(POSTS_DAYS));
         if !self.graph.flush().await {
             tracing::warn!("the old notification history was not moved into the graph; it is kept and tried again at the next start");
             return;
@@ -540,9 +535,6 @@ impl Notifier {
             (posted.unwrap_or_else(|| recorded.posted().clone()), plan)
         };
         self.changed(&posted);
-        if let Ok(value) = to_value(&posted) {
-            self.graph.append(POSTS, vec![value], Some(POSTS_DAYS));
-        }
         match plan {
             Plan::Deliver { replaces } => {
                 let work = self.clone().deliver(posted.clone(), replaces, note);

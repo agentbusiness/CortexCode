@@ -6,7 +6,6 @@
 //! (:Backup {key: "backup", repo, auto, last_push_ms, last_push_error})-[:ON]->(:Machine)
 //! (:PullRequest {key: url, number, branch, commits, state, ms})-[:ON]->(:Machine)
 //! (:LiveFolder {key: "live", update, conflicts})-[:ON]->(:Machine)
-//! stream `source.pushes`    every backup push {repo, ms, ok, error}
 //! ```
 //!
 //! Earlier versions kept this as one setting (`source.settings`) and before that as a JSON file
@@ -50,9 +49,6 @@ pub const SETTINGS: &str = "settings.json";
 const BACKUP: (&str, &str) = ("Backup", "backup");
 const LIVE: (&str, &str) = ("LiveFolder", "live");
 const PULL_REQUEST: &str = "PullRequest";
-/// The stream of backup pushes, and how long it is kept.
-pub const PUSHES: &str = "source.pushes";
-pub const PUSHES_DAYS: u32 = 365;
 
 /// Write what differs between `old` and `new`.
 pub fn write_changes(graph: &Graph, old: &Settings, new: &Settings) {

@@ -3,10 +3,11 @@
 //! ```text
 //! topic `<name>`          memory.stream.*: one record per value, `{at_ms, value}` as JSON
 //! topic `queue.<name>`    memory.queue.*: one record per message, the same envelope, kept 30 days
-//! topics the plugin appends to itself (`app.sessions`, `settings`, `security.status`): made by
-//!                         their first append, kept [`crate::db::KEPT_DAYS`] days; `board`
-//!                         (the work board, kept 90 days). [`OWN_TOPICS`]: refused to
+//! topics the plugin appends to itself: `board` (the work board, kept 90 days), `session.<id>`
+//!                         (old journals, moved into files). [`OWN_TOPICS`]: refused to
 //!                         memory.stream.append, never dropped as expired
+//! [`RETIRED_TOPICS`]      logs earlier versions kept and nothing read (every change of a
+//!                         setting, a session, a security status): dropped at start
 //! WORKSPACE layer, a queue's consumers and what they hold:
 //! (:Queue {key: name, topic})-[:ON]->(:Machine)
 //! (:QueueConsumer {key: '<queue>:<consumer>', queue, consumer, offset, updated_ms})-[:READS]->(:Queue)
@@ -58,6 +59,9 @@ const PENDING_MAX: usize = 10_000;
 /// The topics the plugin writes itself: a name ending in `.` is a prefix, any other a whole name.
 /// `memory.stream.append` refuses them and [`StreamStore::drop_expired`] keeps them.
 const OWN_TOPICS: &[&str] = &["queue.", "session.", "app.sessions", "settings", "security.status", "board"];
+/// The plugin's own topics no version writes any more: their nodes hold everything, so the logs
+/// are dropped.
+const RETIRED_TOPICS: &[&str] = &["app.sessions", "settings", "security.status"];
 
 /// The entry of [`OWN_TOPICS`] that `topic` is, if any.
 fn own_topic(topic: &str) -> Option<&'static str> {
@@ -218,10 +222,17 @@ impl StreamStore {
     }
 
     /// Drop the streams whose every record has passed its retention (a finished Run's output, an
-    /// old shell's history): an empty topic is not kept. Queues and the plugin's own topics stay.
+    /// old shell's history): an empty topic is not kept. Queues and the plugin's own topics stay;
+    /// its retired ones go.
     pub async fn drop_expired(&self) -> Result<u32, RpcError> {
         let mut dropped = 0;
         for (name, ..) in self.graph.topics(&self.ig).await? {
+            if RETIRED_TOPICS.contains(&name.as_str()) {
+                self.graph.drop_topic(&self.ig, &name).await?;
+                self.topics.lock().await.remove(&name);
+                dropped += 1;
+                continue;
+            }
             if own_topic(&name).is_some() {
                 continue;
             }

@@ -1,21 +1,17 @@
 //! The plugin's records in the app's graph (`docs/GRAPH-MODEL.md`), served by the memory plugin
-//! through `memory@1`: puts, read-only queries and stream appends.
+//! through `memory@1`: puts and read-only queries.
 //!
 //! The memory plugin may start after this one. A call it does not answer yet is tried again every
 //! second: a few times for a call the user waits on, until it is answered for the start-up work.
 //! Writes that need no answer go through one queue, in order, and are tried again until memory
 //! takes them; the plugin keeps working from memory meanwhile.
 
-use cc_protocol::contracts::memory::{GraphLayer, GraphNode, GraphPutParams, GraphRef, StreamAppendParams, methods};
+use cc_protocol::contracts::memory::{GraphLayer, GraphNode, GraphPutParams, GraphRef, methods};
 use cc_protocol::{Ctx, RpcError, codes};
 use serde_json::{Map, Value, json};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// How long the plugin's streams (`checkpoints`) are kept: as long as the memory plugin keeps
-/// anything, since undo and history read them (applied when a topic is created).
-const STREAM_DAYS: u32 = 3650;
 
 /// Between two attempts while memory does not answer.
 const RETRY: Duration = Duration::from_secs(1);
@@ -36,7 +32,6 @@ type Build = Box<dyn FnOnce(&str) -> GraphPutParams + Send>;
 
 enum Write {
     Put(Build),
-    Append(StreamAppendParams),
 }
 
 pub struct Graph {
@@ -123,21 +118,9 @@ impl Graph {
         self.call(methods::GRAPH_PUT, params, wait).await.map(drop)
     }
 
-    /// Append records to a stream now.
-    pub async fn append(&self, topic: &str, records: Vec<Value>, wait: Wait) -> Result<(), RpcError> {
-        let params = StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(STREAM_DAYS) };
-        let params = serde_json::to_value(params).map_err(|error| RpcError::internal(error.to_string()))?;
-        self.call(methods::STREAM_APPEND, params, wait).await.map(drop)
-    }
-
     /// Write a batch in the background, after the writes queued before it.
     pub fn put_later(&self, build: impl FnOnce(&str) -> GraphPutParams + Send + 'static) {
         let _ = self.writes.send(Write::Put(Box::new(build)));
-    }
-
-    /// Append records to a stream in the background, after the writes queued before them.
-    pub fn append_later(&self, topic: &str, records: Vec<Value>) {
-        let _ = self.writes.send(Write::Append(StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(STREAM_DAYS) }));
     }
 
     /// One read-only statement; the rows' columns as JSON values.
@@ -178,10 +161,6 @@ async fn writer(graph: Arc<Graph>, mut rx: mpsc::UnboundedReceiver<Write>) {
                     Err(error) => Err(RpcError::internal(error.to_string())),
                 },
                 Err(error) => Err(error),
-            },
-            Write::Append(params) => match serde_json::to_value(params) {
-                Ok(params) => graph.call(methods::STREAM_APPEND, params, Wait::Until).await.map(drop),
-                Err(error) => Err(RpcError::internal(error.to_string())),
             },
         };
         if let Err(error) = outcome {

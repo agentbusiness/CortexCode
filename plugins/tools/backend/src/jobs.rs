@@ -7,7 +7,6 @@
 //! (:Job {key: job id, command, cwd, pid, state*, exit_code, started_ms, finished_ms, wake_pattern,
 //!     wake_silence_s, note, wake_published, exit_published, session_id, project_id, artifact})
 //!     -[:FOR]->(:Session)   -[:IN]->(:Project)   -[:ON]->(:Machine)   -[:OUTPUT]->(:Artifact)
-//! stream `jobs`       start, match, silence, exit and kill of every job
 //! ```
 //!
 //! The jobs are held in memory while the plugin runs and every change is written through. `note`
@@ -338,23 +337,6 @@ impl Jobs {
         self.graph.put(meta.batch(&self.artifacts, self.output_len(meta)));
     }
 
-    /// A job event on the `jobs` stream.
-    fn event(&self, meta: &JobMeta, event: &str) {
-        self.graph.append_kept(
-            "jobs",
-            vec![json!({
-                "job_id": meta.job_id,
-                "event": event,
-                "state": meta.state,
-                "exit_code": meta.exit_code,
-                "session_id": meta.session_id,
-                "project_id": meta.project_id,
-                "command": meta.command,
-            })],
-            365,
-        );
-    }
-
     pub fn meta(&self, job_id: &str) -> Option<JobMeta> {
         self.metas.lock().ok()?.get(job_id).cloned()
     }
@@ -494,7 +476,6 @@ impl Jobs {
             exit_published: false,
         };
         self.write_meta(&meta);
-        self.event(&meta, "start");
         if let Ok(mut running) = self.running.lock() {
             running.insert(job_id.clone(), child);
         }
@@ -670,7 +651,6 @@ impl Jobs {
                         partial.clear();
                         // Published once: by this instance or another.
                         if self.claim(&meta.job_id, Once::Wake).await {
-                            self.event(&meta, "match");
                             self.publish(json!({
                                 "job_id": meta.job_id,
                                 "session_id": meta.session_id,
@@ -741,7 +721,6 @@ impl Jobs {
                 meta.exit_code = exited;
                 meta.ended_ms = Some(util::now_ms());
                 self.write_meta(&meta);
-                self.event(&meta, "exit");
                 if self.claim(&meta.job_id, Once::Exit).await {
                     self.publish(json!({
                         "job_id": meta.job_id,
@@ -765,7 +744,6 @@ impl Jobs {
                 && last_output.elapsed() >= limit
             {
                 silence_fired = true;
-                self.event(&meta, "silence");
                 self.publish(json!({
                     "job_id": meta.job_id,
                     "session_id": meta.session_id,
@@ -809,7 +787,6 @@ impl Jobs {
         if meta.state == "running" {
             meta.state = "killed".to_owned();
             self.write_meta(&meta);
-            self.event(&meta, "kill");
             crate::guard::stop(meta.pid).await;
             self.reap(job_id);
         }
@@ -825,7 +802,6 @@ impl Jobs {
         }
         meta.note = Some(note.to_owned());
         self.write_meta(&meta);
-        self.event(&meta, "kill");
         match mode {
             StopMode::Escalate => crate::guard::stop(meta.pid).await,
             StopMode::Term => crate::guard::signal(meta.pid, &crate::guard::tree(meta.pid), libc::SIGTERM),

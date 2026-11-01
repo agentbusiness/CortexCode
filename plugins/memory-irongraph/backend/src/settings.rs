@@ -9,8 +9,10 @@
 //!                                      first_ms, last_ms})
 //! (:Settings {scope: 'global'})-[:ON]->(:Machine)                   the app's own scope
 //! (:Project)-[:HAS_SETTINGS]->(:Settings)                           a project's scope
-//! stream `settings`                                                 every change: {scope, path, op, value, by}
 //! ```
+//!
+//! A setting keeps who changed it last and when (`updated_ms`, `updated_by`); no log of changes
+//! is kept, as nothing reads one.
 //!
 //! Every node and edge keeps `first_ms` and `last_ms`. A setting or section that is deleted (or
 //! replaced by a value without it, or whose project is deleted) is retired, not removed: it keeps
@@ -51,8 +53,6 @@ use tokio::sync::Mutex;
 
 /// The app's own scope (every other scope is a project id).
 pub const GLOBAL: &str = "global";
-/// The stream every change is appended to.
-pub const TOPIC: &str = "settings";
 /// Joins a scope and its segments into a node id.
 const SEP: char = '\u{1f}';
 /// How long the old JSON text is read through before what is left of it moves into the tree.
@@ -559,18 +559,6 @@ impl Settings {
         Ok(())
     }
 
-    /// Append changes to the `settings` stream (the shared stream envelope `{at_ms, value}`).
-    async fn record(&self, changes: Vec<Value>) {
-        if changes.is_empty() {
-            return;
-        }
-        let at = now_ms();
-        let records: Vec<Vec<u8>> = changes.into_iter().filter_map(|value| serde_json::to_vec(&json!({ "at_ms": at, "value": value })).ok()).collect();
-        if let Err(error) = self.graph.stream_append(&self.ig_id, TOPIC, records).await {
-            tracing::warn!(error = %error.message, "settings changes not added to their stream");
-        }
-    }
-
     pub async fn get(&self, scope: &str, path: &str) -> Result<SettingValue, RpcError> {
         let parts = segments(path)?;
         let tree = self.read(scope_of(scope)).await?;
@@ -612,16 +600,11 @@ impl Settings {
         }
         let now = now_ms();
         let description = description.or_else(|| tree.value(&parts).and_then(|(_, _, _, description)| description));
-        let mut changes = Vec::new();
         // What is under the path now and is not in the new value goes.
         let wanted: BTreeSet<&Vec<String>> = flat.iter().map(|(path, _)| path).collect();
         let gone: Vec<Vec<String>> = tree.leaves.keys().filter(|key| under(key, &parts) && !wanted.contains(key)).cloned().collect();
         let kept: BTreeSet<&Vec<String>> = sections.iter().map(|(path, _)| path).collect();
         let gone_sections: Vec<Vec<String>> = tree.sections.keys().filter(|key| under(key, &parts) && !kept.contains(key)).cloned().collect();
-        // Settings only in the old text were never nodes: their removal is not a change of the tree.
-        for path in gone.iter().filter(|path| !tree.old_leaves.contains(*path)) {
-            changes.push(json!({ "scope": scope, "path": path, "op": "delete", "by": by }));
-        }
         self.remove(scope, &gone, &gone_sections).await?;
         let mut leaves = Vec::new();
         for (leaf_path, leaf_value) in &flat {
@@ -632,9 +615,6 @@ impl Settings {
                 continue;
             }
             leaves.push((leaf_path.clone(), Leaf { value: leaf_value.clone(), description: own, updated_ms: now, updated_by: by.to_owned() }));
-            if !unchanged {
-                changes.push(json!({ "scope": scope, "path": leaf_path, "op": "set", "value": leaf_value, "by": by }));
-            }
         }
         let mut shaped = Vec::new();
         for (section, list) in &sections {
@@ -647,7 +627,6 @@ impl Settings {
         self.write_batch(scope, &leaves, &shaped).await?;
         self.forget_old(scope, &parts).await?;
         drop(_write);
-        self.record(changes).await;
         Ok(SettingValue { path: path.to_owned(), value, value_type: value_type.to_owned(), description, updated_ms: now, updated_by: by.to_owned() })
     }
 
@@ -681,12 +660,6 @@ impl Settings {
         self.remove(scope, &doomed, &sections).await?;
         self.forget_old(scope, &parts).await?;
         drop(_write);
-        // One record for what only the old text held (a record moved elsewhere), one per node deleted.
-        let mut changes: Vec<Value> = doomed.iter().filter(|path| !tree.old_leaves.contains(*path)).map(|path| json!({ "scope": scope, "path": path, "op": "delete", "by": "" })).collect();
-        if doomed.iter().any(|path| tree.old_leaves.contains(path)) {
-            changes.push(json!({ "scope": scope, "path": parts, "op": "delete", "by": "", "old": true }));
-        }
-        self.record(changes).await;
         Ok(doomed.iter().map(|path| dotted(path)).collect())
     }
 }

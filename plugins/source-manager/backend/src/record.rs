@@ -1,30 +1,32 @@
 //! The live folder's record in the app's graph (`memory@1`, `docs/GRAPH-MODEL.md`). The folder
 //! stays the materialised view plugins read as files (scripts and rules need real files); what
-//! changed, when and every version's text are kept here:
+//! changed and when is kept here:
 //!
 //! ```text
 //! (:Plugin {key: id, name})-[:ON]->(:Machine)
 //! (:DataFile {key: "<plugin>/<path>", plugin, path, shipped_hash,
-//!             body*, hash*, origin*: shipped|edit|update|revert|restore})-[:OF]->(:Plugin)
+//!             hash*, origin*: shipped|edit|update|revert|restore})-[:OF]->(:Plugin)
 //! (:LiveFolder {key: "live", recorded_commit, recorded_ms})      how far the record goes
 //! stream `source.changes`   one record per change {at, commit, origin, summary, plugins, files, reverts}
 //! ```
 //!
 //! `path` is the file's path in its plugin's folder (`data/skills/x.md`; in the live folder it is
 //! `plugins/<plugin>/<path>`). `hash` is the content's git blob id, empty once the file is deleted
-//! (the node is then retired); `body` is the text (at most [`MAX_BODY`] bytes), empty for a binary
-//! file, which keeps only its hash. `shipped_hash` is the blob of the packages' data the folder
-//! was last updated from (absent: a file the user added).
+//! (the node is then retired). The content itself is bytes, not a record: it stays in the folder's
+//! git objects (compressed, every committed version), and a restore reads it from there by its
+//! hash. `shipped_hash` is the blob of the packages' data the folder was last updated from
+//! (absent: a file the user added).
 //!
 //! Every change of the branch is recorded once, in order ([`sync`]): the files it changed are put
 //! with their temporal values sampled at the change's time, then the stream record. A first start
-//! replays the branch's first-parent history from the shipped root commit, so the graph holds
-//! every version the folder ever had. Sample times only grow (a change in the same millisecond as
+//! replays the branch's first-parent history from the shipped root commit, so the graph knows
+//! every version the folder ever committed. Sample times only grow (a change in the same millisecond as
 //! the one before is recorded a millisecond later), as IronGraph requires; the shipped root commit
 //! (dated 1970) is recorded just before the first change after it.
 //!
 //! The git repository in the folder stays as the transport to GitHub (backup and sharing) and as
-//! the three-way merge of releases; History and a file's restore read the graph.
+//! the three-way merge of releases, and holds the versions' content; History and a file's
+//! versions read the graph.
 
 use crate::live;
 use crate::paths;
@@ -41,14 +43,11 @@ use std::sync::Arc;
 /// The stream of changes, and how long it is kept (as long as the graph keeps temporal history).
 pub const CHANGES: &str = "source.changes";
 pub const CHANGES_DAYS: u32 = 3650;
-/// The largest text kept as a body.
-pub const MAX_BODY: usize = 1_000_000;
 const DATA_FILE: &str = "DataFile";
 const PLUGIN: &str = "Plugin";
 const LIVE: (&str, &str) = ("LiveFolder", "live");
-/// Files and body bytes per put.
+/// Files per put.
 const FILES_PER_PUT: usize = 200;
-const BYTES_PER_PUT: usize = 8 * 1024 * 1024;
 /// Times before this many days ago are older than the graph keeps history (the root commit).
 const KEPT_DAYS: u64 = 3600;
 const DAY_MS: u64 = 86_400_000;
@@ -77,8 +76,6 @@ pub struct FileState {
     pub path: String,
     /// The blob id; empty when deleted.
     pub hash: String,
-    /// The text; empty for a binary or deleted file.
-    pub body: String,
     pub shipped_hash: Option<String>,
 }
 
@@ -101,26 +98,12 @@ fn blob_of(tree: Option<&Tree>, file: &str) -> Option<Oid> {
     (entry.kind() == Some(ObjectType::Blob)).then(|| entry.id())
 }
 
-/// The text of `bytes`, when it is text small enough to keep.
-pub fn text_of(bytes: &[u8]) -> Option<&str> {
-    if bytes.len() > MAX_BODY || bytes.contains(&0) {
-        return None;
-    }
-    std::str::from_utf8(bytes).ok()
-}
-
-fn state_of(repo: &Repository, tree: &Tree, shipped: Option<&Tree>, file: &str) -> Result<Option<FileState>, String> {
-    let Some(plugin) = paths::plugin_of(file) else { return Ok(None) };
+fn state_of(tree: &Tree, shipped: Option<&Tree>, file: &str) -> Option<FileState> {
+    let plugin = paths::plugin_of(file)?;
     let path = file["plugins/".len() + plugin.len() + 1..].to_owned();
-    let (hash, body) = match blob_of(Some(tree), file) {
-        Some(oid) => {
-            let blob = repo.find_blob(oid).map_err(live::err)?;
-            (oid.to_string(), text_of(blob.content()).unwrap_or_default().to_owned())
-        }
-        None => (String::new(), String::new()),
-    };
+    let hash = blob_of(Some(tree), file).map(|oid| oid.to_string()).unwrap_or_default();
     let shipped_hash = blob_of(shipped, file).map(|oid| oid.to_string());
-    Ok(Some(FileState { plugin: plugin.to_owned(), path, hash, body, shipped_hash }))
+    Some(FileState { plugin: plugin.to_owned(), path, hash, shipped_hash })
 }
 
 /// The branch's changes after `recorded`, oldest first: its first-parent line back to that
@@ -171,14 +154,14 @@ pub fn pending(repo: &Repository, recorded: Option<&str>) -> Result<Vec<Pending>
         };
         let mut files = Vec::new();
         for file in &changed {
-            if let Some(state) = state_of(repo, &tree, now_shipped.as_ref(), file)? {
+            if let Some(state) = state_of(&tree, now_shipped.as_ref(), file) {
                 files.push(state);
             }
         }
         let changed_set: BTreeSet<&String> = changed.iter().collect();
         let mut moved = Vec::new();
         for file in shipped_moved.iter().filter(|file| !changed_set.contains(file)) {
-            if let Some(state) = state_of(repo, &tree, now_shipped.as_ref(), file)? {
+            if let Some(state) = state_of(&tree, now_shipped.as_ref(), file) {
                 moved.push(state);
             }
         }
@@ -233,18 +216,11 @@ async fn put(service: &Service, nodes: Vec<GraphNode>, edges: Vec<GraphEdge>, at
 
 /// Put files (their nodes, their plugins and the edges) in batches.
 async fn put_files(service: &Service, machine: &str, files: &[FileState], with_values: bool, at_ms: u64) -> Result<(), RpcError> {
-    let mut start = 0;
-    while start < files.len() {
-        let mut end = start;
-        let mut bytes = 0;
-        while end < files.len() && end - start < FILES_PER_PUT && (end == start || bytes + files[end].body.len() <= BYTES_PER_PUT) {
-            bytes += files[end].body.len();
-            end += 1;
-        }
+    for batch in files.chunks(FILES_PER_PUT) {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         let mut plugins = BTreeSet::new();
-        for file in &files[start..end] {
+        for file in batch {
             let key = format!("{}/{}", file.plugin, file.path);
             let mut props = Map::new();
             props.insert("plugin".into(), json!(file.plugin));
@@ -255,9 +231,8 @@ async fn put_files(service: &Service, machine: &str, files: &[FileState], with_v
             plugins.insert(file.plugin.clone());
         }
         if with_values {
-            for (node, file) in nodes.iter_mut().zip(&files[start..end]) {
+            for (node, file) in nodes.iter_mut().zip(batch) {
                 node.temporal.insert("hash".into(), json!(file.hash));
-                node.temporal.insert("body".into(), json!(file.body));
             }
         }
         for plugin in plugins {
@@ -265,7 +240,6 @@ async fn put_files(service: &Service, machine: &str, files: &[FileState], with_v
             edges.push(edge(at(PLUGIN, &plugin), "ON", at("Machine", machine)));
         }
         put(service, nodes, edges, at_ms).await?;
-        start = end;
     }
     Ok(())
 }
@@ -433,11 +407,10 @@ pub async fn file_restore(service: &Arc<Service>, params: FileRestoreParams) -> 
         return Err(RpcError::invalid_params("the live folder is a developer checkout: restore with git there"));
     }
     let key = key_of(&params.path)?;
-    let cypher = "AT TIME datetime.fromepochmillis($at) MATCH (f:DataFile {key: $key}) RETURN f.hash AS hash, f.body AS body";
+    let cypher = "AT TIME datetime.fromepochmillis($at) MATCH (f:DataFile {key: $key}) RETURN f.hash AS hash";
     let result: GraphQueryResult = service.graph.ask(methods::GRAPH_QUERY, json!({"cypher": cypher, "params": {"key": key, "at": params.at_ms}, "limit": 1})).await?;
     let row = result.rows.into_iter().next().unwrap_or_default();
     let hash = row.first().and_then(Value::as_str).map(str::to_owned);
-    let body = row.get(1).and_then(Value::as_str).unwrap_or_default().to_owned();
     let Some(hash) = hash else {
         return Err(RpcError::not_found(format!("the graph has no version of {} at {}", params.path, params.at_ms)));
     };
@@ -447,14 +420,12 @@ pub async fn file_restore(service: &Arc<Service>, params: FileRestoreParams) -> 
     let wanted = hash.clone();
     let (state, commit) = service
         .git(move |repo| {
-            // The text the graph keeps; a binary file (or one too large) comes from git's objects.
+            // The content of that version is in git's objects, by its hash.
             let bytes: Option<Vec<u8>> = if wanted.is_empty() {
                 None
-            } else if Oid::hash_object(ObjectType::Blob, body.as_bytes()).map(|oid| oid.to_string()).ok().as_deref() == Some(wanted.as_str()) {
-                Some(body.into_bytes())
             } else {
                 let oid = Oid::from_str(&wanted).map_err(live::err)?;
-                Some(repo.find_blob(oid).map_err(|_| format!("{path} was binary at that time and its content is no longer in the live folder"))?.content().to_vec())
+                Some(repo.find_blob(oid).map_err(|_| format!("{path} at that time is no longer in the live folder's git history"))?.content().to_vec())
             };
             let work = repo.workdir().ok_or("the live folder has no work tree")?.join(&path);
             let current = std::fs::read(&work).ok();
