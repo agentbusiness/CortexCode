@@ -18,6 +18,7 @@ mod home;
 mod http;
 mod hub;
 mod journal;
+#[cfg(target_os = "macos")]
 mod keychain;
 mod machine;
 mod package;
