@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How long the plugin's streams (`checkpoints`) are kept: as long as the memory plugin keeps
+/// anything, since undo and history read them (applied when a topic is created).
+const STREAM_DAYS: u32 = 3650;
+
 /// Between two attempts while memory does not answer.
 const RETRY: Duration = Duration::from_secs(1);
 /// Attempts for a call the user waits on.
@@ -121,7 +125,7 @@ impl Graph {
 
     /// Append records to a stream now.
     pub async fn append(&self, topic: &str, records: Vec<Value>, wait: Wait) -> Result<(), RpcError> {
-        let params = StreamAppendParams { topic: topic.to_owned(), records, retention_days: None };
+        let params = StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(STREAM_DAYS) };
         let params = serde_json::to_value(params).map_err(|error| RpcError::internal(error.to_string()))?;
         self.call(methods::STREAM_APPEND, params, wait).await.map(drop)
     }
@@ -133,7 +137,7 @@ impl Graph {
 
     /// Append records to a stream in the background, after the writes queued before them.
     pub fn append_later(&self, topic: &str, records: Vec<Value>) {
-        let _ = self.writes.send(Write::Append(StreamAppendParams { topic: topic.to_owned(), records, retention_days: None }));
+        let _ = self.writes.send(Write::Append(StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(STREAM_DAYS) }));
     }
 
     /// One read-only statement; the rows' columns as JSON values.

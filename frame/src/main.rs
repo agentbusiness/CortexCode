@@ -259,6 +259,8 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     tracing::info!(home = %home.root.display(), port, socket = %socket.display(), version = FRAME_VERSION, "frame listening");
 
     units::watch_incoming(&frame);
+    // Installs a stopped frame left: their outcomes go to the graph once the memory plugin serves.
+    units::record_recovered(&frame);
 
     // Plugins in order; then the UI shell.
     let start_frame = frame.clone();

@@ -59,7 +59,7 @@ enum Op {
     /// Retire every node whose key the query's first column returns (it filters retired ones out,
     /// so it is asked again until it returns none).
     RetireMatching { label: String, cypher: String, params: Map<String, Value>, reason: String },
-    Append { topic: String, records: Vec<Value> },
+    Append { topic: String, records: Vec<Value>, retention_days: Option<u32> },
     Flush(oneshot::Sender<()>),
 }
 
@@ -156,9 +156,17 @@ impl Graph {
         let _ = self.tx.send(Op::RetireMatching { label: label.to_owned(), cypher: cypher.to_owned(), params, reason: reason.to_owned() });
     }
 
+    /// Append records to a stream; the memory plugin's default retention applies to a new topic.
     pub fn append(&self, topic: &str, records: Vec<Value>) {
         if !records.is_empty() {
-            let _ = self.tx.send(Op::Append { topic: topic.to_owned(), records });
+            let _ = self.tx.send(Op::Append { topic: topic.to_owned(), records, retention_days: None });
+        }
+    }
+
+    /// Append records to a stream kept `retention_days` (applied when the topic is created).
+    pub fn append_kept(&self, topic: &str, records: Vec<Value>, retention_days: u32) {
+        if !records.is_empty() {
+            let _ = self.tx.send(Op::Append { topic: topic.to_owned(), records, retention_days: Some(retention_days) });
         }
     }
 
@@ -246,9 +254,9 @@ async fn write(host: Arc<dyn Host>, mut rx: mpsc::UnboundedReceiver<Op>) {
             Op::Flush(done) => {
                 let _ = done.send(());
             }
-            Op::Append { topic, records } => {
+            Op::Append { topic, records, retention_days } => {
                 for chunk in records.chunks(MAX_ITEMS) {
-                    let params = json!(StreamAppendParams { topic: topic.clone(), records: chunk.to_vec(), retention_days: None });
+                    let params = json!(StreamAppendParams { topic: topic.clone(), records: chunk.to_vec(), retention_days });
                     if let Err(error) = call(&host, methods::STREAM_APPEND, params).await {
                         tracing::error!(topic, error = %error.message, "the step or job event was not kept");
                     }

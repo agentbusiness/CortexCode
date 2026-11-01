@@ -22,7 +22,7 @@ python3 "$SA" cve CVE-2021-23337
 grep -n -i "<package>" package-lock.json yarn.lock pnpm-lock.yaml Cargo.lock poetry.lock requirements.txt go.mod Gemfile.lock composer.lock 2>/dev/null
 ```
 
-- Every dependency at once, against OSV: `python3 "$SA" deps`.
+- Every dependency at once, against OSV, with what is exploited in the wild (CISA KEV) and its EPSS score: `python3 "$SA" deps`.
 
 - A scanner alert: its path:line, then the shapes around it: `python3 "$SA" scan <path>`.
 

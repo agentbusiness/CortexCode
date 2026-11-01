@@ -66,6 +66,19 @@ pub mod methods {
     /// The change of one path over a range of steps as a unified diff:
     /// [`super::TimelineDiffParams`] -> [`super::TimelineDiffResult`].
     pub const TIMELINE_DIFF: &str = "tools.timeline.diff";
+    /// What this plugin shares with the other apps on this machine (`service.rs` [`ShareList`]):
+    /// the `tools.security` service.
+    ///
+    /// [`ShareList`]: crate::contracts::service::ShareList
+    pub const SHARES: &str = "tools.shares";
+    /// `{paths: [absolute], classes?: [string]}` -> `{hits: [{class, path, line, text, why}],
+    /// checked: [class], skipped?}`: the code audit's line patterns over those files (secret values
+    /// masked). Shared as `tools.security` version 1; only for apps on this machine.
+    pub const SECURITY_SCAN: &str = "tools.security.scan.get";
+    /// `{root: absolute}` -> `{lockfiles, not_parsed, vulnerable: [{ecosystem, name, version, ids,
+    /// severity, fixed?, command?}]}`: the project's locked dependencies checked against OSV.
+    /// Shared as `tools.security` version 1; only for apps on this machine.
+    pub const SECURITY_DEPS: &str = "tools.security.deps.get";
 }
 
 /// Approval classes beyond the ask-mode action classes.

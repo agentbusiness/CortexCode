@@ -6,7 +6,7 @@ pub mod cmake;
 pub mod cpp;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{Diagnostic, FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{Diagnostic, FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::{Launch, ServerSpec};
 use cc_lang_kit::pack::Toolchain;
 use cc_lang_kit::{ExtractContext, FoundServer, LanguagePack, PackEnv, Sample};
@@ -90,6 +90,21 @@ impl LanguagePack for CppPack {
             text: SAMPLE.into(),
             expect: strings(&["STORE_LIMIT", "store", "store::Store", "store::Store::get", "store::Store::items_", "store::Kind", "store::Kind::Large"]),
         }
+    }
+
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["cmake"]),
+            Runner::new("build", &["make"]),
+            Runner::new("build", &["ninja"]),
+            Runner::new("build", &["gcc"]),
+            Runner::new("build", &["g++"]),
+            Runner::new("build", &["clang"]),
+            Runner::new("build", &["clang++"]),
+            Runner::new("build", &["cc"]),
+            Runner::new("build", &["c++"]),
+            Runner::new("test", &["ctest"]),
+        ]
     }
 
     fn verifiers(&self) -> Vec<Verifier> {

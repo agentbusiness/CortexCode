@@ -1,12 +1,17 @@
 //! Cited notes in the KNOWLEDGE layer: `(:Note {id, name, topic, topic_key, claim, quote, url,
 //! title, date, source, question, by, project_id, created_ms})-[:CITES]->(:Source {url, name,
-//! title, date})`. Global notes live in the main project, a project's notes in its own IronGraph
-//! project. Search by meaning is IronGraph's automatic embedding index (`semantic_nodes`) bound to
-//! the scope's `Note` nodes (of one topic when asked) before it ranks them.
+//! title, date})`, each note `-[:IN]->` the scope's root (see `work`). Global notes live in the
+//! main project, a project's notes in its own IronGraph project. Search by meaning is IronGraph's
+//! automatic embedding index (`semantic_nodes`) bound to the scope's live `Note` nodes (of one
+//! topic when asked) before it ranks them.
+//!
+//! Nothing is deleted: a removed note is retired (`ended_ms`, `ended_reason`, `state: 'gone'`),
+//! and so is a source no live note cites any more; adding the note again brings both back. Every
+//! node and edge keeps `first_ms` and `last_ms`.
 
 use crate::db::{Rows, layer};
 use crate::params;
-use crate::work::WorkStore;
+use crate::work::{WorkStore, revive, span};
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{Note, NoteAddParams, NoteSearchResult};
 use cc_protocol::contracts::now_ms;
@@ -85,8 +90,8 @@ fn note_from(row: &[Value]) -> Note {
 /// `MATCH` of the scope's notes, of one topic when given, with its parameters.
 fn bind(topic: Option<&str>) -> (String, Map<String, Value>) {
     match topic.map(topic_key).filter(|key| !key.is_empty()) {
-        Some(key) => ("MATCH (n:Note {topic_key: $topic})".to_owned(), params! { "topic" => key }),
-        None => ("MATCH (n:Note)".to_owned(), Map::new()),
+        Some(key) => ("MATCH (n:Note {topic_key: $topic}) WHERE n.ended_ms IS NULL".to_owned(), params! { "topic" => key }),
+        None => ("MATCH (n:Note) WHERE n.ended_ms IS NULL".to_owned(), Map::new()),
     }
 }
 
@@ -101,7 +106,7 @@ impl WorkStore {
     }
 
     pub async fn note_get(&self, id: &str) -> Result<Option<Note>, RpcError> {
-        let rows = self.note_run(&format!("{} MATCH (n:Note {{id: $id}}) RETURN {NOTE_COLS}", layer::KNOWLEDGE_READ), params! { "id" => id }).await?;
+        let rows = self.note_run(&format!("{} MATCH (n:Note {{id: $id}}) WHERE n.ended_ms IS NULL RETURN {NOTE_COLS}", layer::KNOWLEDGE_READ), params! { "id" => id }).await?;
         Ok(rows.rows.first().map(|row| note_from(row)))
     }
 
@@ -121,14 +126,20 @@ impl WorkStore {
         let date = p.date.map(|d| d.trim().to_owned()).filter(|d| !d.is_empty());
         // A KNOWLEDGE node needs its `name` when it is created, and MERGE keys on it: the name
         // comes from what the id is made of (the quote's start; a source's url), so two writers of
-        // one note (or one source) leave one node.
+        // one note (or one source) leave one node. No live note has this id here, so the node is
+        // new or a retired one written again (brought back with this content).
         let name: String = squash(&quote).chars().take(80).collect();
         self.note_run(
             &format!(
-                "{} MERGE (n:Note {{id: $id, name: $name}}) ON CREATE SET n.project_id = $project, n.topic = $topic, n.topic_key = $key, n.claim = $claim, n.quote = $quote, n.url = $url, n.title = $title, n.date = $date, n.source = $source, n.question = $question, n.by = $by, n.created_ms = $now \
-                 MERGE (c:Source {{url: $url, name: $url}}) ON CREATE SET c.title = $title, c.date = $date \
-                 MERGE (n)-[:CITES]->(c)",
-                layer::KNOWLEDGE_WRITE
+                "{} MERGE (n:Note {{id: $id, name: $name}}) SET n.project_id = $project, n.topic = $topic, n.topic_key = $key, n.claim = $claim, n.quote = $quote, n.url = $url, n.title = $title, n.date = $date, n.source = $source, n.question = $question, n.by = $by, n.created_ms = $now, {}, n.state = null, {} \
+                 MERGE (c:Source {{url: $url, name: $url}}) ON CREATE SET c.title = $title, c.date = $date SET {}, c.state = null, {} \
+                 MERGE (n)-[e:CITES]->(c) SET {}",
+                layer::KNOWLEDGE_WRITE,
+                revive("n"),
+                span("n"),
+                revive("c"),
+                span("c"),
+                span("e")
             ),
             params! {
                 "id" => id, "name" => name, "project" => project.clone().unwrap_or_default(), "topic" => topic, "key" => topic_key(&topic),
@@ -137,6 +148,7 @@ impl WorkStore {
             },
         )
         .await?;
+        self.link_root(layer::KNOWLEDGE_WRITE, "MATCH (w:Note {id: $id})", params! { "id" => id }).await?;
         for (name, label, property) in [("note_id", "Note", "id"), ("note_topic", "Note", "topic_key"), ("source_url", "Source", "url")] {
             self.graph.ensure_index(&self.ig_id, name, label, property).await?;
         }
@@ -177,7 +189,7 @@ impl WorkStore {
         let pending = total.saturating_sub(ranked.len() as u64);
         ranked.truncate(limit.max(1) as usize);
         let ids: Vec<&str> = ranked.iter().map(|(id, _)| id.as_str()).collect();
-        let rows = self.note_run(&format!("{} UNWIND $ids AS i MATCH (n:Note {{id: i}}) RETURN {NOTE_COLS}", layer::KNOWLEDGE_READ), params! { "ids" => ids }).await?;
+        let rows = self.note_run(&format!("{} UNWIND $ids AS i MATCH (n:Note {{id: i}}) WHERE n.ended_ms IS NULL RETURN {NOTE_COLS}", layer::KNOWLEDGE_READ), params! { "ids" => ids }).await?;
         let mut by_id: HashMap<String, Note> = rows.rows.iter().map(|row| note_from(row)).map(|note| (note.id.clone(), note)).collect();
         let notes = ranked
             .into_iter()
@@ -191,13 +203,22 @@ impl WorkStore {
         Ok(NoteSearchResult { notes, pending })
     }
 
-    /// Remove a note, and its source when no other note cites it. False when there was none.
+    /// Retire a note, and its source when no other live note cites it (their nodes and edges
+    /// stay as history). False when there was none.
     pub async fn note_remove(&self, id: &str) -> Result<bool, RpcError> {
         let Some(note) = self.note_get(id).await? else { return Ok(false) };
-        self.note_run(&format!("{} MATCH (n:Note {{id: $id}}) DETACH DELETE n", layer::KNOWLEDGE_WRITE), params! { "id" => id }).await?;
+        let now = now_ms();
         self.note_run(
-            &format!("{} MATCH (c:Source {{url: $url}}) WHERE size([(c)<-[:CITES]-(:Note) | 1]) = 0 DETACH DELETE c", layer::KNOWLEDGE_WRITE),
-            params! { "url" => note.url },
+            &format!("{} MATCH (n:Note {{id: $id}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $now, n.ended_reason = 'removed', n.state = 'gone', n.last_ms = $now", layer::KNOWLEDGE_WRITE),
+            params! { "id" => id, "now" => now },
+        )
+        .await?;
+        self.note_run(
+            &format!(
+                "{} MATCH (c:Source {{url: $url}}) WHERE c.ended_ms IS NULL OPTIONAL MATCH (c)<-[:CITES]-(m:Note) WHERE m.ended_ms IS NULL WITH c, count(m) AS live WHERE live = 0 SET c.ended_ms = $now, c.ended_reason = 'no note cites it', c.state = 'gone', c.last_ms = $now",
+                layer::KNOWLEDGE_WRITE
+            ),
+            params! { "url" => note.url, "now" => now },
         )
         .await?;
         Ok(true)

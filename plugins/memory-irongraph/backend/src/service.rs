@@ -7,7 +7,7 @@ use crate::langs::Languages;
 use crate::params;
 use crate::tree::{self, CodeTree, SyncReport};
 use crate::watch::{self, TreeWatcher};
-use crate::security::SecurityStore;
+use crate::security::{Caller, SecurityStore};
 use crate::settings::Settings;
 use crate::work::WorkStore;
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
@@ -19,10 +19,11 @@ use cc_protocol::contracts::memory::{
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, FocusParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
-    RunRecordResult, Scope, SearchParams, SecurityAuditPutParams, SecurityChanged, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecuritySummaryParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
+    RunRecordResult, Scope, SearchParams, SecurityAdvisoriesPutParams, SecurityAuditPutParams, SecurityAuditStartParams, SecurityAuditStateParams, SecurityChanged, SecurityFinding, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecurityHitsPutParams, SecurityRecheckParams, SecurityRecheckResult, SecuritySummaryParams, SecurityUnitsPutParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
     TaskListResult, TaskUpdateParams, UndescribedParams, WorkspaceParams, methods, topics,
     Routine, RoutineListParams, RoutineListResult, RoutineRun, RoutineRunsParams, RoutineRunsResult,
 };
+use cc_protocol::contracts::frame::SessionStatus;
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, parse_params, to_value};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -140,8 +141,21 @@ pub fn unique_name(base: &str, taken: &HashSet<String>) -> String {
 }
 
 /// The methods a command in the model's shells may call (`cx`): tasks, the board, agents, the
-/// code graph and the project list.
+/// code graph, the project list and the security audit's records (the person's own moves on a
+/// finding are refused to a command inside the store; forgetting one is not a command's).
 pub const COMMANDS: &[&str] = &[
+    methods::SECURITY_AUDIT_START,
+    methods::SECURITY_AUDIT_STATE,
+    methods::SECURITY_AUDIT_PUT,
+    methods::SECURITY_UNITS_PUT,
+    methods::SECURITY_HITS_PUT,
+    methods::SECURITY_ADVISORIES_PUT,
+    methods::SECURITY_FINDINGS_PUT,
+    methods::SECURITY_FINDINGS,
+    methods::SECURITY_FINDING,
+    methods::SECURITY_FINDING_UPDATE,
+    methods::SECURITY_RECHECK,
+    methods::SECURITY_SUMMARY,
     methods::TASK_LIST,
     methods::TASK_GET,
     methods::TASK_CREATE,
@@ -193,10 +207,16 @@ pub const PROVIDES: &[&str] = &[
     methods::TASK_GET,
     methods::TASK_LIST,
     methods::SECURITY_AUDIT_PUT,
+    methods::SECURITY_AUDIT_START,
+    methods::SECURITY_AUDIT_STATE,
+    methods::SECURITY_UNITS_PUT,
+    methods::SECURITY_HITS_PUT,
+    methods::SECURITY_ADVISORIES_PUT,
     methods::SECURITY_FINDINGS_PUT,
     methods::SECURITY_FINDINGS,
     methods::SECURITY_FINDING,
     methods::SECURITY_FINDING_UPDATE,
+    methods::SECURITY_RECHECK,
     methods::SECURITY_SUMMARY,
     methods::SECURITY_FORGET,
     methods::BOARD_POST,
@@ -256,6 +276,12 @@ pub const PROVIDES: &[&str] = &[
     methods::QUEUE_TAKE,
     methods::QUEUE_ACK,
 ];
+
+/// Who calls a security method: a command in the model's shells names its session
+/// (`_command_session`, stamped by the frame), the app does not.
+fn security_caller(params: &Value) -> Caller {
+    Caller { command_session: params.get("_command_session").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned) }
+}
 
 fn short_hash(text: &str) -> String {
     crate::facts::hash_hex(text.as_bytes())[..24].to_owned()
@@ -469,7 +495,7 @@ impl Memory {
         let app = crate::app::AppStore::open(graph.clone(), main.clone()).await?;
         let known: HashSet<String> = app.projects().await?.into_iter().map(|project| project.id).collect();
         let entries = graph
-            .run(&main, &format!("{} MATCH (p:ProjectEntry) RETURN p.id, p.name, p.root, p.reference, p.updated_ms", layer::WORKSPACE_READ), Map::new())
+            .run(&main, &format!("{} MATCH (p:ProjectEntry) WHERE p.ended_ms IS NULL RETURN p.id, p.name, p.root, p.reference, p.updated_ms", layer::WORKSPACE_READ), Map::new())
             .await?;
         tracing::info!(records = known.len(), entries = entries.rows.len(), "the start's project check");
         let mut registered = HashSet::new();
@@ -539,7 +565,13 @@ impl Memory {
     /// Open the database and create the main project (with its settings root) on first start.
     pub async fn ensure_main(&self) -> Result<(), RpcError> {
         self.settings().await?;
-        self.graph_store().await.map(|_| ())
+        self.graph_store().await?;
+        match self.streams().await?.drop_expired().await {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(dropped, "dropped the streams whose records all expired"),
+            Err(error) => tracing::warn!(error = %error.message, "the expired streams were not dropped"),
+        }
+        Ok(())
     }
 
     /// The app's graph (see [`crate::graphapi`]); opening it writes this Mac's root node.
@@ -569,14 +601,14 @@ impl Memory {
         let global = self.global().await?;
         let rows = global
             .graph
-            .run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry {{id: $id}}) RETURN p.root", layer::WORKSPACE_READ), params! { "id" => project_id })
+            .run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry {{id: $id}}) WHERE p.ended_ms IS NULL RETURN p.root", layer::WORKSPACE_READ), params! { "id" => project_id })
             .await?;
         Ok(rows.rows.first().and_then(|r| r.first()).and_then(|v| v.as_str()).map(PathBuf::from))
     }
 
     async fn registered_projects(&self) -> Result<Vec<String>, RpcError> {
         let global = self.global().await?;
-        let rows = global.graph.run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry) RETURN p.id", layer::WORKSPACE_READ), Map::new()).await?;
+        let rows = global.graph.run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry) WHERE p.ended_ms IS NULL RETURN p.id", layer::WORKSPACE_READ), Map::new()).await?;
         Ok(rows.column(0).filter_map(|v| v.as_str().map(str::to_owned)).collect())
     }
 
@@ -586,7 +618,7 @@ impl Memory {
         let global = self.global().await?;
         let rows = global
             .graph
-            .run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry) RETURN p.id, p.name, p.root, p.reference", layer::WORKSPACE_READ), Map::new())
+            .run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry) WHERE p.ended_ms IS NULL RETURN p.id, p.name, p.root, p.reference", layer::WORKSPACE_READ), Map::new())
             .await?;
         let text = |row: &[Value], index: usize| row.get(index).and_then(Value::as_str).unwrap_or("").to_owned();
         Ok(rows
@@ -615,12 +647,16 @@ impl Memory {
             (None, flag) => flag.unwrap_or(false),
         };
         let global = self.global().await?;
+        // The entry hangs from this Mac's root (written when the graph opens); one registered
+        // again after it was retired is back.
+        self.graph_store().await?;
         global
             .graph
             .run(
                 &global.ig_id,
                 &format!(
-                    "{} MERGE (p:ProjectEntry {{id: $id}}) SET p.name = $name, p.root = $root, p.ig_name = $ig, p.reference = $reference, p.updated_ms = $now",
+                    "{} MERGE (p:ProjectEntry {{id: $id}}) SET p.name = $name, p.root = $root, p.ig_name = $ig, p.reference = $reference, p.updated_ms = $now, p.ended_ms = null, p.ended_reason = null, p.state = null, p.first_ms = CASE WHEN p.first_ms IS NULL THEN $now ELSE p.first_ms END, p.last_ms = $now \
+                     WITH p MATCH (m:Machine) MERGE (p)-[e:ON]->(m) SET e.first_ms = CASE WHEN e.first_ms IS NULL THEN $now ELSE e.first_ms END, e.last_ms = $now",
                     layer::WORKSPACE_WRITE
                 ),
                 params! { "id" => project_id, "name" => name.clone(), "root" => root.to_string_lossy(), "ig" => project_ig_name(project_id), "reference" => reference, "now" => cc_protocol::contracts::now_ms() },
@@ -768,13 +804,20 @@ impl Memory {
         Ok(())
     }
 
-    /// Remove a project's registry entry.
+    /// Retire a project's registry entry (its node and edge stay as history; reads skip it).
     async fn unregister(&self, project_id: &str) -> Result<(), RpcError> {
         let _guard = self.registry.lock().await;
         let global = self.global().await?;
         global
             .graph
-            .run(&global.ig_id, &format!("{} MATCH (p:ProjectEntry {{id: $id}}) DETACH DELETE p", layer::WORKSPACE_WRITE), params! { "id" => project_id })
+            .run(
+                &global.ig_id,
+                &format!(
+                    "{} MATCH (p:ProjectEntry {{id: $id}}) WHERE p.ended_ms IS NULL SET p.ended_ms = $now, p.ended_reason = 'unregistered', p.state = 'gone', p.last_ms = $now",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "id" => project_id, "now" => cc_protocol::contracts::now_ms() },
+            )
             .await?;
         Ok(())
     }
@@ -862,6 +905,76 @@ impl Memory {
     fn security_changed(&self, project_id: &str, id: Option<&str>, status: Option<&str>) {
         let payload = SecurityChanged { project_id: project_id.to_owned(), id: id.map(str::to_owned), status: status.map(str::to_owned) };
         self.publish(topics::SECURITY_CHANGED, serde_json::to_value(payload).unwrap_or(Value::Null));
+    }
+
+    /// The working tree a security call reads sinks from: the call's workspace (the frame holds a
+    /// command's call to its own command's), else the project's root.
+    async fn security_root(&self, project_id: &str, workspace: Option<&str>) -> Result<PathBuf, RpcError> {
+        if let Some(workspace) = workspace.filter(|w| !w.is_empty()) {
+            return std::fs::canonicalize(workspace).map_err(|error| RpcError::invalid_params(format!("workspace {workspace}: {error}")));
+        }
+        self.registered_root(project_id).await?.ok_or_else(|| RpcError::not_found(format!("project {project_id} is not open; call memory.project.open first")))
+    }
+
+    /// Tell the person about findings the dependency watch found (each once; the store marked them).
+    fn notify_findings(&self, project_id: &str, findings: Vec<SecurityFinding>) {
+        use cc_protocol::contracts::notify::{Notification, kinds, methods as notify_methods};
+        if findings.is_empty() {
+            return;
+        }
+        let Some(ctx) = self.ctx.get().cloned() else { return };
+        let project_id = project_id.to_owned();
+        tokio::spawn(async move {
+            for finding in findings {
+                let severity = finding.severity_overall.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "unrated".into());
+                // Critical and known-exploited ones are the report kind; the other high ones are notices.
+                let kind = if finding.kev || severity == "critical" { kinds::REPORT } else { kinds::INFO };
+                let mut facts = vec![format!("{severity} severity")];
+                if finding.kev {
+                    facts.push("exploited in the wild (CISA KEV)".into());
+                }
+                if let Some(epss) = finding.epss {
+                    facts.push(format!("EPSS {:.0}%", epss * 100.0));
+                }
+                let notification = Notification {
+                    kind: kind.into(),
+                    title: format!("Security: {}", finding.title),
+                    body: format!("{}. Open the Security tab to fix it.", facts.join(", ")),
+                    key: Some(format!("security:{project_id}:{}", finding.id)),
+                    project_id: Some(project_id.clone()),
+                    session_id: None,
+                    target: json!({"project_id": project_id, "view": "security"}),
+                    actions: vec!["Open".into()],
+                    subtitle: finding.sink_path.clone(),
+                };
+                if let Err(error) = ctx.call(notify_methods::SEND, serde_json::to_value(&notification).unwrap_or(Value::Null)).await {
+                    tracing::warn!(error = %error.message, finding = %finding.id, "security notification not sent");
+                }
+            }
+        });
+    }
+
+    /// A session ended (its turn finished, failed or was cancelled, or it was deleted): the findings
+    /// it was fixing without a recorded fix are open again.
+    async fn security_session_ended(&self, project_id: &str, session_id: &str) {
+        if project_id.is_empty() || !matches!(self.registered_root(project_id).await, Ok(Some(_))) {
+            return;
+        }
+        let store = match self.security(project_id).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::debug!(error = %error.message, "security store unavailable at a session's end");
+                return;
+            }
+        };
+        match store.session_ended(session_id).await {
+            Ok(reopened) => {
+                for id in reopened {
+                    self.security_changed(project_id, Some(&id), Some("open"));
+                }
+            }
+            Err(error) => tracing::warn!(error = %error.message, session = session_id, "fixing findings of an ended session not reopened"),
+        }
     }
 
     /// A loaded project (opening it from the registry after a restart).
@@ -1040,7 +1153,7 @@ impl Memory {
 
     async fn status_of(&self, project_id: &str, tree: &CodeTree) -> Result<ProjectStatus, RpcError> {
         let status = tree.status.lock().await.clone();
-        let described = tree.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL RETURN count(s)", layer::OBSERVED_READ), Map::new()).await?;
+        let described = tree.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL AND s.ended_ms IS NULL RETURN count(s)", layer::OBSERVED_READ), Map::new()).await?;
         let count = |rows: &crate::db::Rows| rows.rows.first().and_then(|r| r.first()).and_then(|v| v.as_u64()).unwrap_or(0);
         let embedding = if tree.embedding_ready().await? { "ready" } else { "pending" };
         Ok(ProjectStatus {
@@ -1347,16 +1460,51 @@ impl Memory {
                 self.security_changed(&p.project_id, None, None);
                 to_value(&json!({}))
             }
+            methods::SECURITY_AUDIT_START => {
+                let p: SecurityAuditStartParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security audits").await?;
+                let project_id = p.project_id.clone();
+                let state = self.security(&project_id).await?.audit_start(p).await?;
+                self.security_changed(&project_id, None, None);
+                to_value(&state)
+            }
+            methods::SECURITY_AUDIT_STATE => {
+                let p: SecurityAuditStateParams = parse_params(params)?;
+                to_value(&self.security(&p.project_id).await?.audit_state(p.audit_id.as_deref(), p.units.as_deref()).await?)
+            }
+            methods::SECURITY_UNITS_PUT => {
+                let p: SecurityUnitsPutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security audits").await?;
+                self.security(&p.project_id).await?.units_put(&p.audit_id, &p.units).await?;
+                self.security_changed(&p.project_id, None, None);
+                to_value(&json!({}))
+            }
+            methods::SECURITY_HITS_PUT => {
+                let p: SecurityHitsPutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security audits").await?;
+                self.security(&p.project_id).await?.hits_put(&p.audit_id, p.hits).await?;
+                self.security_changed(&p.project_id, None, None);
+                to_value(&json!({}))
+            }
+            methods::SECURITY_ADVISORIES_PUT => {
+                let p: SecurityAdvisoriesPutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security audits").await?;
+                self.security(&p.project_id).await?.advisories_put(&p.audit_id, &p.advisories).await?;
+                self.security_changed(&p.project_id, None, None);
+                to_value(&json!({}))
+            }
             methods::SECURITY_FINDINGS_PUT => {
                 let p: SecurityFindingsPutParams = parse_params(params)?;
                 self.refuse_reference(&p.project_id, "security findings").await?;
-                let findings = self.security(&p.project_id).await?.findings_put(p.audit_id.as_deref(), p.findings).await?;
+                let root = self.security_root(&p.project_id, p.workspace.as_deref()).await?;
+                let outcome = self.security(&p.project_id).await?.findings_put(p.audit_id.as_deref(), p.findings, &root).await?;
+                self.notify_findings(&p.project_id, outcome.notify);
                 self.security_changed(&p.project_id, None, None);
-                to_value(&SecurityFindingsResult { findings })
+                to_value(&SecurityFindingsResult { findings: outcome.findings, notes: outcome.notes })
             }
             methods::SECURITY_FINDINGS => {
                 let p: SecurityFindingsParams = parse_params(params)?;
-                to_value(&SecurityFindingsResult { findings: self.security(&p.project_id).await?.findings(&p).await? })
+                to_value(&SecurityFindingsResult { findings: self.security(&p.project_id).await?.findings(&p).await?, notes: Vec::new() })
             }
             methods::SECURITY_FINDING => {
                 let p: SecurityFindingParams = parse_params(params)?;
@@ -1364,18 +1512,36 @@ impl Memory {
                 to_value(&detail)
             }
             methods::SECURITY_FINDING_UPDATE => {
+                let caller = security_caller(&params);
                 let p: SecurityFindingUpdateParams = parse_params(params)?;
                 self.refuse_reference(&p.project_id, "security findings").await?;
                 let (project_id, id) = (p.project_id.clone(), p.id.clone());
-                let finding = self.security(&project_id).await?.finding_update(p).await?.ok_or_else(|| RpcError::not_found(format!("finding {id} not found")))?;
+                let root = self.security_root(&project_id, p.workspace.as_deref()).await?;
+                let finding = self.security(&project_id).await?.finding_update(p, &caller, &root).await?.ok_or_else(|| RpcError::not_found(format!("finding {id} not found")))?;
                 self.security_changed(&project_id, Some(&finding.id), Some(&finding.status));
                 to_value(&finding)
+            }
+            methods::SECURITY_RECHECK => {
+                let caller = security_caller(&params);
+                let p: SecurityRecheckParams = parse_params(params)?;
+                if !p.dry {
+                    self.refuse_reference(&p.project_id, "security findings").await?;
+                }
+                let root = self.security_root(&p.project_id, p.workspace.as_deref()).await?;
+                let (checked, moved) = self.security(&p.project_id).await?.recheck(&p, &caller, &root).await?;
+                for id in &moved {
+                    self.security_changed(&p.project_id, Some(id), None);
+                }
+                to_value(&SecurityRecheckResult { checked })
             }
             methods::SECURITY_SUMMARY => {
                 let p: SecuritySummaryParams = parse_params(params)?;
                 to_value(&self.security(&p.project_id).await?.summary().await?)
             }
             methods::SECURITY_FORGET => {
+                if security_caller(&params).command_session.is_some() {
+                    return Err(RpcError::invalid_params("forgetting a finding is the person's decision: the person decides this in the Security tab."));
+                }
                 let p: SecurityFindingParams = parse_params(params)?;
                 self.refuse_reference(&p.project_id, "security findings").await?;
                 if !self.security(&p.project_id).await?.forget(&p.id).await? {
@@ -1553,11 +1719,21 @@ impl Memory {
             methods::APP_SESSION_PUT => {
                 let p: AppSessionPutParams = parse_params(params)?;
                 self.app().await?.put_session(&p.session).await?;
+                // A turn that finished, failed or was cancelled ends a fixing attempt.
+                if matches!(p.session.status, SessionStatus::Done | SessionStatus::Failed | SessionStatus::Cancelled) {
+                    self.security_session_ended(&p.session.project_id, &p.session.id).await;
+                }
                 Ok(json!({}))
             }
             methods::APP_SESSIONS_DELETE => {
                 let p: AppSessionsDeleteParams = parse_params(params)?;
-                self.app().await?.delete_sessions(&p.ids).await?;
+                let app = self.app().await?;
+                let owners: Vec<(String, String)> =
+                    app.sessions().await.map(|list| list.into_iter().filter(|s| p.ids.contains(&s.id)).map(|s| (s.project_id, s.id)).collect()).unwrap_or_default();
+                app.delete_sessions(&p.ids).await?;
+                for (project_id, session_id) in owners {
+                    self.security_session_ended(&project_id, &session_id).await;
+                }
                 Ok(json!({}))
             }
             methods::JOURNAL_APPEND => {

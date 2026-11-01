@@ -6,7 +6,7 @@ pub mod go;
 pub mod gomod;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::install::Toolchains;
 use cc_lang_kit::lsp::ServerSpec;
 use cc_lang_kit::pack::Toolchain;
@@ -102,6 +102,14 @@ impl LanguagePack for GoPack {
 
     fn sample(&self) -> Sample {
         Sample { path: "store/store.go".into(), text: SAMPLE.into(), expect: strings(&["ErrMissing", "Limit", "Store", "Store.items", "Getter", "Getter.Get", "New", "Store.Get"]) }
+    }
+
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["go", "install"]),
+            Runner::new("run", &["go", "run"]),
+            Runner::new("run", &["go", "generate"]),
+        ]
     }
 
     fn verifiers(&self) -> Vec<Verifier> {

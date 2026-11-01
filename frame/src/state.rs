@@ -277,6 +277,14 @@ impl StateStore {
         Ok(state.rev)
     }
 
+    /// Append history records to a stream topic through the outbox, in order with the other
+    /// writes. The answer says whether the memory plugin kept them (an error: the writer stopped).
+    pub fn append_stream(&self, topic: &str, records: Vec<serde_json::Value>, retention_days: u32) -> tokio::sync::oneshot::Receiver<bool> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.outbox.send(Op::StreamAppend { topic: topic.to_owned(), records, retention_days, done: Some(tx) });
+        rx
+    }
+
     /// Mutating frame calls acknowledge only after the ordered store outbox is durable.
     pub async fn flush(&self) -> Result<(), RpcError> {
         self.outbox.flush().await

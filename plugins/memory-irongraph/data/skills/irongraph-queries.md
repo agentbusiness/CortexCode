@@ -36,7 +36,7 @@ Every query starts with the layers it reads; without `USE LAYER` it reads all th
 |---|---|
 | `OBSERVED` | the parsed code and documents (section 4) |
 | `KNOWLEDGE` | symbol descriptions, project knowledge, cited notes (section 5) |
-| `WORKSPACE` | tasks, rules, board messages, agents, runs (section 5) |
+| `WORKSPACE` | tasks, rules, agents, runs (section 5) |
 
 Across layers: `USE LAYER OBSERVED, WORKSPACE MATCH ...`.
 
@@ -47,6 +47,7 @@ Labels:
 - Definitions: `Sym` plus one of `Function Method Class Struct Trait Interface Enum TypeAlias Const Static Field Variant Variable Component Prop Module Macro Test Route Command ShellFunction IpcChannel`.
 - Document headings: `Section` (not `Sym`); `signature` is the heading path, `doc` its text.
 - Other nodes: `File Directory Repo Package Dependency EnvVar Commit`.
+- Code removed from the files stays with `ended_ms` set: match live code with `WHERE n.ended_ms IS NULL`.
 
 Properties:
 - All: `sid kind name qname`. Code and files also: `path start_line end_line`.
@@ -73,22 +74,22 @@ KNOWLEDGE:
 WORKSPACE:
 - `Task {id, title, brief, status, assignee}`: `status` `pending in_progress verifying done failed cancelled`. Edges `TOUCHES` (-> Code), `HAS_SUBTASK`, `DEPENDS_ON`, `HAS_CHECK` (-> ContractCheck).
 - `Rule {id, text, scope, source}` `-[:CONSTRAINS]->` Code (`source: 'cortex_md'` for CORTEX.md items).
-- `BoardMessage {id, kind, author, text}` `-[:REFERS_TO]->` Code or Task. `Agent {name}` `-[:WORKS_ON]->` Task.
+- `Agent {name, status}` `-[:WORKS_ON]->` Task. Board messages are not nodes: read them with `memory.board.list`.
 - `Run {id, outcome, summary}` `-[:FOR_TASK]->` Task; changed code `-[:MODIFIED_IN]->` Run.
 
 ## 6. Query shapes
 
 ```cypher
 // functions nothing refers to
-USE LAYER OBSERVED MATCH (f:Function) WHERE size([(f)<-[c]-() WHERE type(c) <> 'DEFINES' AND type(c) <> 'CONTAINS' | 1]) = 0 RETURN f.sid, f.exported LIMIT 200
+USE LAYER OBSERVED MATCH (f:Function) WHERE f.ended_ms IS NULL AND size([(f)<-[c]-() WHERE type(c) <> 'DEFINES' AND type(c) <> 'CONTAINS' | 1]) = 0 RETURN f.sid, f.exported LIMIT 200
 // routes and their handlers
 USE LAYER OBSERVED MATCH (r:Route)-[:HANDLES]->(h) RETURN r.http_method, r.route_path, h.sid, h.path, h.start_line
 // everything reaching save_order within four calls
-USE LAYER OBSERVED MATCH (a:Code)-[:CALLS*1..4]->(b:Function {name: 'save_order'}) RETURN DISTINCT a.sid LIMIT 200
+USE LAYER OBSERVED MATCH (a:Code)-[:CALLS*1..4]->(b:Function {name: 'save_order'}) WHERE b.ended_ms IS NULL RETURN DISTINCT a.sid LIMIT 200
 // call counts per function (sort them yourself)
 USE LAYER OBSERVED MATCH (f:Function)<-[c:CALLS]-() RETURN f.sid, count(c) AS callers LIMIT 500
 // exported functions no test covers
-USE LAYER OBSERVED MATCH (f:Function) WHERE f.exported AND size([(t:Test)-[:TESTS]->(f) | 1]) = 0 RETURN f.sid LIMIT 200
+USE LAYER OBSERVED MATCH (f:Function) WHERE f.ended_ms IS NULL AND f.exported AND size([(t:Test)-[:TESTS]->(f) | 1]) = 0 RETURN f.sid LIMIT 200
 // tests of a file's code
 USE LAYER OBSERVED MATCH (t:Test)-[:TESTS]->(n:Code {path: 'server/store.py'}) RETURN DISTINCT t.sid
 // importers of a file, two-file import cycles, users of a dependency

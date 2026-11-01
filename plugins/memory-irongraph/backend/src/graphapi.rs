@@ -11,11 +11,20 @@
 //! **How a put is written.** The batch is checked whole before anything is written: names (labels
 //! CamelCase, relationship types UPPER_SNAKE, properties snake_case; nothing but these validated
 //! names is ever put into a statement, every value goes in as a parameter), sizes, value types,
-//! that every node has an edge (in the batch, or one already stored; `Machine` stands alone), and
-//! that every edge's ends exist (in the batch, or stored). One read per label answers the last two.
-//! An edge's end may also be a `Project`, `Session` or `Knowledge` item, records the memory plugin
-//! keeps itself, named by its `id`:
+//! that every edge's ends exist (in the batch, or stored), and that everything the batch puts
+//! hangs from the graph: the batch's nodes, joined by its edges, fall into groups, and each group
+//! must reach `Machine` (which stands alone), a referenced record, a stored node the batch only
+//! links to, or a node it puts again that is stored with an edge. Two new nodes linked only to
+//! each other are refused. One read per label answers the stored part.
+//! An edge's end may also be a `Project`, `Session`, `Knowledge` or `Note` item, records the
+//! memory plugin keeps itself, named by its `id`:
 //! it must be stored, and the put only links to it (never creates or changes it).
+//!
+//! **Retiring.** `memory.graph.retire` sets `ended_ms`, `ended_reason` and `state: 'gone'`; a
+//! retired node put again is back (`ended_ms` and `ended_reason` cleared, `state` cleared when it
+//! is `'gone'`). Where a label keeps `state` as a temporal property, `'gone'` is a sample at the
+//! retire's time and a revived node gets `'active'` unless the put carries its own `state`; a
+//! temporal is never set to null.
 //! Then each label gets its key constraint (once per process), each temporal property its
 //! declaration (once per process), and the batch is written as `UNWIND` statements: one per
 //! label for the nodes, one per (from label, type, to label) for the edges, and one per temporal
@@ -30,7 +39,11 @@
 //! and deletes the sentinel; repeating it is harmless (same type: no change, history kept), so a
 //! new process declares again on first use. Samples are written `AT TIME datetime.fromepochmillis
 //! ($at)`, only when the value differs from the current one (a history of changes; a repeated
-//! put adds no sample). The current value is the latest sample.
+//! put adds no sample). The current value is the latest sample. Each declaration that took is
+//! recorded as `(:TemporalProperty {key: '<label|rel>:<Owner>.<prop>', side, owner, prop, kind,
+//! first_ms, last_ms})-[:ON]->(:Machine)` (reserved: only the plugin writes it) and read back at
+//! open, so a retire or a revive before this process's first put of the label still writes
+//! `state` as a sample.
 
 use crate::db::{Graph, layer};
 use crate::params;
@@ -63,11 +76,11 @@ const SENTINEL: &str = "\u{1}schema-sentinel";
 const RESERVED_LABELS: &[&str] = &[
     "Project", "Session", "Settings", "ProjectEntry", "Task", "Knowledge", "Note", "Rule", "Style", "BoardMessage", "Agent", "Code", "Sym", "File", "Section",
     "Source", "ContractCheck", "ContractRevision", "Audit", "Setting", "SettingSection", "Queue", "QueueConsumer", "QueueLease", "SchemaSentinel", "Routine",
-    "RoutineRun", "Run", "Security", "Finding", "SecurityTraceStep", "SecurityQuickFix", "SecurityStatusChange",
+    "RoutineRun", "Run", "Security", "Finding", "SecurityTraceStep", "SecurityQuickFix", "SecurityStatusChange", "TemporalProperty",
 ];
 /// Reserved records an edge may name as one of its ends, found by their `id` (`key` is their id):
 /// read-only references, never created or changed by a put.
-const REFERENCED_LABELS: &[&str] = &["Project", "Session", "Knowledge"];
+const REFERENCED_LABELS: &[&str] = &["Project", "Session", "Knowledge", "Note"];
 /// Property names the plugin keeps itself (and IronGraph's `created_at`).
 const RESERVED_PROPS: &[&str] = &["key", "first_ms", "last_ms", "ended_ms", "ended_reason", "created_at"];
 /// Words that make a statement write, change the schema or leave the main project.
@@ -103,6 +116,11 @@ impl Kind {
         }
     }
 
+    /// The kind [`Kind::cypher`] names.
+    fn named(name: &str) -> Option<Kind> {
+        [Kind::Integer, Kind::Float, Kind::String, Kind::Boolean].into_iter().find(|kind| kind.cypher() == name)
+    }
+
     /// The two kinds as one: integers are taken for floats.
     fn join(self, other: Kind) -> Option<Kind> {
         match (self, other) {
@@ -124,6 +142,22 @@ impl Owner {
     fn shown(&self) -> &str {
         match self {
             Owner::Label(name) | Owner::Rel(name) => name,
+        }
+    }
+
+    /// `label` or `rel`, as a `TemporalProperty` node records it.
+    fn side(&self) -> &'static str {
+        match self {
+            Owner::Label(_) => "label",
+            Owner::Rel(_) => "rel",
+        }
+    }
+
+    fn from_side(side: &str, name: &str) -> Option<Owner> {
+        match side {
+            "label" => Some(Owner::Label(name.to_owned())),
+            "rel" => Some(Owner::Rel(name.to_owned())),
+            _ => None,
         }
     }
 }
@@ -151,13 +185,52 @@ impl GraphStore {
     /// Open the graph in the main project and write this Mac's root node.
     pub async fn open(graph: Arc<Graph>, ig: String) -> Result<Self, RpcError> {
         let machine = tokio::task::spawn_blocking(machine_info).await.map_err(|error| RpcError::internal(format!("reading the machine's identity: {error}")))?;
-        let store = Self { graph, ig, machine, keyed: Mutex::new(HashSet::new()), temporal: Mutex::new(HashMap::new()), write: Mutex::new(()) };
+        let mut store = Self { graph, ig, machine, keyed: Mutex::new(HashSet::new()), temporal: Mutex::new(HashMap::new()), write: Mutex::new(()) };
+        // The graph's root keeps the key it was made with (an earlier version keyed a Linux
+        // machine by its host name): everything already stored hangs from it.
+        let roots = store.run("MATCH (m:Machine) RETURN m.key", params! {}).await?;
+        if let [row] = roots.rows.as_slice()
+            && let Some(key) = row.first().and_then(Value::as_str).filter(|key| !key.is_empty())
+        {
+            store.machine.key = key.to_owned();
+        }
         let mut props = Map::new();
         props.insert("name".into(), json!(store.machine.name));
         props.insert("os".into(), json!(store.machine.os));
         let root = GraphNode { label: "Machine".into(), key: store.machine.key.clone(), props, temporal: Map::new() };
         store.put(GraphPutParams { nodes: vec![root], ..Default::default() }).await?;
+        // The temporal declarations earlier processes made (in whichever layer each node lives).
+        let declared = store.run(&format!("{} MATCH (t:TemporalProperty) WHERE t.ended_ms IS NULL RETURN t.side, t.owner, t.prop, t.kind", layer::ALL_READ), params! {}).await?;
+        {
+            let mut temporal = store.temporal.lock().await;
+            for row in &declared.rows {
+                let text = |at: usize| row.get(at).and_then(Value::as_str).unwrap_or("");
+                if let (Some(owner), Some(kind)) = (Owner::from_side(text(0), text(1)), Kind::named(text(3)))
+                    && !text(2).is_empty()
+                {
+                    temporal.insert((owner, text(2).to_owned()), kind);
+                }
+            }
+        }
         Ok(store)
+    }
+
+    /// Record a temporal declaration that took, under this machine's root.
+    async fn record_temporal(&self, owner: &Owner, prop: &str, kind: Kind) -> Result<(), RpcError> {
+        self.run(
+            &format!(
+                "{} MERGE (t:TemporalProperty {{key: $key}}) SET t.side = $side, t.owner = $owner, t.prop = $prop, t.kind = $kind, t.ended_ms = null, \
+                 t.first_ms = CASE WHEN t.first_ms IS NULL THEN $now ELSE t.first_ms END, t.last_ms = $now \
+                 WITH t MATCH (m:Machine {{key: $machine}}) MERGE (t)-[e:ON]->(m) SET e.first_ms = CASE WHEN e.first_ms IS NULL THEN $now ELSE e.first_ms END, e.last_ms = $now",
+                Self::write_prefix(GraphLayer::Observed)
+            ),
+            params! {
+                "key" => format!("{}:{}.{prop}", owner.side(), owner.shown()), "side" => owner.side(), "owner" => owner.shown(), "prop" => prop,
+                "kind" => kind.cypher(), "now" => now_ms(), "machine" => self.machine.key
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     /// This Mac's root node.
@@ -270,7 +343,7 @@ impl GraphStore {
                 }
             }
         }
-        // Every edge's ends exist; every node has an edge.
+        // Every edge's ends exist.
         let mut touched: HashSet<&GraphRef> = HashSet::new();
         for (from, rel, to) in edges.keys() {
             for end in [from, to] {
@@ -283,13 +356,39 @@ impl GraphStore {
                 touched.insert(end);
             }
         }
-        let lonely: Vec<&GraphRef> = nodes.keys().filter(|id| id.label != "Machine" && !touched.contains(id) && !stored.get(*id).is_some_and(|s| s.linked)).collect();
-        if let Some(first) = lonely.first() {
-            let more = if lonely.len() > 1 { format!(" (and {} more)", lonely.len() - 1) } else { String::new() };
-            return Err(RpcError::invalid_params(format!(
-                "node {}:{}{more} has no edge in this batch and none stored: nothing is kept unconnected, so send it with the edge that links it (only Machine stands alone)",
-                first.label, first.key
-            )));
+        // Every group of nodes the batch's edges join hangs from the graph: it holds the Machine,
+        // a referenced record, a stored node the batch only links to, or a node put again that is
+        // stored with an edge.
+        let mut group: HashMap<&GraphRef, &GraphRef> = HashMap::new();
+        for (from, _, to) in edges.keys() {
+            let (a, b) = (group_of(&group, from), group_of(&group, to));
+            if a != b {
+                group.insert(a, b);
+            }
+        }
+        let anchor = |id: &GraphRef| {
+            id.label == "Machine" || REFERENCED_LABELS.contains(&id.label.as_str()) || stored.get(id).is_some_and(|s| s.linked || !nodes.contains_key(id))
+        };
+        let mut held: HashSet<&GraphRef> = HashSet::new();
+        for id in nodes.keys().chain(touched.iter().copied()) {
+            if anchor(id) {
+                held.insert(group_of(&group, id));
+            }
+        }
+        let loose: Vec<&GraphRef> = nodes.keys().filter(|id| !held.contains(group_of(&group, *id))).collect();
+        if let Some(first) = loose.first() {
+            let more = if loose.len() > 1 { format!(" (and {} more)", loose.len() - 1) } else { String::new() };
+            return Err(RpcError::invalid_params(if touched.contains(first) {
+                format!(
+                    "node {}:{}{more} is linked only to nodes new in this batch: nothing is kept unconnected, so add an edge from one of them to a stored node (the Machine, a Workspace, a Session)",
+                    first.label, first.key
+                )
+            } else {
+                format!(
+                    "node {}:{}{more} has no edge in this batch and none stored: nothing is kept unconnected, so send it with the edge that links it (only Machine stands alone)",
+                    first.label, first.key
+                )
+            }));
         }
 
         // Schema: each label's key constraint, each temporal property's declaration.
@@ -323,7 +422,20 @@ impl GraphStore {
         }
         for (label, keys) in revived {
             self.run(&format!("{prefix} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) SET n.ended_ms = null, n.ended_reason = null"), params! { "keys" => keys }).await?;
-            self.run(&format!("{prefix} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.state = 'gone' SET n.state = null"), params! { "keys" => keys }).await?;
+            if declared.contains_key(&(Owner::Label(label.to_owned()), "state".to_owned())) || self.state_is_temporal(label).await {
+                // A temporal is never set to null: the node's own `state` sample (written below)
+                // or `active` follows `gone`.
+                let own: Vec<&str> = keys.iter().copied().filter(|key| !nodes.get(&GraphRef { label: label.to_owned(), key: (*key).to_owned() }).is_some_and(|n| n.temporal.contains_key("state"))).collect();
+                if !own.is_empty() {
+                    self.run(
+                        &format!("{prefix} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.state = 'gone' SET n.state = 'active' AT TIME datetime.fromepochmillis($at)"),
+                        params! { "keys" => own, "at" => at },
+                    )
+                    .await?;
+                }
+            } else {
+                self.run(&format!("{prefix} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.state = 'gone' SET n.state = null"), params! { "keys" => keys }).await?;
+            }
         }
 
         // Nodes, one statement per label; then each temporal property, one statement per label.
@@ -393,7 +505,8 @@ impl GraphStore {
     }
 
     /// `memory.graph.retire`: `ended_ms`, `ended_reason` and `state: 'gone'` on nodes not
-    /// already retired.
+    /// already retired, in whichever layer each lives (`state` as a sample at `at` where the
+    /// label keeps it temporal).
     pub async fn retire(&self, request: GraphRetireParams) -> Result<u32, RpcError> {
         if request.refs.len() > MAX_ITEMS {
             return Err(RpcError::invalid_params(format!("{} refs in one retire; at most {MAX_ITEMS}", request.refs.len())));
@@ -408,20 +521,40 @@ impl GraphStore {
         let mut retired = 0;
         for (label, keys) in by_label {
             let keys: Vec<String> = keys.into_iter().collect();
+            let temporal_state = self.state_is_temporal(&label).await;
+            // Each node is marked in the layer it lives in.
             for chunk in keys.chunks(CHUNK) {
-                let rows = self
-                    .run(
-                        &format!(
-                            "{} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $at, n.ended_reason = $reason, n.state = 'gone' RETURN count(n)",
-                            Self::write_prefix(GraphLayer::Observed)
-                        ),
-                        params! { "keys" => chunk, "at" => at, "reason" => request.reason },
-                    )
-                    .await?;
-                retired += rows.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0) as u32;
+                for layer in ["OBSERVED", "KNOWLEDGE", "WORKSPACE"] {
+                    let state = if temporal_state {
+                        self.run(
+                            &format!(
+                                "USE LAYER {layer} WRITE LAYER {layer} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.ended_ms IS NULL AND (n.state IS NULL OR n.state <> 'gone') SET n.state = 'gone' AT TIME datetime.fromepochmillis($at)"
+                            ),
+                            params! { "keys" => chunk, "at" => at },
+                        )
+                        .await?;
+                        ""
+                    } else {
+                        ", n.state = 'gone'"
+                    };
+                    let rows = self
+                        .run(
+                            &format!(
+                                "USE LAYER {layer} WRITE LAYER {layer} UNWIND $keys AS k MATCH (n:{label} {{key: k}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $at, n.ended_reason = $reason{state} RETURN count(n)"
+                            ),
+                            params! { "keys" => chunk, "at" => at, "reason" => request.reason },
+                        )
+                        .await?;
+                    retired += rows.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0) as u32;
+                }
             }
         }
         Ok(retired)
+    }
+
+    /// Whether `label` keeps `state` as a temporal property (declared by a put of this process, or recorded by an earlier one and read at open).
+    async fn state_is_temporal(&self, label: &str) -> bool {
+        self.temporal.lock().await.contains_key(&(Owner::Label(label.to_owned()), "state".to_owned()))
     }
 
     /// `memory.graph.query`: one read-only statement over every layer, time-limited.
@@ -504,6 +637,7 @@ impl GraphStore {
         match outcome {
             Ok(_) => {
                 self.temporal.lock().await.insert(id, kept);
+                self.record_temporal(owner, prop, kept).await?;
                 Ok(kept)
             }
             Err(error) if error.message.contains("cannot change scalar type") => {
@@ -512,6 +646,14 @@ impl GraphStore {
             Err(error) => Err(error),
         }
     }
+}
+
+/// The group a node is in: the last of the links [`GraphStore::put`] joined it by.
+fn group_of<'a>(group: &HashMap<&'a GraphRef, &'a GraphRef>, mut id: &'a GraphRef) -> &'a GraphRef {
+    while let Some(next) = group.get(id).copied() {
+        id = next;
+    }
+    id
 }
 
 /// `SET` items that keep `first_ms` the earliest and `last_ms` the latest time seen.
@@ -574,9 +716,8 @@ fn validate_ref(label: &str, key: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// An edge's end: a label and key as [`validate_ref`], or a reference to a `Project`, `Session` or
-/// `Knowledge` item
-/// by its id.
+/// An edge's end: a label and key as [`validate_ref`], or a reference to a `Project`, `Session`,
+/// `Knowledge` or `Note` item by its id.
 fn validate_end(label: &str, key: &str) -> Result<(), RpcError> {
     if !REFERENCED_LABELS.contains(&label) {
         return validate_ref(label, key);
@@ -709,25 +850,36 @@ pub fn check_read_only(cypher: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// This Mac's identity: the hardware UUID (`IOPlatformUUID`, else `kern.uuid`), its computer name
-/// and macOS version.
+/// This machine's identity: on a Mac the hardware UUID (`IOPlatformUUID`, else `kern.uuid`), its
+/// computer name and macOS version; on Linux the machine id (`/etc/machine-id`, else the board's
+/// UUID), its host name and distribution. The host name only when there is no id at all.
 fn machine_info() -> MachineInfo {
     let output = |program: &str, args: &[&str]| -> Option<String> {
         let out = std::process::Command::new(program).args(args).output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         (out.status.success() && !text.is_empty()).then_some(text)
     };
+    let file = |path: &str| std::fs::read_to_string(path).ok().map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());
+    let hostname = || file("/proc/sys/kernel/hostname").or_else(|| file("/etc/hostname")).or_else(|| output("/bin/hostname", &[]));
     let key = output("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
         .and_then(|text| text.lines().find(|line| line.contains("\"IOPlatformUUID\"")).and_then(|line| line.rsplit('"').nth(1).map(str::to_owned)))
         .filter(|uuid| !uuid.is_empty())
         .or_else(|| output("/usr/sbin/sysctl", &["-n", "kern.uuid"]))
-        .or_else(|| output("/bin/hostname", &[]))
+        .or_else(|| file("/etc/machine-id"))
+        .or_else(|| file("/var/lib/dbus/machine-id"))
+        .or_else(|| file("/sys/class/dmi/id/product_uuid"))
+        .or_else(hostname)
         .unwrap_or_else(|| "unknown-machine".into());
-    let name = output("/usr/sbin/scutil", &["--get", "ComputerName"]).or_else(|| output("/bin/hostname", &[])).unwrap_or_default();
+    let name = output("/usr/sbin/scutil", &["--get", "ComputerName"]).or_else(hostname).unwrap_or_default();
+    let distribution = || {
+        let text = file("/etc/os-release")?;
+        let line = text.lines().find(|line| line.starts_with("PRETTY_NAME="))?;
+        Some(line["PRETTY_NAME=".len()..].trim_matches('"').to_owned()).filter(|name| !name.is_empty())
+    };
     let os = match (output("/usr/bin/sw_vers", &["-productName"]), output("/usr/bin/sw_vers", &["-productVersion"]), output("/usr/bin/sw_vers", &["-buildVersion"])) {
         (Some(product), Some(version), Some(build)) => format!("{product} {version} ({build})"),
         (Some(product), Some(version), None) => format!("{product} {version}"),
-        _ => std::env::consts::OS.to_owned(),
+        _ => distribution().unwrap_or_else(|| std::env::consts::OS.to_owned()),
     };
     MachineInfo { key, name, os }
 }

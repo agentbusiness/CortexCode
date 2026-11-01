@@ -340,7 +340,7 @@ impl Jobs {
 
     /// A job event on the `jobs` stream.
     fn event(&self, meta: &JobMeta, event: &str) {
-        self.graph.append(
+        self.graph.append_kept(
             "jobs",
             vec![json!({
                 "job_id": meta.job_id,
@@ -351,6 +351,7 @@ impl Jobs {
                 "project_id": meta.project_id,
                 "command": meta.command,
             })],
+            365,
         );
     }
 

@@ -234,6 +234,7 @@ How results read:\n\
 - run: the command's output, then `[exit N]`: exit 0 means it succeeded. A long output is cut in the middle: `[N lines not shown: read artifact://<id>:A-B for them]`.\n\
 - A code result: one line, `path:line  signature — what it does`.\n\
 - A call result: `path:line  in <function>: <calling line>` (used-by) or `path:line  calls <function>: <calling line>` (uses).\n\
+- `…(masked <kind>)`: a secret value hidden from you (a key, a token, a password). Leave the line that holds it as it is.\n\
 - A failure says what went wrong; its last sentence is the next step.\n\
 \n\
 Find code:\n\

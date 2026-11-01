@@ -1,6 +1,6 @@
 Security audit or pen-test of this codebase: find, verify, record and report vulnerabilities.
 
-Read-only work: project files never change. The secaudit tool keeps the audit's state and report under the app's home (it survives the turn) and writes only record drafts into the project's `tmp/secaudit/` (git ignores it). The tool drives the audit: it maps the project, decides which attack classes apply, finds the lines worth judging, keeps the records and writes the report. You judge each line it shows: where its value comes from, who controls it, which check stops it.
+Read-only work: project files never change. The secaudit tool keeps the audit in the project's graph (it survives the turn; the Security tab lists what it finds), writes the report under the app's home, and writes only record drafts into the project's `tmp/secaudit/` (git ignores it). The tool drives the audit: it maps the project, decides which attack classes apply, finds the lines worth judging, keeps the records and writes the report. You judge each line it shows: where its value comes from, who controls it, which check stops it.
 
 ## The loop
 
@@ -9,13 +9,13 @@ export SA="$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py"
 python3 "$SA" next
 ```
 
-The first call maps the project (stack, entry points, the dependencies' known vulnerabilities looked up live, the units: one per attack class that applies here) and shows the first lines to judge. Every later call shows the next open lines, with ids like U3.4, the class's invariant, what counts as a finding, and the current upstream guidance. The audit runs unit by unit: when a unit's last line is settled, the tool prints the unit's one-line result and you reply with it; the audit goes on with the next unit after that reply. When nothing is open it writes the report, prints it whole with its path, and says the audit is complete: the audit ends there and nowhere else. A scoped request ("audit the API", "only src/"): run `python3 "$SA" recon --scope src` once before `next`.
+The first call maps the project (stack, entry points, the dependencies' known vulnerabilities looked up live, the units: one per attack class that applies here) and shows the first lines to judge. Every later call shows the next open lines, with ids like U3.4, the class's invariant and what counts as a finding. The audit runs unit by unit: when a unit's last line is settled, the tool prints the unit's one-line result and you reply with it; the audit goes on with the next unit after that reply. When nothing is open it writes the report, prints it whole with its path, and says the audit is complete: the audit ends there and nowhere else. A scoped request ("audit the API", "only src/"): run `python3 "$SA" recon --scope src` once before `next`.
 
 For each line shown:
 
 1. Backward: `read <path>:<from>-<to>` around it; `read graph://used-by/<function>` and `read references://<path:line:col>` for who calls it. Walk back until you reach a lower-trust party (a request field, an upload, an argument, a message, a model output, another app) or a check that stops the value (validation, allowlist, authorization, escaping, parameter binding).
 2. Forward: what does the value do at the sink, and to whom?
-3. Settle it with the fact that decided it:
+3. Settle it with the fact that decided it. A line marked `host signal` (a real key format, a secret in git history, a malicious or exploited package) is a `finding` or a `lead`; `blocked` only with the `path:line` of a test fixture that holds an example value.
 
 ```bash
 python3 "$SA" settle U3.4 safe "bound as a parameter at app/db.py:40"
@@ -28,7 +28,7 @@ python3 "$SA" settle U8.1 lead
 
 One unit only, when the task names it (other agents do the other units at the same time): `python3 "$SA" next --unit U3` shows that unit's lines and, once they are all settled, its one-line result; nothing else is yours.
 
-When the project was audited before, the first unit is U0, the previous audit's issues, each with what the code shows now: settle each as `fixed "<what changed>"` or `still "<re-verified how>"`. Several ids share one reason when one control covers them, and that reason names the control as path:line in the project (the tool checks the place exists): `settle U4 safe "every handler sits behind the loopback middleware, startup.rs:137"` settles a whole unit. Then `python3 "$SA" next` again. A unit the tool itself could not show stays open; it comes back after the other units, and if it fails again the tool prints the settle that records the failure.
+When the project already has findings, the first unit is U0, the issues already known, each with what the host sees in the code now: settle each as `fixed "<what changed>"` or `still "<re-verified how>"`; `fixed` holds only when the flagged line is gone. Several ids share one reason when one control covers them, and that reason names the control as path:line in the project (the tool checks the place exists): `settle U4 safe "every handler sits behind the loopback middleware, startup.rs:137"` settles a whole unit. Then `python3 "$SA" next` again. A unit the tool itself could not show stays open; it comes back after the other units, and if it fails again the tool prints the settle that records the failure.
 
 ## Finding or lead
 
@@ -45,7 +45,7 @@ python3 "$SA" finding tmp/secaudit/finding-1.json
 
 It names each field to fix, or records it; `next` does not move on while a record is unfilled.
 
-Severity, for findings only, from the demonstrated result, never from the class name: critical, an anonymous party gets code execution, the whole data store or any account; high, an explicit control fully defeated with real consequence (auth bypass, another tenant's data, stored script for other users); medium, a boundary crossed with a small blast radius or rare preconditions; low, non-secret internals or much effort for little. Overall never exceeds impact. The fix is the smallest change at the sink, its safe form (`skill://skills-engineering/security-pitfalls`), plus the test that would have caught it.
+Severity, for findings only, from the demonstrated result, never from the class name: critical, an anonymous party gets code execution, the whole data store or any account; high, an explicit control fully defeated with real consequence (auth bypass, another tenant's data, stored script for other users); medium, a boundary crossed with a small blast radius or rare preconditions; low, non-secret internals or much effort for little. Overall never exceeds impact. A line with a host signal comes with the host's severity: raise it when the result is worse, never lower it. The fix is the smallest change at the sink, its safe form (`skill://skills-engineering/security-pitfalls`), plus the test that would have caught it.
 
 ## The replies
 

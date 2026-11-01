@@ -1,6 +1,9 @@
 //! The line store: per-file line-level index kept outside the graph (line hashes and byte offsets),
 //! keyed by the file's content hash. Tags are `cc_protocol::hashline::tag` of each line, so the
 //! anchors shown by the tools plugin and the spans returned here agree by construction.
+//!
+//! Line indexes are the only thing kept here: everything about the tree (files, symbols, whether a
+//! sync was cut off) is in the graph ([`crate::tree`]).
 
 use cc_protocol::hashline;
 use std::collections::HashSet;

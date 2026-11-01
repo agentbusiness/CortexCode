@@ -50,6 +50,9 @@ pub const PROVIDES: &[&str] = &[
     methods::UNDO,
     methods::REDO,
     methods::TIMELINE_DIFF,
+    methods::SHARES,
+    methods::SECURITY_SCAN,
+    methods::SECURITY_DEPS,
 ];
 
 pub struct ToolsPlugin {
@@ -612,6 +615,8 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let (report, notes) = tokio::task::spawn_blocking(move || crate::exec::tests_report(&text)).await.map_err(|error| RpcError::internal(error.to_string()))?;
             Ok(json!({ "report": report, "notes": notes }))
         }
+        methods::SHARES => to_value(&crate::share::shares()),
+        methods::SECURITY_SCAN | methods::SECURITY_DEPS => crate::share::security(&method, params).await,
         other => Err(RpcError::unknown_method(other)),
     }
 }

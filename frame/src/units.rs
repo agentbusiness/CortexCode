@@ -188,6 +188,13 @@ pub struct Units {
     pub root: PathBuf,
     overrides: BTreeMap<String, PluginOverride>,
     batch_dir: PathBuf,
+    /// The final results of the installs this frame finished or recovered, by install id: what
+    /// `frame.plugins.install_many` repeats and `frame.plugins.install_wait` answers. The outcome
+    /// itself is kept in the graph (stream `updates`), and the batch file goes once it is there.
+    finished: Mutex<BTreeMap<String, InstallManyResult>>,
+    /// Finished installs whose outcome waits for the graph (recovered at start, before the memory
+    /// plugin serves): recorded by [`record_recovered`].
+    unrecorded: Mutex<Vec<String>>,
     /// Serializes enable, disable, install, rollback and switch.
     pub op: tokio::sync::Mutex<()>,
     /// The person's choice per category with alternatives (persisted).
@@ -209,7 +216,7 @@ impl Units {
             Err(error) => return Err(format!("cannot read {}: {error}", legacy.display())),
         };
         let batch_dir = state_dir.join("plugin-installs");
-        recover_batches(root, &batch_dir, &mut saved)?;
+        let recovered = recover_batches(root, &batch_dir, &mut saved)?;
         let resolve = |id: &str, version: &str| match crate::package::load(root, id, version) {
             Ok(installed) => Some(Arc::new(installed)),
             Err(error) => {
@@ -234,6 +241,8 @@ impl Units {
             root: root.to_path_buf(),
             overrides,
             batch_dir,
+            unrecorded: Mutex::new(recovered.iter().map(|result| result.id.clone()).collect()),
+            finished: Mutex::new(recovered.into_iter().map(|result| (result.id.clone(), result)).collect()),
             op: tokio::sync::Mutex::new(()),
             providers: Mutex::new(saved.providers.clone()),
             serving: Mutex::new(BTreeMap::new()),
@@ -798,6 +807,8 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
 
 /// The baseline is written before the first activation. A frame restart restores it before any
 /// plugin starts; a source-manager replacement can wait for the final result without owning it.
+/// The file is a boot-recovery record only: once the batch has its final result and that outcome
+/// is in the graph (stream `updates`), the file is deleted.
 #[derive(Serialize, Deserialize)]
 struct InstallBatch {
     id: String,
@@ -829,10 +840,13 @@ fn read_batch(dir: &Path, id: &str) -> Result<InstallBatch, RpcError> {
     serde_json::from_slice(&bytes).map_err(|e| RpcError::internal(format!("{} is corrupt: {e}", path.display())))
 }
 
-fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<(), String> {
+/// Restore the baseline of every batch a stopped frame left without a final result, and return the
+/// final results of all batches still on disk (their outcome is not in the graph yet).
+fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<Vec<InstallManyResult>, String> {
+    let mut finished = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(finished),
         Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
     };
     for entry in entries {
@@ -840,7 +854,10 @@ fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<(
         if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
         let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let mut batch: InstallBatch = serde_json::from_slice(&bytes).map_err(|e| format!("{} is corrupt: {e}", path.display()))?;
-        if batch.result.is_some() { continue; }
+        if let Some(result) = batch.result.take() {
+            finished.push(result);
+            continue;
+        }
         let mut errors = Vec::new();
         for (id, previous) in &batch.previous {
             if let Err(error) = crate::package::load(root, id, &previous.current) {
@@ -861,17 +878,133 @@ fn recover_batches(root: &Path, dir: &Path, saved: &mut PluginsFile) -> Result<(
         batch.result = Some(InstallManyResult { id: batch.id.clone(), ok: false, swaps: Vec::new(),
             error: Some("The frame stopped during installation; restoration of the previous versions was attempted before startup.".into()), recovery_errors: errors });
         save_batch(dir, &batch).map_err(|e| e.message)?;
+        finished.extend(batch.result);
     }
-    Ok(())
+    Ok(finished)
+}
+
+/// The stream the outcome of an install goes to, and how long it is kept (as the updater's).
+const UPDATES: &str = "updates";
+const UPDATES_DAYS: u32 = 365;
+/// The memory calls that read an install's outcome back (part of `memory@1`; the frame names
+/// them here rather than building the whole memory contract).
+const STREAM_TOPICS: &str = "memory.stream.topics";
+const STREAM_READ: &str = "memory.stream.read";
+/// The newest records of `updates` searched for an install's outcome.
+const UPDATES_SEARCHED: u64 = 1000;
+/// How long reading an outcome back may wait for the memory plugin.
+const OUTCOME_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keep a batch's final result for this frame's calls, put its outcome in the graph, then delete
+/// its file. The file stays when the graph did not take the outcome: the next start tries again.
+fn record_finished(frame: &Arc<Frame>, result: &InstallManyResult) {
+    if let Ok(mut finished) = frame.units.finished.lock() {
+        finished.insert(result.id.clone(), result.clone());
+    }
+    // The swaps whole, so the result can be read back from the record ([`recorded_result`]).
+    let swaps = serde_json::to_value(&result.swaps).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    // No top-level `plugin`: the updater's own per-plugin outcomes in this topic stay apart.
+    let record = serde_json::json!({
+        "kind": "plugin_install", "install": result.id, "ms": cc_protocol::contracts::now_ms(), "ok": result.ok,
+        "error": result.error, "recovery_errors": result.recovery_errors, "swaps": swaps, "by": "frame",
+    });
+    let kept = frame.state.append_stream(UPDATES, vec![record], UPDATES_DAYS);
+    let path = batch_path(&frame.units.batch_dir, &result.id).ok();
+    let id = result.id.clone();
+    tokio::spawn(async move {
+        if !matches!(kept.await, Ok(true)) {
+            tracing::warn!(install = %id, "the install's outcome is not in the graph; its batch file stays until the next start");
+            return;
+        }
+        if let Some(path) = path
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(install = %id, %error, "cannot remove the finished install's batch file");
+        }
+    });
+}
+
+/// Put the outcomes of the installs recovered at start in the graph (they wait in the outbox until
+/// the memory plugin serves), deleting their batch files.
+pub fn record_recovered(frame: &Arc<Frame>) {
+    let ids = frame.units.unrecorded.lock().map(|mut ids| std::mem::take(&mut *ids)).unwrap_or_default();
+    for id in ids {
+        let result = frame.units.finished.lock().ok().and_then(|finished| finished.get(&id).cloned());
+        if let Some(result) = result {
+            record_finished(frame, &result);
+        }
+    }
+}
+
+/// The final result of install `id` from its record in stream `updates` (a frame before this one
+/// finished it and deleted its batch file). `Ok(None)` when no record names it; an error when the
+/// memory plugin cannot be asked within [`OUTCOME_READ_LIMIT`].
+async fn recorded_result(frame: &Frame, id: &str) -> Result<Option<InstallManyResult>, RpcError> {
+    use serde_json::Value;
+    let read = async {
+        let topics = frame.memory.call(STREAM_TOPICS, serde_json::json!({ "prefix": UPDATES })).await?;
+        let Some(next) = topics
+            .get("topics")
+            .and_then(Value::as_array)
+            .and_then(|all| all.iter().find(|topic| topic.get("name").and_then(Value::as_str) == Some(UPDATES)))
+            .and_then(|topic| topic.get("next_offset").and_then(Value::as_u64))
+        else {
+            return Ok(None);
+        };
+        let page = frame
+            .memory
+            .call(STREAM_READ, serde_json::json!({ "topic": UPDATES, "from_offset": next.saturating_sub(UPDATES_SEARCHED), "limit": UPDATES_SEARCHED }))
+            .await?;
+        let records = page.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
+        let found = records.into_iter().rev().filter_map(|entry| entry.get("value").cloned()).find(|record| {
+            record.get("kind").and_then(Value::as_str) == Some("plugin_install") && record.get("install").and_then(Value::as_str) == Some(id)
+        });
+        let Some(record) = found else { return Ok(None) };
+        let result = serde_json::json!({
+            "id": id, "ok": record.get("ok").cloned().unwrap_or(Value::Bool(false)),
+            "swaps": record.get("swaps").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "error": record.get("error").cloned().unwrap_or(Value::Null),
+            "recovery_errors": record.get("recovery_errors").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        });
+        serde_json::from_value::<InstallManyResult>(result)
+            .map(Some)
+            .map_err(|error| RpcError::internal(format!("the recorded outcome of install `{id}` cannot be read: {error}")))
+    };
+    match tokio::time::timeout(OUTCOME_READ_LIMIT, read).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(RpcError::new(cc_protocol::codes::UNAVAILABLE, "the memory plugin is not serving; the install's recorded outcome cannot be read yet")),
+    }
+}
+
+/// The final result of install `id`: kept in memory, or in a batch file whose outcome is not in
+/// the graph yet.
+fn finished_result(frame: &Frame, id: &str) -> Result<Option<InstallManyResult>, RpcError> {
+    if let Some(result) = frame.units.finished.lock().ok().and_then(|finished| finished.get(id).cloned()) {
+        return Ok(Some(result));
+    }
+    let path = batch_path(&frame.units.batch_dir, id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_batch(&frame.units.batch_dir, id)?
+        .result
+        .map(Some)
+        .ok_or_else(|| RpcError::internal("the install has no final result; restart the frame to recover it"))
 }
 
 /// Install a prebuilt set under the existing package operation gate. The frame owns this future,
 /// so replacing the requesting source plugin cannot interrupt the remaining swaps or rollbacks.
 pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Result<InstallManyResult, RpcError> {
     let _op = frame.units.op.lock().await;
-    let path = batch_path(&frame.units.batch_dir, &params.id)?;
-    if path.exists() {
-        return read_batch(&frame.units.batch_dir, &params.id)?.result.ok_or_else(|| RpcError::internal("the previous install has no final result; restart the frame to recover it"));
+    if let Some(result) = finished_result(frame, &params.id)? {
+        return Ok(result);
+    }
+    // An install a frame before this one finished: its outcome is in the graph.
+    match recorded_result(frame, &params.id).await {
+        Ok(Some(result)) => return Ok(result),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(install = %params.id, %error.message, "an earlier outcome of this install could not be read from the graph; installing"),
     }
     if params.paths.is_empty() { return Err(RpcError::invalid_params("give the built plugin packages")); }
     if let Some(held) = hold_for_restart(frame, &params.paths.iter().map(PathBuf::from).collect::<Vec<_>>()) {
@@ -944,10 +1077,12 @@ pub async fn install_many(frame: &Arc<Frame>, params: InstallManyParams) -> Resu
             batch.result = Some(result.clone());
         }
         if let Err(record) = save_batch(&frame.units.batch_dir, &batch) {
+            // The file (the baseline) stays for the next start, which recovers it.
             return Err(RpcError::internal(format!("{}; recovery details: {}", record.message, result.recovery_errors.join("; ")))
                 .with_data(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)));
         }
     }
+    record_finished(frame, &result);
     Ok(result)
 }
 
@@ -991,7 +1126,10 @@ async fn restore_batch(frame: &Arc<Frame>, batch: &InstallBatch, attempted: &[St
 /// A successor source plugin waits on the existing operation gate, then reads the durable result.
 pub async fn install_wait(frame: &Arc<Frame>, id: &str) -> Result<InstallManyResult, RpcError> {
     let _op = frame.units.op.lock().await;
-    read_batch(&frame.units.batch_dir, id)?.result.ok_or_else(|| RpcError::internal("the install has no final result; restart the frame to recover it"))
+    if let Some(result) = finished_result(frame, id)? {
+        return Ok(result);
+    }
+    recorded_result(frame, id).await?.ok_or_else(|| RpcError::not_found(format!("no install `{id}`")))
 }
 
 /// `frame.plugins.install`.

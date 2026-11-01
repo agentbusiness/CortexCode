@@ -39,8 +39,8 @@
           "langs": [
             "any"
           ],
-          "needle": "gh",
-          "regex": "\\bgh[pousr]_[A-Za-z0-9]{36,}\\b"
+          "needle": "",
+          "regex": "\\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\\b"
         },
         {
           "name": "Slack token",
@@ -120,7 +120,8 @@
             "any"
           ],
           "needle": "O",
-          "regex": "(?i)\\b(TODO|FIXME|HACK|XXX)\\b.*\\b(auth|authz|authn|permission|validate|validation|sanitize|escape|csrf|security|insecure|secret|password)"
+          "regex": "(?i)\\b(TODO|FIXME|HACK|XXX)\\b.*\\b(auth|authz|authn|permission|validate|validation|sanitize|escape|csrf|security|insecure|secret|password)",
+          "kind": "marker"
         }
       ],
       "files": [
@@ -484,7 +485,8 @@
             "py"
           ],
           "needle": "@",
-          "regex": "@\\w+\\.(route|get|post|put|patch|delete|api_route|websocket)\\s*\\(|^\\s*(path|re_path|url)\\s*\\(\\s*[\"']"
+          "regex": "@\\w+\\.(route|get|post|put|patch|delete|api_route|websocket)\\s*\\(|^\\s*(path|re_path|url)\\s*\\(\\s*[\"']",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -492,7 +494,8 @@
             "js"
           ],
           "needle": ".",
-          "regex": "\\b(app|router|server|fastify|api)\\.(get|post|put|patch|delete|all|use)\\s*\\(\\s*[\"'`/]|export\\s+(async\\s+)?function\\s+(GET|POST|PUT|PATCH|DELETE)\\b|@(Get|Post|Put|Patch|Delete)\\s*\\("
+          "regex": "\\b(app|router|server|fastify|api)\\.(get|post|put|patch|delete|all|use)\\s*\\(\\s*[\"'`/]|export\\s+(async\\s+)?function\\s+(GET|POST|PUT|PATCH|DELETE)\\b|@(Get|Post|Put|Patch|Delete)\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -500,7 +503,8 @@
             "go"
           ],
           "needle": "(",
-          "regex": "\\.(HandleFunc|Handle|GET|POST|PUT|PATCH|DELETE|Any|Group)\\s*\\(\\s*\"|http\\.HandleFunc\\s*\\("
+          "regex": "\\.(HandleFunc|Handle|GET|POST|PUT|PATCH|DELETE|Any|Group)\\s*\\(\\s*\"|http\\.HandleFunc\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -508,7 +512,8 @@
             "rs"
           ],
           "needle": "route",
-          "regex": "\\.route\\s*\\(\\s*\"|#\\[(get|post|put|patch|delete|route)\\s*\\(|\\.service\\s*\\(|web::(get|post|put|patch|delete)\\s*\\(\\)"
+          "regex": "\\.route\\s*\\(\\s*\"|#\\[(get|post|put|patch|delete|route)\\s*\\(|\\.service\\s*\\(|web::(get|post|put|patch|delete)\\s*\\(\\)",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -516,7 +521,8 @@
             "java"
           ],
           "needle": "Mapping",
-          "regex": "@(Get|Post|Put|Patch|Delete|Request)Mapping\\b|@Path\\s*\\("
+          "regex": "@(Get|Post|Put|Patch|Delete|Request)Mapping\\b|@Path\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -524,7 +530,8 @@
             "rb"
           ],
           "needle": " ",
-          "regex": "^\\s*(get|post|put|patch|delete|resources?|match)\\s+[\"':]"
+          "regex": "^\\s*(get|post|put|patch|delete|resources?|match)\\s+[\"':]",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -532,7 +539,8 @@
             "php"
           ],
           "needle": "Route",
-          "regex": "Route::(get|post|put|patch|delete|any|match|resource)\\s*\\("
+          "regex": "Route::(get|post|put|patch|delete|any|match|resource)\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "route handler",
@@ -540,7 +548,8 @@
             "cs"
           ],
           "needle": "[Http",
-          "regex": "\\[Http(Get|Post|Put|Patch|Delete)\\b|\\.Map(Get|Post|Put|Patch|Delete)\\s*\\("
+          "regex": "\\[Http(Get|Post|Put|Patch|Delete)\\b|\\.Map(Get|Post|Put|Patch|Delete)\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "mass assignment from the request",
@@ -978,7 +987,8 @@
             "any"
           ],
           "needle": "/",
-          "regex": "(?i)[\"'`](/[\\w/:{}-]*)?/(export|backup|dump|restore|import|download|bulk|report)s?[\"'`/]"
+          "regex": "(?i)[\"'`](/[\\w/:{}-]*)?/(export|backup|dump|restore|import|download|bulk|report)s?[\"'`/]",
+          "kind": "marker"
         }
       ]
     }

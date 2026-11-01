@@ -82,7 +82,20 @@ async function recordArtifact(store, file) {
   const props = { path: file.path, kind: file.kind, bytes: file.bytes, mime: file.mime, url: file.url, created_ms: Date.now() };
   if (file.width) Object.assign(props, { width: file.width, height: file.height });
   const node = { label: 'Artifact', key: file.path, props };
-  const to = file.sessionId ? { label: 'Session', key: file.sessionId } : { label: 'Machine', key: machineKey };
-  const rel = file.sessionId ? 'FROM' : 'ON';
-  await store.call('memory.graph.put', { nodes: [node], edges: [{ from: { label: 'Artifact', key: file.path }, rel, to }] });
+  const from = { label: 'Artifact', key: file.path };
+  const onMachine = { from, rel: 'ON', to: { label: 'Machine', key: machineKey } };
+  if (!file.sessionId) {
+    await store.call('memory.graph.put', { nodes: [node], edges: [onMachine] });
+    return;
+  }
+  try {
+    await store.call('memory.graph.put', { nodes: [node], edges: [{ from, rel: 'FROM', to: { label: 'Session', key: file.sessionId } }] });
+  } catch (error) {
+    // A session the graph does not keep (deleted, or never written there): the machine holds the
+    // file, so nothing is kept unconnected. Any other refusal is the caller's.
+    const e = /** @type {{ code?: string, message?: string }} */ (error);
+    const unstored = e?.code === 'invalid_params' && String(e.message ?? '').includes(`names Session:${file.sessionId}, which is neither in this batch nor stored`);
+    if (!unstored) throw error;
+    await store.call('memory.graph.put', { nodes: [node], edges: [onMachine] });
+  }
 }

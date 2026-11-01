@@ -23,10 +23,10 @@ The id is in the user's message (`<class>:<file>:<function>`, or `hardening:...`
 python3 "$SA" resolve <id> "ran <test command>: <what it showed>"
 ```
 
-`resolve` checks the code first: the flagged line must have changed or gone, or the package must pin a newer version. When nothing changed it says so and the finding stays open; fix, then resolve again. When it records, reply with one line: the change as `path:line`, how it was verified, and that the finding is marked fixed.
+`resolve` asks the host, which reads the file: the flagged line must be gone from it (a line that only moved is still there, and the answer names its new line), or the lockfile must no longer pin the vulnerable version. When it is still there the answer says where and the finding stays open; fix, then resolve again. When it records, reply with one line: the change as `path:line`, how it was verified, and that the finding is marked fixed.
 
 ## Traps
 
-- Replying before `resolve` recorded the fix: the Security tab still shows the finding as being fixed, and the turn does not end.
+- Replying before `resolve` recorded the fix: the turn does not end, and a turn that ends without it puts the finding back to open.
 - Fixing more than the finding: other suspicious lines are the audit's work, not this session's.
 - A version bump without the test run: the lockfile changes, the build may not.

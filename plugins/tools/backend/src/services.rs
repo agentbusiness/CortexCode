@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Services CortexCode does not offer the model: it has its own tool for the work.
-const OWN: &[&str] = &["terminal.command"];
+/// Services CortexCode does not offer the model: it has its own tool for the work, or the host
+/// uses them itself (the guard and advisories check every `run`; the code audit is a skill).
+const OWN: &[&str] = &["terminal.command", "terminal.guard", "system.advisory", "tools.security"];
 /// The tools CortexCode has itself; a service of the same name is left out.
 const BUILT_IN: &[&str] = &["read", "edit", "run", "terminal"];
 /// How long the list of services is reused.

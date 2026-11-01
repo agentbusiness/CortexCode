@@ -80,15 +80,16 @@ reason, so the next audit does not repeat the work.
 
 ## What a run leaves behind
 
-The audit's state and report live under the app's home, one folder per project
-(`$CORTEX_HOME/audits/<project>-<id>/`): `REPORT.md`, one `units/<unit>.md` per attack class with
-every reviewed line, its verdict and the reviewer's reasoning, the records (`findings.json`), the
-judgments (`hits-state.json`) and the dependency check (`deps.json`). Nothing is written into the
-project except record drafts in its git-ignored `tmp/secaudit/`, which the host removes when the
-turn ends. A new audit of a project that already has a finished one archives it under `runs/<stamp>/`
-and starts with unit U0: every previous finding, lead and hardening note, each with a mechanical
-pre-check (the flagged line unchanged, moved or gone; the package still pinned at the same version),
-for the model to settle as `fixed` or `still`; a still-open finding is carried into the new report
+The audit's state lives in the project's graph, kept by the memory plugin (`memory.security.*`):
+the audit node with the project map, its units with their status, every line to judge with its
+verdict and the reviewer's reasoning, the vulnerable dependencies and the findings. The reports are
+files under the app's home, one folder per project and one per audit inside it
+(`$CORTEX_HOME/audits/<project>-<id>/<audit>/`): `REPORT.md` and one `units/<unit>.md` per attack
+class. Nothing is written into the project except record drafts in its git-ignored `tmp/secaudit/`,
+which the host removes when the turn ends. A new audit retires the one before it (kept, linked by
+`AFTER`) and starts with unit U0: every previous finding, lead and hardening note, each with a
+mechanical pre-check (the flagged line unchanged, moved or gone; the package still pinned at the
+same version), for the model to settle as `fixed` or `still`; a still-open finding is carried into the new report
 as it was, and the report's "Previous audit" section shows the comparison.
 
 ## Live sources
@@ -97,7 +98,7 @@ Nothing is mirrored or cached. At call time the tool asks:
 
 | Source | What for | Where |
 |---|---|---|
-| OSV, the open vulnerability database (carries the GitHub Advisory Database, the npm, PyPI, crates.io, Go, RubyGems, Packagist, Maven and NuGet advisories and the CVE list) | every known vulnerability of the exact dependency versions the project's lockfiles pin, with the fixed versions | `recon` (summary and `tmp/secaudit/deps.json`), the dependencies unit of `hunt`, `deps`, the report |
+| OSV, the open vulnerability database (carries the GitHub Advisory Database, the npm, PyPI, crates.io, Go, RubyGems, Packagist, Maven and NuGet advisories and the CVE list) | every known vulnerability of the exact dependency versions the project's lockfiles pin, with the fixed versions | `recon` (summary, kept with the audit), the dependencies unit of `hunt`, `deps`, the report |
 | NVD | a CVE's description, CVSS and weakness ids when OSV has no record | `cve` |
 | MITRE's CWE API | the mitigations of the weakness behind an advisory | `cve` |
 | the Cloudflare security-audit skill repository | the current hunting guidance for the attack class being hunted | `hunt` |

@@ -8,7 +8,7 @@ pub mod java;
 pub mod maven;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::{Launch, ServerSpec};
 use cc_lang_kit::pack::Toolchain;
 use cc_lang_kit::{ExtractContext, FoundServer, LanguagePack, PackEnv, Sample};
@@ -88,6 +88,25 @@ impl LanguagePack for JavaPack {
     }
 
     /// The project's own wrappers (`gradlew`, `mvnw`: they need only a JDK), else Maven on PATH.
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["./gradlew"]),
+            Runner::new("build", &["gradle"]),
+            Runner::new("build", &["./mvnw"]),
+            Runner::new("build", &["mvn"]),
+            Runner::new("build", &["javac"]),
+            Runner::new("run", &["./gradlew", "run"]),
+            Runner::new("run", &["gradle", "run"]),
+            Runner::new("run", &["mvn", "exec:java"]),
+            Runner::new("run", &["./mvnw", "exec:java"]),
+            Runner::new("run", &["java"]),
+            Runner::new("server", &["./gradlew", "bootRun"]),
+            Runner::new("server", &["gradle", "bootRun"]),
+            Runner::new("server", &["mvn", "spring-boot:run"]),
+            Runner::new("server", &["./mvnw", "spring-boot:run"]),
+        ]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         let verifier = |name: &str, kind: &str, args: &[&str], when: &str, requires: &[&str]| Verifier {
             files: Vec::new(),            name: name.into(),

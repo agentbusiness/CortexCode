@@ -907,6 +907,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // do not check the change (seen: tests that passed on wrong code, the fix taken as done).
     let mut last_pass: Option<(String, u64)> = None;
     let mut baseline_checked = false;
+    // At "done" after the run changed files, the host checks the change itself once (the code
+    // audit's patterns on the lines it added, and the dependencies it added); what it finds goes
+    // back to the model, whose step is to fix it or say why it is safe (seen: the audit ran only
+    // when asked, never on the code the model had just written).
+    let mut security_checked = false;
     // An agent works beside the others of its tree: it hears what bears on its task from them.
     let agent_team = match (&spec.kind, &spec.task) {
         (LoopKind::Agent { .. }, Some(task)) => Some(Team::of(env, task).await),
@@ -1101,6 +1106,16 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         continue;
                     }
                     _ => {}
+                }
+            }
+            if !changed.is_empty() && !security_checked {
+                security_checked = true;
+                env.set_stage("verify");
+                let found = crate::checks::security_change(env, &any).await;
+                env.set_stage("act");
+                if let Some(found) = found {
+                    journal.note(&env.run_id, "security_check", &env.data.text("done_security", &[("found", &found)]), true).await?;
+                    continue;
                 }
             }
             let Some(task) = task.as_mut().filter(|task| !task.contract.checks.is_empty()) else {

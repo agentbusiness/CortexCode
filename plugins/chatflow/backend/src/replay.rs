@@ -435,7 +435,12 @@ async fn put_replay(host: &Host, row: &Value) -> Result<(), RpcError> {
     });
     let node = graph::node(REPLAY, &format!("{lesson}#{ts_ms}"), graph::props(props));
     let at_ms = (ts_ms > 0 && ts_ms <= now_ms()).then_some(ts_ms);
-    graph::put_in_session(host, node, "FOR", Some(session_id), at_ms).await
+    graph::put_in_session(host, node.clone(), "FOR", Some(session_id), at_ms).await?;
+    // The lesson replayed is a Knowledge item (by id): linked when it is stored.
+    if !lesson.is_empty() {
+        graph::link(host, &node, "ABOUT", "Knowledge", lesson, at_ms).await?;
+    }
+    Ok(())
 }
 
 /// Move what older versions kept in files into the graph, once: each snapshot's `meta.json`

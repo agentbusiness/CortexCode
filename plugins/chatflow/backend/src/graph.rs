@@ -4,6 +4,7 @@
 //! ```text
 //! (:Snapshot {key: '<session>/<run>', version, root, head, subdir, untracked, dir, created_ms})-[:OF]->(:Session)
 //! (:Replay {key: '<lesson>#<ts_ms>', ts_ms, lesson, name, text, dom, with_state, without_state, verdict, evidence, of})-[:FOR]->(:Session)
+//!     -[:ABOUT]->(:Knowledge {id: lesson})   (when the lesson is stored)
 //! (:NightReport {key: <date>, text, created_ms, lessons, keyed, repair, skill, replays, failing, topic_only})-[:ON]->(:Machine)
 //! (:Attachment {key: sha256, name, mime, bytes, ext, path, kind, width?, height?})-[:IN]->(:Session)
 //! stream `replays`: every replay's result, as it was decided
@@ -53,18 +54,36 @@ pub async fn put_on_machine(host: &Host, node: GraphNode, at_ms: Option<u64>) ->
     put(host, vec![self::node("Machine", &machine, Map::new()), node], vec![on], at_ms).await
 }
 
+/// The memory plugin's refusal of an edge whose end `label:key` is not stored (its `graphapi.rs`:
+/// "names L:k, which is neither in this batch nor stored").
+pub fn names_unstored(error: &RpcError, label: &str, key: &str) -> bool {
+    error.code == codes::INVALID_PARAMS && error.message.contains(&format!("names {label}:{key}, which is neither in this batch nor stored"))
+}
+
 /// Put `node` with an edge `rel` to its session; on the Machine when the session is not in the
-/// graph (the put names an edge end that is not stored).
+/// graph (the put names an edge end that is not stored). Any other refusal is the caller's.
 pub async fn put_in_session(host: &Host, node: GraphNode, rel: &str, session_id: Option<&str>, at_ms: Option<u64>) -> Result<(), RpcError> {
     if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
         let to = edge(&node, rel, "Session", session_id);
         match put(host, vec![node.clone()], vec![to], at_ms).await {
             Ok(()) => return Ok(()),
-            Err(error) if error.code == codes::INVALID_PARAMS => tracing::debug!(error = %error.message, session = %session_id, "the session is not in the graph; the record goes on the machine"),
+            Err(error) if names_unstored(&error, "Session", session_id) => tracing::debug!(error = %error.message, session = %session_id, "the session is not in the graph; the record goes on the machine"),
             Err(error) => return Err(error),
         }
     }
     put_on_machine(host, node, at_ms).await
+}
+
+/// Link a stored node to another (`from -[rel]-> label:key`); a `to` that is not stored is no
+/// error (the link is left out).
+pub async fn link(host: &Host, from: &GraphNode, rel: &str, label: &str, key: &str, at_ms: Option<u64>) -> Result<(), RpcError> {
+    match put(host, Vec::new(), vec![edge(from, rel, label, key)], at_ms).await {
+        Err(error) if names_unstored(&error, label, key) => {
+            tracing::debug!(error = %error.message, "the link's end is not in the graph; it is left out");
+            Ok(())
+        }
+        outcome => outcome,
+    }
 }
 
 pub async fn retire(host: &Host, label: &str, keys: Vec<String>, reason: &str) -> Result<(), RpcError> {

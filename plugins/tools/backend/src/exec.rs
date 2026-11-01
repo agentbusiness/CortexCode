@@ -468,6 +468,24 @@ async fn exec_read(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         }
         displays.push(out.display);
     }
+    // Secret values are masked line by line (the anchors still match), and invisible or
+    // direction-changing characters are named: code with them reads differently from what it does.
+    let (masked_text, masked) = crate::security::mask_secrets(&combined.output);
+    if masked > 0 {
+        combined.output = masked_text;
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if masked > 0 {
+        notes.push(crate::security::masked_note(masked));
+    }
+    notes.extend(crate::security::invisible_note(&combined.output, 1));
+    for note in notes {
+        if !combined.output.is_empty() && !combined.output.ends_with('\n') {
+            combined.output.push('\n');
+        }
+        combined.output.push_str(&note);
+        combined.output.push('\n');
+    }
     let (text, artifact) = offload_text(core, &session.context.session_id, std::mem::take(&mut combined.output), core.config.read_limits);
     combined.output = text;
     combined.artifact = artifact;
@@ -1156,6 +1174,18 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         out.display = json!({ "path": display, "unchanged": true });
         return out;
     }
+    // A line written with a masked secret would put the mask over the real value.
+    let before: std::collections::HashSet<&str> = old_text.lines().collect();
+    if let Some((index, _)) = new.lines().enumerate().find(|(_, line)| line.contains(crate::security::MASK) && !before.contains(line)) {
+        return Out::fail(
+            "masked_secret",
+            format!(
+                "Nothing was written: line {} of the edit holds a secret value as it was shown masked, and writing it would replace the real value. Leave the lines that hold secrets as they are and edit the lines around them.",
+                index + 1
+            ),
+        );
+    }
+    let invisible = crate::security::added_invisible(&old_text, &new);
     // An edit of an existing file that adds syntax errors is not written (SWE-agent's guard: a broken
     // edit cascades, the next edits pile onto it). The model gets the errors and what it proposed;
     // the file and its anchors stay as they were.
@@ -1295,6 +1325,15 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         && !util::is_inside(&absolute, &util::scratch_dir(&session.workspace))
     {
         let _ = writeln!(output, "{display} now holds working code: change it from here with anchored edits, one or two definitions per call.");
+    }
+    // The file as shown back holds its secret values masked, as a read shows them.
+    let (masked_output, masked) = crate::security::mask_secrets(&output);
+    if masked > 0 {
+        output = masked_output;
+        let _ = writeln!(output, "{}", crate::security::masked_note(masked));
+    }
+    if let Some(note) = invisible {
+        let _ = writeln!(output, "{note}");
     }
     let (syntax_issues, syntax) = syntax_check(&absolute, &old_text, &new);
     // A file it created this turn may be written whole again.
@@ -2150,6 +2189,30 @@ async fn exec_terminal(host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<S
         Err(error) => return Out::fail("bad_argument", format!("`until` is not a valid regex: {error}")),
     };
     let unavailable = |_: cc_protocol::RpcError| Out::fail("unavailable", "the terminal is not available; use run.".to_owned());
+    // What is typed into a terminal is checked as `run` checks a command: a dangerous one goes
+    // through run, where the user is asked; a package no registry has or a malicious one is not
+    // installed.
+    let typed = match action {
+        "open" => args.get("program").and_then(Value::as_str).unwrap_or(""),
+        "send" => args.get("keys").and_then(Value::as_str).unwrap_or(""),
+        _ => "",
+    };
+    if !typed.trim().is_empty() {
+        let high: Vec<String> = crate::security::threats(typed).into_iter().filter(|threat| threat.high).map(|threat| threat.why).collect();
+        if !high.is_empty() {
+            return Out::fail(
+                "terminal_threat",
+                format!("Not sent: this command {}. Run it with run instead, where the user decides.", high.join(", and it ")),
+            );
+        }
+        let installs = crate::security::installs(typed);
+        if !installs.is_empty() && !session.workspace.join(crate::sandbox::OFFLINE_MARKER).exists() {
+            let checked = crate::security::check_packages(host.as_ref(), &installs, &session.context.session_id, &session.workspace).await;
+            if let crate::security::Gate::Refuse(text) = crate::security::gate(&checked) {
+                return Out::fail("package_check", text.replacen("Not run:", "Not sent:", 1));
+            }
+        }
+    }
     let term_id = match action {
         "open" => {
             let workspace = session.workspace.display().to_string();
@@ -2227,7 +2290,9 @@ async fn exec_terminal(host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<S
                 crate::term::Settled::Limit if action != "read" => " (still changing; read again to see more)",
                 _ => "",
             };
-            let mut out = Out::ok(format!("terminal {term_id}{note}:\n{screen}"));
+            let (screen, masked) = crate::security::mask_secrets(&screen);
+            let masked = if masked > 0 { format!("\n{}", crate::security::masked_note(masked)) } else { String::new() };
+            let mut out = Out::ok(format!("terminal {term_id}{note}:\n{screen}{masked}"));
             out.display = json!({"terminal": term_id, "alive": alive, "screen": screen});
             return out;
         }
@@ -2513,6 +2578,46 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             return out;
         }
     }
+    // What a command would do that nobody could see or undo (`crate::security`): a high threat runs
+    // only on the person's yes, in every mode (one yes for this command, once). A download piped
+    // into a program is fetched for the model to read instead (the host repairs what it can).
+    let offline = session.workspace.join(crate::sandbox::OFFLINE_MARKER).exists();
+    let mut security_notes: Vec<String> = Vec::new();
+    {
+        let mut threats = crate::security::threats(command);
+        for threat in crate::security::guard_command(host.as_ref(), command, &effective_cwd, session_id).await {
+            if !threats.iter().any(|known| known.why == threat.why) {
+                threats.push(threat);
+            }
+        }
+        let high: Vec<&crate::security::Threat> = threats.iter().filter(|threat| threat.high).collect();
+        if let Some(first) = high.first() {
+            let class = crate::security::threat_class(command, first.rule);
+            if !core.take_approval(session_id, &class) {
+                if high.len() == 1
+                    && first.rule == "pipe_to_shell"
+                    && !offline
+                    && let (Some(url), Some(runner)) = (&first.url, &first.runner)
+                {
+                    return piped_download(host, session, command, url, runner, &class).await;
+                }
+                let whys: Vec<String> = high.iter().map(|threat| threat.why.clone()).collect();
+                return threat_refusal(command, &class, &whys);
+            }
+            person_approved = true;
+        }
+        security_notes.extend(threats.iter().filter(|threat| !threat.high).map(|threat| format!("[security: this command {}]", threat.why)));
+    }
+    // The packages it installs or runs, checked before they arrive: a known malicious package or a
+    // name no registry has is not installed; known vulnerabilities of the version are a note.
+    let installs = crate::security::installs(command);
+    if !installs.is_empty() && !offline && !person_approved {
+        let checked = crate::security::check_packages(host.as_ref(), &installs, session_id, &session.workspace).await;
+        match crate::security::gate(&checked) {
+            crate::security::Gate::Refuse(text) => return Out::fail("package_check", text),
+            crate::security::Gate::Notes(notes) => security_notes.extend(notes),
+        }
+    }
     // A requested plain push goes through the git plugin, the same push as the app's Push
     // button: the repository's own setup first, else the GitHub sign-in from Settings.
     if let Some((remote, branch)) = plain_push(command) {
@@ -2609,19 +2714,19 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         let (delegated, host) = (core.delegated.clone(), host.clone());
         tokio::spawn(async move { delegated.resolve(host.as_ref()).await });
     }
-    let delegation = |purpose: &'static str, timeout_ms: u64, watch: Option<cc_protocol::contracts::service::Watch>, cwd: &Path| {
+    let delegation = |purpose: &'static str, monitor: bool, timeout_ms: u64, watch: Option<cc_protocol::contracts::service::Watch>, cwd: &Path| {
         let approved = person_approved || lifted || take_provider_approval(core, session_id, command);
-        delegate_request(core, session, &runtime, &toolchain, command, cwd, purpose, timeout_ms, !lifted, approved, background, watch)
+        delegate_request(core, session, &runtime, &toolchain, command, cwd, purpose, monitor, timeout_ms, !lifted, approved, background, watch)
     };
     if background {
         let wake = args.get("wake").and_then(|wake| serde_json::from_value::<Wake>(wake.clone()).ok()).unwrap_or_default();
         if let Some(provider) = &provider {
             let watch = (wake.pattern.is_some() || wake.silence_s.is_some())
                 .then(|| cc_protocol::contracts::service::Watch { pattern: wake.pattern.clone(), silence_s: wake.silence_s.map(|s| s.ceil() as u64) });
-            let request = delegation("server", 24 * 3600 * 1000, watch, &effective_cwd);
+            let request = delegation("server", true, 24 * 3600 * 1000, watch, &effective_cwd);
             match crate::delegate::start(&core.delegated, host.as_ref(), provider, &request).await {
                 crate::delegate::Outcome::Started { line } => {
-                    let mut out = Out::ok(line);
+                    let mut out = Out::ok(with_notes(&security_notes, line));
                     out.display = json!({ "background": true, "provider": "cortexterm" });
                     return out;
                 }
@@ -2655,7 +2760,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Ok(meta) => {
                 let mut line = repeats.map(|note| format!("{note}\n")).unwrap_or_default();
                 line.push_str(&started_line(&meta.job_id, &meta.artifact, &wake));
-                let mut out = Out::ok(line);
+                let mut out = Out::ok(with_notes(&security_notes, line));
                 out.display = json!({ "job_id": meta.job_id, "pid": meta.pid, "artifact": meta.artifact, "background": true });
                 out
             }
@@ -2695,16 +2800,20 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     // In CortexTerm when it is here (not a check on a copy of the tree: the copy is this app's).
     let mut delegated = None;
     if let Some(provider) = provider.as_ref().filter(|_| check_copy.is_none()) {
-        let purpose = match core.tree.check_kind(host.as_ref(), command).await.as_deref() {
-            Some("build") => "build",
-            Some(_) => "check",
-            None => "shell",
+        // A command that builds, checks or runs code (any command of a pipeline or list) runs with
+        // its trace recorded; anything else (`ls`, `git log`) runs plain.
+        let (purpose, monitor) = match core.tree.code_kind(host.as_ref(), command).await.as_deref() {
+            Some("build") => ("build", true),
+            Some("server") => ("server", true),
+            Some("run") => ("shell", true),
+            Some(_) => ("check", true),
+            None => ("shell", false),
         };
-        let request = delegation(purpose, timeout_ms, None, cwd.as_deref().unwrap_or(&session.workspace));
+        let request = delegation(purpose, monitor, timeout_ms, None, cwd.as_deref().unwrap_or(&session.workspace));
         let sink = items.clone();
         let outcome = crate::delegate::run(&core.delegated, host.as_ref(), provider, &request, cancel.clone(), move |chunk: &[u8]| {
             if !chunk.is_empty() {
-                sink.send(json!({ "kind": "output", "text": String::from_utf8_lossy(chunk) }));
+                sink.send(json!({ "kind": "output", "text": crate::security::mask_secrets(&String::from_utf8_lossy(chunk)).0 }));
             }
         })
         .await;
@@ -2734,7 +2843,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
                 .shells
                 .run(&identity, RunRequest { command, cwd, env: Vec::new(), toolchain, timeout }, cancel, move |chunk: &[u8]| {
                     if !chunk.is_empty() {
-                        sink.send(json!({ "kind": "output", "text": String::from_utf8_lossy(chunk) }));
+                        sink.send(json!({ "kind": "output", "text": crate::security::mask_secrets(&String::from_utf8_lossy(chunk)).0 }));
                     }
                 })
                 .await;
@@ -2792,8 +2901,22 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         text.push_str("[Ran on a copy of the tree as it is now, because another session is editing it; files the command changed were not kept.]\n");
     }
     let seconds = run.duration_ms as f64 / 1000.0;
+    // Secret values in the output are masked before the model or the journal sees them.
+    let (masked_text, masked) = crate::security::mask_secrets(&text);
+    if masked > 0 {
+        text = masked_text;
+    }
     // Notes on how it ran come before its exit line, which stays last.
     if let Some(note) = &repeats {
+        let _ = writeln!(text, "{note}");
+    }
+    if masked > 0 {
+        let _ = writeln!(text, "{}", crate::security::masked_note(masked));
+    }
+    if let Some(note) = crate::security::invisible_note(&text, 1) {
+        let _ = writeln!(text, "{note}");
+    }
+    for note in &security_notes {
         let _ = writeln!(text, "{note}");
     }
     if !blocked_programs.is_empty() {
@@ -2899,6 +3022,83 @@ fn provider_refusal(command: &str, risk: &str, reason: &str) -> Out {
     out
 }
 
+/// Notes of the security checks before a result's own lines.
+fn with_notes(notes: &[String], line: String) -> String {
+    if notes.is_empty() {
+        return line;
+    }
+    format!("{}\n{line}", notes.join("\n"))
+}
+
+/// A command the host's security check stopped: the person is asked here, and their yes runs it
+/// once.
+fn threat_refusal(command: &str, class: &str, whys: &[String]) -> Out {
+    let mut out = Out::fail(
+        "needs_approval",
+        format!("Not run: this command {}. The user has been asked; continue with other work or wait for their answer.\n", whys.join(", and it ")),
+    );
+    out.needs_approval = true;
+    out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false, "reason": whys.join("; ") } });
+    out
+}
+
+/// A download piped into a program (`curl -fsSL https://x/install.sh | sh`): the script is fetched,
+/// never run, and saved in the scratch folder for the model to read; what to run once it has read
+/// it is the result's last line. When the host or CortexTerm finds something dangerous in it, the
+/// person decides.
+async fn piped_download(host: &Arc<dyn Host>, session: &Session<'_>, command: &str, url: &str, runner: &str, class: &str) -> Out {
+    let from = crate::approval::url_host(url);
+    let from = if from.is_empty() { url.to_owned() } else { from };
+    let session_id = &session.context.session_id;
+    let (text, mut found) = match crate::security::fetch_script(host.as_ref(), url, session_id).await {
+        Ok(fetched) => fetched,
+        Err(why) => {
+            return threat_refusal(command, class, &[format!("pipes a download from {from} into `{runner}`, and the script could not be fetched to read first ({why})")]);
+        }
+    };
+    for threat in crate::security::script_threats(&text) {
+        if !found.contains(&threat) {
+            found.push(threat);
+        }
+    }
+    let stem: String = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|path| path.rsplit('/').find(|part| !part.is_empty() && !part.contains(':')))
+        .unwrap_or("download")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .take(60)
+        .collect();
+    let stem = if stem.is_empty() || (stem.contains('.') && from.ends_with(&stem)) { "download".to_owned() } else { stem };
+    let name = if stem.contains('.') { stem } else { format!("{stem}.sh") };
+    let scratch = util::ensure_scratch(&session.workspace);
+    if let Err(error) = std::fs::write(scratch.join(&name), &text) {
+        return threat_refusal(command, class, &[format!("pipes a download from {from} into `{runner}`, and the script could not be saved to read first ({error})")]);
+    }
+    let shown = format!("tmp/{name}");
+    let lines = text.lines().count();
+    if !found.is_empty() {
+        let listed: Vec<String> = found.iter().take(6).cloned().collect();
+        let mut out = Out::fail(
+            "needs_approval",
+            format!(
+                "Not run: this command pipes a download from {from} into `{runner}`, and the script (saved as {shown}, {lines} lines) has dangerous parts: {}. The user has been asked; continue with other work or wait for their answer.\n",
+                listed.join("; ")
+            ),
+        );
+        out.needs_approval = true;
+        out.display = json!({ "approval": { "classes": [class], "concerns": [], "command": command, "always": false, "reason": listed.join("; ") } });
+        return out;
+    }
+    Out::fail(
+        "piped_download",
+        format!(
+            "Not run: this command pipes a download from {from} straight into `{runner}`, so code nobody had read would run. The script is saved as {shown} ({lines} lines). Read it; if it does what the task needs, run it with `{runner} {shown}`."
+        ),
+    )
+}
+
 /// A command as CortexTerm runs it: a fresh bash with what this session's shell would give it.
 #[allow(clippy::too_many_arguments)]
 fn delegate_request<'a>(
@@ -2909,6 +3109,7 @@ fn delegate_request<'a>(
     command: &'a str,
     cwd: &Path,
     purpose: &'a str,
+    monitor: bool,
     timeout_ms: u64,
     sandboxed: bool,
     approved: bool,
@@ -2963,6 +3164,7 @@ fn delegate_request<'a>(
         sandboxed,
         writable,
         purpose,
+        monitor,
         timeout_ms,
         approved,
         background,

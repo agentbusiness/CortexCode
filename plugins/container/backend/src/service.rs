@@ -24,6 +24,7 @@ use crate::devcli::{self, Cli, Located};
 use crate::docker::{self, Docker, ExecSettings, Inspected, labels};
 use crate::exec::{self, Run, Stop};
 use crate::paths::{PathMap, normalize};
+use crate::seeds::{self, Caller, Seed};
 use cc_protocol::contracts::container::{
     AttachParams, BuildParams, ContainerInfo, ContainerLogs, DetachParams, ExecItem, ExecParams,
     ExecResult, ImageResult, ImagesParams, ImagesResult, ListResult, LogItem, LogsParams,
@@ -338,6 +339,8 @@ pub struct Containers {
     settings: Mutex<HashMap<String, ExecSettings>>,
     busy: Mutex<HashSet<String>>,
     publish: Publish,
+    /// Calls to the memory plugin (the seeds of roots live in the app's graph).
+    call: Caller,
     /// Cancelled at shutdown: stops every running exec.
     stopping: CancellationToken,
     tasks: TaskTracker,
@@ -369,6 +372,7 @@ impl Containers {
         home: Option<PathBuf>,
         host_env: HostEnv,
         publish: Publish,
+        call: Caller,
     ) -> Self {
         Self {
             config: Mutex::new(config),
@@ -382,6 +386,7 @@ impl Containers {
             settings: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
             publish,
+            call,
             stopping: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
@@ -403,6 +408,16 @@ impl Containers {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Where earlier versions kept a marker per seeded root (moved into the graph at start).
+    fn seeds_dir(&self) -> PathBuf {
+        self.data_dir.join("seeds")
+    }
+
+    /// Move the seed markers of earlier versions into the graph, once.
+    pub async fn migrate_seeds(&self) {
+        seeds::migrate(&self.call, &self.seeds_dir()).await;
     }
 
     /// The docker CLI, or why there is none.
@@ -1476,25 +1491,37 @@ impl Containers {
         root: &str,
         image_id: &str,
     ) -> Result<(), RpcError> {
-        let marker_dir = self.data_dir.join("seeds");
-        let marker = marker_dir.join(format!("{}.json", config::root_hash(root)));
         let empty = std::fs::read_dir(root)
             .map_err(|e| RpcError::internal(format!("{root}: {e}")))?
             .next()
             .is_none();
         if !empty {
-            let seeded: Option<Value> = std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok());
-            if seeded
-                .as_ref()
-                .is_some_and(|s| {
-                    s["root"] == root && s["image_id"] == image_id
-                        && (s.get("device").is_none() || std::fs::metadata(root).is_ok_and(|meta| {
-                            s["device"].as_u64() == Some(meta.dev()) && s["inode"].as_u64() == Some(meta.ino())
+            // Whether this root was seeded is kept in the graph: while the memory plugin does not
+            // serve, the root's files are left alone and the call says to try again.
+            let not_serving = |error: RpcError| {
+                if seeds::away(&error) {
+                    RpcError::new(
+                        codes::UNAVAILABLE,
+                        format!("memory is not serving yet, try again: whether {root} was seeded is kept there ({})", error.message),
+                    )
+                } else {
+                    error
+                }
+            };
+            let mut seeded = seeds::read(&self.call, root).await.map_err(not_serving)?;
+            if seeded.is_none() {
+                // A marker file from an earlier version that the start-up move has not taken yet.
+                let marker = self.seeds_dir().join(format!("{}.json", config::root_hash(root)));
+                seeded = seeds::migrate_one(&self.call, &marker).await.map_err(not_serving)?;
+            }
+            if seeded.as_ref().is_some_and(|s| {
+                s.root == root
+                    && s.image_id == image_id
+                    && (s.device.is_none()
+                        || std::fs::metadata(root).is_ok_and(|meta| {
+                            s.device == Some(meta.dev()) && s.inode == Some(meta.ino())
                         }))
-                })
-            {
+            }) {
                 return Ok(());
             }
             return Err(invalid(format!(
@@ -1537,18 +1564,19 @@ impl Containers {
         copied?;
         let permissions = std::fs::metadata(root).map_err(|e| RpcError::internal(e.to_string()))?.permissions();
         std::fs::set_permissions(stage.path(), permissions).map_err(|e| RpcError::internal(e.to_string()))?;
-        std::fs::create_dir_all(&marker_dir).map_err(|e| RpcError::internal(e.to_string()))?;
         let meta = std::fs::metadata(stage.path()).map_err(|e| RpcError::internal(e.to_string()))?;
-        let marker_tmp = marker_dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        std::fs::write(
-            &marker_tmp,
-            serde_json::json!({"root": root, "image_id": image_id, "image": spec.image, "device": meta.dev(), "inode": meta.ino()})
-                .to_string(),
-        )
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-        std::fs::rename(&marker_tmp, &marker).map_err(|e| RpcError::internal(e.to_string()))?;
+        let seed = Seed {
+            root: root.to_owned(),
+            image: spec.image.clone(),
+            image_id: image_id.to_owned(),
+            device: Some(meta.dev()),
+            inode: Some(meta.ino()),
+        };
+        seeds::write(&self.call, &seed)
+            .await
+            .map_err(|e| RpcError::new(&e.code, format!("recording the seed of {root}: {}", e.message)))?;
         // Rename replaces an empty directory atomically and fails if user files appeared there.
-        // The prepared marker recognizes the published inode even after a crash before return.
+        // The seed recorded first recognizes the published inode even after a crash before return.
         std::fs::rename(stage.path(), root).map_err(|e| RpcError::internal(format!("publishing seed into {root}: {e}")))?;
         Ok(())
     }

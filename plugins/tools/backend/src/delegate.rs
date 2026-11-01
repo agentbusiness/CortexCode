@@ -288,6 +288,8 @@ pub struct Request<'a> {
     pub writable: Vec<String>,
     /// check | build | server | shell
     pub purpose: &'a str,
+    /// Record its trace (a command that builds, checks or runs code).
+    pub monitor: bool,
     pub timeout_ms: u64,
     /// The person approved this command in this app's window (after a refusal).
     pub approved: bool,
@@ -306,7 +308,7 @@ impl Request<'_> {
             "path": self.path,
             "shell": "bash",
             "timeout_ms": self.timeout_ms,
-            "monitor": self.purpose != "shell",
+            "monitor": self.monitor,
             "sandboxed": self.sandboxed,
             "writable": self.writable,
             "purpose": self.purpose,
@@ -327,7 +329,7 @@ impl Request<'_> {
             cwd: self.cwd.to_string_lossy().into_owned(),
             purpose: self.purpose.to_owned(),
             background: self.background,
-            monitored: self.purpose != "shell",
+            monitored: self.monitor,
             state: "running".into(),
             started_ms: util::now_ms(),
             wake_pattern: self.watch.as_ref().and_then(|w| w.pattern.clone()),

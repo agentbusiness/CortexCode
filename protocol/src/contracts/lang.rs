@@ -68,6 +68,26 @@ pub struct Description {
     /// project's own, so it does not build from nothing.
     #[serde(default)]
     pub caches: Vec<String>,
+    /// Commands that build or run the project's code besides the verifiers (`cargo run`, `python`,
+    /// `npm run dev`): a command that starts with one, like one that starts with a verifier's
+    /// command, runs with its trace recorded (processes, memory, files opened) where the terminal
+    /// that runs it can record one.
+    #[serde(default)]
+    pub runs: Vec<Runner>,
+}
+
+/// A command that builds or runs code in this language, as its first words (`["cargo", "run"]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Runner {
+    /// `build`, `test`, `run` (a program that ends) or `server` (a program that stays up).
+    pub kind: String,
+    pub command: Vec<String>,
+}
+
+impl Runner {
+    pub fn new(kind: &str, command: &[&str]) -> Runner {
+        Runner { kind: kind.to_owned(), command: command.iter().map(|word| (*word).to_owned()).collect() }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

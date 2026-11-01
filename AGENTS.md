@@ -82,12 +82,20 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   copy or a cache.
 - The one exception is the chat flow history: session journals (`<home>/journal/<id>.jsonl`).
 - Bytes are not records and never go into the graph: model weights, packages and their install
-  folders, content blobs, artifacts, attachments, git objects, workspace clones, logs. They stay
-  files; the graph holds their metadata and links (an `Artifact` node names its file).
+  folders, content blobs, artifacts, attachments, git objects, workspace clones, logs (prompt
+  dumps under `CORTEX_DUMP_PROMPTS` included), a shell's sourced state (`cwd`, `env`, functions,
+  aliases: script text, and `env` may hold secrets), the agent browser's Chromium profile. They
+  stay files; the graph holds their metadata and links (an `Artifact` node names its file).
 - Runtime files are not records either: the home lock, `run/` (pid, socket, children of a dead
-  frame), OS file locks, and the frame's boot pointers (which installed version of each plugin and
-  of the frame runs, `<home>/plugins/<id>/.current` and its siblings, `frame/handover.json`): the
-  frame reads them before it can start the memory plugin, so they are part of the installation.
+  frame), OS file locks, the mesh's same-machine rendezvous (`~/.cortex-mesh/local/`, removed on
+  exit), the notification helper's click spool (drained into queue `notify.activations`), and the
+  frame's boot pointers (which installed version of each plugin and of the frame runs and which
+  serves a category, `<home>/plugins/<id>/.current` and its siblings `.previous`, `.known_good`,
+  `.disabled`, `.chosen`, `.bundled`, `frame/handover.json`, the journal's `.streams-migrated`,
+  an install batch's baseline until its result is in stream `updates`): the frame reads them
+  before it can start the memory plugin, so they are part of the installation.
+- Deleting a project is the one removal: its `Project` node is retired, and the repository's own
+  IronGraph project (code graph, tasks, knowledge, notes, routines, findings) is dropped.
 - Secrets live in the macOS Keychain (on Linux, the Secret Service), never in a file or the graph.
 - Shipped data (prompts, texts, stages, schemas, skills in the live folder) is the app's source,
   not records.
