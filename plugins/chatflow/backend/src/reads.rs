@@ -13,7 +13,7 @@ use cc_protocol::contracts::memory::{
     BoardListResult, CallSite, EdgesResult, ImpactResult, KnowledgeLinkedResult, OutlineResult, RepoMapResult, SearchResult, SymbolMatches, SymbolRef, TaskListResult,
     methods as memory_methods,
 };
-use cc_protocol::contracts::agents::{ListResult as AgentsListResult, methods as agents_methods};
+use cc_protocol::contracts::agents::{ListResult as AgentsListResult, SchedulerState, methods as agents_methods};
 use cc_protocol::contracts::lang::{self, LanguageInfo};
 use cc_protocol::contracts::tools::{ReadResult, methods as tools_methods};
 use futures::StreamExt;
@@ -496,10 +496,12 @@ fn site_line(site: &CallSite) -> String {
 pub fn render(tool: &str, value: &Value) -> String {
     let rendered = match tool {
         memory_methods::TASK_LIST => serde_json::from_value::<TaskListResult>(value.clone()).ok().map(|result| {
-            if result.tasks.is_empty() {
+            // Cancelled tasks are history nobody acts on (task://<id> still reads one).
+            let tasks: Vec<_> = result.tasks.iter().filter(|task| task.status != "cancelled").collect();
+            if tasks.is_empty() {
                 return "No tasks.".to_owned();
             }
-            result.tasks.iter().map(|task| format!("[{}] {}", task.status, task.title)).collect::<Vec<_>>().join("\n")
+            tasks.iter().map(|task| format!("[{}] {} (task://{})", task.status, task.title, task.id)).collect::<Vec<_>>().join("\n")
         }),
         memory_methods::BOARD_LIST => serde_json::from_value::<BoardListResult>(value.clone()).ok().map(|result| {
             let mut latest = BTreeMap::new();
@@ -512,7 +514,22 @@ pub fn render(tool: &str, value: &Value) -> String {
             if latest.is_empty() {
                 return "No board messages.".to_owned();
             }
-            latest.values().map(|message| format!("{} ({}): {}", message.author, message.kind, message.text)).collect::<Vec<_>>().join("\n\n")
+            // One line per author: whole handoffs of every agent were the last text before an
+            // answer and were reported instead of the question (seen: 45k characters of them).
+            let lines = latest.values().map(|message| {
+                let text = message.text.trim();
+                let first = text.lines().next().unwrap_or("").trim();
+                let more = if text.lines().count() > 1 { " …" } else { "" };
+                format!("{} ({}): {first}{more}", message.author, message.kind)
+            });
+            let mut out = lines.collect::<Vec<_>>().join("\n");
+            out.push_str("\nThe whole of one agent's work: read agent://<name>, or its task://<id>.");
+            out
+        }),
+        agents_methods::SCHEDULER => serde_json::from_value::<SchedulerState>(value.clone()).ok().map(|state| {
+            // What runs and what waits; the scheduler's own tuning history answers nobody's question.
+            let names = |list: &[String]| if list.is_empty() { "none".to_owned() } else { list.join(", ") };
+            format!("Running: {}\nQueued: {}\nAt most {} at once.", names(&state.running), names(&state.queued), state.max_parallel)
         }),
         agents_methods::LIST => serde_json::from_value::<AgentsListResult>(value.clone()).ok().map(|result| {
             if result.agents.is_empty() {

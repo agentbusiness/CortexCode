@@ -60,6 +60,10 @@ pub const AGENTS_PLACEHOLDER: &str = "@agents";
 /// Placeholder of a pick of a session's open background work (a plan's `replaces`): a plan can
 /// only replace work that exists; none open removes the property.
 pub const OPEN_WORK_PLACEHOLDER: &str = "@open_work";
+/// Placeholder of an enum of the titles of a plan's tasks still to do, when the plan is written
+/// again (a task's `from`, the plan's `dropped`): each one is carried on or dropped with a reason;
+/// a fresh plan has none, which removes both properties.
+pub const PENDING_PLACEHOLDER: &str = "@pending";
 
 impl Shape {
     /// The top-level properties written as free text (a plain string, gated or not), in order:
@@ -400,13 +404,45 @@ fn rule_for(shape: &Shape, rules: &mut Vec<String>) -> String {
     }
 }
 
+/// One thing the user's latest message asks for: `quote`, the message's own words for it, and
+/// `means`, what they refer to ("get it" -> "download the model the test needs"). The words come
+/// first so the ask is written from the message, not from a summary of the conversation (seen:
+/// "get it" written as the previous turn's question). A plain string (older journals, the router
+/// fallback) is a quote alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(from = "AskWire")]
+pub struct Ask {
+    pub quote: String,
+    pub means: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AskWire {
+    Text(String),
+    Pair {
+        quote: String,
+        #[serde(default)]
+        means: String,
+    },
+}
+
+impl From<AskWire> for Ask {
+    fn from(wire: AskWire) -> Self {
+        match wire {
+            AskWire::Text(quote) => Ask { quote, means: String::new() },
+            AskWire::Pair { quote, means } => Ask { quote, means },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouterDecision {
     pub work: String,
-    /// Each thing the message asks for, in its words (empty for small talk): what the flow
-    /// checks the turn's work against before the reply goes back.
+    /// Each thing the message asks for (empty for small talk): its own words and what they mean.
+    /// The host keeps only those whose words are in the message (`flow::anchor_asks`).
     #[serde(default)]
-    pub asks: Vec<String>,
+    pub asks: Vec<Ask>,
     pub route: String,
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -511,6 +547,9 @@ pub struct PlanOutput {
     pub risks: Vec<String>,
     #[serde(default)]
     pub tasks: Vec<PlanTaskOutput>,
+    /// Tasks still to do from the version before that this one leaves out, each with why.
+    #[serde(default)]
+    pub dropped: Vec<DroppedTask>,
     /// Open background work this plan takes the place of (labels of the `@open_work` pick).
     #[serde(default)]
     pub replaces: Vec<String>,
@@ -522,6 +561,9 @@ pub struct PlanOutput {
 pub struct PlanTaskOutput {
     #[serde(default)]
     pub title: String,
+    /// The tasks still to do from the version before that this task carries on (their titles).
+    #[serde(default)]
+    pub from: Vec<String>,
     #[serde(default)]
     pub brief: String,
     /// What the conversation already established that the task needs.
@@ -540,6 +582,15 @@ pub struct PlanTaskOutput {
     /// Skills the task's implementation reads (`skill://<plugin>/<name>`, from the catalog).
     #[serde(default)]
     pub skills: Vec<String>,
+}
+
+/// A task of the version before that a rewritten plan leaves out, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DroppedTask {
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub why: String,
 }
 
 /// KNOWLEDGE: what the latest message stated about the project's world.

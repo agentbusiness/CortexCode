@@ -89,6 +89,12 @@ pub struct PlanDiff {
     pub tasks_removed: Vec<String>,
     #[serde(default)]
     pub tasks_changed: Vec<String>,
+    /// Tasks still to do that the rewrite left out, each "title: why".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks_dropped: Vec<String>,
+    /// Tasks still to do that the rewrite left out with no reason: put back at the end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks_restored: Vec<String>,
 }
 
 impl PlanDiff {
@@ -164,7 +170,7 @@ impl Plan {
     }
 }
 
-fn parse(entry: &JournalEntry) -> Option<Plan> {
+pub fn parse(entry: &JournalEntry) -> Option<Plan> {
     (entry.kind == chatflow_kinds::PLAN).then(|| serde_json::from_value::<Plan>(entry.data.clone()).ok()).flatten()
 }
 
@@ -186,6 +192,35 @@ pub fn open(entries: &[JournalEntry]) -> Option<(u64, Plan)> {
 /// The plan entry at `seq`.
 pub fn at(entries: &[JournalEntry], seq: u64) -> Option<Plan> {
     entries.iter().find(|entry| entry.seq == seq).and_then(parse)
+}
+
+/// A plan written again carries each task still to do from the version before: a new task names
+/// it in `from` (or keeps its title), or `dropped` says why it is left out. Any other is put back
+/// at the end as it was: a silent rewrite lost work the user asked for (seen: "run the end-to-end
+/// test" gone after task 1, never run, and the work reported done). Returns the titles put back
+/// and the dropped ones as "title: why".
+pub fn carry_pending(pending: &[PlanTask], output: &PlanOutput, doc: &mut PlanDoc, tasks: &mut Vec<PlanTask>) -> (Vec<String>, Vec<String>) {
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let mut restored = Vec::new();
+    let mut dropped = Vec::new();
+    for task in pending {
+        let carried = output.tasks.iter().any(|new| new.from.iter().any(|from| same(from, &task.title))) || tasks.iter().any(|new| same(&new.title, &task.title));
+        if carried {
+            continue;
+        }
+        if let Some(drop) = output.dropped.iter().find(|drop| same(&drop.task, &task.title) && !drop.why.trim().is_empty()) {
+            dropped.push(format!("{}: {}", task.title, drop.why.trim()));
+            continue;
+        }
+        let mut back = task.clone();
+        back.n = tasks.len() as u32 + 1;
+        back.depends_on = Vec::new();
+        back.task_id = None;
+        doc.steps.push(back.title.clone());
+        restored.push(back.title.clone());
+        tasks.push(back);
+    }
+    (restored, dropped)
 }
 
 /// The next version of a plan after one of its tasks ended badly: the tasks done so far stay as

@@ -240,8 +240,11 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
             "MANAGE" if note_after(&run, last.seq, "managed") && last.data.get("detail").and_then(|detail| detail.get("check")).and_then(Value::as_bool) == Some(true) => Stage::Done,
             "MANAGE" if note_after(&run, last.seq, "managed") => Stage::Reply,
             "MANAGE" => Stage::Manage,
-            "STATUS" if reply_finished(&run, last.seq) => Stage::Done,
-            "STATUS" if host_reads_after(&run, last.seq) > 0 => Stage::Reply,
+            "STATUS" if reply_finished(&run, last.seq) || note_after(&run, last.seq, "explore_done") => Stage::Done,
+            // After the board, tasks and scheduler, the question loop: whether a piece of the work
+            // is there, or works, is checked in the files, not taken from the agents' reports
+            // (seen: "is the new harness ready?" answered from an old handoff, unchecked).
+            "STATUS" if host_reads_after(&run, last.seq) > 0 => Stage::Explore,
             "STATUS" => Stage::StatusReads,
             "IMPLEMENT" if note_after(&run, last.seq, "implement_done") => Stage::Done,
             "IMPLEMENT" => Stage::Implement { route_seq: last.seq },
@@ -450,7 +453,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             .map(|entry| str_field(&entry.data, "text").to_owned())
                             .unwrap_or_default();
                         let fallback = RouterDecision {
-                            asks: if text.trim().is_empty() { Vec::new() } else { vec![text.clone()] },
+                            asks: if text.trim().is_empty() { Vec::new() } else { vec![schemas::Ask { quote: text.clone(), means: String::new() }] },
                             work: text,
                             route: "LOOKUP".into(),
                             effort: "medium".into(),
@@ -476,10 +479,13 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 };
                 let teaches = decision.teaches == "yes";
                 let drops = decision.drops == "yes";
+                // The asks are the user's latest message, never the conversation before it.
+                let message = journal.entries().filter(|entry| entry.kind == kinds::USER_MESSAGE).last().map(|entry| str_field(&entry.data, "text").to_owned()).unwrap_or_default();
+                let unanchored = anchor_asks(&mut decision.asks, &message);
                 journal
                     .append(
                         kinds::ROUTE,
-                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "teaches": teaches, "drops": drops}),
+                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "teaches": teaches, "drops": drops, "asks_dropped": unanchored}),
                     )
                     .await
                     .map(|_| ())
@@ -602,7 +608,12 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 // An answer in a session with background work going says where that work stands
                 // from its records, not from memory of the conversation.
                 let open = crate::manage::open_work(env, &entries).await;
-                let reply_live = if open.is_empty() { String::new() } else { env.data.text("reply_open_work", &[("work", &crate::manage::work_lines(env, &open))]) };
+                let mut reply_live = if open.is_empty() { String::new() } else { env.data.text("reply_open_work", &[("work", &crate::manage::work_lines(env, &open))]) };
+                // The questions last: the text right before the answer is what it answers.
+                let asks = asks_live(&env.data, &entries, &env.run_id, "reply_asks");
+                if !asks.is_empty() {
+                    reply_live = [reply_live.as_str(), asks.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
+                }
                 let messages = crate::fit::fitted(env, journal, |entries| {
                     let mut messages = base_messages(env, entries);
                     messages.push(prompts::stage_message(&env.data, &env.prefix.role, "REPLY", &reply_live));
@@ -833,11 +844,12 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             }
                             journal.set(plan_seq, "status", json!(if outcome_name == "done" { plan_status::DONE } else { plan_status::IMPLEMENTING })).await?;
                         }
+                        let dropped = dropped_note(&env.data, &journal.entries_vec(), &env.run_id);
                         journal
                             .append(
                                 kinds::NOTE,
                                 json!({
-                                    "text": act_note(&outcome),
+                                    "text": format!("{}{dropped}", act_note(&outcome)),
                                     "purpose": "act_done",
                                     "run_id": env.run_id,
                                     "host_message": false,
@@ -1128,6 +1140,22 @@ fn act_note(outcome: &LoopOutcome) -> String {
     format!("Work {}: {calls}, changed {files}.{verified}", outcome.outcome)
 }
 
+/// The tasks this run's plan rewrites left out, with why: the report of the work says what was
+/// not done, so "done" never hides a dropped part of the request.
+fn dropped_note(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
+    let dropped: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.kind == chatflow_kinds::PLAN && str_field(&entry.data, "run_id") == run_id)
+        .filter_map(plan::parse)
+        .filter_map(|plan| plan.diff)
+        .flat_map(|diff| diff.tasks_dropped)
+        .collect();
+    if dropped.is_empty() {
+        return String::new();
+    }
+    data.text("plan_dropped", &[("tasks", &dropped.join("; "))])
+}
+
 fn delegated_note(data: &crate::data::Dataset, result: &DelegateResult) -> String {
     let mut text = data.text("delegated", &[("title", &result.root_task.title), ("count", &result.tasks.len().to_string())]);
     for task in &result.tasks {
@@ -1186,8 +1214,20 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // The session's background work still open: the plan may take its place (`replaces`).
     let open_work = crate::manage::open_work(env, &entries).await;
     let open_labels: Vec<String> = open_work.iter().map(crate::manage::OpenWork::label).collect();
+    // A plan written again names, for each task still to do from before, the new task that carries
+    // it on or why it is dropped (seen: "run the end-to-end test" left out of a rewrite after task
+    // 1, never run, the work reported done).
+    let pending: Vec<plan::PlanTask> = match (&mode, &previous) {
+        (PlanMode::Replan { .. }, Some(previous)) => {
+            let done = previous.steps_done.iter().filter(|step| step.outcome == "done").count();
+            previous.tasks.iter().skip(done).cloned().collect()
+        }
+        _ => Vec::new(),
+    };
+    let pending_titles: Vec<String> = pending.iter().map(|task| task.title.clone()).collect();
     let shape = stage_shape(env, stage)?
         .filled(schemas::OPEN_WORK_PLACEHOLDER, &open_labels, None)
+        .filled(schemas::PENDING_PLACEHOLDER, &pending_titles, None)
         .filled(schemas::TASKS_PLACEHOLDER, &plan::task_numbers(max), None)
         .filled(schemas::VERIFIERS_PLACEHOLDER, &crate::verifiers::commands(&candidates), None)
         .with_catalog(&catalog, skills_max);
@@ -1238,8 +1278,9 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
     let live = joined(&[done_live, open_live, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
-    let (doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
+    let (mut doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
+    let (restored, dropped) = plan::carry_pending(&pending, &output, &mut doc, &mut tasks);
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
     }
@@ -1288,7 +1329,10 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         },
     };
     if let Some(previous) = &previous {
-        made.diff = Some(plan::diff(previous, &made));
+        let mut diff = plan::diff(previous, &made);
+        diff.tasks_dropped = dropped;
+        diff.tasks_restored = restored;
+        made.diff = Some(diff);
     }
     made.replaces = open_work.iter().filter(|item| output.replaces.contains(&item.label())).map(|item| item.task.id.clone()).collect();
     let seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
@@ -2101,6 +2145,49 @@ async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, Rp
         }
     }
     Ok(None)
+}
+
+/// What ROUTE read the user's latest message to ask (its `asks`), numbered, in the stage text
+/// `text`: the closing lines of a stage that answers the message. The message itself can be far
+/// above by then (seen: 30k tokens of agent reports between it and REPLY; the answer reported
+/// those and left the question unanswered).
+pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str, text: &str) -> String {
+    let Some(route) = entries.iter().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "stage") == "route") else {
+        return String::new();
+    };
+    let asks: Vec<schemas::Ask> = route.data.get("detail").and_then(|detail| detail.get("asks")).cloned().and_then(|asks| serde_json::from_value(asks).ok()).unwrap_or_default();
+    let lines: Vec<String> = asks
+        .iter()
+        .filter(|ask| !ask.quote.trim().is_empty())
+        .map(|ask| {
+            let (quote, means) = (ask.quote.trim(), ask.means.trim());
+            if means.is_empty() || means.eq_ignore_ascii_case(quote) { data.text("ask_line", &[("quote", quote)]) } else { data.text("ask_line_means", &[("quote", quote), ("means", means)]) }
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let list = lines.iter().enumerate().map(|(index, line)| format!("{}. {line}", index + 1)).collect::<Vec<_>>().join("\n");
+    data.text(text, &[("asks", &list)])
+}
+
+/// Keeps the asks whose `quote` is in the user's latest message (compared without case,
+/// punctuation or spacing): an ask whose words are not there was written from the conversation
+/// (seen: "get it" became "confirm the harness is ready", the previous turn's question). When the
+/// router wrote asks and none is in the message, the message itself is the one ask. Returns the
+/// quotes it dropped.
+fn anchor_asks(asks: &mut Vec<schemas::Ask>, message: &str) -> Vec<String> {
+    let plain = |text: &str| text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ");
+    let said = format!(" {} ", plain(message));
+    let (kept, dropped): (Vec<schemas::Ask>, Vec<schemas::Ask>) = std::mem::take(asks).into_iter().partition(|ask| {
+        let quote = plain(&ask.quote);
+        !quote.is_empty() && said.contains(&format!(" {quote} "))
+    });
+    *asks = kept;
+    if asks.is_empty() && !dropped.is_empty() && !message.trim().is_empty() {
+        asks.push(schemas::Ask { quote: message.trim().to_owned(), means: String::new() });
+    }
+    dropped.into_iter().map(|ask| ask.quote).collect()
 }
 
 /// True when this run was continued because a tool reports open work (its latest host note).

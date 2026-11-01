@@ -36,6 +36,8 @@ export interface PlanDiff {
   tasks_added: string[];
   tasks_removed: string[];
   tasks_changed: string[];
+  tasks_dropped: string[];
+  tasks_restored: string[];
 }
 
 export interface StepDoneView {
@@ -124,6 +126,8 @@ export function planOf(entry: JournalEntry): PlanView {
         tasks_added: strings(diff.tasks_added),
         tasks_removed: strings(diff.tasks_removed),
         tasks_changed: strings(diff.tasks_changed),
+        tasks_dropped: strings(diff.tasks_dropped),
+        tasks_restored: strings(diff.tasks_restored),
       }
       : null,
     note: str(data.note),
@@ -153,6 +157,8 @@ export function diffLines(diff: PlanDiff | null): string[] {
   for (const task of diff.tasks_added) lines.push(`task added: ${task}`);
   for (const task of diff.tasks_removed) lines.push(`task removed: ${task}`);
   for (const task of diff.tasks_changed) lines.push(`task changed: ${task}`);
+  for (const task of diff.tasks_dropped) lines.push(`task dropped: ${task}`);
+  for (const task of diff.tasks_restored) lines.push(`task kept (left out with no reason): ${task}`);
   return lines;
 }
 

@@ -924,7 +924,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // stage's last line says the next step is the one the tool printed, so the ASK rules'
         // "reply when you know the answer" does not win over it (seen: the model answered with a
         // progress report at "Current stage: ASK" while the tool had 168 lines open).
-        LoopKind::Question => ("ASK", if crate::flow::work_open_round(&entries, &env.run_id) { env.data.text("work_open_stage", &[]) } else { String::new() }),
+        // Otherwise the questions ROUTE read in the message close the stage, so they, not the
+        // conversation's earlier reports, are the last text before each step (seen: "is it done,
+        // yes or no?" answered "yes" from earlier test lists, with no look at the files).
+        LoopKind::Question => (
+            "ASK",
+            if crate::flow::work_open_round(&entries, &env.run_id) {
+                env.data.text("work_open_stage", &[])
+            } else {
+                crate::flow::asks_live(&env.data, &entries, &env.run_id, "ask_asks")
+            },
+        ),
         LoopKind::Agent { name } => ("TASK", format!("{}{}", agent_team.as_ref().map(|team| team.live(&env.data)).unwrap_or_default(), env.data.text("agent_live", &[("name", name)]))),
     };
     env.set_stage("act");
