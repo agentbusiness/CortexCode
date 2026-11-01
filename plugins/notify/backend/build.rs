@@ -23,6 +23,11 @@ fn main() {
     println!("cargo:rerun-if-changed=helper/CortexCode.icns");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SDKROOT");
+    // Only macOS has the app; elsewhere its absence is expected, not worth a warning.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=absent:not building for macOS");
+        return;
+    }
     match build() {
         Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.display()),
         Err(reason) => {
@@ -55,9 +60,6 @@ fn run(command: &mut Command, what: &str) -> Result<String, String> {
 }
 
 fn build() -> Result<PathBuf, String> {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        return Err("not building for macOS".into());
-    }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
     // OUT_DIR is <target>/<profile>/build/<pkg>-<hash>/out: the profile directory holds the binaries.
