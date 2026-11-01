@@ -17,14 +17,13 @@ Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); 
 - `(:Member {key: node id, name*, added_ms, added_by, software})-[:IN]->(:Mesh {key: hash of the
   first entry, founder, founded_ms})-[:ON]->(:Machine)` (WORKSPACE layer), built from the log: a
   revoked member is retired (`revoked`), a mesh left behind is retired (`left`).
-- stream `mesh.served`: every call served to another app, `{at, node, method, ok, ms}`, 30 days.
 - settings `mesh.name`, `mesh.lend`, `mesh.allowed` (the members that may work here, `mesh.allow`). Shared services have no switches: always on (`read` from any member, `edit` and `run` from apps on this machine).
 - **Start order**: the endpoint starts at once, so apps on this Mac link and lend before the
   memory plugin answers; members of the network are let in, and the membership changed, only once
   the log is read (methods that change it wait 10 s, then answer `unavailable`). The store is
   retried every second; writes queue in order in memory until it takes them.
-- Files of earlier versions (`mesh/members.jsonl`, `served.jsonl`, `shares.json`, `name`,
-  `no-lend`) are moved in once, confirmed and deleted.
+- Files of earlier versions (`mesh/members.jsonl`, `shares.json`, `name`, `no-lend`) are moved
+  in once, confirmed and deleted; `served.jsonl` (a record of served calls nothing read) is deleted.
 - `~/.cortex-mesh/local/<software>-<node>.json` stays a file: plumbing (pid and loopback ports of
   a running app, removed when it stops), how CortexCode and CortexTerm on one Mac find each other.
 

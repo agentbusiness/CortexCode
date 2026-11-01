@@ -8,8 +8,6 @@
 //!   added_by, software})-[:IN]->(:Mesh {key: hash of the first entry, founder, founded_ms})
 //!   -[:ON]->(:Machine)`, in the WORKSPACE layer. A revoked member is retired (`revoked`); a mesh
 //!   this node is no longer in is retired (`left`), with its members.
-//! - **Served calls**: stream `mesh.served`, one record per call served to another app:
-//!   `{at, node, method, ok, ms}`, kept 30 days.
 //! - **The person's choices**: `memory.settings` (global scope) `mesh.name` (string),
 //!   `mesh.lend` (boolean) and `mesh.allowed` (the node ids of the members that may work here).
 //!
@@ -22,9 +20,9 @@
 //! a write the store did not take and tries it again, so nothing written before the store answers
 //! is lost while the process runs.
 //!
-//! **Files of earlier versions** (`<home>/mesh/members.jsonl`, `served.jsonl`, `shares.json`,
-//! `name`, `no-lend`) are read once when the store first answers, written to it, confirmed, and
-//! deleted.
+//! **Files of earlier versions** (`<home>/mesh/members.jsonl`, `shares.json`, `name`, `no-lend`)
+//! are read once when the store first answers, written to it, confirmed, and deleted;
+//! `served.jsonl` (a record of served calls nothing read) is deleted.
 
 use crate::members::{Entry, Log};
 use cc_protocol::contracts::memory::methods;
@@ -38,16 +36,11 @@ use tokio::sync::mpsc;
 
 /// The membership log's entries, in order.
 pub const MEMBERS_TOPIC: &str = "mesh.members";
-/// Every call served to another app.
-pub const SERVED_TOPIC: &str = "mesh.served";
 /// Settings paths (global scope).
 pub const NAME_SETTING: &str = "mesh.name";
 pub const LEND_SETTING: &str = "mesh.lend";
 pub const ALLOWED_SETTING: &str = "mesh.allowed";
 
-/// How long served calls are kept (days).
-pub const SERVED_DAYS: u32 = 30;
-const SERVED_KEEP_MS: u64 = SERVED_DAYS as u64 * 24 * 60 * 60 * 1000;
 /// The membership stream is kept as long as the store keeps anything.
 const MEMBERS_DAYS: u32 = 3650;
 /// Between two attempts while the store does not answer.
@@ -157,27 +150,8 @@ pub async fn load(call: &Caller, home: &Path) -> Result<Loaded, RpcError> {
         remove(&file);
     }
 
-    // Served calls of the last 30 days, unless the stream has them already.
-    let file = dir.join("served.jsonl");
-    if file.exists() {
-        let horizon = cc_protocol::contracts::now_ms().saturating_sub(SERVED_KEEP_MS);
-        let old: Vec<Value> = std::fs::read_to_string(&file)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|value| value["at"].as_u64().unwrap_or(0) >= horizon)
-            .collect();
-        let newest_kept = last_record(call, SERVED_TOPIC).await?.and_then(|value| value["at"].as_u64()).unwrap_or(0);
-        let missing: Vec<Value> = old.into_iter().filter(|value| value["at"].as_u64().unwrap_or(0) > newest_kept).collect();
-        let count = missing.len();
-        for chunk in missing.chunks(PAGE as usize) {
-            append(call, SERVED_TOPIC, chunk.to_vec(), SERVED_DAYS).await?;
-        }
-        if count > 0 {
-            tracing::info!(records = count, "the record of served calls moved into the store");
-        }
-        remove(&file);
-    }
+    // Served calls earlier versions kept: nothing read them.
+    remove(&dir.join("served.jsonl"));
     // The folder of earlier versions goes once it is empty.
     let _ = std::fs::remove_dir(&dir);
 
@@ -245,22 +219,6 @@ async fn read_all(call: &Caller, topic: &str, since_ms: Option<u64>, cap: usize)
     }
 }
 
-/// The last record of a topic, if any.
-async fn last_record(call: &Caller, topic: &str) -> Result<Option<Value>, RpcError> {
-    let topics = call_patiently(call, methods::STREAM_TOPICS, json!({ "prefix": topic })).await?;
-    let next = topics
-        .get("topics")
-        .and_then(Value::as_array)
-        .and_then(|list| list.iter().find(|t| t["name"] == topic))
-        .and_then(|t| t["next_offset"].as_u64())
-        .unwrap_or(0);
-    if next == 0 {
-        return Ok(None);
-    }
-    let page = call_patiently(call, methods::STREAM_READ, json!({ "topic": topic, "from_offset": next - 1, "limit": 1 })).await?;
-    Ok(page.get("records").and_then(Value::as_array).and_then(|records| records.first()).and_then(|record| record.get("value").cloned()))
-}
-
 /// The membership log as the stream replays it.
 pub async fn read_log(call: &Caller) -> Result<Vec<Entry>, RpcError> {
     let mut entries = Vec::new();
@@ -277,8 +235,6 @@ pub async fn read_log(call: &Caller) -> Result<Vec<Entry>, RpcError> {
 // --- the writer --------------------------------------------------------------------------------
 
 pub enum Write {
-    /// One served call.
-    Served(Value),
     /// The log as it stands now.
     Log(Vec<Entry>),
     /// A member's software, from its card (written once per value).
@@ -299,22 +255,6 @@ pub async fn run_writer(call: Caller, machine: String, persisted: Vec<Entry>, mu
         loop {
             let Some(write) = (match carried.take() { Some(write) => Some(write), None => rx.recv().await }) else { return };
             match write {
-                Write::Served(first) => {
-                    // Served calls queued together go in one append.
-                    let mut batch = vec![first];
-                    while let Ok(next) = rx.try_recv() {
-                        match next {
-                            Write::Served(value) if batch.len() < PAGE as usize => batch.push(value),
-                            other => {
-                                carried = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                    if let Err(error) = append(&writer.call, SERVED_TOPIC, batch, SERVED_DAYS).await {
-                        tracing::warn!(error = %error.message, "served calls not recorded");
-                    }
-                }
                 Write::Log(mut latest) => {
                     // Only the latest of several queued snapshots matters.
                     while let Ok(next) = rx.try_recv() {

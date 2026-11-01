@@ -14,7 +14,6 @@
 //! (:Checkpoint {key: id, label, ts_ms, commit, tree, root})-[:OF]->(:Workspace {key: canonical root})
 //! (:Checkpoint)-[:AFTER]->(:Checkpoint)          the one made before it in the same root
 //! (:Workspace)-[:ON]->(:Machine)
-//! stream `checkpoints`: {id, root, label, ts_ms, commit, tree}, one record per checkpoint
 //! ```
 //!
 //! The nodes are in the `workspace` layer and written through the plugin's queue; the checkpoints
@@ -44,7 +43,6 @@ const IDENTITY_NAME: &str = "CortexCode checkpoint";
 const IDENTITY_EMAIL: &str = "checkpoint@cortexcode.invalid";
 /// The file earlier versions kept the checkpoints in, inside each shadow repository.
 const OLD_META: &str = "checkpoints.json";
-const TOPIC: &str = "checkpoints";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Meta {
@@ -69,10 +67,6 @@ impl Meta {
         let text = |key: &str| props.get(key).and_then(Value::as_str).map(str::to_owned);
         let ts_ms = props.get("ts_ms").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))?;
         Some(Self { id: text("key")?, label: text("label").unwrap_or_default(), ts_ms, commit: text("commit")?, tree: text("tree").unwrap_or_default() })
-    }
-
-    fn record(&self, root: &str) -> Value {
-        json!({ "id": self.id, "root": root, "label": self.label, "ts_ms": self.ts_ms, "commit": self.commit, "tree": self.tree })
     }
 }
 
@@ -145,7 +139,7 @@ impl Checkpoints {
         Ok(all)
     }
 
-    /// Keep a new checkpoint: in memory now, in the graph and the stream through the queue.
+    /// Keep a new checkpoint: in memory now, in the graph through the queue.
     fn keep(&self, root: &str, scratch: bool, previous: Option<&str>, meta: &Meta) {
         self.made().entry(root.to_owned()).or_default().push(meta.clone());
         if scratch {
@@ -153,7 +147,6 @@ impl Checkpoints {
         }
         let (root_key, previous, entry) = (root.to_owned(), previous.map(str::to_owned), meta.clone());
         self.graph.put_later(move |machine| batch(machine, &root_key, previous.as_deref(), std::slice::from_ref(&entry)));
-        self.graph.append_later(TOPIC, vec![meta.record(root)]);
     }
 
     /// Move one shadow repository's `checkpoints.json` into the graph, then remove it. The caller
@@ -179,9 +172,6 @@ impl Checkpoints {
             let stored = rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0);
             if stored < ids.len() as u64 {
                 return Err(RpcError::internal(format!("memory kept {stored} of {} checkpoints from {}; the file stays", ids.len(), path.display())));
-            }
-            for chunk in checkpoints.chunks(1000) {
-                self.graph.append(TOPIC, chunk.iter().map(|m| m.record(&root)).collect(), wait).await?;
             }
             tracing::info!(root, count = ids.len(), "checkpoints moved into the graph");
         }

@@ -14,7 +14,7 @@
 //! `Machine` instead, so nothing is kept unconnected.
 
 use crate::host::Host;
-use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryResult, GraphRef, GraphRetireParams, MachineInfo, StreamAppendParams, methods};
+use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphQueryResult, GraphRef, GraphRetireParams, MachineInfo, methods};
 use cc_protocol::{RpcError, codes};
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
@@ -108,15 +108,6 @@ pub async fn nodes(host: &Host, cypher: &str, params: Value, limit: u32) -> Resu
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.get("properties").and_then(Value::as_object).cloned())
         .collect())
-}
-
-/// Append records to a stream, kept as long as the memory plugin keeps any.
-pub async fn append(host: &Host, topic: &str, records: Vec<Value>) -> Result<(), RpcError> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let params = StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(3650) };
-    host.effect(methods::STREAM_APPEND, serde_json::to_value(params).map_err(|error| RpcError::internal(error.to_string()))?).await.map(|_| ())
 }
 
 pub fn str_prop<'a>(props: &'a Map<String, Value>, name: &str) -> &'a str {

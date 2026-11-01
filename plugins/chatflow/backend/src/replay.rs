@@ -20,13 +20,11 @@
 //!   worse (`hurt`, and the withdrawal rule applies), anything else is no observed effect. The
 //!   lesson gets a `replay://` evidence either way, so it is not replayed again; a user's turn
 //!   cancels a replay, which then decides nothing and is tried again later. The result is a
-//!   `Replay` node (for the night report) and a record in stream `replays`; the replay's projects
-//!   and sessions are then deleted.
+//!   `Replay` node (for the night report); the replay's projects and sessions are then deleted.
 //!
 //! ```text
 //! (:Snapshot {key: '<session>/<run>', version, root, head, subdir, untracked, dir, created_ms})-[:OF]->(:Session)
 //! (:Replay {key: '<lesson>#<ts_ms>', ts_ms, lesson, name, text, dom, with_state, without_state, verdict, evidence, of})-[:FOR]->(:Session)
-//! stream `replays`: {ts_ms, lesson, name, text, dom, with, without, verdict, evidence, of}
 //! ```
 //!
 //! Files that stay: a snapshot's bytes (`diff.patch`, `untracked/`) and the replays' working copies
@@ -89,8 +87,6 @@ impl Paths {
 
 const SNAPSHOT: &str = "Snapshot";
 const REPLAY: &str = "Replay";
-/// The stream every replay's result is appended to.
-pub const STREAM: &str = "replays";
 
 fn snapshot_key(session_id: &str, run_id: &str) -> String {
     format!("{session_id}/{run_id}")
@@ -417,10 +413,9 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
     Some(c.dom)
 }
 
-/// A replay's result as a `Replay` node of the session it replayed, and a record in the stream.
+/// A replay's result as a `Replay` node of the session it replayed.
 async fn record(host: &Host, row: &Value) -> Result<(), RpcError> {
-    put_replay(host, row).await?;
-    graph::append(host, STREAM, vec![row.clone()]).await
+    put_replay(host, row).await
 }
 
 async fn put_replay(host: &Host, row: &Value) -> Result<(), RpcError> {
@@ -482,10 +477,6 @@ pub async fn migrate(host: &Host, paths: &Paths) {
             tracing::warn!(error = %error.message, "replay results were not moved into the graph; tried again at the next start");
             return;
         }
-    }
-    if let Err(error) = graph::append(host, STREAM, rows).await {
-        tracing::warn!(error = %error.message, "replay results were not moved into the stream; tried again at the next start");
-        return;
     }
     let _ = std::fs::remove_file(&results);
     tracing::info!("moved the replay results into the graph");

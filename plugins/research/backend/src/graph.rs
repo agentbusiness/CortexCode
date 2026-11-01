@@ -6,7 +6,7 @@
 //! `connection_closed`, `draining`) is tried again every second, up to the caller's patience.
 
 use crate::peers::Peers;
-use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphPutResult, GraphQueryParams, GraphQueryResult, GraphRef, GraphRetireParams, GraphRetireResult, MachineInfo, StreamAppendParams, StreamAppendResult, methods};
+use cc_protocol::contracts::memory::{GraphEdge, GraphLayer, GraphNode, GraphPutParams, GraphPutResult, GraphQueryParams, GraphQueryResult, GraphRef, GraphRetireParams, GraphRetireResult, MachineInfo, methods};
 use cc_protocol::{RpcError, codes, parse_params, to_value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -95,12 +95,6 @@ impl Graph {
         let params = GraphQueryParams { cypher: cypher.to_owned(), params: params.as_object().cloned().unwrap_or_default(), limit: Some(limit) };
         let result: GraphQueryResult = self.call(methods::GRAPH_QUERY, &params, tries).await?;
         Ok(result.rows)
-    }
-
-    pub async fn append(&self, topic: &str, records: Vec<Value>, tries: u32) -> Result<(), RpcError> {
-        let params = StreamAppendParams { topic: topic.to_owned(), records, retention_days: Some(365) };
-        let _: StreamAppendResult = self.call(methods::STREAM_APPEND, &params, tries).await?;
-        Ok(())
     }
 }
 

@@ -1,13 +1,12 @@
 //! Shared services (`cc_protocol::contracts::service`): what this computer's plugins share, which
-//! calls of a member are taken, a record of what was served, and where a call of this computer
-//! goes. Sharing is always on; there is nothing to set.
+//! calls of a member are taken, and where a call of this computer goes. Sharing is always on;
+//! there is nothing to set.
 //!
 //! - Each active plugin is asked `<category>.shares` once per build; what it declares is shown on
 //!   the card and is all that members may call (besides the model, which has its own sharing).
 //! - A member's call is taken when its method is declared and its verb's access is allowed for
 //!   where the member is (`read` from anywhere; `edit` and `run` only from an app on this
 //!   machine). The mesh stamps who asked into the params as `caller`.
-//! - Every call served for another app is a record of stream `mesh.served` (kept 30 days).
 //! - Events: from each app on this machine that shares services, this mesh asks for those
 //!   services' events (`mesh.events`) and publishes them on this frame as they come; that app's
 //!   mesh sends only the events that name this app (`node`, `owner.node`).
@@ -32,10 +31,6 @@ pub struct Services {
     /// The services' events heard from each app on this machine: the prefixes asked, and the
     /// stream's stop.
     listening: Mutex<HashMap<String, (Vec<String>, CancellationToken)>>,
-}
-
-fn now_ms() -> u64 {
-    cc_protocol::contracts::now_ms()
 }
 
 impl Mesh {
@@ -110,11 +105,6 @@ impl Mesh {
         }
         params["caller"] = serde_json::to_value(caller).unwrap_or(Value::Null);
         Ok(params)
-    }
-
-    /// One served call, for the record.
-    pub fn served(&self, node: &str, method: &str, ok: bool, ms: u64) {
-        self.write(crate::store::Write::Served(json!({"at": now_ms(), "node": node, "method": method, "ok": ok, "ms": ms})));
     }
 
     /// Hear the events of the services an app on this machine shares (asked again when its card

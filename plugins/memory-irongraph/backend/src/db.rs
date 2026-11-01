@@ -26,8 +26,8 @@ pub mod layer {
     pub const WORKSPACE_WRITE: &str = "USE LAYER OBSERVED, KNOWLEDGE, WORKSPACE WRITE LAYER WORKSPACE";
 }
 
-/// How long a topic made by a first append keeps its records (the plugin's own history: session
-/// changes, settings changes, security status), as long as the graph keeps temporal history.
+/// How long a topic made by a first append keeps its records (the plugin's own topics that name
+/// no retention: old journals), as long as the graph keeps temporal history.
 pub const KEPT_DAYS: u32 = 3650;
 
 pub struct Graph {

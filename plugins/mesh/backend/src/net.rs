@@ -301,7 +301,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                 match mesh.accept_call(&node, &method, params).await {
                     Ok(params) => params,
                     Err(error) => {
-                        mesh.served(&node, &method, false, 0);
                         let message = answer(Err(error));
                         write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                         return Ok(());
@@ -314,7 +313,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                 write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                 return Ok(());
             };
-            let started = std::time::Instant::now();
             let ctx = mesh.ctx().map_err(|e| e.message)?;
             let mut call = match ctx.call_stream(&method, params) {
                 Ok(call) => call,
@@ -350,9 +348,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                         }
                         None => {
                             let outcome = call.finish().await;
-                            if shared {
-                                mesh.served(&node, &method, outcome.is_ok(), started.elapsed().as_millis() as u64);
-                            }
                             let message = answer(outcome);
                             let _ = write_message(&mut send, &message).await;
                             break;

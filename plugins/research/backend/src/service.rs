@@ -49,7 +49,7 @@ pub const PROVIDES: &[&str] = &[
 pub const PUBLISHES: &[&str] = &[topics::PROGRESS, topics::JOB];
 
 /// Methods of other plugins this one calls.
-pub const USES: &[&str] = &["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list", "memory.knowledge.upsert", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query", "memory.stream.append"];
+pub const USES: &[&str] = &["model.chat", "frame.project.get", "browser.open", "browser.eval", "browser.close", "memory.note.add", "memory.note.search", "memory.note.list", "memory.knowledge.upsert", "memory.graph.machine", "memory.graph.put", "memory.graph.retire", "memory.graph.query"];
 
 pub struct Core {
     pub engine: Arc<Engine>,

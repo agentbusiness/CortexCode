@@ -22,7 +22,7 @@ Design: `docs/LIVE-EDITING.md`.
   reverted. The chat flow's safety policy (`prompts/policy.md`) is read from its package only.
 - **The record is the graph** (`docs/GRAPH-MODEL.md`, `backend/src/record.rs`): every change of the
   branch puts the files it changed as `(:DataFile {key: "<plugin>/<path>", plugin, path,
-  shipped_hash, body*, hash*, origin*})-[:OF]->(:Plugin)-[:ON]->(:Machine)`, the temporal values
+  shipped_hash, hash*, origin*})-[:OF]->(:Plugin)-[:ON]->(:Machine)`, the temporal values
   sampled at the change's time, and appends one record to the stream `source.changes` (`{at,
   commit, origin, summary, plugins, files, reverts}`, kept 10 years). The watch loop records each
   commit right after it makes it (in the background: a memory plugin that does not serve never
@@ -32,11 +32,13 @@ Design: `docs/LIVE-EDITING.md`.
   commit, dated 1970, just before the first change after it: samples must be newer than the graph's
   10-year history retention and must only grow). History (`source.history`) reads the stream;
   `source.file.history` lists a file's versions (`HISTORY f.hash`, `f.origin`) and
-  `source.file.restore` writes a file back as the graph had it at a time (`AT TIME … f.body`;
-  a binary file's content comes from git's objects by its hash), committed as a `restore`.
+  `source.file.restore` writes a file back as it was at a time (`AT TIME … f.hash`, the content
+  read from git's objects by that hash), committed as a `restore`. Only committed versions can be
+  restored.
 - **Git** stays in the folder as the transport to GitHub (backup and sharing are git pushes and
-  pull requests) and as the three-way merge of releases, resets and reverts; the record of what
-  changed and every version's text is the graph.
+  pull requests), as the three-way merge of releases, resets and reverts, and as the store of
+  every version's content (compressed objects; the graph never holds file text); the record of
+  what changed and when is the graph.
 - **History, backup, sharing.** Every change can be reverted; the folder is pushed to a repository
   the user picked on GitHub (branch `cortexcode`) and restored from it on a new Mac; picked changes
   are sent to the official repository as a pull request after a privacy check. The GitHub connection
