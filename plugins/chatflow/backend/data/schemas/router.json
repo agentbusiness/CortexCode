@@ -1,17 +1,31 @@
 {
   "type": "object",
   "properties": {
-    "work": {
-      "type": "string",
-      "maxLength": 1000
-    },
     "asks": {
       "type": "array",
       "items": {
-        "type": "string",
-        "maxLength": 600
+        "type": "object",
+        "properties": {
+          "quote": {
+            "type": "string",
+            "maxLength": 600
+          },
+          "means": {
+            "type": "string",
+            "maxLength": 600
+          }
+        },
+        "required": [
+          "quote",
+          "means"
+        ],
+        "additionalProperties": false
       },
       "maxItems": 12
+    },
+    "work": {
+      "type": "string",
+      "maxLength": 1000
     },
     "route": {
       "enum": [
@@ -74,8 +88,8 @@
     }
   },
   "required": [
-    "work",
     "asks",
+    "work",
     "route",
     "skills",
     "effort",
