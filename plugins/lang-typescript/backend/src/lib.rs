@@ -6,7 +6,7 @@ pub mod js;
 pub mod npm;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::ServerSpec;
 use cc_lang_kit::{ExtractContext, FoundServer, LanguagePack, PackEnv, Sample};
 use js::Dialect;
@@ -137,6 +137,45 @@ impl LanguagePack for TypeScriptPack {
     /// install is the user's to approve); `npm test` runs the package's test script.
     fn caches(&self) -> Vec<String> {
         vec!["node_modules".to_owned()]
+    }
+
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["npm", "run", "build"]),
+            Runner::new("build", &["pnpm", "build"]),
+            Runner::new("build", &["pnpm", "run", "build"]),
+            Runner::new("build", &["yarn", "build"]),
+            Runner::new("build", &["bun", "run", "build"]),
+            Runner::new("build", &["tsc"]),
+            Runner::new("test", &["npx", "jest"]),
+            Runner::new("test", &["npx", "vitest"]),
+            Runner::new("test", &["npx", "playwright", "test"]),
+            Runner::new("test", &["jest"]),
+            Runner::new("test", &["vitest"]),
+            Runner::new("test", &["pnpm", "test"]),
+            Runner::new("test", &["yarn", "test"]),
+            Runner::new("test", &["bun", "test"]),
+            Runner::new("server", &["npm", "start"]),
+            Runner::new("server", &["npm", "run", "dev"]),
+            Runner::new("server", &["npm", "run", "start"]),
+            Runner::new("server", &["pnpm", "dev"]),
+            Runner::new("server", &["pnpm", "start"]),
+            Runner::new("server", &["yarn", "dev"]),
+            Runner::new("server", &["yarn", "start"]),
+            Runner::new("server", &["npx", "vite"]),
+            Runner::new("server", &["npx", "next", "dev"]),
+            Runner::new("run", &["node"]),
+            Runner::new("run", &["npx", "tsx"]),
+            Runner::new("run", &["tsx"]),
+            Runner::new("run", &["npx", "ts-node"]),
+            Runner::new("run", &["ts-node"]),
+            Runner::new("run", &["bun"]),
+            Runner::new("run", &["deno"]),
+            Runner::new("run", &["npm", "run"]),
+            Runner::new("run", &["pnpm", "run"]),
+            Runner::new("run", &["yarn", "run"]),
+            Runner::new("run", &["npx"]),
+        ]
     }
 
     fn verifiers(&self) -> Vec<Verifier> {

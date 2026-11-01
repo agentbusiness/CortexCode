@@ -9,4 +9,5 @@ pub mod exec;
 pub mod jsonc;
 pub mod paths;
 pub mod probe;
+pub mod seeds;
 pub mod service;

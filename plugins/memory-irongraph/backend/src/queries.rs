@@ -1,4 +1,8 @@
 //! memory@1 code queries over one indexed tree.
+//!
+//! Code nodes that are gone are retired (`ended_ms`, [`crate::tree`]), not deleted: every read of
+//! code skips them. Tasks and rules attached to a sid are still found through a retired node that
+//! shares it (a definition whose kind changed keeps its sid; its links stay on the retired node).
 
 use crate::attributes::Declared;
 use crate::db::{Rows, layer};
@@ -74,24 +78,24 @@ impl CodeTree {
     /// Resolve a sid, qualified name, path or bare name to symbol sids.
     pub async fn resolve_name(&self, name: &str) -> Result<Vec<SymbolRef>, RpcError> {
         let cols = sym_cols("n");
-        let exact = self.run(&format!("{} MATCH (n:Code {{sid: $v}}) RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
+        let exact = self.run(&format!("{} MATCH (n:Code {{sid: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
         if !exact.rows.is_empty() {
             return Ok(exact.rows.iter().map(|r| sym_from(r, 0)).collect());
         }
-        let file = self.run(&format!("{} MATCH (n:File {{sid: $v}}) RETURN {cols}", layer::OBSERVED_READ), params! { "v" => format!("file:{name}") }).await?;
+        let file = self.run(&format!("{} MATCH (n:File {{sid: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "v" => format!("file:{name}") }).await?;
         if !file.rows.is_empty() {
             return Ok(file.rows.iter().map(|r| sym_from(r, 0)).collect());
         }
-        let qualified = self.run(&format!("{} MATCH (n:Sym {{qname: $v}}) RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
+        let qualified = self.run(&format!("{} MATCH (n:Sym {{qname: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
         if !qualified.rows.is_empty() {
             return Ok(qualified.rows.iter().map(|r| sym_from(r, 0)).collect());
         }
-        let bare = self.run(&format!("{} MATCH (n:Sym {{name: $v}}) RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
+        let bare = self.run(&format!("{} MATCH (n:Sym {{name: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "v" => name }).await?;
         let mut out: Vec<SymbolRef> = bare.rows.iter().map(|r| sym_from(r, 0)).collect();
         // `Type::method` / `Class.method` written with the other separator.
         if out.is_empty() && (name.contains("::") || name.contains('.')) {
             let alt = if name.contains("::") { name.replace("::", ".") } else { name.replace('.', "::") };
-            let rows = self.run(&format!("{} MATCH (n:Sym {{qname: $v}}) RETURN {cols}", layer::OBSERVED_READ), params! { "v" => alt }).await?;
+            let rows = self.run(&format!("{} MATCH (n:Sym {{qname: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "v" => alt }).await?;
             out = rows.rows.iter().map(|r| sym_from(r, 0)).collect();
         }
         Ok(out)
@@ -106,11 +110,11 @@ impl CodeTree {
         // Exact name / qualified-name / sid matches first.
         let trimmed = text.trim();
         for (cypher, value) in [
-            (format!("{} MATCH (n:Code {{sid: $v}}) RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
-            (format!("{} MATCH (n:Sym {{qname: $v}}) RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
-            (format!("{} MATCH (n:Sym {{name: $v}}) RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
+            (format!("{} MATCH (n:Code {{sid: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
+            (format!("{} MATCH (n:Sym {{qname: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
+            (format!("{} MATCH (n:Sym {{name: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), trimmed.to_owned()),
             (
-                if include_external { format!("{} MATCH (n:ExternalSymbol {{name: $v}}) RETURN {cols}", layer::OBSERVED_READ) } else { String::new() },
+                if include_external { format!("{} MATCH (n:ExternalSymbol {{name: $v}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ) } else { String::new() },
                 trimmed.to_owned(),
             ),
         ] {
@@ -137,7 +141,7 @@ impl CodeTree {
         let rows = self
             .run(
                 &format!(
-                    "{} MATCH (n) WHERE {label_filter} WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN n.sid, labels(n), score",
+                    "{} MATCH (n) WHERE ({label_filter}) AND n.ended_ms IS NULL WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN n.sid, labels(n), score",
                     layer::CODE_READ
                 ),
                 params! { "text" => text, "k" => want },
@@ -154,7 +158,7 @@ impl CodeTree {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         let sids: Vec<String> = ranked.iter().map(|(sid, _)| sid.clone()).filter(|sid| !seen.contains(sid)).collect();
         if !sids.is_empty() {
-            let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) RETURN {cols}", layer::OBSERVED_READ), params! { "sids" => sids }).await?;
+            let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "sids" => sids }).await?;
             let by_sid: HashMap<String, SymbolRef> = rows.rows.iter().map(|r| (s(r, 0), sym_from(r, 0))).collect();
             // The repository's own code and documents first, then vendored or generated files
             // ([`Declared`]), each by score: third-party code is what the work reads last.
@@ -193,7 +197,7 @@ impl CodeTree {
             let detail = self
                 .run(
                     &format!(
-                        "{} MATCH (n:Code {{sid: $sid}}) RETURN n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1]), n.param_names, n.param_types, n.param_defaults",
+                        "{} MATCH (n:Code {{sid: $sid}}) WHERE n.ended_ms IS NULL RETURN n.return_type, size([(n)<-[c]-() WHERE type(c) IN $calls | 1]), size([(n)-[c]->() WHERE type(c) IN $calls | 1]), n.param_names, n.param_types, n.param_defaults",
                         layer::OBSERVED_READ
                     ),
                     params! { "sid" => sid, "calls" => CALL_LIKE },
@@ -209,7 +213,7 @@ impl CodeTree {
                 .enumerate()
                 .map(|(i, name)| ParamInfo { name, position: i as u32, type_text: given(&types, i), default_value: given(&defaults, i) })
                 .collect();
-            let tests = self.run(&format!("{} MATCH (t:Test)-[:TESTS]->(n:Code {{sid: $sid}}) RETURN {}", layer::OBSERVED_READ, sym_cols("t")), params! { "sid" => sid }).await?;
+            let tests = self.run(&format!("{} MATCH (t:Test)-[:TESTS]->(n:Code {{sid: $sid}}) WHERE t.ended_ms IS NULL AND n.ended_ms IS NULL RETURN {}", layer::OBSERVED_READ, sym_cols("t")), params! { "sid" => sid }).await?;
             let mut tests: Vec<SymbolRef> = tests.rows.iter().map(|r| sym_from(r, 0)).collect();
             tests.sort_by(|a, b| a.sid.cmp(&b.sid));
             tests.dedup_by(|a, b| a.sid == b.sid);
@@ -237,14 +241,14 @@ impl CodeTree {
             }
             let cypher = if incoming {
                 format!(
-                    "{} UNWIND $sids AS s MATCH (a:Code)-[c]->(b:Code {{sid: s}}) WHERE type(c) IN $calls RETURN {}, {}, c.line, c.args, c.props, c.confidence, type(c), c.url, c.channel",
+                    "{} UNWIND $sids AS s MATCH (a:Code)-[c]->(b:Code {{sid: s}}) WHERE type(c) IN $calls AND a.ended_ms IS NULL AND b.ended_ms IS NULL RETURN {}, {}, c.line, c.args, c.props, c.confidence, type(c), c.url, c.channel",
                     layer::OBSERVED_READ,
                     sym_cols("a"),
                     sym_cols("b")
                 )
             } else {
                 format!(
-                    "{} UNWIND $sids AS s MATCH (a:Code {{sid: s}})-[c]->(b:Code) WHERE type(c) IN $calls RETURN {}, {}, c.line, c.args, c.props, c.confidence, type(c), c.url, c.channel",
+                    "{} UNWIND $sids AS s MATCH (a:Code {{sid: s}})-[c]->(b:Code) WHERE type(c) IN $calls AND a.ended_ms IS NULL AND b.ended_ms IS NULL RETURN {}, {}, c.line, c.args, c.props, c.confidence, type(c), c.url, c.channel",
                     layer::OBSERVED_READ,
                     sym_cols("a"),
                     sym_cols("b")
@@ -283,7 +287,7 @@ impl CodeTree {
             changed.extend(self.resolve_name(sid).await?);
         }
         if !paths.is_empty() {
-            let rows = self.run(&format!("{} UNWIND $paths AS p MATCH (n:Code {{path: p}}) WHERE n:Sym RETURN {cols}", layer::OBSERVED_READ), params! { "paths" => paths }).await?;
+            let rows = self.run(&format!("{} UNWIND $paths AS p MATCH (n:Code {{path: p}}) WHERE n:Sym AND n.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "paths" => paths }).await?;
             changed.extend(rows.rows.iter().map(|r| sym_from(r, 0)));
         }
         changed.sort_by(|a, b| a.sid.cmp(&b.sid));
@@ -301,17 +305,18 @@ impl CodeTree {
         call_sites.dedup_by(|a, b| a.caller.sid == b.caller.sid && a.callee.sid == b.callee.sid && a.line == b.line);
         let affected: Vec<String> = affected.into_iter().collect();
         // Tests: tests of anything affected, and affected symbols that are tests.
-        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Test)-[:TESTS]->(x:Code {{sid: s}}) RETURN {cols}", layer::OBSERVED_READ), params! { "sids" => affected }).await?;
+        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Test)-[:TESTS]->(x:Code {{sid: s}}) WHERE n.ended_ms IS NULL AND x.ended_ms IS NULL RETURN {cols}", layer::OBSERVED_READ), params! { "sids" => affected }).await?;
         let mut tests: Vec<SymbolRef> = rows.rows.iter().map(|r| sym_from(r, 0)).collect();
         tests.extend(call_sites.iter().filter(|c| c.caller.kind == "test").map(|c| c.caller.clone()));
         tests.sort_by(|a, b| a.sid.cmp(&b.sid));
         tests.dedup_by(|a, b| a.sid == b.sid);
-        // Tasks and rules attached to the affected code or its files.
+        // Tasks and rules attached to the affected code or its files (also through a retired node
+        // with the same sid: the links of a definition whose kind changed stay there).
         let mut targets: Vec<String> = affected.clone();
         let files: HashSet<String> = changed.iter().chain(call_sites.iter().map(|c| &c.caller)).map(|s| format!("file:{}", s.path)).collect();
         targets.extend(files);
-        let tasks = self.run(&format!("{} UNWIND $sids AS s MATCH (t:Task)-[:TOUCHES]->(x:Code {{sid: s}}) RETURN DISTINCT t.id", layer::ALL_READ), params! { "sids" => targets }).await?;
-        let rules = self.run(&format!("{} UNWIND $sids AS s MATCH (r:Rule)-[:CONSTRAINS]->(x:Code {{sid: s}}) RETURN DISTINCT r.id", layer::ALL_READ), params! { "sids" => targets }).await?;
+        let tasks = self.run(&format!("{} UNWIND $sids AS s MATCH (t:Task)-[e:TOUCHES]->(x:Code {{sid: s}}) WHERE e.ended_ms IS NULL AND t.ended_ms IS NULL RETURN DISTINCT t.id", layer::ALL_READ), params! { "sids" => targets }).await?;
+        let rules = self.run(&format!("{} UNWIND $sids AS s MATCH (r:Rule)-[e:CONSTRAINS]->(x:Code {{sid: s}}) WHERE e.ended_ms IS NULL AND r.ended_ms IS NULL RETURN DISTINCT r.id", layer::ALL_READ), params! { "sids" => targets }).await?;
         let mut tasks: Vec<String> = tasks.column(0).filter_map(|v| v.as_str().map(str::to_owned)).collect();
         let mut rules: Vec<String> = rules.column(0).filter_map(|v| v.as_str().map(str::to_owned)).collect();
         tasks.sort();
@@ -330,7 +335,7 @@ impl CodeTree {
                 let rows = self
                     .run(
                         &format!(
-                            "{} MATCH (a:Code {{sid: $a}}), (b:Code {{sid: $b}}) CALL graph.shortestpath(a, b) YIELD path, cost RETURN [n IN nodes(path) | n.sid], [r IN relationships(path) | type(r)], cost",
+                            "{} MATCH (a:Code {{sid: $a}}), (b:Code {{sid: $b}}) WHERE a.ended_ms IS NULL AND b.ended_ms IS NULL CALL graph.shortestpath(a, b) YIELD path, cost RETURN [n IN nodes(path) | n.sid], [r IN relationships(path) | type(r)], cost",
                             layer::OBSERVED_READ
                         ),
                         params! { "a" => x.sid, "b" => y.sid },
@@ -347,7 +352,7 @@ impl CodeTree {
             }
         }
         let Some((_, nodes, rels)) = best else { return Ok(PathResult { found: false, steps: Vec::new() }) };
-        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => nodes }).await?;
+        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => nodes }).await?;
         let by_sid: HashMap<String, SymbolRef> = rows.rows.iter().map(|r| (s(r, 0), sym_from(r, 0))).collect();
         let mut steps = Vec::new();
         for (i, sid) in nodes.iter().enumerate() {
@@ -370,7 +375,7 @@ impl CodeTree {
     }
 
     pub async fn outline(&self, path: &str) -> Result<OutlineResult, RpcError> {
-        let rows = self.run(&format!("{} MATCH (n:Code {{path: $p}}) WHERE n:Sym OR n:File RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "p" => path }).await?;
+        let rows = self.run(&format!("{} MATCH (n:Code {{path: $p}}) WHERE (n:Sym OR n:File) AND n.ended_ms IS NULL RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "p" => path }).await?;
         if rows.rows.is_empty() {
             return Err(RpcError::not_found(format!("{path} is not indexed")));
         }
@@ -391,7 +396,7 @@ impl CodeTree {
     /// The definitions and sections of one file ranked by IronGraph's embedding index against
     /// `text` (bind the file's nodes first, then rank). Nodes not embedded yet are left out.
     pub async fn focus(&self, path: &str, text: &str) -> Result<FocusResult, RpcError> {
-        let count = self.run(&format!("{} MATCH (n:Code {{path: $p}}) WHERE n:Sym OR n:Section RETURN count(n)", layer::OBSERVED_READ), params! { "p" => path }).await?;
+        let count = self.run(&format!("{} MATCH (n:Code {{path: $p}}) WHERE (n:Sym OR n:Section) AND n.ended_ms IS NULL RETURN count(n)", layer::OBSERVED_READ), params! { "p" => path }).await?;
         let k = count.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0);
         if k == 0 || text.trim().is_empty() {
             return Ok(FocusResult::default());
@@ -399,7 +404,7 @@ impl CodeTree {
         let rows = self
             .run(
                 &format!(
-                    "{} MATCH (n:Code {{path: $p}}) WHERE n:Sym OR n:Section WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN n.start_line, n.end_line, n.name, score",
+                    "{} MATCH (n:Code {{path: $p}}) WHERE (n:Sym OR n:Section) AND n.ended_ms IS NULL WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN n.start_line, n.end_line, n.name, score",
                     layer::CODE_READ
                 ),
                 params! { "p" => path, "text" => text, "k" => k },
@@ -446,7 +451,7 @@ impl CodeTree {
         let scores: Vec<(String, f64)> = if focus.is_empty() { self.pagerank().await? } else { self.personalized_pagerank(focus).await? };
         let sids: Vec<String> = scores.iter().map(|(sid, _)| sid.clone()).collect();
         let rows = self
-            .run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n:Sym RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => sids })
+            .run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n:Sym AND n.ended_ms IS NULL RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => sids })
             .await?;
         let by_sid: HashMap<String, SymbolRef> = rows.rows.iter().map(|r| (s(r, 0), sym_from(r, 0))).collect();
         let declared = {
@@ -538,7 +543,7 @@ impl CodeTree {
     /// Global PageRank of symbols (IronGraph's `graph.pagerank` over the OBSERVED code graph).
     pub async fn pagerank(&self) -> Result<Vec<(String, f64)>, RpcError> {
         let rows = self
-            .run(&format!("{} CALL graph.pagerank() YIELD node, score WITH node, score WHERE node:Sym RETURN node.sid, score", layer::OBSERVED_READ), Map::new())
+            .run(&format!("{} CALL graph.pagerank() YIELD node, score WITH node, score WHERE node:Sym AND node.ended_ms IS NULL RETURN node.sid, score", layer::OBSERVED_READ), Map::new())
             .await?;
         let mut scores: Vec<(String, f64)> = rows.rows.iter().map(|r| (s(r, 0), r.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0))).collect();
         scores.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -551,7 +556,7 @@ impl CodeTree {
     async fn personalized_pagerank(&self, focus: &[String]) -> Result<Vec<(String, f64)>, RpcError> {
         let rows = self
             .run(
-                &format!("{} MATCH (a:Code)-[r]->(b:Code) WHERE type(r) IN $rels RETURN a.sid, b.sid", layer::OBSERVED_READ),
+                &format!("{} MATCH (a:Code)-[r]->(b:Code) WHERE type(r) IN $rels AND a.ended_ms IS NULL AND b.ended_ms IS NULL RETURN a.sid, b.sid", layer::OBSERVED_READ),
                 params! { "rels" => ["CALLS", "INSTANTIATES", "RENDERS", "USES_HOOK", "REQUESTS", "INVOKES", "HANDLES", "RUNS", "IMPORTS", "DEFINES", "EXTENDS", "IMPLEMENTS", "OF_TYPE", "TAKES", "RETURNS", "READS", "WRITES", "TESTS", "CONTAINS"] },
             )
             .await?;
@@ -635,7 +640,7 @@ impl CodeTree {
 
     /// Every indexed file's repository-relative path, sorted.
     pub async fn files(&self) -> Result<FilesResult, RpcError> {
-        let rows = self.run(&format!("{} MATCH (f:File) RETURN f.path", layer::OBSERVED_READ), Map::new()).await?;
+        let rows = self.run(&format!("{} MATCH (f:File) WHERE f.ended_ms IS NULL RETURN f.path", layer::OBSERVED_READ), Map::new()).await?;
         let mut paths: Vec<String> = rows.column(0).filter_map(|v| v.as_str().map(str::to_owned)).collect();
         paths.sort();
         paths.dedup();
@@ -668,12 +673,12 @@ pub async fn read_only_query(graph: &crate::db::Graph, ig_id: &str, cypher: &str
 impl CodeTree {
     /// Store what a symbol does on its own node: `description`, and `described_hash` (the body it
     /// was written for; a different `body_hash` makes it stale). The indexer never writes these, so
-    /// they stay through re-indexing and renames, and go with the symbol when it is deleted.
+    /// they stay through re-indexing and renames, and stay on the symbol when it is retired.
     pub async fn describe(&self, sid: &str, description: &str) -> Result<SymbolRef, RpcError> {
         let found = self.resolve_name(sid).await?;
         let Some(mut symbol) = found.into_iter().next() else { return Err(RpcError::not_found(format!("no symbol {sid}"))) };
         self.run(
-            &format!("{} MATCH (s:Code {{sid: $sid}}) SET s.description = $text, s.described_hash = s.body_hash, s.described_ms = $now", layer::OBSERVED_WRITE),
+            &format!("{} MATCH (s:Code {{sid: $sid}}) WHERE s.ended_ms IS NULL SET s.description = $text, s.described_hash = s.body_hash, s.described_ms = $now", layer::OBSERVED_WRITE),
             params! { "sid" => symbol.sid, "text" => description, "now" => cc_protocol::contracts::now_ms() },
         )
         .await?;
@@ -685,11 +690,11 @@ impl CodeTree {
     /// central first (PageRank).
     pub async fn undescribed(&self, limit: u32) -> Result<SearchResult, RpcError> {
         let scores = self.pagerank().await?;
-        let described = self.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL RETURN s.sid, s.described_hash = s.body_hash", layer::OBSERVED_READ), Map::new()).await?;
+        let described = self.run(&format!("{} MATCH (s:Sym) WHERE s.description IS NOT NULL AND s.ended_ms IS NULL RETURN s.sid, s.described_hash = s.body_hash", layer::OBSERVED_READ), Map::new()).await?;
         let fresh: HashSet<String> = described.rows.iter().filter(|r| r.get(1).and_then(|v| v.as_bool()) == Some(true)).map(|r| s(r, 0)).collect();
         let candidates: Vec<(String, f64)> = scores.into_iter().filter(|(sid, _)| !fresh.contains(sid)).collect();
         let sids: Vec<String> = candidates.iter().map(|(sid, _)| sid.clone()).collect();
-        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n:Sym RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => sids }).await?;
+        let rows = self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n:Sym AND n.ended_ms IS NULL RETURN {}", layer::OBSERVED_READ, sym_cols("n")), params! { "sids" => sids }).await?;
         let by_sid: HashMap<String, SymbolRef> = rows.rows.iter().map(|r| (s(r, 0), sym_from(r, 0))).collect();
         let describable = ["function", "method", "class", "struct", "trait", "interface", "enum", "type", "component", "macro", "module", "route", "command", "shell_function"];
         let mut hits = Vec::new();
@@ -714,12 +719,12 @@ impl CodeTree {
         for (sid, text) in &probes {
             let rows = self
                 .run(
-                    &format!("{} MATCH (n:Sym {{sid: $sid}}) WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT 5) SCORE AS score RETURN n.sid", layer::OBSERVED_READ),
+                    &format!("{} MATCH (n:Sym {{sid: $sid}}) WHERE n.ended_ms IS NULL WITH n SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT 5) SCORE AS score RETURN n.sid", layer::OBSERVED_READ),
                     params! { "sid" => sid, "text" => text },
                 )
                 .await?;
-            // A symbol deleted since it was written no longer needs embedding.
-            let exists = self.run(&format!("{} MATCH (n:Sym {{sid: $sid}}) RETURN n.sid", layer::OBSERVED_READ), params! { "sid" => sid }).await?;
+            // A symbol retired since it was written no longer needs embedding.
+            let exists = self.run(&format!("{} MATCH (n:Sym {{sid: $sid}}) WHERE n.ended_ms IS NULL RETURN n.sid", layer::OBSERVED_READ), params! { "sid" => sid }).await?;
             if rows.column(0).any(|v| v.as_str() == Some(sid.as_str())) || exists.rows.is_empty() {
                 done.push(sid.clone());
             }

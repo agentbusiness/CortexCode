@@ -4,8 +4,8 @@
 //! is no other store.
 //!
 //! Notes an earlier version kept as JSON lines (`<data>/notes/<project id>.jsonl`) are imported
-//! once, as global notes, before the first note call: a file is renamed `<name>.jsonl.imported`
-//! once all its notes are in memory, so it is never read again.
+//! once, as global notes, before the first note call: a file is deleted once all its notes are in
+//! memory (as is a `<name>.jsonl.imported` an earlier version renamed it to).
 
 use crate::peers::Peers;
 use crate::text::{normalize_date, squash};
@@ -75,7 +75,14 @@ impl Notes {
 
     async fn import(&self) -> Result<(), RpcError> {
         let Ok(entries) = std::fs::read_dir(&self.legacy) else { return Ok(()) };
-        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect();
+        let paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        // Files an earlier import renamed instead of deleting: their notes are in memory already.
+        for done in paths.iter().filter(|p| p.extension().is_some_and(|x| x == "imported")) {
+            if let Err(error) = std::fs::remove_file(done) {
+                tracing::warn!("research: cannot delete {}: {error}", done.display());
+            }
+        }
+        let mut files: Vec<PathBuf> = paths.into_iter().filter(|p| p.extension().is_some_and(|x| x == "jsonl")).collect();
         files.sort();
         for file in files {
             let text = std::fs::read_to_string(&file).map_err(|e| RpcError::internal(format!("{}: {e}", file.display())))?;
@@ -95,10 +102,11 @@ impl Notes {
                 };
                 self.memory::<_, memory::Note>(methods::NOTE_ADD, &params).await?;
             }
-            let mut done = file.clone().into_os_string();
-            done.push(".imported");
-            std::fs::rename(&file, &done).map_err(|e| RpcError::internal(format!("{}: {e}", file.display())))?;
+            // Memory keeps the notes now: the file goes (adding a note again is idempotent, so a
+            // file left by a failed delete is harmless next time).
+            std::fs::remove_file(&file).map_err(|e| RpcError::internal(format!("{}: {e}", file.display())))?;
         }
+        let _ = std::fs::remove_dir(&self.legacy);
         Ok(())
     }
 

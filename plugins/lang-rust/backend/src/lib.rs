@@ -6,7 +6,7 @@ pub mod cargo;
 pub mod rust;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::ServerSpec;
 use cc_lang_kit::{ExtractContext, FoundServer, LanguagePack, PackEnv, Sample};
 use std::path::Path;
@@ -92,6 +92,16 @@ impl LanguagePack for RustPack {
 
     fn caches(&self) -> Vec<String> {
         vec!["target".to_owned()]
+    }
+
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["cargo", "build"]),
+            Runner::new("build", &["rustc"]),
+            Runner::new("test", &["cargo", "nextest"]),
+            Runner::new("test", &["cargo", "bench"]),
+            Runner::new("run", &["cargo", "run"]),
+        ]
     }
 
     fn verifiers(&self) -> Vec<Verifier> {

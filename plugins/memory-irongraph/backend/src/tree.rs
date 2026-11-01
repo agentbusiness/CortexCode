@@ -7,6 +7,18 @@
 //! for files whose outgoing edge set changed, and nodes are rewritten only when their properties
 //! changed. Stable ids (`<lang>:<path>#<qname>`) plus rename detection by body hash keep workspace
 //! links (tasks, rules) and knowledge (descriptions) attached across edits.
+//!
+//! A code node that is gone (its definition, file or directory removed, a dependency no manifest
+//! names any more) is retired, never deleted: `ended_ms`, `ended_reason`, `state: 'gone'`,
+//! `last_ms`. Its edges to other code nodes go (they are derived from the files and rebuilt on
+//! every sync); edges from other records (knowledge, tasks, findings, runs) stay. The same sid
+//! written again brings the node back (the retirement is cleared). Every read of code nodes skips
+//! retired ones (`ended_ms IS NULL`), so a retired node and a live one may share a sid (a definition
+//! whose kind changed). Code nodes and edges carry `first_ms` and `last_ms`.
+//!
+//! A sync in progress is recorded on the project's `Repo` node (`sync_pending_ms`, set before the
+//! write and cleared after it succeeds): a process that stops inside a sync leaves it set, and the
+//! next cold pass rebuilds every file's edges instead of trusting the stored edge hashes.
 
 use crate::db::{Graph, Rows, layer};
 use crate::facts::{self, BINARY, FileFacts, Origin, TEXT, hash_hex};
@@ -64,6 +76,7 @@ pub struct SyncReport {
     pub files_changed: usize,
     pub files_deleted: usize,
     pub nodes_written: usize,
+    /// Code nodes retired (gone from the code; they stay in the graph with `ended_ms`).
     pub nodes_deleted: usize,
     pub renamed: usize,
     pub edge_files: usize,
@@ -406,6 +419,26 @@ fn props_hash(props: &Map<String, Value>) -> String {
     hash_hex(serde_json::to_string(props).unwrap_or_default().as_bytes())
 }
 
+/// Sid of the project's code root (`Code:Repo`, [`model::directory_nodes`]).
+const REPO_SID: &str = "repo:";
+
+/// The marker file earlier versions kept beside the line store while a sync wrote.
+const LEGACY_PENDING_MARKER: &str = "sync-pending";
+
+/// Mark a sync as in progress on the project's `Repo` node (created when the tree has none yet).
+async fn mark_sync_pending(graph: &Graph, ig_id: &str) -> Result<Rows, RpcError> {
+    graph
+        .run(
+            ig_id,
+            &format!(
+                "{} MERGE (r:Code:Repo {{sid: $sid}}) SET r.kind = 'repo', r.sync_pending_ms = $now, r.first_ms = CASE WHEN r.first_ms IS NULL THEN $now ELSE r.first_ms END, r.last_ms = CASE WHEN r.last_ms IS NULL THEN $now ELSE r.last_ms END",
+                layer::OBSERVED_WRITE
+            ),
+            params! { "sid" => REPO_SID, "now" => cc_protocol::contracts::now_ms() },
+        )
+        .await
+}
+
 fn labels_for(kind: &str) -> String {
     let label = label_of(kind);
     if model::SYMBOL_KINDS.contains(&kind) { format!("Code:Sym:{label}") } else { format!("Code:{label}") }
@@ -422,9 +455,27 @@ impl CodeTree {
     pub async fn open(root: PathBuf, ig_name: String, graph: Arc<Graph>, lines_dir: PathBuf, langs: Arc<Languages>) -> Result<Arc<Self>, RpcError> {
         let ig_id = graph.ensure_project(&ig_name).await?;
         let lines = LineStore::new(lines_dir);
+        // Earlier versions marked a sync in progress with a file beside the line store: what it
+        // said moves onto the Repo node once, and the file goes.
+        let legacy_marker = lines.dir().join(LEGACY_PENDING_MARKER);
+        let mut legacy_pending = false;
+        if legacy_marker.exists() {
+            match mark_sync_pending(&graph, &ig_id).await {
+                Ok(_) => {
+                    if let Err(error) = std::fs::remove_file(&legacy_marker) {
+                        tracing::warn!(%error, "the old sync marker file could not be removed");
+                    }
+                }
+                // The file stays until its state is in the graph; this run repairs all the same.
+                Err(error) => {
+                    legacy_pending = true;
+                    tracing::warn!(%error, "the old sync marker could not be moved onto the Repo node");
+                }
+            }
+        }
         // This tree is not exposed yet: collect old sessions' entries without an indexing or
         // model lock. Ordinary saves never walk the line store.
-        let rows = graph.run(&ig_id, &format!("{} MATCH (f:File) RETURN f.content_hash", layer::OBSERVED_READ), Map::new()).await?;
+        let rows = graph.run(&ig_id, &format!("{} MATCH (f:File) WHERE f.ended_ms IS NULL RETURN f.content_hash", layer::OBSERVED_READ), Map::new()).await?;
         let live: HashSet<String> = rows.column(0).filter_map(Value::as_str).map(str::to_owned).collect();
         let cleanup = lines.clone();
         match tokio::task::spawn_blocking(move || cleanup.retain(&live)).await {
@@ -441,7 +492,7 @@ impl CodeTree {
             lines,
             status: Mutex::new(TreeStatus { state: "indexing".into(), externals_state: "pending".into(), ..TreeStatus::default() }),
             sync_lock: Mutex::new(()),
-            sync_pending: AtomicBool::new(false),
+            sync_pending: AtomicBool::new(legacy_pending),
             edge_hashes: Mutex::new(HashMap::new()),
             structure_hash: Mutex::new(String::new()),
             indexes_created: Mutex::new(false),
@@ -486,7 +537,10 @@ impl CodeTree {
         let parse_ms = started.elapsed().as_millis() as u64;
         // What the graph already holds.
         let existing = self
-            .run(&format!("{} MATCH (f:File) RETURN f.path, f.content_hash, f.language, f.extractor, f.extractor_version, f.edge_hash", layer::OBSERVED_READ), Map::new())
+            .run(
+                &format!("{} MATCH (f:File) WHERE f.ended_ms IS NULL RETURN f.path, f.content_hash, f.language, f.extractor, f.extractor_version, f.edge_hash", layer::OBSERVED_READ),
+                Map::new(),
+            )
             .await?;
         let mut stored: HashMap<String, StoredFile> = HashMap::new();
         let mut stored_edges: HashMap<String, String> = HashMap::new();
@@ -511,27 +565,36 @@ impl CodeTree {
             }
         }
         // Rebuild outgoing edges on reconciliation passes, and on a cold pass after a process that
-        // stopped inside a sync (it may have written File metadata but not its edges: the marker
-        // file says so). A graph from before parameters moved onto their definitions has every node
-        // written again.
+        // stopped inside a sync (it may have written File metadata but not its edges: the Repo
+        // node's `sync_pending_ms` says so). A graph from before parameters moved onto their
+        // definitions has every node written again.
         let params_as_nodes = !self.run(&format!("{} MATCH (p:Param) RETURN p.sid LIMIT 1", layer::OBSERVED_READ), Map::new()).await?.rows.is_empty();
         // A graph an earlier way of writing nodes wrote (the ids changed since) is written again.
-        let repo = self.run(&format!("{} MATCH (r:Repo) RETURN r.structure_hash, r.model_version", layer::OBSERVED_READ), Map::new()).await?;
+        let repo = self
+            .run(&format!("{} MATCH (r:Repo {{sid: $sid}}) RETURN r.structure_hash, r.model_version, r.sync_pending_ms", layer::OBSERVED_READ), params! { "sid" => REPO_SID })
+            .await?;
         let stored_version = repo.rows.first().and_then(|row| row.get(1)).and_then(Value::as_u64);
+        let interrupted = repo.rows.first().and_then(|row| row.get(2)).is_some_and(|value| !value.is_null());
         let older_model = !stored.is_empty() && stored_version != Some(MODEL_VERSION);
-        let repairing = self.sync_pending.load(Ordering::Acquire) || self.pending_marker().exists() || params_as_nodes || older_model;
+        let repairing = self.sync_pending.load(Ordering::Acquire) || interrupted || params_as_nodes || older_model;
         self.invalidate_write_caches().await;
         if repairing {
             // A node written twice (a write that created instead of merging) takes every edge to it
-            // twice: the copies go, and the files are written again below, one node each.
+            // twice: the copies go, and the files are written again below, one node each. Only
+            // live copies count: a retired node may share its sid with a live one (its kind changed).
             let doubled = self
-                .run(&format!("{} MATCH (n:Code) WITH n.sid AS sid, count(n) AS copies WHERE copies > 1 RETURN sid", layer::OBSERVED_READ), Map::new())
+                .run(
+                    &format!("{} MATCH (n:Code) WHERE n.ended_ms IS NULL WITH n.sid AS sid, count(n) AS copies WHERE copies > 1 RETURN sid", layer::OBSERVED_READ),
+                    Map::new(),
+                )
                 .await?;
             let sids: Vec<String> = doubled.column(0).filter_map(Value::as_str).map(str::to_owned).collect();
             if !sids.is_empty() {
                 tracing::warn!(project = %self.ig_name, sids = sids.len(), "removing nodes stored more than once before the repair writes them again");
+                // Duplicate copies are a broken write, not code that existed: they are removed
+                // (retiring them would let the next write merge into every copy again).
                 for chunk in sids.chunks(BATCH_ROWS) {
-                    self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+                    self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
                 }
                 stored.retain(|path, _| !sids.iter().any(|sid| *sid == crate::model::file_sid(path)));
             }
@@ -597,7 +660,7 @@ impl CodeTree {
         Ok(report)
     }
 
-    /// Re-index specific paths (repository-relative): re-read those that exist, delete the rest.
+    /// Re-index specific paths (repository-relative): re-read those that exist, retire the rest.
     /// When the language plugins changed since the files were matched, the files whose plugin
     /// changed come along ([`CodeTree::recover`]).
     pub async fn refresh_paths(&self, paths: &[String]) -> Result<SyncReport, RpcError> {
@@ -660,7 +723,7 @@ impl CodeTree {
     }
 
     /// Re-read `paths` (content changes) and `coverage` (files to extract again although their
-    /// content did not change), delete the paths that are gone.
+    /// content did not change), retire the paths that are gone.
     async fn reindex(&self, snapshot: &Arc<Snapshot>, paths: &[String], coverage: Vec<String>) -> Result<SyncReport, RpcError> {
         let started = Instant::now();
         self.note_plugins(snapshot).await;
@@ -734,23 +797,25 @@ impl CodeTree {
         *self.coverage_key.lock().await = None;
     }
 
-    /// Present while a sync writes: a process that stops inside one leaves it, and the next cold
-    /// pass rebuilds every file's edges instead of trusting the stored edge hashes.
-    fn pending_marker(&self) -> PathBuf {
-        self.lines.dir().join("sync-pending")
+    /// `sync_pending_ms` on the Repo node is set while a sync writes: a process that stops inside
+    /// one leaves it, and the next cold pass rebuilds every file's edges instead of trusting the
+    /// stored edge hashes.
+    async fn clear_sync_pending(&self) -> Result<Rows, RpcError> {
+        self.run(&format!("{} MATCH (r:Repo {{sid: $sid}}) SET r.sync_pending_ms = null", layer::OBSERVED_WRITE), params! { "sid" => REPO_SID }).await
     }
 
     async fn sync_prepared(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>, model: Model) -> Result<SyncReport, RpcError> {
         // Leave this set on error or cancellation: the next refresh reconciles all persisted work.
         self.sync_pending.store(true, Ordering::Release);
-        let marker = self.pending_marker();
-        if let Err(error) = std::fs::create_dir_all(self.lines.dir()).and_then(|()| std::fs::write(&marker, b"")) {
-            tracing::warn!(%error, "the sync marker could not be written");
+        if let Err(error) = mark_sync_pending(&self.graph, &self.ig_id).await {
+            tracing::warn!(%error, "the sync in progress could not be recorded on the Repo node");
         }
         let result = self.write_sync(changed, deleted, model).await;
         if result.is_ok() {
             self.sync_pending.store(false, Ordering::Release);
-            let _ = std::fs::remove_file(&marker);
+            if let Err(error) = self.clear_sync_pending().await {
+                tracing::warn!(%error, "the finished sync could not be recorded on the Repo node; the next cold pass rebuilds the edges");
+            }
         } else {
             self.invalidate_write_caches().await;
         }
@@ -759,6 +824,8 @@ impl CodeTree {
 
     async fn write_sync(&self, changed: Vec<(FileFacts, String)>, deleted: Vec<String>, mut model: Model) -> Result<SyncReport, RpcError> {
         let started = Instant::now();
+        // `last_ms` of what this sync writes, `ended_ms` of what it retires.
+        let now = cc_protocol::contracts::now_ms();
         let mut report = SyncReport { files_changed: changed.len(), files_deleted: deleted.len(), ..SyncReport::default() };
         report.changed_paths = changed.iter().map(|(f, _)| f.path.clone()).chain(deleted.iter().cloned()).collect();
         for (facts, text) in &changed {
@@ -816,7 +883,7 @@ impl CodeTree {
         for chunk in touched.chunks(BATCH_ROWS) {
             let rows = self
                 .run(
-                    &format!("{} UNWIND $paths AS p MATCH (n:Code {{path: p}}) WHERE n.kind <> 'directory' AND n.kind <> 'repo' RETURN n.sid, n.kind, n.body_hash, n.props_hash, p", layer::OBSERVED_READ),
+                    &format!("{} UNWIND $paths AS p MATCH (n:Code {{path: p}}) WHERE n.ended_ms IS NULL AND n.kind <> 'directory' AND n.kind <> 'repo' RETURN n.sid, n.kind, n.body_hash, n.props_hash, p", layer::OBSERVED_READ),
                     params! { "paths" => chunk },
                 )
                 .await?;
@@ -860,6 +927,32 @@ impl CodeTree {
             let renamed_old: HashSet<&String> = renames.iter().map(|(o, _)| o).collect();
             removed.retain(|sid| !renamed_old.contains(sid));
         }
+        // A rename onto the sid of a retired node would leave two nodes with that sid and labels
+        // (the next write merges into both): the old definition is retired instead and the retired
+        // one comes back.
+        if !renames.is_empty() {
+            let targets: Vec<&str> = renames.iter().map(|(_, new_sid)| new_sid.as_str()).collect();
+            let rows = self
+                .run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NOT NULL RETURN n.sid, n.kind", layer::OBSERVED_READ), params! { "sids" => targets })
+                .await?;
+            statements += 1;
+            let taken: HashSet<(String, String)> = rows
+                .rows
+                .iter()
+                .filter_map(|row| Some((row.first()?.as_str()?.to_owned(), row.get(1)?.as_str()?.to_owned())))
+                .collect();
+            if !taken.is_empty() {
+                renames.retain(|(old_sid, new_sid)| {
+                    let kind = old.get(old_sid).map(|(kind, ..)| kind.clone()).unwrap_or_default();
+                    if taken.contains(&(new_sid.clone(), kind)) {
+                        removed.push(old_sid.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
         report.renamed = renames.len();
         report.renames = renames.clone();
         let renamed_new: HashSet<&str> = renames.iter().map(|(_, n)| n.as_str()).collect();
@@ -868,24 +961,29 @@ impl CodeTree {
         if !renames.is_empty() {
             let rows: Vec<Value> = renames.iter().map(|(o, n)| json!({"old": o, "new": n})).collect();
             for chunk in chunk_rows(rows) {
-                self.run(&format!("{} UNWIND $rows AS r MATCH (n:Code {{sid: r.old}}) SET n.sid = r.new", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
+                self.run(&format!("{} UNWIND $rows AS r MATCH (n:Code {{sid: r.old}}) WHERE n.ended_ms IS NULL SET n.sid = r.new, n.last_ms = $now", layer::OBSERVED_WRITE), params! { "rows" => chunk, "now" => now }).await?;
                 statements += 1;
             }
         }
-        // 5. Delete removed nodes (and files that are gone).
-        if !removed.is_empty() {
-            for chunk in removed.chunks(BATCH_ROWS) {
-                self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
-                statements += 1;
-            }
+        // 5. Retire removed nodes (and files that are gone): what links to them stays. Their code
+        // edges go, so the files whose edges point at them write their edges again (a definition
+        // whose kind changed keeps its sid: those files' edge sets may not differ).
+        let mut relinked: HashSet<String> = HashSet::new();
+        for chunk in removed.chunks(BATCH_ROWS) {
+            let rows = self
+                .run(&format!("{} UNWIND $sids AS s MATCH (a:Code)-[r]->(n:Code {{sid: s}}) WHERE n.ended_ms IS NULL RETURN DISTINCT a.path", layer::OBSERVED_READ), params! { "sids" => chunk })
+                .await?;
+            statements += 1;
+            relinked.extend(rows.column(0).filter_map(Value::as_str).map(str::to_owned));
         }
+        statements += self.retire_code(&removed, "removed from the code", now).await?;
         report.nodes_deleted = removed.len();
 
         // 6. Which files need their outgoing edges replaced.
         let stored_hashes = self.edge_hashes.lock().await.clone();
         let changed_set: HashSet<&str> = changed_paths.iter().map(String::as_str).collect();
         let dirty: Vec<&(String, Vec<EdgeRow>, String)> =
-            all_edges.iter().filter(|(path, _, hash)| !kept.contains(path) && (changed_set.contains(path.as_str()) || stored_hashes.get(path) != Some(hash))).collect();
+            all_edges.iter().filter(|(path, _, hash)| !kept.contains(path) && (changed_set.contains(path.as_str()) || relinked.contains(path) || stored_hashes.get(path) != Some(hash))).collect();
         report.edge_files = dirty.len();
         // Source sids of dirty files that already exist in the graph (new nodes have no edges yet).
         let mut dirty_sources: Vec<String> = Vec::new();
@@ -902,7 +1000,7 @@ impl CodeTree {
             }
         }
         for chunk in dirty_sources.chunks(BATCH_ROWS) {
-            self.run(&format!("{} UNWIND $sids AS s MATCH (a:Code {{sid: s}})-[r]->() DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+            self.run(&format!("{} UNWIND $sids AS s MATCH (a:Code {{sid: s}})-[r]->() WHERE a.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
             statements += 1;
         }
 
@@ -954,7 +1052,7 @@ impl CodeTree {
                 })
                 .collect();
             for chunk in chunk_rows(rows) {
-                self.run(&format!("{} UNWIND $rows AS r MATCH (n:Sym {{sid: r.sid}}) SET n.summary = r.s, n.summary_hash = r.h", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
+                self.run(&format!("{} UNWIND $rows AS r MATCH (n:Sym {{sid: r.sid}}) WHERE n.ended_ms IS NULL SET n.summary = r.s, n.summary_hash = r.h, n.last_ms = $now", layer::OBSERVED_WRITE), params! { "rows" => chunk, "now" => now }).await?;
                 statements += 1;
             }
         }
@@ -985,7 +1083,7 @@ impl CodeTree {
         }
         if !edge_hash_updates.is_empty() {
             for chunk in chunk_rows(edge_hash_updates) {
-                self.run(&format!("{} UNWIND $rows AS r MATCH (f:File {{sid: r.sid}}) SET f.edge_hash = r.hash", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
+                self.run(&format!("{} UNWIND $rows AS r MATCH (f:File {{sid: r.sid}}) WHERE f.ended_ms IS NULL SET f.edge_hash = r.hash, f.last_ms = $now", layer::OBSERVED_WRITE), params! { "rows" => chunk, "now" => now }).await?;
                 statements += 1;
             }
         }
@@ -1018,12 +1116,9 @@ impl CodeTree {
             self.run(&format!("{} MATCH (d:Code)-[r:CONTAINS]->() WHERE d:Directory OR d:Repo DELETE r", layer::OBSERVED_WRITE), Map::new()).await?;
             statements += 1;
             let live: Vec<&str> = dir_nodes.iter().map(|n| n.sid.as_str()).collect();
-            let stale = self.run(&format!("{} MATCH (d:Directory) RETURN d.sid", layer::OBSERVED_READ), Map::new()).await?;
+            let stale = self.run(&format!("{} MATCH (d:Directory) WHERE d.ended_ms IS NULL RETURN d.sid", layer::OBSERVED_READ), Map::new()).await?;
             let stale: Vec<String> = stale.column(0).filter_map(|v| v.as_str()).filter(|s| !live.contains(s)).map(str::to_owned).collect();
-            if !stale.is_empty() {
-                self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => stale }).await?;
-                statements += 1;
-            }
+            statements += self.retire_code(&stale, "directory removed", now).await?;
         }
 
         // 9. Edges of dirty files (and the directory structure when it changed).
@@ -1039,13 +1134,20 @@ impl CodeTree {
 
         // 10. Orphaned shared nodes.
         let live_shared: HashSet<&str> = shared_nodes.iter().map(|n| n.sid.as_str()).collect();
-        let existing_shared = self.run(&format!("{} MATCH (n:Code) WHERE n:EnvVar OR n:Dependency RETURN n.sid", layer::OBSERVED_READ), Map::new()).await?;
+        let existing_shared = self.run(&format!("{} MATCH (n:Code) WHERE (n:EnvVar OR n:Dependency) AND n.ended_ms IS NULL RETURN n.sid", layer::OBSERVED_READ), Map::new()).await?;
         statements += 1;
         let orphans: Vec<String> = existing_shared.column(0).filter_map(|v| v.as_str()).filter(|s| !live_shared.contains(s)).map(str::to_owned).collect();
         if !orphans.is_empty() {
+            // Third-party API nodes earlier versions hung under a dependency go with it (derived,
+            // no longer written); the dependency or variable itself is retired.
             self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})-[:EXPORTS]->(x:ExternalSymbol) DETACH DELETE x", layer::OBSERVED_WRITE), params! { "sids" => orphans.clone() }).await?;
-            self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) DETACH DELETE n", layer::OBSERVED_WRITE), params! { "sids" => orphans }).await?;
-            statements += 2;
+            statements += 1;
+            statements += self.retire_code(&orphans, "no longer named by the code", now).await?;
+            // Written again when it comes back.
+            let mut written = self.shared_hashes.lock().await;
+            for sid in &orphans {
+                written.remove(sid);
+            }
         }
         {
             let mut hashes = self.edge_hashes.lock().await;
@@ -1132,7 +1234,7 @@ impl CodeTree {
 
     /// `summary_hash` of every definition that has one, by the hash of its sid.
     async fn stored_summary_hashes(&self) -> Result<HashMap<u64, u64>, RpcError> {
-        let rows = self.run(&format!("{} MATCH (n:Sym) WHERE n.summary_hash IS NOT NULL RETURN n.sid, n.summary_hash", layer::OBSERVED_READ), Map::new()).await?;
+        let rows = self.run(&format!("{} MATCH (n:Sym) WHERE n.summary_hash IS NOT NULL AND n.ended_ms IS NULL RETURN n.sid, n.summary_hash", layer::OBSERVED_READ), Map::new()).await?;
         Ok(rows
             .rows
             .iter()
@@ -1144,7 +1246,31 @@ impl CodeTree {
             .collect())
     }
 
+    /// Retire code nodes that are gone: their edges to and from other code nodes go (derived from
+    /// the files, rebuilt every sync), the nodes stay with `ended_ms`, `ended_reason`,
+    /// `state: 'gone'` and `last_ms`, and so does every edge other records hold to them.
+    async fn retire_code(&self, sids: &[String], reason: &str, now: u64) -> Result<usize, RpcError> {
+        let mut statements = 0;
+        for chunk in sids.chunks(BATCH_ROWS) {
+            self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})-[r]->(:Code) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+            self.run(&format!("{} UNWIND $sids AS s MATCH (:Code)-[r]->(n:Code {{sid: s}}) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+            self.run(
+                &format!(
+                    "{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $now, n.ended_reason = $reason, n.state = 'gone', n.last_ms = $now",
+                    layer::OBSERVED_WRITE
+                ),
+                params! { "sids" => chunk, "now" => now, "reason" => reason },
+            )
+            .await?;
+            statements += 3;
+        }
+        Ok(statements)
+    }
+
+    /// Merge nodes by sid: a new one gets `first_ms`, every written one `last_ms`, and a retired
+    /// one written again comes back (its retirement is cleared).
     async fn write_nodes(&self, nodes: &[NodeRow]) -> Result<usize, RpcError> {
+        let now = cc_protocol::contracts::now_ms();
         let mut statements = 0;
         // Group by label set, preserving the order of first appearance.
         let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
@@ -1158,7 +1284,14 @@ impl CodeTree {
         }
         for (labels, rows) in groups {
             for chunk in chunk_rows(rows) {
-                self.run(&format!("{} UNWIND $rows AS r MERGE (n:{labels} {{sid: r.sid}}) SET n += r.p", layer::OBSERVED_WRITE), params! { "rows" => chunk }).await?;
+                self.run(
+                    &format!(
+                        "{} UNWIND $rows AS r MERGE (n:{labels} {{sid: r.sid}}) SET n += r.p, n.first_ms = CASE WHEN n.first_ms IS NULL THEN $now ELSE n.first_ms END, n.last_ms = $now, n.ended_ms = null, n.ended_reason = null, n.state = CASE WHEN n.state = 'gone' THEN null ELSE n.state END",
+                        layer::OBSERVED_WRITE
+                    ),
+                    params! { "rows" => chunk, "now" => now },
+                )
+                .await?;
                 statements += 1;
                 self.ensure_indexes().await?;
             }
@@ -1166,7 +1299,11 @@ impl CodeTree {
         Ok(statements)
     }
 
+    /// Create edges between live code nodes (a retired node may share a sid with a live one).
+    /// Edges are derived and written again whenever their file's edge set changes, so `first_ms`
+    /// is when this edge set was written.
     async fn write_edges(&self, edges: &[&EdgeRow]) -> Result<usize, RpcError> {
+        let now = cc_protocol::contracts::now_ms();
         let mut statements = 0;
         let mut groups: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
         for edge in edges {
@@ -1175,8 +1312,11 @@ impl CodeTree {
         for (rel, rows) in groups {
             for chunk in chunk_rows(rows) {
                 self.run(
-                    &format!("{} UNWIND $rows AS r MATCH (a:Code {{sid: r.a}}), (b:Code {{sid: r.b}}) CREATE (a)-[e:{rel}]->(b) SET e += r.p", layer::OBSERVED_WRITE),
-                    params! { "rows" => chunk },
+                    &format!(
+                        "{} UNWIND $rows AS r MATCH (a:Code {{sid: r.a}}), (b:Code {{sid: r.b}}) WHERE a.ended_ms IS NULL AND b.ended_ms IS NULL CREATE (a)-[e:{rel}]->(b) SET e += r.p, e.first_ms = $now, e.last_ms = $now",
+                        layer::OBSERVED_WRITE
+                    ),
+                    params! { "rows" => chunk, "now" => now },
                 )
                 .await?;
                 statements += 1;

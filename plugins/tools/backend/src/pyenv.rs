@@ -11,8 +11,9 @@
 //! (:Venv {key: venv path, workspace, method, created_ms})-[:ON]->(:Machine)   an automatic venv
 //! ```
 //!
-//! The venv folder is bytes and stays. Its `.cortex-ready` file marks a finished install (the
-//! folder is usable), not a record.
+//! The venv folder is bytes and stays. A finished install is its node: the venv is ready when the
+//! node is there (not retired) and `bin/python` exists. Earlier versions marked it with a
+//! `.cortex-ready` file holding the method; that file is written to the node once and removed.
 
 use crate::util;
 use std::path::{Path, PathBuf};
@@ -63,10 +64,70 @@ pub fn auto_dir(home: &Path, workspace: &Path) -> PathBuf {
     home.join("venvs").join(&hash[..16])
 }
 
+/// The marker earlier versions wrote into a finished venv (its content: the creation method).
 const READY: &str = ".cortex-ready";
 
-fn ready(dir: &Path) -> bool {
-    dir.join(READY).is_file() && dir.join("bin/python").exists()
+/// One query: while the memory plugin does not serve, the folder is used as it is (no wait).
+const QUERY_ATTEMPTS: u32 = 1;
+
+/// How the venv's node says it was made: `Ok(Some(method))` when the venv has a live node,
+/// `Ok(None)` when it has none, `Err` when the graph cannot be asked.
+async fn recorded_method(graph: &crate::graph::Graph, dir: &Path) -> Result<Option<String>, String> {
+    let found = graph
+        .query(
+            "MATCH (v:Venv) WHERE v.key = $key AND v.ended_ms IS NULL RETURN v.method LIMIT 1",
+            serde_json::json!({ "key": dir.to_string_lossy() }),
+            1,
+            QUERY_ATTEMPTS,
+        )
+        .await
+        .map_err(|error| error.message)?;
+    Ok(found
+        .rows
+        .first()
+        .map(|row| row.first().and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()))
+}
+
+/// When a file was last written, in epoch ms (now when unknown).
+fn modified_ms(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_else(util::now_ms)
+}
+
+/// The method of a ready venv, or `None` when it must be (re)created. A `.cortex-ready` file of
+/// an earlier version, with no node yet, becomes the node and is removed.
+async fn ready(graph: &crate::graph::Graph, dir: &Path, workspace: &Path) -> Option<String> {
+    if !dir.join("bin/python").exists() {
+        return None;
+    }
+    let marker = dir.join(READY);
+    match recorded_method(graph, dir).await {
+        Ok(Some(method)) => {
+            let _ = std::fs::remove_file(&marker);
+            Some(method)
+        }
+        Ok(None) => {
+            let method = std::fs::read_to_string(&marker).ok()?.trim().to_owned();
+            let batch = venv_batch(dir, &util::canonical_lenient(workspace).to_string_lossy(), &method, modified_ms(&marker));
+            match graph.put_wait(vec![batch]).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                Err(error) => tracing::error!(error = %error.message, venv = %dir.display(), "the venv's record was not written to the graph; its marker file is kept"),
+            }
+            Some(method)
+        }
+        // The graph cannot be asked: a venv with its interpreter and pip is used as it is rather
+        // than rebuilt.
+        Err(error) => {
+            tracing::warn!(error = %error, venv = %dir.display(), "the venv's record could not be read; using the folder as it is");
+            dir.join("bin/pip").exists().then(|| std::fs::read_to_string(&marker).unwrap_or_default().trim().to_owned())
+        }
+    }
 }
 
 async fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
@@ -101,8 +162,8 @@ async fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
 /// `requires-python`) and then without project discovery; `python3 -m venv` only when uv is missing
 /// or fails. Returns the method used.
 pub async fn ensure_auto(graph: &crate::graph::Graph, dir: &Path, workspace: &Path) -> Result<String, String> {
-    if ready(dir) {
-        return Ok(std::fs::read_to_string(dir.join(READY)).unwrap_or_default().trim().to_owned());
+    if let Some(method) = ready(graph, dir, workspace).await {
+        return Ok(method);
     }
     let parent = dir.parent().ok_or("venv directory has no parent")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
@@ -152,8 +213,12 @@ pub async fn ensure_auto(graph: &crate::graph::Graph, dir: &Path, workspace: &Pa
             return Err(format!("venv created ({method}) but pip could not be installed: {error}"));
         }
     }
-    std::fs::write(dir.join(READY), format!("{method}\n")).map_err(|error| format!("{}: {error}", dir.display()))?;
-    graph.put(venv_batch(dir, &util::canonical_lenient(workspace).to_string_lossy(), method, util::now_ms()));
+    // The node is what makes the venv ready: wait until the graph took it.
+    let batch = venv_batch(dir, &util::canonical_lenient(workspace).to_string_lossy(), method, util::now_ms());
+    if let Err(error) = graph.put_wait(vec![batch]).await {
+        tracing::error!(error = %error.message, venv = %dir.display(), "the venv's record was not written to the graph");
+        return Err(format!("venv created ({method}) but its record was not kept in the graph: {}", error.message));
+    }
     Ok(method.to_owned())
 }
 
@@ -171,8 +236,8 @@ pub fn remove(graph: &crate::graph::Graph, dir: &Path) {
     graph.retire(vec![crate::graph::gref("Venv", &dir.to_string_lossy())], "removed");
 }
 
-/// The workspace file earlier versions wrote into each venv (`.cortex-workspace`): written to the
-/// graph as the venv's node, then removed.
+/// The workspace file earlier versions wrote into each venv (`.cortex-workspace`, with the method
+/// in `.cortex-ready`): written to the graph as the venv's node, then both are removed.
 async fn import_markers(graph: &crate::graph::Graph, home: &Path) {
     let Ok(entries) = std::fs::read_dir(home.join("venvs")) else { return };
     let mut found = Vec::new();
@@ -181,22 +246,18 @@ async fn import_markers(graph: &crate::graph::Graph, home: &Path) {
         let marker = dir.join(".cortex-workspace");
         let Ok(recorded) = std::fs::read_to_string(&marker) else { continue };
         let method = std::fs::read_to_string(dir.join(READY)).unwrap_or_default().trim().to_owned();
-        let created_ms = std::fs::metadata(&marker)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| since.as_millis() as u64)
-            .unwrap_or_else(util::now_ms);
-        found.push((marker, venv_batch(&dir, recorded.trim_end_matches('\n'), &method, created_ms)));
+        let created_ms = modified_ms(&marker);
+        found.push((dir.clone(), marker, venv_batch(&dir, recorded.trim_end_matches('\n'), &method, created_ms)));
     }
     if found.is_empty() {
         return;
     }
-    let batches = found.iter().map(|(_, batch)| batch.clone()).collect();
+    let batches = found.iter().map(|(_, _, batch)| batch.clone()).collect();
     match graph.put_wait(batches).await {
         Ok(()) => {
-            for (marker, _) in found {
+            for (dir, marker, _) in found {
                 let _ = std::fs::remove_file(marker);
+                let _ = std::fs::remove_file(dir.join(READY));
             }
         }
         Err(error) => tracing::error!(error = %error.message, "the old venv records were not written to the graph; their files are kept"),

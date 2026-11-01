@@ -257,7 +257,7 @@ pub fn terminal_edits(script: &str, own: &dyn Fn(&str) -> bool) -> Vec<String> {
 }
 
 /// Literal value of an argument node, or None when it depends on run-time expansion.
-fn literal(node: Node, source: &[u8]) -> Option<String> {
+pub(crate) fn literal(node: Node, source: &[u8]) -> Option<String> {
     let text = node.utf8_text(source).ok()?;
     match node.kind() {
         "word" | "number" => Some(unescape_word(text)),
@@ -320,12 +320,12 @@ fn unescape_double(text: &str) -> String {
 }
 
 /// Arguments of a command node as literals (None entries are dynamic).
-fn arguments(node: Node, source: &[u8]) -> Vec<Option<String>> {
+pub(crate) fn arguments(node: Node, source: &[u8]) -> Vec<Option<String>> {
     let mut cursor = node.walk();
     node.children_by_field_name("argument", &mut cursor).map(|arg| literal(arg, source)).collect()
 }
 
-fn program_name(text: &str) -> &str {
+pub(crate) fn program_name(text: &str) -> &str {
     text.rsplit('/').next().unwrap_or(text)
 }
 
@@ -345,7 +345,7 @@ fn inspect_command(node: Node, source: &[u8], context: &Context, depth: usize, o
 }
 
 /// Wrappers that run another command: skip their own options to find the real program.
-fn unwrap(words: &[Option<String>]) -> Option<(usize, bool)> {
+pub(crate) fn unwrap(words: &[Option<String>]) -> Option<(usize, bool)> {
     let first = words.first()?.as_deref().map(program_name)?;
     let mut index = 1;
     let skip_options = |index: &mut usize, takes_value: &[&str]| {

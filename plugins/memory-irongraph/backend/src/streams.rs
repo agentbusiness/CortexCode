@@ -3,6 +3,10 @@
 //! ```text
 //! topic `<name>`          memory.stream.*: one record per value, `{at_ms, value}` as JSON
 //! topic `queue.<name>`    memory.queue.*: one record per message, the same envelope, kept 30 days
+//! topics the plugin appends to itself (`app.sessions`, `settings`, `security.status`): made by
+//!                         their first append, kept [`crate::db::KEPT_DAYS`] days; `board`
+//!                         (the work board, kept 90 days). [`OWN_TOPICS`]: refused to
+//!                         memory.stream.append, never dropped as expired
 //! WORKSPACE layer, a queue's consumers and what they hold:
 //! (:Queue {key: name, topic})-[:ON]->(:Machine)
 //! (:QueueConsumer {key: '<queue>:<consumer>', queue, consumer, offset, updated_ms})-[:READS]->(:Queue)
@@ -51,8 +55,14 @@ const LEASE_MIN_MS: u64 = 1_000;
 const LEASE_MAX_MS: u64 = 24 * 60 * 60 * 1000;
 /// Messages a consumer may hold unacked: past this, a take only hands out expired leases again.
 const PENDING_MAX: usize = 10_000;
-/// Topic prefixes the plugin writes itself.
-const RESERVED_TOPICS: &[&str] = &["queue.", "session."];
+/// The topics the plugin writes itself: a name ending in `.` is a prefix, any other a whole name.
+/// `memory.stream.append` refuses them and [`StreamStore::drop_expired`] keeps them.
+const OWN_TOPICS: &[&str] = &["queue.", "session.", "app.sessions", "settings", "security.status", "board"];
+
+/// The entry of [`OWN_TOPICS`] that `topic` is, if any.
+fn own_topic(topic: &str) -> Option<&'static str> {
+    OWN_TOPICS.iter().copied().find(|own| if own.ends_with('.') { topic.starts_with(own) } else { topic == *own })
+}
 
 /// One consumer's position in a queue.
 #[derive(Debug, Clone, Default)]
@@ -118,8 +128,9 @@ impl StreamStore {
     /// `memory.stream.append`. Returns the first offset written.
     pub async fn append(&self, topic: &str, records: &[Value], retention_days: Option<u32>) -> Result<u64, RpcError> {
         validate_name("topic", topic, 200)?;
-        if let Some(prefix) = RESERVED_TOPICS.iter().find(|prefix| topic.starts_with(**prefix)) {
-            return Err(RpcError::invalid_params(format!("topics starting `{prefix}` are the plugin's own (queues use memory.queue.publish)")));
+        if let Some(own) = own_topic(topic) {
+            let what = if own.ends_with('.') { format!("topics starting `{own}` are") } else { format!("the topic `{own}` is") };
+            return Err(RpcError::invalid_params(format!("{what} the plugin's own: name another topic (queues use memory.queue.publish)")));
         }
         let days = retention_days.unwrap_or(RETENTION_DAYS);
         if !(1..=3650).contains(&days) {
@@ -204,6 +215,24 @@ impl StreamStore {
             .collect();
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(topics)
+    }
+
+    /// Drop the streams whose every record has passed its retention (a finished Run's output, an
+    /// old shell's history): an empty topic is not kept. Queues and the plugin's own topics stay.
+    pub async fn drop_expired(&self) -> Result<u32, RpcError> {
+        let mut dropped = 0;
+        for (name, ..) in self.graph.topics(&self.ig).await? {
+            if own_topic(&name).is_some() {
+                continue;
+            }
+            let (records, _, end) = self.graph.stream_page(&self.ig, &name, 0, 1, PAGE_BYTES).await?;
+            if records.is_empty() && end > 0 {
+                self.graph.drop_topic(&self.ig, &name).await?;
+                self.topics.lock().await.remove(&name);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 
     /// `memory.queue.publish`. Returns how many were added.

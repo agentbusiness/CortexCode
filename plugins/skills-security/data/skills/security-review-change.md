@@ -19,6 +19,7 @@ The shapes catch sinks; the logic you catch by reading the diff (`git diff`, `gi
 - A new request field, argument or message field: which old code receives it, and does that code trust its callers?
 - A removed or loosened condition, a widened allowlist, a new default, a new `unsafe` block, a disabled check in tests that leaks into production code.
 - A new dependency or a version change: what does it execute at install or import, and is it pinned in the lockfile?
+- A changed AI-agent file (`.mcp.json`, `.claude/settings.json`, `AGENTS.md`, a skill): the scan lists unpinned servers, tokens written in the file, permission checks turned off and hidden text.
 - A changed error path: does failure fall open (no auth, no verification, no limit)?
 
 ## 3. Trace each line

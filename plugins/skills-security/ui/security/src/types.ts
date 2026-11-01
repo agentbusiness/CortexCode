@@ -21,6 +21,23 @@ export interface SecurityAudit {
   skill_version: string;
   /** Where the Markdown export of the report was written, when it was. */
   report_path?: string | null;
+  /** The map: the working tree read, its head, and what it holds (lists of scalars). */
+  root?: string;
+  git_head?: string;
+  dirty?: boolean;
+  files?: number;
+  langs?: string[];
+  stack?: string[];
+  lockfiles?: string[];
+  not_parsed?: string[];
+  agent_files?: string[];
+  /** When the dependency check ran, how many pinned packages it checked, why it did not run. */
+  deps_checked_ms?: number | null;
+  deps_packages?: number;
+  deps_note?: string | null;
+  /** The audit before this one; set when a newer audit began. */
+  previous_id?: string | null;
+  ended_ms?: number | null;
 }
 
 /** One step of a finding's trace, entry point first, sink last. */
@@ -45,18 +62,19 @@ export interface SecurityQuickFix {
   commands: string[];
 }
 
-/** `confirmed`, `needs_validation` or `hardening`. */
-export type SecurityVerdict = 'confirmed' | 'needs_validation' | 'hardening';
+/** `confirmed`, `needs_validation`, `hardening` or `rejected`. */
+export type SecurityVerdict = 'confirmed' | 'needs_validation' | 'hardening' | 'rejected';
 
 /**
- * The lifecycle, moves the store allows: `open` -> `accepted` | `fixing` | `gone`, and `fixed` by a
- * re-check; `fixing` -> `fixed` | `open`; `accepted` -> `open` | `gone`; `fixed` -> `verified` |
- * `open`; `verified` -> `open`; `gone` -> `open`.
+ * The lifecycle, moves the store allows: `open` -> `accepted` | `fixing` | `gone`, and `fixed` once
+ * the host sees the sink gone; `fixing` -> `fixed` | `open`; `accepted` -> `open` | `gone`; `fixed`
+ * -> `verified` | `open`; `verified` -> `open`; `gone` -> `open`. Accepting, not an issue, a reopen
+ * and a forget are the person's; `verified` comes from the host's re-check.
  */
 export type SecurityStatus = 'open' | 'fixing' | 'accepted' | 'fixed' | 'verified' | 'gone';
 
-/** `user`, `model` or `recheck`. */
-export type SecurityBy = 'user' | 'model' | 'recheck';
+/** `user`, `model`, `agent` (a model's command), `recheck` (the host saw the code) or `host`. */
+export type SecurityBy = 'user' | 'model' | 'agent' | 'recheck' | 'host';
 
 /**
  * One security finding of a project: a confirmed vulnerability, a lead (one fact outside the code
@@ -83,11 +101,26 @@ export interface SecurityFinding {
   fix_test: string;
   /** For a lead: the fact outside the code that decides it. */
   missing_fact?: string | null;
+  /** A lead's deciding fact and how the owner checks it, apart; a rejected claim's disproof. */
+  blocker?: string | null;
+  check_how?: string | null;
+  reason?: string | null;
+  conditions?: string[];
   trace: SecurityTraceStep[];
   quick_fix?: SecurityQuickFix | null;
-  /** Computed by the writer: higher first. */
+  /** Computed by the writer, with the store's age term: higher first. */
   priority: number;
   priority_reason: string;
+  /** Who found it: `audit` or `watch` (the daily dependency watch). */
+  source?: string;
+  /** The strong host signal behind it, and the severity the host set (a floor). */
+  signal?: string | null;
+  host_severity?: string | null;
+  /** A dependency finding's advisories, CISA KEV listing and FIRST EPSS score (0 to 1). */
+  advisories?: string[];
+  kev?: boolean;
+  epss?: number | null;
+  epss_percentile?: number | null;
   // Lifecycle, owned by the store:
   status: SecurityStatus | string;
   status_note: string;
@@ -104,6 +137,11 @@ export interface SecurityFinding {
   /** The sink's place (the trace's last step), for the list. */
   sink_path?: string | null;
   sink_line?: number | null;
+  /** The sink's evidence the host checks a fix against (the line as shown, secrets masked). */
+  sink_text?: string | null;
+  sink_package?: string | null;
+  sink_version?: string | null;
+  notified_ms?: number | null;
 }
 
 /** One lifecycle move of a finding. */
@@ -163,6 +201,20 @@ export interface SecuritySummary {
   verified: number;
   /** Open and fixing findings by overall severity (`critical`, `high`, `medium`, `low`, `lead`, `hardening`). */
   by_severity: Record<string, number>;
+  /** Open and fixing findings whose dependency is exploited in the wild (CISA KEV). */
+  kev?: number;
+}
+
+/** `memory.security.recheck` result: what the host saw of each finding's sink. */
+export interface SecurityRecheck {
+  id: string;
+  title: string;
+  /** `unchanged`, `moved`, `gone` or `unknown`. */
+  kind: string;
+  line?: number | null;
+  sentence: string;
+  was: string;
+  now?: string | null;
 }
 
 /** `memory.security.changed` payload. */

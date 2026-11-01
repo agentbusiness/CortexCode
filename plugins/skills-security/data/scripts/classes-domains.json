@@ -202,7 +202,8 @@
             "js"
           ],
           "needle": "message",
-          "regex": "addEventListener\\s*\\(\\s*[\"']message[\"']|window\\.onmessage\\s*=|\\.on\\s*\\(\\s*[\"']message[\"']"
+          "regex": "addEventListener\\s*\\(\\s*[\"']message[\"']|window\\.onmessage\\s*=|\\.on\\s*\\(\\s*[\"']message[\"']",
+          "kind": "marker"
         },
         {
           "name": "postMessage to any origin",
@@ -618,7 +619,8 @@
             "js"
           ],
           "needle": "tool",
-          "regex": "(?i)(@tool\\b|@mcp\\.tool|server\\.tool\\s*\\(|\\.setRequestHandler\\s*\\(|tools?\\s*[:=]\\s*\\[|\"type\"\\s*:\\s*\"function\"|StructuredTool|FunctionTool|defineTool|tool\\s*\\(\\s*\\{|addTool\\s*\\()"
+          "regex": "(?i)(@tool\\b|@mcp\\.tool|server\\.tool\\s*\\(|\\.setRequestHandler\\s*\\(|tools?\\s*[:=]\\s*\\[|\"type\"\\s*:\\s*\"function\"|StructuredTool|FunctionTool|defineTool|tool\\s*\\(\\s*\\{|addTool\\s*\\()",
+          "kind": "marker"
         },
         {
           "name": "markdown or HTML rendered from model output",
@@ -699,7 +701,8 @@
             "any"
           ],
           "needle": "webhook",
-          "regex": "(?i)[\"'`/](webhook|webhooks|hook|hooks|callback|callbacks|events|notify)[\"'`/]|def\\s+\\w*webhook\\w*|function\\s+\\w*webhook\\w*"
+          "regex": "(?i)[\"'`/](webhook|webhooks|hook|hooks|callback|callbacks|events|notify)[\"'`/]|def\\s+\\w*webhook\\w*|function\\s+\\w*webhook\\w*",
+          "kind": "marker"
         },
         {
           "name": "signature header read",
@@ -707,7 +710,8 @@
             "any"
           ],
           "needle": "ignature",
-          "regex": "(?i)(x-hub-signature|stripe-signature|x-signature|x-slack-signature|x-twilio-signature|x-github-event|svix-signature|headers\\s*(\\[|\\.get\\s*\\()\\s*[\"'][\\w-]*signature|header\\s*\\(\\s*[\"'][\\w-]*signature)"
+          "regex": "(?i)(x-hub-signature|stripe-signature|x-signature|x-slack-signature|x-twilio-signature|x-github-event|svix-signature|headers\\s*(\\[|\\.get\\s*\\()\\s*[\"'][\\w-]*signature|header\\s*\\(\\s*[\"'][\\w-]*signature)",
+          "kind": "marker"
         },
         {
           "name": "introspection or limits",
@@ -723,7 +727,8 @@
             "any"
           ],
           "needle": "ocket",
-          "regex": "(?i)(new\\s+WebSocket\\.Server|WebSocketServer\\s*\\(|upgrader\\.Upgrade|CheckOrigin\\s*:|@app\\.websocket|@router\\.websocket|websocket_connect|io\\.on\\s*\\(\\s*[\"']connection|ws\\.on\\s*\\(\\s*[\"']message)"
+          "regex": "(?i)(new\\s+WebSocket\\.Server|WebSocketServer\\s*\\(|upgrader\\.Upgrade|CheckOrigin\\s*:|@app\\.websocket|@router\\.websocket|websocket_connect|io\\.on\\s*\\(\\s*[\"']connection|ws\\.on\\s*\\(\\s*[\"']message)",
+          "kind": "marker"
         },
         {
           "name": "check origin disabled",
@@ -739,7 +744,8 @@
             "any"
           ],
           "needle": "e",
-          "regex": "(?i)\\b(@app\\.task|@celery\\.task|@shared_task|consumer\\.(subscribe|poll|run)|channel\\.(consume|basic_consume)|\\.subscribe\\s*\\(\\s*[\"']|Worker\\s*\\(\\s*[\"']|@KafkaListener|@RabbitListener|@SqsListener|nc\\.Subscribe|js\\.Subscribe)"
+          "regex": "(?i)\\b(@app\\.task|@celery\\.task|@shared_task|consumer\\.(subscribe|poll|run)|channel\\.(consume|basic_consume)|\\.subscribe\\s*\\(\\s*[\"']|Worker\\s*\\(\\s*[\"']|@KafkaListener|@RabbitListener|@SqsListener|nc\\.Subscribe|js\\.Subscribe)",
+          "kind": "marker"
         }
       ]
     },
@@ -805,7 +811,8 @@
             "rs"
           ],
           "needle": "unsafe",
-          "regex": "\\bunsafe\\s*(\\{|fn|impl)"
+          "regex": "\\bunsafe\\s*(\\{|fn|impl)",
+          "kind": "marker"
         },
         {
           "name": "unchecked operation",
@@ -824,7 +831,8 @@
             "cs"
           ],
           "needle": "C",
-          "regex": "import\\s+\"C\"|unsafe\\.Pointer|ctypes\\.(CDLL|cdll|c_char_p|POINTER|cast)|\\bnative\\s+\\w+\\s*\\(|\\[DllImport|Marshal\\.(Copy|PtrToStructure|AllocHGlobal)"
+          "regex": "import\\s+\"C\"|unsafe\\.Pointer|ctypes\\.(CDLL|cdll|c_char_p|POINTER|cast)|\\bnative\\s+\\w+\\s*\\(|\\[DllImport|Marshal\\.(Copy|PtrToStructure|AllocHGlobal)",
+          "kind": "marker"
         }
       ]
     },
@@ -882,7 +890,8 @@
             "js"
           ],
           "needle": "e",
-          "regex": "shell\\.(openExternal|openPath|showItemInFolder)\\s*\\(|ipcMain\\.(on|handle)\\s*\\(|setAsDefaultProtocolClient\\s*\\(|protocol\\.(registerFileProtocol|handle)\\s*\\(|loadURL\\s*\\(\\s*[^\"'`]"
+          "regex": "shell\\.(openExternal|openPath|showItemInFolder)\\s*\\(|ipcMain\\.(on|handle)\\s*\\(|setAsDefaultProtocolClient\\s*\\(|protocol\\.(registerFileProtocol|handle)\\s*\\(|loadURL\\s*\\(\\s*[^\"'`]",
+          "kind": "marker"
         },
         {
           "name": "exported Android component",
@@ -908,7 +917,8 @@
             "any"
           ],
           "needle": "i",
-          "regex": "(?i)(AF_UNIX|UnixListener::bind|net\\.Listen\\s*\\(\\s*\"unix|NSXPCListener|\\\\\\\\\\.\\\\pipe\\\\|net\\.createServer\\s*\\([^)]*\\)\\.listen\\s*\\(\\s*[\"'][^\"']*\\.sock|chmod\\s*\\(\\s*[^,]+,\\s*0o?777|0o?666\\b|localhost:\\d+|127\\.0\\.0\\.1:\\d+)"
+          "regex": "(?i)(AF_UNIX|UnixListener::bind|net\\.Listen\\s*\\(\\s*\"unix|NSXPCListener|\\\\\\\\\\.\\\\pipe\\\\|net\\.createServer\\s*\\([^)]*\\)\\.listen\\s*\\(\\s*[\"'][^\"']*\\.sock|chmod\\s*\\(\\s*[^,]+,\\s*0o?777|0o?666\\b|localhost:\\d+|127\\.0\\.0\\.1:\\d+)",
+          "kind": "marker"
         },
         {
           "name": "URL scheme or deep link handler",
@@ -916,7 +926,8 @@
             "any"
           ],
           "needle": "ur",
-          "regex": "(?i)(CFBundleURLSchemes|open-url|openURL\\s*\\(|application\\s*\\(\\s*_\\s*app[^)]*open\\s+url|onNewIntent|getIntent\\(\\)\\.getData|handleOpenURL|deep[-_]?link)"
+          "regex": "(?i)(CFBundleURLSchemes|open-url|openURL\\s*\\(|application\\s*\\(\\s*_\\s*app[^)]*open\\s+url|onNewIntent|getIntent\\(\\)\\.getData|handleOpenURL|deep[-_]?link)",
+          "kind": "marker"
         }
       ]
     },
@@ -1071,7 +1082,8 @@
             "any"
           ],
           "needle": "delete",
-          "regex": "(?i)\\b(deleted_at|is_deleted|isDeleted|soft_delete|softDelete|paranoid|with_deleted|withTrashed|only_deleted|unscoped)\\b"
+          "regex": "(?i)\\b(deleted_at|is_deleted|isDeleted|soft_delete|softDelete|paranoid|with_deleted|withTrashed|only_deleted|unscoped)\\b",
+          "kind": "marker"
         },
         {
           "name": "cache key without a tenant",
@@ -1087,7 +1099,8 @@
             "any"
           ],
           "needle": "e",
-          "regex": "(?i)\\b(revoke|revoked|invalidate_sessions|logout_all|remove_member|removeMember|change_role|changeRole|set_role|disable_user|deactivate|rotate_secret|rotateKey)\\w*\\s*\\("
+          "regex": "(?i)\\b(revoke|revoked|invalidate_sessions|logout_all|remove_member|removeMember|change_role|changeRole|set_role|disable_user|deactivate|rotate_secret|rotateKey)\\w*\\s*\\(",
+          "kind": "marker"
         },
         {
           "name": "migration file",
@@ -1095,7 +1108,8 @@
             "any"
           ],
           "needle": "igrat",
-          "regex": "(?i)(def\\s+upgrade\\s*\\(|def\\s+downgrade\\s*\\(|exports\\.(up|down)\\s*=|class\\s+Migration\\b|AddColumn|add_column|alter\\s+table|ALTER\\s+TABLE)"
+          "regex": "(?i)(def\\s+upgrade\\s*\\(|def\\s+downgrade\\s*\\(|exports\\.(up|down)\\s*=|class\\s+Migration\\b|AddColumn|add_column|alter\\s+table|ALTER\\s+TABLE)",
+          "kind": "marker"
         }
       ]
     }

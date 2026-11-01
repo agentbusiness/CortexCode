@@ -185,6 +185,7 @@ attachment_pasted_whole = "- pasted text {name}: `{path}` ({size}, {lines} lines
 attachment_test_output = "- test output {name}: `{path}` ({size}). The failures it reports, one line each, then the first one whole; read or search the file for any other failure whole:\n{report}"
 done_tests_pass_before = "The host ran `{command}` on the code as it was before your change, and every test passed there too, so none of them checks what you changed. Add a test that fails without your change and passes with it, run it, then finish."
 done_after_edit = "You changed the code after your last passing test run, so nothing shows the change works. Run the tests, then finish."
+done_security = "The host's security check of your change found this:\n{found}"
 done_without_tests = "Your last check ran no tests, so nothing shows the work is right. Add a test of the case the request is about to the project, run it, then finish."
 attachment_test_notes = "  What the test output above means:\n{notes}"
 attachment_pasted = "- pasted text {name}: `{path}` ({size}, {lines} lines). Only its first and last lines are shown here; read or search the file for the rest:\n{preview}"

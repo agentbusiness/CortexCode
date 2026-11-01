@@ -3,52 +3,61 @@
 
     python3 secaudit.py next                       the one driving command: maps the project on the first call, then the next lines to judge, then the report
     python3 secaudit.py settle <id>... safe|hardening|lead|finding|blocked ["note"]
-    python3 secaudit.py recon [--scope <path>...] [--out <dir>]
-    python3 secaudit.py hunt <unit>
+    python3 secaudit.py recon [--scope <path>...]
+    python3 secaudit.py hunt <unit> [--all]
     python3 secaudit.py cover <unit> covered|candidate|blocked ["<note>"]
     python3 secaudit.py new confirmed|needs_validation|rejected
     python3 secaudit.py finding <file.json>
-    python3 secaudit.py status [--fixing | --finding <id>]   (the fix session's guard: 0 once the finding is fixed)
+    python3 secaudit.py status [--fixing | --finding <id> | --unit <id>]   (exit 0 once the work is done)
     python3 secaudit.py show <id>                   one finding from the project's graph, for a fix session
     python3 secaudit.py fix-plan <id>               the exact upgrade commands of a dependency finding
-    python3 secaudit.py recheck <id>                what the code says now; a sink that is gone marks it fixed
-    python3 secaudit.py resolve <id> "<how>"        record a fix (the code must show it)
+    python3 secaudit.py recheck [<id>]              what the code says now; the host moves what it sees fixed
+    python3 secaudit.py resolve <id> "<how>"        record a fix (the host checks the sink is gone)
     python3 secaudit.py report [--partial]
     python3 secaudit.py scan [<path>...] [--changed [<ref>]]
-    python3 secaudit.py deps
+    python3 secaudit.py scan --json <abs path>... [--classes a,b]      one JSON object, nothing written
+    python3 secaudit.py deps [--json] [--root <dir>]                   --json: one JSON object, nothing written
+    python3 secaudit.py check-change [--root <dir>]                    the working tree's own changes: silent when clean, exit 3 with findings
+    python3 secaudit.py watch [--root <dir>]                           the dependency watch: new advisories since the last one
     python3 secaudit.py cve <GHSA-... | CVE-...>
 
-Runs from the repository root (every CortexCode `run` starts there). Writes only under
-`<out>` (default `tmp/secaudit`, which git ignores). Python 3.8+, standard library only.
-The attack-class catalog is `classes-*.json` beside this file: which classes apply to a
-project is decided from structural facts (languages, imports, files, code shapes), and each
-class carries the invariant, where to look, what counts as a finding, and the code shapes
-to search for. The model does the tracing and the judging; this tool does the rest.
+Runs from the repository root (every CortexCode `run` starts there). The audit's records (its map,
+units, the lines judged, the vulnerable dependencies and the findings) live in the project's graph,
+kept by the memory plugin and reached through `cx call memory.security.*`; without CortexCode the
+audit cannot be kept and the commands that record say so. The reports (REPORT.md, units/*.md) are
+files under `$CORTEX_HOME/audits/`; the finding drafts the model fills are in the project's
+`tmp/secaudit/`. Python 3.8+, standard library only. The attack-class catalog is `classes-*.json`
+beside this file: which classes apply to a project is decided from structural facts (languages,
+imports, files, code shapes), and each class carries the invariant, where to look, what counts as a
+finding, and the code shapes to search for. The model does the tracing and the judging; this tool
+does the rest.
 
-Live sources, queried at call time, never mirrored (each answers within seconds or is skipped
-with one line when the project is offline):
+Live sources, queried at call time, never mirrored (each answers within seconds or is skipped with
+one line; a project with a `.cortex-offline` file is never looked up):
 - OSV (api.osv.dev): known vulnerabilities for the exact dependency versions in the project's
-  lockfiles (npm, PyPI, crates.io, Go, RubyGems, Packagist, Maven, NuGet), with the fixed
-  versions. OSV carries the GitHub Advisory Database, the ecosystems' own advisories and the CVE
-  list. `recon` and `deps` use it; the report lists what it found.
+  lockfiles (npm, PyPI, crates.io, Go, RubyGems, Packagist, Maven, NuGet), with the fixed versions.
+- CISA's Known Exploited Vulnerabilities catalog and FIRST EPSS: which of those are exploited in
+  the wild, and how likely exploitation is; they weigh the priority.
 - NVD (services.nvd.nist.gov): a CVE's description, CVSS and CWE ids when OSV has no record.
 - The CWE API (cwe-api.mitre.org): the mitigations of a weakness class, for `cve`.
-- The Cloudflare security-audit skill (raw.githubusercontent.com/cloudflare/security-audit-skill):
-  the current hunting guidance for each attack class, shown by `hunt`.
 The code shapes searched for (`classes-*.json` beside this file) are this tool's own heuristics,
-written from that upstream guidance; a hit is a question to trace, never a finding.
+reference text shipped with it; a hit is a question to trace, never a finding.
 """
 
+import concurrent.futures
 import fnmatch
 import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -61,30 +70,24 @@ HISTORY_COMMITS = 200
 OSV_URL = "https://api.osv.dev/v1/"
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId="
 CWE_URL = "https://cwe-api.mitre.org/api/v1/cwe/weakness/"
-UPSTREAM_URL = "https://raw.githubusercontent.com/cloudflare/security-audit-skill/main/skills/security-audit/"
-# Where each class's current guidance lives upstream: (file, the bold block in it, or None for a
-# companion file whose core discipline and class list are shown).
-UPSTREAM = {
-    "obvious": ("ATTACK-CLASSES.md", "Obvious things"), "injection": ("ATTACK-CLASSES.md", "Injection"), "access-control": ("ATTACK-CLASSES.md", "Access control"),
-    "files-resources": ("ATTACK-CLASSES.md", "Resource and file handling"), "crypto-secrets": ("ATTACK-CLASSES.md", "Cryptography and secrets"),
-    "business-logic": ("ATTACK-CLASSES.md", "Business logic"), "data-exposure": ("ATTACK-CLASSES.md", "Feature abuse and data leakage"),
-    "web-auth": ("WEB-PROTOCOL-AND-AUTH.md", None), "client-side": ("CLIENT-SIDE.md", None), "supply-chain-ci": ("SUPPLY-CHAIN-AND-RELEASE.md", None),
-    "cloud-deploy": ("CLOUD-AND-DEPLOYMENT.md", None), "ai-llm-agent": ("AI-AND-LLM.md", None), "protocols-messaging": ("PROTOCOLS-RPC-AND-MESSAGING.md", None),
-    "memory-safety": ("MEMORY-SAFETY-AND-BINARY.md", None), "desktop-ipc": ("DESKTOP-MOBILE-AND-LOCAL-IPC.md", None), "availability": ("RESOURCE-EXHAUSTION-AND-AVAILABILITY.md", None),
-    "data-lifecycle": ("DATA-ISOLATION-AND-LIFECYCLE.md", None),
-}
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_URL = "https://api.first.org/data/v1/epss?cve="
 FETCH_TIMEOUT = 8
 FETCH_MAX_BYTES = 4_000_000
+KEV_MAX_BYTES = 12_000_000
 OSV_BATCH = 1000
-OSV_DETAIL_PACKAGES = 60
+OSV_WORKERS = 8
+EPSS_BATCH = 50
 DEPS_SHOWN = 40
 RECON_DEPS_SHOWN = 8
+HITS_WRITE_BATCH = 2000
+CHANGE_LINES_SHOWN = 40
 
 SKIP_DIRS = {".git", "node_modules", "target", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit", "vendor", "venv", ".venv", "env", "__pycache__", ".mypy_cache", ".pytest_cache", ".tox", ".idea", ".vscode", "coverage", "tmp", ".cache", "Pods", "DerivedData", ".gradle", ".terraform", "bower_components", ".yarn", ".pnpm-store", "site-packages", ".dart_tool", "bin", "obj"}
-SKIP_FILE_GLOBS = ["*.min.js", "*.min.css", "*.map", "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum", "poetry.lock", "Pipfile.lock", "composer.lock", "Gemfile.lock", "*.snap", "*.svg", "*.csv", "*.tsv", "*.jsonl", "*.ndjson", "*.pb.go", "*_pb2.py", "*.d.ts", "*.generated.*", "*.gen.go"]
-LOCKFILES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "Cargo.lock", "go.sum", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock", "requirements.txt", "composer.lock", "Gemfile.lock", "packages.lock.json", "gradle.lockfile", "flake.lock"]
+SKIP_FILE_GLOBS = ["*.min.js", "*.min.css", "*.map", "*.lock", "*.lockb", "*.lockfile", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum", "poetry.lock", "Pipfile.lock", "composer.lock", "Gemfile.lock", "*.snap", "*.svg", "*.csv", "*.tsv", "*.jsonl", "*.ndjson", "*.pb.go", "*_pb2.py", "*.d.ts", "*.generated.*", "*.gen.go"]
+LOCKFILES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "Cargo.lock", "go.sum", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock", "requirements.txt", "composer.lock", "Gemfile.lock", "packages.lock.json", "gradle.lockfile", "flake.lock"]
 MANIFESTS = {"package.json": "npm", "requirements.txt": "pip", "requirements-dev.txt": "pip", "pyproject.toml": "python", "setup.py": "python", "Pipfile": "pipenv", "Cargo.toml": "cargo", "go.mod": "go", "Gemfile": "bundler", "composer.json": "composer", "pom.xml": "maven", "build.gradle": "gradle", "build.gradle.kts": "gradle", "*.csproj": "nuget", "Package.swift": "swiftpm", "pubspec.yaml": "pub", "mix.exs": "mix"}
-MANIFEST_LOCK = {"package.json": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"], "pyproject.toml": ["poetry.lock", "uv.lock", "pdm.lock", "requirements.txt"], "Pipfile": ["Pipfile.lock"], "Cargo.toml": ["Cargo.lock"], "go.mod": ["go.sum"], "Gemfile": ["Gemfile.lock"], "composer.json": ["composer.lock"], "build.gradle": ["gradle.lockfile"], "build.gradle.kts": ["gradle.lockfile"]}
+MANIFEST_LOCK = {"package.json": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"], "pyproject.toml": ["poetry.lock", "uv.lock", "pdm.lock", "requirements.txt"], "Pipfile": ["Pipfile.lock"], "Cargo.toml": ["Cargo.lock"], "go.mod": ["go.sum"], "Gemfile": ["Gemfile.lock"], "composer.json": ["composer.lock"], "build.gradle": ["gradle.lockfile"], "build.gradle.kts": ["gradle.lockfile"]}
 ENTRY_FILES = ["main.py", "app.py", "wsgi.py", "asgi.py", "manage.py", "server.py", "server.js", "server.ts", "index.js", "index.ts", "app.js", "app.ts", "main.js", "main.ts", "main.go", "main.rs", "Program.cs", "Application.java", "config.ru", "artisan", "index.php", "lib.rs", "mod.rs"]
 
 LANG_BY_EXT = {
@@ -147,7 +150,13 @@ SEVERITY = ["informational", "low", "medium", "high", "critical"]
 STATUSES = ["planned", "in_progress", "covered", "candidate", "blocked"]
 VERDICTS = ["confirmed", "needs_validation", "rejected"]
 # What the graph records as the audit's tool version.
-SKILL_VERSION = "secaudit 2026-10-26"
+SKILL_VERSION = "secaudit 2026-11-01"
+
+# Strong host signals: a hit of one of these shapes is a real credential format, never waved off.
+STRONG_PATTERNS = {"private key block", "AWS access key id", "GitHub token", "Slack token", "Stripe live key"}
+SIGNAL_SEVERITY = {"key": "high", "history": "high", "malicious": "critical", "kev": "high"}
+TEST_PLACE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|__mocks__|fixtures?|testdata|test-data|examples?|samples?|mocks?)(/|$)|(^|/)(test_[^/]*|[^/]*_test\.[^/]*|[^/]*\.(test|spec)\.[^/]*)$")
+EXAMPLE_VALUE = re.compile(r"(?i)example|dummy|fake|placeholder|changeme|not[-_]?a[-_]?real|redacted|xxxx|0000|1234|abcd|test")
 
 
 # ----------------------------------------------------------------------------- files
@@ -181,31 +190,34 @@ def git(args, root=".", limit=None):
     data = out.stdout if limit is None else out.stdout[:limit]
     return data.decode("utf-8", "replace")
 
-
 def repo_files(root, scope):
     """Repository-relative paths worth scanning: git's tracked and untracked-unignored files when
-    the root is a repository, else a walk; without ignored, generated, huge or binary files."""
+    the root is a repository, else a walk; without ignored, generated, huge or binary files. The
+    lockfiles and the AI-agent files are listed apart (`repo_files.lockfiles`, `.agent_files`),
+    also from folders the scan skips."""
     listed = git(["ls-files", "-co", "--exclude-standard", "-z"], root)
     if listed is not None:
         rels = [rel for rel in listed.split("\0") if rel]
     else:
         rels = []
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and (not d.startswith(".") or d in AGENT_DIRS)]
             for name in filenames:
                 rels.append(os.path.relpath(os.path.join(dirpath, name), root))
     scope = [s.rstrip("/") for s in scope]
     files = []
     repo_files.lockfiles = []
+    repo_files.agent_files = []
     for rel in sorted(set(rels)):
         if scope and not any(rel == s or rel.startswith(s + "/") for s in scope):
             continue
         base = os.path.basename(rel)
-        if (base in LOCKFILES or base in ("go.mod", "pom.xml") or (base.startswith("requirements") and base.endswith(".txt"))) and not any(part in SKIP_DIRS for part in rel.split("/")[:-1]):
+        parents = rel.split("/")[:-1]
+        if (base in LOCKFILES or base in ("go.mod", "pom.xml") or (base.startswith("requirements") and base.endswith(".txt"))) and not any(part in SKIP_DIRS for part in parents):
             repo_files.lockfiles.append(rel)
+        if agent_file_kind(rel) and not any(part in SKIP_DIRS - {".vscode"} for part in parents) and os.path.isfile(os.path.join(root, rel)):
+            repo_files.agent_files.append(rel)
         if skipped(rel):
-            continue
-        if scope and not any(rel == s or rel.startswith(s + "/") for s in scope):
             continue
         full = os.path.join(root, rel)
         try:
@@ -231,6 +243,70 @@ def read_text(path):
 def basename_matches(rel, globs):
     name = os.path.basename(rel)
     return any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(rel, g) or (("/" in g) and fnmatch.fnmatch(rel, "*/" + g)) for g in globs)
+
+
+def normalize(line):
+    """A line as the evidence compares it: ASCII whitespace runs collapsed to one space, trimmed
+    (the memory plugin normalizes the same way)."""
+    return re.sub(r"[ \t\n\r\x0c]+", " ", line).strip(" ")
+
+
+def line_hash(line):
+    normal = normalize(line)
+    if len(normal) < 3:
+        return None
+    return hashlib.sha256(normal.encode("utf-8")).hexdigest()
+
+
+# ----------------------------------------------------------------------------- secrets in excerpts
+
+SECRET_VALUE_RES = [
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\b[sr]k_live_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+]
+QUOTED_SECRET_RE = re.compile(r"""(?i)(\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|token)\b["']?\s*[:=]\s*["'])([^"'\s]{4,})(["'])""")
+ENV_SECRET_RE = re.compile(r"""(?i)^(\s*(?:export\s+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH)[A-Z0-9_]*\s*=\s*["']?)([^"'\s#]{4,})""")
+URL_PASSWORD_RE = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]{3,})(@)")
+BEARER_RE = re.compile(r"(?i)(\b(?:Bearer|Basic)\s+)([A-Za-z0-9._~+/=-]{8,})")
+SECRET_NAME_RE = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|auth)")
+
+
+def masked(value):
+    """A secret as shown: its first four characters and an ellipsis."""
+    return value[:4] + "\u2026"
+
+
+def is_reference(value):
+    """A value that names a secret kept elsewhere (`${VAR}`, `$VAR`, `{env:...}`, `<your key>`)."""
+    value = value.strip()
+    return value.startswith(("$", "{{", "{env", "env:", "%", "<", "#{", "process.env", "os.environ")) or value.lower() in ("", "none", "null", "changeme", "xxx")
+
+
+def mask(text):
+    """`text` with every secret value it carries cut to its first four characters."""
+    text = str(text or "")
+    for regex in SECRET_VALUE_RES:
+        text = regex.sub(lambda m: masked(m.group(0)), text)
+    text = QUOTED_SECRET_RE.sub(lambda m: m.group(1) + (m.group(2) if is_reference(m.group(2)) or m.group(2).endswith("\u2026") else masked(m.group(2))) + m.group(3), text)
+    text = ENV_SECRET_RE.sub(lambda m: m.group(1) + (m.group(2) if is_reference(m.group(2)) or m.group(2).endswith("\u2026") else masked(m.group(2))), text)
+    text = URL_PASSWORD_RE.sub(lambda m: m.group(1) + (m.group(2) if is_reference(m.group(2)) else masked(m.group(2))) + m.group(3), text)
+    text = BEARER_RE.sub(lambda m: m.group(1) + (m.group(2) if is_reference(m.group(2)) or m.group(2).endswith("\u2026") else masked(m.group(2))), text)
+    return text
+
+
+def shown(text, limit=160):
+    """An excerpt as printed and stored: secrets masked, invisible and reordering characters
+    dropped, whitespace collapsed, at most `limit` characters."""
+    visible = "".join(ch for ch in str(text or "") if ch not in ZERO_WIDTH and ch not in BIDI and not 0xE0000 <= ord(ch) <= 0xE007F)
+    return mask(normalize(visible))[:limit]
 
 
 # ----------------------------------------------------------------------------- catalog
@@ -270,15 +346,15 @@ def load_catalog(directory):
 
 
 PREVIOUS_CLASS = {
-    "id": "previous", "name": "Issues of the previous audit", "applies": {}, "patterns": [],
-    "invariant": "Every issue the previous audit reported is either fixed in the current code or still open and carried into this report.",
+    "id": "previous", "name": "Issues already known", "applies": {}, "patterns": [],
+    "invariant": "Every issue already known to the project is either fixed in the current code or still open and carried into this report.",
     "look": [
-        "A confirmed finding or lead: read the flagged line and its callers again; the pre-check says whether the line is unchanged, moved or gone, which is a hint, not a verdict.",
+        "A confirmed finding or lead: read the flagged line and its callers again; the host's re-check says whether the line is unchanged, moved or gone, which is a hint, not a verdict.",
         "A hardening note: is the change made (an upgrade, a moved secret, a tightened check)?",
-        "A dependency note: the pre-check compares the pinned version with the previous one and OSV's current answer."
+        "A dependency finding: the re-check compares the pinned version with the one recorded."
     ],
-    "counts": "A previous finding whose path still exists unchanged is still a finding: settle it as still. A previous issue that the code no longer has is fixed.",
-    "hardening": "A previous hardening note not acted on stays a hardening note (still).",
+    "counts": "A known finding whose path still exists unchanged is still a finding: settle it as still. A known issue that the code no longer has is fixed.",
+    "hardening": "A known hardening note not acted on stays a hardening note (still).",
 }
 
 
@@ -289,11 +365,14 @@ class Catalog:
         self.by_id = {cls["id"]: cls for cls in self.classes}
         self.by_id["previous"] = PREVIOUS_CLASS
 
-    def patterns_for(self, lang):
-        """(class id, pattern) pairs that apply to files of `lang`."""
+    def patterns_for(self, lang, markers=True):
+        """(class id, pattern) pairs that apply to files of `lang`; without the place markers (a
+        handler, a registration: where to read, not a defect) when `markers` is false."""
         out = []
         for cls in self.classes:
             for pattern in cls.get("patterns", []):
+                if not markers and pattern.get("kind") == "marker":
+                    continue
                 langs = pattern["langs"]
                 if "any" in langs or (lang and lang in langs):
                     out.append((cls["id"], pattern))
@@ -330,72 +409,126 @@ LIVE_ERRORS = (OSError, ValueError, KeyError, TypeError, IndexError, urllib.erro
 
 # ----------------------------------------------------------------------------- lockfiles
 
+def strip_jsonc(text):
+    """JSON with comments and trailing commas (bun.lock, editor configs) as plain JSON."""
+    out, i, n, in_string = [], 0, len(text), False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            out.append(ch)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
 def parse_lockfile(rel, text):
-    """(ecosystem, name, version) for every package a lockfile pins; [] for a file that is not one."""
+    """(ecosystem, name, version) for every package a lockfile pins; [] for a file that is not one.
+    Raises ValueError for a lockfile that cannot be read (the caller lists it as not parsed)."""
     name = os.path.basename(rel)
     out = []
-    try:
-        if name == "package-lock.json":
-            data = json.loads(text)
-            for path, info in (data.get("packages") or {}).items():
-                if path and isinstance(info, dict) and info.get("version") and "node_modules/" in path:
-                    out.append(("npm", path.rsplit("node_modules/", 1)[1], info["version"]))
-            def walk(deps):
-                for pkg, info in (deps or {}).items():
-                    if isinstance(info, dict) and info.get("version"):
-                        out.append(("npm", pkg, info["version"]))
-                        walk(info.get("dependencies"))
-            if not data.get("packages"):
-                walk(data.get("dependencies"))
-        elif name == "yarn.lock":
-            for match in re.finditer(r'^"?((?:@[^/\s"]+/)?[^@\s"]+)@[^\n]*:\n(?:[^\n]*\n)*?\s+version:?\s+"?([^"\s]+)"?', text, re.M):
+    if name == "package-lock.json":
+        data = json.loads(text)
+        for path, info in (data.get("packages") or {}).items():
+            if path and isinstance(info, dict) and info.get("version") and "node_modules/" in path and not info.get("link"):
+                out.append(("npm", path.rsplit("node_modules/", 1)[1], info["version"]))
+
+        def walk(deps):
+            for pkg, info in (deps or {}).items():
+                if isinstance(info, dict) and info.get("version"):
+                    out.append(("npm", pkg, info["version"]))
+                    walk(info.get("dependencies"))
+        if not data.get("packages"):
+            walk(data.get("dependencies"))
+    elif name == "bun.lock":
+        data = json.loads(strip_jsonc(text))
+        for key, entry in (data.get("packages") or {}).items():
+            spec = entry[0] if isinstance(entry, list) and entry and isinstance(entry[0], str) else None
+            if not spec or "@" not in spec[1:]:
+                continue
+            pkg, version = spec.rsplit("@", 1)
+            if re.match(r"^\d", version):
+                out.append(("npm", pkg, version))
+    elif name == "yarn.lock":
+        for match in re.finditer(r'^"?((?:@[^/\s"]+/)?[^@\s"]+)@[^\n]*:\n(?:[^\n]*\n)*?\s+version:?\s+"?([^"\s]+)"?', text, re.M):
+            out.append(("npm", match.group(1), match.group(2)))
+    elif name == "pnpm-lock.yaml":
+        section = text.split("\npackages:", 1)
+        if len(section) == 2:
+            for match in re.finditer(r"^  '?/?((?:@[^/\s']+/)?[^@\s'/]+)@([^\s'(:]+)", section[1], re.M):
                 out.append(("npm", match.group(1), match.group(2)))
-        elif name == "pnpm-lock.yaml":
-            section = text.split("\npackages:", 1)
-            if len(section) == 2:
-                for match in re.finditer(r"^  '?/?((?:@[^/\s']+/)?[^@\s'/]+)@([^\s'(:]+)", section[1], re.M):
-                    out.append(("npm", match.group(1), match.group(2)))
-        elif name.startswith("requirements") and name.endswith(".txt"):
-            for match in re.finditer(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9_.+!-]+)", text, re.M):
-                out.append(("PyPI", match.group(1), match.group(2)))
-        elif name in ("poetry.lock", "Cargo.lock", "pdm.lock", "uv.lock"):
-            eco = "crates.io" if name == "Cargo.lock" else "PyPI"
-            for match in re.finditer(r'\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"', text):
-                out.append((eco, match.group(1), match.group(2)))
-        elif name == "Pipfile.lock":
-            data = json.loads(text)
-            for section in ("default", "develop"):
-                for pkg, info in (data.get(section) or {}).items():
-                    version = (info or {}).get("version", "")
-                    if version.startswith("=="):
-                        out.append(("PyPI", pkg, version[2:]))
-        elif name == "go.mod":
-            body = re.sub(r"//[^\n]*", "", text)
-            for match in re.finditer(r"^\s*(?:require\s+)?([\w.~-]+(?:/[\w.~-]+)+)\s+(v[\w.+-]+)", body, re.M):
-                out.append(("Go", match.group(1), match.group(2)))
-        elif name == "Gemfile.lock":
-            for match in re.finditer(r"^    ([A-Za-z0-9_.-]+) \(([^)\s]+)\)\s*$", text, re.M):
-                out.append(("RubyGems", match.group(1), match.group(2)))
-        elif name == "composer.lock":
-            data = json.loads(text)
-            for pkg in (data.get("packages") or []) + (data.get("packages-dev") or []):
-                if pkg.get("name") and pkg.get("version"):
-                    out.append(("Packagist", pkg["name"], pkg["version"].lstrip("v")))
-        elif name == "packages.lock.json":
-            data = json.loads(text)
-            for frameworks in (data.get("dependencies") or {}).values():
-                for pkg, info in (frameworks or {}).items():
-                    if isinstance(info, dict) and info.get("resolved"):
-                        out.append(("NuGet", pkg, info["resolved"]))
-        elif name == "pom.xml":
-            for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
-                group = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", block)
-                artifact = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", block)
-                version = re.search(r"<version>\s*([^<\s$]+)\s*</version>", block)
-                if group and artifact and version:
-                    out.append(("Maven", group.group(1) + ":" + artifact.group(1), version.group(1)))
-    except (ValueError, AttributeError):
-        return []
+    elif name.startswith("requirements") and name.endswith(".txt"):
+        for match in re.finditer(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:\[[^\]]*\])?\s*(===|==)\s*([A-Za-z0-9_.+!-]+)\s*(?:;|#|\\|$)", text, re.M):
+            if "*" not in match.group(3):
+                out.append(("PyPI", match.group(1), match.group(3)))
+        # A direct reference to a built file names its exact version: `pkg @ https://.../pkg-1.2.3-py3-none-any.whl`.
+        for match in re.finditer(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*@\s*\S*/([A-Za-z0-9_.]+)-(\d[A-Za-z0-9_.+!]*?)(?:-[^/\s]*)?\.(?:whl|tar\.gz|zip)\b", text, re.M):
+            out.append(("PyPI", match.group(1), match.group(3)))
+    elif name in ("poetry.lock", "Cargo.lock", "pdm.lock", "uv.lock"):
+        eco = "crates.io" if name == "Cargo.lock" else "PyPI"
+        for match in re.finditer(r'\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"', text):
+            out.append((eco, match.group(1), match.group(2)))
+    elif name == "Pipfile.lock":
+        data = json.loads(text)
+        for section in ("default", "develop"):
+            for pkg, info in (data.get(section) or {}).items():
+                version = (info or {}).get("version", "")
+                if version.startswith("=="):
+                    out.append(("PyPI", pkg, version[2:]))
+    elif name == "go.mod":
+        body = re.sub(r"//[^\n]*", "", text)
+        for match in re.finditer(r"^\s*(?:require\s+)?([\w.~-]+(?:/[\w.~-]+)+)\s+(v[\w.+-]+)", body, re.M):
+            out.append(("Go", match.group(1), match.group(2)))
+    elif name == "go.sum":
+        # The modules whose source was downloaded (a line without /go.mod), at their highest version.
+        best = {}
+        for match in re.finditer(r"^(\S+)\s+(v[^\s/]+)\s+h1:", text, re.M):
+            module, version = match.group(1), match.group(2)
+            if module not in best or version_key(version.lstrip("v")) > version_key(best[module].lstrip("v")):
+                best[module] = version
+        out.extend(("Go", module, version) for module, version in sorted(best.items()))
+    elif name == "Gemfile.lock":
+        for match in re.finditer(r"^    ([A-Za-z0-9_.-]+) \(([^)\s]+)\)\s*$", text, re.M):
+            out.append(("RubyGems", match.group(1), match.group(2)))
+    elif name == "composer.lock":
+        data = json.loads(text)
+        for pkg in (data.get("packages") or []) + (data.get("packages-dev") or []):
+            if pkg.get("name") and pkg.get("version"):
+                out.append(("Packagist", pkg["name"], pkg["version"].lstrip("v")))
+    elif name == "packages.lock.json":
+        data = json.loads(text)
+        for frameworks in (data.get("dependencies") or {}).values():
+            for pkg, info in (frameworks or {}).items():
+                if isinstance(info, dict) and info.get("resolved"):
+                    out.append(("NuGet", pkg, info["resolved"]))
+    elif name == "gradle.lockfile":
+        for match in re.finditer(r"^([\w.-]+):([\w.-]+):([\w.+-]+)=", text, re.M):
+            out.append(("Maven", match.group(1) + ":" + match.group(2), match.group(3)))
+    elif name == "pom.xml":
+        for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
+            group = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", block)
+            artifact = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", block)
+            version = re.search(r"<version>\s*([^<\s$]+)\s*</version>", block)
+            if group and artifact and version:
+                out.append(("Maven", group.group(1) + ":" + artifact.group(1), version.group(1)))
     seen, unique = set(), []
     for item in out:
         if item not in seen:
@@ -404,19 +537,51 @@ def parse_lockfile(rel, text):
     return unique
 
 
-def project_packages(root, files):
-    """Every pinned package of the project's lockfiles: {(ecosystem, name, version): lockfile}."""
-    packages = {}
-    for rel in sorted(set(getattr(repo_files, "lockfiles", []))):
+def manifest_pins(rel, text):
+    """Exact versions a manifest names itself (package.json `"x": "1.2.3"`): what a change check
+    can look up when no lockfile moved with it."""
+    if os.path.basename(rel) != "package.json":
+        return []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    out = []
+    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        for pkg, spec in (data.get(section) or {}).items():
+            if isinstance(spec, str) and re.fullmatch(r"=?v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?", spec.strip()):
+                out.append(("npm", pkg, spec.strip().lstrip("=v")))
+    return out
+
+
+def project_packages(root, lockfiles=None):
+    """Every pinned package of the project's lockfiles: ({(ecosystem, name, version): lockfile},
+    [`<lockfile>: <why it was not read>`])."""
+    packages, not_parsed, go_modules = {}, [], set()
+    for rel in sorted(set(lockfiles if lockfiles is not None else getattr(repo_files, "lockfiles", []))):
+        if os.path.basename(rel) == "bun.lockb":
+            not_parsed.append("%s: binary lockfile, run `bun install --save-text-lockfile`" % rel)
+            continue
         text = read_text(os.path.join(root, rel))
         if text is None:
+            not_parsed.append("%s: not readable as text" % rel)
             continue
-        for item in parse_lockfile(rel, text):
+        try:
+            items = parse_lockfile(rel, text)
+        except (ValueError, AttributeError, TypeError, IndexError) as error:
+            not_parsed.append("%s: %s" % (rel, str(error)[:120]))
+            continue
+        for item in items:
+            # go.sum adds the modules go.mod leaves out; go.mod (read first) wins for the ones it names.
+            if os.path.basename(rel) == "go.sum" and (os.path.dirname(rel), item[1]) in go_modules:
+                continue
+            if os.path.basename(rel) == "go.mod":
+                go_modules.add((os.path.dirname(rel), item[1]))
             packages.setdefault(item, rel)
-    return packages
+    return packages, not_parsed
 
 
-# ----------------------------------------------------------------------------- live: OSV, NVD, CWE, upstream
+# ----------------------------------------------------------------------------- live: OSV, KEV, EPSS, NVD, CWE
 
 CVSS_WEIGHTS = {"AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}, "AC": {"L": 0.77, "H": 0.44}, "UI": {"N": 0.85, "R": 0.62}, "C": {"H": 0.56, "L": 0.22, "N": 0.0}, "I": {"H": 0.56, "L": 0.22, "N": 0.0}, "A": {"H": 0.56, "L": 0.22, "N": 0.0}}
 
@@ -467,27 +632,39 @@ def fixed_versions(vuln, name):
 
 
 def osv_check(packages):
-    """OSV's known vulnerabilities for `packages` ({(eco, name, version): lockfile}): a list of rows
-    {eco, name, version, lockfile, id, aliases, severity, summary, fixed, cwes}, sorted worst first.
-    Raises on network trouble."""
-    items = list(packages.items())[:3 * OSV_BATCH]
-    flagged = []
+    """OSV's known vulnerabilities for `packages` ({(eco, name, version): lockfile}), every package
+    looked up: a list of rows {eco, name, version, lockfile, id, aliases, severity, summary, fixed,
+    cwes, kev, epss, epss_percentile}, worst first. Raises on network trouble."""
+    items = list(packages.items())
+    flagged = {}
     for start in range(0, len(items), OSV_BATCH):
         chunk = items[start:start + OSV_BATCH]
         queries = [{"package": {"name": name, "ecosystem": eco}, "version": version} for (eco, name, version), _ in chunk]
         result = fetch_json(OSV_URL + "querybatch", {"queries": queries})
         for (key, lockfile), answer in zip(chunk, result.get("results") or []):
-            if answer.get("vulns"):
-                flagged.append((key, lockfile))
+            ids = [v["id"] for v in answer.get("vulns") or [] if v.get("id")]
+            token = answer.get("next_page_token")
+            while token:
+                eco, name, version = key
+                page = fetch_json(OSV_URL + "query", {"package": {"name": name, "ecosystem": eco}, "version": version, "page_token": token})
+                ids.extend(v["id"] for v in page.get("vulns") or [] if v.get("id"))
+                token = page.get("next_page_token")
+            if ids:
+                flagged[(key, lockfile)] = ids
+    unique_ids = sorted({vid for ids in flagged.values() for vid in ids})
+    records = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=OSV_WORKERS) as pool:
+        for vid, record in zip(unique_ids, pool.map(lambda vid: fetch_json(OSV_URL + "vulns/" + urllib.parse.quote(vid)), unique_ids)):
+            records[vid] = record
     rows = []
-    for (eco, name, version), lockfile in flagged[:OSV_DETAIL_PACKAGES]:
-        answer = fetch_json(OSV_URL + "query", {"package": {"name": name, "ecosystem": eco}, "version": version})
-        for vuln in answer.get("vulns") or []:
+    for ((eco, name, version), lockfile), ids in flagged.items():
+        for vid in ids:
+            vuln = records.get(vid) or {}
             if vuln.get("withdrawn"):
                 continue
             aliases = [a for a in vuln.get("aliases") or [] if a.startswith("CVE-")]
             summary = (vuln.get("summary") or (vuln.get("details") or "").split("\n")[0]).strip()
-            rows.append({"eco": eco, "name": name, "version": version, "lockfile": lockfile, "id": vuln["id"], "aliases": aliases, "severity": severity_of(vuln), "summary": summary[:120], "fixed": fixed_versions(vuln, name), "cwes": (vuln.get("database_specific") or {}).get("cwe_ids") or []})
+            rows.append({"eco": eco, "name": name, "version": version, "lockfile": lockfile, "id": vid, "aliases": aliases, "severity": severity_of(vuln), "summary": summary[:120], "fixed": fixed_versions(vuln, name), "cwes": (vuln.get("database_specific") or {}).get("cwe_ids") or [], "kev": False, "epss": None, "epss_percentile": None})
     rows.sort(key=lambda r: (SEVERITY_RANK.get(r["severity"], 5), 0 if r["id"].startswith("GHSA-") else 1, r["name"], r["id"]))
     unique, seen = [], set()
     for row in rows:
@@ -496,7 +673,43 @@ def osv_check(packages):
             continue
         seen |= keys
         unique.append(row)
-    return unique, len(flagged) - min(len(flagged), OSV_DETAIL_PACKAGES)
+    return unique
+
+
+def exploit_signals(rows):
+    """Mark rows exploited in the wild (CISA KEV) and with their EPSS score; returns one line per
+    source that could not be read, or [] when both answered."""
+    cves = sorted({alias for row in rows for alias in row["aliases"] + ([row["id"]] if row["id"].startswith("CVE-") else [])})
+    if not cves:
+        return []
+    problems = []
+    try:
+        request = urllib.request.Request(KEV_URL, headers={"User-Agent": "secaudit (CortexCode)", "Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT * 2) as response:
+            payload = response.read(KEV_MAX_BYTES + 1)
+        if len(payload) > KEV_MAX_BYTES:
+            raise ValueError("the KEV catalog is larger than %d bytes" % KEV_MAX_BYTES)
+        known = {item.get("cveID") for item in json.loads(payload.decode("utf-8")).get("vulnerabilities") or []}
+        for row in rows:
+            row["kev"] = any(c in known for c in row["aliases"] + [row["id"]])
+    except LIVE_ERRORS as error:
+        problems.append("CISA KEV could not be read (%s)" % (getattr(error, "reason", None) or error))
+    scores = {}
+    try:
+        for start in range(0, len(cves), EPSS_BATCH):
+            answer = fetch_json(EPSS_URL + ",".join(cves[start:start + EPSS_BATCH]))
+            for item in answer.get("data") or []:
+                try:
+                    scores[item["cve"]] = (float(item["epss"]), float(item.get("percentile") or 0))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except LIVE_ERRORS as error:
+        problems.append("FIRST EPSS could not be read (%s)" % (getattr(error, "reason", None) or error))
+    for row in rows:
+        best = max((scores[c] for c in row["aliases"] + [row["id"]] if c in scores), default=None)
+        if best:
+            row["epss"], row["epss_percentile"] = round(best[0], 5), round(best[1], 5)
+    return problems
 
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4, "unrated": 5}
@@ -525,88 +738,122 @@ def covering_fix(rows):
         return sorted(choices)[-1]
 
 
-def deps_lines(rows, packages, more, shown=DEPS_SHOWN):
+def group_rows(rows):
+    """Advisory rows by package: [((eco, name, version, lockfile), [rows])], worst package first."""
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
+    return sorted(groups.items(), key=lambda kv: (min(SEVERITY_RANK.get(r["severity"], 5) for r in kv[1]), 0 if any(r.get("kev") for r in kv[1]) else 1, kv[0][1]))
+
+
+def exploit_words(group):
+    words = []
+    if any(r.get("kev") for r in group):
+        words.append("exploited in the wild (CISA KEV)")
+    epss = max((r.get("epss") or 0 for r in group), default=0)
+    if epss >= 0.01:
+        words.append("EPSS %d%%" % round(epss * 100))
+    return words
+
+
+def deps_lines(rows, packages, not_parsed, shown=DEPS_SHOWN):
     """The dependency check as the model reads it."""
+    lines = ["Not read: %s." % item for item in not_parsed]
     if not packages:
-        return ["No lockfile pins a dependency here (nothing for OSV to check)."]
+        return lines + ["No lockfile pins a dependency here (nothing for OSV to check)."]
     ecos = {}
     for (eco, _, _) in packages:
         ecos[eco] = ecos.get(eco, 0) + 1
     files = sorted(set(packages.values()))
-    lines = ["%d pinned packages from %s (%s)." % (len(packages), ", ".join(files[:6]) + (" ..." if len(files) > 6 else ""), ", ".join("%s %d" % kv for kv in sorted(ecos.items())))]
+    lines.append("%d pinned packages from %s (%s)." % (len(packages), ", ".join(files[:6]) + (" ..." if len(files) > 6 else ""), ", ".join("%s %d" % kv for kv in sorted(ecos.items()))))
     if not rows:
         lines.append("OSV knows no vulnerability for these exact versions (checked live).")
         return lines
-    groups = {}
-    for row in rows:
-        groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
-    ordered = sorted(groups.items(), key=lambda kv: (min(SEVERITY_RANK.get(r["severity"], 5) for r in kv[1]), kv[0][1]))
-    lines.append("Known vulnerabilities (OSV, live): %d advisories in %d packages%s." % (len(rows), len(groups), "; %d more packages flagged, listed in deps.json" % more if more else ""))
+    ordered = group_rows(rows)
+    lines.append("Known vulnerabilities (OSV, live): %d advisories in %d packages." % (len(rows), len(ordered)))
     for (eco, name, version, lockfile), group in ordered[:shown]:
-        worst = group[0]["severity"]
         fix = covering_fix(group)
-        lines.append("  %s %s %s (%s): %d advisor%s, worst %s; %s" % (eco, name, version, lockfile, len(group), "y" if len(group) == 1 else "ies", worst, ("upgrade to %s fixes every one listed" % fix) if fix else "no fixed version listed"))
+        extra = exploit_words(group)
+        lines.append("  %s %s %s (%s): %d advisor%s, worst %s%s; %s" % (eco, name, version, lockfile, len(group), "y" if len(group) == 1 else "ies", group[0]["severity"], (", " + ", ".join(extra)) if extra else "", ("upgrade to %s fixes every one listed" % fix) if fix else "no fixed version listed"))
         for row in group[:3]:
             ids = row["id"] + (" " + row["aliases"][0] if row["aliases"] else "")
             lines.append("    %s %s: %s" % (ids, row["severity"], row["summary"]))
         if len(group) > 3:
-            lines.append("    ... %d more advisories in tmp/secaudit/deps.json" % (len(group) - 3))
+            lines.append("    ... %d more advisories" % (len(group) - 3))
     if len(ordered) > shown:
-        lines.append("  ... %d more packages (all of them in tmp/secaudit/deps.json; the dependencies unit shows each as a line to judge)" % (len(ordered) - shown))
+        lines.append("  ... %d more packages (the dependencies unit shows each as a line to judge)" % (len(ordered) - shown))
     return lines
 
 
-def live_deps(state, root, files, shown=DEPS_SHOWN):
-    """Run the OSV check, keep deps.json, return the lines to print (or [] when quiet and clean)."""
-    packages = project_packages(root, files)
+def live_deps(root, lockfiles=None, exploits=True):
+    """The OSV check, with KEV and EPSS when `exploits`: (rows, packages, not_parsed, why it did
+    not run or None, problems of the exploit sources)."""
+    packages, not_parsed = project_packages(root, lockfiles)
+    if not packages:
+        return [], packages, not_parsed, None, []
     if offline_here(root):
-        return ["Offline project: the live dependency check (OSV) did not run; %d pinned packages unchecked." % len(packages)] if packages else []
+        return [], packages, not_parsed, "offline project: the live dependency check (OSV) did not run; %d pinned packages unchecked" % len(packages), []
     try:
-        rows, more = osv_check(packages)
+        rows = osv_check(packages)
     except LIVE_ERRORS as error:
-        return ["The live dependency check (OSV) could not run (%s); %d pinned packages unchecked." % (getattr(error, "reason", None) or error, len(packages))]
-    state.save("deps.json", {"checked": time.strftime("%Y-%m-%d %H:%M"), "packages": len(packages), "rows": rows, "more": more})
-    return deps_lines(rows, packages, more, shown)
+        return [], packages, not_parsed, "the live dependency check (OSV) could not run (%s); %d pinned packages unchecked" % (getattr(error, "reason", None) or error, len(packages)), []
+    return rows, packages, not_parsed, None, exploit_signals(rows) if exploits else []
 
 
-def upstream_guidance(class_id):
-    """The class's current guidance from the Cloudflare skill, as a few lines; [] when unreachable."""
-    spec = UPSTREAM.get(class_id)
-    if not spec:
-        return []
-    file_name, block = spec
-    try:
-        text = fetch(UPSTREAM_URL + file_name).decode("utf-8", "replace")
-    except LIVE_ERRORS:
-        return []
-    lines = []
-    if block:
-        match = re.search(r"^\*\*" + re.escape(block) + r"\*\*[^\n]*\n(.*?)(?=^\*\*|^##|\Z)", text, re.M | re.S)
-        if match:
-            body = match.group(1).strip()
-            for raw in body.split("\n"):
-                raw = raw.rstrip()
-                if raw and len("\n".join(lines)) < 1800:
-                    lines.append(re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", raw)[:400])
-    else:
-        discipline = re.search(r"## Core discipline[^\n]*\n+```\n(.*?)```", text, re.S)
-        if discipline:
-            lines.extend(line.rstrip()[:400] for line in discipline.group(1).strip().split("\n") if line.strip())
-        names = re.findall(r"^\*\*([^*\n]+)\*\*\s*$", text, re.M)
-        if names:
-            lines.append("Classes upstream: " + "; ".join(names[:20]))
-    return lines
+def advisory_records(rows):
+    """The graph's advisories from OSV rows."""
+    return [{"ecosystem": r["eco"], "package": r["name"], "version": r["version"], "lockfile": r["lockfile"], "advisory": r["id"], "aliases": r["aliases"], "severity": r["severity"], "summary": r["summary"], "fixed": sorted(set(r["fixed"])), "cwes": r["cwes"], "kev": bool(r.get("kev")), "epss": r.get("epss"), "epss_percentile": r.get("epss_percentile")} for r in rows]
+
+
+def rows_of(advisories):
+    """OSV rows from the graph's advisories."""
+    return [{"eco": a["ecosystem"], "name": a["package"], "version": a["version"], "lockfile": a["lockfile"], "id": a["advisory"], "aliases": a.get("aliases") or [], "severity": a.get("severity") or "unrated", "summary": a.get("summary", ""), "fixed": a.get("fixed") or [], "cwes": a.get("cwes") or [], "kev": bool(a.get("kev")), "epss": a.get("epss"), "epss_percentile": a.get("epss_percentile")} for a in advisories]
 
 
 def cmd_deps(args):
-    root = os.getcwd()
-    state = State(root, default_out())
-    files = repo_files(root, [])
-    for line in live_deps(state, root, files):
-        print(line)
-    if os.path.isfile(state.path("deps.json")) and (state.load("deps.json", {}) or {}).get("rows"):
+    positional, flags = parse_flags(args, {"root": "one"})
+    root = os.path.abspath(flags["root"]) if isinstance(flags.get("root"), str) else os.getcwd()
+    if flags.get("json"):
+        return deps_json(root)
+    if not os.path.isdir(root):
+        fail("%s is not a folder" % root, "%s deps --root <project folder>" % tool())
+    repo_files(root, [])
+    rows, packages, not_parsed, why, problems = live_deps(root)
+    if why:
+        print(why[0].upper() + why[1:] + ".")
+    else:
+        for line in deps_lines(rows, packages, not_parsed):
+            print(line)
+        for problem in problems:
+            print(problem + "; the priority goes without it.")
+    if rows:
         print("Each vulnerable package: is the affected code called with outside data? (read graph://used-by/<function>, grep -rn \"<package>\" --include=*.*). Reachable: a confirmed finding with the upgrade as the fix; not reachable: a hardening note naming the upgrade.")
     print("Next: %s status" % tool())
+
+
+def deps_json(root):
+    """`deps --json`: the project's lockfiles and their known vulnerabilities, as one JSON object."""
+    if not os.path.isdir(root):
+        return json_out({"error": "%s is not a folder" % root}, 2)
+    repo_files(root, [])
+    lockfiles = sorted(set(getattr(repo_files, "lockfiles", [])))
+    rows, packages, not_parsed, why, _ = live_deps(root, lockfiles, exploits=False)
+    out = {"lockfiles": lockfiles, "not_parsed": not_parsed, "vulnerable": []}
+    if why:
+        out["skipped"] = why
+    for (eco, name, version, lockfile), group in group_rows(rows):
+        item = {"ecosystem": eco, "name": name, "version": version, "lockfile": lockfile, "ids": sorted({i for r in group for i in [r["id"]] + r["aliases"]}), "severity": group[0]["severity"]}
+        fix = quick_fix_for(name, rows, lockfile)
+        if fix:
+            item["fixed"] = fix["to"]
+            item["command"] = " && ".join(fix["commands"])
+        out["vulnerable"].append(item)
+    return json_out(out, 0)
+
+
+def json_out(value, code):
+    print(json.dumps(value, ensure_ascii=False))
+    sys.exit(code)
 
 
 def cmd_cve(args):
@@ -779,30 +1026,39 @@ def applies_to(cls, facts, texts):
     return False, ""
 
 
-def scan_texts(catalog, texts, class_ids=None):
-    """Pattern hits per class: {class id: [(rel, line number, pattern name, line text)]}."""
+def scan_lines(catalog, rel, lang, numbered, class_ids=None, markers=True, cache=None):
+    """Pattern hits in `numbered` lines ([(line number, text)]) of one file: [(class id, rel, line,
+    pattern name, raw line)]."""
+    cache = {} if cache is None else cache
+    key = (lang or "-", markers, tuple(sorted(class_ids)) if class_ids is not None else None)
+    if key not in cache:
+        pairs = [(cid, p) for cid, p in catalog.patterns_for(lang, markers) if class_ids is None or cid in class_ids]
+        if lang is None:
+            # Prose and unknown files: only secrets matter there.
+            pairs = [(cid, p) for cid, p in pairs if cid == "obvious" and any(w in p["name"] for w in ("key", "token", "secret", "password", "connection", "JWT"))]
+        cache[key] = pairs
+    out = []
+    for number, line in numbered:
+        if len(line) > 600 or not line.strip():
+            continue
+        for cid, pattern in cache[key]:
+            if pattern["needle"] and pattern["needle"] not in line:
+                continue
+            if pattern["re"].search(line):
+                out.append((cid, rel, number, pattern["name"], line))
+    return out
+
+
+def scan_texts(catalog, texts, class_ids=None, markers=True):
+    """Pattern hits per class: {class id: [(rel, line number, pattern name, raw line)]}."""
     hits = {}
     cache = {}
     for rel, (lang, text) in texts.items():
-        key = lang or "-"
-        if key not in cache:
-            pairs = [(cid, p) for cid, p in catalog.patterns_for(lang) if class_ids is None or cid in class_ids]
-            if lang is None:
-                # Prose and unknown files: only secrets matter there.
-                pairs = [(cid, p) for cid, p in pairs if cid == "obvious" and any(w in p["name"] for w in ("key", "token", "secret", "password", "connection", "JWT"))]
-            cache[key] = pairs
-        pairs = cache[key]
-        if not pairs:
-            continue
-        for number, line in enumerate(text.split("\n"), 1):
-            if len(line) > 600 or not line.strip():
-                continue
-            for cid, pattern in pairs:
-                if pattern["needle"] and pattern["needle"] not in line:
-                    continue
-                if pattern["re"].search(line):
-                    hits.setdefault(cid, []).append((rel, number, pattern["name"], line.strip()[:160]))
+        for cid, rel_, number, name, line in scan_lines(catalog, rel, lang, enumerate(text.split("\n"), 1), class_ids, markers, cache):
+            hits.setdefault(cid, []).append((rel_, number, name, line))
     for cls in catalog.classes:
+        if class_ids is not None and cls["id"] not in class_ids:
+            continue
         for spec in cls.get("files", []):
             if not spec.get("glob"):
                 continue
@@ -812,53 +1068,487 @@ def scan_texts(catalog, texts, class_ids=None):
     return hits
 
 
-# ----------------------------------------------------------------------------- state
+# ----------------------------------------------------------------------------- AI-agent files
+
+AGENT_DIRS = {".claude", ".cursor", ".vscode", ".codex", ".continue", ".gemini", ".windsurf", ".amazonq", ".github"}
+AGENT_CONFIGS = [".mcp.json", "mcp.json", ".cursor/mcp.json", ".vscode/mcp.json", "claude_desktop_config.json", ".claude/settings.json", ".claude/settings.*.json", ".claude/settings.local.json", ".codex/config.toml", ".continue/config.json", ".continue/config.yaml", ".gemini/settings.json", ".windsurf/mcp.json", ".amazonq/mcp.json", "opencode.json"]
+AGENT_INSTRUCTIONS = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".windsurfrules", ".github/copilot-instructions.md", "SKILL.md", ".cursor/rules/*.mdc", ".claude/commands/*.md", ".claude/agents/*.md", ".github/instructions/*.md", ".github/prompts/*.md"]
+SERVER_KEYS = ("mcpServers", "servers", "mcp_servers", "context_servers", "mcp")
+RUNNERS = {"npx": "npm", "bunx": "npm", "pnpx": "npm", "uvx": "pypi", "pipx": "pypi"}
+BYPASS_FLAGS = ("--dangerously-skip-permissions", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--trust-all-tools", "--allow-all-tools")
+DOWNLOAD_PLACE = re.compile(r"(^|[\s='\"])(/tmp/|/var/tmp/|/private/tmp/|~/Downloads/|\$HOME/Downloads/|/Users/[^/]+/Downloads/|/home/[^/]+/Downloads/|[A-Za-z]:\\Users\\[^\\]+\\Downloads\\)")
+ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\u2062", "\u2063", "\u2064", "\ufeff", "\u180e"}
+BIDI = {chr(c) for c in list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A))}
+WHITESPACE_RUN = re.compile(r"[ \t]{120,}\S")
+HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.S)
+
+
+def glob_matches(rel, glob):
+    if "/" not in glob:
+        return fnmatch.fnmatch(os.path.basename(rel), glob)
+    return fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(rel, "*/" + glob)
+
+
+def agent_file_kind(rel):
+    """`config` for an AI agent's settings or MCP server list, `instructions` for text an agent
+    reads as its instructions (including skill files), None otherwise."""
+    if any(glob_matches(rel, glob) for glob in AGENT_CONFIGS):
+        return "config"
+    if any(glob_matches(rel, glob) for glob in AGENT_INSTRUCTIONS):
+        return "instructions"
+    if ("/.claude/skills/" in "/" + rel or "/skills/" in "/" + rel) and rel.endswith((".md", ".mdc")):
+        return "instructions"
+    return None
+
+
+def parse_toml(text):
+    """TOML as data: the standard library's parser when there is one (3.11+), else the subset agent
+    settings use (tables, dotted tables, `key = "string" | number | bool | [array]`, inline tables)."""
+    try:
+        import tomllib  # noqa: PLC0415 - optional, 3.11+
+        return tomllib.loads(text)
+    except ImportError:
+        pass
+    data, table = {}, None
+    table = data
+    for raw in text.split("\n"):
+        line = raw.split(" #")[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        header = re.match(r"^\[\[?([^\]]+)\]\]?$", line)
+        if header:
+            table = data
+            for part in [p.strip().strip('"') for p in header.group(1).split(".")]:
+                table = table.setdefault(part, {})
+            continue
+        pair = re.match(r"^([\w\"'.-]+)\s*=\s*(.+)$", line)
+        if pair:
+            table[pair.group(1).strip("\"'")] = parse_scalar(pair.group(2).strip())
+    return data
+
+
+def parse_scalar(value):
+    if value.startswith(("[", "{")):
+        try:
+            return json.loads(re.sub(r"(\w+)\s*=", r'"\1":', value.replace("'", '"')))
+        except ValueError:
+            return value
+    if value[:1] in ("'", '"'):
+        return value[1:-1] if len(value) > 1 and value[-1] == value[0] else value[1:]
+    if value in ("true", "false"):
+        return value == "true"
+    try:
+        return float(value) if "." in value else int(value)
+    except ValueError:
+        return value
+
+
+def parse_yaml(text):
+    """The YAML subset agent configs use: nested mappings, block lists of scalars or mappings, quoted
+    and plain scalars, flow lists. Anchors, multi-line strings and several documents are not read."""
+    tokens = []
+    for raw in text.split("\n"):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        while stripped == "-" or stripped.startswith("- "):
+            tokens.append((indent, "-", None))
+            stripped = stripped[2:].strip() if stripped != "-" else ""
+            indent += 2
+        if stripped:
+            tokens.append((indent, "line", stripped))
+    pos = 0
+
+    def parse(indent):
+        nonlocal pos
+        if pos >= len(tokens):
+            return None
+        if tokens[pos][1] == "-":
+            items = []
+            while pos < len(tokens) and tokens[pos][0] == indent and tokens[pos][1] == "-":
+                pos += 1
+                items.append(parse(tokens[pos][0]) if pos < len(tokens) and tokens[pos][0] > indent else None)
+            return items
+        mapping = {}
+        while pos < len(tokens) and tokens[pos][0] == indent and tokens[pos][1] == "line":
+            line = tokens[pos][2]
+            pos += 1
+            pair = re.match(r"^([^:#]+?):(?:\s+(.*))?$", line)
+            if not pair:
+                if not mapping:
+                    return parse_scalar(line)
+                continue
+            key, value = pair.group(1).strip().strip("\"'"), (pair.group(2) or "").split(" #")[0].strip()
+            if value:
+                mapping[key] = parse_scalar(value)
+            elif pos < len(tokens) and (tokens[pos][0] > indent or (tokens[pos][0] == indent and tokens[pos][1] == "-")):
+                mapping[key] = parse(tokens[pos][0])
+            else:
+                mapping[key] = None
+        return mapping
+
+    return (parse(tokens[0][0]) or {}) if tokens else {}
+
+
+def line_of(text, needle, start_line=1):
+    """The 1-based line where `needle` first appears at or after `start_line` (1 when it does not)."""
+    if not needle:
+        return start_line
+    for number, line in enumerate(text.split("\n"), 1):
+        if number >= start_line and needle in line:
+            return number
+    return 1
+
+
+def servers_in(data):
+    """Every MCP server an agent config declares: [(name, settings)]."""
+    out = []
+
+    def visit(node, depth):
+        if depth > 6:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in SERVER_KEYS and isinstance(value, dict):
+                    out.extend((name, conf) for name, conf in value.items() if isinstance(conf, dict))
+                elif key in SERVER_KEYS and isinstance(value, list):
+                    out.extend((conf.get("name") or "server %d" % i, conf) for i, conf in enumerate(value, 1) if isinstance(conf, dict))
+                else:
+                    visit(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item, depth + 1)
+    visit(data, 0)
+    return out
+
+
+def strings_in(node, path=""):
+    """Every (key path, string) in parsed data."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from strings_in(value, "%s.%s" % (path, key) if path else str(key))
+    elif isinstance(node, list):
+        for item in node:
+            yield from strings_in(item, path + "[]")
+    elif isinstance(node, str):
+        yield path, node
+
+
+def unpinned(command, args):
+    """The package a runner starts without a pinned version (`npx -y pkg`, `uvx pkg`), or None."""
+    base = os.path.basename(str(command or ""))
+    words = [str(a) for a in args or []]
+    if base in ("pnpm", "yarn") and words[:1] == ["dlx"]:
+        base, words = "npx", words[1:]
+    if base == "pipx" and words[:1] == ["run"]:
+        words = words[1:]
+    if base not in RUNNERS:
+        return None
+    pinned_from = next((words[i + 1] for i, w in enumerate(words[:-1]) if w == "--from"), None)
+    package = pinned_from or next((w for w in words if not w.startswith("-")), None)
+    if not package:
+        return None
+    if RUNNERS[base] == "npm":
+        name, _, version = package[1:].partition("@") if package.startswith("@") else package.partition("@")
+        ok = bool(version) and re.match(r"^\d", version) is not None
+    else:
+        ok = re.search(r"(==|@)\d", package) is not None
+    return None if ok else package
+
+
+def remote_host(url):
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https", "ws", "wss") or not parsed.hostname:
+        return None
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or parsed.hostname.endswith(".localhost"):
+        return None
+    return "%s://%s" % (parsed.scheme, parsed.hostname)
+
+
+def hidden_text_hits(rel, text):
+    """Text an agent reads that a person does not see: zero-width and tag characters, bidirectional
+    controls, HTML comments that say something, text pushed out of view by whitespace."""
+    out = []
+    for number, line in enumerate(text.split("\n"), 1):
+        invisible = sum(1 for i, ch in enumerate(line) if (ch in ZERO_WIDTH and not (number == 1 and i == 0 and ch == "\ufeff")) or 0xE0000 <= ord(ch) <= 0xE007F)
+        if invisible:
+            out.append((rel, number, "agent instructions: hidden characters", "%d zero-width or tag character%s on this line (an agent reads them, a person does not see them)" % (invisible, "" if invisible == 1 else "s")))
+        controls = sorted({"U+%04X" % ord(ch) for ch in line if ch in BIDI})
+        if controls:
+            out.append((rel, number, "agent instructions: bidirectional control characters", "%s reorders what a person sees on this line" % ", ".join(controls)))
+        if WHITESPACE_RUN.search(line):
+            out.append((rel, number, "agent instructions: text pushed out of view", "a run of %d spaces hides the text after it: %s" % (len(WHITESPACE_RUN.search(line).group(0)) - 1, shown(line.strip(), 100))))
+    for match in HTML_COMMENT.finditer(text):
+        words = match.group(1).split()
+        if len(words) >= 6:
+            number = text.count("\n", 0, match.start()) + 1
+            out.append((rel, number, "agent instructions: HTML comment the reader does not see", shown(" ".join(words), 120)))
+    return out
+
+
+def agent_config_hits(rel, text):
+    """The structural facts of an AI agent's settings or MCP server list that weaken it:
+    [(rel, line, shape, text, signal or None)]."""
+    name = os.path.basename(rel)
+    try:
+        if name.endswith(".toml"):
+            data = parse_toml(text)
+        elif name.endswith((".yaml", ".yml")):
+            data = parse_yaml(text)
+        else:
+            data = json.loads(strip_jsonc(text))
+    except (ValueError, TypeError) as error:
+        return [(rel, 0, "agent config: not parsed", "the file is not valid %s (%s): read it by hand" % ("TOML" if name.endswith(".toml") else "YAML" if name.endswith((".yaml", ".yml")) else "JSON", str(error)[:80]), None)]
+    out = []
+    for server, conf in servers_in(data):
+        at = line_of(text, '"%s"' % server) if '"%s"' % server in text else line_of(text, server)
+        command, args = conf.get("command"), conf.get("args") or []
+        if not isinstance(args, list):
+            args = [args]
+        if isinstance(command, list):
+            command, args = (command[0] if command else ""), command[1:] + list(args)
+        if isinstance(command, str) and " " in command.strip() and not args:
+            command, *args = command.split()
+        secrets, keys, strong = 0, [], False
+        for section in ("env", "headers", "environment", "http_headers"):
+            for key, value in (conf.get(section) or {}).items() if isinstance(conf.get(section), dict) else []:
+                if not isinstance(value, str) or is_reference(value) or len(value.strip()) < 8:
+                    continue
+                key_format = any(regex.search(value) for regex in SECRET_VALUE_RES)
+                if key_format or SECRET_NAME_RE.search(key) or BEARER_RE.search(value):
+                    secrets += 1
+                    keys.append(key)
+                    strong = strong or key_format
+        if secrets:
+            out.append((rel, line_of(text, keys[0], at), "agent config: plaintext token", "server %s: %d secret value%s written in the file (%s); a reference to the environment keeps it out" % (server, secrets, "" if secrets == 1 else "s", ", ".join(keys[:4])), "key" if strong else None))
+        package = unpinned(command, args)
+        if package:
+            out.append((rel, line_of(text, package, at), "agent config: unpinned package runner", "server %s: %s %s runs whatever version is published when it starts" % (server, os.path.basename(str(command)), package), None))
+        for word in [str(command or "")] + [str(a) for a in args]:
+            if DOWNLOAD_PLACE.search(word):
+                out.append((rel, line_of(text, word.strip()[:40], at), "agent config: server started from a temporary or download folder", "server %s: %s" % (server, shown(word, 100)), None))
+                break
+        for key in ("url", "serverUrl", "httpUrl", "uri", "endpoint"):
+            host = remote_host(conf.get(key)) if isinstance(conf.get(key), str) else None
+            if host:
+                plain = host.startswith(("http://", "ws://"))
+                out.append((rel, line_of(text, conf[key][:40], at), "agent config: remote MCP server", "server %s: %s receives the agent's tool calls%s" % (server, host, " over plain http" if plain else ""), None))
+                break
+    bypass = []
+    for path, value in strings_in(data):
+        if any(flag in value for flag in BYPASS_FLAGS):
+            bypass.append((value, "%s runs with %s" % (path, next(flag for flag in BYPASS_FLAGS if flag in value))))
+        if path.endswith("defaultMode") and value == "bypassPermissions":
+            bypass.append((value, "permissions.defaultMode is bypassPermissions"))
+        if path.endswith(("approval_policy", "approvalPolicy")) and value == "never":
+            bypass.append((value, "%s is never: every command runs without asking" % path))
+        if path.endswith(("sandbox_mode", "sandboxMode")) and value == "danger-full-access":
+            bypass.append((value, "%s is danger-full-access" % path))
+        if re.search(r"(^|\.)(allow|autoApprove|alwaysAllow|allowedTools)\[\]$", path) and value.strip() in ("*", "Bash", "Bash(*)", "Bash(:*)", "mcp__*"):
+            bypass.append((value, "%s allows %s" % (path[:-2], value.strip())))
+    if isinstance(data, dict):
+        for key in ("dangerouslySkipPermissions", "enableAllProjectMcpServers", "yolo", "autoAccept", "skipPermissions"):
+            for path, value in flags_in(data, key):
+                if value is True:
+                    bypass.append((key, "%s is true" % path))
+    for needle, what in bypass:
+        out.append((rel, line_of(text, needle if len(needle) < 60 else needle[:60]), "agent config: permission checks turned off", what, None))
+    return out
+
+
+def flags_in(node, wanted, path=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = "%s.%s" % (path, key) if path else str(key)
+            if key == wanted:
+                yield here, value
+            yield from flags_in(value, wanted, here)
+    elif isinstance(node, list):
+        for item in node:
+            yield from flags_in(item, wanted, path + "[]")
+
+
+def agent_hits(root, rels):
+    """The agent-file checks of every listed file: [(rel, line, shape, text, signal or None)]."""
+    out = []
+    for rel in rels:
+        kind = agent_file_kind(rel)
+        text = read_text(os.path.join(root, rel))
+        if not kind or text is None:
+            continue
+        if kind == "config":
+            out.extend(agent_config_hits(rel, text))
+        out.extend(hit + (None,) for hit in hidden_text_hits(rel, text))
+    return out
+
+
+# ----------------------------------------------------------------------------- the project's graph
+
+# The audit lives in the project's graph (the memory plugin, through the app): its map, units, the
+# lines to judge and how each was settled, the vulnerable dependencies, and the findings, which the
+# Security tab lists by priority. Every write is checked: a refused one is a failure the model reads.
+
+PRIORITY_BAND = {"critical": 400, "high": 300, "medium": 200, "low": 100, "informational": 50}
+STATUS_DONE = ("fixed", "verified")
+APP_AWAY = "the audit is kept in the project's graph, and CortexCode cannot be reached from here (%s)"
+APP_NEXT = "start CortexCode, open this project, and run this from one of its sessions"
+
+
+def graph_call(method, params):
+    """One call to the app (`cx call`, the params on stdin): (True, result) or (False, why)."""
+    home = os.environ.get("CORTEX_HOME")
+    if not home:
+        return False, "CORTEX_HOME is not set"
+    cx = os.path.join(home, "bin", "cx")
+    if not os.path.isfile(cx):
+        return False, "cx is not installed in %s" % os.path.join(home, "bin")
+    try:
+        out = subprocess.run([cx, "call", method, "-"], input=json.dumps(params), capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, "cx: %s" % error
+    if out.returncode != 0:
+        message = (out.stderr.strip() or out.stdout.strip() or "cx exited %d" % out.returncode).split("\n")[-1]
+        return False, re.sub(r"^cx: (?:[a-z_]+: )?", "", message)
+    try:
+        return True, json.loads(out.stdout) if out.stdout.strip() else {}
+    except ValueError:
+        return False, "cx answered something that is not JSON"
+
+
+def project_id(root):
+    """(the app's id of the project at `root`, None) or (None, why): the `run` shell exports it;
+    outside the app the project list is matched by root."""
+    env = os.environ.get("CORTEX_PROJECT_ID")
+    if env and os.path.realpath(root) == os.path.realpath(os.getcwd()):
+        return env, None
+    ok, result = graph_call("frame.project.list", {})
+    if not ok:
+        return None, result
+    want = os.path.realpath(root)
+    projects = (result or {}).get("projects", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+    for project in projects:
+        if os.path.realpath(project.get("root", "")) == want:
+            return project["id"], None
+    return None, "no CortexCode project has the root %s" % want
+
+
+def app_away(why):
+    """Whether a failed call means the app itself is not there (rather than a refused write)."""
+    return any(word in why for word in ("CORTEX_HOME", "cx is not installed", "cx:", "connect", "not running", "unavailable", "frame", "timed out", "No such file"))
+
+
+def require_app(root):
+    pid, why = project_id(root)
+    if not pid:
+        fail(APP_AWAY % why, APP_NEXT)
+    return pid
+
+
+def write(method, params, what):
+    """A write to the graph; a refusal or failure ends the command with the store's reason."""
+    ok, result = graph_call(method, params)
+    if not ok:
+        print("%s was not recorded: %s" % (what, result))
+        if "Next:" not in result:
+            print("Next: " + (APP_NEXT if app_away(result) else "%s status" % tool()))
+        sys.exit(1)
+    return result
+
 
 class State:
-    """The audit's files under <out>: recon.json (facts), coverage.json (the units), hits/<unit>.json,
-    findings.json, finding-<n>.json drafts, REPORT.md."""
+    """The audit as the project's graph keeps it: the current audit, its units, its lines and how
+    each was settled, its vulnerable dependencies, and the reports' folder."""
 
-    def __init__(self, root, out):
+    def __init__(self, root, units=None):
         self.root = root
-        self.out = out if os.path.isabs(out) else os.path.join(root, out)
-        self.out_rel = out if os.path.isabs(out) else out
-        self.drafts = os.path.join(root, drafts_dir())
-        self.drafts_rel = drafts_dir()
+        self.pid = require_app(root)
+        self.drafts = os.path.join(root, OUT_DEFAULT)
+        self.drafts_rel = OUT_DEFAULT
+        self.reload(units)
+
+    def reload(self, units=None):
+        params = {"project_id": self.pid}
+        if units:
+            params["units"] = units
+        ok, result = graph_call("memory.security.audit.state", params)
+        if not ok:
+            fail("the audit could not be read from the project's graph: %s" % result, APP_NEXT if app_away(result) else "%s status" % tool())
+        self.audit = (result or {}).get("audit")
+        self.previous = (result or {}).get("previous")
+        self.units = (result or {}).get("units") or []
+        self.hits = {}
+        for hit in (result or {}).get("hits") or []:
+            self.hits.setdefault(hit["unit"].upper(), []).append(hit)
+        self.by_hit = {hit["id"]: hit for hits in self.hits.values() for hit in hits}
+        self.advisories = (result or {}).get("advisories") or []
+        self._findings = None
+
+    @property
+    def audit_id(self):
+        return (self.audit or {}).get("id")
+
+    @property
+    def out(self):
+        return os.path.join(default_out(), self.audit_id or "audit")
 
     def path(self, name):
         return os.path.join(self.out, name)
 
-    def load(self, name, default):
-        try:
-            with open(self.path(name), encoding="utf-8") as handle:
-                return json.load(handle)
-        except (OSError, ValueError):
-            return default
-
-    def save(self, name, data):
-        os.makedirs(os.path.dirname(self.path(name)), exist_ok=True)
-        tmp = self.path(name) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=1, ensure_ascii=False)
-        os.replace(tmp, self.path(name))
-
     def coverage(self):
-        data = self.load("coverage.json", None)
-        if data is None:
-            fail("no audit here yet", "python3 %s recon" % sys.argv[0])
-        sync_units(self, data)
-        return data
+        if not self.audit:
+            fail("no audit here yet", "%s next" % tool())
+        coverage = {"root": self.audit.get("root") or self.root, "scope": [s for s in (self.audit.get("scope") or "").split(", ") if s], "files": self.audit.get("files", 0), "units": self.units, "audit_id": self.audit_id, "started_ms": self.audit.get("started_ms")}
+        sync_units(self, coverage)
+        return coverage
 
     def unit(self, coverage, uid):
         uid = uid.upper()
         for unit in coverage["units"]:
             if unit["id"] == uid:
                 return unit
-        known = ", ".join(u["id"] for u in coverage["units"])
-        fail("no unit %s (units: %s)" % (uid, known), "python3 %s status" % sys.argv[0])
+        fail("no unit %s (units: %s)" % (uid, ", ".join(u["id"] for u in coverage["units"])), "%s status" % tool())
+
+    def rows(self):
+        return rows_of(self.advisories)
 
     def findings(self):
-        return self.load("findings.json", [])
+        """The findings this audit reported last (every status), from the graph."""
+        if self._findings is None:
+            ok, result = graph_call("memory.security.findings", {"project_id": self.pid, "audit_id": self.audit_id})
+            if not ok:
+                fail("the audit's findings could not be read from the project's graph: %s" % result, "%s status" % tool())
+            self._findings = (result or {}).get("findings") or []
+        return self._findings
+
+    def put_units(self, units):
+        write("memory.security.units.put", {"project_id": self.pid, "audit_id": self.audit_id, "units": [unit_record(u) for u in units]}, "The unit")
+
+    def put_hits(self, hits):
+        for start in range(0, len(hits), HITS_WRITE_BATCH):
+            write("memory.security.hits.put", {"project_id": self.pid, "audit_id": self.audit_id, "hits": hits[start:start + HITS_WRITE_BATCH]}, "The settlement")
+        for hit in hits:
+            known = self.by_hit.get(hit["id"])
+            if known is not None:
+                known.update(hit)
+
+    def put_findings(self, findings, audit=True):
+        """Store findings; returns (the findings as stored, the store's notes)."""
+        result = write("memory.security.findings.put", {"project_id": self.pid, "audit_id": self.audit_id if audit else None, "findings": findings, "workspace": self.root}, "The finding")
+        self._findings = None
+        return (result or {}).get("findings") or [], (result or {}).get("notes") or []
+
+    def put_audit(self, audit):
+        write("memory.security.audit.put", {"project_id": self.pid, "audit": audit}, "The audit")
+        self.audit = dict(self.audit or {}, **{k: v for k, v in audit.items() if v is not None})
+
+
+def unit_record(unit):
+    keys = ("id", "class", "name", "reason", "status", "note", "error", "hits", "files", "previous_status", "previous_note")
+    return {key: unit.get(key) for key in keys if key in unit}
 
 
 def fail(message, next_step=None):
@@ -874,19 +1564,35 @@ def tool():
 
 
 def default_out():
-    """Where the audit's state and report live: under the app's home (commands may write there and
-    nothing cleans it; the project's `tmp/` is wiped when a turn ends), one folder per project."""
+    """Where the audit's reports live: under the app's home (nothing cleans it; the project's
+    `tmp/` is wiped when a turn ends), one folder per project, one per audit inside it."""
     home = os.environ.get("CORTEX_HOME")
-    if not home:
-        return OUT_DEFAULT
     root = os.getcwd()
+    if not home:
+        return os.path.join(root, OUT_DEFAULT)
     return os.path.join(home, "audits", "%s-%s" % (os.path.basename(root) or "project", hashlib.sha1(root.encode("utf-8")).hexdigest()[:8]))
 
 
-def drafts_dir():
-    """Where record templates are written for the model to fill with `edit` (which writes only inside
-    the workspace): the project's scratch folder."""
-    return OUT_DEFAULT
+LEGACY_FILES = ("coverage.json", "recon.json", "deps.json", "findings.json", "previous.json")
+LEGACY_DIRS = ("hits", "hits-state")
+
+
+def drop_legacy_state():
+    """Remove the audit state earlier versions kept as files beside the reports (the graph holds
+    it now): the JSON records and the hit folders, at the project's folder and in its `runs/`
+    archives. The Markdown reports stay."""
+    if not os.environ.get("CORTEX_HOME"):
+        return
+    base = default_out()
+    folders = [base] + sorted(str(p) for p in Path(base, "runs").glob("*") if p.is_dir())
+    for folder in folders:
+        for name in LEGACY_FILES:
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+        for name in LEGACY_DIRS:
+            shutil.rmtree(os.path.join(folder, name), ignore_errors=True)
 
 
 def parse_flags(args, flags_with_values):
@@ -902,6 +1608,8 @@ def parse_flags(args, flags_with_values):
                 while i + 1 < len(args) and not args[i + 1].startswith("--"):
                     values.append(args[i + 1])
                     i += 1
+                    if flags_with_values[name] == "one":
+                        break
                 flags[name] = values if flags_with_values[name] == "many" else (values[0] if values else True)
             else:
                 flags[name] = True
@@ -913,57 +1621,178 @@ def parse_flags(args, flags_with_values):
 
 # ----------------------------------------------------------------------------- recon
 
+def history_secrets(root, catalog):
+    """Credential formats added in the last commits' diffs: [(short sha, file, pattern name, masked excerpt)]."""
+    log = git(["log", "-p", "-n", str(HISTORY_COMMITS), "--no-color", "--format=commit %h", "--", "."], root, limit=30_000_000)
+    if not log:
+        return []
+    patterns = [p for p in catalog.by_id["obvious"]["patterns"] if p["name"] in STRONG_PATTERNS or p["name"] in ("Google API key", "JWT literal")]
+    rows, sha, path, seen = [], "", "", set()
+    for line in log.split("\n"):
+        if line.startswith("commit "):
+            sha = line[7:].strip()
+        elif line.startswith("+++ b/"):
+            path = line[6:].strip()
+        elif line.startswith("+") and not line.startswith("+++"):
+            for pattern in patterns:
+                if (not pattern["needle"] or pattern["needle"] in line) and pattern["re"].search(line):
+                    if (path, pattern["name"]) not in seen:
+                        seen.add((path, pattern["name"]))
+                        rows.append((sha, path, pattern["name"], shown(line[1:], 100)))
+                    break
+        if len(rows) >= 30:
+            break
+    return rows
+
+
+def hit_record(uid, index, cls_id, rel, number, shape, text, signal_kind=None, extra=None):
+    """A line to judge as the graph keeps it; `signal_kind` names a strong host signal."""
+    hit = {"id": "%s.%d" % (uid, index), "unit": uid, "class": cls_id, "path": rel or "", "line": int(number or 0), "shape": shape, "text": shown(text)}
+    if signal_kind:
+        hit["signal"] = {"key": "real key format (%s)" % shape, "history": "a secret in git history", "malicious": "malicious package", "kev": "exploited in the wild (CISA KEV)"}[signal_kind]
+        hit["severity"] = SIGNAL_SEVERITY[signal_kind]
+    hit.update(extra or {})
+    return hit
+
+
+def dependency_hits(uid, rows, root):
+    """The dependencies unit's lines: one per vulnerable package, worst first."""
+    out = []
+    for index, ((eco, name, version, lockfile), group) in enumerate(group_rows(rows), 1):
+        fix = covering_fix(group)
+        extra = exploit_words(group)
+        text = "%s %s %s: %d advisor%s, worst %s%s; %s; %s" % (eco, name, version, len(group), "y" if len(group) == 1 else "ies", group[0]["severity"], (", " + ", ".join(extra)) if extra else "", ("upgrade to %s" % fix) if fix else "no fixed version", "; ".join("%s %s" % (r["id"], r["summary"][:70]) for r in group[:2]))
+        kind = "malicious" if any(r["id"].startswith("MAL-") for r in group) else "kev" if any(r.get("kev") for r in group) else None
+        lock_text = read_text(os.path.join(root, lockfile)) or ""
+        line = pin_line(lock_text, name, version) or 0
+        hit = hit_record(uid, index, "dependencies", lockfile, line, "vulnerable package", text, kind, {"ecosystem": eco, "package": name, "version": version})
+        if kind == "kev" and SEVERITY_RANK.get(group[0]["severity"], 5) < SEVERITY_RANK["high"]:
+            hit["severity"] = group[0]["severity"]
+        out.append(hit)
+    return out
+
+
+def pin_line(text, package, version):
+    """The 1-based line of a lockfile that pins `package` at `version` (the memory plugin's rule)."""
+    name = package.rsplit(":", 1)[-1]
+    version = version.lstrip("v")
+    if not name or not version:
+        return None
+    name_re = re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape(name) + r"(?![A-Za-z0-9_./-])")
+    version_re = re.compile(r"(?<![0-9.])" + re.escape(version) + r"(?![A-Za-z0-9.])")
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if name_re.search(line) and any(version_re.search(l) for l in lines[index:index + 8]):
+            return index + 1
+    return None
+
+
 def cmd_recon(args):
-    positional, flags = parse_flags(args, {"scope": "many", "out": "one"})
+    positional, flags = parse_flags(args, {"scope": "many"})
     scope = list(flags.get("scope", [])) + positional
-    out = flags.get("out") or default_out()
     root = os.getcwd()
     started = time.time()
-    state = State(root, out)
+    pid = require_app(root)
     catalog = Catalog()
     files = repo_files(root, scope)
     if not files:
         fail("no files to audit under %s%s" % (root, (" within " + ", ".join(scope)) if scope else ""), "run from the repository root, or name existing paths after --scope")
     git_head = (git(["rev-parse", "--short", "HEAD"], root) or "").strip()
     dirty = bool((git(["status", "--porcelain"], root) or "").strip())
-    earlier_run = archive_previous(state)
     facts, texts = collect(root, files)
     hits = scan_texts(catalog, texts)
-    units = []
-    if earlier_run and earlier_run["issues"]:
-        units.append({"id": "U0", "class": "previous", "name": "Issues of the previous audit", "reason": "%d issues reported on %s" % (len(earlier_run["issues"]), earlier_run["archived"][:8]), "status": "planned", "hits": len(earlier_run["issues"]), "files": len({i.get("file") for i in earlier_run["issues"] if i.get("file")}), "note": ""})
+    agent_files = sorted(set(getattr(repo_files, "agent_files", [])))
+    agent = agent_hits(root, agent_files)
+    history = history_secrets(root, catalog)
+    rows, packages, not_parsed, deps_why, exploit_problems = live_deps(root)
+
+    # What the host sees of the findings already known, before the new audit's units are made.
+    ok, recheck = graph_call("memory.security.recheck", {"project_id": pid, "workspace": root})
+    if not ok:
+        fail("the known findings could not be re-checked: %s" % recheck, APP_NEXT)
+    checked = {row["id"]: row for row in (recheck or {}).get("checked") or []}
+    ok, known = graph_call("memory.security.findings", {"project_id": pid, "status": ["open", "fixing", "accepted"]})
+    if not ok:
+        fail("the known findings could not be read: %s" % known, APP_NEXT)
+    known = [f for f in (known or {}).get("findings") or [] if f.get("verdict") != "rejected"]
+    ok, before = graph_call("memory.security.audit.state", {"project_id": pid})
+    previous_units = {u["class"]: u for u in ((before or {}).get("units") or []) if u.get("status") not in ("planned", "in_progress")} if ok else {}
+
+    units, unit_hits = [], {}
+    if known:
+        units.append({"id": "U0", "class": "previous", "name": PREVIOUS_CLASS["name"], "reason": "%d issues already known to the project" % len(known), "status": "planned", "note": ""})
+        rows0 = []
+        for index, finding in enumerate(known, 1):
+            label = {"confirmed": "confirmed finding, %s" % (finding.get("severity_overall") or ""), "needs_validation": "lead (needs validation)", "hardening": "hardening note"}.get(finding.get("verdict"), finding.get("verdict"))
+            now = checked.get(finding["id"], {})
+            line = now.get("line") or finding.get("sink_line") or 0
+            text = "%s: %s. Now: %s" % (label, (finding.get("title") or "")[:120], now.get("sentence") or "not compared")
+            hit = hit_record("U0", index, "previous", finding.get("sink_path") or "", line, "previous " + {"confirmed": "finding", "needs_validation": "lead", "hardening": "hardening"}.get(finding.get("verdict"), "finding"), text, None, {"finding_id": finding["id"]})
+            if finding.get("signal"):
+                hit["signal"], hit["severity"] = finding["signal"], finding.get("host_severity")
+            rows0.append(hit)
+        unit_hits["U0"] = rows0
     for cls in catalog.classes:
-        ok, reason = applies_to(cls, facts, texts)
-        if not ok:
+        ok_, reason = applies_to(cls, facts, texts)
+        if not ok_ and cls["id"] == "ai-llm-agent" and agent:
+            ok_, reason = True, "AI-agent files: %s" % ", ".join(sorted({a[0] for a in agent})[:4])
+        if not ok_:
             continue
-        uid = "U%d" % (len(units) + 1)
-        unit_hits = hits.get(cls["id"], [])
-        units.append({"id": uid, "class": cls["id"], "name": cls["name"], "reason": reason, "status": "planned", "hits": len(unit_hits), "files": len({h[0] for h in unit_hits}), "note": ""})
-    os.makedirs(state.path("hits"), exist_ok=True)
-    for unit in units:
-        state.save(os.path.join("hits", unit["id"] + ".json"), hits.get(unit["class"], []))
-    previous = state.load("coverage.json", None)
-    coverage = {"root": root, "scope": scope, "started": time.strftime("%Y-%m-%d %H:%M"), "started_ms": int(time.time() * 1000), "units": units, "files": len(files)}
-    coverage["audit_id"] = "audit-%s" % hashlib.sha1(("%s %d" % (root, coverage["started_ms"])).encode("utf-8")).hexdigest()[:12]
-    if previous and previous.get("units"):
-        done = {u["class"]: u for u in previous["units"] if u["status"] not in ("planned", "in_progress")}
-        for unit in units:
-            if unit["class"] in done:
-                unit["previous"] = {"status": done[unit["class"]]["status"], "note": done[unit["class"]]["note"]}
-    state.save("coverage.json", coverage)
+        uid = "U%d" % (len([u for u in units if u["id"] != "U0"]) + 1)
+        unit = {"id": uid, "class": cls["id"], "name": cls["name"], "reason": reason, "status": "planned", "note": ""}
+        if cls["id"] in previous_units:
+            unit["previous_status"] = previous_units[cls["id"]]["status"]
+            unit["previous_note"] = previous_units[cls["id"]].get("note", "")
+        if cls["id"] == "dependencies":
+            lines = dependency_hits(uid, rows, root)
+            if not lines:
+                why = ("the dependency check did not run (%s): settle the unit blocked with that reason, or run recon again when the network is back" % deps_why) if deps_why else "no pinned dependency has a known vulnerability (OSV, live); settle the unit"
+                lines = [hit_record(uid, 0, cls["id"], "", 0, "the unit", why)]
+        else:
+            raw = hits.get(cls["id"], [])
+            lines = []
+            for index, (rel, number, shape, text) in enumerate(raw, 1):
+                lines.append(hit_record(uid, index, cls["id"], rel, number, shape, text, "key" if shape in STRONG_PATTERNS else None))
+            if cls["id"] == "obvious":
+                for sha, path, name, excerpt in history:
+                    lines.append(hit_record(uid, len(lines) + 1, cls["id"], path, 0, "secret in git history", "commit %s: %s %s" % (sha, name, excerpt), "history" if name in STRONG_PATTERNS else None))
+            if cls["id"] == "ai-llm-agent":
+                for (rel, number, shape, text, sig) in agent:
+                    lines.append(hit_record(uid, len(lines) + 1, cls["id"], rel, number, shape, text, sig))
+            if not lines:
+                lines = [hit_record(uid, 0, cls["id"], "", 0, "the unit", "no code shape of this class matched: read its 'look for' items against the entry points and handlers, then settle the unit")]
+        unit["hits"] = sum(1 for h in lines if not h["id"].endswith(".0"))
+        unit["files"] = len({h["path"] for h in lines if h["path"]})
+        units.append(unit)
+        unit_hits[uid] = lines
+    if "U0" in unit_hits:
+        units[0]["hits"] = len(unit_hits["U0"])
+        units[0]["files"] = len({h["path"] for h in unit_hits["U0"] if h["path"]})
+
     stack = stack_of(facts)
-    facts_out = {k: (sorted(v) if isinstance(v, set) else v) for k, v in facts.items() if k != "gitignore"}
-    facts_out["stack"] = stack
-    facts_out["files"] = len(files)
-    facts_out["git_head"] = git_head
-    facts_out["dirty"] = dirty
-    state.save("recon.json", facts_out)
+    started_ms = int(time.time() * 1000)
+    audit = {
+        "id": "audit-%s" % hashlib.sha1(("%s %d" % (root, started_ms)).encode("utf-8")).hexdigest()[:12],
+        "started_ms": started_ms, "units": len(units), "lines_judged": 0, "findings": 0, "leads": 0, "hardening": 0,
+        "scope": ", ".join(scope) or None, "skill_version": SKILL_VERSION, "root": root, "git_head": git_head, "dirty": dirty, "files": len(files),
+        "langs": ["%s=%d" % kv for kv in sorted(facts["langs"].items(), key=lambda kv: -kv[1])], "stack": stack, "entries": facts["entries"][:200],
+        "manifests": ["%s=%s" % m for m in facts["manifests"]], "lockfiles": facts["lockfiles"], "not_parsed": not_parsed, "ci": facts["ci"], "containers": facts["containers"],
+        "iac": facts["iac"], "secret_files": facts["secret_files"], "agent_files": agent_files, "tests": bool(facts["tests"]),
+        "deps_checked_ms": None if deps_why else started_ms, "deps_packages": len(packages), "deps_note": deps_why,
+    }
+    state_after = write("memory.security.audit.start", {"project_id": pid, "audit": audit, "units": [unit_record(u) for u in units], "advisories": advisory_records(rows)}, "The audit")
+    if not (state_after or {}).get("audit"):
+        fail("the audit was not recorded: the store answered without it", "%s recon" % tool())
+    all_hits = [hit for uid in [u["id"] for u in units] for hit in unit_hits.get(uid, [])]
+    for start in range(0, len(all_hits), HITS_WRITE_BATCH):
+        write("memory.security.hits.put", {"project_id": pid, "audit_id": audit["id"], "hits": all_hits[start:start + HITS_WRITE_BATCH]}, "The audit's lines")
+    drop_legacy_state()
 
     # The map: what the project is, structurally.
     langs = sorted(facts["langs"].items(), key=lambda kv: -kv[1])
     code = [(LANG_NAMES.get(l, l), n) for l, n in langs if l in CODE_LANGS]
     other = [(LANG_NAMES.get(l, l), n) for l, n in langs if l not in CODE_LANGS]
-    print("Project: %s%s, %d files%s%s" % (os.path.basename(root), (" at " + facts_out["git_head"]) if facts_out["git_head"] else "", len(files), " (scope: %s)" % ", ".join(scope) if scope else "", ", uncommitted changes present" if facts_out["dirty"] else ""))
+    print("Project: %s%s, %d files%s%s" % (os.path.basename(root), (" at " + git_head) if git_head else "", len(files), " (scope: %s)" % ", ".join(scope) if scope else "", ", uncommitted changes present" if dirty else ""))
     if code:
         print("Code: " + ", ".join("%s (%d)" % c for c in code[:6]))
     if other:
@@ -979,10 +1808,9 @@ def cmd_recon(args):
             by_file[h[0]] = by_file.get(h[0], 0) + 1
         top = sorted(by_file.items(), key=lambda kv: -kv[1])[:5]
         print("Handlers: %d in %d files (%s)" % (len(routes), len(by_file), ", ".join("%s %d" % t for t in top)))
-    manifests = facts["manifests"]
-    if manifests:
+    if facts["manifests"]:
         parts = []
-        for rel, kind in manifests[:8]:
+        for rel, kind in facts["manifests"][:8]:
             locks = MANIFEST_LOCK.get(os.path.basename(rel), [])
             folder = os.path.dirname(rel)
             locked = any(os.path.dirname(lf) == folder and os.path.basename(lf) in locks for lf in facts["lockfiles"]) if locks else None
@@ -992,62 +1820,72 @@ def cmd_recon(args):
         print("Delivery: " + ", ".join(facts["ci"][:4] + facts["containers"][:4] + facts["iac"][:4]) + (" ..." if len(facts["ci"]) + len(facts["containers"]) + len(facts["iac"]) > 12 else ""))
     if facts["secret_files"]:
         print("Secret-looking files in the repository: " + ", ".join(facts["secret_files"][:8]))
+    if agent_files:
+        print("AI-agent files: " + ", ".join(agent_files[:8]) + (" ..." if len(agent_files) > 8 else ""))
     if not facts["tests"]:
         print("Tests: none found (local checks will be small scripts in tmp/)")
-    for line in live_deps(state, root, files, shown=RECON_DEPS_SHOWN):
-        print(line)
-    if earlier_run and earlier_run["issues"]:
-        recheck_previous(state, earlier_run, list(project_packages(root, files)))
+    if deps_why:
+        print(deps_why[0].upper() + deps_why[1:] + ".")
+    else:
+        for line in deps_lines(rows, packages, not_parsed, RECON_DEPS_SHOWN):
+            print(line)
+        for problem in exploit_problems:
+            print(problem + "; the priority goes without it.")
+    moved = [row for row in checked.values() if row.get("now")]
+    if moved:
+        print("Re-checked by the host: " + "; ".join("%s now %s (%s)" % (row["id"], row["now"], row["sentence"]) for row in moved[:6]) + ("; and %d more" % (len(moved) - 6) if len(moved) > 6 else "") + ".")
+    if known:
         print("")
-        print("A previous audit of this project (%s) reported %d issues; they are U0, re-checked first. Its report is kept at %s." % (earlier_run["archived"][:8], len(earlier_run["issues"]), state.path(earlier_run["report"])))
+        print("%d issues already known to this project are U0, re-checked first." % len(known))
     print("")
     print("Units (the audit's checklist; each is one attack class that applies here):")
     for unit in units:
         line = "  %s %s: %s; %d suspicious lines in %d files" % (unit["id"], unit["class"], unit["reason"], unit["hits"], unit["files"])
-        if unit.get("previous"):
-            line += "; last audit: %s" % unit["previous"]["status"]
+        if unit.get("previous_status"):
+            line += "; last audit: %s" % unit["previous_status"]
         print(line)
     print("")
-    print("State kept in %s (survives the turn; the project itself is not written). %.1fs." % (state.out, time.time() - started))
+    print("Recorded in the project's graph as %s. %.1fs." % (audit["id"], time.time() - started))
     print("Next: %s next" % tool())
 
 
 # ----------------------------------------------------------------------------- hunt, cover, status
 
-def history_secrets(root, catalog):
-    """Secret patterns in the last commits' diffs: (short sha, file, pattern name) rows."""
-    log = git(["log", "-p", "-n", str(HISTORY_COMMITS), "--no-color", "--format=commit %h", "--", "."], root, limit=30_000_000)
-    if not log:
-        return []
-    secret_patterns = [p for p in catalog.by_id["obvious"]["patterns"] if any(w in p["name"] for w in ("key", "token", "secret", "password", "connection", "JWT"))]
-    rows, sha, path = [], "", ""
-    for line in log.split("\n"):
-        if line.startswith("commit "):
-            sha = line[7:].strip()
-        elif line.startswith("+++ b/"):
-            path = line[6:].strip()
-        elif line.startswith("+") and not line.startswith("+++"):
-            for pattern in secret_patterns:
-                if pattern["needle"] in line and pattern["re"].search(line):
-                    rows.append((sha, path, pattern["name"]))
-                    break
-        if len(rows) >= 30:
-            break
-    return rows
+def print_hits(state, unit, show_all):
+    rows = hit_rows(state, unit)
+    real = [r for r in rows if not r[0].endswith(".0")]
+    if not real:
+        print(rows[0][4] if rows else "No line to judge.")
+        return
+    by_pattern = {}
+    for hid, rel, number, shape, text in real:
+        by_pattern.setdefault(shape, []).append((hid, rel, number, text))
+    print("Suspicious lines (%d in %d files), by shape:" % (len(real), len({r[1] for r in real})))
+    shown_count = 0
+    for name, items in sorted(by_pattern.items(), key=lambda kv: -len(kv[1])):
+        print("  %s (%d):" % (name, len(items)))
+        for hid, rel, number, text in (items if show_all else items[:HITS_PER_PATTERN]):
+            if not show_all and shown_count >= HITS_SHOWN:
+                break
+            print("    %s %s%s  %s" % (hid, rel, ":%d" % number if number else "", text[:110]))
+            shown_count += 1
+        if not show_all and len(items) > HITS_PER_PATTERN:
+            print("    ... %d more" % (len(items) - HITS_PER_PATTERN))
+    if not show_all and shown_count < len(real):
+        print("All %d lines: %s hunt %s --all" % (len(real), tool(), unit["id"]))
 
 
 def cmd_hunt(args):
-    if not args:
+    positional, flags = parse_flags(args, {})
+    if not positional:
         fail("which unit?", "%s hunt U1" % tool())
-    state = State(os.getcwd(), default_out())
+    state = State(os.getcwd())
     coverage = state.coverage()
-    unit = state.unit(coverage, args[0])
-    catalog = Catalog()
-    cls = catalog.by_id[unit["class"]]
-    hits = state.load(os.path.join("hits", unit["id"] + ".json"), [])
+    unit = state.unit(coverage, positional[0])
+    cls = Catalog().by_id[unit["class"]]
     if unit["status"] == "planned":
         unit["status"] = "in_progress"
-        state.save("coverage.json", coverage)
+        state.put_units([unit])
     print("%s %s (%s)" % (unit["id"], cls["name"], unit["reason"]))
     print("Invariant: " + cls["invariant"])
     print("Look for:")
@@ -1055,60 +1893,21 @@ def cmd_hunt(args):
         print("  - " + item)
     print("A finding here: " + cls["counts"])
     print("Only a hardening note: " + cls["hardening"])
-    if cls.get("live") == "osv":
-        for line in live_deps(state, state.root, repo_files(state.root, coverage.get("scope") or [])):
-            print(line)
-        print("")
-        print("Each vulnerable package: is the affected code called with outside data? (read graph://used-by/<function>, grep -rn \"<package>\"). Reachable: a confirmed finding with the upgrade as the fix; not reachable: a hardening note naming the upgrade.")
-        print("Next, when every package is settled: %s cover %s covered|candidate|blocked \"<what settled it>\"" % (tool(), unit["id"]))
-        return
-    if not offline_here(state.root):
-        guidance = upstream_guidance(unit["class"])
-        if guidance:
-            print("Upstream guidance (Cloudflare security-audit skill, live):")
-            for line in guidance:
-                print("  " + line)
     if unit["class"] == "obvious":
-        recon = state.load("recon.json", {})
-        for rel in recon.get("secret_files", []):
+        for rel in (state.audit or {}).get("secret_files") or []:
             print("Secret-looking file: %s" % rel)
-        rows = history_secrets(state.root, catalog)
-        if rows:
-            print("Secret patterns in the last %d commits (check whether they are real and still valid; a rotated secret is still a finding to report):" % HISTORY_COMMITS)
-            for sha, path, name in rows[:12]:
-                print("  %s %s: %s" % (sha, path, name))
-    if not hits:
-        print("No suspicious lines matched this class's shapes: read the 'look for' items against the entry points and the handlers, then cover the unit.")
-    else:
-        by_pattern = {}
-        for rel, number, name, text in hits:
-            by_pattern.setdefault(name, []).append((rel, number, text))
-        print("Suspicious lines (%d in %d files), by shape:" % (len(hits), len({h[0] for h in hits})))
-        shown = 0
-        for name, rows in sorted(by_pattern.items(), key=lambda kv: -len(kv[1])):
-            print("  %s (%d):" % (name, len(rows)))
-            for rel, number, text in rows[:HITS_PER_PATTERN]:
-                if shown >= HITS_SHOWN:
-                    break
-                print("    %s%s  %s" % (rel, ":%d" % number if number else "", text[:110]))
-                shown += 1
-            if len(rows) > HITS_PER_PATTERN:
-                print("    ... %d more" % (len(rows) - HITS_PER_PATTERN))
-        if shown < len(hits):
-            listing = state.path(os.path.join("hits", unit["id"] + ".txt"))
-            with open(listing, "w", encoding="utf-8") as handle:
-                for rel, number, name, text in hits:
-                    handle.write("%s:%d  [%s]  %s\n" % (rel, number, name, text))
-            print("All %d lines: run `cat %s`" % (len(hits), listing))
+    print_hits(state, unit, bool(flags.get("all")))
+    if unit["class"] == "dependencies":
+        print("Each vulnerable package: is the affected code called with outside data? (read graph://used-by/<function>, grep -rn \"<package>\"). Reachable: a confirmed finding with the upgrade as the fix; not reachable: a hardening note naming the upgrade.")
     print("")
-    print("For each line: find where its value comes from (read graph://used-by/<function>, read <path>:<from>-<to>), decide whether a lower-trust party controls it and whether a check you read stops it; then record (%s new <verdict>) or move on." % tool())
+    print("For each line: find where its value comes from (read graph://used-by/<function>, read <path>:<from>-<to>), decide whether a lower-trust party controls it and whether a check you read stops it; then settle it (%s settle <id> ...)." % tool())
     print("Next, when every line is settled: %s cover %s covered|candidate|blocked \"<what settled it>\"" % (tool(), unit["id"]))
 
 
 def cmd_cover(args):
     if len(args) < 2 or args[1] not in ("covered", "candidate", "blocked"):
         fail("usage: cover <unit> covered|candidate|blocked \"<note>\"", "%s status" % tool())
-    state = State(os.getcwd(), default_out())
+    state = State(os.getcwd())
     coverage = state.coverage()
     unit = state.unit(coverage, args[0])
     status, note = args[1], " ".join(args[2:]).strip()
@@ -1118,9 +1917,12 @@ def cmd_cover(args):
         recorded = [f for f in state.findings() if f.get("class") == unit["class"] or f.get("unit") == unit["id"]]
         if not recorded:
             fail("candidate means records exist for this class; none names %s yet" % unit["class"], "%s new confirmed|needs_validation|rejected, then finding <file>, then cover again" % tool())
+    strong = [h for h in state.hits.get(unit["id"], []) if h.get("signal") and h.get("verdict") not in ("finding", "lead")]
+    if strong and status != "candidate":
+        fail("%s holds strong host signals not settled as finding or lead: %s" % (unit["id"], ", ".join("%s (%s)" % (h["id"], h["signal"]) for h in strong[:4])), "%s settle %s finding" % (tool(), strong[0]["id"]))
     unit["status"], unit["note"] = status, note
-    state.save("coverage.json", coverage)
-    left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress")]
+    state.put_units([unit])
+    left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress") and u["id"] != unit["id"]]
     print("%s %s: %s%s" % (unit["id"], unit["class"], status, (" (" + note + ")") if note else ""))
     if left:
         print("Left: " + ", ".join("%s %s" % (u["id"], u["class"]) for u in left))
@@ -1130,22 +1932,36 @@ def cmd_cover(args):
         print("Next: %s report" % tool())
 
 
+def session_findings(pid):
+    """The findings this session fixes or fixed: (open ones, all of them), or exits 1 when the graph
+    cannot be read (a guard that cannot read the record never passes)."""
+    session = os.environ.get("CORTEX_SESSION_ID")
+    params = {"project_id": pid, "session_id": session} if session else {"project_id": pid, "status": ["fixing"]}
+    ok, result = graph_call("memory.security.findings", params)
+    if not ok:
+        fail("the fix could not be read from the project's graph: %s" % result, APP_NEXT)
+    found = (result or {}).get("findings") or []
+    return [f for f in found if f.get("status") in ("open", "fixing")], found
+
+
 def cmd_status(args):
-    positional, flags = parse_flags(args, {"finding": True, "unit": True})
-    state = State(os.getcwd(), default_out())
+    positional, flags = parse_flags(args, {"finding": "one", "unit": "one"})
+    root = os.getcwd()
     # The fix session's guard: exit 0 once its finding is recorded fixed.
     if flags.get("fixing") or flags.get("finding"):
-        if flags.get("finding"):
-            finding, _ = graph_finding(state, flags["finding"])
-            if finding is None:
-                fail("no finding %s in the project's graph" % flags["finding"], "%s show %s" % (tool(), flags["finding"]))
-            if finding.get("status") in STATUS_DONE:
+        pid = require_app(root)
+        if isinstance(flags.get("finding"), str):
+            ok, result = graph_call("memory.security.finding", {"project_id": pid, "id": flags["finding"]})
+            if not ok:
+                fail("finding %s could not be read from the project's graph: %s" % (flags["finding"], result), "%s show %s" % (tool(), flags["finding"]))
+            finding = (result or {}).get("finding") or {}
+            if finding.get("status") in STATUS_DONE + ("accepted", "gone"):
                 print("%s is %s." % (finding["id"], finding["status"]))
                 return
-            print("Open: %s is %s: %s" % (finding["id"], finding.get("status", "open"), finding.get("title", "")))
-            print("Next: make the fix, run the test, then %s resolve %s \"<how>\"" % (tool(), finding["id"]))
+            print("Open: %s is %s: %s" % (finding.get("id", flags["finding"]), finding.get("status", "open"), finding.get("title", "")))
+            print("Next: make the fix, run the test, then %s resolve %s \"<how>\"" % (tool(), finding.get("id", flags["finding"])))
             sys.exit(1)
-        open_fixes = fixing_here(state)
+        open_fixes, _ = session_findings(pid)
         if not open_fixes:
             print("No fix is open in this session.")
             return
@@ -1153,10 +1969,10 @@ def cmd_status(args):
             print("Open: %s (%s) %s; sink %s:%s" % (finding["id"], finding.get("severity_overall") or finding.get("verdict"), finding.get("title", ""), finding.get("sink_path") or "", finding.get("sink_line") or ""))
         print("Next: make the fix at the sink, run the test, then %s resolve %s \"<how you verified it>\"" % (tool(), open_fixes[0]["id"]))
         sys.exit(1)
+    state = State(root)
     coverage = state.coverage()
-    findings = state.findings()
     states = hit_states(state)
-    if flags.get("unit"):
+    if isinstance(flags.get("unit"), str):
         unit = state.unit(coverage, flags["unit"])
         rows = hit_rows(state, unit)
         left = [r[0] for r in rows if r[0] not in states]
@@ -1164,9 +1980,8 @@ def cmd_status(args):
             print("Open: %s %s, %d of %d lines (%s%s)." % (unit["id"], unit["class"], len(left), len(rows), ", ".join(left[:6]), ", ..." if len(left) > 6 else ""))
             print("Next: %s next --unit %s" % (tool(), unit["id"]))
             sys.exit(1)
-        catalog = Catalog()
-        report_path = state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))
-        print("%s is settled: %s" % (unit["id"], unit_line(state, unit, catalog, report_path)))
+        report_path = state.path(os.path.join("units", unit_report(state, coverage, unit, Catalog())))
+        print("%s is settled: %s" % (unit["id"], unit_line(state, unit, Catalog(), report_path)))
         return
     open_units = []
     for unit in coverage["units"]:
@@ -1182,14 +1997,15 @@ def cmd_status(args):
                 print("Failed: %s %s: %s (still open)." % (unit["id"], unit["class"], unit["error"]))
     else:
         print("Settled: %s." % (", ".join("%s %s" % (u["id"], u["status"]) for u in settled) or "nothing yet"))
+    findings = state.findings()
     counts = {v: sum(1 for f in findings if f.get("verdict") == v) for v in VERDICTS}
     if findings or not open_units:
         print("Records: %d confirmed, %d needs_validation, %d rejected" % (counts["confirmed"], counts["needs_validation"], counts["rejected"]))
-    pending = [name for name, _ in pending_records(state)]
+    pending = pending_records(state)
     if pending:
-        print("Drafts not recorded yet: " + ", ".join(os.path.join(state.drafts_rel, d) for d in pending))
+        print("Drafts not recorded yet: " + ", ".join(os.path.join(state.drafts_rel, name) for name, _ in pending))
     left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress")]
-    if pending or left or not os.path.isfile(state.path("REPORT.md")):
+    if pending or left or not report_current(state):
         print("Next: %s next" % tool())
         sys.exit(1)
     print("The audit is complete; the report is %s." % state.path("REPORT.md"))
@@ -1257,19 +2073,19 @@ FORBIDDEN = {
     "rejected": ["severity", "fix", "blocker", "check", "impact", "evidence"],
 }
 
-
 def cmd_new(args):
     if not args or args[0] not in TEMPLATES:
         fail("usage: new confirmed|needs_validation|rejected", "%s new confirmed" % tool())
-    state = State(os.getcwd(), default_out())
-    os.makedirs(state.drafts, exist_ok=True)
+    root = os.getcwd()
+    drafts = os.path.join(root, OUT_DEFAULT)
+    os.makedirs(drafts, exist_ok=True)
     n = 1
-    while os.path.exists(os.path.join(state.drafts, "finding-%d.json" % n)):
+    while os.path.exists(os.path.join(drafts, "finding-%d.json" % n)):
         n += 1
     name = "finding-%d.json" % n
-    with open(os.path.join(state.drafts, name), "w", encoding="utf-8") as handle:
+    with open(os.path.join(drafts, name), "w", encoding="utf-8") as handle:
         json.dump(TEMPLATES[args[0]], handle, indent=1)
-    rel = os.path.join(state.drafts_rel, name)
+    rel = os.path.join(OUT_DEFAULT, name)
     print("Wrote %s. Replace every value that starts with '? ' using edit; keep the field names." % rel)
     if args[0] == "confirmed":
         print("Severity comes from the demonstrated result, never from the class name; overall never exceeds impact:")
@@ -1391,7 +2207,6 @@ def cmd_finding(args):
     if not args:
         fail("which file?", "%s finding tmp/secaudit/finding-1.json" % tool())
     root = os.getcwd()
-    state = State(root, default_out())
     path = args[0]
     try:
         with open(os.path.join(root, path), encoding="utf-8") as handle:
@@ -1407,32 +2222,233 @@ def cmd_finding(args):
             print("  - " + problem)
         print("Next: fix these with edit, then %s finding %s" % (tool(), path))
         sys.exit(1)
-    findings = state.findings()
-    replaced = [f for f in findings if f.get("fingerprint") == record["fingerprint"]]
-    findings = [f for f in findings if f.get("fingerprint") != record["fingerprint"]]
-    record["recorded"] = time.strftime("%Y-%m-%d %H:%M")
-    record["draft"] = path
+    state = State(root)
+    if not state.audit:
+        fail("no audit is open to record this in", "%s next" % tool())
+    hit = state.by_hit.get(str(record.get("hit") or "").upper()) if record.get("hit") else None
+    if record.get("hit") and (hit is None or record.get("audit") not in (None, state.audit_id)):
+        # A draft from an earlier audit: the record stands on its own, without the old line.
+        record.pop("hit", None)
+        record.pop("unit", None)
+        hit = None
     for step in record.get("trace", []):
-        content = read_text(os.path.join(root, step["file"])) or ""
-        lines = content.split("\n")
+        lines = (read_text(os.path.join(root, step["file"])) or "").split("\n")
         if 0 < step.get("line", 0) <= len(lines):
-            step["text"] = lines[step["line"] - 1].strip()
-    findings.append(record)
-    findings.sort(key=lambda f: (VERDICTS.index(f["verdict"]), -(SEVERITY.index(f["severity"]["overall"]) if f.get("severity") else -1), f["fingerprint"]))
-    state.save("findings.json", findings)
-    if record.get("hit"):
-        states = hit_states(state)
-        states[record["hit"]] = {"status": "finding" if record["verdict"] == "confirmed" else "lead" if record["verdict"] == "needs_validation" else "safe", "note": record["title"], "record": os.path.basename(path)}
-        save_hit_states(state, states, sorted({hid.split(".")[0] for hid in states}))
-        coverage = state.load("coverage.json", None)
-        if coverage:
-            sync_units(state, coverage)
-    print("Recorded %s as %s%s." % (record["fingerprint"], record["verdict"], " (replaced the earlier record)" if replaced else ""))
-    coverage = state.load("coverage.json", None)
-    if coverage and record["verdict"] in ("confirmed", "needs_validation"):
-        deps_rows = (state.load("deps.json", {}) or {}).get("rows") or []
-        push_findings(state, coverage, [record_to_finding(record, deps_rows)])
+            step["text"] = lines[step["line"] - 1]
+    finding = record_to_finding(record, state.rows(), hit)
+    if hit and hit.get("severity") and record["verdict"] == "confirmed":
+        floor = hit["severity"]
+        if SEVERITY.index(record["severity"]["overall"]) < SEVERITY.index(floor):
+            print("Severity set to %s: the host sets it for %s; it can be raised, not lowered." % (floor, hit.get("signal")))
+    stored, notes = state.put_findings([finding])
+    for note in notes:
+        print(note[0].upper() + note[1:] + ".")
+    if hit:
+        verdict = {"confirmed": "finding", "needs_validation": "lead"}.get(record["verdict"], "safe")
+        settled = dict(hit, verdict=verdict, note=hit.get("note") or record["title"], finding_id=record["fingerprint"], record=os.path.basename(path), settled_ms=int(time.time() * 1000))
+        if verdict == "safe":
+            settled["note"] = "rejected: " + record.get("reason", record["title"])
+            settled["record"] = os.path.basename(path)
+        state.put_hits([settled])
+    print("Recorded %s as %s in the project's graph." % (record["fingerprint"], record["verdict"]))
     print("Next: %s next" % tool())
+
+
+def record_to_finding(record, deps_rows, hit=None):
+    """A validated record (confirmed, needs_validation or rejected) as the graph's finding."""
+    trace = [{"kind": step.get("kind", "step"), "file": step.get("file", ""), "line": int(step.get("line") or 0), "what": step.get("what", "")} for step in record.get("trace", [])]
+    sink = record.get("trace", [{}])[-1] if record.get("trace") else {}
+    verdict = record["verdict"]
+    severity = dict(record.get("severity") or {})
+    fix = record.get("fix") or {}
+    evidence = record.get("evidence") or {}
+    floor = (hit or {}).get("severity")
+    if floor and verdict == "confirmed" and severity.get("overall") in SEVERITY and SEVERITY.index(severity["overall"]) < SEVERITY.index(floor):
+        severity["overall"] = floor
+        if severity.get("impact") in SEVERITY and SEVERITY.index(severity["impact"]) < SEVERITY.index(floor):
+            severity["impact"] = floor
+    quick_fix, package, version = None, None, None
+    if record.get("class") == "dependencies":
+        parts = record["fingerprint"].split(":")
+        package = (hit or {}).get("package") or (parts[-1] if len(parts) >= 3 else None)
+        version = (hit or {}).get("version") or next((r["version"] for r in deps_rows if r["name"].lower() == (package or "").lower()), None)
+        if package:
+            quick_fix = quick_fix_for(package, deps_rows)
+    group = [r for r in deps_rows if package and r["name"].lower() == package.lower()]
+    finding = {
+        "id": record["fingerprint"],
+        "class": record.get("class", ""),
+        "verdict": verdict,
+        "title": record.get("title", ""),
+        "principal": record.get("principal", ""),
+        "control": record.get("control", ""),
+        "impact": record.get("impact", ""),
+        "result": mask((evidence.get("observed") or record.get("impact") or "").split("\n")[0]),
+        "evidence_how": mask(evidence.get("how", "")),
+        "evidence_observed": mask(evidence.get("observed", "")),
+        "severity_likelihood": severity.get("likelihood"),
+        "severity_impact": severity.get("impact"),
+        "severity_overall": severity.get("overall") if verdict == "confirmed" else (floor if floor and verdict == "needs_validation" else None),
+        "fix_where": fix.get("where", ""),
+        "fix_change": fix.get("change", ""),
+        "fix_test": fix.get("test", ""),
+        "missing_fact": ("%s. Check: %s" % (record.get("blocker", "").rstrip("."), record.get("check", ""))) if verdict == "needs_validation" else None,
+        "blocker": record.get("blocker"),
+        "check_how": record.get("check"),
+        "reason": record.get("reason"),
+        "conditions": [str(c) for c in record.get("conditions") or []],
+        "trace": trace,
+        "quick_fix": quick_fix,
+        "source": "audit",
+        "unit": record.get("unit"),
+        "hit": record.get("hit"),
+        "signal": (hit or {}).get("signal"),
+        "host_severity": floor,
+        "advisories": sorted({r["id"] for r in group}),
+        "kev": any(r.get("kev") for r in group),
+        "epss": max((r.get("epss") or 0 for r in group), default=0) or None,
+        "sink_path": sink.get("file") or None,
+        "sink_line": int(sink.get("line") or 0) or None,
+        "sink_text": shown(sink.get("text") or "") or None,
+        "sink_hash": line_hash(sink.get("text") or "") if sink.get("text") else None,
+        "sink_package": package if record.get("class") == "dependencies" else None,
+        "sink_version": version if record.get("class") == "dependencies" else None,
+    }
+    finding["priority"], finding["priority_reason"] = priority_of(finding)
+    return finding
+
+
+def priority_of(finding):
+    """One number, higher first, from the facts the finding states; the reason spells the terms out.
+    The store adds the age term (+1 per day open, at most 30) when it lists."""
+    terms = []
+    verdict = finding.get("verdict")
+    level = (finding.get("severity_overall") or "").lower()
+    if verdict == "confirmed":
+        level = level if level in PRIORITY_BAND else "low"
+        score = PRIORITY_BAND[level]
+        terms.append("%s severity %d" % (level, score))
+        score += 50
+        terms.append("confirmed +50")
+    elif verdict == "needs_validation":
+        if level in PRIORITY_BAND:
+            score = PRIORITY_BAND[level]
+            terms.append("lead, %s severity by the host %d" % (level, score))
+        else:
+            score = 150
+            terms.append("lead 150")
+    elif verdict == "rejected":
+        return 0, "rejected claim"
+    else:
+        level = level if level in PRIORITY_BAND else "low"
+        score = PRIORITY_BAND[level] - 80
+        terms.append("hardening note, %s band %d -80" % (level, PRIORITY_BAND[level]))
+    who = (finding.get("principal") or "").lower()
+    if any(word in who for word in ("anonymous", "unauthenticated", "any visitor", "remote peer", "the network")):
+        score += 30
+        terms.append("anonymous party +30")
+    elif any(word in who for word in ("user", "authenticated", "logged", "member", "tenant")):
+        score += 15
+        terms.append("authenticated party +15")
+    if finding.get("quick_fix"):
+        score += 20
+        terms.append("quick fix available +20")
+    if finding.get("kev"):
+        score += 80
+        terms.append("exploited in the wild (CISA KEV) +80")
+    epss = finding.get("epss") or 0
+    bonus = int(round(epss * 40))
+    if bonus:
+        score += bonus
+        terms.append("EPSS %d%% +%d" % (round(epss * 100), bonus))
+    return score, ", ".join(terms)
+
+
+ECOSYSTEM_TOOLS = {
+    "npm": lambda name, to, lockdir: ["cd %s && npm install %s@%s" % (lockdir, name, to)],
+    "crates.io": lambda name, to, lockdir: ["cd %s && cargo update -p %s --precise %s" % (lockdir, name, to)],
+    "PyPI": lambda name, to, lockdir: ["cd %s && python3 -m pip install '%s==%s' && python3 -m pip freeze | grep -i '^%s==' " % (lockdir, name, to, name)],
+    "Go": lambda name, to, lockdir: ["cd %s && go get %s@v%s && go mod tidy" % (lockdir, name, to.lstrip("v"))],
+    "RubyGems": lambda name, to, lockdir: ["cd %s && bundle update %s" % (lockdir, name)],
+    "Packagist": lambda name, to, lockdir: ["cd %s && composer update %s" % (lockdir, name)],
+    "Maven": lambda name, to, lockdir: ["edit the version of %s to %s in %s/pom.xml, then: cd %s && mvn -q dependency:resolve" % (name, to, lockdir, lockdir)],
+    "NuGet": lambda name, to, lockdir: ["cd %s && dotnet add package %s --version %s" % (lockdir, name, to)],
+}
+
+
+def quick_fix_for(package_name, deps_rows, lockfile=None):
+    """The exact upgrade for a vulnerable package: the covering version and the commands of its
+    ecosystem; None when no fixed version exists."""
+    rows = [r for r in deps_rows if r["name"].lower() == package_name.lower() and (lockfile is None or r["lockfile"] == lockfile)]
+    if not rows:
+        return None
+    to = covering_fix(rows)
+    if not to:
+        return None
+    row = rows[0]
+    lockdir = os.path.dirname(row["lockfile"]) or "."
+    make = ECOSYSTEM_TOOLS.get(row["eco"])
+    commands = make(row["name"], to, lockdir) if make else ["upgrade %s to %s in %s" % (row["name"], to, row["lockfile"])]
+    if os.path.basename(row["lockfile"]).startswith("requirements") and row["lockfile"].endswith(".txt"):
+        # Portable on macOS and Linux (no `sed -i`): Python rewrites the pin in place.
+        pattern = r"(?im)^(%s\s*(?:\[[^]]*\])?\s*===?\s*)%s(?![\w.])" % (re.escape(row["name"]), re.escape(row["version"]))
+        script = 'import re,sys; p=sys.argv[1]; t=open(p).read(); open(p, "w").write(re.sub(r"%s", lambda m: m.group(1) + "%s", t))' % (pattern, to)
+        commands = ["python3 -c '%s' %s" % (script, row["lockfile"]), "cd %s && python3 -m pip install -r %s" % (lockdir, os.path.basename(row["lockfile"]))]
+    return {"kind": "upgrade", "ecosystem": row["eco"], "package": row["name"], "from": row["version"], "to": to, "lockfile": row["lockfile"], "commands": commands}
+
+
+def hardening_findings(state, coverage):
+    """Every hardening note as a finding of its own: the class, the line, the reviewer's note."""
+    deps_rows = state.rows()
+    states = hit_states(state)
+    out = []
+    for unit in coverage.get("units", []):
+        if unit["class"] == "previous":
+            continue
+        for hid, rel, number, shape, text in hit_rows(state, unit):
+            judged = states.get(hid)
+            if not judged or judged.get("status") != "hardening":
+                continue
+            hit = state.by_hit.get(hid) or {}
+            package = hit.get("package")
+            quick_fix = quick_fix_for(package, deps_rows, rel or None) if package else None
+            group = [r for r in deps_rows if package and r["name"] == package and (not rel or r["lockfile"] == rel)]
+            ident = ("hardening:%s:%s" % (unit["class"], package or ("%s:%d" % (rel or unit["id"], number or 0)))).lower()
+            raw = (read_text(os.path.join(state.root, rel)) or "").split("\n") if rel and number else []
+            sink_raw = raw[number - 1] if raw and 0 < number <= len(raw) else ""
+            finding = {
+                "id": ident,
+                "class": unit["class"],
+                "verdict": "hardening",
+                "title": judged.get("note", "") or "hardening note",
+                "principal": "",
+                "control": "",
+                "impact": "",
+                "result": "",
+                "evidence_how": "static: the reviewer's note on the flagged line",
+                "evidence_observed": text[:200],
+                "severity_overall": group[0]["severity"] if group and group[0]["severity"] in PRIORITY_BAND else None,
+                "fix_where": ("%s:%d" % (rel, number)) if rel and number else (rel or ""),
+                "fix_change": judged.get("note", ""),
+                "fix_test": "",
+                "trace": [{"kind": "sink", "file": rel or "", "line": int(number or 0), "what": text[:160]}] if rel else [],
+                "quick_fix": quick_fix,
+                "source": "audit",
+                "unit": unit["id"],
+                "hit": hid,
+                "advisories": sorted({r["id"] for r in group}),
+                "kev": any(r.get("kev") for r in group),
+                "epss": max((r.get("epss") or 0 for r in group), default=0) or None,
+                "sink_path": rel or None,
+                "sink_line": int(number or 0) or None,
+                "sink_text": shown(sink_raw) if sink_raw else None,
+                "sink_hash": line_hash(sink_raw) if sink_raw else None,
+                "sink_package": package,
+                "sink_version": hit.get("version") if package else None,
+            }
+            finding["priority"], finding["priority_reason"] = priority_of(finding)
+            out.append(finding)
+    return out
 
 
 # ----------------------------------------------------------------------------- report
@@ -1441,27 +2457,59 @@ def md_escape(text):
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
+WATCH_TITLE = "Security: dependency watch"
+WATCH_WHEN = "every day at 09:00"
+
+
+def ensure_watch(state):
+    """After a whole audit, the project's locked dependencies are watched daily for new advisories
+    (a command routine of the scheduler running `watch`; new high, critical or exploited ones reach
+    the person as notifications). One routine per project; an offline project gets none. Returns the
+    line to print when it was made now, else None (also when the scheduler is not there: the audit
+    stands without it)."""
+    if offline_here(state.root):
+        return None
+    ok, listed = graph_call("schedule.list", {"scope": state.pid})
+    if not ok:
+        return None
+    routines = (listed or {}).get("routines", []) if isinstance(listed, dict) else []
+    if any(r.get("title") == WATCH_TITLE and r.get("state") != "ended" for r in routines):
+        return None
+    # Absolute paths: the routine may run in the CortexTerm on this Mac, whose shell has no
+    # CORTEX_HOME of its own.
+    home = os.environ.get("CORTEX_HOME", "")
+    command = "%spython3 %s watch --root %s" % ("CORTEX_HOME=%s " % shlex.quote(home) if home else "", shlex.quote(str(Path(__file__).resolve())), shlex.quote(state.root))
+    params = {"scope": state.pid, "title": WATCH_TITLE, "kind": "command", "when": WATCH_WHEN, "command": command}
+    ok, _ = graph_call("schedule.add", params)
+    if not ok:
+        return None
+    return "The project's dependencies are now checked for new advisories %s (routine \"%s\"; new high, critical or exploited ones notify)." % (WATCH_WHEN, WATCH_TITLE)
+
+
 def cmd_report(args):
     positional, flags = parse_flags(args, {})
-    state = State(os.getcwd(), default_out())
+    state = State(os.getcwd())
     coverage = state.coverage()
-    recon = state.load("recon.json", {})
-    findings = state.findings()
+    audit = state.audit
     left = [u for u in coverage["units"] if u["status"] in ("planned", "in_progress")]
     if left and not flags.get("partial"):
         print("Not every unit is settled: " + ", ".join("%s %s (%s)" % (u["id"], u["class"], u["status"]) for u in left))
         fail("hunt them, or mark them blocked with why; `report --partial` writes a report that says they were not covered", "%s hunt %s" % (tool(), left[0]["id"]))
-    confirmed = [f for f in findings if f["verdict"] == "confirmed"]
+    # The hardening notes become findings first, so the report and the finish see them.
+    hardening = hardening_findings(state, coverage)
+    if hardening:
+        state.put_findings(hardening)
+    findings = state.findings()
+    confirmed = sorted([f for f in findings if f["verdict"] == "confirmed"], key=lambda f: -SEVERITY.index(f.get("severity_overall") or "low"))
     leads = [f for f in findings if f["verdict"] == "needs_validation"]
     rejected = [f for f in findings if f["verdict"] == "rejected"]
-    confirmed.sort(key=lambda f: -SEVERITY.index(f["severity"]["overall"]))
     lines = []
     add = lines.append
     add("# Security audit: %s" % os.path.basename(coverage["root"]))
     add("")
-    add("Source: %s%s. Scope: %s. %d files read. Method: source review of every attack class that applies to this stack, each suspicious line traced to its source and its effect; local checks with dummy data only; nothing deployed was touched." % (recon.get("git_head") or "working tree", " (uncommitted changes present)" if recon.get("dirty") else "", ", ".join(coverage.get("scope") or ["whole repository"]), coverage.get("files", 0)))
-    if recon.get("stack"):
-        add("Stack: " + ", ".join(recon["stack"]) + ".")
+    add("Source: %s%s. Scope: %s. %d files read. Method: source review of every attack class that applies to this stack, each suspicious line traced to its source and its effect; local checks with dummy data only; nothing deployed was touched." % (audit.get("git_head") or "working tree", " (uncommitted changes present)" if audit.get("dirty") else "", ", ".join(coverage.get("scope") or ["whole repository"]), coverage.get("files", 0)))
+    if audit.get("stack"):
+        add("Stack: " + ", ".join(audit["stack"]) + ".")
     if left:
         add("")
         add("**Partial pass.** Not covered: " + ", ".join("%s (%s)" % (u["class"], u["status"]) for u in left) + ".")
@@ -1469,7 +2517,7 @@ def cmd_report(args):
     add("")
     add("## Summary")
     add("")
-    counts = {level: sum(1 for f in confirmed if f["severity"]["overall"] == level) for level in SEVERITY}
+    counts = {level: sum(1 for f in confirmed if f.get("severity_overall") == level) for level in SEVERITY}
     summary = ", ".join("%d %s" % (counts[level], level) for level in reversed(SEVERITY) if counts[level])
     summary_line = "%d confirmed finding%s%s; %d lead%s needing validation; %d claim%s checked and rejected. %d of %d units covered%s." % (len(confirmed), "" if len(confirmed) == 1 else "s", " (%s)" % summary if summary else "", len(leads), "" if len(leads) == 1 else "s", len(rejected), "" if len(rejected) == 1 else "s", sum(1 for u in coverage["units"] if u["status"] in ("covered", "candidate")), len(coverage["units"]), "; %d blocked" % len(blocked) if blocked else "")
     add(summary_line)
@@ -1487,51 +2535,55 @@ def cmd_report(args):
         add("| Severity | Title | Where | Result |")
         add("|---|---|---|---|")
         for f in confirmed:
-            sink = f["trace"][-1]
-            add("| %s | %s | %s:%d | %s |" % (f["severity"]["overall"], md_escape(f["title"]), sink["file"], sink["line"], md_escape(f["impact"])))
+            add("| %s | %s | %s:%d | %s |" % (f.get("severity_overall"), md_escape(f["title"]), f.get("sink_path") or "", f.get("sink_line") or 0, md_escape(f.get("impact", ""))))
         for f in confirmed:
             add("")
-            add("### %s: %s" % (f["severity"]["overall"], f["title"]))
+            add("### %s: %s" % (f.get("severity_overall"), f["title"]))
             add("")
-            add("- Fingerprint: `%s`" % f["fingerprint"])
-            add("- Attacker: " + f["principal"])
+            add("- Fingerprint: `%s`" % f["id"])
+            add("- Attacker: " + f.get("principal", ""))
             add("- Path:")
-            for step in f["trace"]:
+            for step in f.get("trace") or []:
                 add("  - %s `%s:%d`: %s" % (step["kind"], step["file"], step["line"], step["what"]))
-            add("- Control: " + f["control"])
+            add("- Control: " + f.get("control", ""))
             if f.get("conditions"):
                 add("- Conditions: " + "; ".join(f["conditions"]))
-            add("- Evidence: %s. Observed: %s" % (f["evidence"]["how"], f["evidence"]["observed"]))
-            add("- Impact: " + f["impact"])
-            add("- Severity: likelihood %s, impact %s, overall %s" % (f["severity"]["likelihood"], f["severity"]["impact"], f["severity"]["overall"]))
-            add("- Fix: in %s, %s. Test: %s" % (f["fix"]["where"], f["fix"]["change"], f["fix"]["test"]))
-    previous = state.load(PREVIOUS_FILE, None)
-    if previous and previous.get("issues"):
-        judged_prev = hit_states(state)
+            add("- Evidence: %s. Observed: %s" % (f.get("evidence_how", ""), f.get("evidence_observed", "")))
+            add("- Impact: " + f.get("impact", ""))
+            add("- Severity: likelihood %s, impact %s, overall %s" % (f.get("severity_likelihood"), f.get("severity_impact"), f.get("severity_overall")))
+            add("- Fix: in %s, %s. Test: %s" % (f.get("fix_where", ""), f.get("fix_change", ""), f.get("fix_test", "")))
+    previous_unit = next((u for u in coverage["units"] if u["class"] == "previous"), None)
+    if previous_unit:
+        rows0 = hit_rows(state, previous_unit)
+        fixed = sum(1 for r in rows0 if (judged_all.get(r[0]) or {}).get("status") == "fixed")
+        still = sum(1 for r in rows0 if (judged_all.get(r[0]) or {}).get("status") in ("finding", "lead", "hardening", "still"))
         add("")
-        add("## Previous audit (%s)" % previous["archived"][:8])
+        add("## Issues already known")
         add("")
-        fixed = sum(1 for i, issue in enumerate(previous["issues"], 1) if (judged_prev.get("U0.%d" % i) or {}).get("status") == "fixed")
-        still = sum(1 for i, issue in enumerate(previous["issues"], 1) if (judged_prev.get("U0.%d" % i) or {}).get("status") in ("finding", "lead", "hardening"))
-        add("The previous audit reported %d issues; %d are fixed, %d are still open, %d were not re-checked. Its report is kept at %s." % (len(previous["issues"]), fixed, still, len(previous["issues"]) - fixed - still, previous["report"]))
+        add("%d issues were known when this audit began; %d are fixed, %d are still open, %d were not re-checked." % (len(rows0), fixed, still, len(rows0) - fixed - still))
         add("")
-        add("| Issue | Was | Where | Code now | Verdict |")
-        add("|---|---|---|---|---|")
-        for i, issue in enumerate(previous["issues"], 1):
-            st = judged_prev.get("U0.%d" % i) or {}
-            where = ("%s:%d" % (issue["file"], issue["line"])) if issue.get("file") and issue.get("line") else (issue.get("file") or "")
-            add("| %s | %s | %s | %s | %s |" % (md_escape(issue["title"][:90]), issue["kind"] + ((" " + issue["severity"]) if issue.get("severity") else ""), where, md_escape(issue.get("now", "")), md_escape(VERDICT_WORDS.get(st.get("status"), st.get("status") or "not re-checked") + ((": " + st["note"]) if st.get("note") else ""))))
-    deps = state.load("deps.json", {}) or {}
-    if deps.get("rows"):
+        add("| Line | Issue | Where | Verdict |")
+        add("|---|---|---|---|")
+        for hid, rel, number, shape, text in rows0:
+            st = judged_all.get(hid) or {}
+            where = ("%s:%d" % (rel, number)) if rel and number else (rel or "")
+            add("| %s | %s | %s | %s |" % (hid, md_escape(text[:140]), where, md_escape(VERDICT_WORDS.get(st.get("status"), st.get("status") or "not re-checked") + ((": " + st["note"]) if st.get("note") else ""))))
+    deps = state.rows()
+    if deps:
         add("")
-        add("## Known vulnerable dependencies (OSV, %s)" % deps.get("checked", ""))
+        add("## Known vulnerable dependencies (OSV)")
         add("")
-        add("| Package | Version | Advisory | Severity | Fixed in | Lockfile |")
-        add("|---|---|---|---|---|---|")
-        for row in deps["rows"]:
-            add("| %s %s | %s | %s%s %s | %s | %s | %s |" % (row["eco"], row["name"], row["version"], row["id"], (" / " + row["aliases"][0]) if row["aliases"] else "", md_escape(row["summary"]), row["severity"], ", ".join(sorted(set(row["fixed"]))[:3]) or "none listed", row["lockfile"]))
+        add("| Package | Version | Advisory | Severity | Exploitation | Fixed in | Lockfile |")
+        add("|---|---|---|---|---|---|---|")
+        for row in deps:
+            add("| %s %s | %s | %s%s %s | %s | %s | %s | %s |" % (row["eco"], row["name"], row["version"], row["id"], (" / " + row["aliases"][0]) if row["aliases"] else "", md_escape(row["summary"]), row["severity"], ", ".join(exploit_words([row])) or "-", ", ".join(sorted(set(row["fixed"]))[:3]) or "none listed", row["lockfile"]))
         add("")
         add("Reachability of each advisory is in the findings above when it was traced; an upgrade to the fixed version is the hardening note otherwise.")
+    elif audit.get("deps_note"):
+        add("")
+        add("## Dependencies")
+        add("")
+        add(sentence(audit["deps_note"]))
     add("")
     add("## Needs validation")
     add("")
@@ -1543,25 +2595,23 @@ def cmd_report(args):
         add("| Title | Where | Missing fact | How to check |")
         add("|---|---|---|---|")
         for f in leads:
-            sink = f["trace"][-1]
-            add("| %s | %s:%d | %s | %s |" % (md_escape(f["title"]), sink["file"], sink["line"], md_escape(f["blocker"]), md_escape(f["check"])))
-    hardening = [(u["class"], u["note"]) for u in coverage["units"] if u["status"] == "covered" and u.get("note")]
+            add("| %s | %s:%d | %s | %s |" % (md_escape(f["title"]), f.get("sink_path") or "", f.get("sink_line") or 0, md_escape(f.get("blocker") or f.get("missing_fact") or ""), md_escape(f.get("check_how") or "")))
+    notes = [(u["class"], u["note"]) for u in coverage["units"] if u["status"] == "covered" and u.get("note")]
     add("")
     add("## Hardening notes")
     add("")
-    if not hardening:
+    if not notes:
         add("None recorded.")
     else:
-        for cls, note in hardening:
+        for cls, note in notes:
             add("- %s: %s" % (cls, note))
-    judged = hit_states(state)
-    if judged:
+    if judged_all:
         add("")
         add("## Lines judged")
         add("")
         add("Every line the tool showed and how the reviewer settled it. `safe` names the check or fact; `hardening` a change worth making without a reachable attack; `blocked` what could not be read or run.")
         for u in coverage["units"]:
-            rows = [(hid, rel, number, shape, text) for hid, rel, number, shape, text in hit_rows(state, u) if hid in judged]
+            rows = [(hid, rel, number, shape, text) for hid, rel, number, shape, text in hit_rows(state, u) if hid in judged_all]
             if not rows:
                 continue
             add("")
@@ -1570,7 +2620,7 @@ def cmd_report(args):
             add("| Line | Where | Shape | Verdict | Reason |")
             add("|---|---|---|---|---|")
             for hid, rel, number, shape, text in rows:
-                st = judged[hid]
+                st = judged_all[hid]
                 where = ("%s:%d" % (rel, number)) if number else (rel or "")
                 add("| %s | %s | %s | %s | %s |" % (hid, where, md_escape(shape), st["status"], md_escape(st.get("note", ""))))
     catalog_for_units = Catalog()
@@ -1592,7 +2642,7 @@ def cmd_report(args):
     add("| Unit | Class | Why it applies | Lines reviewed | Status | Note |")
     add("|---|---|---|---|---|---|")
     for u in coverage["units"]:
-        add("| %s | %s | %s | %d | %s | %s |" % (u["id"], u["class"], md_escape(u["reason"]), u["hits"], u["status"], md_escape(unit_note(u))))
+        add("| %s | %s | %s | %d | %s | %s |" % (u["id"], u["class"], md_escape(u["reason"]), u.get("hits") or 0, u["status"], md_escape(unit_note(u))))
     if rejected:
         add("")
         add("## Rejected claims")
@@ -1600,34 +2650,35 @@ def cmd_report(args):
         add("Checked and disproved; kept so the next audit does not repeat them.")
         add("")
         for f in rejected:
-            add("- `%s` %s: %s" % (f["fingerprint"], f["title"], f["reason"]))
+            add("- `%s` %s: %s" % (f["id"], f["title"], f.get("reason") or ""))
     add("")
     os.makedirs(state.out, exist_ok=True)
     with open(state.path("REPORT.md"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
-    rel = state.path("REPORT.md")
-    print("Wrote %s." % rel)
-    if push_findings(state, coverage, all_graph_findings(state, coverage), finished=True):
-        print("The findings are in the project's graph (the Security tab lists them by priority).")
+    report_path = state.path("REPORT.md")
+    finished = dict(audit, units=len(coverage["units"]), lines_judged=len(judged_all), findings=len(confirmed), leads=len(leads), hardening=sum(1 for s in judged_all.values() if s.get("status") == "hardening"), report_path=report_path, finished_ms=int(time.time() * 1000))
+    state.put_audit(finished)
+    print("Wrote %s; the findings are in the project's graph (the Security tab lists them by priority)." % report_path)
+    watched = ensure_watch(state)
+    if watched:
+        print(watched)
     print(summary_line)
     for f in confirmed:
-        sink = f["trace"][-1]
-        print("  %s: %s (%s:%d). Fix: %s" % (f["severity"]["overall"], f["title"], sink["file"], sink["line"], f["fix"]["change"]))
+        print("  %s: %s (%s:%s). Fix: %s" % (f.get("severity_overall"), f["title"], f.get("sink_path") or "", f.get("sink_line") or 0, f.get("fix_change", "")))
     for f in leads:
-        sink = f["trace"][-1]
-        print("  needs validation: %s (%s:%d); missing: %s" % (f["title"], sink["file"], sink["line"], f["blocker"]))
+        print("  needs validation: %s (%s:%s); missing: %s" % (f["title"], f.get("sink_path") or "", f.get("sink_line") or 0, f.get("blocker") or f.get("missing_fact") or ""))
     for u in blocked + left:
         print("  not covered: %s %s%s" % (u["id"], u["class"], (": " + u["note"]) if u.get("note") else ""))
-    print("The report is at %s." % rel)
+    print("The report is at %s." % report_path)
 
 
 # ----------------------------------------------------------------------------- scan
 
 def changed_files(root, ref):
-    """Files changed against `ref` (default HEAD), plus untracked ones."""
+    """Files changed against `ref` (default HEAD), plus untracked ones; None outside a repository."""
     out = git(["diff", "--name-only", "--diff-filter=ACMR", ref or "HEAD"], root)
     if out is None:
-        fail("not a git repository, or %s is not a ref" % (ref or "HEAD"), "%s scan <path>..." % tool())
+        return None
     files = [rel for rel in out.split("\n") if rel.strip()]
     untracked = git(["ls-files", "--others", "--exclude-standard"], root) or ""
     files.extend(rel for rel in untracked.split("\n") if rel.strip())
@@ -1635,11 +2686,15 @@ def changed_files(root, ref):
 
 
 def cmd_scan(args):
-    positional, flags = parse_flags(args, {"changed": "one"})
+    positional, flags = parse_flags(args, {"changed": "one", "classes": "one"})
+    if flags.get("json"):
+        return scan_json(positional, flags)
     root = os.getcwd()
     if "changed" in flags:
         ref = flags["changed"] if isinstance(flags["changed"], str) else None
         rels = changed_files(root, ref)
+        if rels is None:
+            fail("not a git repository, or %s is not a ref" % (ref or "HEAD"), "%s scan <path>..." % tool())
         label = "changed against %s" % (ref or "HEAD")
     else:
         if not positional:
@@ -1649,13 +2704,15 @@ def cmd_scan(args):
             full = os.path.join(root, p)
             if os.path.isdir(full):
                 rels.extend(repo_files(root, [p.rstrip("/")]))
+                rels.extend(getattr(repo_files, "agent_files", []))
             elif os.path.isfile(full):
                 rels.append(os.path.relpath(full, root))
             else:
                 fail("%s does not exist" % p, "name repository paths")
         label = ", ".join(positional)
+    agents = [rel for rel in rels if agent_file_kind(rel)]
     rels = [rel for rel in sorted(set(rels)) if not skipped(rel) and os.path.isfile(os.path.join(root, rel))]
-    if not rels:
+    if not rels and not agents:
         print("Nothing to scan (%s)." % label)
         return
     catalog = Catalog()
@@ -1665,11 +2722,12 @@ def cmd_scan(args):
         if text is not None:
             texts[rel] = (lang_of(rel), text)
     hits = scan_texts(catalog, texts)
+    for rel, number, shape, text, _ in agent_hits(root, agents):
+        hits.setdefault("ai-llm-agent", []).append((rel, number, shape, text))
     print("%d files (%s)." % (len(texts), label))
     if not hits:
         print("No suspicious lines matched any class's shapes. Still read each change for: a new handler without an authorization check, a request field reaching old code, a removed condition, a new dependency, a changed default.")
         return
-    total = 0
     for cls in catalog.classes:
         rows = hits.get(cls["id"])
         if not rows:
@@ -1677,12 +2735,253 @@ def cmd_scan(args):
         print("")
         print("%s: %s" % (cls["name"], cls["counts"]))
         for rel, number, name, text in rows[:HITS_SHOWN]:
-            print("  %s%s  [%s]  %s" % (rel, ":%d" % number if number else "", name, text[:100]))
+            print("  %s%s  [%s]  %s" % (rel, ":%d" % number if number else "", name, shown(text, 100)))
         if len(rows) > HITS_SHOWN:
             print("  ... %d more" % (len(rows) - HITS_SHOWN))
-        total += len(rows)
     print("")
     print("For each line: where does the value come from (read graph://used-by/<function>, read <path>:<from>-<to>), who controls it, which check stops it. A hit is a question, not a finding.")
+
+
+def scan_json(paths, flags):
+    """`scan --json`: the shapes in the named files (absolute paths; a folder is walked), as one
+    JSON object. Place markers (a handler, a registration) are left out: they say where to read."""
+    if not paths:
+        return json_out({"error": "usage: scan --json <absolute path>... [--classes a,b]"}, 2)
+    catalog = Catalog()
+    wanted = None
+    if isinstance(flags.get("classes"), str):
+        wanted = {c.strip() for c in flags["classes"].split(",") if c.strip()}
+        unknown = sorted(wanted - set(cls["id"] for cls in catalog.classes))
+        if unknown:
+            return json_out({"error": "unknown classes: %s (known: %s)" % (", ".join(unknown), ", ".join(cls["id"] for cls in catalog.classes))}, 2)
+    files, skipped_files = [], 0
+    for path in paths:
+        if not os.path.isabs(path):
+            return json_out({"error": "%s is not an absolute path" % path}, 2)
+        if os.path.isdir(path):
+            for rel in repo_files(path, []) + [r for r in getattr(repo_files, "agent_files", [])]:
+                files.append(os.path.join(path, rel))
+        elif os.path.isfile(path):
+            files.append(path)
+        else:
+            return json_out({"error": "%s does not exist" % path}, 2)
+    out_hits, cache = [], {}
+    for full in sorted(set(files)):
+        try:
+            too_big = os.path.getsize(full) > MAX_FILE_BYTES
+        except OSError:
+            too_big = True
+        text = None if too_big else read_text(full)
+        if text is None:
+            skipped_files += 1
+            continue
+        for cid, _, number, name, line in scan_lines(catalog, full, lang_of(full), enumerate(text.split("\n"), 1), wanted, False, cache):
+            out_hits.append({"class": cid, "path": full, "line": number, "text": shown(line), "why": name})
+        if agent_file_kind(full.replace(os.sep, "/")) and (wanted is None or "ai-llm-agent" in wanted):
+            hits = agent_config_hits(full, text) if agent_file_kind(full) == "config" else []
+            hits += [h + (None,) for h in hidden_text_hits(full, text)]
+            for rel, number, shape, why_text, _ in hits:
+                out_hits.append({"class": "ai-llm-agent", "path": full, "line": number, "text": why_text, "why": shape})
+    out = {"hits": out_hits, "checked": sorted(wanted) if wanted is not None else [cls["id"] for cls in catalog.classes]}
+    if skipped_files:
+        out["skipped"] = "%d file%s not read: binary, unreadable or larger than %d bytes" % (skipped_files, "" if skipped_files == 1 else "s", MAX_FILE_BYTES)
+    return json_out(out, 0)
+
+
+# ----------------------------------------------------------------------------- the turn's own changes
+
+def added_lines(root):
+    """{rel: set of added or changed line numbers, or None for a whole new file} of the working tree
+    against HEAD with the untracked files; None outside a git repository."""
+    if git(["rev-parse", "--is-inside-work-tree"], root) is None:
+        return None
+    out = {}
+    if git(["rev-parse", "--verify", "-q", "HEAD"], root) is None:
+        listed = git(["ls-files", "-co", "--exclude-standard"], root) or ""
+        return {rel: None for rel in listed.split("\n") if rel.strip()}
+    diff = git(["diff", "HEAD", "--relative", "--unified=0", "--no-color", "--no-ext-diff", "--no-renames", "--diff-filter=AM", "--", "."], root) or ""
+    current = None
+    for line in diff.split("\n"):
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else None
+            if current is not None:
+                out.setdefault(current, set())
+        elif line.startswith("@@") and current is not None:
+            match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+            if match:
+                start, count = int(match.group(1)), int(match.group(2) if match.group(2) is not None else 1)
+                out[current].update(range(start, start + count))
+    untracked = git(["ls-files", "--others", "--exclude-standard"], root) or ""
+    for rel in untracked.split("\n"):
+        if rel.strip():
+            out[rel] = None
+    return out
+
+
+def changed_packages(root, changes):
+    """{(eco, name, version): lockfile} added or changed by the working tree in its lockfiles and in
+    the exact pins of its manifests."""
+    added = {}
+    for rel in sorted(changes):
+        base = os.path.basename(rel)
+        is_lock = base in LOCKFILES or base in ("go.mod", "pom.xml") or (base.startswith("requirements") and base.endswith(".txt"))
+        if not is_lock and base != "package.json":
+            continue
+        new_text = read_text(os.path.join(root, rel))
+        if new_text is None:
+            continue
+        old_text = git(["show", "HEAD:./" + rel], root) if changes[rel] is not None else ""
+        reader = (lambda r, t: parse_lockfile(r, t)) if is_lock else manifest_pins
+        try:
+            new = set(reader(rel, new_text))
+            old = set(reader(rel, old_text or "")) if old_text else set()
+        except (ValueError, AttributeError, TypeError, IndexError):
+            continue
+        for item in sorted(new - old):
+            added.setdefault(item, rel)
+    return added
+
+
+# `check-change` found something (the chat flow reads only this code as findings).
+CHANGE_FOUND = 3
+
+
+def cmd_check_change(args):
+    """The turn's own edits: the shapes on added or changed lines, the agent-file checks on changed
+    lines, and the known vulnerabilities of dependencies the change added. Silent and 0 when clean."""
+    positional, flags = parse_flags(args, {"root": "one"})
+    root = os.path.abspath(flags["root"]) if isinstance(flags.get("root"), str) else os.getcwd()
+    if not os.path.isdir(root):
+        fail("%s is not a folder" % root, "%s check-change --root <project folder>" % tool())
+    changes = added_lines(root)
+    if not changes:
+        return
+    catalog = Catalog()
+    cache, lines_out = {}, []
+    for rel in sorted(changes):
+        full = os.path.join(root, rel)
+        wanted = changes[rel]
+        kind = agent_file_kind(rel)
+        if (skipped(rel) and not kind) or not os.path.isfile(full) or os.path.islink(full):
+            continue
+        try:
+            if os.path.getsize(full) > MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        text = read_text(full)
+        if text is None:
+            continue
+        numbered = [(n, line) for n, line in enumerate(text.split("\n"), 1) if wanted is None or n in wanted]
+        if not skipped(rel):
+            for cid, _, number, name, line in scan_lines(catalog, rel, lang_of(rel), numbered, None, False, cache):
+                lines_out.append("%s:%d %s: %s (%s)" % (rel, number, cid, name, shown(line, 100)))
+        if kind:
+            hits = agent_config_hits(rel, text) if kind == "config" else []
+            hits += [h + (None,) for h in hidden_text_hits(rel, text)]
+            for _, number, shape, why, _ in hits:
+                if wanted is None or number in wanted or number == 0:
+                    lines_out.append("%s:%d ai-llm-agent: %s (%s)" % (rel, number, shape, why))
+    deps_out = []
+    added = changed_packages(root, changes)
+    if added and not offline_here(root):
+        try:
+            rows = osv_check(added)
+        except LIVE_ERRORS:
+            rows = []
+        for (eco, name, version, lockfile), group in group_rows(rows):
+            fix = covering_fix(group)
+            ids = sorted({i for r in group for i in [r["id"]] + r["aliases"]})
+            deps_out.append("dependency %s@%s: %s (%s%s)" % (name, version, ", ".join(ids[:4]) + (" and %d more" % (len(ids) - 4) if len(ids) > 4 else ""), group[0]["severity"], ", fixed in %s" % fix if fix else ", no fixed version"))
+    if not lines_out and not deps_out:
+        return
+    for line in lines_out[:CHANGE_LINES_SHOWN]:
+        print(line)
+    if len(lines_out) > CHANGE_LINES_SHOWN:
+        print("... %d more lines like these (all of them: %s scan --changed)" % (len(lines_out) - CHANGE_LINES_SHOWN, tool()))
+    for line in deps_out:
+        print(line)
+    print("Fix these at the sink, or say why each is safe in your reply.")
+    # Its own exit code: a usage error or a crash (exit 1) is never read as a finding.
+    sys.exit(CHANGE_FOUND)
+
+
+# ----------------------------------------------------------------------------- the dependency watch
+
+def cmd_watch(args):
+    """Re-check the project's locked dependencies (OSV, CISA KEV, FIRST EPSS) and record what is
+    vulnerable as findings (source `watch`); print only the advisories not seen by the last watch."""
+    positional, flags = parse_flags(args, {"root": "one"})
+    root = os.path.abspath(flags["root"]) if isinstance(flags.get("root"), str) else os.getcwd()
+    if not os.path.isdir(root):
+        fail("%s is not a folder" % root, "%s watch --root <project folder>" % tool())
+    if offline_here(root):
+        print("Offline project: the dependency watch did not run.")
+        return
+    pid, why = project_id(root)
+    if not pid:
+        fail(APP_AWAY % why, APP_NEXT)
+    repo_files(root, [])
+    rows, packages, not_parsed, why, problems = live_deps(root)
+    if why:
+        fail(why[0].upper() + why[1:] + ".", "run the watch again when the network is back")
+    ok, result = graph_call("memory.security.findings", {"project_id": pid, "source": "watch", "status": ["open", "fixing", "accepted", "fixed", "verified", "gone"]})
+    if not ok:
+        fail("the earlier watch could not be read from the project's graph: %s" % result, APP_NEXT)
+    known = {f["id"]: f for f in (result or {}).get("findings") or []}
+    findings, new_lines = [], []
+    for (eco, name, version, lockfile), group in group_rows(rows):
+        fid = ("watch:%s:%s" % (lockfile, name)).lower()
+        seen = set((known.get(fid) or {}).get("advisories") or [])
+        if (known.get(fid) or {}).get("sink_version") not in (None, version):
+            seen = set()
+        lock_text = read_text(os.path.join(root, lockfile)) or ""
+        line = pin_line(lock_text, name, version) or 0
+        worst = group[0]["severity"]
+        fix = quick_fix_for(name, rows, lockfile)
+        ids = sorted({r["id"] for r in group})
+        kev = any(r.get("kev") for r in group)
+        epss = max((r.get("epss") or 0 for r in group), default=0) or None
+        finding = {
+            "id": fid, "class": "dependencies", "verdict": "needs_validation", "source": "watch",
+            "title": "%s %s has %d known vulnerabilit%s (worst %s)" % (name, version, len(group), "y" if len(group) == 1 else "ies", worst),
+            "principal": "whoever can reach the vulnerable code of %s with their own input" % name,
+            "control": "", "impact": group[0]["summary"], "result": group[0]["summary"],
+            "evidence_how": "the dependency watch: OSV, CISA KEV and FIRST EPSS, checked %s" % time.strftime("%Y-%m-%d %H:%M"),
+            "evidence_observed": "; ".join("%s %s: %s" % (r["id"], r["severity"], r["summary"][:80]) for r in group[:4]),
+            "missing_fact": "Whether this project calls the vulnerable code of %s with outside data. Check: search the code for its imports and read the advisory's affected functions" % name,
+            "blocker": "whether this project calls the vulnerable code of %s with outside data" % name,
+            "check_how": "search the code for its imports and read the advisory's affected functions",
+            "severity_overall": worst if worst in PRIORITY_BAND else None, "host_severity": worst if worst in PRIORITY_BAND else None,
+            "fix_where": lockfile, "fix_change": ("upgrade %s to %s" % (name, fix["to"])) if fix else "no fixed version is published yet", "fix_test": "the project's tests",
+            "trace": [{"kind": "sink", "file": lockfile, "line": line, "what": "%s pinned at %s" % (name, version)}],
+            "quick_fix": fix, "advisories": ids, "kev": kev, "epss": epss,
+            "epss_percentile": max((r.get("epss_percentile") or 0 for r in group), default=0) or None,
+            "signal": "malicious package" if any(i.startswith("MAL-") for i in ids) else ("exploited in the wild (CISA KEV)" if kev else None),
+            "sink_path": lockfile, "sink_line": line or None, "sink_package": name, "sink_version": version,
+        }
+        if finding["signal"] == "malicious package":
+            finding["severity_overall"] = finding["host_severity"] = "critical"
+        finding["priority"], finding["priority_reason"] = priority_of(finding)
+        findings.append(finding)
+        for row in group:
+            if row["id"] not in seen:
+                extra = exploit_words([row])
+                new_lines.append("%s %s %s (%s): %s%s %s%s: %s; %s" % (eco, name, version, lockfile, row["id"], (" " + row["aliases"][0]) if row["aliases"] else "", row["severity"], (", " + ", ".join(extra)) if extra else "", row["summary"][:100], ("fixed in %s" % fix["to"]) if fix else "no fixed version"))
+    # A command's calls stay in its own working tree; another root is read from the project's.
+    here = {"workspace": root} if os.path.realpath(root) == os.path.realpath(os.getcwd()) else {}
+    if findings:
+        write("memory.security.findings.put", dict({"project_id": pid, "audit_id": None, "findings": findings}, **here), "The watch's findings")
+    current = {item["id"] for item in findings}
+    gone = [fid for fid, item in known.items() if fid not in current and item.get("status") in ("open", "fixing", "fixed")]
+    if gone:
+        write("memory.security.recheck", dict({"project_id": pid, "ids": gone}, **here), "The re-check of fixed dependencies")
+    for line in not_parsed:
+        new_lines.append("Not read: %s." % line)
+    for line in new_lines:
+        print(line)
+    if new_lines and findings:
+        print("Next: open the Security tab to fix them; each has its upgrade there.")
 
 
 # ----------------------------------------------------------------------------- next and settle: the script drives
@@ -1693,33 +2992,12 @@ DEPS_PER_STEP = 60
 
 
 def hit_rows(state, unit):
-    """The unit's hits as the model settles them: [(id, file, line, shape, text)]. The dependencies
-    unit's hits are its vulnerable packages; the previous-issues unit's are the last audit's issues;
-    a unit without shape hits has one hit, the unit itself."""
-    if unit["class"] == "previous":
-        return previous_rows(state, unit) or [("%s.0" % unit["id"], "", 0, "the unit", "the previous audit left no issue to re-check; settle the unit")]
-    if unit["class"] == "dependencies":
-        rows = (state.load("deps.json", {}) or {}).get("rows") or []
-        groups = {}
-        for row in rows:
-            groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
-        ordered = sorted(groups.items(), key=lambda kv: (min(SEVERITY_RANK.get(r["severity"], 5) for r in kv[1]), kv[0][1]))
-        out = []
-        for index, ((eco, name, version, lockfile), group) in enumerate(ordered, 1):
-            fix = covering_fix(group)
-            text = "%s %s %s: %d advisor%s, worst %s; %s; %s" % (eco, name, version, len(group), "y" if len(group) == 1 else "ies", group[0]["severity"], ("upgrade to %s" % fix) if fix else "no fixed version", "; ".join("%s %s" % (r["id"], r["summary"][:70]) for r in group[:2]))
-            out.append(("%s.%d" % (unit["id"], index), lockfile, 0, "vulnerable package", text))
-        if out:
-            return out
-        return [("%s.0" % unit["id"], "", 0, "the unit", "no pinned dependency has a known vulnerability (OSV, live); settle the unit")]
-    try:
-        hits = state.load(os.path.join("hits", unit["id"] + ".json"), [])
-        rows = [("%s.%d" % (unit["id"], index), rel, number, name, text) for index, (rel, number, name, text) in enumerate(hits, 1)]
-    except (OSError, ValueError, TypeError) as error:
-        # A damaged hits file never hides the unit: it stays one open line the model settles.
-        return [("%s.0" % unit["id"], "", 0, "the unit", "the unit's lines could not be read (%s): settle the unit blocked with that reason, or run recon again" % error)]
+    """The unit's hits as the model settles them: [(id, file, line, shape, text)]. A unit without
+    shape hits has one hit, the unit itself (`<unit>.0`)."""
+    hits = state.hits.get(unit["id"].upper()) or []
+    rows = [(h["id"], h.get("path") or "", int(h.get("line") or 0), h.get("shape") or "", h.get("text") or "") for h in hits]
     if not rows:
-        return [("%s.0" % unit["id"], "", 0, "the unit", "no code shape of this class matched: read its 'look for' items against the entry points and handlers, then settle the unit")]
+        return [("%s.0" % unit["id"], "", 0, "the unit", "the unit's lines are not in the graph: settle the unit blocked with that reason, or run recon again")]
     return rows
 
 
@@ -1760,39 +3038,36 @@ def cited_location(state, note, targets):
 
 
 def hit_states(state):
-    """Every settled line: the old single file, then one file per unit (`hits-state/<unit>.json`,
-    so agents settling different units at the same time never overwrite each other)."""
-    states = dict(state.load("hits-state.json", {}) or {})
-    folder = state.path("hits-state")
-    if os.path.isdir(folder):
-        for name in sorted(os.listdir(folder)):
-            if name.endswith(".json"):
-                states.update(state.load(os.path.join("hits-state", name), {}) or {})
-    return states
+    """Every settled line: {hit id: {status, note, record, cited, finding_id}}."""
+    out = {}
+    for hits in state.hits.values():
+        for hit in hits:
+            if hit.get("verdict"):
+                out[hit["id"]] = {"status": hit["verdict"], "note": hit.get("note") or "", "record": hit.get("record"), "cited": hit.get("cited"), "finding_id": hit.get("finding_id")}
+    return out
 
 
-def save_hit_states(state, states, unit_ids):
-    """Write the settled lines of `unit_ids`, each unit to its own file."""
-    for unit_id in unit_ids:
-        unit_states = {hid: st for hid, st in states.items() if hid.split(".")[0] == unit_id}
-        state.save(os.path.join("hits-state", unit_id + ".json"), unit_states)
+def settle_hits(state, changes):
+    """Write how lines were settled: {hit id: {status, note, record?, cited?, finding_id?}}."""
+    now = int(time.time() * 1000)
+    hits = []
+    for hid, st in changes.items():
+        hit = dict(state.by_hit.get(hid) or {"id": hid, "unit": hid.split(".")[0]})
+        hit.update({"verdict": st["status"], "note": st.get("note", ""), "record": st.get("record"), "cited": st.get("cited"), "finding_id": st.get("finding_id") or hit.get("finding_id"), "settled_ms": now})
+        hits.append(hit)
+    state.put_hits(hits)
 
 
 def report_current(state):
     """The report stands: written after the last settle and the last record."""
-    report = state.path("REPORT.md")
-    if not os.path.isfile(report):
+    audit = state.audit or {}
+    finished = audit.get("finished_ms")
+    if not finished or not audit.get("report_path") or not os.path.isfile(audit["report_path"]):
         return False
-    written = os.path.getmtime(report)
-    newest = 0
-    for name in ("hits-state.json", "findings.json"):
-        if os.path.isfile(state.path(name)):
-            newest = max(newest, os.path.getmtime(state.path(name)))
-    folder = state.path("hits-state")
-    if os.path.isdir(folder):
-        for name in os.listdir(folder):
-            newest = max(newest, os.path.getmtime(os.path.join(folder, name)))
-    return written >= newest
+    newest = max([h.get("settled_ms") or 0 for hits in state.hits.values() for h in hits] or [0])
+    if newest > finished:
+        return False
+    return all((f.get("last_seen_ms") or 0) <= finished + 1000 for f in state.findings())
 
 
 def unit_status_from_hits(rows, states):
@@ -1812,7 +3087,7 @@ def unit_status_from_hits(rows, states):
 
 def sync_units(state, coverage):
     """Every unit's status and note from its hits (the notes of safe, hardening and blocked hits),
-    in memory: agents settle units at the same time, so coverage.json is not rewritten here."""
+    in memory: agents settle units at the same time, so the units are not rewritten here."""
     states = hit_states(state)
     for unit in coverage["units"]:
         rows = hit_rows(state, unit)
@@ -1831,20 +3106,40 @@ def sync_units(state, coverage):
 
 
 def pending_records(state):
-    """Record files written for hits and not yet recorded."""
-    recorded = {f.get("hit") for f in state.findings()}
+    """Lines settled finding or lead whose record is not in the graph yet: [(draft name, hit id)]."""
     out = []
-    if os.path.isdir(state.drafts):
-        for name in sorted(os.listdir(state.drafts)):
-            if re.match(r"finding-\d+\.json$", name):
-                try:
-                    with open(os.path.join(state.drafts, name), encoding="utf-8") as handle:
-                        record = json.load(handle)
-                except (OSError, ValueError):
-                    continue
-                if record.get("hit") and record.get("hit") not in recorded:
-                    out.append((name, record["hit"]))
+    for hits in state.hits.values():
+        for hit in hits:
+            if hit.get("verdict") in ("finding", "lead") and not hit.get("finding_id"):
+                out.append((hit.get("record") or "finding-for-%s.json" % hit["id"].replace(".", "-"), hit["id"]))
     return out
+
+
+def write_draft(state, unit, hid, rel, number, text, status, name=None):
+    """The record template of a line settled finding or lead, prefilled with what the host knows."""
+    os.makedirs(state.drafts, exist_ok=True)
+    if name is None:
+        n = 1
+        while os.path.exists(os.path.join(state.drafts, "finding-%d.json" % n)):
+            n += 1
+        name = "finding-%d.json" % n
+    record = json.loads(json.dumps(TEMPLATES["confirmed" if status == "finding" else "needs_validation"]))
+    record["class"] = unit["class"]
+    record["unit"] = unit["id"]
+    record["hit"] = hid
+    record["audit"] = state.audit_id
+    record["fingerprint"] = "? %s:%s:<function>" % (unit["class"], rel or "<file>")
+    hit = state.by_hit.get(hid) or {}
+    if unit["class"] == "dependencies" and hit.get("package"):
+        package = hit["package"]
+        record["fingerprint"] = ("dependencies:%s:%s" % (rel, package)).lower()
+        record["title"] = "? what a lower-trust party can do through %s at the pinned version" % package
+        record["trace"][-1] = {"kind": "sink", "file": rel, "line": number or 1, "what": "? the package at its pinned version, and the call in this project that reaches the vulnerable code"}
+    elif rel and number:
+        record["trace"][-1] = {"kind": "sink", "file": rel, "line": number, "what": "? what the value does here: " + text[:80]}
+    with open(os.path.join(state.drafts, name), "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=1)
+    return name
 
 
 def print_unit_step(state, coverage, unit, catalog, first_time):
@@ -1860,13 +3155,7 @@ def print_unit_step(state, coverage, unit, catalog, first_time):
             print("  - " + item)
         print("A finding here: " + cls["counts"])
         print("Only a hardening note: " + cls["hardening"])
-        if not offline_here(state.root):
-            guidance = upstream_guidance(unit["class"])
-            if guidance:
-                print("Upstream guidance (Cloudflare security-audit skill, live):")
-                for line in guidance:
-                    print("  " + line)
-    shown = DEPS_PER_STEP if unit["class"] == "dependencies" else HITS_PER_STEP
+    shown_count = DEPS_PER_STEP if unit["class"] == "dependencies" else HITS_PER_STEP
     # A file's run of lines with the same shape is one entry with an id range: one judgment
     # settles them together (seen: 61 innerHTML lines of two static design files judged one by one).
     entries = []
@@ -1876,19 +3165,23 @@ def print_unit_step(state, coverage, unit, catalog, first_time):
         run = [open_rows[index]]
         while index + len(run) < len(open_rows) and open_rows[index + len(run)][1] == rel and open_rows[index + len(run)][3] == shape:
             run.append(open_rows[index + len(run)])
-        if len(run) >= 3:
+        if len(run) >= 3 and not any((state.by_hit.get(r[0]) or {}).get("signal") for r in run):
             entries.append(("%s-%s" % (run[0][0], run[-1][0]), rel, 0, shape, "%d lines, e.g. :%d %s" % (len(run), number, text[:110])))
         else:
             entries.extend(run)
         index += len(run)
+    strong = [e[0] for e in entries[:shown_count] if (state.by_hit.get(e[0]) or {}).get("signal")]
     print("Lines to judge now:")
-    for hid, rel, number, shape, text in entries[:shown]:
+    for hid, rel, number, shape, text in entries[:shown_count]:
         where = ("%s:%d" % (rel, number)) if number else rel
-        print("  %s  %s  [%s]  %s" % (hid, where, shape, text[:150]))
-    if len(entries) > shown:
-        print("  ... %d more come with the next `next` once these are settled (one control that covers a whole file or the unit settles them together: settle %s safe \"<the control>\")" % (len(entries) - shown, unit["id"]))
-    if any("-" in e[0] for e in entries[:shown]):
+        mark = "  (host signal: %s)" % state.by_hit[hid]["signal"] if hid in strong else ""
+        print("  %s  %s  [%s]  %s%s" % (hid, where, shape, text[:150], mark))
+    if len(entries) > shown_count:
+        print("  ... %d more come with the next `next` once these are settled (one control that covers a whole file or the unit settles them together: settle %s safe \"<the control>\")" % (len(entries) - shown_count, unit["id"]))
+    if any("-" in e[0] for e in entries[:shown_count]):
         print("  A range (U3.4-U3.20) is one file's lines of one shape: settle the range with one reason, or a single id inside it.")
+    if strong:
+        print("  A line with a host signal is a real credential, a malicious or an exploited package: settle it finding or lead.")
     print("")
     print("For each line: where does the value come from (read <path>:<from>-<to> around it, read graph://used-by/<function>), who controls it, which check stops it. Then settle it:")
     print("  %s settle %s safe \"<the check or fact that settles it, with path:line>\"" % (tool(), open_rows[0][0] if open_rows else unit["id"]))
@@ -1902,35 +3195,39 @@ def print_unit_step(state, coverage, unit, catalog, first_time):
 
 def cmd_next(args):
     positional, flags = parse_flags(args, {"unit": "one"})
-    only = (flags.get("unit") or "").upper() or None
+    only = (flags.get("unit") or "").upper() if isinstance(flags.get("unit"), str) else None
     root = os.getcwd()
-    state = State(root, default_out())
+    state = State(root)
     catalog = Catalog()
-    coverage = state.load("coverage.json", None)
-    if coverage is not None and only is None and report_current(state):
-        # The last audit of this project is complete: this is a new run. recon archives the old one
-        # and seeds U0 with its issues.
-        coverage = None
-    if coverage is None:
+    # An audit node without units is an earlier version's record: a new run maps the project.
+    fresh = state.audit is None or not state.units or (only is None and report_current(state))
+    if fresh:
         if only:
             fail("no audit here yet", "%s units" % tool())
+        # No audit, or the last one is complete: this is a new run (U0 holds what is still known).
         cmd_recon([])
-        coverage = state.coverage()
+        state.reload()
         print("")
+    coverage = state.coverage()
     pending = pending_records(state)
     if only:
         # Another agent's unfilled record is not this unit's business.
         pending = [(name, hid) for name, hid in pending if hid.split(".")[0] == only]
     if pending:
         name, hid = pending[0]
+        draft = os.path.join(state.drafts, name)
+        if not os.path.isfile(draft):
+            # The project's tmp/ was cleaned: the draft comes back from what the graph knows.
+            unit = state.unit(coverage, hid.split(".")[0])
+            row = next((r for r in hit_rows(state, unit) if r[0] == hid), (hid, "", 0, "", ""))
+            write_draft(state, unit, hid, row[1], row[2], row[4], state.by_hit.get(hid, {}).get("verdict") or "finding", name)
         print("The record for %s is not written yet: %s still holds its template." % (hid, os.path.join(state.drafts_rel, name)))
         print("Next: fill every '? ' value with edit, then %s finding %s" % (tool(), os.path.join(state.drafts_rel, name)))
         sys.exit(1)
-    sync_units(state, coverage)
     states = hit_states(state)
     if only:
         # One unit, for an agent that has this unit only: shown while it has open lines, its one
-        # line when it is settled; nothing of the shared state is written.
+        # line when it is settled.
         unit = state.unit(coverage, only)
         if not any(r[0] not in states for r in hit_rows(state, unit)):
             report_path = state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))
@@ -1950,7 +3247,7 @@ def cmd_next(args):
         try:
             if first_time:
                 unit["status"] = "in_progress"
-                state.save("coverage.json", coverage)
+                state.put_units([unit])
             print_unit_step(state, coverage, unit, catalog, first_time)
         except SystemExit:
             raise
@@ -1958,7 +3255,7 @@ def cmd_next(args):
             message = "%s: %s" % (type(error).__name__, str(error)[:200])
             failed_before = unit.get("error")
             unit["error"] = message
-            state.save("coverage.json", coverage)
+            state.put_units([unit])
             print("")
             if failed_before or position == len(open_units) - 1:
                 print("%s %s could not be shown%s: %s" % (unit["id"], unit["class"], " again" if failed_before else "", message))
@@ -1968,8 +3265,9 @@ def cmd_next(args):
             print("%s %s could not be shown (%s); it stays open and comes back after the other units." % (unit["id"], unit["class"], message))
             print("")
             continue
-        if unit.pop("error", None) is not None:
-            state.save("coverage.json", coverage)
+        if unit.get("error"):
+            unit["error"] = None
+            state.put_units([unit])
         return
     if not report_current(state):
         print("Every line of every unit is settled. Writing the report.")
@@ -1977,7 +3275,7 @@ def cmd_next(args):
         print("")
         print("Next: %s next" % tool())
         return
-    report_path = state.path("REPORT.md")
+    report_path = state.audit["report_path"]
     print("The audit is complete. The report (%s):" % report_path)
     print("")
     with open(report_path, encoding="utf-8") as handle:
@@ -1988,16 +3286,14 @@ def cmd_next(args):
 def cmd_units(args):
     """The open units, one per line as `<id>\t<title>`: what agents can take on at the same time
     (each with `next --unit <id>`). Maps the project first when no audit is open."""
-    state = State(os.getcwd(), default_out())
-    coverage = state.load("coverage.json", None)
-    if coverage is not None and report_current(state):
-        coverage = None
-    if coverage is None:
+    state = State(os.getcwd())
+    if state.audit is None or not state.units or report_current(state):
         # The map's own account goes to stderr: stdout is the list alone.
         import contextlib
         with contextlib.redirect_stdout(sys.stderr):
             cmd_recon([])
-        coverage = state.coverage()
+        state.reload()
+    coverage = state.coverage()
     states = hit_states(state)
     for unit in coverage["units"]:
         rows = hit_rows(state, unit)
@@ -2006,12 +3302,24 @@ def cmd_units(args):
             print("%s\t%s (%s)" % (unit["id"], unit["name"], unit["reason"]))
 
 
+def fixture_proof(state, hit, cited):
+    """Whether a blocked judgment of a strong-signal line rests on a test fixture: the cited place is
+    the line itself, in a test folder or file, and its value is a known example or placeholder."""
+    if not cited or not hit.get("path") or not hit.get("line"):
+        return False
+    if cited != "%s:%d" % (hit["path"], hit["line"]) or not TEST_PLACE.search(hit["path"]):
+        return False
+    lines = (read_text(os.path.join(state.root, hit["path"])) or "").split("\n")
+    raw = lines[hit["line"] - 1] if 0 < hit["line"] <= len(lines) else ""
+    values = [m.group(0) for regex in SECRET_VALUE_RES for m in regex.finditer(raw)]
+    if "PRIVATE KEY" in raw and not values:
+        return bool(EXAMPLE_VALUE.search(os.path.basename(hit["path"])))
+    return bool(values) and all(EXAMPLE_VALUE.search(v) or len(set(v[4:])) <= 2 for v in values)
+
+
 def cmd_settle(args):
     if len(args) < 2:
         fail("usage: settle <id or unit>... safe|hardening|lead|finding|blocked [\"note\"]", "%s next" % tool())
-    state = State(os.getcwd(), default_out())
-    coverage = state.coverage()
-    catalog = Catalog()
     ids, status, note = [], None, ""
     for index, arg in enumerate(args):
         if arg in HIT_STATUSES:
@@ -2021,14 +3329,17 @@ def cmd_settle(args):
     if status is None or not ids:
         fail("usage: settle <id or unit>... safe|hardening|lead|finding|blocked [\"note\"]", "%s next" % tool())
     if status in ("fixed", "still") and not all(i.startswith("U0") for i in ids):
-        fail("fixed and still are for the previous audit's issues (U0) only", "%s next" % tool())
+        fail("fixed and still are for the issues already known (U0) only", "%s next" % tool())
     if status in ("safe", "hardening", "blocked", "fixed", "still") and len(note) < 8:
         fail("%s needs the reason (the check or fact, with path:line)" % status, "%s settle %s %s \"<reason>\"" % (tool(), " ".join(ids), status))
+    state = State(os.getcwd())
+    coverage = state.coverage()
+    catalog = Catalog()
     states = hit_states(state)
     units = {u["id"]: u for u in coverage["units"]}
     targets = []
     for ident in ids:
-        unit_id = ident.split(".")[0]
+        unit_id = ident.split(".")[0].split("-")[0]
         unit = units.get(unit_id)
         if unit is None:
             fail("no unit %s" % unit_id, "%s next" % tool())
@@ -2059,81 +3370,88 @@ def cmd_settle(args):
     cited = None
     if status == "blocked" and all(u.get("error") for u in {u["id"]: u for u, _ in targets}.values()):
         cited = "tool failure"  # the unit's step failed: the failure is the reason, no line was shown
-    elif status in ("safe", "hardening", "blocked") and len(targets) > 1:
+    elif status in ("safe", "hardening", "blocked") and (len(targets) > 1 or any((state.by_hit.get(r[0]) or {}).get("signal") for _, r in targets)):
         cited = cited_location(state, note, targets)
-        if cited is None:
+        if cited is None and len(targets) > 1:
             first = targets[0][1]
             example = ("%s:%d" % (first[1], first[2])) if first[1] and first[2] else (first[1] or "src/app.py:42")
             if targets[0][0]["class"] == "dependencies":
                 fail("a judgment of %d packages names the package or lockfile it rests on" % len(targets), "%s settle %s %s \"<reason naming the package>\"" % (tool(), " ".join(ids), status))
             fail("a judgment of %d lines names the place you read that covers them, as path:line in the project (e.g. %s)" % (len(targets), example), "%s settle %s %s \"<reason with path:line>\"" % (tool(), " ".join(ids), status))
-    written = []
-    previous = state.load(PREVIOUS_FILE, None) or {"issues": []}
+    # A strong host signal (a real key format, a secret in history, a malicious or exploited
+    # package) is never waved off: finding or lead, or blocked on a cited test fixture.
+    if status in ("safe", "hardening", "blocked"):
+        for unit, row in targets:
+            hit = state.by_hit.get(row[0]) or {}
+            if not hit.get("signal"):
+                continue
+            if status == "blocked" and fixture_proof(state, hit, cited):
+                continue
+            proof = " (blocked needs the cited path:line of a test fixture holding an example value)" if status == "blocked" else ""
+            fail("%s is a strong host signal (%s): settle it finding or lead, not %s%s." % (row[0], hit["signal"], status, proof), "%s settle %s finding" % (tool(), row[0]))
+    changes, written = {}, []
     for unit, (hid, rel, number, shape, text) in targets:
-        if status == "still" and unit["class"] == "previous":
-            issue = previous["issues"][int(hid.split(".")[1]) - 1] if "." in hid and hid.split(".")[1].isdigit() else None
-            if issue and issue.get("record"):
-                record = dict(issue["record"])
-                record["hit"] = hid
-                record["unit"] = unit["id"]
-                record["carried_from"] = previous.get("archived", "")
-                record["recorded"] = time.strftime("%Y-%m-%d %H:%M")
-                findings = [f for f in state.findings() if f.get("fingerprint") != record.get("fingerprint")]
-                findings.append(record)
-                state.save("findings.json", findings)
-                states[hid] = {"status": "finding" if record["verdict"] == "confirmed" else "lead", "note": "still open: " + note, "record": "carried"}
+        hit = state.by_hit.get(hid) or {}
+        if unit["class"] == "previous" and status in ("fixed", "still"):
+            fid = hit.get("finding_id")
+            if not fid:
+                changes[hid] = {"status": "hardening" if status == "still" else "fixed", "note": ("still open: " if status == "still" else "") + note}
+                continue
+            ok, result = graph_call("memory.security.finding", {"project_id": state.pid, "id": fid})
+            if not ok:
+                fail("finding %s could not be read from the project's graph: %s" % (fid, result), "%s next" % tool())
+            finding = (result or {}).get("finding") or {}
+            if status == "fixed":
+                if finding.get("status") not in ("fixed", "verified"):
+                    kind, words, _ = now_at_sink(state.pid, state.root, fid)
+                    if kind != "gone":
+                        fail("%s is not fixed: %s." % (hid, words), "%s settle %s still \"<re-verified how>\"" % (tool(), hid))
+                    if finding.get("status") == "accepted":
+                        print("%s stays accepted (the person's decision); its line is gone." % fid)
+                    else:
+                        write("memory.security.finding.update", {"project_id": state.pid, "id": fid, "status": "fixed", "by": "recheck", "note": note, "workspace": state.root}, "The fix of %s" % fid)
+                changes[hid] = {"status": "fixed", "note": note, "finding_id": fid}
             else:
-                states[hid] = {"status": "hardening", "note": "still open: " + note}
+                again = {k: v for k, v in finding.items() if k not in ("status", "status_note", "status_by", "status_ms", "notified_ms", "ended_ms")}
+                again["priority"], again["priority_reason"] = priority_of(again)
+                state.put_findings([again])
+                carried = {"confirmed": "finding", "needs_validation": "lead"}.get(finding.get("verdict"), "hardening")
+                changes[hid] = {"status": carried, "note": "still open: " + note, "finding_id": fid, "record": "carried"}
             continue
         if status in ("finding", "lead"):
-            os.makedirs(state.drafts, exist_ok=True)
-            n = 1
-            while os.path.exists(os.path.join(state.drafts, "finding-%d.json" % n)) or os.path.exists(state.path("finding-%d.json" % n)):
-                n += 1
-            name = "finding-%d.json" % n
-            record = json.loads(json.dumps(TEMPLATES["confirmed" if status == "finding" else "needs_validation"]))
-            record["class"] = unit["class"]
-            record["unit"] = unit["id"]
-            record["hit"] = hid
-            record["fingerprint"] = "? %s:%s:<function>" % (unit["class"], rel or "<file>")
-            if unit["class"] == "dependencies" and rel:
-                package = text.split(":")[0].split(" ")[1] if " " in text.split(":")[0] else text.split(":")[0]
-                record["fingerprint"] = ("dependencies:%s:%s" % (rel, package)).lower()
-                record["title"] = "? what a lower-trust party can do through %s at the pinned version" % package
-                lock_text = read_text(os.path.join(state.root, rel)) or ""
-                line_no = next((i for i, l in enumerate(lock_text.split("\n"), 1) if package.split("/")[-1] in l), 1)
-                record["trace"][-1] = {"kind": "sink", "file": rel, "line": line_no, "what": "? the package at its pinned version, and the call in this project that reaches the vulnerable code"}
-            elif rel and number:
-                record["trace"][-1] = {"kind": "sink", "file": rel, "line": number, "what": "? what the value does here: " + text[:80]}
-            with open(os.path.join(state.drafts, name), "w", encoding="utf-8") as handle:
-                json.dump(record, handle, indent=1)
+            name = write_draft(state, unit, hid, rel, number, text, status)
             written.append((hid, os.path.join(state.drafts_rel, name)))
-            states[hid] = {"status": status, "note": note, "record": name}
+            changes[hid] = {"status": status, "note": note, "record": name}
         else:
-            states[hid] = {"status": status, "note": note}
+            changes[hid] = {"status": status, "note": note}
             if cited:
-                states[hid]["cited"] = cited
-    save_hit_states(state, states, sorted({u["id"] for u, _ in targets}))
+                changes[hid]["cited"] = cited
+    settle_hits(state, changes)
     coverage = state.coverage()
     closed = []
     for unit in {u["id"]: u for u, _ in targets}.values():
-        if unit["status"] in ("covered", "candidate", "blocked"):
-            closed.append((unit, state.path(os.path.join("units", unit_report(state, coverage, unit, catalog)))))
+        current = next(u for u in coverage["units"] if u["id"] == unit["id"])
+        if current["status"] in ("covered", "candidate", "blocked"):
+            closed.append((current, state.path(os.path.join("units", unit_report(state, coverage, current, catalog)))))
     print("Settled %s as %s." % (", ".join(hid for _, (hid, *_) in targets), status))
     if written:
         for hid, path in written:
             print("Record for %s: %s" % (hid, path))
+            floor = (state.by_hit.get(hid) or {}).get("severity")
+            if floor:
+                print("The host sets %s for this line's signal: the severity is at least %s." % (floor, floor))
         if status == "finding":
             print("Severity comes from the demonstrated result, never from the class name; overall never exceeds impact:")
             for anchor in SEVERITY_ANCHORS:
                 print("  " + anchor)
         print("Next: fill every '? ' value of %s with edit (trace: entrypoint first, the sink is prefilled; a real path:line each), then %s finding %s" % (written[0][1], tool(), written[0][1]))
         return
+    states = hit_states(state)
     still_open = any(r[0] not in states for u in coverage["units"] for r in hit_rows(state, u))
     if closed and still_open:
         # A unit is one piece of the work: its one-line result goes to the user now, and the audit
-        # goes on with the next unit from the state on disk (the host continues the turn while the
-        # tool says work is open), so each unit starts from a short history.
+        # goes on with the next unit from the graph (the host continues the turn while the tool
+        # says work is open), so each unit starts from a short history.
         for unit, report_path in closed:
             print("%s is settled: %s" % (unit["id"], unit_line(state, unit, catalog, report_path)))
         print("Next: reply to the user with that one line; the audit goes on with the next unit after it.")
@@ -2164,9 +3482,9 @@ def sentence(text):
 
 
 def unit_report(state, coverage, unit, catalog):
-    """Write `units/<id>-<class>.md`: the unit's review in full, as a reader would want it: what the
-    class is, why it applies here, each finding and lead in prose, the hardening notes, and every
-    line reviewed with its verdict and the reviewer's reasoning."""
+    """Write `units/<id>-<class>.md` in the audit's report folder: the unit's review in full, as a
+    reader would want it: what the class is, why it applies here, each finding and lead in prose,
+    the hardening notes, and every line reviewed with its verdict and the reviewer's reasoning."""
     cls = catalog.by_id[unit["class"]]
     states = hit_states(state)
     rows = hit_rows(state, unit)
@@ -2174,8 +3492,8 @@ def unit_report(state, coverage, unit, catalog):
     counts = {}
     for _, st in judged:
         counts[st["status"] if st else "open"] = counts.get(st["status"] if st else "open", 0) + 1
-    records = {f.get("hit"): f for f in state.findings() if f.get("hit")}
-    deps = (state.load("deps.json", {}) or {}).get("rows") or []
+    by_id = {f["id"]: f for f in state.findings()}
+    deps = state.rows()
     lines = []
     add = lines.append
     add("# %s: %s" % (unit["id"], cls["name"]))
@@ -2194,41 +3512,42 @@ def unit_report(state, coverage, unit, catalog):
     add("What would count as a vulnerability here: %s" % sentence(cls["counts"]))
     add("")
     add("What is only a hardening note: %s" % sentence(cls["hardening"]))
-    findings = [(r, records[r[0]]) for r, st in judged if st and st["status"] in ("finding", "lead") and r[0] in records]
+    findings = [(r, by_id[st["finding_id"]]) for r, st in judged if st and st["status"] in ("finding", "lead") and st.get("finding_id") in by_id]
     if findings:
         add("")
         add("## Findings and leads")
         for (hid, rel, number, shape, text), rec in findings:
             add("")
+            trace = " then ".join("`%s:%d` (%s: %s)" % (s["file"], s["line"], s["kind"], s["what"]) for s in rec.get("trace") or [])
             if rec["verdict"] == "confirmed":
-                add("### %s (%s severity)" % (rec["title"], rec["severity"]["overall"]))
+                add("### %s (%s severity)" % (rec["title"], rec.get("severity_overall")))
                 add("")
-                add("Affected code: " + " then ".join("`%s:%d` (%s: %s)" % (s["file"], s["line"], s["kind"], s["what"]) for s in rec["trace"]) + ".")
+                add("Affected code: " + trace + ".")
                 add("")
-                add("Who can exploit it: %s" % sentence(rec["principal"]))
+                add("Who can exploit it: %s" % sentence(rec.get("principal")))
                 add("")
-                add("Why the existing controls do not stop it: %s" % sentence(rec["control"]))
+                add("Why the existing controls do not stop it: %s" % sentence(rec.get("control")))
                 add("")
-                add("Impact: %s" % sentence(rec["impact"]))
+                add("Impact: %s" % sentence(rec.get("impact")))
                 if rec.get("conditions"):
                     add("")
                     add("Conditions: " + "; ".join(rec["conditions"]) + ".")
                 add("")
-                add("Evidence: %s Observed: %s" % (sentence(rec["evidence"]["how"]), sentence(rec["evidence"]["observed"])))
+                add("Evidence: %s Observed: %s" % (sentence(rec.get("evidence_how")), sentence(rec.get("evidence_observed"))))
                 add("")
-                add("Severity: likelihood %s, impact %s, overall %s." % (rec["severity"]["likelihood"], rec["severity"]["impact"], rec["severity"]["overall"]))
+                add("Severity: likelihood %s, impact %s, overall %s." % (rec.get("severity_likelihood"), rec.get("severity_impact"), rec.get("severity_overall")))
                 add("")
-                add("Recommended fix: in %s, %s Regression test: %s" % (rec["fix"]["where"], sentence(rec["fix"]["change"]), sentence(rec["fix"]["test"])))
+                add("Recommended fix: in %s, %s Regression test: %s" % (rec.get("fix_where"), sentence(rec.get("fix_change")), sentence(rec.get("fix_test"))))
             else:
                 add("### %s (lead, needs validation)" % rec["title"])
                 add("")
-                add("Affected code: " + " then ".join("`%s:%d` (%s: %s)" % (s["file"], s["line"], s["kind"], s["what"]) for s in rec["trace"]) + ".")
+                add("Affected code: " + trace + ".")
                 add("")
-                add("Who could exploit it: %s" % sentence(rec["principal"]))
+                add("Who could exploit it: %s" % sentence(rec.get("principal")))
                 add("")
-                add("The one fact outside the code that decides: %s" % sentence(rec["blocker"]))
+                add("The one fact outside the code that decides: %s" % sentence(rec.get("blocker") or rec.get("missing_fact")))
                 add("")
-                add("How to settle it without attacking anything: %s" % sentence(rec["check"]))
+                add("How to settle it without attacking anything: %s" % sentence(rec.get("check_how")))
     hardening = [(r, st) for r, st in judged if st and st["status"] == "hardening"]
     if hardening:
         add("")
@@ -2257,17 +3576,16 @@ def unit_report(state, coverage, unit, catalog):
     if unit["class"] == "dependencies":
         groups = {}
         for row in deps:
-            groups.setdefault((row["eco"], row["name"], row["version"], row["lockfile"]), []).append(row)
+            groups.setdefault((row["eco"], row["name"], row["version"]), []).append(row)
         for (hid, rel, number, shape, text), st in judged:
-            name = text.split(":")[0]
-            add("### %s %s" % (hid, name))
+            hit = state.by_hit.get(hid) or {}
+            add("### %s %s %s" % (hid, hit.get("package") or text.split(":")[0], hit.get("version") or ""))
             add("")
-            key = next((k for k in groups if "%s %s %s" % (k[0], k[1], k[2]) == name), None)
-            if key:
-                for row in groups[key]:
-                    ids = row["id"] + (" / " + row["aliases"][0] if row["aliases"] else "")
-                    add("- %s, %s: %s Fixed in %s." % (ids, row["severity"], sentence(row["summary"]), ", ".join(sorted(set(row["fixed"]))[:3]) or "no version listed"))
-                add("")
+            for row in groups.get((hit.get("ecosystem"), hit.get("package"), hit.get("version")), []):
+                ids = row["id"] + (" / " + row["aliases"][0] if row["aliases"] else "")
+                extra = exploit_words([row])
+                add("- %s, %s%s: %s Fixed in %s." % (ids, row["severity"], (" (" + ", ".join(extra) + ")") if extra else "", sentence(row["summary"]), ", ".join(sorted(set(row["fixed"]))[:3]) or "no version listed"))
+            add("")
             add("Verdict: %s. %s" % (VERDICT_WORDS.get(st["status"], st["status"]) if st else "open", sentence(st["note"]) if st and st.get("note") else ""))
             add("")
     else:
@@ -2290,424 +3608,39 @@ def unit_report(state, coverage, unit, catalog):
     return name
 
 
-# ----------------------------------------------------------------------------- previous audits
+# ----------------------------------------------------------------------------- one finding: show, fix-plan, recheck, resolve
 
-PREVIOUS_FILE = "previous.json"
-
-
-def archive_previous(state):
-    """A new audit on a project with a finished one: keep the old run under runs/<stamp>/ and
-    return its issues (findings, leads, hardening notes) for the re-check, or None when there is
-    no previous run."""
-    if not os.path.isfile(state.path("REPORT.md")) and not os.path.isfile(state.path("hits-state.json")) and not os.path.isdir(state.path("hits-state")):
-        return None
-    findings = state.findings()
-    states = hit_states(state)
-    coverage = state.load("coverage.json", {}) or {}
-    issues = []
-    for record in findings:
-        if record.get("verdict") not in ("confirmed", "needs_validation"):
-            continue
-        sink = record["trace"][-1]
-        issues.append({"kind": "finding" if record["verdict"] == "confirmed" else "lead", "title": record["title"], "file": sink["file"], "line": sink["line"], "text": sink.get("text", ""), "severity": (record.get("severity") or {}).get("overall", ""), "record": record, "class": record.get("class", "")})
-    hits_by_unit = {}
-    for unit in coverage.get("units", []):
-        for hid, rel, number, shape, text in hit_rows(state, unit):
-            hits_by_unit[hid] = (unit, rel, number, shape, text)
-    for hid, st in states.items():
-        if st.get("status") != "hardening" or hid not in hits_by_unit:
-            continue
-        unit, rel, number, shape, text = hits_by_unit[hid]
-        issue = {"kind": "hardening", "title": st.get("note", ""), "file": rel, "line": number, "text": text, "class": unit["class"], "hit": hid}
-        if unit["class"] == "dependencies":
-            parts = text.split(":")[0].split(" ")
-            if len(parts) >= 3:
-                issue["package"] = {"eco": parts[0], "name": parts[1], "version": parts[2]}
-        issues.append(issue)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    archive = state.path(os.path.join("runs", stamp))
-    os.makedirs(archive, exist_ok=True)
-    for name in ("REPORT.md", "findings.json", "hits-state.json", "coverage.json", "recon.json", "deps.json"):
-        if os.path.isfile(state.path(name)):
-            os.replace(state.path(name), os.path.join(archive, name))
-    for folder in ("units", "hits", "hits-state"):
-        if os.path.isdir(state.path(folder)):
-            os.replace(state.path(folder), os.path.join(archive, folder))
-    # The old run's record drafts (normally gone with the project's tmp/) must not block the new one.
-    if os.path.isdir(state.drafts):
-        for name in os.listdir(state.drafts):
-            if re.match(r"finding-\d+\.json$", name):
-                os.replace(os.path.join(state.drafts, name), os.path.join(archive, name))
-    previous = {"archived": stamp, "report": os.path.join("runs", stamp, "REPORT.md"), "issues": issues}
-    state.save(PREVIOUS_FILE, previous)
-    return previous
-
-
-def recheck_previous(state, previous, packages_now):
-    """What the code says about each previous issue now: the flagged line still present, moved or
-    gone; a flagged package still pinned at a vulnerable version, upgraded, or removed."""
-    for issue in previous["issues"]:
-        if issue.get("package"):
-            pkg = issue["package"]
-            current = next((v for (eco, name, v) in packages_now if eco == pkg["eco"] and name == pkg["name"]), None)
-            if current is None:
-                issue["now"] = "the package is no longer pinned in a lockfile"
-            elif current != pkg["version"]:
-                issue["now"] = "the package is now pinned at %s (was %s)" % (current, pkg["version"])
-            else:
-                issue["now"] = "still pinned at %s" % pkg["version"]
-            continue
-        rel = issue.get("file")
-        if not rel:
-            issue["now"] = "no line to compare"
-            continue
-        full = os.path.join(state.root, rel)
-        if not os.path.isfile(full):
-            issue["now"] = "the file %s no longer exists" % rel
-            continue
-        text = (issue.get("text") or "").strip()
-        content = read_text(full) or ""
-        lines = content.split("\n")
-        if text and issue.get("line") and 0 < issue["line"] <= len(lines) and lines[issue["line"] - 1].strip() == text:
-            issue["now"] = "the flagged line is unchanged at %s:%d" % (rel, issue["line"])
-        elif text and any(l.strip() == text for l in lines):
-            issue["now"] = "the flagged line still exists in %s, at another line" % rel
-        elif text:
-            issue["now"] = "the flagged line is gone from %s (changed or removed)" % rel
-        else:
-            issue["now"] = "the file still exists; compare %s:%d by hand" % (rel, issue.get("line") or 0)
-    state.save(PREVIOUS_FILE, previous)
-
-
-def previous_rows(state, unit):
-    """The U0 lines: one per previous issue."""
-    previous = state.load(PREVIOUS_FILE, None)
-    if not previous:
-        return []
-    out = []
-    for index, issue in enumerate(previous["issues"], 1):
-        where = ("%s:%d" % (issue["file"], issue["line"])) if issue.get("file") and issue.get("line") else (issue.get("file") or "")
-        label = {"finding": "confirmed finding, %s" % issue.get("severity", ""), "lead": "lead (needs validation)", "hardening": "hardening note"}[issue["kind"]]
-        text = "%s: %s. Now: %s" % (label, issue["title"][:120], issue.get("now", "not compared"))
-        out.append(("%s.%d" % (unit["id"], index), issue.get("file") or "", issue.get("line") or 0, "previous " + issue["kind"], text))
-    return out
-
-
-
-# ----------------------------------------------------------------------------- the project's graph
-
-# Findings live in the project's graph (the memory plugin, through the app): the Security tab lists
-# them by priority, starts fix sessions from them and marks them fixed. The script is the only
-# writer; the app is reached through `cx`, so an audit never waits for it: a push that finds no app
-# is noted and the next push carries everything again.
-
-GRAPH_METHODS = {
-    "audit": "memory.security.audit.put",
-    "put": "memory.security.findings.put",
-    "list": "memory.security.findings",
-    "get": "memory.security.finding",
-    "update": "memory.security.finding.update",
-    "summary": "memory.security.summary",
-}
-PRIORITY_BAND = {"critical": 400, "high": 300, "medium": 200, "low": 100, "informational": 50}
-STATUS_DONE = ("fixed", "verified")
-
-
-def graph_call(method, params):
-    """One call to the app (`cx call`): (True, result) or (False, why). The app not running is a
-    `why` like any other; callers that only push note it and go on."""
-    home = os.environ.get("CORTEX_HOME")
-    if not home:
-        return False, "no CORTEX_HOME"
-    cx = os.path.join(home, "bin", "cx")
-    if not os.path.isfile(cx):
-        return False, "cx is not installed in %s" % os.path.join(home, "bin")
-    try:
-        out = subprocess.run([cx, "call", method, json.dumps(params)], capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return False, "cx: %s" % error
-    if out.returncode != 0:
-        message = (out.stderr.strip() or out.stdout.strip() or "cx exited %d" % out.returncode).split("\n")[-1]
-        return False, message
-    try:
-        return True, json.loads(out.stdout) if out.stdout.strip() else {}
-    except ValueError:
-        return False, "cx answered something that is not JSON"
-
-
-def project_id(state):
-    """The app's id of the project this audit runs in: the `run` shell exports it; outside the app
-    the project list is matched by root."""
-    env = os.environ.get("CORTEX_PROJECT_ID")
-    if env:
-        return env
-    ok, result = graph_call("frame.project.list", {})
-    if ok:
-        want = os.path.realpath(state.root)
-        for project in (result or {}).get("projects", []) if isinstance(result, dict) else []:
-            if os.path.realpath(project.get("root", "")) == want:
-                return project["id"]
-    return None
-
-
-def audit_record(state, coverage, finished):
-    """The audit node: the run's id, times, size and counts."""
-    findings = state.findings()
-    states = hit_states(state)
-    audit = {
-        "id": coverage.get("audit_id") or "audit-%s" % hashlib.sha1(("%s %s" % (state.root, coverage.get("started", ""))).encode("utf-8")).hexdigest()[:12],
-        "started_ms": coverage.get("started_ms") or int(time.time() * 1000),
-        "units": len(coverage.get("units", [])),
-        "lines_judged": len(states),
-        "findings": sum(1 for f in findings if f.get("verdict") == "confirmed"),
-        "leads": sum(1 for f in findings if f.get("verdict") == "needs_validation"),
-        "hardening": sum(1 for s in states.values() if s.get("status") == "hardening"),
-        "scope": ", ".join(coverage.get("scope") or []) or None,
-        "skill_version": SKILL_VERSION,
-        "report_path": state.path("REPORT.md") if os.path.isfile(state.path("REPORT.md")) else None,
-    }
-    if finished:
-        audit["finished_ms"] = int(time.time() * 1000)
-    return audit
-
-
-def priority_of(finding):
-    """One number, higher first, from the facts the record states; the reason spells the terms out."""
-    terms = []
-    verdict = finding.get("verdict")
-    if verdict == "confirmed":
-        level = (finding.get("severity_overall") or "low").lower()
-        score = PRIORITY_BAND.get(level, 100)
-        terms.append("%s severity %d" % (level, score))
-        score += 50
-        terms.append("confirmed +50")
-    elif verdict == "needs_validation":
-        score = 150
-        terms.append("lead 150")
-    else:
-        score = 60
-        terms.append("hardening note 60")
-    who = (finding.get("principal") or "").lower()
-    if any(word in who for word in ("anonymous", "unauthenticated", "any visitor", "remote peer", "the network")):
-        score += 30
-        terms.append("anonymous party +30")
-    elif any(word in who for word in ("user", "authenticated", "logged", "member", "tenant")):
-        score += 15
-        terms.append("authenticated party +15")
-    if finding.get("quick_fix"):
-        score += 20
-        terms.append("quick fix available +20")
-    return score, ", ".join(terms)
-
-
-ECOSYSTEM_TOOLS = {
-    "npm": lambda name, to, lockdir: ["cd %s && npm install %s@%s" % (lockdir, name, to)],
-    "crates.io": lambda name, to, lockdir: ["cd %s && cargo update -p %s --precise %s" % (lockdir, name, to)],
-    "PyPI": lambda name, to, lockdir: ["cd %s && python3 -m pip install '%s==%s' && python3 -m pip freeze | grep -i '^%s==' " % (lockdir, name, to, name)],
-    "Go": lambda name, to, lockdir: ["cd %s && go get %s@v%s && go mod tidy" % (lockdir, name, to.lstrip("v"))],
-    "RubyGems": lambda name, to, lockdir: ["cd %s && bundle update %s" % (lockdir, name)],
-    "Packagist": lambda name, to, lockdir: ["cd %s && composer update %s" % (lockdir, name)],
-    "Maven": lambda name, to, lockdir: ["edit the version of %s to %s in %s/pom.xml, then: cd %s && mvn -q dependency:resolve" % (name, to, lockdir, lockdir)],
-    "NuGet": lambda name, to, lockdir: ["cd %s && dotnet add package %s --version %s" % (lockdir, name, to)],
-}
-
-
-def quick_fix_for(package_name, deps_rows, lockfile=None):
-    """The exact upgrade for a vulnerable package: the covering version and the commands of its
-    ecosystem; None when no fixed version exists."""
-    rows = [r for r in deps_rows if r["name"] == package_name and (lockfile is None or r["lockfile"] == lockfile)]
-    if not rows:
-        return None
-    to = covering_fix(rows)
-    if not to:
-        return None
-    row = rows[0]
-    lockdir = os.path.dirname(row["lockfile"]) or "."
-    make = ECOSYSTEM_TOOLS.get(row["eco"])
-    commands = make(row["name"], to, lockdir) if make else ["upgrade %s to %s in %s" % (row["name"], to, row["lockfile"])]
-    if row["lockfile"].endswith("requirements.txt"):
-        commands = ["sed -i '' 's/^%s==%s/%s==%s/' %s" % (re.escape(row["name"]), re.escape(row["version"]), row["name"], to, row["lockfile"]), "cd %s && python3 -m pip install -r %s" % (lockdir, os.path.basename(row["lockfile"]))]
-    return {"kind": "upgrade", "ecosystem": row["eco"], "package": row["name"], "from": row["version"], "to": to, "lockfile": row["lockfile"], "commands": commands}
-
-
-def record_to_finding(record, deps_rows):
-    """A validated record (confirmed or needs_validation) as the graph's finding."""
-    trace = [{"kind": step.get("kind", "step"), "file": step.get("file", ""), "line": int(step.get("line") or 0), "what": step.get("what", "")} for step in record.get("trace", [])]
-    sink = record.get("trace", [{}])[-1] if record.get("trace") else {}
-    verdict = record["verdict"]
-    severity = record.get("severity") or {}
-    fix = record.get("fix") or {}
-    evidence = record.get("evidence") or {}
-    quick_fix = None
-    if record.get("class") == "dependencies":
-        parts = record["fingerprint"].split(":")
-        if len(parts) >= 3:
-            quick_fix = quick_fix_for(parts[-1], deps_rows)
-    finding = {
-        "id": record["fingerprint"],
-        "class": record.get("class", ""),
-        "verdict": verdict,
-        "title": record.get("title", ""),
-        "principal": record.get("principal", ""),
-        "control": record.get("control", ""),
-        "impact": record.get("impact", ""),
-        "result": (evidence.get("observed") or record.get("impact") or "").split("\n")[0],
-        "evidence_how": evidence.get("how", ""),
-        "evidence_observed": evidence.get("observed", ""),
-        "severity_likelihood": severity.get("likelihood"),
-        "severity_impact": severity.get("impact"),
-        "severity_overall": severity.get("overall"),
-        "fix_where": fix.get("where", ""),
-        "fix_change": fix.get("change", ""),
-        "fix_test": fix.get("test", ""),
-        "missing_fact": ("%s. Check: %s" % (record.get("blocker", "").rstrip("."), record.get("check", ""))) if verdict == "needs_validation" else None,
-        "trace": trace,
-        "quick_fix": quick_fix,
-        "sink_path": sink.get("file") or None,
-        "sink_line": int(sink.get("line") or 0) or None,
-    }
-    finding["priority"], finding["priority_reason"] = priority_of(finding)
-    return finding
-
-
-def hardening_findings(state, coverage, deps_rows):
-    """Every hardening note as a finding of its own: the class, the line, the reviewer's note."""
-    states = hit_states(state)
-    out = []
-    for unit in coverage.get("units", []):
-        for hid, rel, number, shape, text in hit_rows(state, unit):
-            judged = states.get(hid)
-            if not judged or judged.get("status") != "hardening":
-                continue
-            quick_fix = None
-            package = None
-            if unit["class"] == "dependencies" and " " in text.split(":")[0]:
-                package = text.split(":")[0].split(" ")[1]
-                quick_fix = quick_fix_for(package, deps_rows, rel or None)
-            ident = ("hardening:%s:%s" % (unit["class"], package or ("%s:%d" % (rel or unit["id"], number or 0)))).lower()
-            finding = {
-                "id": ident,
-                "class": unit["class"],
-                "verdict": "hardening",
-                "title": judged.get("note", "") or "hardening note",
-                "principal": "",
-                "control": "",
-                "impact": "",
-                "result": "",
-                "evidence_how": "static: the reviewer's note on the flagged line",
-                "evidence_observed": text[:200],
-                "fix_where": ("%s:%d" % (rel, number)) if rel and number else (rel or ""),
-                "fix_change": judged.get("note", ""),
-                "fix_test": "",
-                "trace": [{"kind": "sink", "file": rel or "", "line": int(number or 0), "what": text[:160]}] if rel else [],
-                "quick_fix": quick_fix,
-                "sink_path": rel or None,
-                "sink_line": int(number or 0) or None,
-            }
-            finding["priority"], finding["priority_reason"] = priority_of(finding)
-            out.append(finding)
-    return out
-
-
-def all_graph_findings(state, coverage):
-    deps_rows = (state.load("deps.json", {}) or {}).get("rows") or []
-    findings = [record_to_finding(r, deps_rows) for r in state.findings() if r.get("verdict") in ("confirmed", "needs_validation")]
-    findings.extend(hardening_findings(state, coverage, deps_rows))
-    return findings
-
-
-def push_findings(state, coverage, findings, finished=False):
-    """Write the audit and these findings to the project's graph. One line when the app is away."""
-    pid = project_id(state)
-    if not pid:
-        print("(not written to the project's graph: the app is not reachable from here; the next push carries it)")
-        return False
-    audit = audit_record(state, coverage, finished)
-    ok, why = graph_call(GRAPH_METHODS["audit"], {"project_id": pid, "audit": audit})
-    if not ok:
-        print("(not written to the project's graph: %s)" % why)
-        return False
-    if findings:
-        ok, why = graph_call(GRAPH_METHODS["put"], {"project_id": pid, "audit_id": audit["id"], "findings": findings})
-        if not ok:
-            print("(findings not written to the project's graph: %s)" % why)
-            return False
-    return True
-
-
-def graph_finding(state, ident):
+def graph_finding(pid, ident):
     """A finding from the graph with its history: (finding, history), or (None, why)."""
-    pid = project_id(state)
-    if not pid:
-        return None, "the app is not reachable from here"
-    ok, result = graph_call(GRAPH_METHODS["get"], {"project_id": pid, "id": ident})
+    ok, result = graph_call("memory.security.finding", {"project_id": pid, "id": ident})
     if not ok:
         return None, result
     return (result or {}).get("finding"), (result or {}).get("history", [])
 
 
-def local_finding(state, ident):
-    """The same finding from this folder's state (the records and the hardening notes), or None."""
-    coverage = state.load("coverage.json", None) or {"units": []}
-    for finding in all_graph_findings(state, coverage):
-        if finding["id"] == ident:
-            return finding
-    return None
+def now_at_sink(pid, root, ident):
+    """What the host sees of a finding's sink now: (kind, sentence, line)."""
+    ok, result = graph_call("memory.security.recheck", {"project_id": pid, "ids": [ident], "workspace": root, "dry": True})
+    row = ((result or {}).get("checked") or [{}])[0] if ok else {}
+    if not ok or not row:
+        return "unknown", "the host could not compare (%s)" % (result if not ok else "no such finding"), None
+    return row.get("kind", "unknown"), row.get("sentence", ""), row.get("line")
 
 
-def now_at_sink(state, finding):
-    """What the code says about a finding now: the flagged line unchanged, moved or gone; the
-    package still pinned, upgraded or removed. (kind, sentence) with kind in unchanged|moved|gone|
-    upgraded|unknown."""
-    quick_fix = finding.get("quick_fix")
-    if finding.get("class") == "dependencies":
-        package = (quick_fix or {}).get("package") or finding["id"].split(":")[-1]
-        pinned = (quick_fix or {}).get("from")
-        current = None
-        for eco, name, version in project_packages(state.root, repo_files(state.root, [])):
-            if name == package:
-                current = version
-                break
-        if current is None:
-            return "gone", "%s is no longer pinned in a lockfile" % package
-        if pinned and current != pinned:
-            return "upgraded", "%s is now pinned at %s (was %s)" % (package, current, pinned)
-        return "unchanged", "%s is still pinned at %s" % (package, current)
-    sink = (finding.get("trace") or [{}])[-1] if finding.get("trace") else {}
-    rel, line, want = sink.get("file"), int(sink.get("line") or 0), (sink.get("text") or "").strip()
-    if not rel:
-        return "unknown", "the finding names no line to compare"
-    full = os.path.join(state.root, rel)
-    if not os.path.isfile(full):
-        return "gone", "the file %s no longer exists" % rel
-    lines = (read_text(full) or "").split("\n")
-    if not want:
-        # The stored finding carries no line text: the hits file or the record may.
-        for record in state.findings():
-            if record.get("fingerprint") == finding["id"] and record.get("trace"):
-                want = (record["trace"][-1].get("text") or "").strip()
-        if not want and finding.get("evidence_observed") and finding.get("verdict") == "hardening":
-            want = finding["evidence_observed"].split(":", 1)[-1].strip()[:80]
-    if want and 0 < line <= len(lines) and lines[line - 1].strip().startswith(want[:60]):
-        return "unchanged", "the flagged line is unchanged at %s:%d" % (rel, line)
-    if want and any(l.strip().startswith(want[:60]) for l in lines):
-        return "moved", "the flagged line still exists in %s, at another line" % rel
-    if want:
-        return "gone", "the flagged line is gone from %s (changed or removed)" % rel
-    return "unknown", "the file still exists; compare %s:%d by hand" % (rel, line)
+def one_finding(args, usage):
+    if not args:
+        fail("which finding?", "%s %s <id>" % (tool(), usage))
+    root = os.getcwd()
+    pid = require_app(root)
+    finding, history = graph_finding(pid, args[0])
+    if finding is None:
+        fail("no finding %s in the project's graph (%s)" % (args[0], history), "%s status" % tool())
+    return root, pid, finding, history
 
 
 def cmd_show(args):
     """Print one finding, readable, for the fix session."""
-    if not args:
-        fail("which finding?", "%s show <id>" % tool())
-    state = State(os.getcwd(), default_out())
-    finding, history = graph_finding(state, args[0])
-    if finding is None:
-        finding = local_finding(state, args[0])
-        history = []
-        if finding is None:
-            fail("no finding %s in the graph (%s) or in this audit's records" % (args[0], history if isinstance(history, str) else ""), "%s status" % tool())
+    root, pid, finding, history = one_finding(args, "show")
     level = finding.get("severity_overall") or {"needs_validation": "lead", "hardening": "hardening note"}.get(finding.get("verdict"), finding.get("verdict"))
     print("%s [%s, %s] %s" % (finding["id"], level, finding.get("class", ""), finding.get("title", "")))
     if finding.get("status"):
@@ -2715,6 +3648,8 @@ def cmd_show(args):
     for label, key in (("Who", "principal"), ("Result", "result"), ("Control", "control"), ("Impact", "impact"), ("Missing fact", "missing_fact")):
         if finding.get(key):
             print("%s: %s" % (label, finding[key]))
+    if finding.get("kev") or finding.get("epss"):
+        print("Exploitation: %s." % ", ".join(w for w in [("exploited in the wild (CISA KEV)" if finding.get("kev") else ""), ("EPSS %d%%" % round(finding["epss"] * 100) if finding.get("epss") else "")] if w))
     if finding.get("trace"):
         print("Trace (entry point first, sink last):")
         for step in finding["trace"]:
@@ -2728,21 +3663,14 @@ def cmd_show(args):
         print("Quick fix: %s %s %s -> %s in %s:" % (qf["ecosystem"], qf["package"], qf["from"], qf["to"], qf["lockfile"]))
         for command in qf.get("commands", []):
             print("  " + command)
-    kind, sentence = now_at_sink(state, finding)
-    print("Now: %s." % sentence)
+    kind, words, _ = now_at_sink(pid, root, finding["id"])
+    print("Now: %s." % words)
     print("Next: make the fix at the sink, run the test, then %s resolve %s \"<how you verified it>\"" % (tool(), finding["id"]))
 
 
 def cmd_fix_plan(args):
     """The exact commands of a quick fix."""
-    if not args:
-        fail("which finding?", "%s fix-plan <id>" % tool())
-    state = State(os.getcwd(), default_out())
-    finding, _ = graph_finding(state, args[0])
-    if finding is None:
-        finding = local_finding(state, args[0])
-    if finding is None:
-        fail("no finding %s" % args[0], "%s status" % tool())
+    root, pid, finding, _ = one_finding(args, "fix-plan")
     qf = finding.get("quick_fix")
     if not qf:
         print("%s has no quick fix: it needs a code change. Fix: %s at %s" % (finding["id"], finding.get("fix_change", ""), finding.get("fix_where", "")))
@@ -2755,79 +3683,50 @@ def cmd_fix_plan(args):
 
 
 def cmd_recheck(args):
-    """What the code says now about one finding; a sink that is gone or a package that moved on
-    marks the finding fixed in the graph (by: recheck)."""
-    if not args:
-        fail("which finding?", "%s recheck <id>" % tool())
-    state = State(os.getcwd(), default_out())
-    finding, _ = graph_finding(state, args[0])
-    if finding is None:
-        finding = local_finding(state, args[0])
-    if finding is None:
-        fail("no finding %s" % args[0], "%s status" % tool())
-    kind, sentence = now_at_sink(state, finding)
-    print("%s: %s." % (finding["id"], sentence))
-    if kind in ("gone", "upgraded") and finding.get("status") not in STATUS_DONE:
-        pid = project_id(state)
-        if pid:
-            ok, why = graph_call(GRAPH_METHODS["update"], {"project_id": pid, "id": finding["id"], "status": "fixed", "by": "recheck", "note": sentence})
-            print("Marked fixed in the project's graph." if ok else "(not marked in the graph: %s)" % why)
-    print("Next: %s next" % tool())
+    """The host's re-check of one finding (or every open, fixing and fixed one): what the code says
+    now, and the move it makes (gone: fixed; fixed and still gone later: verified; back: open)."""
+    root = os.getcwd()
+    pid = require_app(root)
+    params = {"project_id": pid, "workspace": root}
+    if args:
+        params["ids"] = [args[0]]
+    result = write("memory.security.recheck", params, "The re-check")
+    rows = (result or {}).get("checked") or []
+    if args and not rows:
+        fail("no finding %s in the project's graph" % args[0], "%s status" % tool())
+    for row in rows:
+        print("%s: %s%s." % (row["id"], row.get("sentence", ""), ("; now %s" % row["now"]) if row.get("now") else ""))
+    if not rows:
+        print("No open, fixing or fixed finding to re-check.")
+    print("Next: %s status" % tool())
 
 
 def cmd_resolve(args):
-    """Record a fix: the code must show it (the sink changed or gone, the package moved on), then
-    the finding is fixed in the graph with how it was verified, the session and the commit."""
+    """Record a fix: the host checks that the sink's line (or the pinned version) is gone from the
+    working tree, then the finding is fixed with how it was verified, the session and the commit."""
     if len(args) < 2 or len(" ".join(args[1:]).strip().strip('"')) < 8:
         fail("usage: resolve <id> \"<how you verified the fix: the test or run>\"", "%s show <id>" % tool())
     ident, how = args[0], " ".join(args[1:]).strip().strip('"')
-    state = State(os.getcwd(), default_out())
-    finding, _ = graph_finding(state, ident)
-    if finding is None:
-        finding = local_finding(state, ident)
-    if finding is None:
-        fail("no finding %s" % ident, "%s status" % tool())
-    kind, sentence = now_at_sink(state, finding)
-    if kind == "unchanged":
-        fail("nothing changed: %s. A fix changes the sink or moves the package on" % sentence, "make the change, run the test, then %s resolve %s \"<how>\"" % (tool(), ident))
-    pid = project_id(state)
-    if not pid:
-        fail("the app is not reachable from here, so the fix cannot be recorded", "run this inside the app's session")
-    commit = None
-    try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=state.root, capture_output=True, text=True, timeout=10)
-        commit = out.stdout.strip() or None if out.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
-        commit = None
-    params = {"project_id": pid, "id": ident, "status": "fixed", "by": "model", "note": "%s (%s)" % (how, sentence), "commit": commit}
+    root = os.getcwd()
+    pid = require_app(root)
+    commit = (git(["rev-parse", "HEAD"], root) or "").strip() or None
+    params = {"project_id": pid, "id": ident, "status": "fixed", "by": "agent", "note": how, "workspace": root, "commit": commit}
     session = os.environ.get("CORTEX_SESSION_ID")
     if session:
         params["session_id"] = session
-    ok, why = graph_call(GRAPH_METHODS["update"], params)
+    ok, result = graph_call("memory.security.finding.update", params)
     if not ok:
-        fail("the graph refused the fix: %s" % why, "%s show %s" % (tool(), ident))
-    print("Recorded %s as fixed: %s." % (ident, sentence))
+        print("The fix was not recorded: %s" % result)
+        if "Next:" not in result:
+            print("Next: %s show %s" % (tool(), ident))
+        sys.exit(1)
+    print("Recorded %s as fixed: %s." % (ident, (result or {}).get("status_note", how)))
     print("Next: reply to the user with one line: what was changed (path:line), how it was verified, and that the finding is marked fixed.")
-
-
-def fixing_here(state):
-    """Findings this session is fixing (status fixing with this session's id; without an id in the
-    environment, every fixing finding of the project)."""
-    pid = project_id(state)
-    if not pid:
-        return []
-    ok, result = graph_call(GRAPH_METHODS["list"], {"project_id": pid, "status": ["fixing"]})
-    if not ok:
-        return []
-    session = os.environ.get("CORTEX_SESSION_ID")
-    found = (result or {}).get("findings", [])
-    mine = [f for f in found if not session or f.get("session_id") == session]
-    return mine if session else found
 
 
 # ----------------------------------------------------------------------------- main
 
-COMMANDS = {"next": cmd_next, "units": cmd_units, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve, "show": cmd_show, "fix-plan": cmd_fix_plan, "recheck": cmd_recheck, "resolve": cmd_resolve}
+COMMANDS = {"next": cmd_next, "units": cmd_units, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve, "show": cmd_show, "fix-plan": cmd_fix_plan, "recheck": cmd_recheck, "resolve": cmd_resolve, "check-change": cmd_check_change, "watch": cmd_watch}
 
 
 def main(argv):
@@ -2842,6 +3741,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    # A result piped into head must not end in a traceback.
+    # A result piped into head must not end in a traceback; a terminal without UTF-8 gets "?" for
+    # the ellipsis of a masked secret instead of an error.
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     sys.exit(main(sys.argv[1:]))

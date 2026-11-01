@@ -84,6 +84,12 @@ pub fn hello() -> Hello {
 
 /// Event topic of limit changes: `{ts_ms, from, to, reason, metrics, model}`.
 pub const SCHEDULER_TOPIC: &str = "agents.scheduler";
+/// Stream of every concurrency-limit change with the metrics behind it (`memory.stream.*`).
+const ADJUSTMENTS_STREAM: &str = "agents.adjustments";
+/// Days the adjustments stream keeps a change.
+const ADJUSTMENTS_RETENTION_DAYS: u32 = 365;
+/// Changes the scheduler state shows (the newest).
+const ADJUSTMENTS_SHOWN: usize = 200;
 
 /// One finished model call, as `chatflow.usage` reports it.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -226,12 +232,11 @@ struct Inner {
     usage: Mutex<VecDeque<UsageSample>>,
     /// The model's slots and the last `model.slots` reading.
     model: Mutex<ModelLoad>,
-    /// Every limit change with the metrics behind it, newest last.
+    /// The last limit changes with the metrics behind them, newest last (read back from their
+    /// stream at start).
     adjustments: Mutex<VecDeque<Value>>,
     /// Projects this process has opened in the memory plugin.
     opened: Mutex<std::collections::HashSet<String>>,
-    /// Effort per task chosen by the planner (used when an agent's run starts).
-    efforts: Mutex<HashMap<String, String>>,
     /// Stop scopes, shared by an agent's controller and explicit merge/verify calls.
     cancellations: Mutex<HashMap<AgentKey, AgentCancellations>>,
     /// One merge into a project at a time.
@@ -263,7 +268,6 @@ impl Agents {
                 model: Mutex::new(ModelLoad::default()),
                 adjustments: Mutex::new(VecDeque::new()),
                 opened: Mutex::new(std::collections::HashSet::new()),
-                efforts: Mutex::new(HashMap::new()),
                 cancellations: Mutex::new(HashMap::new()),
                 merge: tokio::sync::Mutex::new(()),
                 self_checked: Mutex::new(std::collections::HashSet::new()),
@@ -591,10 +595,10 @@ impl Agents {
                         "contract": contract::contract_from(&planned.checks.iter().map(|command| contract::rooted(command, &[project.root.as_str()])).collect::<Vec<_>>()),
                         "depends_on": depends,
                         "touches": planned.touches,
+                        "effort": schemas::effort_or_default(&planned.effort, &data.effort.default),
                     }),
                 )
                 .await?;
-            lock(&self.inner.efforts).insert(task.id.clone(), schemas::effort_or_default(&planned.effort, &data.effort.default));
             ids.insert(planned.title.trim().to_owned(), task.id.clone());
             journal.append(kinds::TASK_LINK, json!({"task_id": task.id, "title": task.title, "run_id": run_id, "parent_id": root.id})).await?;
             created.push(task);
@@ -762,6 +766,51 @@ impl Agents {
         }
     }
 
+    /// The last limit changes from their stream, before the ones this process made.
+    async fn load_adjustments(&self, ctx: &Ctx) {
+        let host = Host::new(ctx.clone());
+        let topics = match host.get::<Value>(memory_methods::STREAM_TOPICS, json!({"prefix": ADJUSTMENTS_STREAM})).await {
+            Ok(topics) => topics,
+            Err(error) => {
+                tracing::warn!(%error, "the earlier limit changes could not be read");
+                return;
+            }
+        };
+        let Some(next) = topics
+            .get("topics")
+            .and_then(Value::as_array)
+            .and_then(|all| all.iter().find(|topic| topic.get("name").and_then(Value::as_str) == Some(ADJUSTMENTS_STREAM)))
+            .and_then(|topic| topic.get("next_offset").and_then(Value::as_u64))
+        else {
+            return;
+        };
+        let from = next.saturating_sub(ADJUSTMENTS_SHOWN as u64);
+        let read = match host
+            .get::<Value>(memory_methods::STREAM_READ, json!({"topic": ADJUSTMENTS_STREAM, "from_offset": from, "limit": ADJUSTMENTS_SHOWN}))
+            .await
+        {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "the earlier limit changes could not be read");
+                return;
+            }
+        };
+        let earlier: Vec<Value> = read
+            .get("records")
+            .and_then(Value::as_array)
+            .map(|records| records.iter().filter_map(|entry| entry.get("value").cloned()).collect())
+            .unwrap_or_default();
+        let mut adjustments = lock(&self.inner.adjustments);
+        let newest_kept = earlier.last().and_then(|record| record.get("ts_ms")).and_then(Value::as_u64).unwrap_or(0);
+        // Changes this process made meanwhile are also in the stream: keep each once.
+        let own: Vec<Value> = adjustments.drain(..).filter(|record| record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0) > newest_kept).collect();
+        adjustments.extend(earlier);
+        adjustments.extend(own);
+        while adjustments.len() > ADJUSTMENTS_SHOWN {
+            adjustments.pop_front();
+        }
+    }
+
     /// One step of the concurrency control loop.
     async fn control_tick(&self, ctx: &Ctx) {
         let host = Host::new(ctx.clone());
@@ -811,9 +860,18 @@ impl Agents {
         {
             let mut adjustments = lock(&self.inner.adjustments);
             adjustments.push_back(record.clone());
-            while adjustments.len() > 200 {
+            while adjustments.len() > ADJUSTMENTS_SHOWN {
                 adjustments.pop_front();
             }
+        }
+        if let Err(error) = host
+            .effect(
+                memory_methods::STREAM_APPEND,
+                json!({"topic": ADJUSTMENTS_STREAM, "records": [record.clone()], "retention_days": ADJUSTMENTS_RETENTION_DAYS}),
+            )
+            .await
+        {
+            tracing::warn!(%error, "the limit change was not kept in its stream");
         }
         ctx.publish(SCHEDULER_TOPIC, record.clone());
         // Journal the change where the delegations that run these agents can see it.
@@ -1053,7 +1111,14 @@ impl Agents {
         let (Some(session_id), Some(task_id)) = (record.session_id.clone(), record.task_id.clone()) else {
             return Err(RpcError::internal(format!("agent {} has no session or task", key.name)));
         };
-        let effort = lock(&self.inner.efforts).get(&task_id).cloned().unwrap_or_else(|| "medium".into());
+        // The planner's effort, kept with the task.
+        let effort = host
+            .get::<Value>(memory_methods::TASK_GET, json!({"id": task_id}))
+            .await
+            .ok()
+            .and_then(|task| task.get("effort").and_then(Value::as_str).map(str::to_owned))
+            .filter(|effort| !effort.is_empty())
+            .unwrap_or_else(|| self.inner.data.get().effort.default.clone());
         // Its model calls: here when this computer's model is free, else a joined computer's free
         // model (then its place here goes to the next queued agent).
         let already_remote = lock(&self.inner.scheduler).remote.contains(&key);
@@ -2011,6 +2076,7 @@ impl Plugin for Agents {
             this.start_control(&ctx);
             this.start_checks(&ctx);
             tokio::spawn(async move {
+                this.load_adjustments(&ctx).await;
                 if let Err(error) = this.readopt(ctx).await {
                     tracing::warn!(%error, "could not re-adopt working agents");
                 }

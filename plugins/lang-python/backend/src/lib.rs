@@ -6,7 +6,7 @@ pub mod pyproject;
 pub mod python;
 pub mod server;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::{Launch, ServerSpec};
 use cc_lang_kit::pack::Toolchain;
 use cc_lang_kit::{ExtractContext, FoundServer, LanguagePack, PackEnv, Sample};
@@ -107,6 +107,27 @@ impl LanguagePack for PythonPack {
     /// `{file}` in a command is the file being checked; `requires` names what must be on PATH.
     fn caches(&self) -> Vec<String> {
         vec![".venv".to_owned(), "venv".to_owned(), "__pycache__".to_owned(), ".pytest_cache".to_owned(), ".mypy_cache".to_owned(), ".ruff_cache".to_owned()]
+    }
+
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("test", &["pytest"]),
+            Runner::new("test", &["tox"]),
+            Runner::new("test", &["nox"]),
+            Runner::new("server", &["uvicorn"]),
+            Runner::new("server", &["gunicorn"]),
+            Runner::new("server", &["flask", "run"]),
+            Runner::new("server", &["fastapi"]),
+            Runner::new("server", &["python", "manage.py", "runserver"]),
+            Runner::new("server", &["python3", "manage.py", "runserver"]),
+            Runner::new("run", &["python"]),
+            Runner::new("run", &["python3"]),
+            Runner::new("run", &["uv", "run"]),
+            Runner::new("run", &["poetry", "run"]),
+            Runner::new("run", &["pipenv", "run"]),
+            Runner::new("run", &["pdm", "run"]),
+            Runner::new("run", &["hatch", "run"]),
+        ]
     }
 
     fn verifiers(&self) -> Vec<Verifier> {

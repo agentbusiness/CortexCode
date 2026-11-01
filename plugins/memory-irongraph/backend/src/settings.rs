@@ -1,15 +1,21 @@
 //! Settings in the main project's WORKSPACE layer, as a tree of nodes (shared with CortexTerm):
 //!
 //! ```text
-//! (:Settings {scope, first_ms, last_ms})                            one per scope: `global` or a project id
+//! (:Settings {scope, first_ms, last_ms, ended_ms?})                 one per scope: `global` or a project id
 //!     -[:HAS_SECTION]->(:SettingSection {id, scope, path, name, description, list?, first_ms, last_ms})
 //!         -[:HAS_SECTION]->(:SettingSection)                        sections nest
 //!         -[:HAS_SETTING]->(:Setting {id, scope, path, name, value_type, text | integer | number |
 //!                                      flag | texts | numbers, description, updated_ms, updated_by,
 //!                                      first_ms, last_ms})
+//! (:Settings {scope: 'global'})-[:ON]->(:Machine)                   the app's own scope
 //! (:Project)-[:HAS_SETTINGS]->(:Settings)                           a project's scope
 //! stream `settings`                                                 every change: {scope, path, op, value, by}
 //! ```
+//!
+//! Every node and edge keeps `first_ms` and `last_ms`. A setting or section that is deleted (or
+//! replaced by a value without it, or whose project is deleted) is retired, not removed: it keeps
+//! its edges and gets `ended_ms`, `ended_reason` and `state: 'gone'`; reads skip it, and setting
+//! it again brings the same node back.
 //!
 //! `path` is the list of segments from the scope down (`["model", "variant"]`); `id` is the scope
 //! and the segments joined by `\u{1f}`. A setting holds one typed value: `string` (`text`),
@@ -24,9 +30,11 @@
 //!
 //! Settings an earlier version kept as one JSON text (`Settings.values`) are read through while
 //! they last: a read answers from the tree and that text at once, so no caller waits for a move
-//! or sees defaults. A path that is set or deleted leaves the text (a plugin that moves its old
-//! record elsewhere reads it, then deletes it, so it never becomes setting nodes); what is left
-//! after [`DRAIN_AFTER_MS`] is written into the tree in one batch and the text is removed.
+//! or sees defaults. The text itself is never written again. A path that is set or deleted leaves
+//! it: its dotted path goes into `Settings.values_forgotten` (a list of strings), which reads
+//! skip (a plugin that moves its old record elsewhere reads it, then deletes it, so it never
+//! becomes setting nodes); what is left after [`DRAIN_AFTER_MS`] is written into the tree in one
+//! batch, and both properties are removed (at once when nothing is left).
 //!
 //! Every write is one batch: a few `UNWIND` statements for all the sections, settings and edges
 //! it touches, whatever their number.
@@ -57,7 +65,8 @@ pub struct Settings {
     ig_id: String,
     /// Serialises writes: each one reads a scope's tree, compares and writes the difference.
     write: Mutex<()>,
-    /// The old JSON text of each scope (dotted path -> entry), read once; empty when it has none.
+    /// The old JSON text of each scope (dotted path -> entry, forgotten ones left out), read once;
+    /// empty when it has none.
     old: Mutex<BTreeMap<String, Map<String, Value>>>,
     /// When this store opened (the old text drains [`DRAIN_AFTER_MS`] later).
     opened_ms: u64,
@@ -245,6 +254,13 @@ impl Settings {
                 params! { "scope" => GLOBAL, "now" => now },
             )
             .await?;
+        // The global root hangs off this Mac (a project's off its project, below).
+        settings
+            .run(
+                &format!("{} MATCH (s:Settings {{scope: $scope}}), (m:Machine) MERGE (s)-[r:ON]->(m) ON CREATE SET r.first_ms = $now SET r.last_ms = $now", layer::WORKSPACE_WRITE),
+                params! { "scope" => GLOBAL, "now" => now },
+            )
+            .await?;
         settings.graph.ensure_index(&settings.ig_id, "settings_scope", "Settings", "scope").await?;
         settings.graph.ensure_index(&settings.ig_id, "setting_id", "Setting", "id").await?;
         settings.graph.ensure_index(&settings.ig_id, "setting_scope", "Setting", "scope").await?;
@@ -257,10 +273,10 @@ impl Settings {
         self.graph.run(&self.ig_id, cypher, params).await
     }
 
-    /// The properties of every node of `label` in a scope (whole nodes, so a value column no
-    /// setting has yet cannot empty the answer).
+    /// The properties of every node of `label` in a scope that is not retired (whole nodes, so a
+    /// value column no setting has yet cannot empty the answer).
     async fn nodes(&self, label: &str, scope: &str) -> Result<Vec<Map<String, Value>>, RpcError> {
-        let rows = self.run(&format!("{} MATCH (n:{label} {{scope: $scope}}) RETURN n", layer::WORKSPACE_READ), params! { "scope" => scope }).await?;
+        let rows = self.run(&format!("{} MATCH (n:{label} {{scope: $scope}}) WHERE n.ended_ms IS NULL RETURN n", layer::WORKSPACE_READ), params! { "scope" => scope }).await?;
         Ok(rows.column(0).filter_map(|node| node.get("properties").and_then(Value::as_object).cloned()).collect())
     }
 
@@ -326,14 +342,17 @@ impl Settings {
         Ok(tree)
     }
 
-    /// The old JSON text of a scope (dotted path -> entry), read from its node once.
+    /// The old JSON text of a scope (dotted path -> entry), read from its node once, without the
+    /// entries it forgot.
     async fn old_entries(&self, scope: &str) -> Result<Map<String, Value>, RpcError> {
         if let Some(entries) = self.old.lock().await.get(scope) {
             return Ok(entries.clone());
         }
-        let rows = self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) RETURN s", layer::WORKSPACE_READ), params! { "scope" => scope }).await?;
-        let text = rows.column(0).find_map(|node| node.get("properties").and_then(|props| props.get("values")).and_then(Value::as_str).map(str::to_owned));
-        let entries = match text.as_deref().map(serde_json::from_str::<Value>) {
+        let rows = self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) WHERE s.ended_ms IS NULL RETURN s", layer::WORKSPACE_READ), params! { "scope" => scope }).await?;
+        let props = rows.column(0).find_map(|node| node.get("properties").and_then(Value::as_object).cloned()).unwrap_or_default();
+        let text = props.get("values").and_then(Value::as_str).map(str::to_owned);
+        let forgotten: BTreeSet<String> = props.get("values_forgotten").and_then(strings).unwrap_or_default().into_iter().collect();
+        let mut entries = match text.as_deref().map(serde_json::from_str::<Value>) {
             Some(Ok(Value::Object(map))) => map,
             Some(_) => {
                 tracing::warn!(scope, "the old settings text is not a JSON object; it is dropped");
@@ -341,23 +360,32 @@ impl Settings {
             }
             None => Map::new(),
         };
+        entries.retain(|key, _| !forgotten.contains(key));
         self.old.lock().await.insert(scope.to_owned(), entries.clone());
         Ok(entries)
     }
 
-    /// Drop the old text's entries at or under `path` (they were set or deleted); the text goes
-    /// when none is left.
+    /// Drop the old text's entries at or under `path` (they were set or deleted): their paths are
+    /// added to `values_forgotten` (the text is not rewritten); both go when none is left.
     async fn forget_old(&self, scope: &str, path: &[String]) -> Result<(), RpcError> {
         let mut old = self.old.lock().await;
         let Some(entries) = old.get_mut(scope) else { return Ok(()) };
-        let before = entries.len();
-        entries.retain(|key, _| segments(key).map(|key| !under(&key, path)).unwrap_or(true));
-        if entries.len() == before {
+        let gone: Vec<String> = entries.keys().filter(|key| segments(key).is_ok_and(|key| under(&key, path))).cloned().collect();
+        if gone.is_empty() {
             return Ok(());
         }
-        let text = (!entries.is_empty()).then(|| Value::Object(entries.clone()).to_string());
+        entries.retain(|key, _| !gone.contains(key));
+        let empty = entries.is_empty();
         drop(old);
-        self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) SET s.values = $values", layer::WORKSPACE_WRITE), params! { "scope" => scope, "values" => text }).await?;
+        if empty {
+            self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) REMOVE s.values, s.values_forgotten", layer::WORKSPACE_WRITE), params! { "scope" => scope }).await?;
+        } else {
+            self.run(
+                &format!("{} MATCH (s:Settings {{scope: $scope}}) SET s.values_forgotten = coalesce(s.values_forgotten, []) + $gone", layer::WORKSPACE_WRITE),
+                params! { "scope" => scope, "gone" => gone },
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -372,24 +400,30 @@ impl Settings {
             sections.extend(entry_sections.into_iter().filter(|(section_path, _)| !tree.sections.contains_key(section_path)));
         }
         self.write_batch(scope, &leaves, &sections).await?;
-        self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) REMOVE s.values", layer::WORKSPACE_WRITE), params! { "scope" => scope }).await?;
+        self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) REMOVE s.values, s.values_forgotten", layer::WORKSPACE_WRITE), params! { "scope" => scope }).await?;
         self.old.lock().await.insert(scope.to_owned(), Map::new());
         tracing::info!(scope, settings = leaves.len(), "the old settings text moved into the tree");
         Ok(())
     }
 
-    /// The scope's root node, linked from its project.
+    /// The scope's root node (back when it was retired), linked from its project.
     async fn ensure_scope(&self, scope: &str) -> Result<(), RpcError> {
         let now = now_ms();
         self.run(
-            &format!("{} MERGE (s:Settings {{scope: $scope}}) ON CREATE SET s.first_ms = $now SET s.last_ms = $now", layer::WORKSPACE_WRITE),
+            &format!(
+                "{} MERGE (s:Settings {{scope: $scope}}) ON CREATE SET s.first_ms = $now SET s.last_ms = $now, s.ended_ms = null, s.ended_reason = null, s.state = null",
+                layer::WORKSPACE_WRITE
+            ),
             params! { "scope" => scope, "now" => now },
         )
         .await?;
         if scope != GLOBAL {
             self.run(
-                &format!("{} MATCH (p:Project {{id: $scope}}), (s:Settings {{scope: $scope}}) MERGE (p)-[:HAS_SETTINGS]->(s)", layer::WORKSPACE_WRITE),
-                params! { "scope" => scope },
+                &format!(
+                    "{} MATCH (p:Project {{id: $scope}}), (s:Settings {{scope: $scope}}) MERGE (p)-[r:HAS_SETTINGS]->(s) ON CREATE SET r.first_ms = $now SET r.last_ms = $now",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "scope" => scope, "now" => now },
             )
             .await?;
         }
@@ -413,6 +447,17 @@ impl Settings {
             }
         }
         let rows: Vec<Value> = all.iter().map(|path| json!({ "id": node_id(scope, path), "path": path, "name": path[path.len() - 1] })).collect();
+        // A retired section written again is back, without the shape it had.
+        for chunk in rows.chunks(CHUNK) {
+            self.run(
+                &format!(
+                    "{} UNWIND $rows AS r MATCH (n:SettingSection {{id: r.id}}) WHERE n.ended_ms IS NOT NULL SET n.ended_ms = null, n.ended_reason = null, n.state = null, n.list = null, n.description = null",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "rows" => chunk },
+            )
+            .await?;
+        }
         for chunk in rows.chunks(CHUNK) {
             self.run(
                 &format!(
@@ -446,7 +491,7 @@ impl Settings {
             for chunk in rows.chunks(CHUNK) {
                 self.run(
                     &format!(
-                        "{} UNWIND $rows AS r MERGE (n:Setting {{id: r.id}}) ON CREATE SET n.first_ms = $now SET {set}, n.scope = $scope, n.path = r.path, n.name = r.name, n.value_type = r.type, n.description = r.description, n.updated_ms = r.updated, n.updated_by = r.by, n.last_ms = $now",
+                        "{} UNWIND $rows AS r MERGE (n:Setting {{id: r.id}}) ON CREATE SET n.first_ms = $now SET {set}, n.scope = $scope, n.path = r.path, n.name = r.name, n.value_type = r.type, n.description = r.description, n.updated_ms = r.updated, n.updated_by = r.by, n.last_ms = $now, n.ended_ms = null, n.ended_reason = null, n.state = null",
                         layer::WORKSPACE_WRITE
                     ),
                     params! { "rows" => chunk, "scope" => scope, "now" => now },
@@ -458,8 +503,9 @@ impl Settings {
     }
 
     /// Link nodes of `label` to their parent: the scope's root for a top-level one, else the
-    /// section above.
+    /// section above (each edge with its `first_ms` and `last_ms`).
     async fn link<'a>(&self, scope: &str, label: &str, rel: &str, paths: impl Iterator<Item = &'a [String]>) -> Result<(), RpcError> {
+        let now = now_ms();
         let (mut top, mut nested) = (Vec::new(), Vec::new());
         for path in paths {
             if path.len() == 1 {
@@ -469,28 +515,46 @@ impl Settings {
             }
         }
         for chunk in top.chunks(CHUNK) {
-            self.run(&format!("{} MATCH (s:Settings {{scope: $scope}}) UNWIND $ids AS i MATCH (n:{label} {{id: i}}) MERGE (s)-[:{rel}]->(n)", layer::WORKSPACE_WRITE), params! { "scope" => scope, "ids" => chunk })
-                .await?;
+            self.run(
+                &format!(
+                    "{} MATCH (s:Settings {{scope: $scope}}) UNWIND $ids AS i MATCH (n:{label} {{id: i}}) MERGE (s)-[e:{rel}]->(n) ON CREATE SET e.first_ms = $now SET e.last_ms = $now",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "scope" => scope, "ids" => chunk, "now" => now },
+            )
+            .await?;
         }
         for chunk in nested.chunks(CHUNK) {
             self.run(
-                &format!("{} UNWIND $rows AS r MATCH (p:SettingSection {{id: r.parent}}) MATCH (n:{label} {{id: r.id}}) MERGE (p)-[:{rel}]->(n)", layer::WORKSPACE_WRITE),
-                params! { "rows" => chunk },
+                &format!(
+                    "{} UNWIND $rows AS r MATCH (p:SettingSection {{id: r.parent}}) MATCH (n:{label} {{id: r.id}}) MERGE (p)-[e:{rel}]->(n) ON CREATE SET e.first_ms = $now SET e.last_ms = $now",
+                    layer::WORKSPACE_WRITE
+                ),
+                params! { "rows" => chunk, "now" => now },
             )
             .await?;
         }
         Ok(())
     }
 
-    /// Delete settings and sections by path, with their edges.
+    /// Retire settings and sections by path: they keep their edges and leave every read.
     async fn remove(&self, scope: &str, leaves: &[Vec<String>], sections: &[Vec<String>]) -> Result<(), RpcError> {
-        if !leaves.is_empty() {
-            let ids: Vec<String> = leaves.iter().map(|path| node_id(scope, path)).collect();
-            self.run(&format!("{} UNWIND $ids AS id MATCH (n:Setting {{id: id}}) DETACH DELETE n", layer::WORKSPACE_WRITE), params! { "ids" => ids }).await?;
-        }
-        if !sections.is_empty() {
-            let ids: Vec<String> = sections.iter().map(|path| node_id(scope, path)).collect();
-            self.run(&format!("{} UNWIND $ids AS id MATCH (n:SettingSection {{id: id}}) DETACH DELETE n", layer::WORKSPACE_WRITE), params! { "ids" => ids }).await?;
+        let now = now_ms();
+        for (label, paths) in [("Setting", leaves), ("SettingSection", sections)] {
+            if paths.is_empty() {
+                continue;
+            }
+            let ids: Vec<String> = paths.iter().map(|path| node_id(scope, path)).collect();
+            for chunk in ids.chunks(CHUNK) {
+                self.run(
+                    &format!(
+                        "{} UNWIND $ids AS id MATCH (n:{label} {{id: id}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $now, n.ended_reason = 'deleted', n.state = 'gone', n.last_ms = $now",
+                        layer::WORKSPACE_WRITE
+                    ),
+                    params! { "ids" => chunk, "now" => now },
+                )
+                .await?;
+            }
         }
         Ok(())
     }

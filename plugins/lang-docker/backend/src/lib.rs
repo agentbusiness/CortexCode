@@ -11,7 +11,7 @@ pub mod router;
 pub mod server;
 pub mod yaml;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::install::FoundServer;
 use cc_lang_kit::lsp::ServerSpec;
 use cc_lang_kit::pack::Toolchain;
@@ -111,6 +111,16 @@ impl LanguagePack for DockerPack {
     /// `docker compose config` and `docker build --check` (they need the docker CLI), hadolint
     /// (installed into the toolchains directory, which the toolchain puts on commands' PATH, or the
     /// user's own). The consumer leaves out those whose `requires` is not on PATH.
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("build", &["docker", "build"]),
+            Runner::new("build", &["docker", "compose", "build"]),
+            Runner::new("server", &["docker", "compose", "up"]),
+            Runner::new("run", &["docker", "compose", "run"]),
+            Runner::new("run", &["docker", "run"]),
+        ]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         let lint = |name: &str, command: &[&str], when: &[&str], requires: &str| Verifier {
             files: Vec::new(),            name: name.into(),

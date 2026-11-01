@@ -18,6 +18,7 @@
 //!
 //! ```text
 //! (:UpdateFailure {key: plugin, name, version, error, ms, seen, failed_under})-[:ON]->(:Machine)
+//!     -[:FOR]->(:Plugin {key: plugin})
 //!     a version that could not start; retired when the failure is over
 //! stream `updates`    every outcome {plugin, version, ms, outcome, detail}; the status shows the newest
 //! ```
@@ -59,12 +60,17 @@ const FIRST_CHECK: Duration = Duration::from_secs(30);
 const WAITING_CHECK: Duration = Duration::from_secs(60);
 /// Recent outcomes kept for the band.
 const RECENT: usize = 20;
+/// The newest records of `updates` read for the recent list: the topic also holds records of
+/// other kinds (the frame's `plugin_install`), skipped, so more than [`RECENT`] are read.
+const RECENT_READ: u64 = 500;
 /// The file earlier versions kept their state in (moved into the graph once, then deleted).
 const SAVED: &str = "updater.json";
 /// The graph's label of a version that could not start.
 const FAILURE: &str = "UpdateFailure";
 /// The stream of update outcomes, and how long it is kept.
 const UPDATES: &str = "updates";
+/// The source manager's node of an installed plugin (key: its id).
+const PLUGIN: &str = "Plugin";
 const UPDATES_DAYS: u32 = 365;
 /// The frame's row in the round.
 const FRAME: &str = "frame";
@@ -240,13 +246,16 @@ impl Updater {
             }
             Err(error) => tracing::warn!(error = %error.message, "the failed updates were not read from the graph"),
         }
-        match self.graph.newest(UPDATES, RECENT as u64).await {
+        match self.graph.newest(UPDATES, RECENT_READ).await {
             Ok(entries) => self.with_status(|status| {
                 let known: BTreeSet<(String, String, u64)> = status.recent.iter().map(|a| (a.plugin.clone(), a.version.clone(), a.ms)).collect();
                 let older = entries
                     .into_iter()
                     .rev()
+                    // Records with a `kind` are other writers' (the frame's installs), not updates.
+                    .filter(|entry| entry.value.get("kind").is_none())
                     .filter_map(|entry| serde_json::from_value::<Applied>(entry.value).ok())
+                    .take(RECENT)
                     .filter(|a| !known.contains(&(a.plugin.clone(), a.version.clone(), a.ms)));
                 status.recent.extend(older);
                 status.recent.sort_by(|a, b| b.ms.cmp(&a.ms));
@@ -266,7 +275,16 @@ impl Updater {
             ("seen", json!(failed.seen)),
             ("failed_under", json!(failed_under)),
         ]);
-        self.graph.put(vec![graph::node(FAILURE, &failed.plugin, props)], vec![graph::edge((FAILURE, &failed.plugin), "ON", graph::machine())]);
+        // The plugin it is about: the source manager keeps `(:Plugin {key: id})-[:ON]->(:Machine)`;
+        // named here with its edge too (no properties, so its own are left), in case it is not yet.
+        self.graph.put(
+            vec![graph::node(FAILURE, &failed.plugin, props), graph::node(PLUGIN, &failed.plugin, serde_json::Map::new())],
+            vec![
+                graph::edge((FAILURE, &failed.plugin), "ON", graph::machine()),
+                graph::edge((FAILURE, &failed.plugin), "FOR", graph::at(PLUGIN, &failed.plugin)),
+                graph::edge((PLUGIN, &failed.plugin), "ON", graph::machine()),
+            ],
+        );
     }
 
     /// The failures of `plugins` are over: dropped from memory, retired in the graph.

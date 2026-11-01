@@ -1,5 +1,6 @@
 //! Where the frame's records live: the memory plugin keeps projects and sessions (`memory.app.*`)
-//! and the workbench's slot state (`memory.settings.*` at `ui.state`) in its main store. The frame
+//! and the workbench's slot state (`memory.settings.*` at `ui.state`, a settings subtree with one
+//! setting per scalar member, `ui.state.document.<slot>.<key>`) in its main store. The frame
 //! holds them in memory while it runs and writes every change through one outbox, in the order it
 //! was made. While no memory plugin serves (starting, swapping, disabled), changes wait in the
 //! outbox and go out when one serves again. Session journals are the frame's own files
@@ -19,6 +20,9 @@ pub const MEMORY: &str = "memory";
 const CALL_LIMIT: Duration = Duration::from_secs(60);
 /// The settings path of the workbench's slot state.
 const UI_STATE: &str = "ui.state";
+/// `memory.stream.append` (part of `memory@1`; the frame names it here rather than building the
+/// whole memory contract): history the frame keeps, such as the outcome of a plugin install.
+const STREAM_APPEND: &str = "memory.stream.append";
 
 /// The connection to the memory plugin that serves now, if any.
 pub struct MemoryLink {
@@ -80,6 +84,9 @@ pub enum Op {
     PutSession(Session),
     DeleteSessions(Vec<String>),
     UiState(UiStateDocument),
+    /// Records appended to a stream topic (created with `retention_days`); `done` hears whether
+    /// they were kept (false: the memory plugin refused them, so nothing waits on them forever).
+    StreamAppend { topic: String, records: Vec<Value>, retention_days: u32, done: Option<oneshot::Sender<bool>> },
     /// Answered once everything sent before it is written.
     Flush(oneshot::Sender<()>),
 }
@@ -114,6 +121,12 @@ pub fn spawn_writer(link: Arc<MemoryLink>, mut rx: mpsc::UnboundedReceiver<Op>) 
                 Op::Flush(done) => {
                     let _ = done.send(());
                 }
+                Op::StreamAppend { topic, records, retention_days, done } => {
+                    let kept = append(&link, json!({ "topic": topic, "records": records, "retention_days": retention_days })).await;
+                    if let Some(done) = done {
+                        let _ = done.send(kept);
+                    }
+                }
                 other => {
                     let (method, params) = request(other);
                     write(&link, method, params).await;
@@ -139,6 +152,27 @@ async fn write(link: &MemoryLink, method: &str, params: Value) {
     }
 }
 
+/// A stream append, retried like [`write`] while the failure may pass; a refusal (the records or
+/// the topic are invalid, or this memory plugin keeps no streams) is logged and dropped, so it
+/// never holds up the writes after it.
+async fn append(link: &MemoryLink, params: Value) -> bool {
+    let mut retry = Duration::from_millis(250);
+    loop {
+        match link.call(STREAM_APPEND, params.clone()).await {
+            Ok(_) => return true,
+            Err(error) if matches!(error.code.as_str(), codes::INVALID_PARAMS | codes::UNKNOWN_METHOD | codes::CONTRACT_VIOLATION) => {
+                tracing::error!(%error.message, "the memory plugin refused a stream append; it is dropped");
+                return false;
+            }
+            Err(error) => {
+                tracing::error!(%error.message, retry_ms = retry.as_millis(), "stream append not acknowledged; retaining it and retrying in order");
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
 /// The memory call that writes a record change.
 fn request(op: Op) -> (&'static str, Value) {
     match op {
@@ -147,7 +181,7 @@ fn request(op: Op) -> (&'static str, Value) {
         Op::PutSession(session) => (methods::APP_SESSION_PUT, json!({ "session": session })),
         Op::DeleteSessions(ids) => (methods::APP_SESSIONS_DELETE, json!({ "ids": ids })),
         Op::UiState(document) => (methods::SETTINGS_SET, json!({ "path": UI_STATE, "value": document, "by": "frame" })),
-        Op::Flush(_) => unreachable!("answered by the writer loop"),
+        Op::Flush(_) | Op::StreamAppend { .. } => unreachable!("answered by the writer loop"),
     }
 }
 
@@ -157,7 +191,14 @@ pub async fn load(link: &MemoryLink) -> Result<(Vec<Project>, Vec<Session>, Opti
     let projects: AppProjectsResult = serde_json::from_value(link.call(methods::APP_PROJECTS, json!({})).await?).map_err(|error| RpcError::internal(error.to_string()))?;
     let sessions: AppSessionsResult = serde_json::from_value(link.call(methods::APP_SESSIONS, json!({})).await?).map_err(|error| RpcError::internal(error.to_string()))?;
     let ui_state = match link.call(methods::SETTINGS_GET, json!({ "path": UI_STATE })).await {
-        Ok(setting) => setting.get("value").cloned().and_then(|value| serde_json::from_value(value).ok()),
+        // The settings keep the document as a subtree, one setting per scalar member: an empty
+        // object has no setting, so an empty document reads back absent.
+        Ok(setting) => setting.get("value").cloned().and_then(|mut value| {
+            if let Some(fields) = value.as_object_mut() {
+                fields.entry("document").or_insert_with(|| Value::Object(serde_json::Map::new()));
+            }
+            serde_json::from_value(value).ok()
+        }),
         Err(error) if error.code == codes::NOT_FOUND => None,
         Err(error) => return Err(error),
     };

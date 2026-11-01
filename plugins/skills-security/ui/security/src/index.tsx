@@ -1,9 +1,10 @@
 /**
  * pane.security@1 — the project's security findings as the memory plugin keeps them
  * (`memory.security.*`): the last audit and the counts by severity, the active findings in priority
- * order, one finding's trace, fix, evidence and history, and the moves on it (a fix session, accept
- * the risk, not an issue, reopen, forget). An audit or a fix is a conversation: the pane creates
- * the session and sends its first message, as the composer does.
+ * order (with what the dependency watch found, and which are exploited in the wild), one finding's
+ * trace, fix, evidence and history, and the moves on it (a fix session, accept the risk, not an
+ * issue, a re-check by the host, reopen, forget). An audit or a fix is a conversation: the pane
+ * creates the session and sends its first message, as the composer does.
  */
 
 import { useState } from 'react';
@@ -23,7 +24,7 @@ import {
   flowMethod,
   type Session,
 } from '@cortex/sdk';
-import type { SecurityChanged, SecurityFinding, SecurityFindingDetail, SecurityStatus, SecuritySummary, SecurityTraceStep } from './types';
+import type { SecurityChanged, SecurityFinding, SecurityFindingDetail, SecurityRecheck, SecurityStatus, SecuritySummary, SecurityTraceStep } from './types';
 import './security.css';
 
 /** The chip a finding wears: its overall severity, `lead` for a lead, `note` for a hardening note. */
@@ -45,6 +46,15 @@ export function severityOf(finding: Pick<SecurityFinding, 'verdict' | 'severity_
 
 export function severityLabel(severity: Severity): string {
   return severity === 'hardening' ? 'note' : severity;
+}
+
+/** What says a finding is likely to be attacked: CISA KEV, the EPSS score, the dependency watch. */
+export function exploitChips(finding: Pick<SecurityFinding, 'kev' | 'epss' | 'source'>): string[] {
+  const chips: string[] = [];
+  if (finding.kev) chips.push('exploited');
+  if (typeof finding.epss === 'number' && finding.epss >= 0.01) chips.push(`EPSS ${Math.round(finding.epss * 100)}%`);
+  if (finding.source === 'watch') chips.push('watch');
+  return chips;
 }
 
 /** The sink's place for a row: `path:line`, or the path alone. */
@@ -159,6 +169,11 @@ function Security() {
         ) : (
           <span className="ap faint">{data ? 'No audit yet' : 'Reading…'}</span>
         )}
+        {(data?.kev ?? 0) > 0 && (
+          <span className="ap cx-security-sev" data-sev="critical" title="Open findings whose dependency CISA lists as exploited in the wild">
+            {data?.kev} exploited
+          </span>
+        )}
         <div className="grow" />
         {auditButton}
       </div>
@@ -209,6 +224,9 @@ function Security() {
                       <span className="ap faint">{finding.class}</span>
                       <span className={`ap ${finding.status === 'fixing' ? 'live' : 'faint'}`}>{finding.status}</span>
                       {finding.quick_fix && <span className="ap origin">quick fix</span>}
+                      {exploitChips(finding).map((chip) => (
+                        <span key={chip} className={`ap ${chip === 'exploited' ? 'cx-security-sev' : 'faint'}`} data-sev={chip === 'exploited' ? 'critical' : undefined}>{chip}</span>
+                      ))}
                       <span className="grow" />
                       <span className="ap faint">{ago(finding.last_seen_ms, now)}</span>
                     </div>
@@ -246,6 +264,7 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
   const [pending, setPending] = useState<Pending | null>(null);
   const [note, setNote] = useState('');
   const [confirmForget, setConfirmForget] = useState(false);
+  const [recheck, setRecheck] = useState<SecurityRecheck | null>(null);
   const detail = useQuery<SecurityFindingDetail>(
     `memory.security.finding:${projectId}:${row.id}`,
     (c) => c.call<SecurityFindingDetail>('memory.security.finding', { project_id: projectId, id: row.id }),
@@ -299,6 +318,14 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
     });
   };
 
+  /** The host compares the sink's evidence with the file now; a gone sink moves the finding. */
+  const recheckNow = () => run('recheck', async () => {
+    const result = await client.call<{ checked: SecurityRecheck[] }>('memory.security.recheck', { project_id: projectId, ids: [finding.id] });
+    setRecheck(result?.checked?.[0] ?? null);
+    await detail.refresh();
+    onChanged();
+  });
+
   const forget = () => {
     if (!confirmForget) {
       setConfirmForget(true);
@@ -332,7 +359,13 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
         <span className="ap faint">{finding.verdict.replace(/_/g, ' ')}</span>
         {finding.severity_likelihood && <span className="ap faint">likelihood {finding.severity_likelihood}</span>}
         {finding.severity_impact && <span className="ap faint">impact {finding.severity_impact}</span>}
-        <span className="ap faint">seen in {finding.seen_in} audit{finding.seen_in === 1 ? '' : 's'}</span>
+        {finding.source === 'watch'
+          ? <span className="ap faint">found by the dependency watch</span>
+          : <span className="ap faint">seen in {finding.seen_in} audit{finding.seen_in === 1 ? '' : 's'}</span>}
+        {exploitChips(finding).filter((chip) => chip !== 'watch').map((chip) => (
+          <span key={chip} className={`ap ${chip === 'exploited' ? 'cx-security-sev' : 'faint'}`} data-sev={chip === 'exploited' ? 'critical' : undefined}
+            title={chip === 'exploited' ? 'CISA Known Exploited Vulnerabilities' : 'FIRST EPSS: the probability of exploitation in the next 30 days'}>{chip}</span>
+        ))}
         <span className="grow" />
         <span className="cx-security-id">{finding.id}</span>
       </div>
@@ -352,6 +385,20 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
           <span className="ap faint">Decides it</span>
           <p className="cx-security-text">{finding.missing_fact}</p>
         </>
+      )}
+
+      {finding.verdict === 'rejected' && finding.reason && (
+        <>
+          <span className="ap faint">Rejected because</span>
+          <p className="cx-security-text">{finding.reason}</p>
+        </>
+      )}
+
+      {(finding.signal || (finding.advisories?.length ?? 0) > 0) && (
+        <dl className="cx-security-facts">
+          {finding.signal && <><dt className="ap faint">Host signal</dt><dd>{finding.signal}{finding.host_severity ? ` (at least ${finding.host_severity})` : ''}</dd></>}
+          {(finding.advisories?.length ?? 0) > 0 && <><dt className="ap faint">Advisories</dt><dd>{finding.advisories?.join(', ')}</dd></>}
+        </dl>
       )}
 
       {finding.trace.length > 0 && (
@@ -438,6 +485,12 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
         </>
       )}
 
+      {recheck && (
+        <p className="cx-security-text" role="status">
+          Re-check: {recheck.sentence}{recheck.now ? `; now ${recheck.now}` : ''}.
+        </p>
+      )}
+
       {error && <p className="inline-error" role="alert">{error}</p>}
       <div className="cx-security-acts">
         {canFix && (
@@ -455,6 +508,11 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
         )}
         {(status === 'open' || status === 'accepted') && (
           <button className="detent" type="button" aria-pressed={pending === 'gone'} disabled={busy !== null} onClick={() => begin('gone')}>Not an issue</button>
+        )}
+        {(status === 'open' || status === 'fixing' || status === 'fixed') && (
+          <button className="detent" type="button" disabled={busy !== null} onClick={() => void recheckNow()}>
+            {busy === 'recheck' ? 'Checking…' : 'Re-check'}
+          </button>
         )}
         {canReopen && (
           <button className="detent" type="button" aria-pressed={pending === 'reopen'} disabled={busy !== null} onClick={() => begin('reopen')}>Reopen</button>

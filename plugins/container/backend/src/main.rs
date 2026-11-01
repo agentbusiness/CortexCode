@@ -3,7 +3,8 @@
 use cc_container::service::{Config, Containers, PROVIDES};
 use cc_protocol::contracts::container::{ContainerInfo, topics};
 use cc_protocol::contracts::lifecycle::{Hello, ProbeReport};
-use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, run_plugin};
+use cc_container::seeds::Caller;
+use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, run_plugin};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 
@@ -41,6 +42,9 @@ impl Plugin for ContainerPlugin {
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         self.remember(&ctx);
+        // Seed markers of earlier versions move into the graph once the memory plugin serves.
+        let containers = self.containers.clone();
+        tokio::spawn(async move { containers.migrate_seeds().await });
         Box::pin(async { Ok(()) })
     }
 
@@ -93,6 +97,16 @@ fn main() {
                 ctx.publish(topics::CHANGED, data);
             }
         });
+        let call_slot = ctx_slot.clone();
+        let call: Caller = Arc::new(move |method: &'static str, params: Value| {
+            let ctx = call_slot.get().cloned();
+            Box::pin(async move {
+                match ctx {
+                    Some(ctx) => ctx.call(method, params).await,
+                    None => Err(RpcError::new(codes::UNAVAILABLE, "not connected to the frame yet")),
+                }
+            }) as BoxFuture<'static, Result<Value, RpcError>>
+        });
         let containers = Arc::new(Containers::new(
             env.data_dir.clone(),
             env.home.clone(),
@@ -101,6 +115,7 @@ fn main() {
             std::env::var_os("HOME").map(Into::into),
             Arc::new(|name: &str| std::env::var(name).ok()),
             publish,
+            call,
         ));
         let mut hello = Hello::new(
             "cc-container",

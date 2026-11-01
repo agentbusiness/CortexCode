@@ -10,6 +10,7 @@
 //                           every other link opens in the agent browser
 //   loadState             - the slot state an earlier shell kept itself (the frame keeps it now:
 //                           frame.ui_state), read once to move it into the frame
+//   stateMoved            - the frame holds the slot state: the earlier shell's file is deleted
 //   onNavigate            - a shell module asks the workbench to show a target (a session, a view)
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
@@ -64,5 +65,8 @@ contextBridge.exposeInMainWorld('cortexShell', {
   },
   loadState() {
     return ipcRenderer.invoke('cortex:state-load');
+  },
+  stateMoved() {
+    return ipcRenderer.invoke('cortex:state-moved');
   },
 });

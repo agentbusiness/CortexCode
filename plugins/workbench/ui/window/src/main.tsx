@@ -12,6 +12,8 @@ import './splash.css';
  * earlier shell kept itself (before the frame kept it), for the one-time move into the frame. */
 interface ShellApi extends ShellBridge {
   loadState(): Promise<StateDocument>;
+  /** Deletes the earlier shell's file once the frame holds the state (absent in older shells). */
+  stateMoved?(): Promise<boolean>;
   onNavigate(listener: (target: Target) => void): void;
 }
 
@@ -44,8 +46,13 @@ void runtime.state.attach({
       const kept = await shellApi.loadState().catch(() => ({}) as StateDocument);
       if (kept && Object.keys(kept).length) {
         await runtime.client.call('frame.ui_state.put', { document: kept });
+        // The frame acknowledged it (durable in its store): the old file goes.
+        void shellApi.stateMoved?.().catch(() => false);
         return kept;
       }
+    } else if (stored.rev > 0) {
+      // A file an earlier move left behind: the frame's copy is the state.
+      void shellApi?.stateMoved?.().catch(() => false);
     }
     return stored.document ?? {};
   },

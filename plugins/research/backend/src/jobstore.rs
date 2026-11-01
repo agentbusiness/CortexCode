@@ -2,7 +2,7 @@
 //! the jobs read and change.
 //!
 //! ```text
-//! (:ResearchJob {key: job id, project_id, session_id, topic, state, phase, round, depth, questions,
+//! (:ResearchJob {key: job id, project_id, session_id, topic, state*, phase*, round, depth, questions,
 //!     sources_read, sources_failed, notes, report_path, error, resumed, started_ms, updated_ms,
 //!     param_project_id, param_topic, param_questions, param_depth, param_sources, param_since,
 //!     param_max_sources, param_root, param_fresh, param_session_id,
@@ -12,6 +12,9 @@
 //! (:ResearchSource {key: '<job>#<read url>', url, read_url, title, source, date, authors, snippet,
 //!     score, questions, found_by, position, state: candidate | unread, why, extra_<name>…})-[:OF]->(:ResearchJob)
 //! (:ResearchFinding {key: '<job>#<n>', position, statement, notes, confidence})-[:OF]->(:ResearchJob)
+//!     -[:SUPPORTED_BY]->(:Note {id})   (one per note the finding cites)
+//! * temporal: `state` and `phase` keep their history (a whole node leaves them out, so a read
+//!   names them as their own columns)
 //! stream `research.jobs`: {job_id, state, phase, round, at} for every change of state or phase
 //! ```
 //!
@@ -67,6 +70,9 @@ struct Batch {
     edges: Vec<GraphEdge>,
     retire: Vec<GraphRef>,
     event: Option<Value>,
+    /// Findings' `SUPPORTED_BY` edges to their notes, written after the checkpoint on their own: a
+    /// note that is gone fails only these, never the checkpoint.
+    supports: Vec<GraphEdge>,
 }
 
 enum Write {
@@ -92,10 +98,10 @@ impl JobStore {
     /// Read every job from the graph into RAM, move the files of an earlier version in, and start
     /// the writer. Fails while memory stays away; the caller tries again on its next call.
     pub async fn load(&self) -> Result<(), RpcError> {
-        let rows = self.graph.query(&format!("MATCH (j:{JOB}) WHERE j.ended_ms IS NULL RETURN j"), json!({}), 5000, PATIENT).await?;
+        let rows = self.graph.query(&format!("MATCH (j:{JOB}) WHERE j.ended_ms IS NULL RETURN j, j.state, j.phase"), json!({}), 5000, PATIENT).await?;
         let mut loaded = HashMap::new();
         for row in rows {
-            let props = graph::props_of(row.first().unwrap_or(&Value::Null));
+            let props = job_row(&row);
             let id = graph::text(&props, "key");
             if id.is_empty() {
                 continue;
@@ -103,6 +109,7 @@ impl JobStore {
             let kept = self.read_children(&id, props).await?;
             loaded.insert(id, kept);
         }
+        self.keep_history(&loaded).await;
         for state in self.migrate(&loaded).await {
             let questions = Questions { base: 0, total: state.pending.len() as u32 };
             loaded.insert(state.job.job_id.clone(), Kept { state, questions });
@@ -118,9 +125,9 @@ impl JobStore {
 
     /// Read one job back from the graph (a predecessor may have written it since the load).
     pub async fn reload(&self, job_id: &str) -> Result<Option<JobState>, RpcError> {
-        let rows = self.graph.query(&format!("MATCH (j:{JOB}) WHERE j.key = $job AND j.ended_ms IS NULL RETURN j"), json!({ "job": job_id }), 1, PATIENT).await?;
-        let Some(cell) = rows.first().and_then(|row| row.first()) else { return Ok(None) };
-        let kept = self.read_children(job_id, graph::props_of(cell)).await?;
+        let rows = self.graph.query(&format!("MATCH (j:{JOB}) WHERE j.key = $job AND j.ended_ms IS NULL RETURN j, j.state, j.phase"), json!({ "job": job_id }), 1, PATIENT).await?;
+        let Some(row) = rows.first() else { return Ok(None) };
+        let kept = self.read_children(job_id, job_row(row)).await?;
         let state = kept.state.clone();
         if let Ok(mut all) = self.kept.lock() {
             all.insert(job_id.to_owned(), kept);
@@ -184,6 +191,24 @@ impl JobStore {
         Ok(Kept { state, questions: Questions { base, total } })
     }
 
+    /// Write every job's `state` and `phase` as temporal values. Earlier versions wrote them as
+    /// plain properties, which the graph drops when it first declares them temporal: the values
+    /// just read are written back as their first samples (repeating it adds nothing).
+    /// One job per put: a job the graph refuses (its project is gone) costs only that job.
+    async fn keep_history(&self, loaded: &HashMap<String, Kept>) {
+        for kept in loaded.values() {
+            let job = &kept.state.job;
+            if job.project_id.is_empty() {
+                continue;
+            }
+            let node = GraphNode { label: JOB.into(), key: job.job_id.clone(), props: Map::new(), temporal: job_temporal(&kept.state) };
+            let link = edge(gref(JOB, &job.job_id), "FOR", gref("Project", &job.project_id));
+            if let Err(error) = self.graph.put(vec![node], vec![link], PATIENT).await {
+                tracing::warn!("research: job {}'s state and phase were not written as their history: {}", job.job_id, error.message);
+            }
+        }
+    }
+
     /// Jobs kept as files by an earlier version: written to the graph (each one put, confirmed),
     /// then their files deleted. A file that cannot be read as a job is left for a look.
     async fn migrate(&self, loaded: &HashMap<String, Kept>) -> Vec<JobState> {
@@ -205,10 +230,10 @@ impl JobStore {
             // The graph's copy is newer when an earlier move wrote it but could not delete the file.
             if !loaded.contains_key(&state.job.job_id) {
                 let questions = Questions { base: 0, total: state.pending.len() as u32 };
-                let batch = batch(None, &state, questions);
+                let Batch { nodes, edges, event, supports, .. } = batch(None, &state, questions);
                 let written = async {
-                    self.graph.put(batch.nodes, batch.edges, PATIENT).await?;
-                    if let Some(event) = batch.event {
+                    self.graph.put(nodes, edges, PATIENT).await?;
+                    if let Some(event) = event {
                         self.graph.append(STREAM, vec![event], PATIENT).await?;
                     }
                     Ok::<_, RpcError>(())
@@ -217,6 +242,7 @@ impl JobStore {
                     tracing::warn!("research: cannot move job {} into the graph ({}); its file stays until the next start", state.job.job_id, error.message);
                     continue;
                 }
+                write_supports(&self.graph, supports).await;
                 moved.push(state);
             }
             if let Err(error) = std::fs::remove_file(&path) {
@@ -284,7 +310,10 @@ async fn write_loop(graph: Arc<Graph>, mut receiver: mpsc::UnboundedReceiver<Wri
                 }
                 .await;
                 match outcome {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        write_supports(&graph, batch.supports.clone()).await;
+                        break;
+                    }
                     Err(error) if graph::away(&error) => tracing::warn!("research: a job checkpoint waits for memory: {}", error.message),
                     Err(error) => {
                         tracing::warn!("research: memory refused a job checkpoint: {}", error.message);
@@ -294,6 +323,32 @@ async fn write_loop(graph: Arc<Graph>, mut receiver: mpsc::UnboundedReceiver<Wri
             },
         }
     }
+}
+
+/// The findings' links to the notes they cite, one put per finding: a note that is not stored
+/// refuses only its finding's links, which are logged and dropped (the finding keeps the ids in
+/// `notes`). Links to notes a finding no longer cites stay: the contract cannot retire an edge yet.
+async fn write_supports(graph: &Graph, supports: Vec<GraphEdge>) {
+    let mut by_finding: BTreeMap<GraphRef, Vec<GraphEdge>> = BTreeMap::new();
+    for support in supports {
+        by_finding.entry(support.from.clone()).or_default().push(support);
+    }
+    for (finding, links) in by_finding {
+        if let Err(error) = graph.put(Vec::new(), links, PATIENT).await {
+            tracing::warn!("research: finding {}'s links to its notes were not written: {}", finding.key, error.message);
+        }
+    }
+}
+
+/// A job row (`j, j.state, j.phase`): the node's properties with its temporal `state` and `phase`.
+fn job_row(row: &[Value]) -> Map<String, Value> {
+    let mut props = graph::props_of(row.first().unwrap_or(&Value::Null));
+    for (at, name) in [(1, "state"), (2, "phase")] {
+        if let Some(value) = row.get(at).filter(|value| !value.is_null()) {
+            props.insert(name.into(), value.clone());
+        }
+    }
+    props
 }
 
 /// What a job's nodes should hold, by node.
@@ -335,13 +390,14 @@ fn desired(state: &JobState, questions: Questions) -> BTreeMap<GraphRef, Map<Str
 fn batch(previous: Option<(&JobState, Questions)>, state: &JobState, questions: Questions) -> Batch {
     let id = &state.job.job_id;
     let job_ref = gref(JOB, id);
-    let mut nodes = vec![node(JOB, id, job_props(state))];
+    let mut nodes = vec![GraphNode { label: JOB.into(), key: id.clone(), props: job_props(state), temporal: job_temporal(state) }];
     let mut edges = vec![edge(job_ref.clone(), "FOR", gref("Project", &state.job.project_id))];
     if let Some(session) = state.job.session_id.as_deref().filter(|s| !s.is_empty()) {
         edges.push(edge(job_ref.clone(), "IN", gref("Session", session)));
     }
     let before = previous.map(|(s, q)| desired(s, q)).unwrap_or_default();
     let now = desired(state, questions);
+    let mut supports = Vec::new();
     for (at, props) in &now {
         let old = before.get(at);
         if old == Some(props) {
@@ -350,6 +406,11 @@ fn batch(previous: Option<(&JobState, Questions)>, state: &JobState, questions: 
         let mut props = props.clone();
         for name in old.into_iter().flat_map(|o| o.keys()) {
             props.entry(name.clone()).or_insert(Value::Null);
+        }
+        if at.label == FINDING {
+            for note in props.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter(|note| !note.is_empty()) {
+                supports.push(edge(at.clone(), "SUPPORTED_BY", gref("Note", note)));
+            }
         }
         nodes.push(node(&at.label, &at.key, props));
         edges.push(edge(at.clone(), "OF", job_ref.clone()));
@@ -365,7 +426,7 @@ fn batch(previous: Option<(&JobState, Questions)>, state: &JobState, questions: 
     }
     let moved = previous.is_none_or(|(s, _)| s.job.state != state.job.state || s.job.phase != state.job.phase);
     let event = moved.then(|| json!({ "job_id": id, "state": state.job.state, "phase": state.job.phase, "round": state.job.round, "at": state.job.updated_ms }));
-    Batch { nodes, edges, retire, event }
+    Batch { nodes, edges, retire, event, supports }
 }
 
 fn into_map(value: Value) -> Map<String, Value> {
@@ -382,8 +443,6 @@ fn job_props(state: &JobState) -> Map<String, Value> {
         "project_id": job.project_id,
         "session_id": graph::or_null(&job.session_id),
         "topic": job.topic,
-        "state": job.state,
-        "phase": job.phase,
         "round": job.round,
         "depth": job.depth,
         "questions": job.questions,
@@ -412,6 +471,11 @@ fn job_props(state: &JobState) -> Map<String, Value> {
         "summary": synthesis.map(|s| json!(s.summary)).unwrap_or(Value::Null),
         "open_questions": synthesis.map(|s| json!(s.open_questions)).unwrap_or(Value::Null),
     }))
+}
+
+/// The job's temporal properties (see the module documentation).
+fn job_temporal(state: &JobState) -> Map<String, Value> {
+    into_map(json!({ "state": state.job.state, "phase": state.job.phase }))
 }
 
 fn job_from(p: &Map<String, Value>) -> Job {

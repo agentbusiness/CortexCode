@@ -28,7 +28,7 @@ use crate::syntax::dedupe_qnames;
 use cc_protocol::contracts::contract_of;
 use cc_protocol::contracts::lang::{
     self, Diagnostic, Description, DiagnosticsParams, ExtractParams, ExtractResult, FileFacts, InstallResult, LanguageInfo, PositionParams, ServerInfo, SkillInfo, SkillParams,
-    SkillResult, SourceFile, Verifier, methods, topics,
+    Runner, SkillResult, SourceFile, Verifier, methods, topics,
 };
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, PluginEnv, RpcError, codes, parse_params, run_plugin, to_value};
@@ -100,6 +100,11 @@ pub trait LanguagePack: Send + Sync + 'static {
     /// Ignored directories a build may share between copies of a project's tree (`target`,
     /// `node_modules`): see `Description::caches`.
     fn caches(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Commands that build or run code in this language besides the verifiers (`cargo run`,
+    /// `python`): see `Description::runs`.
+    fn runs(&self) -> Vec<Runner> {
         Vec::new()
     }
     /// The language server, None when the language has none.
@@ -376,6 +381,7 @@ impl<P: LanguagePack> LangPlugin<P> {
             path: toolchain.path,
             env: toolchain.env,
             caches: pack.caches(),
+            runs: pack.runs(),
         }
     }
 

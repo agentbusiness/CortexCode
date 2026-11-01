@@ -76,7 +76,10 @@ pub mod methods {
     pub const TASK_GET: &str = "memory.task.get";
     pub const TASK_LIST: &str = "memory.task.list";
 
+    /// Post a message to the project's board (kept in order, as a history, not as records).
     pub const BOARD_POST: &str = "memory.board.post";
+    /// The board's messages in the order posted: those at or after `since_ms`, addressed to `to`
+    /// or to everyone.
     pub const BOARD_LIST: &str = "memory.board.list";
 
     pub const AGENT_UPSERT: &str = "memory.agent.upsert";
@@ -162,24 +165,54 @@ pub mod methods {
     /// journals into files wrote here; the frame no longer calls it.
     pub const JOURNAL_APPEND: &str = "memory.journal.append";
 
-    // Security findings (the security plugin's audits, kept in the project's graph):
-    /// Create or replace an audit run's record: `{project_id, audit: SecurityAudit}` -> `{}`.
+    // Security findings (the security plugin's audits, kept in the project's graph). Every method
+    // here but `forget` may be called from a command in the model's shells (`cx call`); the frame
+    // then stamps `_command_session`, and the store forces `by` to `agent` (or `recheck`), refuses
+    // the person's own moves and verifies a `fixed` against the workspace's file.
+    /// Update an audit run's record: `{project_id, audit: SecurityAudit}` -> `{}`.
     pub const SECURITY_AUDIT_PUT: &str = "memory.security.audit.put";
+    /// Begin an audit run: [`super::SecurityAuditStartParams`] -> [`super::SecurityAuditState`].
+    /// The project's earlier audits are retired (`ended_ms`), the newest becoming the new one's
+    /// `previous_id`; the units and advisories are written with it, the hits follow with
+    /// [`SECURITY_HITS_PUT`].
+    pub const SECURITY_AUDIT_START: &str = "memory.security.audit.start";
+    /// An audit's whole state: [`super::SecurityAuditStateParams`] -> [`super::SecurityAuditState`]
+    /// (the current audit when no id is named; `audit: null` when the project has none).
+    pub const SECURITY_AUDIT_STATE: &str = "memory.security.audit.state";
+    /// Create or update an audit's units by id: [`super::SecurityUnitsPutParams`] -> `{}`.
+    pub const SECURITY_UNITS_PUT: &str = "memory.security.units.put";
+    /// Create or update an audit's lines to judge by id: [`super::SecurityHitsPutParams`] -> `{}`.
+    /// A hit's place, text and host signal stay as first written; a hit with a host signal cannot
+    /// be settled `safe` or `hardening`, and `blocked` only with a cited place.
+    pub const SECURITY_HITS_PUT: &str = "memory.security.hits.put";
+    /// Replace an audit's known vulnerable dependencies: [`super::SecurityAdvisoriesPutParams`] -> `{}`.
+    pub const SECURITY_ADVISORIES_PUT: &str = "memory.security.advisories.put";
     /// Create or update findings by id (their fingerprint): `{project_id, audit_id, findings:
-    /// [SecurityFinding]}` -> `{findings: [SecurityFinding]}` as stored. A finding seen before keeps
-    /// its status and history; one that was fixed, verified or gone and is seen again is open again.
+    /// [SecurityFinding]}` -> `{findings: [SecurityFinding], notes}` as stored. A finding seen
+    /// before keeps its status and history; one that was fixed, verified or gone (by the model) and
+    /// is seen again is open again; one a person marked gone stays gone. A host-set severity
+    /// (`host_severity`) is a floor: a put may raise the severity, never lower it below.
     pub const SECURITY_FINDINGS_PUT: &str = "memory.security.findings.put";
-    /// The project's findings, highest priority first: `{project_id, status?: [status], class?,
-    /// min_priority?}` -> `{findings: [SecurityFinding]}`. Without `status`: open, fixing and accepted.
+    /// The project's findings, highest priority first: [`super::SecurityFindingsParams`] ->
+    /// `{findings: [SecurityFinding]}`. Without `status`: open, fixing and accepted. The priority
+    /// read carries the age term (+1 per day open, at most 30).
     pub const SECURITY_FINDINGS: &str = "memory.security.findings";
     /// One finding with its history: `{project_id, id}` -> `SecurityFindingDetail`.
     pub const SECURITY_FINDING: &str = "memory.security.finding";
-    /// A lifecycle move: `{project_id, id, status, note, by, session_id?, commit?}` -> the finding.
-    /// Refused when the lifecycle does not allow the move (see [`super::SecurityFinding::status`]).
+    /// A lifecycle move: `{project_id, id, status, note, by, session_id?, commit?, workspace?}` ->
+    /// the finding. Refused when the lifecycle does not allow the move (see
+    /// [`super::SecurityFinding::status`]); a `fixed` that is not the person's is accepted only
+    /// when the sink's evidence is gone from the workspace's file.
     pub const SECURITY_FINDING_UPDATE: &str = "memory.security.finding.update";
+    /// The host's re-check of findings against the workspace: [`super::SecurityRecheckParams`] ->
+    /// [`super::SecurityRecheckResult`]. Open or fixing with the evidence gone: `fixed`; fixed and
+    /// still gone (outside the session that fixed it): `verified`; fixed and back: `open`. All by
+    /// `recheck`; `dry` only says what the code shows now.
+    pub const SECURITY_RECHECK: &str = "memory.security.recheck";
     /// Counts and the last audit: `{project_id}` -> `SecuritySummary`.
     pub const SECURITY_SUMMARY: &str = "memory.security.summary";
-    /// Delete a finding and its history (the user's explicit delete): `{project_id, id}` -> `{}`.
+    /// Retire a finding (the person's explicit forget in the Security tab; `ended_ms`, history
+    /// kept, no longer listed): `{project_id, id}` -> `{}`. Never from a model's command.
     pub const SECURITY_FORGET: &str = "memory.security.forget";
 
     // Routines (the scheduler plugin's recurring and timed work, docs/SCHEDULES-PLAN.md):
@@ -832,6 +865,10 @@ pub struct Task {
     pub contract_hash: Option<String>,
     #[serde(default)]
     pub contract_revisions: Vec<ContractRevision>,
+    /// The planner's effort for the task (`low` | `medium` | `high`, as the planner names it),
+    /// kept as the task's property; absent when the planner gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -851,6 +888,9 @@ pub struct TaskCreateParams {
     pub touches: Vec<String>,
     #[serde(default)]
     pub assignee: Option<String>,
+    /// The planner's effort for the task, stored as `Task.effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -880,6 +920,9 @@ pub struct TaskUpdateParams {
     /// Required to change a frozen contract.
     #[serde(default)]
     pub revision: Option<ContractRevisionRequest>,
+    /// A new effort for the task (`Task.effort`); absent keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1133,7 +1176,7 @@ pub struct JournalAppendResult {
 
 // ----- security findings -----
 
-/// One audit run of a project by the security plugin.
+/// One audit run of a project by the security plugin, with the facts its map found (recon).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SecurityAudit {
     pub id: String,
@@ -1160,6 +1203,176 @@ pub struct SecurityAudit {
     /// Where the Markdown export of the report was written, when it was.
     #[serde(default)]
     pub report_path: Option<String>,
+    // The map (recon facts), lists of scalars:
+    /// The working tree the audit read.
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub git_head: String,
+    /// Uncommitted changes were present.
+    #[serde(default)]
+    pub dirty: bool,
+    /// Files read.
+    #[serde(default)]
+    pub files: u32,
+    /// Languages with their file counts, as `<language>=<files>`.
+    #[serde(default)]
+    pub langs: Vec<String>,
+    /// Frameworks and libraries named by the imports.
+    #[serde(default)]
+    pub stack: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<String>,
+    /// Manifests as `<path>=<kind>`.
+    #[serde(default)]
+    pub manifests: Vec<String>,
+    #[serde(default)]
+    pub lockfiles: Vec<String>,
+    /// Lockfiles not read, as `<path>: <why>`.
+    #[serde(default)]
+    pub not_parsed: Vec<String>,
+    #[serde(default)]
+    pub ci: Vec<String>,
+    #[serde(default)]
+    pub containers: Vec<String>,
+    #[serde(default)]
+    pub iac: Vec<String>,
+    #[serde(default)]
+    pub secret_files: Vec<String>,
+    /// AI-agent configuration and instruction files.
+    #[serde(default)]
+    pub agent_files: Vec<String>,
+    /// The project has tests.
+    #[serde(default)]
+    pub tests: bool,
+    /// When the dependency check (OSV) ran, how many pinned packages it checked, and why it did not
+    /// run when it did not.
+    #[serde(default)]
+    pub deps_checked_ms: Option<u64>,
+    #[serde(default)]
+    pub deps_packages: u32,
+    #[serde(default)]
+    pub deps_note: Option<String>,
+    /// The audit before this one (retired when this one began).
+    #[serde(default)]
+    pub previous_id: Option<String>,
+    /// Set when a newer audit began: the audit is history.
+    #[serde(default)]
+    pub ended_ms: Option<u64>,
+}
+
+/// One unit of an audit: an attack class that applies to the project, the audit's checklist item.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityUnit {
+    /// `U1`, `U2`, ...; `U0` holds the findings already known when the audit began.
+    pub id: String,
+    pub class: String,
+    #[serde(default)]
+    pub name: String,
+    /// The structural fact that makes the class apply.
+    #[serde(default)]
+    pub reason: String,
+    /// `planned`, `in_progress`, `covered`, `candidate` or `blocked`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub note: String,
+    /// The tool's own failure on this unit, when it had one.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Lines to judge, and the files they are in.
+    #[serde(default)]
+    pub hits: u32,
+    #[serde(default)]
+    pub files: u32,
+    /// How the previous audit left this class.
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    #[serde(default)]
+    pub previous_note: Option<String>,
+}
+
+/// One line an audit shows the model to judge (a code shape, a vulnerable package, a known finding,
+/// an agent-configuration fact), and how it was settled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityHit {
+    /// `<unit>.<n>` (`U3.4`); `<unit>.0` stands for the unit as a whole.
+    pub id: String,
+    pub unit: String,
+    #[serde(default)]
+    pub class: String,
+    /// Repository-relative path and 1-based line (0: the file or the unit as a whole).
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: u32,
+    /// The shape that matched (the pattern's name).
+    #[serde(default)]
+    pub shape: String,
+    /// The line, secrets masked.
+    #[serde(default)]
+    pub text: String,
+    /// A strong host signal (a real key format, a secret in history, a malicious or known-exploited
+    /// package): such a hit is settled only as `finding` or `lead` (or `blocked` with a cited place).
+    #[serde(default)]
+    pub signal: Option<String>,
+    /// The severity the host sets for the signal: a floor for the finding it becomes.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// For a vulnerable package: its ecosystem, name and pinned version.
+    #[serde(default)]
+    pub ecosystem: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// How it was settled: `safe`, `hardening`, `lead`, `finding`, `blocked`, `fixed`, `still`.
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub note: String,
+    /// The draft the model fills for a finding or lead.
+    #[serde(default)]
+    pub record: Option<String>,
+    /// The place a judgment of several lines rests on.
+    #[serde(default)]
+    pub cited: Option<String>,
+    /// The finding this line is about (`U0`) or became (a recorded finding or lead).
+    #[serde(default)]
+    pub finding_id: Option<String>,
+    #[serde(default)]
+    pub settled_ms: Option<u64>,
+}
+
+/// A known vulnerability of a pinned dependency, as the dependency check found it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAdvisory {
+    pub ecosystem: String,
+    pub package: String,
+    pub version: String,
+    pub lockfile: String,
+    /// The advisory's id (`GHSA-…`, `RUSTSEC-…`, `MAL-…`) and its CVE aliases.
+    pub advisory: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// `critical`, `high`, `medium`, `low` or `unrated`.
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub summary: String,
+    /// The versions that fix it.
+    #[serde(default)]
+    pub fixed: Vec<String>,
+    #[serde(default)]
+    pub cwes: Vec<String>,
+    /// In CISA's Known Exploited Vulnerabilities catalog.
+    #[serde(default)]
+    pub kev: bool,
+    /// FIRST EPSS: the probability of exploitation in the next 30 days, and its percentile.
+    #[serde(default)]
+    pub epss: Option<f64>,
+    #[serde(default)]
+    pub epss_percentile: Option<f64>,
 }
 
 /// One step of a finding's trace, entry point first, sink last.
@@ -1188,16 +1401,19 @@ pub struct SecurityQuickFix {
 }
 
 /// One security finding of a project: a confirmed vulnerability, a lead (one fact outside the code
-/// decides) or a hardening note. Identified by its fingerprint (`<class>:<file>:<function>`).
+/// decides), a hardening note or a rejected claim. Identified by its fingerprint
+/// (`<class>:<file>:<function>`).
 ///
 /// `status` lifecycle, moves the store allows: `open` -> `accepted` | `fixing` | `gone`, and
-/// `fixed` by a re-check; `fixing` -> `fixed` | `open`; `accepted` -> `open` | `gone`;
-/// `fixed` -> `verified` | `open`; `verified` -> `open`; `gone` -> `open`.
+/// `fixed` once the host saw the evidence gone; `fixing` -> `fixed` | `open`; `accepted` -> `open`
+/// | `gone`; `fixed` -> `verified` | `open`; `verified` -> `open`; `gone` -> `open`. `accepted`,
+/// `gone`, a reopen and a forget are the person's (the Security tab); a command's `fixed` is
+/// accepted only when the sink's evidence is gone; `verified` comes from the host's re-check.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SecurityFinding {
     pub id: String,
     pub class: String,
-    /// `confirmed`, `needs_validation` or `hardening`.
+    /// `confirmed`, `needs_validation`, `hardening` or `rejected`.
     pub verdict: String,
     pub title: String,
     #[serde(default)]
@@ -1229,21 +1445,54 @@ pub struct SecurityFinding {
     /// For a lead: the fact outside the code that decides it.
     #[serde(default)]
     pub missing_fact: Option<String>,
+    /// A lead's deciding fact and how the owner checks it, apart.
+    #[serde(default)]
+    pub blocker: Option<String>,
+    #[serde(default)]
+    pub check_how: Option<String>,
+    /// A rejected claim: what disproves it.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The conditions a confirmed finding needs.
+    #[serde(default)]
+    pub conditions: Vec<String>,
     #[serde(default)]
     pub trace: Vec<SecurityTraceStep>,
     #[serde(default)]
     pub quick_fix: Option<SecurityQuickFix>,
-    /// Computed by the writer: higher first.
+    /// Computed by the writer: higher first. The store adds the age term when it lists.
     #[serde(default)]
     pub priority: i64,
     #[serde(default)]
     pub priority_reason: String,
+    /// Who found it: `audit` (default), `watch` (the daily dependency watch).
+    #[serde(default)]
+    pub source: String,
+    /// The unit and line of the audit it was recorded from.
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub hit: Option<String>,
+    /// The strong host signal behind it, and the severity the host set (a floor).
+    #[serde(default)]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub host_severity: Option<String>,
+    /// Advisory ids of a dependency finding, CISA KEV listing, FIRST EPSS score and percentile.
+    #[serde(default)]
+    pub advisories: Vec<String>,
+    #[serde(default)]
+    pub kev: bool,
+    #[serde(default)]
+    pub epss: Option<f64>,
+    #[serde(default)]
+    pub epss_percentile: Option<f64>,
     // Lifecycle, owned by the store (ignored on put for a finding already known):
     #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub status_note: String,
-    /// `user`, `model` or `recheck`.
+    /// `user`, `model`, `agent` (a model's command), `recheck` (the host saw the code) or `host`.
     #[serde(default)]
     pub status_by: String,
     #[serde(default)]
@@ -1267,6 +1516,23 @@ pub struct SecurityFinding {
     pub sink_path: Option<String>,
     #[serde(default)]
     pub sink_line: Option<u32>,
+    /// The sink's evidence, which the host compares with the file: the line as shown (secrets
+    /// masked, whitespace collapsed), the SHA-256 of the line itself (whitespace collapsed), or for
+    /// a dependency the package and the version the lockfile pins.
+    #[serde(default)]
+    pub sink_text: Option<String>,
+    #[serde(default)]
+    pub sink_hash: Option<String>,
+    #[serde(default)]
+    pub sink_package: Option<String>,
+    #[serde(default)]
+    pub sink_version: Option<String>,
+    /// When the person was notified of it (once per finding).
+    #[serde(default)]
+    pub notified_ms: Option<u64>,
+    /// Set when the person forgot it: no longer listed, kept as history.
+    #[serde(default)]
+    pub ended_ms: Option<u64>,
 }
 
 /// One lifecycle move of a finding.
@@ -1291,6 +1557,69 @@ pub struct SecurityAuditPutParams {
     pub audit: SecurityAudit,
 }
 
+/// [`methods::SECURITY_AUDIT_START`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAuditStartParams {
+    pub project_id: String,
+    pub audit: SecurityAudit,
+    #[serde(default)]
+    pub units: Vec<SecurityUnit>,
+    #[serde(default)]
+    pub advisories: Vec<SecurityAdvisory>,
+}
+
+/// [`methods::SECURITY_AUDIT_STATE`] parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAuditStateParams {
+    pub project_id: String,
+    /// Absent: the current audit (the newest not retired).
+    #[serde(default)]
+    pub audit_id: Option<String>,
+    /// Only these units' hits (absent: every unit's).
+    #[serde(default)]
+    pub units: Option<Vec<String>>,
+}
+
+/// [`methods::SECURITY_AUDIT_STATE`] and [`methods::SECURITY_AUDIT_START`] result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAuditState {
+    #[serde(default)]
+    pub audit: Option<SecurityAudit>,
+    /// The audit before it.
+    #[serde(default)]
+    pub previous: Option<SecurityAudit>,
+    #[serde(default)]
+    pub units: Vec<SecurityUnit>,
+    #[serde(default)]
+    pub hits: Vec<SecurityHit>,
+    #[serde(default)]
+    pub advisories: Vec<SecurityAdvisory>,
+}
+
+/// [`methods::SECURITY_UNITS_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityUnitsPutParams {
+    pub project_id: String,
+    pub audit_id: String,
+    pub units: Vec<SecurityUnit>,
+}
+
+/// [`methods::SECURITY_HITS_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityHitsPutParams {
+    pub project_id: String,
+    pub audit_id: String,
+    pub hits: Vec<SecurityHit>,
+}
+
+/// [`methods::SECURITY_ADVISORIES_PUT`] parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityAdvisoriesPutParams {
+    pub project_id: String,
+    pub audit_id: String,
+    pub advisories: Vec<SecurityAdvisory>,
+}
+
 /// [`methods::SECURITY_FINDINGS_PUT`] parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SecurityFindingsPutParams {
@@ -1298,6 +1627,9 @@ pub struct SecurityFindingsPutParams {
     #[serde(default)]
     pub audit_id: Option<String>,
     pub findings: Vec<SecurityFinding>,
+    /// The working tree the sinks are read from (absent: the project's root).
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// [`methods::SECURITY_FINDINGS`] parameters.
@@ -1311,12 +1643,25 @@ pub struct SecurityFindingsParams {
     pub class: Option<String>,
     #[serde(default)]
     pub min_priority: Option<i64>,
+    /// Only the findings the audit reported last, the session fixes, the source found, or these ids.
+    #[serde(default)]
+    pub audit_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
 }
 
 /// [`methods::SECURITY_FINDINGS`] and [`methods::SECURITY_FINDINGS_PUT`] result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SecurityFindingsResult {
     pub findings: Vec<SecurityFinding>,
+    /// What the store kept differently from what was put, one line each (a severity kept at the
+    /// host's floor, a finding a person closed left closed).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// [`methods::SECURITY_FINDING`] and [`methods::SECURITY_FORGET`] parameters.
@@ -1342,12 +1687,56 @@ pub struct SecurityFindingUpdateParams {
     pub status: String,
     #[serde(default)]
     pub note: String,
-    /// `user`, `model` or `recheck`.
+    /// `user`, `model`, `agent` or `recheck` (a command's is forced to `agent` or `recheck`).
     pub by: String,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
+    /// The working tree a `fixed` is checked in (absent: the project's root).
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// [`methods::SECURITY_RECHECK`] parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityRecheckParams {
+    pub project_id: String,
+    /// The findings to re-check (absent: every open, fixing and fixed one).
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    /// The working tree to read (absent: the project's root).
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Only say what the code shows; move nothing.
+    #[serde(default)]
+    pub dry: bool,
+}
+
+/// What the host's re-check saw for one finding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityRecheck {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    /// `unchanged`, `moved`, `gone` or `unknown` (no evidence to compare).
+    pub kind: String,
+    /// Where the evidence is now, when it is still there.
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// The fact in one sentence (`the flagged line is gone from src/db.py`).
+    #[serde(default)]
+    pub sentence: String,
+    /// The status before, and after when the re-check moved it.
+    pub was: String,
+    #[serde(default)]
+    pub now: Option<String>,
+}
+
+/// [`methods::SECURITY_RECHECK`] result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityRecheckResult {
+    pub checked: Vec<SecurityRecheck>,
 }
 
 /// [`methods::SECURITY_SUMMARY`] parameters.
@@ -1375,6 +1764,9 @@ pub struct SecuritySummary {
     /// `lead`, `hardening`).
     #[serde(default)]
     pub by_severity: std::collections::BTreeMap<String, u32>,
+    /// Open and fixing findings whose dependency is in CISA's KEV catalog.
+    #[serde(default)]
+    pub kev: u32,
 }
 
 /// [`topics::SECURITY_CHANGED`] payload.
@@ -2091,7 +2483,8 @@ pub struct MachineInfo {
 }
 
 /// [`methods::STREAM_APPEND`]. Topic names: `[a-z0-9][a-z0-9._-]*`, at most 200 bytes; `queue.` and
-/// `session.` topics belong to the plugin.
+/// `session.` topics, and `app.sessions`, `settings`, `security.status` and `board`, belong to the
+/// plugin.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StreamAppendParams {
     pub topic: String,

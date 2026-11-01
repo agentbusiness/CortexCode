@@ -5,7 +5,7 @@
 pub mod server;
 pub mod shell;
 
-use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Verifier};
+use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::install::Toolchains;
 use cc_lang_kit::lsp::ServerSpec;
 use cc_lang_kit::pack::Toolchain;
@@ -93,6 +93,14 @@ impl LanguagePack for ShellPack {
 
     /// Shell scripts have no project marker: the verifiers apply to the scripts being checked
     /// (`{file}` one script, `{files}` every script checked).
+    fn runs(&self) -> Vec<Runner> {
+        vec![
+            Runner::new("run", &["bash"]),
+            Runner::new("run", &["sh"]),
+            Runner::new("run", &["zsh"]),
+        ]
+    }
+
     fn verifiers(&self) -> Vec<Verifier> {
         vec![
             Verifier { files: Vec::new(),name: "shellcheck".into(), kind: "lint".into(), command: strings(&[server::SHELLCHECK, "-x", "{files}"]), when: Vec::new(), requires: strings(&[server::SHELLCHECK]) },

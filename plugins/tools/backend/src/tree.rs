@@ -38,6 +38,9 @@ struct Verifiers {
     prefixes: Vec<Vec<String>>,
     /// Each prefix's verifier kind (`build`, `test`, `lint`, ...), in the same order.
     kinds: Vec<String>,
+    /// The commands that build or run code besides the verifiers (`cargo run`, `python`), with
+    /// their kind (`build`, `test`, `run`, `server`).
+    runs: Vec<(Vec<String>, String)>,
     caches: Vec<String>,
 }
 
@@ -135,6 +138,11 @@ impl Tree {
                         found.kinds.push(verifier.kind.clone());
                     }
                 }
+                for runner in &description.runs {
+                    if !runner.command.is_empty() && !found.runs.iter().any(|(words, _)| *words == runner.command) {
+                        found.runs.push((runner.command.clone(), runner.kind.clone()));
+                    }
+                }
                 for cache in &description.caches {
                     if !found.caches.contains(cache) {
                         found.caches.push(cache.clone());
@@ -151,18 +159,69 @@ impl Tree {
         self.check_kind(host, command).await.is_some()
     }
 
-    /// The kind of the project's check `command` is (`build`, `test`, `lint`, ...), if it is one.
+    /// The kind of the project's check `command` is (`build`, `test`, `lint`, ...), if it is one:
+    /// one of its commands (in a pipeline or list too: `cargo test 2>&1 | tail`) starts with a
+    /// verifier's first words.
     pub async fn check_kind(&self, host: &dyn Host, command: &str) -> Option<String> {
-        let argv = crate::approval::simple_argv(command)?;
         let verifiers = self.verifiers(host).await;
-        let at = verifiers.prefixes.iter().position(|prefix| prefix.len() <= argv.len() && prefix.iter().zip(argv.iter()).all(|(a, b)| a == b))?;
-        Some(verifiers.kinds.get(at).cloned().unwrap_or_default())
+        longest(verifiers.prefixes.iter().zip(verifiers.kinds.iter()), &commands_of(command))
+    }
+
+    /// What `command` does with code, if anything: a verifier's kind (`build`, `test`, `lint`, ...)
+    /// or a runner's (`build`, `test`, `run`, `server`), from the command of the script that starts
+    /// with the longest declared words (`python manage.py runserver` over `python`); a verifier
+    /// wins a tie. None: it does nothing with code (`ls`, `git log`).
+    pub async fn code_kind(&self, host: &dyn Host, command: &str) -> Option<String> {
+        let verifiers = self.verifiers(host).await;
+        let commands = commands_of(command);
+        let checks = verifiers.prefixes.iter().zip(verifiers.kinds.iter());
+        let runs = verifiers.runs.iter().map(|(words, kind)| (words, kind));
+        longest(checks.chain(runs), &commands)
     }
 
     /// The cache directories the language plugins declare.
     pub async fn caches(&self, host: &dyn Host) -> Vec<String> {
         self.verifiers(host).await.caches
     }
+}
+
+/// Every simple command of a script as the words it starts with (literal words only), the wrappers
+/// that only change how it runs taken off: `env RUST_LOG=1 timeout 60 cargo test` starts with
+/// `cargo test`.
+fn commands_of(script: &str) -> Vec<Vec<String>> {
+    crate::approval::simple_commands(script)
+        .iter()
+        .map(|words| {
+            let mut words: Vec<&str> = words.iter().map_while(|word| word.as_deref()).collect();
+            while let Some(first) = words.first() {
+                let name = crate::approval::program_name(first);
+                if !matches!(name, "time" | "timeout" | "env" | "nice" | "nohup" | "command" | "exec") {
+                    break;
+                }
+                let amounts = matches!(name, "timeout" | "nice");
+                let amount = |word: &str| word.trim_end_matches(['s', 'm', 'h', 'd']).parse::<f64>().is_ok();
+                let program = words[1..].iter().position(|word| !(word.starts_with('-') || word.contains('=') || (amounts && amount(word)))).map_or(words.len(), |at| at + 1);
+                words.drain(..program);
+            }
+            words.into_iter().map(str::to_owned).collect()
+        })
+        .collect()
+}
+
+/// The kind of the longest declared words some command starts with; the first wins a tie. The
+/// program is compared by name (`.venv/bin/python` is `python`).
+fn longest<'a>(declared: impl Iterator<Item = (&'a Vec<String>, &'a String)>, commands: &[Vec<String>]) -> Option<String> {
+    let starts = |prefix: &[String], words: &[String]| {
+        prefix.len() <= words.len()
+            && prefix.iter().zip(words).enumerate().all(|(at, (a, b))| if at == 0 { crate::approval::program_name(a) == crate::approval::program_name(b) } else { a == b })
+    };
+    let mut best: Option<(usize, &String)> = None;
+    for (prefix, kind) in declared {
+        if !prefix.is_empty() && best.is_none_or(|(length, _)| prefix.len() > length) && commands.iter().any(|words| starts(prefix, words)) {
+            best = Some((prefix.len(), kind));
+        }
+    }
+    best.map(|(_, kind)| kind.clone())
 }
 
 /// A throw-away copy of a workspace for one check; the folder goes when the guard drops.

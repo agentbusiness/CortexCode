@@ -6,8 +6,12 @@
 //! `SUPPORTED_BY` (-> `Note`), `TESTED_BY` (-> `Run`, a WORKSPACE node), `ANSWERS` and
 //! `SUPERSEDES` (-> `Knowledge`). Code is linked by sid, so a rename keeps the link.
 //!
+//! Each item hangs from the scope's root (`-[:IN]->`, see `work`); `state` is temporal (its
+//! history is kept). Every node and edge keeps `first_ms` and `last_ms`.
+//!
 //! Nothing is deleted: a withdrawn or superseded item keeps its node and links as history, and
-//! search, `linked` and the brief serve only live items. Search by meaning is IronGraph's automatic
+//! search, `linked` and the brief serve only live items. An unlinked edge gets `ended_ms` and
+//! reads skip it; linking it again opens it. Search by meaning is IronGraph's automatic
 //! embedding index (`semantic_nodes`) bound to the scope's live items, an exact name or alias match
 //! first.
 
@@ -16,7 +20,7 @@ use crate::host::Host;
 use crate::notes::topic_key;
 use crate::params;
 use crate::queries::MapCounter;
-use crate::work::WorkStore;
+use crate::work::{WorkStore, span};
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{
     KnowledgeBriefResult, KnowledgeItem, KnowledgeLink, KnowledgeLinked, KnowledgeLinkedResult, KnowledgeSearchResult, KnowledgeUpsertParams, knowledge as k,
@@ -195,7 +199,7 @@ impl WorkStore {
     }
 
     pub async fn knowledge_get(&self, id: &str) -> Result<Option<KnowledgeItem>, RpcError> {
-        let rows = self.k_run(&format!("{} MATCH (k:Knowledge {{id: $id}}) RETURN {COLS}", layer::KNOWLEDGE_READ), params! { "id" => id }).await?;
+        let rows = self.k_run(&format!("{} MATCH (k:Knowledge {{id: $id}}) WHERE k.ended_ms IS NULL RETURN {COLS}", layer::KNOWLEDGE_READ), params! { "id" => id }).await?;
         let Some(item) = rows.rows.first().map(|row| item_from(row)) else { return Ok(None) };
         Ok(self.with_links(vec![item]).await?.pop())
     }
@@ -212,7 +216,7 @@ impl WorkStore {
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         let rows = self
             .k_run(
-                &format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}})-[r]->(t) RETURN i, r.rel, r.ref, t.sid, t.id, t.name, t.qname", layer::ALL_READ),
+                &format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}})-[r]->(t) WHERE r.ended_ms IS NULL RETURN i, r.rel, r.ref, t.sid, t.id, t.name, t.qname", layer::ALL_READ),
                 params! { "ids" => ids },
             )
             .await?;
@@ -244,9 +248,9 @@ impl WorkStore {
         let found = match rel {
             "implemented_by" | "about" => match self.code_sid(target).await? {
                 Some(sid) => {
-                    let rows = self.k_run(&format!("{} MATCH (t:Code {{sid: $v}}) RETURN t.sid, t.qname, t.name", layer::OBSERVED_READ), params! { "v" => sid }).await?;
+                    let rows = self.k_run(&format!("{} MATCH (t:Code {{sid: $v}}) WHERE t.ended_ms IS NULL RETURN t.sid, t.qname, t.name", layer::OBSERVED_READ), params! { "v" => sid }).await?;
                     rows.rows.first().map(|row| Target {
-                        matched: "MATCH (t:Code {sid: $target})",
+                        matched: "MATCH (t:Code {sid: $target}) WHERE t.ended_ms IS NULL",
                         layers: layer::KNOWLEDGE_WRITE,
                         key: s(row, 0),
                     })
@@ -254,12 +258,12 @@ impl WorkStore {
                 None => None,
             },
             "described_in" => {
-                let rows = self.k_run(&format!("{} MATCH (t:Section {{sid: $v}}) RETURN t.sid, t.name", layer::OBSERVED_READ), params! { "v" => target }).await?;
-                rows.rows.first().map(|row| Target { matched: "MATCH (t:Section {sid: $target})", layers: layer::KNOWLEDGE_WRITE, key: s(row, 0) })
+                let rows = self.k_run(&format!("{} MATCH (t:Section {{sid: $v}}) WHERE t.ended_ms IS NULL RETURN t.sid, t.name", layer::OBSERVED_READ), params! { "v" => target }).await?;
+                rows.rows.first().map(|row| Target { matched: "MATCH (t:Section {sid: $target}) WHERE t.ended_ms IS NULL", layers: layer::KNOWLEDGE_WRITE, key: s(row, 0) })
             }
             "supported_by" => {
                 let id = target.strip_prefix("note://").unwrap_or(target);
-                let rows = self.k_run(&format!("{} MATCH (t:Note {{id: $v}}) RETURN t.id, t.claim", layer::KNOWLEDGE_READ), params! { "v" => id }).await?;
+                let rows = self.k_run(&format!("{} MATCH (t:Note {{id: $v}}) WHERE t.ended_ms IS NULL RETURN t.id, t.claim", layer::KNOWLEDGE_READ), params! { "v" => id }).await?;
                 rows.rows.first().map(|row| Target { matched: "MATCH (t:Note {id: $target})", layers: layer::KNOWLEDGE_WRITE, key: s(row, 0) })
             }
             "tested_by" => {
@@ -269,7 +273,7 @@ impl WorkStore {
             }
             "answers" | "supersedes" => {
                 let id = target.strip_prefix("knowledge://").unwrap_or(target);
-                let rows = self.k_run(&format!("{} MATCH (t:Knowledge {{id: $v}}) RETURN t.id, t.name", layer::KNOWLEDGE_READ), params! { "v" => id }).await?;
+                let rows = self.k_run(&format!("{} MATCH (t:Knowledge {{id: $v}}) WHERE t.ended_ms IS NULL RETURN t.id, t.name", layer::KNOWLEDGE_READ), params! { "v" => id }).await?;
                 rows.rows.first().map(|row| Target { matched: "MATCH (t:Knowledge {id: $target})", layers: layer::KNOWLEDGE_WRITE, key: s(row, 0) })
             }
             _ => None,
@@ -282,8 +286,8 @@ impl WorkStore {
         check_rel(rel)?;
         let Some(found) = self.resolve_target(rel, target).await? else { return Ok(false) };
         self.k_run(
-            &format!("{} MATCH (k:Knowledge {{id: $id}}) {} MERGE (k)-[r:{} {{rel: $rel}}]->(t) SET r.ref = $ref", found.layers, found.matched, edge_type(rel)),
-            params! { "id" => id, "target" => found.key, "rel" => rel, "ref" => target.trim() },
+            &format!("{} MATCH (k:Knowledge {{id: $id}}) {} MERGE (k)-[r:{} {{rel: $rel}}]->(t) SET r.ref = $ref, r.ended_ms = null, {}", found.layers, found.matched, edge_type(rel), span("r")),
+            params! { "id" => id, "target" => found.key, "rel" => rel, "ref" => target.trim(), "now" => now_ms() },
         )
         .await?;
         Ok(true)
@@ -325,12 +329,12 @@ impl WorkStore {
             let merged_keys: Vec<String> = merged_aliases.iter().map(|a| topic_key(a)).collect();
             self.k_run(
                 &format!(
-                    "{} MATCH (k:Knowledge {{id: $id}}) SET k.text = $text, k.state = $state, k.source = $source, k.confidence = $confidence, k.as_of = $as_of, k.by = $by, k.evidence = $evidence, k.aliases = $aliases, k.alias_keys = $alias_keys, k.updated_ms = $now",
-                    layer::KNOWLEDGE_WRITE
+                    "{} MATCH (k:Knowledge {{id: $id}}) SET k.text = $text, k.source = $source, k.confidence = $confidence, k.as_of = $as_of, k.by = $by, k.evidence = $evidence, k.aliases = $aliases, k.alias_keys = $alias_keys, k.updated_ms = $now, {}",
+                    layer::KNOWLEDGE_WRITE,
+                    span("k")
                 ),
                 params! {
                     "id" => id, "text" => if text.is_empty() { existing.text.clone() } else { text.clone() },
-                    "state" => state.clone().unwrap_or_else(|| existing.state.clone()),
                     "source" => if p.source.is_some() { source.clone() } else { existing.source.clone() },
                     "confidence" => p.confidence.unwrap_or(existing.confidence),
                     "as_of" => as_of.clone().or_else(|| existing.as_of.clone()),
@@ -339,6 +343,9 @@ impl WorkStore {
                 },
             )
             .await?;
+            if let Some(state) = &state {
+                self.set_temporal("Knowledge", &id, state, false).await?;
+            }
         } else {
             if text.is_empty() {
                 return Err(RpcError::invalid_params("a knowledge item needs `text`"));
@@ -349,21 +356,26 @@ impl WorkStore {
             // writers of one item leave one node.
             self.k_run(
                 &format!(
-                    "{} MERGE (k:Knowledge:{} {{id: $id, name: $name}}) ON CREATE SET k.project_id = $project, k.kind = $kind, k.name_key = $name_key, k.text = $text, k.state = $state, k.source = $source, k.confidence = $confidence, k.as_of = $as_of, k.by = $by, k.evidence = $evidence, k.aliases = $aliases, k.alias_keys = $alias_keys, k.created_ms = $now, k.updated_ms = $now",
+                    "{} MERGE (k:Knowledge:{} {{id: $id, name: $name}}) ON CREATE SET k.project_id = $project, k.kind = $kind, k.name_key = $name_key, k.text = $text, k.source = $source, k.confidence = $confidence, k.as_of = $as_of, k.by = $by, k.evidence = $evidence, k.aliases = $aliases, k.alias_keys = $alias_keys, k.created_ms = $now, k.updated_ms = $now SET {}",
                     layer::KNOWLEDGE_WRITE,
-                    kind_label(&kind)
+                    kind_label(&kind),
+                    span("k")
                 ),
                 params! {
                     "id" => id, "name" => name, "project" => project.clone().unwrap_or_default(), "kind" => kind, "name_key" => topic_key(&name), "text" => text,
-                    "state" => state, "source" => source, "confidence" => confidence, "as_of" => as_of, "by" => p.by.trim(), "evidence" => evidence,
+                    "source" => source, "confidence" => confidence, "as_of" => as_of, "by" => p.by.trim(), "evidence" => evidence,
                     "aliases" => aliases, "alias_keys" => alias_keys, "now" => now
                 },
             )
             .await?;
-            for (index, label, property) in [("knowledge_id", "Knowledge", "id"), ("knowledge_kind", "Knowledge", "kind"), ("knowledge_state", "Knowledge", "state")] {
+            // Another writer that made the item first keeps its state. (`state` is temporal, so
+            // it has no equality index.)
+            self.set_temporal("Knowledge", &id, &state, true).await?;
+            for (index, label, property) in [("knowledge_id", "Knowledge", "id"), ("knowledge_kind", "Knowledge", "kind")] {
                 self.graph.ensure_index(&self.ig_id, index, label, property).await?;
             }
         }
+        self.link_root(layer::KNOWLEDGE_WRITE, "MATCH (w:Knowledge {id: $id})", params! { "id" => id }).await?;
         let mut unresolved: Vec<KnowledgeLink> = Vec::new();
         for link in &p.links {
             if !self.add_link(&id, link.rel.trim(), &link.target).await? {
@@ -377,7 +389,7 @@ impl WorkStore {
 
     /// Items of the scope, newest first; live ones unless `include_history`.
     pub async fn knowledge_list(&self, kind: Option<&str>, state: Option<&str>, include_history: bool) -> Result<Vec<KnowledgeItem>, RpcError> {
-        let rows = self.k_run(&format!("{} MATCH (k:Knowledge) RETURN {COLS}", layer::KNOWLEDGE_READ), Map::new()).await?;
+        let rows = self.k_run(&format!("{} MATCH (k:Knowledge) WHERE k.ended_ms IS NULL RETURN {COLS}", layer::KNOWLEDGE_READ), Map::new()).await?;
         let kind = kind.map(str::trim).filter(|v| !v.is_empty()).map(str::to_ascii_lowercase);
         let state = state.map(str::trim).filter(|v| !v.is_empty()).map(str::to_ascii_lowercase);
         let mut items: Vec<KnowledgeItem> = rows
@@ -416,7 +428,7 @@ impl WorkStore {
         let ids: Vec<&str> = live.iter().map(|i| i.id.as_str()).collect();
         let rows = self
             .k_run(
-                &format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}}) WITH k SEARCH k IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN k.id, score", layer::KNOWLEDGE_READ),
+                &format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}}) WHERE k.ended_ms IS NULL WITH k SEARCH k IN (EMBEDDING INDEX semantic_nodes FOR TEXT $text LIMIT $k) SCORE AS score RETURN k.id, score", layer::KNOWLEDGE_READ),
                 params! { "ids" => ids, "text" => text, "k" => live.len() },
             )
             .await?;
@@ -461,11 +473,15 @@ impl WorkStore {
         check_rel(&rel)?;
         self.must_get(id).await?;
         let target = target.trim();
-        // Edges to WORKSPACE nodes live in that layer; the rest in KNOWLEDGE.
+        // Edges to WORKSPACE nodes live in that layer; the rest in KNOWLEDGE. The edge ends (it stays
+        // as history).
         for layers in [layer::KNOWLEDGE_WRITE, layer::WORKSPACE_WRITE] {
             self.k_run(
-                &format!("{} MATCH (k:Knowledge {{id: $id}})-[r {{rel: $rel}}]->(t) WHERE r.ref = $ref OR t.sid = $ref OR t.id = $ref DELETE r", layers),
-                params! { "id" => id, "rel" => rel, "ref" => target },
+                &format!(
+                    "{} MATCH (k:Knowledge {{id: $id}})-[r {{rel: $rel}}]->(t) WHERE r.ended_ms IS NULL AND (r.ref = $ref OR t.sid = $ref OR t.id = $ref) SET r.ended_ms = $now, r.last_ms = $now",
+                    layers
+                ),
+                params! { "id" => id, "rel" => rel, "ref" => target, "now" => now_ms() },
             )
             .await?;
         }
@@ -476,8 +492,8 @@ impl WorkStore {
     pub async fn knowledge_count(&self, id: &str, seen: u32, helped: u32, hurt: u32) -> Result<KnowledgeItem, RpcError> {
         let existing = self.must_get(id).await?;
         self.k_run(
-            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.seen = $seen, k.helped = $helped, k.hurt = $hurt", layer::KNOWLEDGE_WRITE),
-            params! { "id" => id, "seen" => existing.seen + seen, "helped" => existing.helped + helped, "hurt" => existing.hurt + hurt },
+            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.seen = $seen, k.helped = $helped, k.hurt = $hurt, k.last_ms = $now", layer::KNOWLEDGE_WRITE),
+            params! { "id" => id, "seen" => existing.seen + seen, "helped" => existing.helped + helped, "hurt" => existing.hurt + hurt, "now" => now_ms() },
         )
         .await?;
         self.must_get(id).await
@@ -487,10 +503,11 @@ impl WorkStore {
         let existing = self.must_get(id).await?;
         let by = if by.trim().is_empty() { existing.by } else { by.trim().to_owned() };
         self.k_run(
-            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.state = $state, k.reason = $reason, k.by = $by, k.updated_ms = $now", layer::KNOWLEDGE_WRITE),
-            params! { "id" => id, "state" => k::WITHDRAWN, "reason" => squash(reason), "by" => by, "now" => now_ms() },
+            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.reason = $reason, k.by = $by, k.updated_ms = $now, k.last_ms = $now", layer::KNOWLEDGE_WRITE),
+            params! { "id" => id, "reason" => squash(reason), "by" => by, "now" => now_ms() },
         )
         .await?;
+        self.set_temporal("Knowledge", id, k::WITHDRAWN, false).await?;
         self.must_get(id).await
     }
 
@@ -504,10 +521,11 @@ impl WorkStore {
         self.must_get(id).await?;
         self.must_get(&by).await?;
         self.k_run(
-            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.state = $state, k.superseded_by = $by, k.updated_ms = $now", layer::KNOWLEDGE_WRITE),
-            params! { "id" => id, "state" => k::SUPERSEDED, "by" => by, "now" => now_ms() },
+            &format!("{} MATCH (k:Knowledge {{id: $id}}) SET k.superseded_by = $by, k.updated_ms = $now, k.last_ms = $now", layer::KNOWLEDGE_WRITE),
+            params! { "id" => id, "by" => by, "now" => now_ms() },
         )
         .await?;
+        self.set_temporal("Knowledge", id, k::SUPERSEDED, false).await?;
         self.add_link(&by, "supersedes", id).await?;
         self.must_get(id).await
     }
@@ -523,13 +541,13 @@ impl WorkStore {
         let mut bound: Vec<(String, String, String)> = Vec::new();
         if !sids.is_empty() {
             let rows = self
-                .k_run(&format!("{} UNWIND $sids AS s MATCH (k:Knowledge)-[r]->(t {{sid: s}}) RETURN t.sid, r.rel, k.id", layer::CODE_READ), params! { "sids" => sids.clone() })
+                .k_run(&format!("{} UNWIND $sids AS s MATCH (k:Knowledge)-[r]->(t {{sid: s}}) WHERE r.ended_ms IS NULL AND k.ended_ms IS NULL RETURN t.sid, r.rel, k.id", layer::CODE_READ), params! { "sids" => sids.clone() })
                 .await?;
             bound.extend(rows.rows.iter().map(|row| (s(row, 0), s(row, 1), s(row, 2))));
         }
         if !paths.is_empty() {
             for (clause, values) in [("MATCH (k:Knowledge)-[r]->(t:Code {path: p})", paths.clone()), ("MATCH (k:Knowledge)-[r]->(t:Code {sid: p})", paths.iter().map(|p| format!("file:{p}")).collect())] {
-                let rows = self.k_run(&format!("{} UNWIND $paths AS p {clause} RETURN t.sid, r.rel, k.id", layer::CODE_READ), params! { "paths" => values }).await?;
+                let rows = self.k_run(&format!("{} UNWIND $paths AS p {clause} WHERE r.ended_ms IS NULL AND k.ended_ms IS NULL RETURN t.sid, r.rel, k.id", layer::CODE_READ), params! { "paths" => values }).await?;
                 bound.extend(rows.rows.iter().map(|row| (s(row, 0), s(row, 1), s(row, 2))));
             }
         }
@@ -538,7 +556,7 @@ impl WorkStore {
         if ids.is_empty() {
             return Ok(KnowledgeLinkedResult::default());
         }
-        let rows = self.k_run(&format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}}) RETURN {COLS}", layer::KNOWLEDGE_READ), params! { "ids" => ids }).await?;
+        let rows = self.k_run(&format!("{} UNWIND $ids AS i MATCH (k:Knowledge {{id: i}}) WHERE k.ended_ms IS NULL RETURN {COLS}", layer::KNOWLEDGE_READ), params! { "ids" => ids }).await?;
         let items = self.with_links(rows.rows.iter().map(|row| item_from(row)).filter(|item| k::is_live(&item.state)).collect()).await?;
         let by_id: HashMap<&str, &KnowledgeItem> = items.iter().map(|i| (i.id.as_str(), i)).collect();
         let order: Vec<&String> = sids.iter().chain(paths.iter()).collect();

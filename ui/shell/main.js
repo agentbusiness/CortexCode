@@ -216,6 +216,16 @@ async function start() {
       return {};
     }
   });
+  // The frame holds the slot state now (moved, or kept there from before): the old file goes.
+  ipcMain.handle('cortex:state-moved', (event) => {
+    if (!fromWorkbench(event)) return false;
+    try {
+      fs.rmSync(stateFile, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  });
 
   // The workbench never navigates away from itself; links open in the agent browser instead.
   window.webContents.on('will-navigate', (event, url) => {

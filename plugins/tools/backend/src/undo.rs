@@ -565,7 +565,8 @@ impl ProjectLog {
         let workspace = self.workspace.to_string_lossy();
         self.graph.put_many(step_batches(&self.hash, &workspace, record));
         if let Ok(value) = serde_json::to_value(record) {
-            self.graph.append(&format!("steps.{}", self.hash), vec![value]);
+            // Kept as long as the memory plugin keeps anything: undo and history read it.
+            self.graph.append_kept(&format!("steps.{}", self.hash), vec![value], 3650);
         }
     }
 

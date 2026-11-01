@@ -26,6 +26,10 @@ pub mod layer {
     pub const WORKSPACE_WRITE: &str = "USE LAYER OBSERVED, KNOWLEDGE, WORKSPACE WRITE LAYER WORKSPACE";
 }
 
+/// How long a topic made by a first append keeps its records (the plugin's own history: session
+/// changes, settings changes, security status), as long as the graph keeps temporal history.
+pub const KEPT_DAYS: u32 = 3650;
+
 pub struct Graph {
     db: EmbeddedDatabase,
     /// IronGraph project display name -> immutable project UUID.
@@ -214,8 +218,8 @@ impl Graph {
         Ok(())
     }
 
-    /// Append records to a stream (one partition), creating its topic on first use. Returns the
-    /// offset after the last record.
+    /// Append records to a stream (one partition), creating its topic on first use with
+    /// [`KEPT_DAYS`] of retention. Returns the offset after the last record.
     pub async fn stream_append(&self, project: &str, topic: &str, records: Vec<Vec<u8>>) -> Result<u64, RpcError> {
         if records.is_empty() {
             return self.stream_end(project, topic).await;
@@ -296,7 +300,7 @@ impl Graph {
 
     async fn create_topic(&self, project: &str, topic: &str) -> Result<(), RpcError> {
         validate_topic(topic)?;
-        match self.run(project, &format!("CREATE TOPIC `{topic}` PARTITIONS 1"), Map::new()).await {
+        match self.run(project, &format!("CREATE TOPIC `{topic}` PARTITIONS 1 RETENTION {KEPT_DAYS} DAYS"), Map::new()).await {
             Ok(_) => Ok(()),
             // Created meanwhile by a concurrent append.
             Err(error) if error.message.to_lowercase().contains("exist") => Ok(()),

@@ -447,3 +447,40 @@ pub async fn submit(
         .await?;
     Ok(outcome.contract)
 }
+
+/// The code audit's script in the live folder (`skills-security`), None when it is not installed.
+fn security_script() -> Option<std::path::PathBuf> {
+    let own = std::env::var_os("CORTEX_PLUGIN_LIVE").map(std::path::PathBuf::from)?;
+    let script = own.parent()?.join("skills-security").join("data").join("scripts").join("secaudit.py");
+    script.is_file().then_some(script)
+}
+
+fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The audit's check of what the run changed (`secaudit.py check-change`: the code patterns on the
+/// lines the change added, and the dependencies it added or changed): its findings, whose last line
+/// is the step to take; None when it found nothing, or could not run (no audit installed, no git,
+/// the check broken in itself), which is never the work's failure.
+pub async fn security_change(env: &RunEnv, cancel: &tokio_util::sync::CancellationToken) -> Option<String> {
+    let script = security_script()?;
+    let workspace = &env.scope.workspace;
+    let command = format!("python3 -I {} check-change --root {}", quoted(&script.to_string_lossy()), quoted(workspace));
+    let params = json!({"workspace": workspace, "command": command, "timeout_ms": SECURITY_CHECK_MS, "background": false});
+    let outcome = match env.host.call_with(cc_protocol::contracts::tools::methods::RUN, params, crate::host::Effect::Idempotent, Some(cancel)).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::info!(session = %env.session_id, error = %error.message, "the change's security check could not run");
+            return None;
+        }
+    };
+    let run: cc_protocol::contracts::tools::RunResult = cc_protocol::parse_params(outcome).ok()?;
+    let found = run.output.trim();
+    // Exit 3 is "found something"; anything else (a usage error, a crash) is the check's own problem.
+    (run.exit_code == Some(3) && !run.timed_out && !found.is_empty()).then(|| found.to_owned())
+}
+
+/// How long the change's security check may take (it reads the diff and asks OSV about changed
+/// dependencies only).
+const SECURITY_CHECK_MS: u64 = 90_000;
