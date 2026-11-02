@@ -232,6 +232,9 @@ pub struct StepSpec {
     pub goal: String,
     /// The titles of the tasks after this one, done later (named so the model leaves them).
     pub later: Vec<String>,
+    /// The direction the user set for the whole work (`flow::direction`), empty when none: it opens
+    /// the step's text, before the plan's own goal sentence.
+    pub direction: String,
 }
 
 /// The stage text that tells the loop its step: the step, what the earlier steps did, and that
@@ -245,6 +248,7 @@ pub fn step_live(data: &Dataset, step: &StepSpec) -> String {
     };
     let later = if step.later.is_empty() { String::new() } else { data.text("do_step_later", &[("titles", &step.later.join("; "))]) };
     let goal = if step.goal.trim().is_empty() { String::new() } else { data.text("do_step_goal", &[("goal", step.goal.trim())]) };
+    let goal = format!("{}{goal}", step.direction);
     let mut text = data.text("do_step", &[("goal", &goal), ("n", &step.n.to_string()), ("of", &step.of.to_string()), ("text", step.text.trim()), ("later", &later), ("done", &done)]);
     if step.n >= step.of {
         text.push_str(&data.text("do_step_last", &[]));
@@ -936,7 +940,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             if crate::flow::work_open_round(&entries, &env.run_id) {
                 env.data.text("work_open_stage", &[])
             } else {
-                crate::flow::asks_live(&env.data, &entries, &env.run_id, "ask_asks")
+                crate::flow::asks_live(&env.data, &entries, &env.run_id, "ask_asks", true)
             },
         ),
         LoopKind::Agent { name } => ("TASK", format!("{}{}", agent_team.as_ref().map(|team| team.live(&env.data)).unwrap_or_default(), env.data.text("agent_live", &[("name", name)]))),

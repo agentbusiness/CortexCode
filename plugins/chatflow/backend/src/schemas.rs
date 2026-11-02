@@ -466,6 +466,11 @@ pub struct RouterDecision {
     /// conversation: the conversation's decisions in the project's knowledge are withdrawn.
     #[serde(default)]
     pub drops: String,
+    /// no | states | approves: the latest message lays out what the whole work is to be, or
+    /// accepts the design in the answer before it; the host keeps it in front of every plan and
+    /// task (`flow::direction`).
+    #[serde(default)]
+    pub direction: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
