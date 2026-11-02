@@ -272,7 +272,10 @@ fn derive_work(entries: &[JournalEntry], run_id: &str, read_rounds_limit: usize)
         }
         "ANSWER" if reply_finished(&run, last.seq) => Stage::Done,
         "ANSWER" => Stage::Reply,
-        "DO" if note_after(&run, last.seq, "act_done") => Stage::Done,
+        "DO" if note_after(&run, last.seq, "act_done") && reply_finished(&run, last.seq) => Stage::Done,
+        // The last task's reply is a report for the host (what changed, each test); the user gets
+        // their own answer after the work, written from their asks.
+        "DO" if note_after(&run, last.seq, "act_done") => Stage::Reply,
         // The auto plan's tasks went to agents at once (computers were free for them).
         "DO" if note_after(&run, last.seq, "implement_done") => Stage::Done,
         // A decided change is planned first, then carried out one step at a time (an IMPLEMENT
@@ -2177,17 +2180,33 @@ pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], r
 /// router wrote asks and none is in the message, the message itself is the one ask. Returns the
 /// quotes it dropped.
 fn anchor_asks(asks: &mut Vec<schemas::Ask>, message: &str) -> Vec<String> {
-    let plain = |text: &str| text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ");
-    let said = format!(" {} ", plain(message));
+    let words = |text: &str| text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    let said = words(message);
+    // The router fixes the user's spelling ("capeable" quoted as "capable"): a word counts when
+    // the message has it, or one a letter apart; a quote stands when most of its words do.
+    let near = |a: &str, b: &str| a == b || (a.chars().count() >= 4 && one_letter_apart(a, b));
     let (kept, dropped): (Vec<schemas::Ask>, Vec<schemas::Ask>) = std::mem::take(asks).into_iter().partition(|ask| {
-        let quote = plain(&ask.quote);
-        !quote.is_empty() && said.contains(&format!(" {quote} "))
+        let quote = words(&ask.quote);
+        let found = quote.iter().filter(|word| said.iter().any(|told| near(word, told))).count();
+        !quote.is_empty() && found * 5 >= quote.len() * 4
     });
     *asks = kept;
     if asks.is_empty() && !dropped.is_empty() && !message.trim().is_empty() {
         asks.push(schemas::Ask { quote: message.trim().to_owned(), means: String::new() });
     }
     dropped.into_iter().map(|ask| ask.quote).collect()
+}
+
+/// Whether two words differ by one letter added, dropped or changed.
+fn one_letter_apart(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let head = short.iter().zip(long.iter()).take_while(|(x, y)| x == y).count();
+    let skip = if short.len() == long.len() { 1 } else { 0 };
+    short.get(head + skip..).unwrap_or(&[]) == long.get(head + 1..).unwrap_or(&[])
 }
 
 /// True when this run was continued because a tool reports open work (its latest host note).
