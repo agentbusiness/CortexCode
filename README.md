@@ -127,7 +127,9 @@ npx cortexcode
 
 The first run downloads the app for your machine from this repository's releases, checks it
 against the checksum in the release catalog and starts it; later runs start the installed app at
-once, and the app updates itself. On Linux you
+once, and the app updates itself. It also adds CortexCode to your applications (on macOS
+`/Applications`, or `~/Applications` when that is not writable; on Linux the desktop's app list), so
+later you can open it from there without a terminal. On Linux you
 can also unpack the `.tar.gz` from [Releases](https://github.com/agentbusiness/CortexCode/releases/latest)
 and run `cortexcode/CortexCode`. The macOS app is not signed by Apple yet, so it is not offered as a
 `.dmg` download; `npx cortexcode` installs it.
