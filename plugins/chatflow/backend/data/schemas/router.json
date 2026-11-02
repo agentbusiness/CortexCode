@@ -78,6 +78,13 @@
         "yes"
       ]
     },
+    "direction": {
+      "enum": [
+        "no",
+        "states",
+        "approves"
+      ]
+    },
     "files": {
       "type": "array",
       "items": {
@@ -95,6 +102,7 @@
     "effort",
     "teaches",
     "drops",
+    "direction",
     "files"
   ],
   "additionalProperties": false

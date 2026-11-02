@@ -467,6 +467,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             skills: vec![],
                             teaches: String::new(),
                             drops: String::new(),
+                            direction: String::new(),
                         };
                         (fallback, format!("router failed: {error}"))
                     }
@@ -612,8 +613,15 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 // from its records, not from memory of the conversation.
                 let open = crate::manage::open_work(env, &entries).await;
                 let mut reply_live = if open.is_empty() { String::new() } else { env.data.text("reply_open_work", &[("work", &crate::manage::work_lines(env, &open))]) };
+                // What the plan left out on the way is told, not hidden behind "done" (seen: the
+                // part that steered the model dropped in a rewrite, the work reported finished).
+                let dropped = dropped_tasks(&entries, &env.run_id);
+                if !dropped.is_empty() {
+                    let told = env.data.text("reply_dropped", &[("tasks", &dropped.join("\n"))]);
+                    reply_live = [reply_live.as_str(), told.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
+                }
                 // The questions last: the text right before the answer is what it answers.
-                let asks = asks_live(&env.data, &entries, &env.run_id, "reply_asks");
+                let asks = asks_live(&env.data, &entries, &env.run_id, "reply_asks", true);
                 if !asks.is_empty() {
                     reply_live = [reply_live.as_str(), asks.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
                 }
@@ -680,6 +688,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         let text = env.data.text("do_task_text", &[("title", &planned_task.title), ("brief", &plan::task_focus(&env.data, &planned_task))]);
                         let later: Vec<String> = plan.tasks.iter().filter(|task| task.n > *n).map(|task| task.title.clone()).collect();
                         let goal = plan.doc.goal.clone();
+                        let direction = direction(&env.data, &journal.entries_vec());
                         // Where this task's work starts in the transcript (the chat nests what
                         // follows under it); not a message for the model.
                         let label = env.data.text("task_start", &[("n", &n.to_string()), ("of", &plan.tasks.len().to_string()), ("title", &planned_task.title)]);
@@ -747,7 +756,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 reads::run(journal, &env.run_id, &env.scope, files, &mut fresh, &any, env.data.limits.reads_per_round).await?;
                             }
                         }
-                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later }))
+                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later, direction }))
                     }
                     None => (foreground_task(env, journal, &decision).await?, None),
                 };
@@ -1150,17 +1159,22 @@ fn act_note(outcome: &LoopOutcome) -> String {
 /// The tasks this run's plan rewrites left out, with why: the report of the work says what was
 /// not done, so "done" never hides a dropped part of the request.
 fn dropped_note(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
-    let dropped: Vec<String> = entries
+    let dropped = dropped_tasks(entries, run_id);
+    if dropped.is_empty() {
+        return String::new();
+    }
+    data.text("plan_dropped", &[("tasks", &dropped.join("; "))])
+}
+
+/// The tasks this run's plan rewrites left out, each "title: why".
+fn dropped_tasks(entries: &[JournalEntry], run_id: &str) -> Vec<String> {
+    entries
         .iter()
         .filter(|entry| entry.kind == chatflow_kinds::PLAN && str_field(&entry.data, "run_id") == run_id)
         .filter_map(plan::parse)
         .filter_map(|plan| plan.diff)
         .flat_map(|diff| diff.tasks_dropped)
-        .collect();
-    if dropped.is_empty() {
-        return String::new();
-    }
-    data.text("plan_dropped", &[("tasks", &dropped.join("; "))])
+        .collect()
 }
 
 fn delegated_note(data: &crate::data::Dataset, result: &DelegateResult) -> String {
@@ -1283,7 +1297,12 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     };
     // Each task's `skills` choose from the catalog, shown last.
     let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
-    let live = joined(&[done_live, open_live, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    // The direction the user set, then their latest words as they wrote them, right before how
+    // the plan is written: the project's rules and the earlier work are in every prompt, and the
+    // planner wrote the old design again from them (seen: twice after the user rejected it).
+    let direction_live = direction(&env.data, &entries);
+    let asks = asks_live(&env.data, &entries, &env.run_id, "plan_asks", false);
+    let live = joined(&[direction_live, done_live, open_live, asks, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (mut doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
     let mut tasks = plan::merge_same_touches(tasks);
@@ -1444,7 +1463,8 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     stop_replaced_work(env, journal, plan_seq, &current).await?;
     current.replaces.clear();
     if current.tasks.len() <= 1 {
-        let decision = plan::foreground_decision(&env.data, &current, &env.data.effort.default);
+        let mut decision = plan::foreground_decision(&env.data, &current, &env.data.effort.default);
+        decision.brief = format!("{}{}", direction(&env.data, &journal.entries_vec()), decision.brief);
         return journal
             .append(kinds::ROUTE, json!({"route": "DO", "stage": "implement", "detail": decision, "plan_id": current.plan_id, "run_id": env.run_id}))
             .await
@@ -1561,6 +1581,8 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
         }
     }
     let dirs = [env.scope.workspace.as_str(), env.scope.root.as_str()];
+    // Each agent works from its brief alone: the direction the user set opens it.
+    let direction = direction(&env.data, &journal.entries_vec());
     for index in 0..current.tasks.len() {
         if current.tasks[index].task_id.is_some() {
             continue;
@@ -1577,7 +1599,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                     "project_id": env.scope.project_id,
                     "parent_id": root,
                     "title": task.title,
-                    "brief": if task.title == fix_title { plan::agent_brief(&env.data, current, &task) } else { format!("{}{already_failing}{}", plan::agent_brief(&env.data, current, &task), missing_note(env, current, &task).await) },
+                    "brief": if task.title == fix_title { format!("{direction}{}", plan::agent_brief(&env.data, current, &task)) } else { format!("{direction}{}{already_failing}{}", plan::agent_brief(&env.data, current, &task), missing_note(env, current, &task).await) },
                     "plan": "",
                     "contract": contract::contract_from(&checks),
                     "depends_on": depends,
@@ -2157,8 +2179,10 @@ async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, Rp
 /// What ROUTE read the user's latest message to ask (its `asks`), numbered, in the stage text
 /// `text`: the closing lines of a stage that answers the message. The message itself can be far
 /// above by then (seen: 30k tokens of agent reports between it and REPLY; the answer reported
-/// those and left the question unanswered).
-pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str, text: &str) -> String {
+/// those and left the question unanswered). `means`: each quote with what ROUTE read it to refer
+/// to, for an answer; a planner gets the quotes alone (seen: "a real-world test suite" read as
+/// "test the brain's recall", the old design the user had just rejected).
+pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str, text: &str, means: bool) -> String {
     let Some(route) = entries.iter().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "stage") == "route") else {
         return String::new();
     };
@@ -2167,8 +2191,8 @@ pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], r
         .iter()
         .filter(|ask| !ask.quote.trim().is_empty())
         .map(|ask| {
-            let (quote, means) = (ask.quote.trim(), ask.means.trim());
-            if means.is_empty() || means.eq_ignore_ascii_case(quote) { data.text("ask_line", &[("quote", quote)]) } else { data.text("ask_line_means", &[("quote", quote), ("means", means)]) }
+            let (quote, read) = (ask.quote.trim(), ask.means.trim());
+            if !means || read.is_empty() || read.eq_ignore_ascii_case(quote) { data.text("ask_line", &[("quote", quote)]) } else { data.text("ask_line_means", &[("quote", quote), ("means", read)]) }
         })
         .collect();
     if lines.is_empty() {
@@ -2176,6 +2200,40 @@ pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], r
     }
     let list = lines.iter().enumerate().map(|(index, line)| format!("{}. {line}", index + 1)).collect::<Vec<_>>().join("\n");
     data.text(text, &[("asks", &list)])
+}
+
+/// The direction the user set for the whole work: the latest message ROUTE read as laying it out
+/// (`direction: states`: the message), or as accepting the design in the answer before it
+/// (`approves`: that answer and the message); a later message that sets the direction aside
+/// (`drops`) ends it. Empty when there is none. Shown before every plan and task: the project's
+/// rules file and the earlier work are in every prompt, while the user's change of course was
+/// only in the conversation, shortened as it grew (seen: an approved design, "the brain steers
+/// the model, it stores no facts", built and tested as a fact-recall memory again for two days).
+pub(crate) fn direction(data: &crate::data::Dataset, entries: &[JournalEntry]) -> String {
+    let mut current = String::new();
+    for route in entries.iter().filter(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route") {
+        let set = route.data.get("detail").map(|detail| str_field(detail, "direction").to_owned()).unwrap_or_default();
+        if set != "states" && set != "approves" {
+            if route.data.get("drops").and_then(Value::as_bool) == Some(true) {
+                current.clear();
+            }
+            continue;
+        }
+        let Some(message) = entries.iter().filter(|entry| entry.seq < route.seq && entry.kind == kinds::USER_MESSAGE).last() else { continue };
+        let said = str_field(&message.data, "text").trim();
+        let answer = entries
+            .iter()
+            .filter(|entry| entry.seq < message.seq && entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty())
+            .last()
+            .map(|entry| str_field(&entry.data, "text").trim().to_owned())
+            .unwrap_or_default();
+        current = if set == "approves" && !answer.is_empty() {
+            data.text("direction_approved", &[("said", said), ("answer", &answer)])
+        } else {
+            data.text("direction_said", &[("said", said)])
+        };
+    }
+    if current.is_empty() { current } else { data.text("direction_live", &[("direction", &current)]) }
 }
 
 /// Keeps the asks whose `quote` is in the user's latest message (compared without case,
