@@ -29,6 +29,8 @@ export interface TurnActions extends PlanActions {
   approve: (seq: number, approve: boolean) => Promise<void>;
   openFile: (path: string) => void;
   openLink: (url: string) => void;
+  /** A file an answer names: code opens in the editor (at its line), Markdown in its view. */
+  openNamedFile: (path: string, line: number | null) => void;
   /** Put the files a turn edited back as they were before it, from the edit tool's own results
    * (turns without a Changed note; null: not possible here). */
   undoEdits: ((turn: Turn, files: EditedFile[]) => Promise<void>) | null;
@@ -213,7 +215,7 @@ function EntryView({ entry, actions }: { entry: JournalEntry; actions: TurnActio
       const streaming = data.streaming === true;
       return (
         <div className={`prose markdown cx-answer${streaming ? ' stream' : ''}`} data-seq={entry.seq} data-streaming={streaming ? 'true' : 'false'}>
-          <MarkdownBlock text={text} onLink={actions.openLink} />
+          <MarkdownBlock text={text} onLink={actions.openLink} onFile={actions.openNamedFile} />
         </div>
       );
     }

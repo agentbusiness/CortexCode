@@ -126,7 +126,7 @@ function GitSection() {
         </div>
         {panel === 'commit' && (
           <div className="cx-git-panel">
-            <textarea className="write one" value={text} placeholder="What this commit does" aria-label="Commit message" onChange={(event) => setText(event.target.value)} />
+            <textarea className="write cx-git-message" value={text} placeholder="What this commit does" aria-label="Commit message" onChange={(event) => setText(event.target.value)} />
             <div className="cx-git-acts">
               <button className="detent tiny" type="button" disabled={!text.trim() || busy || staged === 0} onClick={() => void run(async () => `Committed ${(await client.call<{ sha: string }>('vcs.commit', { root, message: text.trim(), all: false })).sha.slice(0, 8)}`)}>Commit staged</button>
               <button className="detent tiny send" type="button" disabled={!text.trim() || busy} onClick={() => void run(async () => `Committed ${(await client.call<{ sha: string }>('vcs.commit', { root, message: text.trim(), all: true })).sha.slice(0, 8)}`)}>Commit all</button>

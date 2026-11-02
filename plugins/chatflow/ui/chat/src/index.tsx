@@ -179,6 +179,17 @@ function Chat() {
     openFile: (path) => {
       if (workspace) openInCode({ root: workspace, path });
     },
+    openNamedFile: (named, line) => {
+      if (!workspace) return;
+      // An answer may name a file by its full path; the panes take it relative to the workspace.
+      const path = named.startsWith(`${workspace}/`) ? named.slice(workspace.length + 1) : named;
+      if (/\.(md|markdown|mdx)$/i.test(path)) {
+        setShared('markdown.open', { root: workspace, path });
+        showPane('markdown');
+      } else {
+        openInCode({ root: workspace, path, line });
+      }
+    },
     openLink: (url) => {
       showPane('browser');
       void client.call('browser.open', { url, session_id: sessionId }).catch((cause) => host.notify(`The browser could not open ${url}: ${errorMessage(cause)}`));
