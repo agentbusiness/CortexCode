@@ -409,9 +409,17 @@ async fn lead_session(host: &Host, record: &AgentRecord) -> Option<String> {
 
 /// A progress line in the delegating session's journal: shown on its card, not a model message.
 async fn progress(host: &Host, lead: Option<&str>, text: &str, record: &AgentRecord) {
+    progress_note(host, lead, text, record, false).await;
+}
+
+/// A progress line the delegating session's model reads too (`host_message`): a finished task's
+/// own report, so the session answers "what was done" from the work, not from its memory of
+/// earlier runs (seen: a task that changed nothing reported as "finished", and the session then
+/// describing older results).
+async fn progress_note(host: &Host, lead: Option<&str>, text: &str, record: &AgentRecord, host_message: bool) {
     if let Some(lead) = lead {
         let _ = host
-            .journal_append(lead, kinds::NOTE, json!({"text": text, "purpose": "agent_progress", "host_message": false, "agent": record.name, "task_id": record.task_id}))
+            .journal_append(lead, kinds::NOTE, json!({"text": text, "purpose": "agent_progress", "host_message": host_message, "agent": record.name, "task_id": record.task_id}))
             .await;
     }
 }
@@ -1215,7 +1223,9 @@ impl Agents {
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
             handoff_ended(host, &updated, task, "is done", &result.summary).await;
             let lead = lead_session(host, &updated).await;
-            progress(host, lead.as_deref(), &data.text("progress_done", &[("agent", &record.name), ("title", &task.title)]), &updated).await;
+            let changed = if changed.is_empty() { data.text("progress_changed_none", &[]) } else { changed };
+            let text = data.text("progress_done", &[("agent", &record.name), ("title", &task.title), ("changed", changed.trim()), ("summary", result.summary.trim())]);
+            progress_note(host, lead.as_deref(), &text, &updated, true).await;
             let _ = host.call(memory_methods::REFRESH, json!({"project_id": project.id})).await;
             Ok(Stewarded::Verified)
         } else {

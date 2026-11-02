@@ -896,6 +896,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // a jest run that found no tests, and the same failure handed back).
     let mut checked_nothing = false;
     let mut told_checked_nothing = false;
+    // A task that ends with no file changed is answered once with its own title: its check passes
+    // on the untouched code too, so it shows nothing (seen: "align the code to the new model" ended
+    // on "let me extract it", no edit, and counted done because the build still passed).
+    let mut told_no_change = false;
     // A project file changed after the last passing test run: a "done" then rests on code no test
     // ran, and is answered once with the run that checks it (seen: a fix edited after the green run
     // and handed back failing).
@@ -1092,6 +1096,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             // files sent it on for twenty more steps).
             if answering_session {
                 return Ok(outcome("done", summary, turns, tool_calls, &changed, None));
+            }
+            if let Some(title) = task.as_ref().map(|task| task.title.clone()).filter(|_| changed.is_empty() && !told_no_change) {
+                told_no_change = true;
+                journal.note(&env.run_id, "no_change", &env.data.text("done_no_change", &[("title", &title)]), true).await?;
+                continue;
             }
             if checked_nothing && !told_checked_nothing {
                 told_checked_nothing = true;

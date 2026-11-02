@@ -434,6 +434,12 @@ pub async fn read_target(
                         " Find it with graph://search/<words>, or run `git ls-files | grep <part of the name>`.",
                     ),
                 }
+                // A place the user named as theirs ("in my home folder, .cortex-model") is read
+                // inside the project; the home folder's entry of that name, or one a letter
+                // apart, is named so the next read goes there.
+                if let Some(found) = in_home(&absolute, Path::new(&session.workspace)) {
+                    let _ = write!(message, " Your home folder has {found}: read it there.");
+                }
             }
             Out::fail(error.kind, message)
         }
@@ -3203,4 +3209,39 @@ fn describe_class(class: &str) -> String {
 /// Edit format for a context (default hashline).
 pub fn edit_format(context: &ExecContext) -> EditFormat {
     EditFormat::parse(context.edit_format.as_deref())
+}
+
+/// The home folder's entry for a path missing from the workspace: its first part as the home
+/// folder names it (the same name, or one a letter apart: `.cortex-model` finds `.cortex-models`),
+/// shown as `~/<name>/<rest>`.
+fn in_home(absolute: &Path, workspace: &Path) -> Option<String> {
+    let relative = absolute.strip_prefix(workspace).ok()?;
+    let mut parts = relative.components();
+    let first = parts.next()?.as_os_str().to_str()?.to_lowercase();
+    let rest = parts.as_path();
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if home == workspace {
+        return None;
+    }
+    let name = std::fs::read_dir(&home)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .find(|name| one_letter_apart(&name.to_lowercase(), &first))?;
+    let shown = if rest.as_os_str().is_empty() { format!("~/{name}") } else { format!("~/{name}/{}", rest.display()) };
+    Some(shown)
+}
+
+/// Whether two names are the same or differ by one letter added, dropped or changed.
+fn one_letter_apart(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if long.len() - short.len() > 1 || short.len() < 4 {
+        return a == b;
+    }
+    let head = short.iter().zip(long.iter()).take_while(|(x, y)| x == y).count();
+    if head == short.len() {
+        return true;
+    }
+    let skip = usize::from(short.len() == long.len());
+    short.get(head + skip..).unwrap_or(&[]) == long.get(head + 1..).unwrap_or(&[])
 }
