@@ -28,6 +28,21 @@ const macos = path.join(contents, 'MacOS');
 if (fs.existsSync(path.join(macos, 'Electron')) && !fs.existsSync(path.join(macos, NAME))) {
   fs.renameSync(path.join(macos, 'Electron'), path.join(macos, NAME));
 }
+// The helpers too, so Activity Monitor shows "CortexCode Helper (Renderer)", not "Electron Helper":
+// Electron looks for "Electron Helper.app" first, then "<CFBundleName> Helper.app".
+let helpersRenamed = false;
+const frameworks = path.join(contents, 'Frameworks');
+for (const entry of fs.existsSync(frameworks) ? fs.readdirSync(frameworks) : []) {
+  if (!entry.startsWith('Electron Helper') || !entry.endsWith('.app')) continue;
+  const base = entry.slice(0, -'.app'.length);
+  const name = `${NAME}${base.slice('Electron'.length)}`;
+  const helper = path.join(frameworks, entry);
+  if (fs.existsSync(path.join(frameworks, `${name}.app`))) continue;
+  fs.renameSync(path.join(helper, 'Contents', 'MacOS', base), path.join(helper, 'Contents', 'MacOS', name));
+  execFileSync('/usr/libexec/PlistBuddy', ['-c', `Set :CFBundleName ${name}`, path.join(helper, 'Contents', 'Info.plist')]);
+  fs.renameSync(helper, path.join(frameworks, `${name}.app`));
+  helpersRenamed = true;
+}
 const pathFile = path.join(electronDir, 'path.txt');
 const executable = `${NAME}.app/Contents/MacOS/${NAME}`;
 if (fs.readFileSync(pathFile, 'utf8').trim() !== executable) fs.writeFileSync(pathFile, executable);
@@ -50,7 +65,7 @@ function set(key, value) {
   return true;
 }
 
-let changed = set('CFBundleName', NAME) | set('CFBundleDisplayName', NAME) | set('CFBundleExecutable', NAME);
+let changed = Number(helpersRenamed) | set('CFBundleName', NAME) | set('CFBundleDisplayName', NAME) | set('CFBundleExecutable', NAME);
 if (fs.existsSync(ICNS)) {
   const target = path.join(contents, 'Resources', `${NAME}.icns`);
   if (!fs.existsSync(target) || fs.readFileSync(target).compare(fs.readFileSync(ICNS)) !== 0) {
