@@ -1126,7 +1126,11 @@ async fn review_plan(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: 
 
 fn decide_routes(full: Shape, route: &str) -> Shape {
     match route {
-        "PLAN" => full.without("route", "DO").without("route", "DELEGATE"),
+        // A plan request ends in a plan: what is still unknown becomes a step of it, not a
+        // question back (seen: "plan" read the model folder in the wrong place, then asked the
+        // user where it was instead of planning).
+        "PLAN" => full.without("route", "DO").without("route", "DELEGATE").without("route", "ANSWER"),
+        "DELEGATE" => full.without("route", "DO").without("route", "PLAN").without("route", "ANSWER"),
         // A change keeps ANSWER: a request that can be read two ways is asked back to the user.
         _ => full,
     }

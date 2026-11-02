@@ -52,7 +52,8 @@ board_conflict = "{title}: merge conflict in {files}; handed back to {agent}"
 board_blocked_by_local = "{title}: {agent}'s work is ready; the merge waits for uncommitted edits in {files} to be committed."
 
 # ---- progress (the delegating session's journal, shown on its card) -------------------------------
-progress_done = "{agent} finished \"{title}\": its checks pass in the project."
+progress_done = "{agent} finished \"{title}\": its checks pass in the project. {changed}\nIts report:\n{summary}"
+progress_changed_none = "It changed no file."
 progress_cancelled = "\"{title}\" was cancelled{agent}."
 progress_cancelled_agent = " ({agent} stopped)"
 progress_restarted = "{agent} works on \"{title}\" again."
