@@ -281,7 +281,7 @@ gh_upload() {
   existing="$(gh_api GET "/repos/$RELEASE_REPO/releases/$id/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')"
   [ -z "$existing" ] || gh_api DELETE "/repos/$RELEASE_REPO/releases/assets/$existing" >/dev/null
   curl -fsSL -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-    -H "Content-Type: application/octet-stream" --data-binary "@$file" \
+    -H "Content-Type: application/octet-stream" -T "$file" \
     "https://uploads.github.com/repos/$RELEASE_REPO/releases/$id/assets?name=$name" >/dev/null || die "cannot upload $name"
 }
 
