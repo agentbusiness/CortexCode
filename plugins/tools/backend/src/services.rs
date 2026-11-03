@@ -2,8 +2,8 @@
 //! the services this machine's apps offer (`mesh.services`, those a session may call from here)
 //! become one tool each, named by the service (`schedule`, `trace`), with an `action` for the
 //! method. A call goes through `mesh.service.call`; the host fills in who asked and never passes
-//! `approved` from the model. A service CortexCode has its own tool for (`terminal.command`: the
-//! `run` tool) is not offered again.
+//! `approved` from the model. Only services their provider declares for models are offered
+//! (`Share::for_models`), and none named like a tool CortexCode has itself.
 
 use crate::host::Host;
 use cc_protocol::contracts::mesh::{OfferedService, ServicesResult};
@@ -14,9 +14,6 @@ use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Services CortexCode does not offer the model: it has its own tool for the work, or the host
-/// uses them itself (the guard and advisories check every `run`; the code audit is a skill).
-const OWN: &[&str] = &["terminal.command", "terminal.guard", "system.advisory", "tools.security"];
 /// The tools CortexCode has itself; a service of the same name is left out.
 const BUILT_IN: &[&str] = &["read", "edit", "run", "terminal"];
 /// How long the list of services is reused.
@@ -39,7 +36,7 @@ async fn offered(host: &dyn Host) -> Vec<Share> {
     let mut shares: Vec<Share> = Vec::new();
     for offer in services.into_iter().filter(|o| o.local && o.reachable) {
         let (name, _, _) = svc::tool_of(&offer.share);
-        if OWN.contains(&offer.share.service.as_str()) || BUILT_IN.contains(&name.as_str()) || shares.iter().any(|s| s.service == offer.share.service) {
+        if !offer.share.for_models() || BUILT_IN.contains(&name.as_str()) || shares.iter().any(|s| s.service == offer.share.service) {
             continue;
         }
         shares.push(offer.share);

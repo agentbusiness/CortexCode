@@ -137,8 +137,10 @@ built to the same standard as CortexCode. The standard is:
   handshake, one models folder for every Cortex app (`~/.cortex-models`, `docs/SHARED-MODELS.md`;
   `shared-models/`);
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
-  `<category>.shares` declaration, where a call may come from, the caller, run options, jobs and
-  read sizes, and the one-tool-per-service builder;
+  `<category>.shares` declaration, who a service is for (its `audience`: models, apps or peers),
+  where a call may come from, the caller, run options, jobs and read sizes, and the
+  one-tool-per-service builder. Every service is optional: an app shares what it has, a caller
+  that finds no provider does without, and no app names another app's service in its code;
 - where data lives (the rule above) and the graph's contract: `memory.graph.*`, `memory.stream.*`,
   `memory.queue.*`, settings and the app's records, with the memory plugin's `graphapi.rs`,
   `streams.rs`, `settings.rs` and `app.rs` the same in both repositories, byte for byte;
@@ -148,7 +150,8 @@ built to the same standard as CortexCode. The standard is:
 
 **Any change to the plugin architecture, the mesh, or model and resource sharing is made in both
 CortexCode and CortexTerm**, in the same piece of work, and listed in both repositories' docs with the
-version it lands in. A change to anything outside the standard stays in its own app.
+version it lands in. Any other app that carries the standard (its own copy of `cc-protocol` and of
+the mesh's files) takes the same change. A change to anything outside the standard stays in its own app.
 
 ## Checking a change
 

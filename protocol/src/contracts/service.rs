@@ -1,7 +1,11 @@
 //! Shared services: how a plugin offers some of its methods to the other apps on this machine and
-//! to the members of the mesh, and how they are called. Part of the standard CortexCode and
-//! CortexTerm share (both `AGENTS.md`); the mesh plugin enforces it.
+//! to the members of the mesh, and how they are called. Part of the shared standard (`AGENTS.md`);
+//! the mesh enforces it.
 //!
+//! - **Every service is optional.** An app shares what it has and nothing more; no app has to
+//!   implement any service, and a new one needs no change in the others. A caller that finds no
+//!   provider does the work itself or goes without (`service-kit`'s `client::provider` answers
+//!   None).
 //! - A **service** is the first two words of its methods, `<category>.<service>`
 //!   (`terminal.command`, `system.schedule`); the frame routes it by the category as any call.
 //! - A **method** ends with a verb from a fixed list, and the verb alone says what the method may
@@ -14,6 +18,10 @@
 //! - Where a call may come from: `read` from any member; `edit` and `run` only from apps on the
 //!   same machine (a session runs where its project is, so its calls are local there). There is
 //!   nothing to set: what a plugin declares is always shared under these rules.
+//! - Who it is for: the provider declares it ([`Audience`]), so no app names another app's
+//!   service to keep it from its model. `models` (the default) may be a model tool; `apps` is for
+//!   apps' own code; `peers` is for the apps that share the same service themselves, and the mesh
+//!   lists it to and takes its calls from those only.
 //! - Every shared call carries who asked ([`Caller`], stamped by the mesh, never taken from the
 //!   caller's word); a run carries [`RunOptions`]; long work answers a [`Job`]; data comes back in
 //!   the [`Size`] the caller asks for.
@@ -89,6 +97,29 @@ pub struct Share {
     /// One line: what it is for, for people and models.
     pub description: String,
     pub methods: Vec<SharedMethod>,
+    /// Who it is for; absent in a declaration: `models`.
+    #[serde(default, skip_serializing_if = "Audience::is_models")]
+    pub audience: Audience,
+}
+
+/// Who a service is for, as its provider declares it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Audience {
+    /// Any app, and a host may offer it to its model as a tool.
+    #[default]
+    Models,
+    /// Any app's own code (a check the host makes, work it hands on); never a model tool.
+    Apps,
+    /// Only apps that share this same service themselves (the provider's own kind on other
+    /// computers): the mesh lists it to and takes its calls from those only; never a model tool.
+    Peers,
+}
+
+impl Audience {
+    pub fn is_models(&self) -> bool {
+        *self == Audience::Models
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -107,6 +138,11 @@ impl Share {
     /// The method's declaration, when this service shares it.
     pub fn method(&self, method: &str) -> Option<&SharedMethod> {
         self.methods.iter().find(|m| m.method == method)
+    }
+
+    /// Whether a host may offer it to its model as a tool.
+    pub fn for_models(&self) -> bool {
+        self.audience.is_models()
     }
 
     /// What is wrong with the declaration, if anything: methods outside the service or with a
@@ -361,7 +397,7 @@ pub struct NeedsApproval {
 /// A service as one model tool: its name is the service's second word (`schedule`), `action`
 /// picks the method (`list`, `runs_read`), and the parameters are every method's, merged. One
 /// tool per service keeps the tool list short for a small model; the host adds only the services a
-/// session may use, and never `approved` or `caller` (the host sets those).
+/// session may use ([`Share::for_models`]), and never `approved` or `caller` (the host sets those).
 pub fn tool_of(share: &Share) -> (String, String, Value) {
     let name = share.service.split('.').nth(1).unwrap_or(&share.service).to_owned();
     let mut properties = serde_json::Map::new();
