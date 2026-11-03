@@ -1,0 +1,35 @@
+[package]
+name = "cc-model-llama"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "CortexCode model plugin (model@1) for Linux: Qwen3.8-27B on a supervised upstream llama-server (CUDA or Vulkan, DFlash 2 drafts), or a member's Qwen through the mesh."
+
+# Own workspace: the plugin builds (and ships) on its own.
+[workspace]
+
+[[bin]]
+name = "cc-model-llama"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["memory", "mesh", "model", "preserve_order"] }
+# The models folder the Cortex apps share (~/.cortex-models), where Gemma lives.
+cc-shared-models = { path = "../../../shared-models" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"] }
+sha2 = "0.10.9"
+base64 = "0.22.1"
+libc = "0.2.182"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[profile.release]
+debug = false
+lto = "thin"

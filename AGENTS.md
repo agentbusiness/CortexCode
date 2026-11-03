@@ -133,7 +133,9 @@ built to the same standard as CortexCode. The standard is:
 - the wire shape of every contract both apps have (`model@1`, `mesh@1`, `notify@1`, `skills@1`,
   `terminal@1`, `chatflow@1`);
 - the mesh: ALPNs, pairing, membership log, card, claims, lending, `mesh.link`, `mesh.session.start`;
-- model and resource sharing: model tags (`coding`, `office`), one model per machine, the yield
+- model and resource sharing: model tags (`coding`, `office`), one model per machine, a model only
+  on a GPU (Metal on macOS, CUDA or Vulkan on Linux; a machine without one, or a Linux CortexCode
+  with under 16 GB of GPU memory, loads no model and uses a member's through the mesh), the yield
   handshake, one models folder for every Cortex app (`~/.cortex-models`, `docs/SHARED-MODELS.md`;
   `shared-models/`);
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the

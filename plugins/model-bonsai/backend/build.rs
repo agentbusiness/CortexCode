@@ -11,11 +11,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vendor.display());
     println!("cargo:rerun-if-env-changed=SDKROOT");
 
-    let macos = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
     // The C/C++ flags otherwise inherit a deployment target newer than the running macOS (derived
     // from the newest installed SDK), and the objects would then fail to load. Match a floor every
     // supported Mac meets.
-    if macos && std::env::var_os("MACOSX_DEPLOYMENT_TARGET").is_none() {
+    if std::env::var_os("MACOSX_DEPLOYMENT_TARGET").is_none() {
         // SAFETY: build scripts are single-threaded; nothing else reads the environment yet.
         unsafe { std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "14.0") };
     }
@@ -37,20 +36,6 @@ fn main() {
     collect_archives(&build, &mut archives);
     if archives.is_empty() {
         panic!("the llama.cpp build produced no static libraries under {}", build.display());
-    }
-    if !macos {
-        // GNU ld resolves archives in order: one group lets them refer to each other.
-        println!("cargo:rustc-link-arg=-Wl,--start-group");
-        for archive in &archives {
-            println!("cargo:rustc-link-arg={}", archive.display());
-        }
-        println!("cargo:rustc-link-arg=-Wl,--end-group");
-        println!("cargo:rustc-link-arg=-lstdc++");
-        println!("cargo:rustc-link-arg=-lm");
-        println!("cargo:rustc-link-arg=-lpthread");
-        // GCC's outlined atomics (`__aarch64_*`) live only in the static libgcc.
-        println!("cargo:rustc-link-arg=-lgcc");
-        return;
     }
     // ld64 resolves archive order itself.
     for archive in &archives {

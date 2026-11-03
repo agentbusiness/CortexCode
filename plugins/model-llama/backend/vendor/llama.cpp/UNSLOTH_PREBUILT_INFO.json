@@ -1,0 +1,271 @@
+{
+  "requested_tag": "latest",
+  "tag": "b11876",
+  "release_tag": "b11876-mix-ec42614",
+  "published_repo": "unslothai/llama.cpp",
+  "asset": "llama-b11876-mix-ec42614-bin-macos-arm64.tar.gz",
+  "force_cpu": false,
+  "llama_backend": null,
+  "backend": "metal",
+  "backend_request": "auto",
+  "asset_sha256": "9de50ae4215ca2b869db1703dba5f76055f4c5b8969cb22ae5189845281c8c0f",
+  "runtime_asset": null,
+  "source": "published",
+  "binary_repo": "unslothai/llama.cpp",
+  "binary_release_tag": "b11876-mix-ec42614",
+  "source_asset": "llama.cpp-source-commit-468ad5824c4afb245338f0ede29ef31680ba59c7.tar.gz",
+  "source_sha256": "e7b3d6c998027018a5ad33c7db0c573168c1d02cc1a0694e82fe13450e11d8ad",
+  "source_commit": "468ad5824c4afb245338f0ede29ef31680ba59c7",
+  "source_commit_short": "468ad58",
+  "source_repo": "unslothai/llama.cpp",
+  "source_repo_url": "https://github.com/unslothai/llama.cpp",
+  "source_ref_kind": null,
+  "requested_source_ref": "b11876-mix-ec42614",
+  "resolved_source_ref": "b11876-mix-ec42614",
+  "ggml_tree": "5053576b728b87a1d9f7e846ad7920e863882ba5",
+  "bundle_profile": "macos-metal-arm64",
+  "runtime_line": null,
+  "torch_runtime_preference": null,
+  "coverage_class": null,
+  "gfx_target": null,
+  "mapped_targets": [],
+  "supported_sms": [],
+  "runtime_sha256": null,
+  "install_fingerprint": "f3e06c405b6088e9e6013450d2a7c218ac349e43d75f91b59e15fcfe72c02b5c",
+  "runtime_files": {
+    "build/bin/llama-server": {
+      "size": 33472,
+      "mtime_ns": 1793198439891701542,
+      "sha256": "0b2720c58454e8ecd4326bfef65c7a17b0d58af486919a88204af38bd80fb6d7"
+    },
+    "build/bin/llama-quantize": {
+      "size": 33472,
+      "mtime_ns": 1793198439892220874,
+      "sha256": "5a1b7c869347439b10babb7d727207592b8a22ee63019b6f02ba0232f1a96ae5"
+    },
+    "build/bin/llama-diffusion-gemma-visual-server": {
+      "size": 118528,
+      "mtime_ns": 1793198439850210327,
+      "sha256": "20f0d82462badcb02f1a516359943b6610e6c0bd15e34f47ab8c02b3c88971db"
+    },
+    "build/bin/llama-bench": {
+      "size": 33464,
+      "mtime_ns": 1793198439890937004,
+      "sha256": "361d91d96b5fbfb324d876d5058987675d02bba6b4c910d1581bff30a3c0e567"
+    },
+    "build/bin/llama-fit-params": {
+      "size": 33472,
+      "mtime_ns": 1793198439886587020,
+      "sha256": "8da0e63884beb394226eb32ca6d0349c505d7a8bd33360283cb07d1899c10377"
+    },
+    "build/bin/libggml-base.0.27.0.dylib": {
+      "size": 786744,
+      "mtime_ns": 1793198439890102257,
+      "sha256": "4bfa1479edbd542827f435fcfc85956e1372c1f9554d4af00eb2cb9c275ead8b"
+    },
+    "build/bin/libggml-base.0.dylib": {
+      "size": 786744,
+      "mtime_ns": 1793198439890102257,
+      "sha256": "4bfa1479edbd542827f435fcfc85956e1372c1f9554d4af00eb2cb9c275ead8b"
+    },
+    "build/bin/libggml-base.dylib": {
+      "size": 786744,
+      "mtime_ns": 1793198439890102257,
+      "sha256": "4bfa1479edbd542827f435fcfc85956e1372c1f9554d4af00eb2cb9c275ead8b"
+    },
+    "build/bin/libggml-blas.0.27.0.dylib": {
+      "size": 58776,
+      "mtime_ns": 1793198439887468767,
+      "sha256": "22a596695a8a783e4be327aebf2dd18ca417da0eb8c7f3d7d62c74ffd04d44ce"
+    },
+    "build/bin/libggml-blas.0.dylib": {
+      "size": 58776,
+      "mtime_ns": 1793198439887468767,
+      "sha256": "22a596695a8a783e4be327aebf2dd18ca417da0eb8c7f3d7d62c74ffd04d44ce"
+    },
+    "build/bin/libggml-blas.dylib": {
+      "size": 58776,
+      "mtime_ns": 1793198439887468767,
+      "sha256": "22a596695a8a783e4be327aebf2dd18ca417da0eb8c7f3d7d62c74ffd04d44ce"
+    },
+    "build/bin/libggml-cpu.0.27.0.dylib": {
+      "size": 959056,
+      "mtime_ns": 1793198439870389416,
+      "sha256": "c743a01dd5d516ca4a087541afcff40f189df40df3624ce24a1db887e891b037"
+    },
+    "build/bin/libggml-cpu.0.dylib": {
+      "size": 959056,
+      "mtime_ns": 1793198439870389416,
+      "sha256": "c743a01dd5d516ca4a087541afcff40f189df40df3624ce24a1db887e891b037"
+    },
+    "build/bin/libggml-cpu.dylib": {
+      "size": 959056,
+      "mtime_ns": 1793198439870389416,
+      "sha256": "c743a01dd5d516ca4a087541afcff40f189df40df3624ce24a1db887e891b037"
+    },
+    "build/bin/libggml-metal.0.27.0.dylib": {
+      "size": 6809672,
+      "mtime_ns": 1793198439885755732,
+      "sha256": "7dd3cc3e3b7a41eaec7b94482c19db0a228f707a67c10b8f786edf0ae1c8fd70"
+    },
+    "build/bin/libggml-metal.0.dylib": {
+      "size": 6809672,
+      "mtime_ns": 1793198439885755732,
+      "sha256": "7dd3cc3e3b7a41eaec7b94482c19db0a228f707a67c10b8f786edf0ae1c8fd70"
+    },
+    "build/bin/libggml-metal.dylib": {
+      "size": 6809672,
+      "mtime_ns": 1793198439885755732,
+      "sha256": "7dd3cc3e3b7a41eaec7b94482c19db0a228f707a67c10b8f786edf0ae1c8fd70"
+    },
+    "build/bin/libggml-rpc.0.27.0.dylib": {
+      "size": 239264,
+      "mtime_ns": 1793198439887310642,
+      "sha256": "2596e13a5a7f4804ed8b7df430555b350baf2878270af37e7b3c135763ec65d4"
+    },
+    "build/bin/libggml-rpc.0.dylib": {
+      "size": 239264,
+      "mtime_ns": 1793198439887310642,
+      "sha256": "2596e13a5a7f4804ed8b7df430555b350baf2878270af37e7b3c135763ec65d4"
+    },
+    "build/bin/libggml-rpc.dylib": {
+      "size": 239264,
+      "mtime_ns": 1793198439887310642,
+      "sha256": "2596e13a5a7f4804ed8b7df430555b350baf2878270af37e7b3c135763ec65d4"
+    },
+    "build/bin/libggml.0.27.0.dylib": {
+      "size": 60016,
+      "mtime_ns": 1793198439870602873,
+      "sha256": "43cdf3556b95c666a7e1fa23875cc07a022861f6376258bfd85950403803d7f7"
+    },
+    "build/bin/libggml.0.dylib": {
+      "size": 60016,
+      "mtime_ns": 1793198439870602873,
+      "sha256": "43cdf3556b95c666a7e1fa23875cc07a022861f6376258bfd85950403803d7f7"
+    },
+    "build/bin/libggml.dylib": {
+      "size": 60016,
+      "mtime_ns": 1793198439870602873,
+      "sha256": "43cdf3556b95c666a7e1fa23875cc07a022861f6376258bfd85950403803d7f7"
+    },
+    "build/bin/libllama-batched-bench-impl.dylib": {
+      "size": 56576,
+      "mtime_ns": 1793198439891842000,
+      "sha256": "767fe83e9c4b2004c29ea81222d6ad3b91f21f585495f57a545788c05331930f"
+    },
+    "build/bin/libllama-bench-impl.dylib": {
+      "size": 323016,
+      "mtime_ns": 1793198439888406388,
+      "sha256": "51b2624ae709321833ce21d168ff5f8cbabb0cb10223160b2dea89b83230984c"
+    },
+    "build/bin/libllama-cli-impl.dylib": {
+      "size": 255144,
+      "mtime_ns": 1793198439891557168,
+      "sha256": "438c935360c0233f61522aa2509330be85aecd1f33e72bded9447737a1ae5c56"
+    },
+    "build/bin/libllama-common.0.7.0.dylib": {
+      "size": 8022488,
+      "mtime_ns": 1793198439868421548,
+      "sha256": "aec3d44fe2a38f7767e6429c288d199b7c5f7175ec62c62ca6e04b2bb14602e9"
+    },
+    "build/bin/libllama-common.0.dylib": {
+      "size": 8022488,
+      "mtime_ns": 1793198439868421548,
+      "sha256": "aec3d44fe2a38f7767e6429c288d199b7c5f7175ec62c62ca6e04b2bb14602e9"
+    },
+    "build/bin/libllama-common.dylib": {
+      "size": 8022488,
+      "mtime_ns": 1793198439868421548,
+      "sha256": "aec3d44fe2a38f7767e6429c288d199b7c5f7175ec62c62ca6e04b2bb14602e9"
+    },
+    "build/bin/libllama-completion-impl.dylib": {
+      "size": 121680,
+      "mtime_ns": 1793198439887911473,
+      "sha256": "27b25453c66349c4d5c4beec621cd76d7e978b31236f706154c40cfa3c6a640d"
+    },
+    "build/bin/libllama-fit-params-impl.dylib": {
+      "size": 55264,
+      "mtime_ns": 1793198439892570164,
+      "sha256": "b8ae40d6526031f06a3754db10cdd382d038013376cf176abcd6785104b08004"
+    },
+    "build/bin/libllama-perplexity-impl.dylib": {
+      "size": 156384,
+      "mtime_ns": 1793198439888768179,
+      "sha256": "82d642d27aaad221749f352ad0651e7218b321cee1b8e1218de4e6839ee0b6ea"
+    },
+    "build/bin/libllama-quantize-impl.dylib": {
+      "size": 96496,
+      "mtime_ns": 1793198439890717921,
+      "sha256": "3c12ecb3ac2426e2760e75813881f0ad78087c223a523a6b1479bf05597a9c8d"
+    },
+    "build/bin/libllama-server-impl.dylib": {
+      "size": 9536952,
+      "mtime_ns": 1793198439880927500,
+      "sha256": "627b3f58cc6ec878dfe6c6a3a1772d6137a1d6195e4e23bddac00d1fe6bef75c"
+    },
+    "build/bin/libllama.0.7.0.dylib": {
+      "size": 3693504,
+      "mtime_ns": 1793198439855655723,
+      "sha256": "6eb51eae713cb497bb146514e22252fc517e041f25b61aaa2913025a9ce72a70"
+    },
+    "build/bin/libllama.0.dylib": {
+      "size": 3693504,
+      "mtime_ns": 1793198439855655723,
+      "sha256": "6eb51eae713cb497bb146514e22252fc517e041f25b61aaa2913025a9ce72a70"
+    },
+    "build/bin/libllama.dylib": {
+      "size": 3693504,
+      "mtime_ns": 1793198439855655723,
+      "sha256": "6eb51eae713cb497bb146514e22252fc517e041f25b61aaa2913025a9ce72a70"
+    },
+    "build/bin/libmtmd.0.7.0.dylib": {
+      "size": 1540720,
+      "mtime_ns": 1793198439858151880,
+      "sha256": "826649da81f115326d12d4892e6ebbef27db614c3802d17865757df338eb8793"
+    },
+    "build/bin/libmtmd.0.dylib": {
+      "size": 1540720,
+      "mtime_ns": 1793198439858151880,
+      "sha256": "826649da81f115326d12d4892e6ebbef27db614c3802d17865757df338eb8793"
+    },
+    "build/bin/libmtmd.dylib": {
+      "size": 1540720,
+      "mtime_ns": 1793198439858151880,
+      "sha256": "826649da81f115326d12d4892e6ebbef27db614c3802d17865757df338eb8793"
+    },
+    "llama-server": {
+      "size": 33472,
+      "mtime_ns": 1793198439891701542,
+      "sha256": "0b2720c58454e8ecd4326bfef65c7a17b0d58af486919a88204af38bd80fb6d7"
+    },
+    "llama-quantize": {
+      "size": 33472,
+      "mtime_ns": 1793198439892220874,
+      "sha256": "5a1b7c869347439b10babb7d727207592b8a22ee63019b6f02ba0232f1a96ae5"
+    }
+  },
+  "host_profile": {
+    "machine": "arm64",
+    "has_usable_nvidia": false,
+    "has_physical_nvidia": false,
+    "driver_cuda_version": null,
+    "compute_caps": [],
+    "has_rocm": false,
+    "rocm_runtime": null,
+    "rocm_gfx_target": null,
+    "rocm_gfx_targets": [],
+    "has_intel_gpu": false,
+    "has_amd_gpu_without_rocm": false,
+    "macos_version": [
+      26,
+      6
+    ],
+    "cuda_runtime_lines": null
+  },
+  "macos_load_probe": {
+    "passed": true,
+    "macos_product_version": "26.6.2 25G83"
+  },
+  "prebuilt_fallback_used": false,
+  "installed_at_utc": "2026-10-28T14:40:43Z"
+}

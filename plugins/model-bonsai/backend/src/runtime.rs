@@ -867,7 +867,7 @@ impl Runtime {
             slots: u32::try_from(facts.resident).unwrap_or(u32::MAX),
             kv_type: facts.plan.kv_type.name().into(),
             speculative: if facts.draft_tokens > 0 { "mtp".into() } else { String::new() },
-            backend: if cfg!(target_os = "macos") { "metal" } else { "cpu" }.into(),
+            backend: "metal".into(),
             tensor_api: None,
             engine_revision: crate::llama::REVISION.into(),
             extra: json!({

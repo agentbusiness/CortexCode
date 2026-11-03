@@ -1,0 +1,7 @@
+llama.cpp source vendored from unslothai/llama.cpp
+commit 468ad5824c4afb245338f0ede29ef31680ba59c7 (468ad58), build b11876 (release tag b11876-mix-ec42614)
+source tarball sha256 e7b3d6c998027018a5ad33c7db0c573168c1d02cc1a0694e82fe13450e11d8ad
+ggml tree 5053576b728b87a1d9f7e846ad7920e863882ba5
+Copied: CMakeLists.txt, LICENSE, cmake/, common/, ggml/, include/, src/, tools/, vendor/, licenses/,
+scripts/ui-assets.cmake, UNSLOTH_PREBUILT_INFO.json (provenance). Left out: prebuilt binaries, models,
+tests, examples, docs, Python tooling, the test folders under tools/.

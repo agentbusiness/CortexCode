@@ -1,0 +1,5 @@
+# The Rust toolchain this folder builds with (the repository's pin, repeated here so the folder
+# builds the same when it lives in a repository of its own).
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
