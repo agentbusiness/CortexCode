@@ -19,7 +19,9 @@
 //! - **The runs' ends decide**: `with` done and `without` not is better (`helped`), the reverse is
 //!   worse (`hurt`, and the withdrawal rule applies), anything else is no observed effect. The
 //!   lesson gets a `replay://` evidence either way, so it is not replayed again; a user's turn
-//!   cancels a replay, which then decides nothing and is tried again later. The result is a
+//!   cancels a replay, which then decides nothing and is tried again later. The user stopping a
+//!   replay's run is a decision: the lesson gets `replay://stopped` (never replayed again) and no
+//!   replay starts until the user's next turn. The result is a
 //!   `Replay` node (for the night report); the replay's projects and sessions are then deleted.
 //!
 //! ```text
@@ -52,6 +54,9 @@ const UNTRACKED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The note purpose that marks a replay session and its arm.
 pub const NOTE_PURPOSE: &str = "replay";
+
+/// An arm's end when the user stopped its run (the replay itself was not cancelled).
+pub const USER_STOPPED: &str = "user_stopped";
 
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
     data.get(field).and_then(Value::as_str).unwrap_or("")
@@ -368,7 +373,7 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
     tracing::info!(lesson = %c.item.name, "replaying a lesson with and without it");
     let with = run_arm(host, paths, replayer, &c, "with", &stamp, &guard.cancel).await;
     let without = match &with {
-        Ok((_, state)) if state != "cancelled" && !guard.cancel.is_cancelled() => run_arm(host, paths, replayer, &c, "without", &stamp, &guard.cancel).await,
+        Ok((_, state)) if state != "cancelled" && state != USER_STOPPED && !guard.cancel.is_cancelled() => run_arm(host, paths, replayer, &c, "without", &stamp, &guard.cancel).await,
         Ok(_) => Err("cancelled".to_owned()),
         Err(error) => Err(error.clone()),
     };
@@ -376,6 +381,12 @@ pub async fn replay_one(host: &Host, paths: &Paths, replayer: &dyn Replayer, las
         let _ = std::fs::remove_dir_all(paths.replays.join(format!("{stamp}-{arm}")));
     }
     forget(host, paths).await;
+    let stopped = |arm: &Result<(String, String), String>| matches!(arm, Ok((_, state)) if state == USER_STOPPED);
+    if stopped(&with) || stopped(&without) {
+        let _ = host.call(memory_methods::KNOWLEDGE_UPSERT, json!({"kind": knowledge::LESSON, "name": c.item.name, "text": "", "by": "replay", "evidence": ["replay://stopped"]})).await;
+        tracing::info!(lesson = %c.item.name, "the user stopped the replay; the lesson is not replayed again");
+        return None;
+    }
     let ((with_session, with_state), (without_session, without_state)) = match (with, without) {
         (Ok(with), Ok(without)) if with.1 != "cancelled" && without.1 != "cancelled" => (with, without),
         (with, without) => {
