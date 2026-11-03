@@ -139,6 +139,8 @@ struct ReplayState {
     active: bool,
     cancel: CancellationToken,
     foreground: usize,
+    /// The user stopped a replay: none starts until their next turn.
+    paused: bool,
 }
 
 /// A foreground request owns its preparation until it has registered its run.
@@ -169,7 +171,7 @@ impl crate::replay::Replayer for FlowReplayer {
 
     fn begin(&self) -> Option<crate::replay::ReplayGuard> {
         let mut replay = self.flow.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if replay.active || replay.foreground > 0 || !self.idle() || self.flow.inner.park.is_cancelled() {
+        if replay.active || replay.paused || replay.foreground > 0 || !self.idle() || self.flow.inner.park.is_cancelled() {
             return None;
         }
         replay.active = true;
@@ -186,7 +188,7 @@ impl crate::replay::Replayer for FlowReplayer {
         let ctx = self.ctx.clone();
         Box::pin(async move {
             let params = TurnParams { session_id: session_id.clone(), text, mode: "auto".to_owned(), attachments: Vec::new(), spec: false, mentions: Vec::new() };
-            let started = flow.turn_inner(ctx.clone(), params, Some(cancel)).await?;
+            let started = flow.turn_inner(ctx.clone(), params, Some(cancel.clone())).await?;
             if let Some((.., mut done)) = flow.active(&session_id) {
                 while done.borrow().is_none() {
                     if done.changed().await.is_err() {
@@ -201,6 +203,11 @@ impl crate::replay::Replayer for FlowReplayer {
                 .find(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "run_id") == started.run_id && str_field(&entry.data, "state") != "running")
                 .map(|entry| str_field(&entry.data, "state").to_owned())
                 .unwrap_or_else(|| "cancelled".to_owned());
+            // The run was cancelled but the replay was not: the user stopped it.
+            if state == "cancelled" && !cancel.is_cancelled() {
+                flow.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).paused = true;
+                return Ok(crate::replay::USER_STOPPED.to_owned());
+            }
             Ok(state)
         })
     }
@@ -364,7 +371,8 @@ impl Chatflow {
     /// Register a run for `session_id` unless one is active. Returns the stops and the sender.
     fn register(&self, session_id: &str, run_id: &str) -> Option<Registered> {
         // Non-replay entrances (plans, agent runs and resumed runs) also yield background work.
-        let replay = self.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut replay = self.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        replay.paused = false;
         replay.cancel.cancel();
         self.register_with_cancel(session_id, run_id, None)
     }
@@ -660,6 +668,7 @@ impl Chatflow {
         } else {
             let mut state = self.inner.replay.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.foreground += 1;
+            state.paused = false;
             state.cancel.cancel();
             Some(ForegroundTurn(self.inner.clone()))
         };
