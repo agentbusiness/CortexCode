@@ -7,13 +7,15 @@
 //! - A member's call is taken when its method is declared and its verb's access is allowed for
 //!   where the member is (`read` from anywhere; `edit` and `run` only from an app on this
 //!   machine). The mesh stamps who asked into the params as `caller`.
+//! - A service for `peers` (`Share::audience`) is taken only from a member whose card shares the
+//!   same service, and listed to this computer's apps only when this computer shares it too.
 //! - Events: from each app on this machine that shares services, this mesh asks for those
 //!   services' events (`mesh.events`) and publishes them on this frame as they come; that app's
 //!   mesh sends only the events that name this app (`node`, `owner.node`).
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{OfferedService, ServiceCallParams, ServiceCard, ServicesResult};
-use cc_protocol::contracts::service::{self as svc, Access, Caller, Share, ShareList};
+use cc_protocol::contracts::service::{self as svc, Access, Audience, Caller, Share, ShareList};
 use cc_protocol::{Ctx, RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -79,10 +81,9 @@ impl Mesh {
         let access = svc::access_of(method).ok_or_else(|| refuse(format!("`{method}` is not shared with members")))?;
         let service = svc::service_of(method).unwrap_or("");
         let shares = self.local_shares().await;
-        let declared = shares.iter().any(|share| share.service == service && share.method(method).is_some());
-        if !declared {
+        let Some(share) = shares.iter().find(|share| share.service == service && share.method(method).is_some()) else {
             return Err(refuse(format!("`{method}` is not shared with members")));
-        }
+        };
         let local = self.is_local(node);
         if access != Access::Read && !local {
             return Err(refuse(format!(
@@ -91,6 +92,9 @@ impl Mesh {
             )));
         }
         let card = lock(&self.cards).get(node).cloned();
+        if share.audience == Audience::Peers && !card.as_ref().is_some_and(|card| card.services.iter().any(|offered| offered.service == service)) {
+            return Err(refuse(format!("`{method}` answers only apps that share `{service}` themselves")));
+        }
         let theirs: Caller = params.get("caller").cloned().and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
         let caller = Caller {
             app: card.as_ref().map(|card| card.software.clone()).unwrap_or_default(),
@@ -184,6 +188,7 @@ impl Mesh {
             .into_iter()
             .map(|share| OfferedService { node: me.clone(), name: self.name(), here: true, local: true, reachable: true, share, access: vec![Access::Read, Access::Edit, Access::Run] })
             .collect();
+        let mine: Vec<String> = out.iter().map(|offer| offer.share.service.clone()).collect();
         let peers: Vec<(String, String, bool, bool)> = self
             .members()
             .into_values()
@@ -200,6 +205,10 @@ impl Mesh {
             let reachable = self.connection(&node).is_some();
             let shares = if reachable { self.member_shares(&node).await } else { Vec::new() };
             for share in shares {
+                // A peers-only service is for the apps that share it too.
+                if share.audience == Audience::Peers && !mine.contains(&share.service) {
+                    continue;
+                }
                 let access = if local { vec![Access::Read, Access::Edit, Access::Run] } else { vec![Access::Read] };
                 out.push(OfferedService { node: node.clone(), name: name.clone(), here: false, local, reachable, share, access });
             }

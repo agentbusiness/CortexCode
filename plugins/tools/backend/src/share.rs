@@ -2,12 +2,13 @@
 //! audit's line scan and dependency check as the `tools.security` service, so the CortexTerm on
 //! this Mac can check a script it fetched, an MCP server's package or a launch agent's program
 //! with the same attack classes and lockfile parsers the audit uses. Both read files of this Mac,
-//! so they answer only apps on this machine.
+//! so they answer only apps on this machine. It is for apps' own checks, never a model tool
+//! (`Audience::Apps`): CortexCode's model has the audit as a skill.
 //!
 //! The work is the audit's own script (`skills-security`'s `secaudit.py`, `scan --json` and
 //! `deps --json`): one implementation of the classes and parsers, never a second copy.
 
-use cc_protocol::contracts::service::{Caller, Share, ShareList, SharedMethod};
+use cc_protocol::contracts::service::{Audience, Caller, Share, ShareList, SharedMethod};
 use cc_protocol::contracts::tools::methods;
 use cc_protocol::{RpcError, codes};
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ pub fn shares() -> ShareList {
                 }),
             ),
         ],
+        audience: Audience::Apps,
     };
     ShareList { shares: vec![security] }
 }

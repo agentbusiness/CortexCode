@@ -3,9 +3,10 @@
 //! tagged for the call's work (`mesh.claim {tag}`) and gives it back when the call ends (`mesh.release`), so a run holds no model
 //! between its calls (a build, a test) and moves to a better model the moment one frees.
 //!
-//! Each computer decides who uses its own model next ([`Lending`]): one run's call at a time
-//! (a person's call on this computer's model only waits for another person's: the engine puts a
-//! person's request before agent work), and a freed model goes to the call that has waited longest
+//! Each computer decides who uses its own model next ([`Lending`]): one run's call per slot of the
+//! model at a time, so a model with two slots serves two calls side by side (a person's call on
+//! this computer's model only waits for another person's: the engine puts a person's request
+//! before agent work), and a freed slot goes to the call that has waited longest
 //! (`since`: when this call began to wait). Ordering by a run's age (its first claim) starved the
 //! youngest run, since older runs call again after every tool step (seen: an agent that waited 82
 //! minutes and never ran). A claim that finds nothing free waits at every model it could use
@@ -91,8 +92,9 @@ struct ModelOption {
 impl Mesh {
     // --- the lending side: this computer's model ----------------------------------------------
 
-    /// Whether this computer's model can take one more use now: nobody holds it and it runs
-    /// nothing else; or, for a person's call made here, no other person's call holds or runs it.
+    /// Whether this computer's model can take one more use now: a slot is free (fewer uses held,
+    /// and fewer slots busy, than it has slots) and nothing waits for one; or, for a person's
+    /// call made here, no other person's call holds or runs it.
     async fn model_free_for(&self, requester: &str, foreground: bool) -> bool {
         let Some(ctx) = self.ctx.get() else { return false };
         let Some(slots) = ctx.call("model.slots", json!({})).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { return false };
@@ -102,7 +104,10 @@ impl Mesh {
             let person_runs = slots.slots.iter().any(|slot| slot.busy && slot.priority == Some(Priority::Foreground)) || slots.queued_by_priority.foreground > 0;
             return !person_holds && !person_runs;
         }
-        lending.holders.is_empty() && slots.busy == 0 && slots.queued == 0
+        // A held use may not run yet, and work that does not claim runs without a holder: the
+        // larger of the two counts the slots taken.
+        let taken = lending.holders.len().max(slots.busy as usize);
+        taken < slots.slots.len().max(1) && slots.queued == 0
     }
 
     /// Lend this computer's model for one use: at once when it is free and no older run waits for
