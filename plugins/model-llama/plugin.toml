@@ -1,0 +1,43 @@
+# CortexCode plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin: its backend
+# and README together, separable into its own repository (only cc-protocol comes from outside).
+# `cortex-pack` builds the folder and packs it into a portable .ccplugin; the frame runs it only as
+# an installed package. Paths are relative to this folder.
+
+[plugin]
+id = "model-llama"
+name = "Model (Qwen on llama.cpp)"
+version = "0.1.0"
+description = "Qwen3.8-27B (unsloth UD quants, with its vision projector) on upstream llama.cpp's llama-server, CUDA or Vulkan, with DFlash 2 block-diffusion drafts: the model engine for Linux. Q4 on a GPU with 24 GB or more, Q3 on 16 GB. A machine without such a GPU runs no model and lends none: it uses a member's Qwen through the mesh."
+license = "UNLICENSED"
+platforms = ["linux"]
+
+# The logic plugin: a supervised process speaking CPP/1 to the frame. It supervises one llama-server
+# child (built from the vendored llama.cpp by build.sh, shipped in llama/ beside the executable with
+# its GPU backends) on loopback.
+[backend]
+category = "model"
+contract = "model@1"
+dir = "backend"
+build = ["sh", "build.sh"]
+exec = "backend/target/release/cc-model-llama"
+assets = ["backend/target/release/llama"]
+swap = "drain_first"
+hello_timeout_ms = 60000
+# A first start may download the model (15 or 20 GB) before the probe's generation check.
+probe_timeout_ms = 600000
+provides = [
+  "model.info", "model.chat", "model.complete", "model.tokenize", "model.count", "model.slots",
+  "model.hibernate", "model.hold", "model.prewarm", "model.variants", "model.select", "model.yield",
+]
+publishes = ["model.progress", "model.install"]
+
+# Defaults for the frame config's [plugin.config] table (the frame config's values win).
+[backend.config]
+variant = ""            # "" = by the GPU's memory: qwen3.8-27b-q4 from 24 GB, qwen3.8-27b-q3 from 16 GB
+ctx = 32768             # context tokens per slot
+parallel = 2            # llama-server slots (the pool is ctx * parallel)
+ubatch = 512
+kv_type = "q8_0"        # flash attention's quantized cache (checked once, falls back to f16)
+idle_unload_s = 600     # unload Qwen after this long without a request
+draft_max = 7           # tokens DFlash 2 drafts per step at most
+borrow = true           # use another app's Qwen on this machine (through the mesh) instead of loading one
