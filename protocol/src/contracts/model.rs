@@ -475,6 +475,11 @@ pub struct SlotsResult {
     /// Recent throughput and the measured cost of hibernation (for the agents scheduler).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<LiveMetrics>,
+    /// The model is in memory now (false: it loads on the next call that needs it). An app that
+    /// needs work of this model's tag uses a model already loaded on its computer before it loads
+    /// one (the cortex-network).
+    #[serde(default)]
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
