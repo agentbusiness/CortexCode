@@ -332,6 +332,11 @@ impl Mesh {
         if session.is_empty() {
             return Err(RpcError::invalid_params("session_id must not be empty"));
         }
+        // A claim that finds nothing free waits at this computer's model too, and only the grant
+        // loop serves that wait: it runs from the first claim, whoever makes it (seen: an app that
+        // claims in process, not through `mesh.claim`, stopped for good at its first call that had
+        // to wait).
+        self.start_granting();
         // A use still held (a call that never gave it back) is over now.
         self.release(&session).await;
         // The call's place in the line: when it began to wait.

@@ -1,11 +1,11 @@
 /**
  * workbench.band@1 — the card host (card.host), at the right of the brand band. A toggle that says
  * the state of things while closed (KV fill · agents running) and, next to it, Open pane or Close
- * pane (the right pane's one switch); and the card it opens, anchored under the band at the
- * toggle's right edge: the header (`card.header@1`), then every section plugin (`card.git@1`,
+ * pane (the right pane's one switch), and last the settings window's gear (`settings.host@1`);
+ * and the card it opens, anchored under the band at the bar's right edge: the header (`card.header@1`), then every section plugin (`card.git@1`,
  * `card.agents@1`, `card.tasks@1`, `card.board@1`, `card.index@1`, `card.model@1`, and any other
- * `card.<name>@1` dropped in; a section with nothing to say renders nothing), then the foot: the
- * settings window (`settings.host@1`) behind a gear, how full the model's KV pool is, and Hide.
+ * `card.<name>@1` dropped in; a section with nothing to say renders nothing), then the foot: how
+ * full the model's KV pool is, and Hide.
  */
 
 import { useEffect, useRef } from 'react';
@@ -87,11 +87,14 @@ function Card() {
     <div className="cx-card-host" data-build={__CORTEX_BUILD__} data-open={open ? 'true' : 'false'} data-pane={collapsed ? 'collapsed' : 'open'}>
       <div className="cx-card-bar">
         <button type="button" className={`detent cx-card-toggle${waiting > 0 ? ' cx-attn' : ''}`} aria-expanded={open} aria-pressed={open} onClick={() => toggle(!open)}
-          title={open ? 'Hide the card' : 'Open the card: git, agents, tasks, board, index, model, settings'} data-summary={parts.join(' · ')}>
+          title={open ? 'Hide the card' : 'Open the card: git, agents, tasks, board, index, model'} data-summary={parts.join(' · ')}>
           {parts.length ? parts.join(' · ') : 'Card'}
         </button>
         <button type="button" className="detent cx-pane-open" data-action={collapsed ? 'open-pane' : 'close-pane'} aria-pressed={!collapsed} onClick={() => setCollapsed(!collapsed)}
           title={collapsed ? 'Open the right pane again, at its last width and tab' : 'Close the right pane; the conversation takes the width'}>{collapsed ? 'Open pane' : 'Close pane'}</button>
+        <button type="button" className="detent cx-band-gear" onClick={() => (settings === null ? openSettings() : closeSettings())} data-action="settings" aria-pressed={settings !== null} title="Settings: model, plugins, agents, machine…" aria-label="Settings">
+          <Gear />
+        </button>
       </div>
       {/* Mounted from the start and only shown when open, so the sections are ready at once. */}
       {(
@@ -101,9 +104,6 @@ function Card() {
             <host.Slot key={slot} name={slot} className="cx-card-section" />
           ))}
           <div className="cx-card-foot">
-            <button type="button" className="cx-icon" onClick={() => openSettings()} data-action="settings" title="Settings: model, plugins, agents, machine…" aria-label="Settings">
-              <Gear />
-            </button>
             <KvMeter kv={kv} />
             <button type="button" className="detent tiny" data-action="hide" onClick={() => toggle(false)}>Hide</button>
           </div>

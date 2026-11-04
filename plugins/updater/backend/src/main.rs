@@ -28,6 +28,7 @@ impl Plugin for UpdaterPlugin {
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         self.updater.attach(&ctx);
+        self.updater.clear_work();
         self.updater.spawn_loop(self.stop.clone());
         Box::pin(async { Ok(()) })
     }

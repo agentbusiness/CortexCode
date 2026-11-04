@@ -536,7 +536,7 @@ impl Runtime {
             other => return Err(format!("unknown speculative mode `{other}` (auto | off)")),
         };
         let identity = format!("{}@{}", spec.repo, spec.revision);
-        let hibernate_dir = self.paths.data_dir.join("hibernated");
+        let hibernate_dir = self.hibernate_dir();
         let metrics = Arc::new(Metrics::default());
         let state_capacity = u32::try_from(plan.ctx_total.min(geometry.native_context)).unwrap_or(u32::MAX);
         let config = EngineConfig {
@@ -1059,8 +1059,23 @@ impl Runtime {
         answer.await.unwrap_or_default()
     }
 
-    /// Conversations a predecessor hibernated: adopted now, or at load.
+    /// Where this process writes its hibernated conversations: `hibernated/<pid>/`, so files a
+    /// killed process left are told apart from a living one's (`engine::sweep_hibernated`).
+    pub fn hibernate_dir(&self) -> PathBuf {
+        self.paths.data_dir.join("hibernated").join(std::process::id().to_string())
+    }
+
+    /// Delete what dead processes hibernated (and files of the old flat layout). Run at activation,
+    /// after the handover moved the adopted files into this process's folder.
+    pub fn sweep_hibernated(&self) {
+        engine::sweep_hibernated(&self.paths.data_dir.join("hibernated"), &self.hibernate_dir());
+    }
+
+    /// Conversations a predecessor hibernated: adopted now, or at load. Their files move into this
+    /// process's folder first, so they outlive the predecessor's folder.
     pub fn adopt(&self, records: Vec<Hibernated>) {
+        let own = self.hibernate_dir();
+        let records: Vec<Hibernated> = records.into_iter().filter_map(|record| engine::move_hibernated(record, &own)).collect();
         if let Some(loaded) = self.current() {
             let _ = loaded.engine.send(Command::Adopt(records));
         } else if let Ok(mut adopted) = self.adopted.lock() {

@@ -4,6 +4,8 @@
 #cc .cx-card-bar{display:flex;align-items:center;gap:8px;min-width:0;}
 #cc .cx-card-toggle{max-width:min(420px,40vw);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 #cc .cx-pane-open{flex:0 0 auto;}
+#cc .cx-band-gear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 24px;width:24px;height:24px;padding:0;}
+#cc .cx-band-gear svg{width:13px;height:13px;}
 /* The card floats clear of the bar's rule (its own thing, not part of the line), narrow and dense:
    one line per thing, the detail a pane away. Its right edge is the toggle's. */
 #cc .cx-card{

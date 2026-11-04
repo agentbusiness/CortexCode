@@ -879,7 +879,6 @@ impl Mesh {
             methods::PROJECTS => to_value(&self.projects().await),
             methods::CLAIM => {
                 let params: ClaimParams = parse_params(params)?;
-                self.start_granting();
                 to_value(&self.claim(params, cancel).await?)
             }
             methods::RELEASE => {

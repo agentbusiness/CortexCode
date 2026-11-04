@@ -162,12 +162,21 @@ function writeIfChanged(path, text, mode = 0o644) {
   return true;
 }
 
-/** The starter's script: the newest ready version in APPS, started as this launcher starts it. */
+/**
+ * The starter's script: the newest ready version in APPS, started exactly as this launcher starts it
+ * (its binary run directly, detached, output to the start log). Not through `open`: that hands the
+ * bundle to LaunchServices, which starts it differently from a terminal. When the app already runs,
+ * it brings the app's window forward instead (macOS).
+ */
 function starterScript() {
-  const start =
+  const exe = process.platform === 'darwin' ? '$apps/$version/CortexCode.app/Contents/MacOS/CortexCode' : '$apps/$version/cortexcode/CortexCode';
+  // The window belongs to the frame's Electron child: opening that running bundle activates it.
+  const forward =
     process.platform === 'darwin'
-      ? 'exec open "$apps/$version/CortexCode.app" --stdout "$log" --stderr "$log" --args "$@"'
-      : 'exec "$apps/$version/cortexcode/CortexCode" "$@" >>"$log" 2>&1';
+      ? `  shell="$(ps -axo ppid=,comm= | awk -v p="$pid" '$1 == p && /\\.app\\/Contents\\/MacOS\\// { sub(/^ *[0-9]+ +/, ""); sub(/\\/Contents\\/MacOS\\/.*/, ""); print; exit }')"
+  [ -n "$shell" ] && open "$shell"
+`
+      : '';
   const missing =
     process.platform === 'darwin'
       ? `osascript -e 'display alert "CortexCode is not installed" message "Run npx cortexcode in a terminal to install it."' >/dev/null 2>&1`
@@ -176,6 +185,10 @@ function starterScript() {
 # CortexCode starter, written by npx cortexcode: starts the newest app installed in the folder below.
 apps=${shq(APPS)}
 log=${shq(START_LOG)}
+pid="$(sed -n 's/.*"pid": *\\([0-9][0-9]*\\).*/\\1/p' ${shq(join(HOME, 'run', 'frame.json'))} 2>/dev/null)"
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+${forward}  exit 0
+fi
 mkdir -p "$(dirname "$log")"
 version="$(ls "$apps" 2>/dev/null | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n |
   while read -r v; do [ -e "$apps/$v/${READY}" ] && echo "$v"; done | tail -n 1)"
@@ -183,7 +196,8 @@ if [ -z "$version" ]; then
   ${missing}
   exit 1
 fi
-${start}
+# Detached, so the starter ends at once and opening it again finds the running app.
+nohup "${exe}" "$@" >>"$log" 2>&1 </dev/null &
 `;
 }
 
