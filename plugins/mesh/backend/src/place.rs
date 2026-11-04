@@ -37,7 +37,8 @@ pub(crate) struct Candidate {
     pub(crate) node: Option<String>,
     name: String,
     model_id: String,
-    /// 0 this computer, 1 local network, 2 remote.
+    /// 0 this app's own model, 1 local network, 2 remote, 3 another app on this computer (it
+    /// shares this computer's GPU, so it comes after the other computers).
     tier: u8,
     /// The model's files on disk: within one family, the larger the stronger.
     pub(crate) weights: u64,
@@ -118,7 +119,14 @@ impl Mesh {
                     return None;
                 }
                 let (path, _) = Self::path_of(connection);
-                Some(Candidate { node: Some(member.node.clone()), name: member.name.clone(), model_id: model.model_id.clone(), tier: if path == "lan" { 1 } else { 2 }, weights: 0, tok_s: model.tok_s })
+                let tier = if member.local {
+                    3
+                } else if path == "lan" {
+                    1
+                } else {
+                    2
+                };
+                Some(Candidate { node: Some(member.node.clone()), name: member.name.clone(), model_id: model.model_id.clone(), tier, weights: 0, tok_s: model.tok_s })
             })
             .collect();
         found

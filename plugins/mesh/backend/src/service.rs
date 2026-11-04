@@ -9,7 +9,7 @@ use cc_protocol::contracts::mesh::{
     CallParams, CapacityParams, Card, Changed, ClaimParams, LendParams, AllowParams, Member, MembersResult, MeshStatus, NameParams, NodeParams, PairCode, PairJoinParams, Peer, PeersResult, PlaceParams, methods,
     topics,
 };
-use cc_protocol::contracts::model::{ModelInfo, YieldParams};
+use cc_protocol::contracts::model::ModelInfo;
 use cc_protocol::contracts::now_ms;
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use iroh::Endpoint;
@@ -45,7 +45,6 @@ pub const PROVIDES: &[&str] = &[
     methods::LINK,
     methods::CLAIM,
     methods::RELEASE,
-    methods::MODEL_YIELD,
     methods::SERVICES,
     methods::SERVICE_CALL,
 ];
@@ -937,10 +936,6 @@ impl Mesh {
                 let params: ClaimParams = parse_params(params)?;
                 self.release(&params.session_id).await;
                 Ok(json!({}))
-            }
-            methods::MODEL_YIELD => {
-                let params: YieldParams = parse_params(params)?;
-                to_value(&self.ask_local_yield(&params.to_tag).await)
             }
             methods::LINK => {
                 let mut params: NodeParams = parse_params(params)?;

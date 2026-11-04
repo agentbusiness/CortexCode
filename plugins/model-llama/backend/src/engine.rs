@@ -1,9 +1,9 @@
-//! Where each `model.*` call goes, and one model per machine.
+//! Where each `model.*` call goes.
 //!
 //! - A GPU with at least 16 GB (`gpu`, `catalog::MIN_GPU_BYTES`): Qwen is loaded on the first call
 //!   that needs it (installing it first when needed), unloaded after `idle_unload_s` without a
-//!   request and at critical memory pressure. Before it loads, the other apps on this machine are
-//!   asked to unload their model (`mesh.model.yield`): Qwen, tagged `coding`, ranks first.
+//!   request and at critical memory pressure. The other apps' models on this machine stay loaded:
+//!   each app lends its own (the cortex-network).
 //! - Another app on this machine already holds a Qwen (a local member of the mesh): every call that
 //!   reaches this plugin is forwarded to it through the mesh (borrowed), and none loads here.
 //! - No such GPU: Qwen is never installed or loaded and nothing is lent; every call goes to a
@@ -21,7 +21,7 @@ use crate::server::{Launch, Server};
 use crate::store;
 use cc_protocol::contracts::model::{
     ChatParams, CompleteParams, HoldParams, ModelInfo, PrewarmParams, SelectParams, SelectResult, SlotState, SlotsResult, TokenizeParams, Variant, VariantsResult, VisionInfo,
-    YieldResult, methods, tags,
+    methods, tags,
 };
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
@@ -32,8 +32,6 @@ use tokio_util::sync::CancellationToken;
 
 pub const ENGINE_REVISION: &str = "llama.cpp 468ad58 (unslothai b11876)";
 const WATCH_EVERY: Duration = Duration::from_secs(5);
-/// How long a load waits for the other apps on this machine to unload their model.
-const YIELD_WAIT: Duration = Duration::from_secs(5);
 
 /// Where stream items go: the caller over CPP/1, or stdout (the `call` command).
 pub enum Sink {
@@ -280,19 +278,6 @@ impl Engine {
         self.local().await.map(Target::Local)
     }
 
-    /// One model per machine: before the weights load, every other app on this machine holding a
-    /// model not tagged `coding` (CortexTerm's Gemma) is asked to unload it (`mesh.model.yield`,
-    /// mesh@1). Best effort: no mesh plugin, or no answer within a few seconds, and the load goes on.
-    async fn ask_yield(&self) {
-        let Some(ctx) = &self.ctx else { return };
-        let asked = tokio::time::timeout(YIELD_WAIT, ctx.call("mesh.model.yield", json!({"to_tag": tags::CODING}))).await;
-        if let Ok(Ok(answer)) = asked
-            && answer.get("asked").and_then(Value::as_array).is_some_and(|asked| !asked.is_empty())
-        {
-            tracing::info!(%answer, "asked the other apps on this machine to unload their model");
-        }
-    }
-
     /// The loaded server, loading it (and installing the model) first when needed.
     async fn local(&self) -> Result<Arc<Server>, RpcError> {
         let mut slot = self.server.lock().await;
@@ -306,7 +291,6 @@ impl Engine {
         }
         let spec = self.spec();
         self.ensure_installed(spec).await?;
-        self.ask_yield().await;
         self.set_state("loading");
         let server = match self.start(spec).await {
             Ok(server) => Arc::new(server),
@@ -575,8 +559,6 @@ impl Engine {
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value, items: Option<&Sink>, cancel: CancellationToken) -> Result<Value, RpcError> {
         match method {
             methods::INFO => return self.info().await,
-            // Qwen ranks first: it never yields to another app's model.
-            methods::YIELD => return to_value(&YieldResult { yielded: false }),
             methods::VARIANTS => return to_value(&self.variants()),
             methods::SELECT => {
                 let params: SelectParams = parse_params(params)?;

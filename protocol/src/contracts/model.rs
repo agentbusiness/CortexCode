@@ -48,11 +48,6 @@ pub mod methods {
     pub const VARIANTS: &str = "model.variants";
     /// Switch the active variant (reloads weights).
     pub const SELECT: &str = "model.select";
-    /// [`super::YieldParams`] -> [`super::YieldResult`]: another app on this machine needs a
-    /// model tagged `to_tag` that this one is not: take no new work, let what runs finish, unload
-    /// (one model per machine). The mesh forwards it from a local member; a plugin that does not
-    /// serve it answers unknown_method and nothing happens.
-    pub const YIELD: &str = "model.yield";
 }
 
 pub mod topics {
@@ -586,20 +581,6 @@ pub struct Variant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VariantsResult {
     pub variants: Vec<Variant>,
-}
-
-/// Params of `model.yield` (and of the mesh's `mesh.model.yield`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct YieldParams {
-    /// The tag the asking app needs (`coding`).
-    pub to_tag: String,
-}
-
-/// Result of `model.yield`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct YieldResult {
-    /// A loaded model was unloaded.
-    pub yielded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

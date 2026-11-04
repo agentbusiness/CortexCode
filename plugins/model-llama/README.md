@@ -34,12 +34,11 @@ member's Qwen (`mesh.call`), on this machine or another one.
   when it fails.
 - Two slots of 32k tokens each, prompt caching per conversation (`cache_prompt`).
 
-## One model per machine
+## Other apps' models
 
-Before Qwen loads, the other apps on this machine are asked to unload their model
-(`mesh.model.yield`, as `model-bonsai` and `model-uzu` ask): Qwen, tagged `coding`, ranks first and
-never yields itself. While another app on this machine already holds a Qwen, calls are forwarded to
-it and none loads here.
+The other apps' models on this machine stay loaded when Qwen loads: each app lends its own (the
+cortex-network). While another app on this machine already holds a Qwen, calls are forwarded to it
+and no second copy of the same model loads here.
 
 ## Building
 

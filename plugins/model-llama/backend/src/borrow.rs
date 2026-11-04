@@ -1,6 +1,6 @@
-//! A member's Qwen, through the mesh: another app's on this machine (one model per machine: the
-//! apps here are members of each other's mesh without pairing), or, on a machine without a GPU
-//! that runs Qwen, any member's. Cards show the model each member holds and lends. `look` finds
+//! A member's Qwen, through the mesh: another app's on this machine (the same model is not
+//! loaded twice on one machine; other models stay, each app lends its own), or, on a machine
+//! without a GPU that runs Qwen, any member's. Cards show the model each member holds and lends. `look` finds
 //! one; `call` forwards a `model.*` call to it (`mesh.call`), stream items as the model produces
 //! them.
 
