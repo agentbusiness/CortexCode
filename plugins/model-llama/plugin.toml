@@ -27,7 +27,7 @@ hello_timeout_ms = 60000
 probe_timeout_ms = 600000
 provides = [
   "model.info", "model.chat", "model.complete", "model.tokenize", "model.count", "model.slots",
-  "model.hibernate", "model.hold", "model.prewarm", "model.variants", "model.select", "model.yield",
+  "model.hibernate", "model.hold", "model.prewarm", "model.variants", "model.select",
 ]
 publishes = ["model.progress", "model.install"]
 

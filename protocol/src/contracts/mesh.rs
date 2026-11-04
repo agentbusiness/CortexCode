@@ -67,11 +67,6 @@ pub mod methods {
     pub const CLAIM: &str = "mesh.claim";
     /// [`super::ClaimParams`] -> `{}`: the use is over; the resource is free for the next run.
     pub const RELEASE: &str = "mesh.release";
-    /// [`crate::contracts::model::YieldParams`] -> [`super::YieldResult`]: one model per machine.
-    /// Called here (a model plugin about to load a model tagged `to_tag`): every member on this
-    /// machine whose model is not tagged `to_tag` is asked to unload it. Sent by a member on this
-    /// machine: forwarded to this frame's model plugin as `model.yield`.
-    pub const MODEL_YIELD: &str = "mesh.model.yield";
     /// [`super::LendParams`] -> [`super::MeshStatus`]: whether members may use this computer's
     /// model (off: its card shows no model and its claims are refused); this computer still uses
     /// theirs.
@@ -437,17 +432,6 @@ impl ClaimParams {
     }
 }
 
-/// Result of [`methods::MODEL_YIELD`] called here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct YieldResult {
-    /// The members on this machine that were asked to unload their model.
-    #[serde(default)]
-    pub asked: Vec<String>,
-    /// Those that unloaded one.
-    #[serde(default)]
-    pub yielded: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CapacityParams {
     /// The work the sessions would be for: only models with this tag count.
@@ -472,7 +456,8 @@ pub struct Placement {
     pub name: String,
     #[serde(default)]
     pub model_id: String,
-    /// `local` | `lan` | `remote`.
+    /// `local` (this app's own model) | `machine` (another app's on this computer) | `lan` |
+    /// `remote`.
     #[serde(default)]
     pub tier: String,
 }

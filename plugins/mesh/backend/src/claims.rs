@@ -13,8 +13,11 @@
 //! (here, and `mesh.model.claim` on each member); the first grant wins, the others are withdrawn.
 //! A claim may list several tags, best first (`mesh.claim {tags: ["coding", "office"]}`): a model
 //! with an earlier tag wins before the other rules, and a claim with several tags takes models of
-//! any family. One model per machine: this computer's own model is not an option while another
-//! app on this machine offers one with a better tag (it would load a second model).
+//! any family. Every app's model is its own option: the apps on one computer each lend theirs.
+//! Another computer's model ranks before another app's on this computer (tier `machine`): the apps
+//! here share this computer's GPU, so a call sent to one of them adds little while another
+//! computer is free (seen: an ingest's overflow went to a second model on its own computer while
+//! a free one on the local network waited).
 //! A claim whose tag no model has yet waits for one: it looks again whenever the models change
 //! (a model plugin here starts or swaps, a member connects, goes or sends its card), keeping its
 //! place, so the longest waiting call of that tag is first when a tagged model comes up.
@@ -81,7 +84,7 @@ struct ModelOption {
     rank: usize,
     name: String,
     model_id: String,
-    /// 0 this computer, 1 local network, 2 remote.
+    /// 0 this app's own model, 1 local network, 2 remote, 3 another app on this computer.
     tier: u8,
     weights: u64,
     tok_s: f64,
@@ -271,14 +274,14 @@ impl Mesh {
                 continue;
             }
             let Some((rank, tag)) = ranked(&model.tags) else { continue };
-            // One model per machine: another app here offers a better-tagged model than this
-            // computer's own, so this one's (which may not be loaded) is not an option.
-            if member.local
-                && let Some(own) = options.iter().position(|option| option.node.is_empty() && option.rank > rank)
-            {
-                options.remove(own);
-            }
-            let tier = if Self::path_of(connection).0 == "lan" { 1 } else { 2 };
+            // Another app on this computer shares its GPU: it comes after the other computers.
+            let tier = if member.local {
+                3
+            } else if Self::path_of(connection).0 == "lan" {
+                1
+            } else {
+                2
+            };
             let weights = self.weights_of(&member.node, &model.model_id).await;
             options.push(ModelOption { node: member.node.clone(), tag, rank, name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
         }
@@ -420,6 +423,7 @@ impl Mesh {
         let tier = match option.tier {
             0 => "local",
             1 => "lan",
+            3 => "machine",
             _ => "remote",
         };
         Ok(Placement { node: (!option.node.is_empty()).then(|| option.node.clone()), name: option.name.clone(), model_id: option.model_id.clone(), tier: tier.to_owned() })

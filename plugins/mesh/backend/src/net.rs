@@ -16,9 +16,6 @@
 //! release` (one use of this computer's model for a member's run, when the model has the run's
 //! tag: [`crate::claims`]).
 //!
-//! `mesh.model.yield {to_tag}` (only from an app on this machine: forwarded to this frame's model
-//! plugin as `model.yield`, one model per machine).
-//!
 //! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
 
 use crate::members::Entry;
@@ -217,20 +214,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let session = params.get("session_id").and_then(Value::as_str).unwrap_or("");
             mesh.give_back(&node, session);
             let message = answer(Ok(json!({})));
-            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-        }
-        "mesh.model.yield" => {
-            // Another app on this machine needs a model of another kind: this frame's model plugin
-            // unloads its own (one model per machine). Only an app on this machine may ask.
-            let outcome = if !mesh.is_local(&node) {
-                Err(RpcError::new(codes::CONTRACT_VIOLATION, "only an app on this machine may ask its model to yield"))
-            } else {
-                match mesh.ctx() {
-                    Ok(ctx) => ctx.call(cc_protocol::contracts::model::methods::YIELD, params).await,
-                    Err(error) => Err(error),
-                }
-            };
-            let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.window.ticket" => {

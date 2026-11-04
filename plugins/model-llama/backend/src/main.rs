@@ -38,7 +38,6 @@ const PROVIDES: &[&str] = &[
     methods::PREWARM,
     methods::VARIANTS,
     methods::SELECT,
-    methods::YIELD,
 ];
 
 #[derive(Default)]
