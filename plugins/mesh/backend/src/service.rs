@@ -400,8 +400,8 @@ impl Mesh {
 
     /// An app on this machine joins this node's network without a code: being on this machine
     /// (`crate::local`) is the proof, and the connection is its key. Taken only while this node is
-    /// in a network with other computers, and only for an app that was never in it (one that left
-    /// or was removed comes back by an invitation).
+    /// in a network with other computers; an app that left it is taken back, one a member removed
+    /// comes back only by an invitation.
     pub fn admit_local(&self, node: &str, name: &str, addrs: Vec<String>) -> Result<Vec<Entry>, String> {
         if !self.is_local(node) {
             return Err("only an app on this machine joins without an invitation".to_owned());
@@ -409,13 +409,16 @@ impl Mesh {
         if self.network().is_none() {
             return Err("this app is in no network".to_owned());
         }
-        if lock(&self.log).entries.iter().any(|entry| entry.node == node) {
-            return Err("this app was in the network before; it comes back by an invitation".to_owned());
+        let removed = lock(&self.log).entries.iter().rev().find(|entry| entry.node == node).is_some_and(|entry| entry.kind == "revoke" && entry.by != node);
+        if removed {
+            return Err("this app was removed from the network; it comes back by an invitation".to_owned());
         }
         self.admit(&JoinerRecord { node: node.to_owned(), name: name.to_owned(), addrs, sig: String::new() })
     }
 
-    /// A joiner takes the inviter's log as its own cortex.
+    /// A joiner takes the inviter's log as its own cortex. One already in a network with other
+    /// members links that network in (`Log::link`): the caller pushes the log, and every member
+    /// of both ends up on it (`Mesh::log_received`).
     pub fn adopt_log(&self, entries: Vec<Entry>) -> Result<(), String> {
         let mut candidate = Log { entries };
         candidate.validate()?;
@@ -426,7 +429,7 @@ impl Mesh {
             let mut log = lock(&self.log);
             let alone = log.members().len() <= 1;
             if log.founded() && !alone && log.entries.first() != candidate.entries.first() {
-                return Err("this computer is already in a cortex with other members; revoke it there first".to_owned());
+                candidate.link(&self.me, &log);
             }
             *log = candidate;
         }
@@ -445,6 +448,15 @@ impl Mesh {
             return None;
         }
         Some(cc_protocol::contracts::mesh::Network { id: first.hash()[..10].to_owned(), founder: first.name.clone(), founded_ms: first.ts_ms, members: members.len() as u32 })
+    }
+
+    /// When this node joined its network: its own latest `add` (the founder's is the first entry);
+    /// none while alone. Of two apps on this machine in different networks, the one that joined
+    /// earlier links its network into the other's (`Mesh::join_local`).
+    pub fn joined_ms(&self) -> Option<u64> {
+        self.network()?;
+        let me = self.me.hex();
+        lock(&self.log).entries.iter().rev().find(|entry| entry.kind == "add" && entry.node == me).map(|entry| entry.ts_ms)
     }
 
     /// Forget the network: the log goes, every connection closes, nothing borrowed or placed
@@ -489,7 +501,11 @@ impl Mesh {
         if !self.loaded() {
             return Err("this computer is still reading its membership".to_owned());
         }
-        let changed = lock(&self.log).merge(entries)?;
+        let merged = lock(&self.log).merge(entries.clone());
+        let changed = match merged {
+            Ok(changed) => changed,
+            Err(error) => self.take_link(entries).ok_or(error)?,
+        };
         if changed && !self.in_log(&self.me.hex()) {
             // Taken out by a member: this node is alone again.
             tracing::info!("this computer was removed from its network");
@@ -509,6 +525,28 @@ impl Mesh {
             }
         }
         Ok(changed)
+    }
+
+    /// A member's log of another network: when it took this node's network in (`Log::link`), this
+    /// node moves onto it, carrying over the members it holds that the other does not; when this
+    /// node's network took the other in, the copy is an old one and changes nothing. Two networks
+    /// that took each other in at once settle on the one with the smaller id. None: unrelated.
+    fn take_link(&self, entries: Vec<Entry>) -> Option<bool> {
+        let mut candidate = Log { entries };
+        candidate.validate().ok()?;
+        let mut log = lock(&self.log);
+        let (mine, theirs) = (log.id()?, candidate.id()?);
+        let they_took_mine = candidate.linked(&mine);
+        if log.linked(&theirs) && !(they_took_mine && theirs < mine) {
+            return Some(false);
+        }
+        if !they_took_mine || !candidate.is_member(&self.me.hex()) {
+            return None;
+        }
+        candidate.carry_over(&self.me, &log);
+        *log = candidate;
+        tracing::info!("this network was linked into another; every member of both is on it now");
+        Some(true)
     }
 
     // --- connections ---------------------------------------------------------------------------
