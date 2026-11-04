@@ -712,6 +712,59 @@ fn file_stem(key: &str) -> String {
     format!("{readable}-{hash:016x}")
 }
 
+/// Move an adopted conversation's file into `own` (this process's folder); None when the file is
+/// gone or cannot be moved (the conversation then starts cold).
+pub fn move_hibernated(mut record: Hibernated, own: &Path) -> Option<Hibernated> {
+    if record.file.parent() == Some(own) {
+        return Some(record);
+    }
+    let name = record.file.file_name()?.to_owned();
+    let target = own.join(name);
+    let moved = std::fs::create_dir_all(own).and_then(|()| std::fs::rename(&record.file, &target));
+    if let Err(error) = moved {
+        tracing::warn!(file = %record.file.display(), %error, "cannot take over a hibernated conversation; it starts cold");
+        let _ = std::fs::remove_file(&record.file);
+        return None;
+    }
+    record.file = target;
+    Some(record)
+}
+
+/// Delete what no living process owns under `root`: the folders of processes that ended without
+/// their cleanup (killed, crashed) and files of the old flat layout. `own` and the folders of
+/// living processes (a predecessor still draining) stay.
+pub fn sweep_hibernated(root: &Path, own: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == own {
+            continue;
+        }
+        if !path.is_dir() {
+            if let Ok(bytes) = entry.metadata().map(|meta| meta.len()) {
+                tracing::info!(file = %path.display(), bytes, "deleted a hibernated conversation no process owns");
+            }
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let pid = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok());
+        if pid.is_some_and(process_alive) {
+            continue;
+        }
+        tracing::info!(folder = %path.display(), "deleted the hibernated conversations of a process that has ended");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 checks existence only; EPERM means it exists under another user.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 impl<B: Backend> Worker<B> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -833,6 +886,8 @@ impl<B: Backend> Worker<B> {
                         let _ = std::fs::remove_file(&record.file);
                     }
                 }
+                // Empty once the files are gone or a successor moved them.
+                let _ = std::fs::remove_dir(&self.config.hibernate_dir);
                 break;
             }
             let admission_at = Instant::now();
@@ -926,8 +981,12 @@ impl<B: Backend> Worker<B> {
                 for record in records {
                     if record.identity == self.config.identity && record.file.exists() {
                         self.hibernated.insert(record.key.clone(), record);
+                    } else {
+                        // Saved by other weights: it cannot restore here, so it goes.
+                        let _ = std::fs::remove_file(&record.file);
                     }
                 }
+                self.bound_spill_files();
                 self.publish_view();
             }
             Command::Vision(message) => self.vision_message(message),

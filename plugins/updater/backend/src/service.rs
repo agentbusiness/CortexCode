@@ -182,6 +182,18 @@ impl Updater {
         })
     }
 
+    /// Empty `work/` before the first round. A round deletes its own folder at the end, but one that
+    /// installs the updater itself is replaced mid-call and never gets there; by the time this
+    /// instance is active, that install is placed and its downloads are no longer read.
+    pub fn clear_work(&self) {
+        let work = self.data_dir.join("work");
+        if work.exists() {
+            if let Err(error) = std::fs::remove_dir_all(&work) {
+                tracing::warn!(folder = %work.display(), %error, "cannot clear the leftover download folders");
+            }
+        }
+    }
+
     /// The context and configuration arrive with the frame's hello acknowledgement; then what the
     /// graph keeps is read back.
     pub fn attach(self: &Arc<Self>, ctx: &Ctx) {

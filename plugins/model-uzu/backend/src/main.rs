@@ -51,7 +51,9 @@ fn main() {
         hello.swap = SwapPolicy::DrainFirst;
         // A deleted session's conversation is dropped, in memory and on disk.
         hello.subscribes = vec![cc_protocol::contracts::frame::topics::SESSION_DELETED.to_owned()];
-        match cc_protocol::run_plugin(hello, Arc::new(ModelPlugin::default())).await {
+        let plugin = Arc::new(ModelPlugin::default());
+        on_signals(plugin.clone());
+        match cc_protocol::run_plugin(hello, plugin).await {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("cc-model-uzu: {error}");
@@ -60,6 +62,21 @@ fn main() {
         }
     });
     std::process::exit(code);
+}
+
+/// SIGTERM / SIGINT: stop the engine first, so its cleanup runs (a killed engine leaves its
+/// hibernated conversations on disk), then exit.
+fn on_signals(plugin: Arc<ModelPlugin>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        plugin.stop().await;
+        std::process::exit(0);
+    });
 }
 
 async fn install(args: &[String]) -> i32 {

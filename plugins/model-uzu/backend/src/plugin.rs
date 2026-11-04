@@ -36,6 +36,15 @@ pub struct ModelPlugin {
     ctx: Arc<Mutex<Option<Ctx>>>,
 }
 
+impl ModelPlugin {
+    /// Stop the engine as `shutdown` does (its hibernated files go with it); for SIGTERM / SIGINT.
+    pub async fn stop(&self) {
+        if let Some(runtime) = self.runtime.get().cloned() {
+            runtime.shutdown().await;
+        }
+    }
+}
+
 /// How long the first call waits for the frame's hello acknowledgement (which carries the plugin
 /// configuration) to be recorded; the frame may send `plugin.probe` before `run_plugin` stored it.
 const CONFIG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -265,7 +274,13 @@ impl Plugin for ModelPlugin {
 
     fn activate(&self, ctx: Ctx) -> BoxFuture<'static, Result<(), RpcError>> {
         let runtime = self.runtime(&ctx);
-        Box::pin(async move { runtime.await.map(|_| ()) })
+        Box::pin(async move {
+            // The handover is done (adopted files are in this process's folder): what killed or
+            // crashed processes left goes now.
+            let runtime = runtime.await?;
+            tokio::task::spawn_blocking(move || runtime.sweep_hibernated()).await.ok();
+            Ok(())
+        })
     }
 
     fn event(&self, _ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
