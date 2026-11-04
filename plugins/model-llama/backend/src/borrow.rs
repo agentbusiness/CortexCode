@@ -19,6 +19,8 @@ pub struct Lender {
     /// The app (`cortexcode`), as the window shows it.
     pub software: String,
     pub model_id: String,
+    /// The model on the member's computer (its card's `plugin`), named on every call to it.
+    pub plugin: String,
 }
 
 /// A reachable member's model tagged `coding` (CortexCode needs Qwen): another app's on this
@@ -34,12 +36,12 @@ pub async fn look(ctx: &Ctx, own_loaded: bool, anywhere: bool) -> Option<Lender>
         .filter_map(|peer| {
             let card = peer.card?;
             let software = card.software;
-            let model = card.model?;
-            if own_loaded || !model.tags.iter().any(|tag| tag == tags::CODING) {
+            if own_loaded {
                 return None;
             }
+            let model = card.models.into_iter().find(|model| model.tags.iter().any(|tag| tag == tags::CODING))?;
             let rank = if peer.member.local { 0 } else { 1 };
-            Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id }))
+            Some((rank, Lender { node: peer.member.node, name: peer.member.name, software, model_id: model.model_id, plugin: model.plugin }))
         })
         .collect();
     found.sort_by_key(|(rank, _)| *rank);
@@ -58,7 +60,10 @@ pub fn prefix_cache_key(params: &mut Value) {
 
 /// One call on the lender's model. Stream items go to `on_item` as they arrive; `cancel` cancels
 /// the call there.
-pub async fn call(ctx: &Ctx, lender: &Lender, method: &str, params: Value, on_item: &mut (dyn FnMut(Value) + Send), cancel: Option<CancellationToken>) -> Result<Value, RpcError> {
+pub async fn call(ctx: &Ctx, lender: &Lender, method: &str, mut params: Value, on_item: &mut (dyn FnMut(Value) + Send), cancel: Option<CancellationToken>) -> Result<Value, RpcError> {
+    if let Some(params) = params.as_object_mut() {
+        params.insert(cc_protocol::contracts::model::PLUGIN_PARAM.to_owned(), Value::String(lender.plugin.clone()));
+    }
     let mut stream = ctx.call_stream("mesh.call", json!({"node": lender.node, "method": method, "params": params}))?;
     let cancel = cancel.unwrap_or_default();
     loop {

@@ -28,8 +28,8 @@ const WAIT_STEP: Duration = Duration::from_secs(1);
 pub struct Placements {
     /// session id -> the member serving its model calls.
     pub placed: Mutex<HashMap<String, String>>,
-    /// node -> the client connection the frame routes those sessions to.
-    clients: Mutex<HashMap<String, Arc<Client>>>,
+    /// (node, model) -> the client connection the frame routes those sessions to.
+    clients: Mutex<HashMap<(String, String), Arc<Client>>>,
 }
 
 pub(crate) struct Candidate {
@@ -37,6 +37,8 @@ pub(crate) struct Candidate {
     pub(crate) node: Option<String>,
     name: String,
     model_id: String,
+    /// The model on that computer (its card's `plugin`); empty for this computer's.
+    pub(crate) plugin: String,
     /// 0 this app's own model, 1 local network, 2 remote, 3 another app on this computer (it
     /// shares this computer's GPU, so it comes after the other computers).
     tier: u8,
@@ -88,13 +90,22 @@ impl Mesh {
         })
     }
 
-    /// Whether this computer's own model (not a borrowed one) is tagged for `tag`.
-    pub async fn local_serves(&self, tag: &str) -> bool {
-        self.local_model().await.is_some_and(|local| local.tags.iter().any(|own| own == tag))
+    /// The model of this computer's own (not a borrowed one) a claim for `tag` takes: the one named
+    /// `plugin`, or with no name the first tagged for it; None when it does not serve `tag`.
+    pub async fn local_serves(&self, plugin: &str, tag: &str) -> Option<String> {
+        let ctx = self.ctx.get()?;
+        if lock(&self.borrows).contains_key("model") {
+            return None;
+        }
+        crate::card::local_models(ctx)
+            .await
+            .into_iter()
+            .find(|(own, info)| (plugin.is_empty() || own == plugin) && info.tags.iter().any(|own_tag| own_tag == tag))
+            .map(|(own, _)| own)
     }
 
     /// Reachable members with a model of `family` (any family when None), tagged for `tag`, that
-    /// no session of ours is placed on. Whether the model is free now, and how strong it is, are asked live
+    /// no session of ours is placed on: each member's first such model. Whether the model is free now, and how strong it is, are asked live
     /// ([`Self::free_weights`]): a card is up to 15 s old.
     pub(crate) fn candidates(&self, family: Option<&str>, tag: &str) -> Vec<Candidate> {
         let me = self.me.hex();
@@ -108,13 +119,7 @@ impl Mesh {
             .filter_map(|member| {
                 let connection = conns.get(&member.node)?;
                 let card = cards.get(&member.node)?;
-                let model = card.model.as_ref()?;
-                if family.is_some_and(|family| !family.is_empty() && model.family != family) {
-                    return None;
-                }
-                if !model.tags.iter().any(|own| own == tag) {
-                    return None;
-                }
+                let model = card.models.iter().find(|model| family.is_none_or(|family| family.is_empty() || model.family == family) && model.tags.iter().any(|own| own == tag))?;
                 if placed.values().any(|node| *node == member.node) {
                     return None;
                 }
@@ -126,20 +131,20 @@ impl Mesh {
                 } else {
                     2
                 };
-                Some(Candidate { node: Some(member.node.clone()), name: member.name.clone(), model_id: model.model_id.clone(), tier, weights: 0, tok_s: model.tok_s })
+                Some(Candidate { node: Some(member.node.clone()), name: member.name.clone(), model_id: model.model_id.clone(), plugin: model.plugin.clone(), tier, weights: 0, tok_s: model.tok_s })
             })
             .collect();
         found
     }
 
     /// The size of a member's model when it runs nothing now (None: busy or not answering).
-    pub(crate) async fn free_weights(&self, node: &str) -> Option<u64> {
+    pub(crate) async fn free_weights(&self, node: &str, plugin: &str) -> Option<u64> {
         let fresh = self.call_member(node, "mesh.card", json!({}), None, CancellationToken::new()).await.ok()?;
-        let model = fresh.get("model")?;
+        let model = fresh.get("models")?.as_array()?.iter().find(|model| model.get("plugin").and_then(Value::as_str) == Some(plugin))?;
         if model.get("slots_busy").and_then(Value::as_u64) != Some(0) || model.get("queued").and_then(Value::as_u64) != Some(0) {
             return None;
         }
-        let info: ModelInfo = serde_json::from_value(self.call_member(node, "model.info", json!({}), None, CancellationToken::new()).await.ok()?).ok()?;
+        let info: ModelInfo = serde_json::from_value(self.call_member(node, "model.info", crate::card::for_model(plugin), None, CancellationToken::new()).await.ok()?).ok()?;
         Some(info.file_bytes)
     }
 
@@ -148,7 +153,7 @@ impl Mesh {
         let mut free = Vec::new();
         for mut candidate in self.candidates(family, tag) {
             let Some(node) = candidate.node.clone() else { continue };
-            if let Some(weights) = self.free_weights(&node).await {
+            if let Some(weights) = self.free_weights(&node, &candidate.plugin).await {
                 candidate.weights = weights;
                 free.push(candidate);
             }
@@ -174,9 +179,9 @@ impl Mesh {
             if let Some(node) = current {
                 if self.connection(&node).is_some() {
                     let member = self.member(&node);
-                    let model_id = lock(&self.cards).get(&node).and_then(|card| card.model.as_ref()).map(|model| model.model_id.clone()).unwrap_or_default();
+                    let model = lock(&self.cards).get(&node).and_then(|card| card.models.iter().find(|model| model.tags.contains(&params.tag)).cloned()).unwrap_or_default();
                     let tier = self.connection(&node).map(|connection| if Self::path_of(&connection).0 == "lan" { "lan" } else { "remote" }).unwrap_or("remote");
-                    return Ok(Placement { node: Some(node.clone()), name: member.map(|member| member.name).unwrap_or_default(), model_id, tier: tier.to_owned() });
+                    return Ok(Placement { node: Some(node.clone()), name: member.map(|member| member.name).unwrap_or_default(), model_id: model.model_id, plugin: model.plugin, tier: tier.to_owned() });
                 }
                 self.place_end(&params.session_id).await;
             }
@@ -190,30 +195,30 @@ impl Mesh {
                 // agent: free only when nothing runs here at all.
                 let free = if params.wait { local.busy_foreground == 0 && local.queued_foreground == 0 } else { local.busy == 0 && local.queued == 0 };
                 if free {
-                    options.push(Candidate { node: None, name: self.name(), model_id: String::new(), tier: 0, weights: local.weights, tok_s: local.tok_s });
+                    options.push(Candidate { node: None, name: self.name(), model_id: String::new(), plugin: String::new(), tier: 0, weights: local.weights, tok_s: local.tok_s });
                     options.sort_by(best_first);
                 }
             }
             for candidate in options {
                 let Some(node) = candidate.node else {
-                    return Ok(Placement { node: None, name: candidate.name, model_id: String::new(), tier: "local".to_owned() });
+                    return Ok(Placement { node: None, name: candidate.name, model_id: String::new(), plugin: String::new(), tier: "local".to_owned() });
                 };
-                match self.bind(&params.session_id, &node).await {
+                match self.bind(&params.session_id, &node, &candidate.plugin).await {
                     Ok(()) => {
                         tracing::info!(session = %params.session_id, member = %candidate.name, "a session's model calls go to a member");
                         self.notify("placed");
-                        return Ok(Placement { node: Some(node), name: candidate.name, model_id: candidate.model_id, tier: if candidate.tier == 1 { "lan".to_owned() } else { "remote".to_owned() } });
+                        return Ok(Placement { node: Some(node), name: candidate.name, model_id: candidate.model_id, plugin: candidate.plugin, tier: if candidate.tier == 1 { "lan".to_owned() } else { "remote".to_owned() } });
                     }
                     Err(error) => tracing::debug!(member = %candidate.name, %error, "could not route a session to a member"),
                 }
             }
             // Nothing to wait for: no model here and no member with one (the call fails or
             // queues as it would without the mesh).
-            let any_model = local.is_some() || lock(&self.cards).values().any(|card| card.model.is_some());
+            let any_model = local.is_some() || lock(&self.cards).values().any(|card| !card.models.is_empty());
             if !params.wait || !any_model {
                 // Nothing free: the call runs here, queued behind what runs (or, for an agent whose
                 // queue here is full, it stays queued).
-                return Ok(Placement { node: None, name: self.name(), model_id: String::new(), tier: if local.is_some() { "local".to_owned() } else { String::new() } });
+                return Ok(Placement { node: None, name: self.name(), model_id: String::new(), plugin: String::new(), tier: if local.is_some() { "local".to_owned() } else { String::new() } });
             }
             tokio::select! {
                 _ = tokio::time::sleep(WAIT_STEP) => {}
@@ -222,10 +227,12 @@ impl Mesh {
         }
     }
 
-    /// Route one session's model calls to a member: the client serving `model` for sessions
-    /// (one per member, opened on first use), then the frame's session route.
-    pub(crate) async fn bind(self: &Arc<Self>, session_id: &str, node: &str) -> Result<(), RpcError> {
-        let client = lock(&self.placements.clients).get(node).cloned();
+    /// Route one session's model calls to a member's model `plugin`: the client serving `model` for
+    /// sessions (one per member's model, opened on first use; its calls name the model), then the
+    /// frame's session route.
+    pub(crate) async fn bind(self: &Arc<Self>, session_id: &str, node: &str, plugin: &str) -> Result<(), RpcError> {
+        let key = (node.to_owned(), plugin.to_owned());
+        let client = lock(&self.placements.clients).get(&key).cloned();
         let client = match client {
             Some(client) if !client.stop.is_cancelled() => client,
             _ => {
@@ -234,9 +241,9 @@ impl Mesh {
                     return Err(RpcError::new(codes::UNAVAILABLE, "the member's model is not serving"));
                 }
                 let mesh = self.clone();
-                let gone = node.to_owned();
-                let client = Arc::new(self.open_client("model", node, provides, "sessions", false, move || mesh.client_closed(&gone)).await?);
-                lock(&self.placements.clients).insert(node.to_owned(), client.clone());
+                let gone = key.clone();
+                let client = Arc::new(self.open_client("model", node, plugin, provides, "sessions", false, move || mesh.client_closed(&gone)).await?);
+                lock(&self.placements.clients).insert(key, client.clone());
                 client
             }
         };
@@ -254,10 +261,14 @@ impl Mesh {
             let _ = ctx.call("frame.route.clear", json!({"category": "model", "key": session_id})).await;
         }
         let others = lock(&self.placements.placed).values().any(|placed| *placed == node);
-        if !others
-            && let Some(client) = lock(&self.placements.clients).remove(&node)
-        {
-            client.stop.cancel();
+        if !others {
+            lock(&self.placements.clients).retain(|(member, _), client| {
+                let keep = *member != node;
+                if !keep {
+                    client.stop.cancel();
+                }
+                keep
+            });
         }
         self.notify("placed");
     }
@@ -270,15 +281,20 @@ impl Mesh {
             return;
         }
         lock(&self.placements.placed).retain(|_, placed| placed != node);
-        if let Some(client) = lock(&self.placements.clients).remove(node) {
-            client.stop.cancel();
-        }
+        lock(&self.placements.clients).retain(|(member, _), client| {
+            let keep = member != node;
+            if !keep {
+                client.stop.cancel();
+            }
+            keep
+        });
         tracing::info!(member = %&node[..node.len().min(10)], sessions = sessions.len(), "a lender went away; its sessions' model calls run here");
         self.notify("placed");
     }
 
-    fn client_closed(&self, node: &str) {
-        let removed = lock(&self.placements.clients).remove(node).is_some();
+    fn client_closed(&self, key: &(String, String)) {
+        let node = key.0.as_str();
+        let removed = lock(&self.placements.clients).remove(key).is_some();
         let had = {
             let mut placed = lock(&self.placements.placed);
             let before = placed.len();

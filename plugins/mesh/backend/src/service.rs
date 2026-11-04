@@ -612,11 +612,13 @@ impl Mesh {
         {
             // The slow parts are reused; the model's load is what placement decides on, so it is
             // read live every time.
-            if let (Some(ctx), Some(model)) = (self.ctx.get(), card.model.as_mut()) {
-                crate::card::refresh_load(ctx, model).await;
+            if let Some(ctx) = self.ctx.get() {
+                for model in &mut card.models {
+                    crate::card::refresh_load(ctx, model).await;
+                }
             }
             if !self.lends() {
-                card.model = None;
+                card.models.clear();
             }
             return card;
         }
@@ -628,7 +630,7 @@ impl Mesh {
         card.services = Self::service_cards(&self.local_shares().await);
         // A model this computer does not lend is not shown to the members.
         if !self.lends() {
-            card.model = None;
+            card.models.clear();
         }
         *lock(&self.my_card) = Some(card.clone());
         card
@@ -988,16 +990,16 @@ impl Mesh {
         // The borrowed model serves every call here; coding is the one kind of work today.
         for mut candidate in self.candidates(None, cc_protocol::contracts::model::tags::CODING) {
             let Some(node) = candidate.node.clone() else { continue };
-            let free = cards.get(&node).and_then(|card| card.model.as_ref()).is_some_and(|model| model.slots > model.slots_busy);
-            let info = self.call_member(&node, "model.info", json!({}), None, CancellationToken::new()).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());
+            let free = cards.get(&node).and_then(|card| card.models.iter().find(|model| model.plugin == candidate.plugin)).is_some_and(|model| model.slots > model.slots_busy);
+            let info = self.call_member(&node, "model.info", crate::card::for_model(&candidate.plugin), None, CancellationToken::new()).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());
             if let (true, Some(info)) = (free, info) {
                 candidate.weights = info.file_bytes;
                 candidates.push(candidate);
             }
         }
         candidates.sort_by(crate::place::best_first);
-        let Some(node) = candidates.into_iter().next().and_then(|candidate| candidate.node) else { return };
-        match self.start_borrow("model", &node).await {
+        let Some((node, plugin)) = candidates.into_iter().next().and_then(|candidate| candidate.node.map(|node| (node, candidate.plugin))) else { return };
+        match self.start_borrow("model", &node, &plugin).await {
             Ok(_) => tracing::info!(node = %&node[..node.len().min(10)], "no model of its own here: a member's model serves"),
             Err(error) => tracing::debug!(%error, "could not borrow a member's model"),
         }

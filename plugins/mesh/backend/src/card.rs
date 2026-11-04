@@ -95,9 +95,29 @@ fn repository_id(root: &str) -> Option<String> {
     String::from_utf8_lossy(&output.stdout).lines().next().map(|line| line.trim().to_owned()).filter(|id| !id.is_empty())
 }
 
+/// The models this computer serves itself, each with the name a call gives to reach it (its
+/// plugin): every active plugin of the `model` category, asked for its `model.info`. A model
+/// borrowed from another app on this machine is that app's, and left out.
+pub async fn local_models(ctx: &Ctx) -> Vec<(String, ModelInfo)> {
+    let plugins: Vec<PluginInfo> = get::<Value>(ctx, "frame.plugins.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("plugins").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
+    let mut models = Vec::new();
+    for plugin in plugins.iter().filter(|plugin| plugin.category == "model" && plugin.state == "active" && !plugin.instance.starts_with("ws-")) {
+        let params = json!({ cc_protocol::contracts::model::PLUGIN_PARAM: plugin.plugin_id });
+        if let Some(info) = get::<ModelInfo>(ctx, "model.info", params).await.filter(|info| !info.borrowed()) {
+            models.push((plugin.plugin_id.clone(), info));
+        }
+    }
+    models
+}
+
+/// The params of a `model.*` call for one of this computer's models.
+pub fn for_model(plugin: &str) -> Value {
+    json!({ cc_protocol::contracts::model::PLUGIN_PARAM: plugin })
+}
+
 /// The model's load now: busy slots, those a person waits for, the queue.
 pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
-    if let Some(slots) = get::<SlotsResult>(ctx, "model.slots", json!({})).await {
+    if let Some(slots) = get::<SlotsResult>(ctx, "model.slots", for_model(&model.plugin)).await {
         model.slots_busy = slots.busy;
         model.busy_foreground = slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32;
         model.queued = slots.queued;
@@ -129,29 +149,27 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
             languages.push(LanguageCard { id: description.id, version });
         }
     }
-    // A model borrowed from another app on this machine is that app's: not shown here.
-    let model = match get::<ModelInfo>(ctx, "model.info", json!({})).await.filter(|info| !info.borrowed()) {
-        Some(info) => {
-            let slots: Option<SlotsResult> = get(ctx, "model.slots", json!({})).await;
-            let metrics: Option<LiveMetrics> = get(ctx, "model.metrics", json!({})).await;
-            let plugin = plugins.iter().find(|plugin| plugin.category == "model" && plugin.state == "active").map(|plugin| plugin.plugin_id.clone()).unwrap_or_default();
-            Some(ModelCard {
-                plugin,
-                model_id: info.model_id,
-                variant: info.variant,
-                family: info.family,
-                tags: info.tags,
-                ctx_total: info.ctx_total,
-                slots: info.slots,
-                slots_busy: slots.as_ref().map(|slots| slots.busy).unwrap_or(0),
-                busy_foreground: slots.as_ref().map(|slots| slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32).unwrap_or(0),
-                queued: slots.as_ref().map(|slots| slots.queued).unwrap_or(0),
-                tok_s: metrics.map(|metrics| metrics.decode_tps_per_stream).unwrap_or(0.0),
-                loaded: slots.as_ref().is_some_and(|slots| slots.loaded),
-            })
-        }
-        None => None,
-    };
+    // Every model this computer serves; one borrowed from another app on this machine is that
+    // app's: not shown here.
+    let mut models = Vec::new();
+    for (plugin, info) in local_models(ctx).await {
+        let slots: Option<SlotsResult> = get(ctx, "model.slots", for_model(&plugin)).await;
+        let metrics: Option<LiveMetrics> = get(ctx, "model.metrics", for_model(&plugin)).await;
+        models.push(ModelCard {
+            plugin,
+            model_id: info.model_id,
+            variant: info.variant,
+            family: info.family,
+            tags: info.tags,
+            ctx_total: info.ctx_total,
+            slots: info.slots,
+            slots_busy: slots.as_ref().map(|slots| slots.busy).unwrap_or(0),
+            busy_foreground: slots.as_ref().map(|slots| slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32).unwrap_or(0),
+            queued: slots.as_ref().map(|slots| slots.queued).unwrap_or(0),
+            tok_s: metrics.map(|metrics| metrics.decode_tps_per_stream).unwrap_or(0.0),
+            loaded: slots.as_ref().is_some_and(|slots| slots.loaded),
+        });
+    }
     let sessions: Vec<Session> = get::<Value>(ctx, "frame.session.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("sessions").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
     let now = now_ms();
     let running = sessions.iter().filter(|session| session.status == SessionStatus::Running).count() as u32;
@@ -189,7 +207,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
         free_memory_bytes: free_memory(),
         on_mains,
         user_active,
-        model,
+        models,
         plugins: plugin_cards,
         services: Vec::new(),
         languages,
