@@ -10,7 +10,7 @@ use cc_protocol::contracts::mesh::Member;
 use cc_protocol::contracts::now_ms;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -18,7 +18,7 @@ pub struct Entry {
     pub seq: u64,
     /// Hex SHA-256 of the entry before this one (empty for the first).
     pub prev: String,
-    /// `add` | `rename` | `revoke` | `addrs`
+    /// `add` | `rename` | `revoke` | `addrs` | `link` (`node`: the id of a network taken in)
     pub kind: String,
     pub node: String,
     #[serde(default)]
@@ -181,6 +181,43 @@ impl Log {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The network this chain is: the hash of its first entry (`Mesh::network` shows its first ten
+    /// characters).
+    pub fn id(&self) -> Option<String> {
+        self.entries.first().map(Entry::hash)
+    }
+
+    /// Whether this chain took in the network `id` (a `link` entry naming it).
+    pub fn linked(&self, id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.kind == "link" && entry.node == id)
+    }
+
+    /// Take in the network `old` this node was in: a `link` entry naming it, then its members
+    /// (`Log::carry_over`). Its members move onto this chain when it reaches them
+    /// (`Mesh::log_received`), so joining a second network links the two instead of leaving one.
+    pub fn link(&mut self, me: &Identity, old: &Log) {
+        let Some(id) = old.id() else { return };
+        if self.id().as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if !self.linked(&id) {
+            self.append(me, "link", &id, "", Vec::new());
+        }
+        self.carry_over(me, old);
+    }
+
+    /// An `add` for each member of `old` this chain does not hold; a node this chain revoked stays
+    /// out (a member removed it, or it left).
+    pub fn carry_over(&mut self, me: &Identity, old: &Log) {
+        let held = self.members();
+        let revoked: BTreeSet<String> = self.entries.iter().filter(|entry| entry.kind == "revoke").map(|entry| entry.node.clone()).collect();
+        for (node, member) in old.members() {
+            if !held.contains_key(&node) && !revoked.contains(&node) {
+                self.append(me, "add", &node, &member.name, member.addrs.clone());
+            }
+        }
     }
 
     /// The first member (the founder) made this node's own cortex.
