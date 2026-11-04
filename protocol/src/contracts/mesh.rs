@@ -231,6 +231,9 @@ pub struct ModelCard {
     /// Measured decode speed, tokens per second (0 when not measured yet).
     #[serde(default)]
     pub tok_s: f64,
+    /// The model is in memory now ([`crate::contracts::model::SlotsResult::loaded`]).
+    #[serde(default)]
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

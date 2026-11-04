@@ -101,6 +101,7 @@ pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
         model.slots_busy = slots.busy;
         model.busy_foreground = slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32;
         model.queued = slots.queued;
+        model.loaded = slots.loaded;
     }
 }
 
@@ -146,6 +147,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
                 busy_foreground: slots.as_ref().map(|slots| slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32).unwrap_or(0),
                 queued: slots.as_ref().map(|slots| slots.queued).unwrap_or(0),
                 tok_s: metrics.map(|metrics| metrics.decode_tps_per_stream).unwrap_or(0.0),
+                loaded: slots.as_ref().is_some_and(|slots| slots.loaded),
             })
         }
         None => None,

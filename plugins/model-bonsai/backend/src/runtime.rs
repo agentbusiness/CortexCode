@@ -847,6 +847,8 @@ impl Runtime {
             pool_tokens: view.pool_tokens,
             reserved_tokens: view.reserved_tokens,
             metrics: Some(loaded.metrics.snapshot()),
+            // Answered only once the model is ready: it is in memory.
+            loaded: true,
         })
     }
 

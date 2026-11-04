@@ -13,7 +13,11 @@
 //! (here, and `mesh.model.claim` on each member); the first grant wins, the others are withdrawn.
 //! A claim may list several tags, best first (`mesh.claim {tags: ["coding", "office"]}`): a model
 //! with an earlier tag wins before the other rules, and a claim with several tags takes models of
-//! any family. Every app's model is its own option: the apps on one computer each lend theirs.
+//! any family. Every app's model is its own option: the apps on one computer each lend theirs. A
+//! model of the claim's tags that another app on this computer has in memory already is used before
+//! this app loads its own (`SlotsResult::loaded`, the card's `loaded`): a model is not loaded twice
+//! on one computer for the same work, and an app that can do its work with either tag uses what is
+//! there.
 //! Another computer's model ranks before another app's on this computer (tier `machine`): the apps
 //! here share this computer's GPU, so a call sent to one of them adds little while another
 //! computer is free (seen: an ingest's overflow went to a second model on its own computer while
@@ -248,16 +252,26 @@ impl Mesh {
         let ranked = |own: &[String]| tags.iter().enumerate().find(|(_, tag)| own.contains(tag)).map(|(rank, tag)| (rank, tag.clone()));
         let mut options = Vec::new();
         let mut family = None;
+        // This app's own model while it is not in memory: an option only when no other app on this
+        // computer has a model of the claim's tags loaded already.
+        let mut own_cold: Option<ModelOption> = None;
+        let mut loaded_here: Vec<usize> = Vec::new();
         if let Some(ctx) = self.ctx.get()
             && !lock(&self.borrows).contains_key("model")
             && let Some(info) = ctx.call("model.info", json!({})).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok())
             && !info.borrowed()
         {
             let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
+            let loaded = ctx.call("model.slots", json!({})).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()).is_some_and(|slots| slots.loaded);
             lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
             if let Some((rank, tag)) = ranked(&info.tags) {
                 let window = if info.ctx_native == 0 { info.ctx_total } else { info.ctx_total.min(info.ctx_native) };
-                options.push(ModelOption { node: String::new(), tag, rank, name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window });
+                let own = ModelOption { node: String::new(), tag, rank, name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window };
+                if loaded {
+                    options.push(own);
+                } else {
+                    own_cold = Some(own);
+                }
             }
             // A claim of one tag stays within this computer's family; one of several takes any.
             if tags.len() == 1 {
@@ -283,7 +297,24 @@ impl Mesh {
                 2
             };
             let weights = self.weights_of(&member.node, &model.model_id).await;
+            if member.local && model.loaded {
+                loaded_here.push(options.len());
+            }
             options.push(ModelOption { node: member.node.clone(), tag, rank, name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
+        }
+        // A model of the claim's tags already in memory on this computer is used before this app
+        // loads its own: the best of them takes the own model's place (tier 0, and its rank when
+        // that is better), so a model is not loaded twice on one computer for the same work.
+        if let Some(own) = own_cold {
+            let best = loaded_here.into_iter().min_by(|a, b| options[*a].rank.cmp(&options[*b].rank).then(options[*b].weights.cmp(&options[*a].weights)));
+            match best {
+                Some(index) => {
+                    let shared = &mut options[index];
+                    shared.tier = 0;
+                    shared.rank = shared.rank.min(own.rank);
+                }
+                None => options.push(own),
+            }
         }
         if tokens > 0 && options.iter().any(|option| option.window > 0) {
             let holds = |option: &ModelOption| option.window == 0 || option.window >= tokens;
