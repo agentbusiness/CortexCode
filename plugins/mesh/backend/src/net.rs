@@ -182,11 +182,14 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let since = params.get("since_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
             let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
             let tag = params.get("tag").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(cc_protocol::contracts::model::default_tag);
-            if !mesh.lends() || !mesh.local_serves(&tag).await {
+            // The model the claim is for (its card's `plugin`); none named: the first for the tag.
+            let named = params.get("plugin").and_then(Value::as_str).unwrap_or("").to_owned();
+            let served = if mesh.lends() { mesh.local_serves(&named, &tag).await } else { None };
+            let Some(plugin) = served else {
                 let message = answer(Ok(json!({"granted": false})));
                 write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
                 return Ok(());
-            }
+            };
             mesh.start_granting();
             let withdrawn = CancellationToken::new();
             let watcher = {
@@ -203,7 +206,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                     }
                 })
             };
-            let granted = mesh.lend(&node, &session, since, false, wait, withdrawn.clone()).await;
+            let granted = mesh.lend(&node, &session, &plugin, since, false, wait, withdrawn.clone()).await;
             watcher.abort();
             let message = answer(Ok(json!({"granted": granted})));
             if write_message(&mut send, &message).await.is_err() && granted {

@@ -43,7 +43,8 @@ use tokio_util::sync::CancellationToken;
 /// not claim (a project description, a prewarm).
 const LOOK_AGAIN: Duration = Duration::from_millis(500);
 
-/// Who uses this computer's model now, and who waits for it.
+/// Who uses this computer's models now, and who waits for them; each use and wait names its
+/// model (`plugin`), and each model has its own slots and its own line.
 #[derive(Default)]
 pub struct Lending {
     holders: Vec<Holder>,
@@ -54,12 +55,15 @@ struct Holder {
     /// The requesting computer (hex); empty: this one.
     requester: String,
     session: String,
+    /// The model it uses.
+    plugin: String,
     foreground: bool,
 }
 
 struct Waiter {
     requester: String,
     session: String,
+    plugin: String,
     since: u64,
     foreground: bool,
     grant: oneshot::Sender<()>,
@@ -83,6 +87,8 @@ pub struct Claims {
 struct ModelOption {
     /// Empty: this computer.
     node: String,
+    /// The model on that computer (its card's `plugin`).
+    plugin: String,
     /// The claim's tag this model has, and its place in the claim's list (0 best).
     tag: String,
     rank: usize,
@@ -99,41 +105,43 @@ struct ModelOption {
 impl Mesh {
     // --- the lending side: this computer's model ----------------------------------------------
 
-    /// Whether this computer's model can take one more use now: a slot is free (fewer uses held,
-    /// and fewer slots busy, than it has slots) and nothing waits for one; or, for a person's
-    /// call made here, no other person's call holds or runs it.
-    async fn model_free_for(&self, requester: &str, foreground: bool) -> bool {
+    /// Whether this computer's model `plugin` can take one more use now: a slot is free (fewer
+    /// uses held, and fewer slots busy, than it has slots) and nothing waits for one; or, for a
+    /// person's call made here, no other person's call holds or runs it.
+    async fn model_free_for(&self, requester: &str, foreground: bool, plugin: &str) -> bool {
         let Some(ctx) = self.ctx.get() else { return false };
-        let Some(slots) = ctx.call("model.slots", json!({})).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { return false };
+        let Some(slots) = ctx.call("model.slots", crate::card::for_model(plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { return false };
         let lending = lock(&self.claims.lending);
+        let holders = || lending.holders.iter().filter(|holder| holder.plugin == plugin);
         if foreground && requester.is_empty() {
-            let person_holds = lending.holders.iter().any(|holder| holder.foreground && holder.requester.is_empty());
+            let person_holds = holders().any(|holder| holder.foreground && holder.requester.is_empty());
             let person_runs = slots.slots.iter().any(|slot| slot.busy && slot.priority == Some(Priority::Foreground)) || slots.queued_by_priority.foreground > 0;
             return !person_holds && !person_runs;
         }
         // A held use may not run yet, and work that does not claim runs without a holder: the
         // larger of the two counts the slots taken.
-        let taken = lending.holders.len().max(slots.busy as usize);
+        let taken = holders().count().max(slots.busy as usize);
         taken < slots.slots.len().max(1) && slots.queued == 0
     }
 
-    /// Lend this computer's model for one use: at once when it is free and no older run waits for
-    /// it; else, with `wait`, when it is this run's turn (false: not now, or cancelled).
-    pub async fn lend(&self, requester: &str, session: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
+    /// Lend this computer's model `plugin` for one use: at once when it is free and no older run
+    /// waits for it; else, with `wait`, when it is this run's turn (false: not now, or cancelled).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lend(&self, requester: &str, session: &str, plugin: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
         // A person here waits only for an older person here; anyone else for any older run.
         let person = foreground && requester.is_empty();
-        let older_waits = lock(&self.claims.lending).waiting.iter().any(|waiter| waiter.since < since && (!person || (waiter.foreground && waiter.requester.is_empty())));
-        if !older_waits && self.model_free_for(requester, foreground).await {
+        let older_waits = lock(&self.claims.lending).waiting.iter().any(|waiter| waiter.plugin == plugin && waiter.since < since && (!person || (waiter.foreground && waiter.requester.is_empty())));
+        if !older_waits && self.model_free_for(requester, foreground, plugin).await {
             let mut lending = lock(&self.claims.lending);
             lending.holders.retain(|holder| !(holder.requester == requester && holder.session == session));
-            lending.holders.push(Holder { requester: requester.to_owned(), session: session.to_owned(), foreground });
+            lending.holders.push(Holder { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), foreground });
             return true;
         }
         if !wait {
             return false;
         }
         let (grant, granted) = oneshot::channel();
-        lock(&self.claims.lending).waiting.push(Waiter { requester: requester.to_owned(), session: session.to_owned(), since, foreground, grant });
+        lock(&self.claims.lending).waiting.push(Waiter { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), since, foreground, grant });
         self.claims.freed.notify_one();
         tokio::select! {
             outcome = granted => outcome.is_ok(),
@@ -191,15 +199,15 @@ impl Mesh {
             // The oldest waiter the model can take now: every run but a person here waits on the
             // same condition, so this keeps their order; a person here may pass agent work.
             loop {
-                let waiting: Vec<(String, String, bool)> = {
+                let waiting: Vec<(String, String, String, bool)> = {
                     let mut lending = lock(&self.claims.lending);
                     lending.waiting.retain(|waiter| !waiter.grant.is_closed());
                     lending.waiting.sort_by_key(|waiter| waiter.since);
-                    lending.waiting.iter().map(|waiter| (waiter.requester.clone(), waiter.session.clone(), waiter.foreground)).collect()
+                    lending.waiting.iter().map(|waiter| (waiter.requester.clone(), waiter.session.clone(), waiter.plugin.clone(), waiter.foreground)).collect()
                 };
                 let mut next = None;
-                for (requester, session, foreground) in waiting {
-                    if self.model_free_for(&requester, foreground).await {
+                for (requester, session, plugin, foreground) in waiting {
+                    if self.model_free_for(&requester, foreground, &plugin).await {
                         next = Some((requester, session));
                         break;
                     }
@@ -208,7 +216,7 @@ impl Mesh {
                 let mut lending = lock(&self.claims.lending);
                 let Some(position) = lending.waiting.iter().position(|waiter| waiter.requester == requester && waiter.session == session) else { continue };
                 let waiter = lending.waiting.remove(position);
-                lending.holders.push(Holder { requester: waiter.requester.clone(), session: waiter.session.clone(), foreground: waiter.foreground });
+                lending.holders.push(Holder { requester: waiter.requester.clone(), session: waiter.session.clone(), plugin: waiter.plugin.clone(), foreground: waiter.foreground });
                 if waiter.grant.send(()).is_err() {
                     lending.holders.retain(|holder| !(holder.requester == waiter.requester && holder.session == waiter.session));
                 }
@@ -224,17 +232,17 @@ impl Mesh {
     // --- the claiming side: a session's model call -----------------------------------------------
 
     /// The weights' size of a model (asked once per model id).
-    async fn weights_of(&self, node: &str, model_id: &str) -> u64 {
+    async fn weights_of(&self, node: &str, plugin: &str, model_id: &str) -> u64 {
         if let Some(known) = lock(&self.claims.weights).get(model_id).copied() {
             return known;
         }
         let info = if node.is_empty() {
             match self.ctx.get() {
-                Some(ctx) => ctx.call("model.info", json!({})).await.ok(),
+                Some(ctx) => ctx.call("model.info", crate::card::for_model(plugin)).await.ok(),
                 None => None,
             }
         } else {
-            self.call_member(node, "model.info", json!({}), None, CancellationToken::new()).await.ok()
+            self.call_member(node, "model.info", crate::card::for_model(plugin), None, CancellationToken::new()).await.ok()
         };
         let Some(info) = info.and_then(|value| serde_json::from_value::<ModelInfo>(value).ok()) else { return 0 };
         lock(&self.claims.weights).insert(model_id.to_owned(), info.file_bytes);
@@ -252,30 +260,30 @@ impl Mesh {
         let ranked = |own: &[String]| tags.iter().enumerate().find(|(_, tag)| own.contains(tag)).map(|(rank, tag)| (rank, tag.clone()));
         let mut options = Vec::new();
         let mut family = None;
-        // This app's own model while it is not in memory: an option only when no other app on this
-        // computer has a model of the claim's tags loaded already.
-        let mut own_cold: Option<ModelOption> = None;
+        // This app's own models while they are not in memory: options only when no other app on
+        // this computer has a model of the claim's tags loaded already.
+        let mut own_cold: Vec<ModelOption> = Vec::new();
         let mut loaded_here: Vec<usize> = Vec::new();
         if let Some(ctx) = self.ctx.get()
             && !lock(&self.borrows).contains_key("model")
-            && let Some(info) = ctx.call("model.info", json!({})).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok())
-            && !info.borrowed()
         {
-            let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
-            let loaded = ctx.call("model.slots", json!({})).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()).is_some_and(|slots| slots.loaded);
-            lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
-            if let Some((rank, tag)) = ranked(&info.tags) {
+            for (plugin, info) in crate::card::local_models(ctx).await {
+                let Some((rank, tag)) = ranked(&info.tags) else { continue };
+                let tok_s = ctx.call("model.metrics", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
+                let loaded = ctx.call("model.slots", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()).is_some_and(|slots| slots.loaded);
+                lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
                 let window = if info.ctx_native == 0 { info.ctx_total } else { info.ctx_total.min(info.ctx_native) };
-                let own = ModelOption { node: String::new(), tag, rank, name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window };
+                // A claim of one tag stays within the family of this computer's model for it; one
+                // of several takes any.
+                if tags.len() == 1 && family.is_none() {
+                    family = Some(info.family.clone());
+                }
+                let own = ModelOption { node: String::new(), plugin, tag, rank, name: self.name(), model_id: info.model_id.clone(), tier: 0, weights: info.file_bytes, tok_s, window };
                 if loaded {
                     options.push(own);
                 } else {
-                    own_cold = Some(own);
+                    own_cold.push(own);
                 }
-            }
-            // A claim of one tag stays within this computer's family; one of several takes any.
-            if tags.len() == 1 {
-                family = Some(info.family);
             }
         }
         let me = self.me.hex();
@@ -283,11 +291,7 @@ impl Mesh {
         let conns = self.connections();
         for member in self.members().into_values().filter(|member| member.node != me) {
             let Some(connection) = conns.get(&member.node) else { continue };
-            let Some(model) = cards.get(&member.node).and_then(|card| card.model.clone()) else { continue };
-            if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) {
-                continue;
-            }
-            let Some((rank, tag)) = ranked(&model.tags) else { continue };
+            let Some(card) = cards.get(&member.node) else { continue };
             // Another app on this computer shares its GPU: it comes after the other computers.
             let tier = if member.local {
                 3
@@ -296,24 +300,31 @@ impl Mesh {
             } else {
                 2
             };
-            let weights = self.weights_of(&member.node, &model.model_id).await;
-            if member.local && model.loaded {
-                loaded_here.push(options.len());
+            for model in &card.models {
+                if family.as_deref().is_some_and(|family| !family.is_empty() && model.family != family) {
+                    continue;
+                }
+                let Some((rank, tag)) = ranked(&model.tags) else { continue };
+                let weights = self.weights_of(&member.node, &model.plugin, &model.model_id).await;
+                if member.local && model.loaded {
+                    loaded_here.push(options.len());
+                }
+                options.push(ModelOption { node: member.node.clone(), plugin: model.plugin.clone(), tag, rank, name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
             }
-            options.push(ModelOption { node: member.node.clone(), tag, rank, name: member.name.clone(), model_id: model.model_id.clone(), tier, weights, tok_s: model.tok_s, window: model.ctx_total });
         }
         // A model of the claim's tags already in memory on this computer is used before this app
         // loads its own: the best of them takes the own model's place (tier 0, and its rank when
         // that is better), so a model is not loaded twice on one computer for the same work.
-        if let Some(own) = own_cold {
+        if !own_cold.is_empty() {
             let best = loaded_here.into_iter().min_by(|a, b| options[*a].rank.cmp(&options[*b].rank).then(options[*b].weights.cmp(&options[*a].weights)));
             match best {
                 Some(index) => {
+                    let own_rank = own_cold.iter().map(|own| own.rank).min().unwrap_or(usize::MAX);
                     let shared = &mut options[index];
                     shared.tier = 0;
-                    shared.rank = shared.rank.min(own.rank);
+                    shared.rank = shared.rank.min(own_rank);
                 }
-                None => options.push(own),
+                None => options.extend(own_cold),
             }
         }
         if tokens > 0 && options.iter().any(|option| option.window > 0) {
@@ -337,13 +348,14 @@ impl Mesh {
         options
     }
 
-    /// Ask one computer's model for one use for `tag`'s work (`wait`: until it is this run's turn).
+    /// Ask one computer's model `plugin` for one use for `tag`'s work (`wait`: until it is this
+    /// run's turn).
     #[allow(clippy::too_many_arguments)]
-    async fn ask(&self, node: &str, session: &str, tag: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
+    async fn ask(&self, node: &str, plugin: &str, session: &str, tag: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
         if node.is_empty() {
-            return self.lend("", session, since, foreground, wait, cancel).await;
+            return self.lend("", session, plugin, since, foreground, wait, cancel).await;
         }
-        let params = json!({"session_id": session, "tag": tag, "since_ms": since, "wait": wait});
+        let params = json!({"session_id": session, "plugin": plugin, "tag": tag, "since_ms": since, "wait": wait});
         let answer = self.call_member(node, "mesh.model.claim", params, None, cancel).await;
         answer.ok().and_then(|value| value.get("granted").and_then(Value::as_bool)).unwrap_or(false)
     }
@@ -387,7 +399,7 @@ impl Mesh {
                 break options;
             }
             if !params.wait {
-                return Ok(Placement { node: None, name: String::new(), model_id: String::new(), tier: "busy".to_owned() });
+                return Ok(Placement { node: None, name: String::new(), model_id: String::new(), plugin: String::new(), tier: "busy".to_owned() });
             }
             tokio::select! {
                 _ = changed => {}
@@ -396,13 +408,13 @@ impl Mesh {
         };
         let mut chosen = None;
         for (index, option) in options.iter().enumerate() {
-            if self.ask(&option.node, &session, &option.tag, since, params.foreground, false, CancellationToken::new()).await {
+            if self.ask(&option.node, &option.plugin, &session, &option.tag, since, params.foreground, false, CancellationToken::new()).await {
                 chosen = Some(index);
                 break;
             }
         }
         if chosen.is_none() && !params.wait {
-            return Ok(Placement { node: None, name: String::new(), model_id: String::new(), tier: "busy".to_owned() });
+            return Ok(Placement { node: None, name: String::new(), model_id: String::new(), plugin: String::new(), tier: "busy".to_owned() });
         }
         if chosen.is_none() {
             // Nothing free: wait at every model; the first grant wins.
@@ -410,10 +422,11 @@ impl Mesh {
             let waits = options.iter().enumerate().map(|(index, option)| {
                 let mesh = self.clone();
                 let node = option.node.clone();
+                let plugin = option.plugin.clone();
                 let session = session.clone();
                 let tag = option.tag.clone();
                 let stop = stop.clone();
-                Box::pin(async move { if mesh.ask(&node, &session, &tag, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
+                Box::pin(async move { if mesh.ask(&node, &plugin, &session, &tag, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
             });
             let outcome = select_ok(waits).await;
             stop.cancel();
@@ -438,7 +451,7 @@ impl Mesh {
                 let _ = ctx.call("frame.route.clear", json!({"category": "model", "key": session})).await;
             }
             lock(&self.placements.placed).remove(&session);
-        } else if let Err(error) = self.bind(&session, &option.node).await {
+        } else if let Err(error) = self.bind(&session, &option.node, &option.plugin).await {
             self.give_back_at(&option.node, &session).await;
             return Err(error);
         }
@@ -457,7 +470,7 @@ impl Mesh {
             3 => "machine",
             _ => "remote",
         };
-        Ok(Placement { node: (!option.node.is_empty()).then(|| option.node.clone()), name: option.name.clone(), model_id: option.model_id.clone(), tier: tier.to_owned() })
+        Ok(Placement { node: (!option.node.is_empty()).then(|| option.node.clone()), name: option.name.clone(), model_id: option.model_id.clone(), plugin: option.plugin.clone(), tier: tier.to_owned() })
     }
 
     /// The session's call is over: its model is free for the next run.

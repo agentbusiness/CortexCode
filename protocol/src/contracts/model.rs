@@ -10,6 +10,9 @@ use serde_json::Value;
 /// The work a model is for. A model plugin declares its model's tags ([`ModelInfo::tags`]); a
 /// request names one (`mesh.claim {tag}`), and only a model with that tag takes it. Requests and
 /// models from before tags were all coding.
+/// The tags CortexCode's and CortexTerm's models carry. A tag is any name for the work a model
+/// is for: an app may lend models under tags of its own, and a computer that does not know a tag
+/// never claims a model by it.
 pub mod tags {
     /// Writing and changing code: the chat flow, its agents and their background calls.
     pub const CODING: &str = "coding";
@@ -17,6 +20,11 @@ pub mod tags {
     /// Apps that accept it also accept a `coding` model, so one model per machine serves them all.
     pub const OFFICE: &str = "office";
 }
+
+/// The params key that names which of a computer's models a `model.*` call is for: the model's
+/// `plugin` on that computer's card (`crate::contracts::mesh::ModelCard::plugin`). An app that
+/// serves one model may ignore it.
+pub const PLUGIN_PARAM: &str = "plugin";
 
 pub fn default_tag() -> String {
     tags::CODING.to_owned()

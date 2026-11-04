@@ -1737,7 +1737,7 @@ fn format_peers(value: &Value) -> String {
         let _ = write!(out, "{} ({}): {}", s(&member, "name"), short_node(s(&member, "node")), if reachable { format!("reachable, {path}, {rtt} ms") } else { "not reachable".to_owned() });
         if let Some(card) = peer.get("card") {
             let _ = write!(out, " · {} · {} GB", s(card, "chip"), card.get("memory_bytes").and_then(Value::as_u64).unwrap_or(0) / (1024 * 1024 * 1024));
-            if let Some(model) = card.get("model") {
+            for model in card.get("models").and_then(Value::as_array).into_iter().flatten() {
                 let busy = model.get("slots_busy").and_then(Value::as_u64).unwrap_or(0) > 0 || model.get("queued").and_then(Value::as_u64).unwrap_or(0) > 0;
                 let _ = write!(out, " · model {} ({}), {}, {:.1} tok/s", s(model, "model_id"), s(model, "variant"), if busy { "busy" } else { "free" }, model.get("tok_s").and_then(Value::as_f64).unwrap_or(0.0));
             }

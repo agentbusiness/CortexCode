@@ -141,9 +141,11 @@ pub struct Card {
     /// A person is working in the app here (a foreground session ran recently).
     #[serde(default)]
     pub user_active: bool,
-    /// The model plugin serving `model`, its model and variant, context, free slots and speed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelCard>,
+    /// The models this computer lends, each with its model and variant, tags, context, free slots
+    /// and speed. As many as the app serving them lends, with any tags: the standard sets no
+    /// number and no names, and a computer that does not know a model's tags leaves it alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCard>,
     /// Every plugin, with the hash of its live data (prompts, skills, texts), so a lender's plugin
     /// is known to behave exactly as the borrower's.
     #[serde(default)]
@@ -213,6 +215,8 @@ pub struct Link {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ModelCard {
+    /// The model's name on its computer, unique there: a call to that computer for this model
+    /// carries it as `plugin` in its params ([`crate::contracts::model::PLUGIN_PARAM`]).
     pub plugin: String,
     pub model_id: String,
     /// `medium` | `small` | the engine's own variant name.
@@ -459,6 +463,10 @@ pub struct Placement {
     pub name: String,
     #[serde(default)]
     pub model_id: String,
+    /// The model of that computer the call is for (its card's `ModelCard::plugin`); empty: this
+    /// computer's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin: String,
     /// `local` (this app's own model) | `machine` (another app's on this computer) | `lan` |
     /// `remote`.
     #[serde(default)]

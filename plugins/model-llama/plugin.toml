@@ -6,7 +6,7 @@
 [plugin]
 id = "model-llama"
 name = "Model (Qwen on llama.cpp)"
-version = "0.1.0"
+version = "0.1.1"
 description = "Qwen3.8-27B (unsloth UD quants, with its vision projector) on upstream llama.cpp's llama-server, CUDA or Vulkan, with DFlash 2 block-diffusion drafts: the model engine for Linux. Q4 on a GPU with 24 GB or more, Q3 on 16 GB. A machine without such a GPU runs no model and lends none: it uses a member's Qwen through the mesh."
 license = "UNLICENSED"
 platforms = ["linux"]

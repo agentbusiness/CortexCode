@@ -69,8 +69,9 @@ pub(crate) fn frame_info(home: &std::path::Path) -> Result<FrameInfo, String> {
 }
 
 impl Mesh {
-    /// Start serving `category` here from the member `node`, for every session.
-    pub async fn start_borrow(self: &Arc<Self>, category: &str, node: &str) -> Result<Vec<String>, RpcError> {
+    /// Start serving `category` here from the member `node`'s model `plugin` (its card's name for
+    /// it; empty for a category that is not a model), for every session.
+    pub async fn start_borrow(self: &Arc<Self>, category: &str, node: &str, plugin: &str) -> Result<Vec<String>, RpcError> {
         let member = self.member(node).ok_or_else(|| RpcError::not_found("no such member"))?;
         if !crate::net::lendable(&format!("{category}.x")) {
             return Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{category}` is not something members lend")));
@@ -93,7 +94,7 @@ impl Mesh {
         }
         let category_owned = category.to_owned();
         let mesh = self.clone();
-        let client = self.open_client(category, node, provides.clone(), "", true, move || mesh.borrow_ended(&category_owned)).await?;
+        let client = self.open_client(category, node, plugin, provides.clone(), "", true, move || mesh.borrow_ended(&category_owned)).await?;
         let borrow = Borrow { category: category.to_owned(), node: node.to_owned(), provides: provides.clone(), stop: client.stop };
         self.borrows.lock().unwrap_or_else(|p| p.into_inner()).insert(category.to_owned(), borrow);
         self.notify("serving");
@@ -106,12 +107,14 @@ impl Mesh {
         Ok(serde_json::from_value(answer.get("provides").cloned().unwrap_or(Value::Null)).unwrap_or_default())
     }
 
-    /// Connect to this node's frame as a client serving `category` from the member `node`:
+    /// Connect to this node's frame as a client serving `category` from the member `node`, whose
+    /// calls name the member's model `plugin` (when not empty: a member may lend several):
     /// `scope` empty takes the category over, `sessions` serves only routed sessions. `events`:
     /// the member's events of the category are published here too (only when the category is
     /// taken over; a session's lender must not speak for this node's own plugin). `ended` runs
     /// when the connection closes.
-    pub async fn open_client(self: &Arc<Self>, category: &str, node: &str, provides: Vec<String>, scope: &str, events: bool, ended: impl FnOnce() + Send + 'static) -> Result<Client, RpcError> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_client(self: &Arc<Self>, category: &str, node: &str, plugin: &str, provides: Vec<String>, scope: &str, events: bool, ended: impl FnOnce() + Send + 'static) -> Result<Client, RpcError> {
         let contract = cc_protocol::contracts::contract_of(category).ok_or_else(|| RpcError::invalid_params(format!("`{category}` is not a category this frame knows")))?;
         let info = frame_info(&self.home).map_err(|e| RpcError::new(codes::UNAVAILABLE, e))?;
         let url = format!("ws://127.0.0.1:{}/ws?token={}", info.port, info.token);
@@ -204,6 +207,7 @@ impl Mesh {
         {
             let mesh = self.clone();
             let node = node.to_owned();
+            let plugin = plugin.to_owned();
             let stop = stop.clone();
             let out = out_tx.clone();
             tokio::spawn(async move {
@@ -221,7 +225,12 @@ impl Mesh {
                     };
                     let Ok(message) = serde_json::from_str::<Message>(&text) else { continue };
                     match message {
-                        Message::Req { id, method, params } => {
+                        Message::Req { id, method, mut params } => {
+                            if !plugin.is_empty()
+                                && let Some(params) = params.as_object_mut()
+                            {
+                                params.insert(cc_protocol::contracts::model::PLUGIN_PARAM.to_owned(), Value::String(plugin.clone()));
+                            }
                             let cancel = CancellationToken::new();
                             open.lock().unwrap_or_else(|p| p.into_inner()).insert(id, cancel.clone());
                             let mesh = mesh.clone();
