@@ -87,7 +87,7 @@ Every prompt, stage message, tool result, skill and flow decision is written wit
   aliases: script text, and `env` may hold secrets), the agent browser's Chromium profile. They
   stay files; the graph holds their metadata and links (an `Artifact` node names its file).
 - Runtime files are not records either: the home lock, `run/` (pid, socket, children of a dead
-  frame), OS file locks, the mesh's same-machine rendezvous (`~/.cortex-mesh/local/`, removed on
+  frame), OS file locks, the cortex-network's running apps (`~/.cortex-network/apps/`, removed on
   exit), the notification helper's click spool (drained into queue `notify.activations`), and the
   frame's boot pointers (which installed version of each plugin and of the frame runs and which
   serves a category, `<home>/plugins/<id>/.current` and its siblings `.previous`, `.known_good`,

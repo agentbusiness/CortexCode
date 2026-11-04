@@ -10,9 +10,16 @@
 //!
 //! The item is made and read through `/usr/bin/security` ([`crate::keychain`]), so a new version
 //! of this plugin (another executable) does not make macOS ask the person again.
+//!
+//! The machine key of the cortex-network ([`Identity::machine`], `crate::machine`) is kept the
+//! same way under its own service, `cortex-network machine`, with the person's home folder as the
+//! account, so every app of this person on this computer reads the same key.
 
 use iroh::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
+
+/// The Keychain (Secret Service) service of the machine key every app on this computer shares.
+const MACHINE_SERVICE: &str = "cortex-network machine";
 
 pub struct Identity {
     pub secret: SecretKey,
@@ -35,99 +42,148 @@ impl Identity {
     /// Load the key, or make and keep one. An error when a kept key cannot be read: a new key
     /// would be another node, so none is made then.
     pub fn load_or_create(home: &Path) -> Result<Identity, String> {
-        let file = key_file(home);
-        let from_file = std::fs::read_to_string(&file).ok().and_then(|text| parse(&text));
-        #[cfg(target_os = "macos")]
-        {
-            let account = home.display().to_string();
-            match keychain::get(&account) {
-                Ok(Some(text)) => {
-                    let secret = parse(&text).ok_or("the mesh identity in the Keychain is not a key")?;
-                    // A file the move left behind (the same key) goes now.
-                    if from_file.as_ref().is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
-                        let _ = std::fs::remove_file(&file);
-                    }
-                    Ok(Identity { secret })
+        load_or_create_kept(&format!("{} mesh identity", crate::APP), &home.display().to_string(), &key_file(home))
+    }
+
+    /// The machine key every app of this person on this computer shares (`crate::machine`):
+    /// kept like a node's key, under `cortex-network machine` with the home folder as the account
+    /// (where no Secret Service keeps it: a file in the cortex-network folder, readable by the
+    /// owner only). Read back once more after it is made, so two apps that start together and
+    /// both make one end up holding the one the store kept.
+    pub fn machine() -> Result<Identity, String> {
+        let home = std::env::var_os("HOME").ok_or("no home folder")?;
+        let dir = crate::machine::private_dir().ok_or("the cortex-network folder is not this person's alone")?;
+        let account = PathBuf::from(home).display().to_string();
+        let file = dir.join("machine.key");
+        load_or_create_kept(MACHINE_SERVICE, &account, &file)?;
+        load_or_create_kept(MACHINE_SERVICE, &account, &file)
+    }
+}
+
+/// A small secret of the cortex-network kept beside the keys (`crate::machine`'s rollback
+/// guard); `None` when there is none or no secret store answers.
+pub fn kept_get(service: &str, account: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::keychain::get(service, account).ok().flatten()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        secret::get(service, account).ok().flatten()
+    }
+}
+
+/// Keep a small secret of the cortex-network (plain ASCII, no quotes or backslashes); false when
+/// no secret store took it.
+pub fn kept_set(service: &str, account: &str, text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::keychain::set(service, account, text).is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        secret::set(service, account, text).is_ok()
+    }
+}
+
+/// A key kept under `service` and `account`, or made and kept there; `file` is where an older
+/// version left it, or where it lives when no Secret Service keeps it. An error when a kept key
+/// cannot be read: a new key would be another identity, so none is made then.
+fn load_or_create_kept(service: &str, account: &str, file: &Path) -> Result<Identity, String> {
+    let file = file.to_path_buf();
+    let from_file = std::fs::read_to_string(&file).ok().and_then(|text| parse(&text));
+    #[cfg(target_os = "macos")]
+    {
+        let account = account.to_owned();
+        match keychain::get(service, &account) {
+            Ok(Some(text)) => {
+                let secret = parse(&text).ok_or("the mesh identity in the Keychain is not a key")?;
+                // A file the move left behind (the same key) goes now.
+                if from_file.as_ref().is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
+                    let _ = std::fs::remove_file(&file);
                 }
-                Ok(None) => {
-                    let secret = from_file.unwrap_or_else(SecretKey::generate);
-                    let text = hex::encode(secret.to_bytes());
-                    keychain::set(&account, &text)?;
-                    // The file is deleted only once the Keychain gives the same key back.
-                    if keychain::get(&account).ok().flatten().as_deref() == Some(text.as_str()) {
-                        let _ = std::fs::remove_file(&file);
-                    }
-                    Ok(Identity { secret })
-                }
-                // The person denied access, or the Keychain is locked: the old file still works.
-                Err(error) => from_file.map(|secret| Identity { secret }).ok_or(error),
+                Ok(Identity { secret })
             }
+            Ok(None) => {
+                let secret = from_file.unwrap_or_else(SecretKey::generate);
+                let text = hex::encode(secret.to_bytes());
+                keychain::set(service, &account, &text)?;
+                // The file is deleted only once the Keychain gives the same key back.
+                if keychain::get(service, &account).ok().flatten().as_deref() == Some(text.as_str()) {
+                    let _ = std::fs::remove_file(&file);
+                }
+                Ok(Identity { secret })
+            }
+            // The person denied access, or the Keychain is locked: the old file still works.
+            Err(error) => from_file.map(|secret| Identity { secret }).ok_or(error),
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let account = home.display().to_string();
-            match secret::get(&account) {
-                Ok(Some(text)) => {
-                    let secret = parse(&text).ok_or("the mesh identity in the Secret Service is not a key")?;
-                    // A file the move left behind (the same key) goes now.
-                    if from_file.as_ref().is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
-                        let _ = std::fs::remove_file(&file);
-                    }
-                    Ok(Identity { secret })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let account = account.to_owned();
+        match secret::get(service, &account) {
+            Ok(Some(text)) => {
+                let secret = parse(&text).ok_or("the mesh identity in the Secret Service is not a key")?;
+                // A file the move left behind (the same key) goes now.
+                if from_file.as_ref().is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
+                    let _ = std::fs::remove_file(&file);
                 }
-                Ok(None) => {
-                    let secret = from_file.unwrap_or_else(SecretKey::generate);
-                    let text = hex::encode(secret.to_bytes());
-                    match secret::set(&account, &text) {
-                        // The file is deleted only once the Secret Service gives the same key back.
-                        Ok(()) if secret::get(&account).ok().flatten().as_deref() == Some(text.as_str()) => {
-                            let _ = std::fs::remove_file(&file);
-                            Ok(Identity { secret })
-                        }
-                        Ok(()) => {
-                            tracing::warn!("the Secret Service did not give the mesh identity back; it is kept in {} as well", file.display());
-                            keep_in_file(home, &file, &secret)?;
-                            Ok(Identity { secret })
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "the mesh identity cannot be kept in the Secret Service; it is kept in {}", file.display());
-                            keep_in_file(home, &file, &secret)?;
-                            Ok(Identity { secret })
-                        }
-                    }
-                }
-                // No `secret-tool` on this system: the key lives in the file.
-                Err(error) if error.missing => {
-                    tracing::warn!(%error, "no Secret Service for the mesh identity; it is kept in {}", file.display());
-                    let secret = match from_file {
-                        Some(secret) => secret,
-                        None => {
-                            let secret = SecretKey::generate();
-                            keep_in_file(home, &file, &secret)?;
-                            secret
-                        }
-                    };
-                    Ok(Identity { secret })
-                }
-                // The Secret Service is locked or does not answer (no session bus): the key may be
-                // kept there, so none is made; the old file still works.
-                Err(error) => from_file
-                    .map(|secret| Identity { secret })
-                    .ok_or_else(|| format!("cannot read the mesh identity from the Secret Service: {error}")),
+                Ok(Identity { secret })
             }
+            Ok(None) => {
+                let secret = from_file.unwrap_or_else(SecretKey::generate);
+                let text = hex::encode(secret.to_bytes());
+                match secret::set(service, &account, &text) {
+                    // The file is deleted only once the Secret Service gives the same key back.
+                    Ok(()) if secret::get(service, &account).ok().flatten().as_deref() == Some(text.as_str()) => {
+                        let _ = std::fs::remove_file(&file);
+                        Ok(Identity { secret })
+                    }
+                    Ok(()) => {
+                        tracing::warn!("the Secret Service did not give the mesh identity back; it is kept in {} as well", file.display());
+                        keep_in_file(&file, &secret)?;
+                        Ok(Identity { secret })
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "the mesh identity cannot be kept in the Secret Service; it is kept in {}", file.display());
+                        keep_in_file(&file, &secret)?;
+                        Ok(Identity { secret })
+                    }
+                }
+            }
+            // No `secret-tool` on this system: the key lives in the file.
+            Err(error) if error.missing => {
+                tracing::warn!(%error, "no Secret Service for the mesh identity; it is kept in {}", file.display());
+                let secret = match from_file {
+                    Some(secret) => secret,
+                    None => {
+                        let secret = SecretKey::generate();
+                        keep_in_file(&file, &secret)?;
+                        secret
+                    }
+                };
+                Ok(Identity { secret })
+            }
+            // The Secret Service is locked or does not answer (no session bus): the key may be
+            // kept there, so none is made; the old file still works.
+            Err(error) => from_file
+                .map(|secret| Identity { secret })
+                .ok_or_else(|| format!("cannot read the mesh identity from the Secret Service: {error}")),
         }
     }
 }
 
-/// Write the key to `<home>/mesh/node.key`, readable by the owner only (where no Secret Service
-/// keeps it). A file that already holds this key is left as it is.
+/// Write the key to its file, readable by the owner only (where no Secret Service keeps it). A
+/// file that already holds this key is left as it is.
 #[cfg(not(target_os = "macos"))]
-fn keep_in_file(home: &Path, file: &Path, secret: &SecretKey) -> Result<(), String> {
+fn keep_in_file(file: &Path, secret: &SecretKey) -> Result<(), String> {
     let text = hex::encode(secret.to_bytes());
     if std::fs::read_to_string(file).ok().and_then(|old| parse(&old)).is_some_and(|old| old.to_bytes() == secret.to_bytes()) {
         return Ok(());
     }
-    let _ = std::fs::create_dir_all(file.parent().unwrap_or(home));
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -152,17 +208,13 @@ fn key_file(home: &Path) -> PathBuf {
 
 #[cfg(target_os = "macos")]
 mod keychain {
-    fn service() -> String {
-        format!("{} mesh identity", crate::APP)
-    }
-
     /// `None` when there is no such item.
-    pub fn get(account: &str) -> Result<Option<String>, String> {
-        crate::keychain::get(&service(), account).map_err(|error| format!("cannot read the mesh identity from the Keychain: {error}"))
+    pub fn get(service: &str, account: &str) -> Result<Option<String>, String> {
+        crate::keychain::get(service, account).map_err(|error| format!("cannot read the mesh identity from the Keychain: {error}"))
     }
 
-    pub fn set(account: &str, secret: &str) -> Result<(), String> {
-        crate::keychain::set(&service(), account, secret).map_err(|error| format!("cannot keep the mesh identity in the Keychain: {error}"))
+    pub fn set(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        crate::keychain::set(service, account, secret).map_err(|error| format!("cannot keep the mesh identity in the Keychain: {error}"))
     }
 }
 
@@ -175,10 +227,6 @@ mod secret {
     use std::process::{Command, Output, Stdio};
 
     const TOOL: &str = "secret-tool";
-
-    fn service() -> String {
-        format!("{} mesh identity", crate::APP)
-    }
 
     /// Why a `secret-tool` call failed: `missing` when the tool itself is not installed (then the
     /// key may live in the file); any other failure leaves the key where it is.
@@ -199,12 +247,11 @@ mod secret {
     }
 
     /// `secret-tool <command> <args> service <service> account <account>`, with `input` on stdin.
-    fn run(command: &str, args: &[&str], account: &str, input: Option<&str>) -> Result<Output, Failure> {
-        let service = service();
+    fn run(command: &str, args: &[&str], service: &str, account: &str, input: Option<&str>) -> Result<Output, Failure> {
         let mut child = Command::new(TOOL)
             .arg(command)
             .args(args)
-            .args(["service", service.as_str(), "account", account])
+            .args(["service", service, "account", account])
             .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -225,8 +272,8 @@ mod secret {
     }
 
     /// `None` when there is no such item (`lookup` then exits 1 and says nothing).
-    pub fn get(account: &str) -> Result<Option<String>, Failure> {
-        let output = run("lookup", &[], account, None)?;
+    pub fn get(service: &str, account: &str) -> Result<Option<String>, Failure> {
+        let output = run("lookup", &[], service, account, None)?;
         if output.status.success() {
             let text = String::from_utf8(output.stdout).map_err(|_| other("the Secret Service item is not text".to_owned()))?;
             let text = text.trim_end_matches('\n');
@@ -239,9 +286,9 @@ mod secret {
     }
 
     /// Make the item, or replace its secret.
-    pub fn set(account: &str, secret: &str) -> Result<(), Failure> {
-        let label = format!("--label={}", service());
-        let output = run("store", &[label.as_str()], account, Some(secret))?;
+    pub fn set(service: &str, account: &str, secret: &str) -> Result<(), Failure> {
+        let label = format!("--label={service}");
+        let output = run("store", &[label.as_str()], service, account, Some(secret))?;
         if output.status.success() { Ok(()) } else { Err(failed(&output)) }
     }
 }

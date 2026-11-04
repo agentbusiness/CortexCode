@@ -153,8 +153,16 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
         "mesh.log.push" => {
             let entries: Vec<Entry> = serde_json::from_value(params.get("entries").cloned().unwrap_or(Value::Null)).unwrap_or_default();
             // An app on this machine only, not in this network's log: its log is another network's.
+            let pushed = entries.clone();
             let outcome = if !mesh.local_only(&node) { mesh.log_received(entries).map(|changed| json!({"changed": changed})).map_err(RpcError::invalid_params) } else { Ok(json!({"changed": false})) };
             let changed = outcome.as_ref().is_ok_and(|value| value["changed"] == json!(true));
+            // The sender's copy lost to this one (a fork this side kept, or an older copy of a
+            // network linked in here): it gets this copy back, so it does not stay on its own.
+            if outcome.is_ok() && !mesh.local_only(&node) && !mesh.log_entries().starts_with(&pushed) {
+                let mesh = mesh.clone();
+                let node = node.clone();
+                tokio::spawn(async move { mesh.push_log_to(&node).await });
+            }
             let message = answer(outcome);
             write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
             // A log that changed here goes on to the members connected here, so a network linked
@@ -163,34 +171,6 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                 let mesh = mesh.clone();
                 tokio::spawn(async move { mesh.push_log().await });
             }
-        }
-        "mesh.local.join" => {
-            // An app on this machine in no network asks into this one (`Mesh::admit_local`); the
-            // members hear of it at once.
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
-            let addrs: Vec<String> = serde_json::from_value(params.get("addrs").cloned().unwrap_or(Value::Null)).unwrap_or_default();
-            let admitted = mesh.admit_local(&node, &name, addrs);
-            let outcome = admitted.as_ref().map(|entries| json!({"entries": entries})).map_err(|reason| RpcError::new(codes::CONTRACT_VIOLATION, reason.clone()));
-            let message = answer(outcome);
-            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
-            if admitted.is_ok() {
-                tracing::info!(%name, "an app on this machine joined the network");
-                mesh.push_log().await;
-            }
-        }
-        "mesh.local.network" => {
-            // An app on this machine asks which network this one is in and since when, to keep the
-            // machine's apps in one network (`Mesh::join_local`). Only an app on this machine asks.
-            let outcome = if !mesh.is_local(&node) {
-                Err(RpcError::new(codes::CONTRACT_VIOLATION, "only an app on this machine may ask"))
-            } else {
-                Ok(match mesh.network() {
-                    Some(network) => json!({"id": network.id, "joined_ms": mesh.joined_ms()}),
-                    None => json!({}),
-                })
-            };
-            let message = answer(outcome);
-            write_message(&mut send, &message).await.map_err(|e| e.to_string())?;
         }
         "mesh.provides" => {
             let category = params.get("category").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -432,7 +412,7 @@ impl Mesh {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 mesh.refresh_local();
                 mesh.dial_all().await;
-                mesh.join_local().await;
+                mesh.sync_machine().await;
                 mesh.push_card().await;
                 mesh.auto_place().await;
             }
@@ -625,7 +605,9 @@ impl Mesh {
             }
         };
         self.adopt_log(entries)?;
-        // Members of a network linked in by this join hear of it now.
+        // This computer's machine key comes in with this app, so its other apps follow it; the
+        // members of a network linked in by this join hear of it now.
+        self.sync_machine().await;
         self.push_log().await;
         self.dial_all().await;
         Ok(())

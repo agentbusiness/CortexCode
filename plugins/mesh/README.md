@@ -24,12 +24,17 @@ Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); 
   retried every second; writes queue in order in memory until it takes them.
 - Files of earlier versions (`mesh/members.jsonl`, `shares.json`, `name`, `no-lend`) are moved
   in once, confirmed and deleted; `served.jsonl` (a record of served calls nothing read) is deleted.
-- `~/.cortex-mesh/local/<software>-<node>.json` stays a file: plumbing (pid and loopback ports of
-  a running app, removed when it stops), how CortexCode and CortexTerm on one Mac find each other.
+- The cortex-network folder `~/.cortex-network/` (0700) holds files, not records: `apps/<software>-<node>.json`
+  (pid and loopback ports of a running app, removed when it stops: how the apps on one computer find
+  each other) and `network.json` (the signed membership log as it was written last, 0600: how an app
+  that starts while the others are closed finds the computer's network). The machine key every app on
+  the computer shares is in the Keychain (`cortex-network machine`), with the rollback guard of the
+  shared log (`cortex-network log`).
 
-Nothing to set. One invitation joins a computer; Remove takes it out. Apps on one Mac join each
-other's network by themselves: one in no network is taken in by one that is in a network with
-other computers (`mesh.local.join`), unless it left that network or was removed from it before. Each member row has one switch: whether
+Nothing to set. One invitation joins a computer; Remove takes it out. All apps on one computer are in one network:
+each signs itself in with the computer's machine key, so one that starts while the others are closed
+joins by itself, and joining another network links it with this one (every computer of both). Remove
+takes a member's whole computer out; Leave takes this computer out. Each member row has one switch: whether
 that member may see its projects. A member not switched on gets no projects in this computer's card and its
 window is refused. A project lives on its own
 computer, and every member's window works in it there; every member lends every other its model,

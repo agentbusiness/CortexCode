@@ -94,7 +94,7 @@ pub struct Mesh {
     pub me: Identity,
     pub config: Mutex<Config>,
     name: Mutex<String>,
-    log: Mutex<Log>,
+    pub(crate) log: Mutex<Log>,
     pub cards: Mutex<HashMap<String, Card>>,
     my_card: Mutex<Option<Card>>,
     conns: Mutex<HashMap<String, Connection>>,
@@ -211,6 +211,7 @@ impl Mesh {
             let persisted = loaded.entries.clone();
             mesh.apply_loaded(loaded);
             tokio::spawn(store::run_writer(call, machine, persisted, rx));
+            mesh.sync_machine().await;
             mesh.dial_all().await;
         });
     }
@@ -357,12 +358,17 @@ impl Mesh {
         lock(&self.log).entries.clone()
     }
 
-    /// The log as it stands now, to the store (this node's software with it).
-    fn save_log(&self) {
+    /// The log as it stands now, to the store (this node's software with it), and to the shared
+    /// folder while it is a network or this app was just taken out of one (`crate::machine`), so
+    /// the other apps on this computer follow even when they start later.
+    pub(crate) fn save_log(&self) {
         if !self.loaded() {
             return;
         }
         let entries = lock(&self.log).entries.clone();
+        if self.network().is_some() || !self.in_log(&self.me.hex()) {
+            crate::machine::write_log(&Log { entries: entries.clone() });
+        }
         self.write(Write::Log(entries));
         self.write(Write::Software(self.me.hex(), crate::SOFTWARE.to_owned()));
     }
@@ -396,24 +402,6 @@ impl Mesh {
         self.save_log();
         self.notify("members");
         Ok(entries)
-    }
-
-    /// An app on this machine joins this node's network without a code: being on this machine
-    /// (`crate::local`) is the proof, and the connection is its key. Taken only while this node is
-    /// in a network with other computers; an app that left it is taken back, one a member removed
-    /// comes back only by an invitation.
-    pub fn admit_local(&self, node: &str, name: &str, addrs: Vec<String>) -> Result<Vec<Entry>, String> {
-        if !self.is_local(node) {
-            return Err("only an app on this machine joins without an invitation".to_owned());
-        }
-        if self.network().is_none() {
-            return Err("this app is in no network".to_owned());
-        }
-        let removed = lock(&self.log).entries.iter().rev().find(|entry| entry.node == node).is_some_and(|entry| entry.kind == "revoke" && entry.by != node);
-        if removed {
-            return Err("this app was removed from the network; it comes back by an invitation".to_owned());
-        }
-        self.admit(&JoinerRecord { node: node.to_owned(), name: name.to_owned(), addrs, sig: String::new() })
     }
 
     /// A joiner takes the inviter's log as its own cortex. One already in a network with other
@@ -450,18 +438,9 @@ impl Mesh {
         Some(cc_protocol::contracts::mesh::Network { id: first.hash()[..10].to_owned(), founder: first.name.clone(), founded_ms: first.ts_ms, members: members.len() as u32 })
     }
 
-    /// When this node joined its network: its own latest `add` (the founder's is the first entry);
-    /// none while alone. Of two apps on this machine in different networks, the one that joined
-    /// earlier links its network into the other's (`Mesh::join_local`).
-    pub fn joined_ms(&self) -> Option<u64> {
-        self.network()?;
-        let me = self.me.hex();
-        lock(&self.log).entries.iter().rev().find(|entry| entry.kind == "add" && entry.node == me).map(|entry| entry.ts_ms)
-    }
-
     /// Forget the network: the log goes, every connection closes, nothing borrowed or placed
     /// stays. The node is alone again and can be invited into another network.
-    fn forget_network(&self) {
+    pub(crate) fn forget_network(&self) {
         {
             let mut log = lock(&self.log);
             *log = Log::default();
@@ -484,12 +463,30 @@ impl Mesh {
         self.notify("members");
     }
 
-    /// This node leaves its network: a revoke of itself, told to the members, then nothing of
-    /// the network kept here.
+    /// This computer leaves its network: every app of it and its machine key revoked by the
+    /// machine key (so none is counted as removed, and an invitation brings them all back), told
+    /// to the members and left in the shared folder, then nothing of the network kept here.
+    /// Without a machine key only this app is revoked, by itself.
     pub async fn leave(&self) {
-        if self.in_log(&self.me.hex()) && lock(&self.log).members().len() > 1 {
+        let me = self.me.hex();
+        if self.in_log(&me) && lock(&self.log).members().len() > 1 {
             let name = self.name();
-            lock(&self.log).append(&self.me, "revoke", &self.me.hex(), &name, Vec::new());
+            {
+                let mut log = lock(&self.log);
+                let computer = log.computer_of(&me);
+                match crate::machine::identity().filter(|machine| computer.contains(&machine.hex())) {
+                    Some(machine) => {
+                        let (members, machines) = (log.members(), log.machines());
+                        for node in &computer {
+                            let named = members.get(node).map(|member| member.name.clone()).or_else(|| machines.get(node).cloned()).unwrap_or_default();
+                            log.append(machine, "revoke", node, &named, Vec::new());
+                        }
+                    }
+                    None => {
+                        log.append(&self.me, "revoke", &me, &name, Vec::new());
+                    }
+                }
+            }
             self.save_log();
             self.push_log().await;
         }
@@ -501,7 +498,7 @@ impl Mesh {
         if !self.loaded() {
             return Err("this computer is still reading its membership".to_owned());
         }
-        let merged = lock(&self.log).merge(entries.clone());
+        let merged = lock(&self.log).merge(&self.me, entries.clone());
         let changed = match merged {
             Ok(changed) => changed,
             Err(error) => self.take_link(entries).ok_or(error)?,
@@ -816,18 +813,35 @@ impl Mesh {
                 if !self.in_log(&params.node) {
                     return Err(RpcError::invalid_params("an app on this machine is a member while it runs; quit it there"));
                 }
-                let member = self.member(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
-                lock(&self.log).append(&self.me, "revoke", &params.node, &member.name, Vec::new());
+                self.member(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
+                // The member's whole computer goes: its machine key would sign its apps back in.
+                let gone = {
+                    let mut log = lock(&self.log);
+                    let computer = log.computer_of(&params.node);
+                    if computer.contains(&self.me.hex()) {
+                        return Err(RpcError::invalid_params("this app is on the same computer; take the computer out with Leave"));
+                    }
+                    let (members, machines) = (log.members(), log.machines());
+                    for node in &computer {
+                        let named = members.get(node).map(|member| member.name.clone()).or_else(|| machines.get(node).cloned()).unwrap_or_default();
+                        log.append(&self.me, "revoke", node, &named, Vec::new());
+                    }
+                    computer
+                };
                 self.save_log();
-                let borrowed: Vec<String> = lock(&self.borrows).values().filter(|borrow| borrow.node == params.node).map(|borrow| borrow.category.clone()).collect();
-                for category in borrowed {
-                    self.stop_borrow(&category);
+                for node in &gone {
+                    let borrowed: Vec<String> = lock(&self.borrows).values().filter(|borrow| &borrow.node == node).map(|borrow| borrow.category.clone()).collect();
+                    for category in borrowed {
+                        self.stop_borrow(&category);
+                    }
+                    self.member_gone(node);
                 }
-                self.member_gone(&params.node);
-                // Told before the connection closes, so the revoked node learns it.
+                // Told before the connections close, so the revoked nodes learn it.
                 self.push_log().await;
-                if let Some(connection) = lock(&self.conns).remove(&params.node) {
-                    connection.close(3u32.into(), b"revoked");
+                for node in &gone {
+                    if let Some(connection) = lock(&self.conns).remove(node) {
+                        connection.close(3u32.into(), b"revoked");
+                    }
                 }
                 self.notify("members");
                 Ok(json!({}))

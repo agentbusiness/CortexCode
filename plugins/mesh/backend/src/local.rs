@@ -1,25 +1,16 @@
-//! Apps of this person on this machine: members without pairing.
+//! Apps of this person on this machine: found without pairing, dialed over loopback.
 //!
-//! Every running frame's mesh writes one small file into a folder only this macOS user can open
-//! (`~/.cortex-mesh/local/<software>-<node>.json`, the folder 0700, the file 0600; `CORTEX_MESH_LOCAL_DIR`
-//! moves it): its node id, software, frame home, process id and the loopback addresses its
-//! endpoint listens on. The others read it, skip files whose process is gone, and take those
-//! nodes as members marked `local`, dialed straight over loopback (no relay, no lookup).
+//! Every running frame's mesh writes one small file into the cortex-network folder's `apps/`
+//! (`~/.cortex-network/apps/<software>-<node>.json`, the folders 0700, the file 0600;
+//! `crate::machine`): its node id, software, frame home, process id and the loopback addresses
+//! its endpoint listens on. The others read it, skip files whose process is gone, and take those
+//! nodes as members marked `local`, dialed straight over loopback (no relay, no lookup). Being able
+//! to write into this person's folder is the proof; the trust ends when the file or its process
+//! goes.
 //!
-//! The trust lives here, apart from the signed membership log: each app keeps its own log (and
-//! may be in a network with other computers), and two networks become one only by a link
-//! (`Log::link`). Being able to write into this user's folder is the proof; the trust ends when
-//! the file or its process goes.
-//!
-//! One step crosses into the log: the apps on one machine are in one network. An app in no network
-//! asks the others on this machine to take it into theirs (`Mesh::join_local`, every 15 s), and one
-//! in a network with other computers adds it (`Mesh::admit_local`), so it is a member on every
-//! computer of that network too. When an app on this machine is in another network, the two
-//! networks become one: the app that joined its network earlier asks to be taken into the other
-//! and links its own network in (`Log::link`), so every member of both knows every other (seen: a
-//! computer whose one app joined another network fell out of the network its other app was
-//! in). An app that left a network is taken back; one a member removed is not, without an
-//! invitation.
+//! The network itself is the computer's (`crate::machine`): every app signs itself in with the
+//! machine key, so the apps here are members of one network and each still offers its own model
+//! and services.
 
 use cc_protocol::contracts::mesh::Member;
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
@@ -50,10 +41,7 @@ impl LocalPeer {
 }
 
 pub fn dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CORTEX_MESH_LOCAL_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cortex-mesh").join("local"))
+    Some(crate::machine::private_dir()?.join("apps"))
 }
 
 fn file_of(software: &str, node: &str) -> Option<PathBuf> {
@@ -135,58 +123,6 @@ pub fn loopback(bound: &[std::net::SocketAddr]) -> Vec<String> {
 }
 
 impl crate::service::Mesh {
-    /// Keep this machine's apps in one network. While this node is in no network, ask each
-    /// connected app on this machine to take it into its own; the first in a network with other
-    /// computers does (`Mesh::admit_local`). While it is in a network and an app here is in another
-    /// one, the networks become one: the app that joined its network earlier is taken into the
-    /// other and links its own in (`Mesh::adopt_log`).
-    pub async fn join_local(self: &std::sync::Arc<Self>) {
-        if !self.loaded() {
-            return;
-        }
-        let locals: Vec<String> = crate::service::lock(&self.local).keys().cloned().collect();
-        let nodes: Vec<String> = locals.into_iter().filter(|node| self.connection(node).is_some()).collect();
-        let addrs: Vec<String> = self.my_addr().and_then(|addr| serde_json::to_string(&addr).ok()).into_iter().collect();
-        let me = self.me.hex();
-        for node in nodes {
-            if let Some(own) = self.network() {
-                // Which network the other app is in, and since when (an app of an earlier version
-                // does not say: it is not linked).
-                let Ok(theirs) = self.call_member(&node, "mesh.local.network", serde_json::json!({}), None, tokio_util::sync::CancellationToken::new()).await else { continue };
-                let Some(id) = theirs.get("id").and_then(serde_json::Value::as_str) else { continue };
-                if id == own.id {
-                    continue;
-                }
-                let their_join = theirs.get("joined_ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                let my_join = self.joined_ms().unwrap_or(0);
-                // One side links, never both at once: the app that joined its network earlier
-                // (the same moment: the smaller node id) asks the other to take it in.
-                if (their_join, node.as_str()) < (my_join, me.as_str()) {
-                    continue;
-                }
-                tracing::info!(app = %&node[..node.len().min(10)], network = %id, "an app on this machine is in another network; linking this one into it");
-            }
-            let params = serde_json::json!({"name": self.name(), "addrs": addrs});
-            let asked = self.call_member(&node, "mesh.local.join", params, None, tokio_util::sync::CancellationToken::new()).await;
-            let entries: Vec<crate::members::Entry> = match asked {
-                Ok(answer) => serde_json::from_value(answer.get("entries").cloned().unwrap_or_default()).unwrap_or_default(),
-                Err(error) => {
-                    tracing::debug!(node = %&node[..node.len().min(10)], error = %error.message, "an app on this machine did not take this one into its network");
-                    continue;
-                }
-            };
-            match self.adopt_log(entries) {
-                Ok(()) => {
-                    tracing::info!("joined the network of an app on this machine");
-                    self.push_log().await;
-                    self.dial_all().await;
-                    return;
-                }
-                Err(reason) => tracing::warn!(%reason, "the network of an app on this machine was not taken"),
-            }
-        }
-    }
-
     /// One model per machine, asked by this frame's model plugin before it loads a model tagged
     /// `to_tag`: every app on this machine whose model is not tagged so unloads it. Each is
     /// reached directly (dialed now when not connected yet: the apps may have started together)

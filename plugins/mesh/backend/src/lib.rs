@@ -11,6 +11,7 @@ pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod local;
+pub mod machine;
 pub mod members;
 pub mod net;
 pub mod pairing;
