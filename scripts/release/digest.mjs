@@ -6,12 +6,13 @@
 //   plugin <dir>  the plugin's folder; for its Rust crates (every Cargo.toml in the folder) the
 //                 local crates they depend on by path (lang-kit, model-kit), the frame's interface
 //                 in protocol/ and the protocol contracts they name as features of cc-protocol
-//                 (with the features those need), and rust-toolchain.toml; for its UI packages the
-//                 SDK's build preset (ui/sdk/vite.mjs), or the whole SDK when it ships the SDK's
-//                 runtime (the window, window@1)
+//                 (with the features those need), rust-toolchain.toml and scripts/build-env.sh;
+//                 for its UI packages the SDK's build preset (ui/sdk/vite.mjs), or the whole SDK
+//                 when it ships the SDK's runtime (the window, window@1)
 //   frame         frame/ with its protocol files, the Electron shell (ui/shell), what the frame
 //                 release takes from ui/package.json (name, main, type, dependencies, Electron's
-//                 version), scripts/app/cortex.frame.toml and electron.sh, rust-toolchain.toml
+//                 version), scripts/app/cortex.frame.toml and electron.sh, rust-toolchain.toml,
+//                 scripts/build-env.sh
 //   interface     the frame's interface: protocol/ without the contracts and helpers that are
 //                 features (a plugin needs a frame at least as new as the one that brought it)
 //   npm           the npx launcher (npm/cortexcode)
@@ -124,7 +125,7 @@ function inputs(part, dir) {
     return { paths: ['npm/cortexcode'], files: sources(['npm/cortexcode']), texts: [] };
   }
   if (part === 'frame') {
-    const own = ['frame', 'ui/shell', 'scripts/app/cortex.frame.toml', 'scripts/app/electron.sh', 'rust-toolchain.toml'];
+    const own = ['frame', 'ui/shell', 'scripts/app/cortex.frame.toml', 'scripts/app/electron.sh', 'rust-toolchain.toml', 'scripts/build-env.sh'];
     const rust = rustInputs(['frame/Cargo.toml']);
     const ui = JSON.parse(read('ui/package.json'));
     const shipped = JSON.stringify({ name: ui.name, main: ui.main, type: ui.type, dependencies: ui.dependencies, electron: ui.devDependencies?.electron });
@@ -143,8 +144,8 @@ function inputs(part, dir) {
     const texts = [];
     if (manifests.length > 0) {
       const rust = rustInputs(manifests);
-      paths.push(...rust.local, PROTOCOL, 'rust-toolchain.toml');
-      files.push(...sources([...rust.local, 'rust-toolchain.toml']), ...protocolFilesFor(rust.features));
+      paths.push(...rust.local, PROTOCOL, 'rust-toolchain.toml', 'scripts/build-env.sh');
+      files.push(...sources([...rust.local, 'rust-toolchain.toml', 'scripts/build-env.sh']), ...protocolFilesFor(rust.features));
       texts.push(protocolManifest(rust.features));
     }
     if (own.some((file) => path.basename(file) === 'package.json' && file.startsWith(`${dir}/ui`))) {

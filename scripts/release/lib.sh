@@ -22,6 +22,8 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Built files name no folder of this computer (scripts/build-env.sh).
+. "$repo/scripts/build-env.sh"
 pack="$repo/packer/target/release/cortex-pack"
 artifacts="$repo/artifacts"
 release_name="${release_name:-release}"
