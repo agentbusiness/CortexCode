@@ -13,8 +13,8 @@ build="$here/target/llama-ninja"
 out="$here/target/release/llama"
 cpu=""
 case "$(uname -m)" in aarch64|arm64) cpu="-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16" ;; esac
-# CFLAGS / CXXFLAGS (scripts/build-env.sh) on every configure, not only a new build folder's.
-cmake -S "$here/vendor/llama.cpp" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="${CFLAGS:-}" -DCMAKE_CXX_FLAGS="${CXXFLAGS:-}" -G Ninja $cpu \
+# CFLAGS / CXXFLAGS / LDFLAGS (scripts/build-env.sh) on every configure, not only a new build folder's.
+cmake -S "$here/vendor/llama.cpp" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="${CFLAGS:-}" -DCMAKE_CXX_FLAGS="${CXXFLAGS:-}" -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS:-}" -G Ninja $cpu \
   -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN' \
   -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
