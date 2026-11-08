@@ -17,7 +17,7 @@ platforms = ["macos", "linux"]
 category = "vcs"
 contract = "vcs@1"
 dir = "backend"
-build = ["cargo", "build", "--release"]
+build = ["sh", "build.sh", "cc-vcs"]
 exec = "backend/target/release/cc-vcs"
 
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
