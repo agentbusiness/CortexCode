@@ -198,6 +198,10 @@ pub struct UsedModel {
     /// This app still has it in memory (it is finishing a call before it stops its model).
     #[serde(default)]
     pub loaded: bool,
+    /// The context the app needs from whoever serves this model (tokens): the serving app runs the
+    /// biggest any app asks for. 0: none stated.
+    #[serde(default)]
+    pub ctx_needed: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -250,6 +254,10 @@ pub struct ModelCard {
     #[serde(default = "crate::contracts::model::default_tags")]
     pub tags: Vec<String>,
     pub ctx_total: u32,
+    /// The context the app needs from whoever serves this model (tokens): the serving app runs the
+    /// biggest any app asks for. 0: none stated.
+    #[serde(default)]
+    pub ctx_needed: u32,
     pub slots: u32,
     pub slots_busy: u32,
     /// Slots running a request a person waits for.
@@ -446,8 +454,9 @@ pub struct ClaimParams {
     /// that is pointless on a busy model); the answer's `tier` is `busy` when none is.
     #[serde(default = "claim_waits")]
     pub wait: bool,
-    /// The prompt's size in tokens: only a model whose conversation holds it takes the call (0:
-    /// unknown, any model).
+    /// The call's size in tokens (prompt, and the answer when the caller knows its cap): only a
+    /// model whose conversation holds it takes the call, and it holds that much of the model's
+    /// context pool while it runs (0: unknown, any model, one slot's share).
     #[serde(default)]
     pub tokens: u32,
 }

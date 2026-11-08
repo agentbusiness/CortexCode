@@ -15,6 +15,9 @@
 # min_frame: the first released frame with the frame interface the plugin is built against (the
 # catalog's `frame.interface_since`). When the interface changed since the released frame, the
 # frame is released first (scripts/release.sh does).
+#
+# Several plugins go out together, in one catalog at the end. A run that stops keeps what it
+# finished (artifacts/finished/): the next run skips those whose source is still the same.
 set -euo pipefail
 self="${CORTEX_RELEASE_ORIGINAL:-$0}"
 release_name="release-plugin"
@@ -38,7 +41,7 @@ for arg in "$@"; do
 done
 if [ $changed = 1 ] && [ ${#plugins[@]} -gt 0 ]; then die "give plugins or --changed, not both"; fi
 if [ $changed = 0 ] && [ ${#plugins[@]} -eq 0 ]; then
-  sed -n '2,15p' "$self" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$self" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 if [ -n "$given" ] && [ ${#plugins[@]} -ne 1 ]; then die "a version can be given for one plugin only"; fi
@@ -84,6 +87,14 @@ release_one() {
   released="$(jq -r --arg id "$id" '.plugins[$id].digest // empty' "$catalog")"
   if [ -z "$given" ] && [ -n "$released" ] && [ "$(plugin_digest "$dir")" = "$released" ]; then
     step "$id is unchanged since its release $latest (give a version to release it anyway)"
+    return
+  fi
+  # A batch that stopped before its catalog went out: what it finished stays finished.
+  local finished="$artifacts/finished/$id.json"
+  if [ -z "$given" ] && [ $dry_run = 0 ] && [ -f "$finished" ] && [ "$(plugin_digest "$dir")" = "$(jq -r '.digest' "$finished")" ]; then
+    step "$id $(jq -r '.version' "$finished") is already built and uploaded by the run that stopped: kept"
+    jq --arg id "$id" --slurpfile entry "$finished" '.plugins[$id] = $entry[0]' "$catalog" > "$catalog.next"
+    mv "$catalog.next" "$catalog"
     return
   fi
   if [ -z "$given" ] && [ -n "$latest" ] && version_newer "$toml_v" "$latest"; then
@@ -145,6 +156,10 @@ release_one() {
     '.plugins[$id] = {version: $version, tag: $tag, name: $name, min_frame: $min, platforms: $platforms, digest: $digest, files: $files}' \
     "$catalog" > "$catalog.next"
   mv "$catalog.next" "$catalog"
+  if [ $dry_run = 0 ]; then
+    mkdir -p "$artifacts/finished"
+    jq --arg id "$id" '.plugins[$id]' "$catalog" > "$finished"
+  fi
 }
 
 for id in "${plugins[@]}"; do
@@ -157,5 +172,6 @@ if [ $dry_run = 1 ]; then
   step "dry run: packages in artifacts/plugins/, the catalog it would publish in artifacts/catalog.preview.json"
 else
   publish_catalog "$catalog"
+  rm -rf "$artifacts/finished"
   step "done; commit the plugin.toml versions"
 fi

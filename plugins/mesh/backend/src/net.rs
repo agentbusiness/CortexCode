@@ -181,6 +181,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
             let session = params.get("session_id").and_then(Value::as_str).unwrap_or("").to_owned();
             let since = params.get("since_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
             let wait = params.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            let tokens = params.get("tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
             let tag = params.get("tag").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(cc_protocol::contracts::model::default_tag);
             // The model the claim is for (its card's `plugin`); none named: the first for the tag.
             let named = params.get("plugin").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -206,7 +207,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                     }
                 })
             };
-            let granted = mesh.lend(&node, &session, &plugin, since, false, wait, withdrawn.clone()).await;
+            let granted = mesh.lend(&node, &session, &plugin, since, false, tokens, wait, withdrawn.clone()).await;
             watcher.abort();
             let message = answer(Ok(json!({"granted": granted})));
             if write_message(&mut send, &message).await.is_err() && granted {

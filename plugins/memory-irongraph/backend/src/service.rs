@@ -794,7 +794,8 @@ impl Memory {
     /// A project the person deleted: everything memory holds for it goes (its code graph and
     /// workspaces, line indexes, knowledge, registry entry), as for a closed reference.
     async fn forget_project(&self, project_id: &str) -> Result<(), RpcError> {
-        crate::procedures::forget(&self.graph_store().await?, project_id).await?;
+        let store = self.graph_store().await?;
+        crate::procedures::forget(&store, project_id).await?;
         // Under the lock the background open ends under, so the drop is seen by it or done here.
         let running = match self.indexing.lock() {
             Ok(set) if set.contains(project_id) => {

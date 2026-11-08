@@ -279,12 +279,17 @@ gh_release() {
 
 # gh_upload <release id> <file> [asset name]: replaces an asset of the same name.
 gh_upload() {
-  local id="$1" file="$2" name="${3:-$(basename "$2")}" existing
-  existing="$(gh_api GET "/repos/$RELEASE_REPO/releases/$id/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')"
-  [ -z "$existing" ] || gh_api DELETE "/repos/$RELEASE_REPO/releases/assets/$existing" >/dev/null
-  curl -fsSL -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-    -H "Content-Type: application/octet-stream" -T "$file" \
-    "https://uploads.github.com/repos/$RELEASE_REPO/releases/$id/assets?name=$name" >/dev/null || die "cannot upload $name"
+  local id="$1" file="$2" name="${3:-$(basename "$2")}" existing try
+  # A server timeout can leave the asset behind, so each try starts by removing it.
+  for try in 1 2 3 4; do
+    existing="$(gh_api GET "/repos/$RELEASE_REPO/releases/$id/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')"
+    [ -z "$existing" ] || gh_api DELETE "/repos/$RELEASE_REPO/releases/assets/$existing" >/dev/null
+    curl -fsSL -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+      -H "Content-Type: application/octet-stream" -T "$file" \
+      "https://uploads.github.com/repos/$RELEASE_REPO/releases/$id/assets?name=$name" >/dev/null && return
+    [ "$try" = 4 ] || { step "upload of $name failed (try $try of 4): trying again"; sleep 15; }
+  done
+  die "cannot upload $name"
 }
 
 # asset_json <file> <tag>: the catalog entry of an uploaded file.

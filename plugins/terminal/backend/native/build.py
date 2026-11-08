@@ -69,6 +69,14 @@ with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             with tar.extractfile(member) as incoming:
                 destination.write_bytes(incoming.read())
             destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+# Fetch these packages from their own projects: Zig still checks each against the hash Ghostty pins.
+for manifest in source.rglob("build.zig.zon"):
+    text = manifest.read_text()
+    changed = text
+    for pinned, upstream in PIN["dependency_sources"].items():
+        changed = changed.replace(pinned, upstream)
+    if changed != text:
+        manifest.write_text(changed)
 # Keep the unstable API adaptation small and inside the exact upstream module.
 shutil.copyfile(NATIVE / "cortex_terminal.zig", source / "src" / "cortex_terminal.zig")
 with (source / "src" / "lib_vt.zig").open("a") as output:

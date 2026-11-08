@@ -6,5 +6,11 @@
   "sha256": "7759929eadaddf602d6fd5ad6b3403d854b91b7083975cd984bb525bc8275187",
   "zig": "0.17.0",
   "license": "MIT",
-  "abi": "libghostty-vt 0.1.0-dev with Cortex read adapter 1"
+  "abi": "libghostty-vt 0.1.0-dev with Cortex read adapter 1",
+  "dependency_sources": {
+    "https://deps.files.ghostty.org/uucode-ea62149739404a73c202b48a33bf6dd2af4bd9b0.tar.gz": "https://github.com/jacobsandlund/uucode/archive/ea62149739404a73c202b48a33bf6dd2af4bd9b0.tar.gz",
+    "https://deps.files.ghostty.org/translate_c-02ff0c523fb92a38939b04d0145c4a9602a74d56.tar.gz": "https://codeberg.org/ziglang/translate-c/archive/02ff0c523fb92a38939b04d0145c4a9602a74d56.tar.gz",
+    "https://deps.files.ghostty.org/zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz": "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz",
+    "https://deps.files.ghostty.org/ghostty-themes-release-20261019-151001-86a776d.tgz": "https://github.com/mbadolato/iTerm2-Color-Schemes/releases/download/release-20261019-151001-86a776d/ghostty-themes.tgz"
+  }
 }
