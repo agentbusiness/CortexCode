@@ -16,7 +16,7 @@ platforms = ["macos", "linux"]
 category = "source"
 contract = "source@1"
 dir = "backend"
-build = ["cargo", "build", "--release"]
+build = ["sh", "build.sh", "cc-source"]
 exec = "backend/target/release/cc-source"
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
