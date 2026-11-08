@@ -21,4 +21,18 @@ case " ${CXXFLAGS:-} " in
   *" -ffile-prefix-map=$HOME=~ "*) ;;
   *) CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-ffile-prefix-map=$HOME=~" ;;
 esac
+# macOS: the linker also writes each object file's path into the executable's debug map (the
+# release profiles keep `debug = 1`); -oso_prefix takes the home folder off those paths. LDFLAGS
+# reach CMake through the plugins' build.sh.
+if [ "$(uname -s)" = Darwin ]; then
+  case " $RUSTFLAGS " in
+    *" -C link-arg=-Wl,-oso_prefix,$HOME "*) ;;
+    *) RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$HOME" ;;
+  esac
+  case " ${LDFLAGS:-} " in
+    *" -Wl,-oso_prefix,$HOME "*) ;;
+    *) LDFLAGS="${LDFLAGS:+$LDFLAGS }-Wl,-oso_prefix,$HOME" ;;
+  esac
+  export LDFLAGS
+fi
 export RUSTFLAGS CFLAGS CXXFLAGS
