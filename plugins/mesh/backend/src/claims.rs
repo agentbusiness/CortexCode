@@ -28,6 +28,11 @@
 //! A claim whose tag no model has yet waits for one: it looks again whenever the models change
 //! (a model plugin here starts or swaps, a member connects, goes or sends its card), keeping its
 //! place, so the longest waiting call of that tag is first when a tagged model comes up.
+//!
+//! Slots share one context pool, so a use also holds its part of that pool: the tokens its claim
+//! states, and at least one slot's share (the pool over its slots; a claim that states none takes
+//! just that). A model takes a call only when the pool has room for it. A call too big for what is
+//! free waits, and the calls behind it wait behind it, so it runs when the running ones have ended.
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
@@ -69,6 +74,8 @@ struct Holder {
     /// The model it uses.
     plugin: String,
     foreground: bool,
+    /// The context its claim states (0: none).
+    tokens: u32,
 }
 
 struct Waiter {
@@ -77,6 +84,7 @@ struct Waiter {
     plugin: String,
     since: u64,
     foreground: bool,
+    tokens: u32,
     grant: oneshot::Sender<()>,
 }
 
@@ -117,42 +125,52 @@ impl Mesh {
     // --- the lending side: this computer's model ----------------------------------------------
 
     /// Whether this computer's model `plugin` can take one more use now: a slot is free (fewer
-    /// uses held, and fewer slots busy, than it has slots) and nothing waits for one; or, for a
-    /// person's call made here, no other person's call holds or runs it.
-    async fn model_free_for(&self, requester: &str, foreground: bool, plugin: &str) -> bool {
+    /// uses held, and fewer slots busy, than it has slots), nothing waits for one and its context
+    /// pool has room for the call's `tokens`; or, for a person's call made here, no other person's
+    /// call holds or runs it and the context other uses state leaves it room.
+    async fn model_free_for(&self, requester: &str, foreground: bool, plugin: &str, tokens: u32) -> bool {
         let Some(ctx) = self.ctx.get() else { return false };
         let Some(slots) = ctx.call("model.slots", crate::card::for_model(plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { return false };
+        // The pool the slots share (0: not known, slots alone decide) and one slot's share of it.
+        let pool = match ctx.call("model.info", crate::card::for_model(plugin)).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok()) {
+            Some(info) => u64::from(info.ctx_total),
+            None => 0,
+        };
+        let share = pool / slots.slots.len().max(1) as u64;
+        let need = u64::from(tokens).max(share).min(pool);
         let lending = lock(&self.claims.lending);
         let holders = || lending.holders.iter().filter(|holder| holder.plugin == plugin);
         if foreground && requester.is_empty() {
             let person_holds = holders().any(|holder| holder.foreground && holder.requester.is_empty());
             let person_runs = slots.slots.iter().any(|slot| slot.busy && slot.priority == Some(Priority::Foreground)) || slots.queued_by_priority.foreground > 0;
-            return !person_holds && !person_runs;
+            let stated: u64 = holders().map(|holder| u64::from(holder.tokens)).sum();
+            return !person_holds && !person_runs && (pool == 0 || stated + need <= pool);
         }
         // A held use may not run yet, and work that does not claim runs without a holder: the
         // larger of the two counts the slots taken.
         let taken = holders().count().max(slots.busy as usize);
-        taken < slots.slots.len().max(1) && slots.queued == 0
+        let held = holders().map(|holder| u64::from(holder.tokens).max(share)).sum::<u64>().max(u64::from(slots.busy) * share);
+        taken < slots.slots.len().max(1) && slots.queued == 0 && (pool == 0 || held + need <= pool)
     }
 
     /// Lend this computer's model `plugin` for one use: at once when it is free and no older run
     /// waits for it; else, with `wait`, when it is this run's turn (false: not now, or cancelled).
     #[allow(clippy::too_many_arguments)]
-    pub async fn lend(&self, requester: &str, session: &str, plugin: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
+    pub async fn lend(&self, requester: &str, session: &str, plugin: &str, since: u64, foreground: bool, tokens: u32, wait: bool, cancel: CancellationToken) -> bool {
         // A person here waits only for an older person here; anyone else for any older run.
         let person = foreground && requester.is_empty();
         let older_waits = lock(&self.claims.lending).waiting.iter().any(|waiter| waiter.plugin == plugin && waiter.since < since && (!person || (waiter.foreground && waiter.requester.is_empty())));
-        if !older_waits && self.model_free_for(requester, foreground, plugin).await {
+        if !older_waits && self.model_free_for(requester, foreground, plugin, tokens).await {
             let mut lending = lock(&self.claims.lending);
             lending.holders.retain(|holder| !(holder.requester == requester && holder.session == session));
-            lending.holders.push(Holder { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), foreground });
+            lending.holders.push(Holder { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), foreground, tokens });
             return true;
         }
         if !wait {
             return false;
         }
         let (grant, granted) = oneshot::channel();
-        lock(&self.claims.lending).waiting.push(Waiter { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), since, foreground, grant });
+        lock(&self.claims.lending).waiting.push(Waiter { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), since, foreground, tokens, grant });
         self.claims.freed.notify_one();
         tokio::select! {
             outcome = granted => outcome.is_ok(),
@@ -213,27 +231,36 @@ impl Mesh {
             } else {
                 self.claims.freed.notified().await;
             }
-            // The oldest waiter the model can take now: every run but a person here waits on the
-            // same condition, so this keeps their order; a person here may pass agent work.
+            // The oldest waiter the model can take now. A run the model cannot take holds back the
+            // runs behind it on that model, so a big call is not passed by small ones for ever; a
+            // person here may pass agent work.
             loop {
-                let waiting: Vec<(String, String, String, bool)> = {
+                let waiting: Vec<(String, String, String, bool, u32)> = {
                     let mut lending = lock(&self.claims.lending);
                     lending.waiting.retain(|waiter| !waiter.grant.is_closed());
                     lending.waiting.sort_by_key(|waiter| waiter.since);
-                    lending.waiting.iter().map(|waiter| (waiter.requester.clone(), waiter.session.clone(), waiter.plugin.clone(), waiter.foreground)).collect()
+                    lending.waiting.iter().map(|waiter| (waiter.requester.clone(), waiter.session.clone(), waiter.plugin.clone(), waiter.foreground, waiter.tokens)).collect()
                 };
                 let mut next = None;
-                for (requester, session, plugin, foreground) in waiting {
-                    if self.model_free_for(&requester, foreground, &plugin).await {
+                let mut held_back: Vec<String> = Vec::new();
+                for (requester, session, plugin, foreground, tokens) in waiting {
+                    let person = foreground && requester.is_empty();
+                    if !person && held_back.contains(&plugin) {
+                        continue;
+                    }
+                    if self.model_free_for(&requester, foreground, &plugin, tokens).await {
                         next = Some((requester, session));
                         break;
+                    }
+                    if !person {
+                        held_back.push(plugin);
                     }
                 }
                 let Some((requester, session)) = next else { break };
                 let mut lending = lock(&self.claims.lending);
                 let Some(position) = lending.waiting.iter().position(|waiter| waiter.requester == requester && waiter.session == session) else { continue };
                 let waiter = lending.waiting.remove(position);
-                lending.holders.push(Holder { requester: waiter.requester.clone(), session: waiter.session.clone(), plugin: waiter.plugin.clone(), foreground: waiter.foreground });
+                lending.holders.push(Holder { requester: waiter.requester.clone(), session: waiter.session.clone(), plugin: waiter.plugin.clone(), foreground: waiter.foreground, tokens: waiter.tokens });
                 if waiter.grant.send(()).is_err() {
                     lending.holders.retain(|holder| !(holder.requester == waiter.requester && holder.session == waiter.session));
                 }
@@ -372,11 +399,11 @@ impl Mesh {
     /// Ask one computer's model `plugin` for one use for `tag`'s work (`wait`: until it is this
     /// run's turn).
     #[allow(clippy::too_many_arguments)]
-    async fn ask(&self, node: &str, plugin: &str, session: &str, tag: &str, since: u64, foreground: bool, wait: bool, cancel: CancellationToken) -> bool {
+    async fn ask(&self, node: &str, plugin: &str, session: &str, tag: &str, since: u64, foreground: bool, tokens: u32, wait: bool, cancel: CancellationToken) -> bool {
         if node.is_empty() {
-            return self.lend("", session, plugin, since, foreground, wait, cancel).await;
+            return self.lend("", session, plugin, since, foreground, tokens, wait, cancel).await;
         }
-        let params = json!({"session_id": session, "plugin": plugin, "tag": tag, "since_ms": since, "wait": wait});
+        let params = json!({"session_id": session, "plugin": plugin, "tag": tag, "since_ms": since, "wait": wait, "tokens": tokens});
         let call = self.call_member(node, "mesh.model.claim", params, None, cancel);
         let answer = if wait {
             call.await
@@ -443,7 +470,7 @@ impl Mesh {
         };
         let mut chosen = None;
         for (index, option) in options.iter().enumerate() {
-            if self.ask(&option.node, &option.plugin, &session, &option.tag, since, params.foreground, false, CancellationToken::new()).await {
+            if self.ask(&option.node, &option.plugin, &session, &option.tag, since, params.foreground, params.tokens, false, CancellationToken::new()).await {
                 chosen = Some(index);
                 break;
             }
@@ -461,7 +488,7 @@ impl Mesh {
                 let session = session.clone();
                 let tag = option.tag.clone();
                 let stop = stop.clone();
-                Box::pin(async move { if mesh.ask(&node, &plugin, &session, &tag, since, params.foreground, true, stop).await { Ok(index) } else { Err(()) } })
+                Box::pin(async move { if mesh.ask(&node, &plugin, &session, &tag, since, params.foreground, params.tokens, true, stop).await { Ok(index) } else { Err(()) } })
             });
             let outcome = select_ok(waits).await;
             stop.cancel();

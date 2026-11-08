@@ -35,6 +35,16 @@ ENV CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.1 --no-modify-path
 
+# Zig at the exact version the terminal plugin's Ghostty library is pinned to
+# (plugins/terminal/backend/native/ghostty-pin.json), digest-checked. Both images take the ARM
+# build: the x86-64 Zig crashes under Rosetta (bss_size overflow) on the Mac these images run on,
+# and a static ARM binary runs natively in the amd64 container, still targeting x86-64.
+RUN curl -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz" \
+ && echo "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8  /tmp/zig.tar.xz" | sha256sum -c - \
+ && mkdir /usr/local/zig && tar -xJf /tmp/zig.tar.xz -C /usr/local/zig --strip-components=1 \
+ && ln -s /usr/local/zig/zig /usr/local/bin/zig \
+ && rm /tmp/zig.tar.xz
+
 # The repository is mounted read-only; builds run in a copy (/work, a volume that keeps the build
 # outputs between runs).
 RUN git config --system --add safe.directory '*'

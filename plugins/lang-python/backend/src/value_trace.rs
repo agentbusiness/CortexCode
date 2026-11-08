@@ -558,7 +558,7 @@ pub fn trace(p: ValueTraceParams) -> Result<ValueTrace, RpcError> {
             .unwrap_or("")
             .into(),
         line: p.line,
-        name: p.name,
+        name: p.name.clone(),
         roots,
         steps,
         boundaries: a.notes.into_iter().collect(),

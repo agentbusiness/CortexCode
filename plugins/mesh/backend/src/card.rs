@@ -162,6 +162,7 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
             family: info.family,
             tags: info.tags,
             ctx_total: info.ctx_total,
+            ctx_needed: info.extra.get("ctx_needed").and_then(serde_json::Value::as_u64).map_or(info.ctx_total, |needed| needed as u32),
             slots: info.slots,
             slots_busy: slots.as_ref().map(|slots| slots.busy).unwrap_or(0),
             busy_foreground: slots.as_ref().map(|slots| slots.slots.iter().filter(|slot| slot.busy && slot.priority == Some(cc_protocol::contracts::model::Priority::Foreground)).count() as u32).unwrap_or(0),

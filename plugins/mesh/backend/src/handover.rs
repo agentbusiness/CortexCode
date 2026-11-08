@@ -75,7 +75,8 @@ impl Mesh {
             if !serves_all(&above, &model.tags) {
                 return true;
             }
-            handed.insert(model.plugin.clone(), UsedModel { model_id: model.model_id.clone(), family: model.family.clone(), tags: model.tags.clone(), loaded: model.loaded });
+            let ctx_needed = model.ctx_needed.max(handed.get(&model.plugin).map_or(0, |used| used.ctx_needed));
+            handed.insert(model.plugin.clone(), UsedModel { model_id: model.model_id.clone(), family: model.family.clone(), tags: model.tags.clone(), loaded: model.loaded, ctx_needed });
             false
         });
         let before = handed.len();

@@ -330,7 +330,7 @@ impl Mesh {
             if slots.busy > 0 || slots.queued > 0 {
                 continue;
             }
-            let used = UsedModel { model_id: info.model_id, family: info.family, tags: info.tags, loaded: false };
+            let used = UsedModel { model_id: info.model_id, family: info.family, tags: info.tags, loaded: false, ctx_needed: info.ctx_total };
             let Some(server) = self.server_for(&used) else { continue };
             match self.start_handover(&server.node, &server.model.plugin, &plugin, used).await {
                 Ok(()) => tracing::info!(model = %plugin, to = %server.model.plugin, "this app's model is handed over to an app that serves its tags first"),
