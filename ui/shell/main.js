@@ -98,6 +98,8 @@ if (!single) {
   app.on('second-instance', () => {
     if (!win) return;
     if (win.isMinimized()) win.restore();
+    // Opened again from the Applications folder or the Dock: come to the front over the active app.
+    if (process.platform === 'darwin') app.focus({ steal: true });
     win.focus();
   });
   app.whenReady().then(start).catch((error) => {

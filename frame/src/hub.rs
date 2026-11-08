@@ -123,6 +123,8 @@ pub struct Frame {
     session_routes: RwLock<HashMap<(String, String), Route>>,
     /// WebSocket clients serving a category, oldest first; the newest one is routed.
     ws_servers: Mutex<HashMap<String, Vec<(u64, Hello)>>>,
+    /// Categories whose plugin is stopped while a client serves them (hello scope `handover`).
+    handed_over: Mutex<std::collections::BTreeSet<String>>,
     next_peer: AtomicU64,
     /// Serializes UI rescans, so `ui_plugin.changed` events go out in scan order.
     ui_scan: tokio::sync::Mutex<()>,
@@ -168,6 +170,7 @@ impl Frame {
             routes: RwLock::new(HashMap::new()),
             session_routes: RwLock::new(HashMap::new()),
             ws_servers: Mutex::new(HashMap::new()),
+            handed_over: Mutex::new(std::collections::BTreeSet::new()),
             next_peer: AtomicU64::new(1),
             config,
             home,
@@ -526,14 +529,16 @@ impl Frame {
             tracing::info!(category = %hello.category, peer = peer.id, "client serves a category for routed sessions");
             return HelloAck { accepted: true, reason: String::new(), instance, frame_version: FRAME_VERSION.into(), config: Value::Null };
         }
-        if !hello.scope.is_empty() {
-            return reject(format!("unknown hello scope `{}` (empty or `sessions`)", hello.scope));
+        let handover = hello.scope == "handover";
+        if !hello.scope.is_empty() && !handover {
+            return reject(format!("unknown hello scope `{}` (empty, `sessions` or `handover`)", hello.scope));
         }
         // A category whose plugin runs here is the plugin's; a client may serve it while that
         // plugin is disabled (a member of the mesh lending its model: the local one is unloaded
         // first) or when no plugin of the category is installed.
         if let Some(slot) = self.sup.slot(&hello.category)
             && !slot.is_disabled()
+            && !handover
         {
             return reject(format!("`{}` is served by a supervised plugin process", hello.category));
         }
@@ -554,6 +559,19 @@ impl Frame {
         }
         if let Some(conn) = peer.conn() {
             self.set_route(&hello.category, Route { conn: conn.clone(), instance: instance.clone(), peer: peer.id });
+        }
+        // A handover: the category's plugin stops for as long as a client serves it in its place.
+        // Nothing is recorded, so a frame restart runs the plugin again.
+        if handover
+            && let Some(slot) = self.sup.slot(&hello.category).filter(|slot| !slot.is_disabled())
+        {
+            if let Ok(mut handed) = self.handed_over.lock() {
+                handed.insert(hello.category.clone());
+            }
+            let frame = self.clone();
+            tokio::spawn(async move {
+                supervisor::disable(&frame, &slot).await;
+            });
         }
         tracing::info!(category = %hello.category, plugin = %hello.plugin_id, version = %hello.version, peer = peer.id, "client serves a category");
         self.publish(topics::PLUGIN_STATE, &json!(self.ws_info(peer.id, &hello, "active")));
@@ -582,7 +600,14 @@ impl Frame {
                 // No client serves it any more: the category's own plugin, which the client had
                 // taken over (a borrowed model, a borrowed tool), serves it again.
                 None => {
-                    if let Some(route) = self.sup.slot(category).and_then(|slot| slot.live_current()).and_then(|instance| instance.route()) {
+                    if self.handed_over.lock().is_ok_and(|mut handed| handed.remove(category)) {
+                        if let Some(slot) = self.sup.slot(category) {
+                            let frame = self.clone();
+                            tokio::spawn(async move {
+                                crate::units::hand_back(&frame, &slot).await;
+                            });
+                        }
+                    } else if let Some(route) = self.sup.slot(category).and_then(|slot| slot.live_current()).and_then(|instance| instance.route()) {
                         self.set_route(category, route);
                         tracing::info!(category, "the category's own plugin serves it again");
                     }

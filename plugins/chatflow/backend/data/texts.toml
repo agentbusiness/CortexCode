@@ -20,6 +20,7 @@ knowledge_note = "What the project knows about this work (`read knowledge://<id>
 set_aside = "These earlier decisions of this conversation no longer hold; the user set them aside:\n{items}"
 set_aside_reason = "set aside by the user in the conversation that made it"
 lessons_note = "Lessons from earlier work, each learned where it went wrong before:\n{text}"
+procedure_note = "A method reviewed by the owner for this project. Use only when it fits: {when}\n{steps}\nContinue the current task using its own requirements and evidence."
 # Under a failure: what was learned the last time this failure came (one line each).
 # A replay of a lesson (replay.rs) asks nobody for approval.
 replay_denied = "Not run: this is a replay with nobody to approve it. Continue without this command."

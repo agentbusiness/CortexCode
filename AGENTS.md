@@ -133,9 +133,9 @@ built to the same standard as CortexCode. The standard is:
 - the wire shape of every contract both apps have (`model@1`, `mesh@1`, `notify@1`, `skills@1`,
   `terminal@1`, `chatflow@1`);
 - the mesh: ALPNs, pairing, membership log, card, claims, lending, `mesh.link`, `mesh.session.start`;
-- model and resource sharing: model tags (`coding`, `office`), every app keeps and lends its own
+- model and resource sharing: model tags (`coding`, `office`, `smalloffice` for Gemma E2B, `largeoffice` for Gemma 26B), every app keeps and lends its own
   model (no second copy of one model on a computer; another app on this computer ranks after the
-  other computers), a model only on a GPU (Metal on macOS, CUDA or Vulkan on Linux; a machine
+  other computers), the serving order on one computer (each app says its own `sharing_priority` on its card, the highest first; no app knows another by name): an app hands a tag over to an app of a higher priority that serves the tag on the same computer, stops its own model for it, uses the other app's and does not lend it (a model an app does not run is not its to share), a model only on a GPU (Metal on macOS, CUDA or Vulkan on Linux; a machine
   without one, or a Linux CortexCode with under 16 GB of GPU memory, loads no model and uses a
   member's through the mesh), one models folder for every Cortex app (`~/.cortex-models`,
   `docs/SHARED-MODELS.md`; `shared-models/`);

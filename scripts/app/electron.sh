@@ -5,6 +5,12 @@
 # its executable, name and icon CortexCode, so the Dock, Force Quit and Activity Monitor show
 # CortexCode; ad-hoc signed), path.txt (the executable inside dist/) and version.
 
+# This branding's number in the release catalog, which names an Electron "<version>-<number>". An
+# installed updater keeps one folder per name and never replaces it, and a release reuses the archive
+# of a name already published, so raise this whenever what electron_mac_branded makes changes.
+# 2: the first archives published kept "Electron Helper".
+ELECTRON_BRANDING=2
+
 electron_mac_branded() {
   local src="$1" dst="$2" icns="$3"
   rm -rf "$dst"

@@ -4,6 +4,15 @@ PTY terminals running the user's login shell: `terminal.open`, `terminal.write`,
 
 ## Terminal application compatibility (source only)
 
+The backend now uses one pinned Ghostty terminal parser. Its optional vector fast paths and image processing
+are disabled; speed and transitive license completeness remain unverified. An authorized build must
+collect the pinned Unicode dependency notices into `data/licenses/GHOSTTY-THIRD-PARTY.txt` before
+packaging can proceed. The generated notice stays visible to the packer and release digest.
+Future authorized builds need Python 3,
+Zig 0.17.0 and the existing Rust toolchain. The manifest runs `backend/native/build.py`, which
+checks the source digest, builds a static library and then builds Rust. Direct Cargo commands
+do not download or compile Ghostty. See [terminal-core implementation and validation limits](../../docs/TERMINAL-CORE.md).
+
 The shared `terminal@1` additions provide binary input and formatted screen restoration with byte
 offsets. Both apps' terminal panes use one SDK transport for ordered input, mouse bytes, resize and
 reconnect. See [shared contract and release targets](../../docs/SHARED-TERMINAL.md).
@@ -20,7 +29,7 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 ## Build and run
 
 ```sh
-cd backend && cargo build --release && cargo clippy --all-targets -- -D warnings
+cd backend && python3 native/build.py
 cd ui && npm ci && npm run build && npm test     # after the SDK is built (cd ../../ui/sdk && npm run build)
 cortex-pack build plugins/terminal                  # -> plugins/terminal/target/terminal-<version>-<target>.ccplugin
 ```

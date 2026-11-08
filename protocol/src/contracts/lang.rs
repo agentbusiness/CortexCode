@@ -15,6 +15,8 @@ pub mod methods {
     pub const DESCRIBE: &str = "describe";
     /// The code graph's facts of files ([`super::ExtractParams`] -> [`super::ExtractResult`]).
     pub const EXTRACT: &str = "extract";
+    /// Bounded, on-demand origins of a local value; unsupported packs return unavailable.
+    pub const VALUE_TRACE: &str = "value_trace";
     /// The language server's diagnostics for files of a workspace (after their latest text).
     pub const DIAGNOSTICS: &str = "diagnostics";
     /// Where the symbol at a position is defined.
@@ -27,7 +29,8 @@ pub mod methods {
     pub const SKILL: &str = "skill";
     /// Install the language server (and tools) into CortexCode's toolchains directory.
     pub const INSTALL: &str = "install";
-    /// Every method of the contract (the plugin's `provides`, prefixed by its category).
+    /// Required methods of the contract (prefixed by the category in `provides`).
+    /// VALUE_TRACE is optional and advertised separately by supporting packs.
     pub const ALL: &[&str] = &[DESCRIBE, EXTRACT, DIAGNOSTICS, DEFINITION, REFERENCES, HOVER, SKILL, INSTALL];
 }
 
@@ -312,6 +315,19 @@ pub struct ExtractParams {
 pub struct ExtractResult {
     /// One per file, in order. Content hash, size, line count and text excerpt are the caller's.
     pub files: Vec<FileFacts>,
+}
+
+pub use super::value_trace::{ValueTrace, ValueInput, ValueStep};
+
+/// The value of `name` immediately before `line` executes (1-based).
+/// The caller supplies current bytes; no language server or program execution is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValueTraceParams {
+    pub file: SourceFile,
+    pub line: u32,
+    pub name: String,
+    #[serde(default = "super::value_trace::trace_limit")]
+    pub max_steps: u32,
 }
 
 // ----- language server -----

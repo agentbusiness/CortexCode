@@ -73,7 +73,7 @@ impl Mesh {
         }
         let info: ModelInfo = serde_json::from_value(ctx.call("model.info", json!({})).await.ok()?).ok()?;
         // Another app's model on this machine, borrowed by this one's model plugin: not local.
-        if info.borrowed() {
+        if info.borrowed() || self.is_handed(&info.tags) {
             return None;
         }
         let slots: SlotsResult = serde_json::from_value(ctx.call("model.slots", json!({})).await.ok()?).ok()?;
@@ -100,7 +100,7 @@ impl Mesh {
         crate::card::local_models(ctx)
             .await
             .into_iter()
-            .find(|(own, info)| (plugin.is_empty() || own == plugin) && info.tags.iter().any(|own_tag| own_tag == tag))
+            .find(|(own, info)| (plugin.is_empty() || own == plugin) && info.tags.iter().any(|own_tag| own_tag == tag) && !self.is_handed(&info.tags))
             .map(|(own, _)| own)
     }
 
@@ -125,7 +125,7 @@ impl Mesh {
                 }
                 let (path, _) = Self::path_of(connection);
                 let tier = if member.local {
-                    3
+                    if crate::handover::serves_before_me(card) { 0 } else { 3 }
                 } else if path == "lan" {
                     1
                 } else {

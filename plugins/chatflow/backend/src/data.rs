@@ -49,6 +49,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/describe.md", include_str!("../data/prompts/describe.md")),
     ("prompts/knowledge.md", include_str!("../data/prompts/knowledge.md")),
     ("prompts/learn.md", include_str!("../data/prompts/learn.md")),
+    ("prompts/procedure.md", include_str!("../data/prompts/procedure.md")),
     ("prompts/check_rules.md", include_str!("../data/prompts/check_rules.md")),
     // EXPERIMENT (2026-10-19, rule checks): see `[stage.DO]` in stages.toml to switch it off.
     ("prompts/experiment_rule_checks.md", include_str!("../data/prompts/experiment_rule_checks.md")),
@@ -63,6 +64,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("schemas/plan.json", include_str!("../data/schemas/plan.json")),
     ("schemas/knowledge.json", include_str!("../data/schemas/knowledge.json")),
     ("schemas/learn.json", include_str!("../data/schemas/learn.json")),
+    ("schemas/procedure.json", include_str!("../data/schemas/procedure.json")),
 ];
 
 /// Roles a session's system prompt is built for: `chat` (the foreground flow) and `agent` (a
@@ -71,7 +73,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "DESCRIBE", "REVIEW", "MANAGE"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -83,6 +85,7 @@ const SCHEMA_NEEDS: &[SchemaNeed] = &[
     ("PLAN_EDIT", &["goal", "tasks"], None),
     ("KNOWLEDGE", &["items"], None),
     ("LEARN", &["useful"], Some(("useful", &["no", "yes"]))),
+    ("PROCEDURE", &["name", "applicability", "steps", "useful"], Some(("useful", &["no", "yes"]))),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
     ("MANAGE", &["actions", "replan"], Some(("replan", &["no", "yes"]))),
 ];

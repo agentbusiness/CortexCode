@@ -119,6 +119,13 @@ impl Learner {
                         let _ = again.send(Job::Backlog);
                     }
                     Ok(_) => {
+                        if replayer.idle() {
+                            match crate::procedures::synthesize(&host, &dataset, &park).await {
+                                Ok(true) => { let _ = again.send(Job::Backlog); }
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(%error, "a reusable procedure was not proposed"),
+                            }
+                        }
                         crate::night::report_if_due(&host).await;
                         if replayer.idle()
                             && let Some(dom) = crate::replay::replay_one(&host, &paths, replayer.as_ref(), last_dom).await
@@ -372,6 +379,15 @@ struct Episode {
     tools: Vec<String>,
     evidence: u64,
     key: Option<String>,
+}
+
+/// Reconstruct only one selected episode for synthesis. Raw journal bytes remain in the journal.
+pub(crate) fn procedure_card(data: &Dataset, entries: &[JournalEntry], run: &str, workspace: &str, evidence: &str) -> Option<String> {
+    if crate::replay::arm(entries).is_some() { return None; }
+    let seq = evidence.rsplit_once('/')?.1.parse::<u64>().ok()?;
+    episodes(data, entries, run, workspace, data.limits.learn_episodes_per_run)
+        .into_iter().find(|episode| episode.evidence == seq)
+        .map(|episode| episode.body.chars().take(1800).collect())
 }
 
 /// The run's episodes, the ones about reported failures and the user's words first, at most
@@ -654,6 +670,13 @@ async fn learn_marked(host: &Host, data: &Dataset, session_id: &str, run_id: &st
     let done = ended_done(&entries, run_id);
     let run_steps = steps(&entries, run_id);
     let languages = run_languages(host, &entries, &run_steps).await;
+    let procedure_work = crate::procedures::work(&entries, run_id);
+    let procedure_outcome = if done { "done" } else { match final_state(&entries, run_id).as_str() {
+        "failed" => "failed", "stopped" | "cancelled" => "stopped", _ => "unknown",
+    }};
+    if let Err(error) = crate::procedures::outcome(host, &entries, &scope.project_id, session_id, run_id, procedure_outcome).await {
+        tracing::warn!(%error, "the procedure outcome was not kept");
+    }
     let mut new = 0usize;
     let mut came_back: HashSet<String> = HashSet::new();
     if !found.is_empty() {
@@ -678,12 +701,15 @@ async fn learn_marked(host: &Host, data: &Dataset, session_id: &str, run_id: &st
                 scope.project_id.as_str()
             });
             match store(host, data, project, &anchor, &lesson, episode.key.as_deref(), session_id, &evidence).await {
-                Ok((id, true)) => {
-                    tracing::info!(%anchor, %lesson, "learned a lesson");
-                    new += 1;
-                    came_back.insert(id);
-                }
-                Ok((id, false)) => {
+                Ok((id, is_new)) => {
+                    let procedure_anchor = if anchor.starts_with("lang:") { anchor.clone() } else if languages.len() == 1 { format!("lang:{}", languages[0]) } else { String::new() };
+                    if let Err(error) = crate::procedures::episode(host, &scope.project_id, session_id, run_id, &procedure_work, &procedure_anchor, &id, &evidence, &lesson, procedure_outcome).await {
+                        tracing::warn!(%error, "a procedure episode was not kept");
+                    }
+                    if is_new {
+                        tracing::info!(%anchor, %lesson, "learned a lesson");
+                        new += 1;
+                    }
                     came_back.insert(id);
                 }
                 Err(error) => tracing::warn!(%error, "a lesson was not stored"),

@@ -103,6 +103,10 @@ pub fn chat_body(params: &ChatParams) -> Value {
     body.insert("stream_options".into(), json!({"include_usage": true}));
     body.insert("cache_prompt".into(), json!(true));
     body.insert("return_progress".into(), json!(true));
+    // A cut-off answer goes on in place (`ChatMessage::open_prefix`).
+    if params.messages.last().is_some_and(|message| message.open_prefix) {
+        body.insert("continue_final_message".into(), json!("content"));
+    }
     sampling_into(&mut body, &params.sampling);
     thinking_into(&mut body, &params.thinking);
     if let Some(max) = params.max_tokens {

@@ -1,4 +1,10 @@
 /* card.knowledge@1 */
+#cc .cx-kn-procedures{margin-bottom:10px;}
+#cc .cx-kn-procedures summary{cursor:pointer;color:var(--ink);}
+#cc .cx-kn-procedures ol{margin:4px 0;padding-left:22px;}
+#cc .cx-kn-procedures .cx-kn-text{white-space:pre-wrap;overflow-wrap:anywhere;}
+#cc .cx-kn-observation{padding:4px 0;border-top:1px solid var(--rule);}
+#cc .cx-kn-review-note{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--rule);padding:3px 6px;min-width:0;}
 #cc .cx-kn-tabs{display:flex;gap:4px;flex-wrap:wrap;margin:0 0 6px;}
 #cc .cx-kn-tabs button{font:inherit;font-size:11.5px;padding:1px 6px;border:1px solid var(--rule);background:transparent;color:var(--ink);cursor:pointer;}
 #cc .cx-kn-tabs button[aria-pressed="true"]{color:var(--rubric);border-color:var(--rubric);}

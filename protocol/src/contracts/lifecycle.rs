@@ -52,7 +52,9 @@ pub struct Hello {
     #[serde(default)]
     pub swap: SwapPolicy,
     /// A client's hello only: `sessions` serves the category for the sessions routed to it
-    /// (`frame.route.set`) instead of taking the category over; empty serves the category.
+    /// (`frame.route.set`) instead of taking the category over; empty serves the category;
+    /// `handover` serves it and stops the category's plugin for as long as the client is connected
+    /// (an app on this computer that serves the model's tags first).
     #[serde(default)]
     pub scope: String,
 }

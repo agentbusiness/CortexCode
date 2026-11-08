@@ -9,7 +9,8 @@
 //!   -[:ON]->(:Machine)`, in the WORKSPACE layer. A revoked member is retired (`revoked`); a mesh
 //!   this node is no longer in is retired (`left`), with its members.
 //! - **The person's choices**: `memory.settings` (global scope) `mesh.name` (string),
-//!   `mesh.lend` (boolean) and `mesh.allowed` (the node ids of the members that may work here).
+//!   `mesh.lend` (boolean) and `mesh.refused` (the node ids of the members switched off: every
+//!   other member may work here; the list of earlier versions, `mesh.allowed`, is no longer read).
 //!
 //! **Start order.** The memory plugin may answer later than the mesh starts. Until it does, the
 //! mesh runs on what it holds in memory: the network endpoint starts at once, so apps on this
@@ -39,7 +40,7 @@ pub const MEMBERS_TOPIC: &str = "mesh.members";
 /// Settings paths (global scope).
 pub const NAME_SETTING: &str = "mesh.name";
 pub const LEND_SETTING: &str = "mesh.lend";
-pub const ALLOWED_SETTING: &str = "mesh.allowed";
+pub const REFUSED_SETTING: &str = "mesh.refused";
 
 /// The membership stream is kept as long as the store keeps anything.
 const MEMBERS_DAYS: u32 = 3650;
@@ -86,7 +87,8 @@ pub struct Loaded {
     pub machine: String,
     pub name: Option<String>,
     pub lend: bool,
-    pub allowed: Vec<String>,
+    /// Members switched off; every other member may work here.
+    pub refused: Vec<String>,
     /// The log as the stream replays (before validation: what the stream holds).
     pub entries: Vec<Entry>,
 }
@@ -127,7 +129,7 @@ pub async fn load(call: &Caller, home: &Path) -> Result<Loaded, RpcError> {
             lend
         }
     };
-    let allowed: Vec<String> = get_setting(call, ALLOWED_SETTING).await?.and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+    let refused: Vec<String> = get_setting(call, REFUSED_SETTING).await?.and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
     // Sharing has no switches any more: an earlier version's file of them goes.
     remove(&dir.join("shares.json"));
 
@@ -155,7 +157,7 @@ pub async fn load(call: &Caller, home: &Path) -> Result<Loaded, RpcError> {
     // The folder of earlier versions goes once it is empty.
     let _ = std::fs::remove_dir(&dir);
 
-    Ok(Loaded { machine, name, lend, allowed, entries })
+    Ok(Loaded { machine, name, lend, refused, entries })
 }
 
 fn remove(file: &Path) {

@@ -8,6 +8,7 @@
 import { useState } from 'react';
 import { definePlugin, errorMessage, ServiceProblem, useClient, useHost, useQuery, useSelection } from '@cortex/sdk';
 import './index.css';
+import { Procedures } from './Procedures';
 
 interface KnowledgeLink { rel: string; target: string; id?: string; name?: string }
 interface KnowledgeItem {
@@ -59,6 +60,7 @@ function KnowledgeSection() {
     <section className="cx-cs" data-section="knowledge" data-build={__CORTEX_BUILD__}>
       <div className="cx-cs-l"><span className="ap">Memory</span></div>
       <div className="cx-cs-b">
+        <Procedures key={projectId} projectId={projectId} />
         {items.error && items.errorCode === 'unavailable' ? <ServiceProblem service="memory" state={items} /> : null}
         <div className="cx-kn-tabs" role="tablist" aria-label="Kinds">
           {TABS.map(([kind, label]) => (

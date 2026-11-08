@@ -28,3 +28,5 @@ pub mod summary;
 pub mod tree;
 pub mod watch;
 pub mod work;
+pub mod value_trace;
+pub mod procedures;

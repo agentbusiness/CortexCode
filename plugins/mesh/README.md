@@ -17,7 +17,7 @@ Everything in the graph the memory plugin serves (`docs/GRAPH-MODEL.md`, Mesh); 
 - `(:Member {key: node id, name*, added_ms, added_by, software})-[:IN]->(:Mesh {key: hash of the
   first entry, founder, founded_ms})-[:ON]->(:Machine)` (WORKSPACE layer), built from the log: a
   revoked member is retired (`revoked`), a mesh left behind is retired (`left`).
-- settings `mesh.name`, `mesh.lend`, `mesh.allowed` (the members that may work here, `mesh.allow`). Shared services have no switches: always on (`read` from any member, `edit` and `run` from apps on this machine).
+- settings `mesh.name`, `mesh.lend`, `mesh.refused` (the members switched off, `mesh.allow`; every other member may work here). Shared services have no switches: always on (`read` from any member, `edit` and `run` from apps on this machine).
 - **Start order**: the endpoint starts at once, so apps on this Mac link and lend before the
   memory plugin answers; members of the network are let in, and the membership changed, only once
   the log is read (methods that change it wait 10 s, then answer `unavailable`). The store is
@@ -35,8 +35,8 @@ Nothing to set. One invitation joins a computer; Remove takes it out. All apps o
 each signs itself in with the computer's machine key, so one that starts while the others are closed
 joins by itself, and joining another network links it with this one (every computer of both). Remove
 takes a member's whole computer out; Leave takes this computer out. Each member row has one switch: whether
-that member may see its projects. A member not switched on gets no projects in this computer's card and its
-window is refused. A project lives on its own
+that member may open a session on it. It is on for every member from the moment it joins; a member
+switched off gets no projects in this computer's card and its window is refused. A project lives on its own
 computer, and every member's window works in it there; every member lends every other its model,
 for the work the model is tagged for. What runs where is decided by the host from what each computer
 reports, never by the model; the model is told one number when it plans (how many other computers

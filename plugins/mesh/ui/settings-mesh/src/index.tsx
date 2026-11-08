@@ -19,7 +19,7 @@ interface Placed { session_id: string; node: string; name: string }
 interface Network { id: string; founder: string; founded_ms: number; members: number }
 interface Status { node: string; name: string; members: number; reachable: number; network?: Network | null; pairing?: PairCode | null; serving: [string, string][]; placed: Placed[]; allowed: string[] }
 
-/** What a member allowed by `mesh.allow` may do on this computer. */
+/** What every member may do on this computer until it is switched off (`mesh.allow`). */
 const ALLOW_LABEL = 'Projects';
 const ALLOW_TEXT = 'may see the projects on this computer';
 
