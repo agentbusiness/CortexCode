@@ -1,7 +1,7 @@
 //! `cc-terminal`: PTY terminals for the CortexCode `terminal@1` contract.
 //!
 //! Each terminal is the user's login shell on its own pseudo-terminal. A reader thread feeds every
-//! output byte both to a VT emulator (`vt100`, for `terminal.snapshot`) and to a pump task that
+//! output byte both to a VT emulator (Ghostty, for `terminal.snapshot`) and to a pump task that
 //! publishes `terminal.output` events, coalescing bytes that arrive within about 16 ms into one
 //! event. A waiter thread reports the shell's exit as `terminal.exit`.
 //!
@@ -251,6 +251,7 @@ impl Terminals {
 
     pub fn open(&self, params: OpenParams) -> Result<TermInfo, RpcError> {
         check_size(params.cols, params.rows)?;
+        let screen = ScreenState::new(params.rows, params.cols).map_err(RpcError::internal)?;
         let cwd = PathBuf::from(&params.cwd);
         if !cwd.is_absolute() || !cwd.is_dir() {
             return Err(RpcError::invalid_params(format!("cwd `{}` is not an existing absolute directory", params.cwd)));
@@ -288,7 +289,7 @@ impl Terminals {
         let writer = pair.master.take_writer().map_err(|e| RpcError::internal(format!("pty writer: {e}")))?;
 
         let id = format!("term-{}", uuid::Uuid::new_v4().simple());
-        let parser = Arc::new(Mutex::new(ScreenState::new(params.rows, params.cols)));
+        let parser = Arc::new(Mutex::new(screen));
         let (exit_tx, exit_rx) = watch::channel(None);
         let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -361,7 +362,7 @@ impl Terminals {
                 .resize(PtySize { rows: params.rows, cols: params.cols, pixel_width: 0, pixel_height: 0 })
                 .map_err(|e| RpcError::internal(format!("resize failed: {e}")))?;
         }
-        parser.set_size(params.rows, params.cols);
+        parser.set_size(params.rows, params.cols).map_err(RpcError::internal)?;
         *lock(&term.size) = (params.cols, params.rows);
         drop(parser);
         Ok(term.info())
@@ -387,7 +388,7 @@ impl Terminals {
     fn screen_snapshot(&self, term_id: &str, restore: bool) -> Result<Snapshot, RpcError> {
         let term = self.get(term_id)?;
         let parser = lock(&term.parser);
-        let screen = parser.screen();
+        let screen = parser.screen().map_err(RpcError::internal)?;
         let (cursor_row, cursor_col) = screen.cursor_position();
         let (rows, cols) = screen.size();
         Ok(Snapshot {
@@ -399,7 +400,7 @@ impl Terminals {
             rows,
             alive: term.exit.borrow().is_none(),
             alternate_screen: screen.alternate_screen(),
-            restore: if restore { parser.restore() } else { None },
+            restore: if restore { Some(parser.restore().map_err(RpcError::internal)?) } else { None },
             input_base64: true,
         })
     }

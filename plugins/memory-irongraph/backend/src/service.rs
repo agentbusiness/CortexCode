@@ -111,7 +111,7 @@ struct Entry {
 
 /// Names a project cannot take: graph URI verbs (`graph://<project>/search/...` must stay
 /// unambiguous) and the work-state scopes.
-const RESERVED_NAMES: &[&str] = &["search", "callers", "callees", "impact", "path", "global", "main", "db"];
+const RESERVED_NAMES: &[&str] = &["search", "callers", "callees", "impact", "path", "value", "global", "main", "db"];
 
 /// The id the frame gives a canonical root (`frame/src/state.rs`, `project_id`): a reference opened
 /// by path has the id the frame would give it, so opening it later as a session project reuses
@@ -180,6 +180,14 @@ pub const COMMANDS: &[&str] = &[
 
 /// Every method this plugin serves.
 pub const PROVIDES: &[&str] = &[
+    methods::PROCEDURE_EPISODE,
+    methods::PROCEDURE_MATERIAL,
+    methods::PROCEDURE_PROPOSE,
+    methods::PROCEDURE_LIST,
+    methods::PROCEDURE_REVIEW,
+    methods::PROCEDURE_RECALL,
+    methods::PROCEDURE_OUTCOME,
+    methods::VALUE_TRACE,
     methods::PROJECT_OPEN,
     methods::PROJECT_STATUS,
     methods::PROJECT_LIST,
@@ -786,6 +794,7 @@ impl Memory {
     /// A project the person deleted: everything memory holds for it goes (its code graph and
     /// workspaces, line indexes, knowledge, registry entry), as for a closed reference.
     async fn forget_project(&self, project_id: &str) -> Result<(), RpcError> {
+        crate::procedures::forget(&self.graph_store().await?, project_id).await?;
         // Under the lock the background open ends under, so the drop is seen by it or done here.
         let running = match self.indexing.lock() {
             Ok(set) if set.contains(project_id) => {
@@ -1249,7 +1258,50 @@ impl Memory {
     }
 
     pub async fn dispatch(self: Arc<Self>, method: &str, params: Value) -> Result<Value, RpcError> {
+        if method.starts_with("memory.procedure.") && method != methods::PROCEDURE_LIST
+            && params.get("_command_session").is_some() {
+            return Err(RpcError::invalid_params("Procedure learning and review are not shell commands; use the project's Procedures controls."));
+        }
         match method {
+            methods::PROCEDURE_EPISODE => {
+                let store = self.graph_store().await?;
+                crate::procedures::record(&store, parse_params(params)?).await?;
+                to_value(&json!({}))
+            }
+            methods::PROCEDURE_MATERIAL => {
+                let store = self.graph_store().await?;
+                to_value(&crate::procedures::material(&store).await?)
+            }
+            methods::PROCEDURE_PROPOSE => {
+                let store = self.graph_store().await?;
+                crate::procedures::propose(&store, parse_params(params)?).await?;
+                self.publish(topics::KNOWLEDGE_CHANGED, json!({"kind": "procedure"}));
+                to_value(&json!({}))
+            }
+            methods::PROCEDURE_LIST => {
+                let p: cc_protocol::contracts::memory::ProcedureListParams = parse_params(params)?;
+                let store = self.graph_store().await?;
+                to_value(&crate::procedures::list(&store, &p.project_id).await?)
+            }
+            methods::PROCEDURE_REVIEW => {
+                let p: cc_protocol::contracts::memory::ProcedureReview = parse_params(params)?;
+                let project = p.project_id.clone();
+                self.refuse_reference(&project, "procedure reviews").await?;
+                let store = self.graph_store().await?;
+                crate::procedures::review(&store, p).await?;
+                self.publish(topics::KNOWLEDGE_CHANGED, json!({"project_id": project, "kind": "procedure"}));
+                to_value(&json!({}))
+            }
+            methods::PROCEDURE_RECALL => {
+                let store = self.graph_store().await?;
+                to_value(&crate::procedures::recall(&store, parse_params(params)?).await?)
+            }
+            methods::PROCEDURE_OUTCOME => {
+                let store = self.graph_store().await?;
+                crate::procedures::outcome(&store, parse_params(params)?).await?;
+                self.publish(topics::KNOWLEDGE_CHANGED, json!({"kind": "procedure"}));
+                to_value(&json!({}))
+            }
             methods::PROJECT_OPEN => {
                 let p: ProjectOpenParams = parse_params(params)?;
                 let what = if p.reference { "reference root" } else { "project root" };
@@ -1379,6 +1431,13 @@ impl Memory {
                 let tree = self.tree(&p.scope).await?;
                 let path = relative(&tree.root, &p.path);
                 to_value(&tree.outline(&path).await?)
+            }
+            methods::VALUE_TRACE => {
+                let p: cc_protocol::contracts::memory::ValueTraceParams = parse_params(params)?;
+                let tree = self.tree(&p.scope).await?;
+                let host = self.langs.host().ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "Language plugins are not ready; read the function's source."))?;
+                let snapshot = self.langs.snapshot().await;
+                to_value(&crate::value_trace::trace(&tree.root, host.as_ref(), &snapshot, p).await?)
             }
             methods::FOCUS => {
                 let p: FocusParams = parse_params(params)?;

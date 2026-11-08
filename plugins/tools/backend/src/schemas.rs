@@ -37,7 +37,7 @@ fn intent() -> Value {
 /// Every URI `read` takes, with what it gives. The one place they are listed for the model.
 const READ_PATH: &str = "What to read: a file or folder relative to the workspace (a file may end in a line range: src/app.ts:120-180, or name one definition: src/app.ts#Cart::total), or one of these.\n\
 Find code by meaning: graph://search/<words>.\n\
-One function or class, by its name: symbol://<name> (its code, what it takes and returns), graph://used-by/<name> (every place that uses it), graph://uses/<name> (everything it uses), graph://impact/<name> (what a change to it reaches), graph://path/<name>/<name> (how two relate), outline://<path> (what a file contains).\n\
+One function or class, by its name: symbol://<name> (its code, what it takes and returns), graph://used-by/<name> (every place that uses it), graph://uses/<name> (everything it uses), graph://impact/<name> (what a change to it reaches), graph://path/<name>/<name> (how two relate), outline://<path> (what a file contains). For a Python local value before a line executes: graph://value/<path>?line=<line>&name=<variable>.\n\
 Language server, at path:line:col: definition://<path:line:col>, references://<path:line:col> (every use), hover://<path:line:col> (type and docs), diagnostics://<path> (errors; diagnostics:// for every file).\n\
 Host: artifact://<id> (a saved long output; may end in :range), task://<id> and agent://<name> (background agents and their tasks), board:// (messages between agents), schedule:// (routines: what runs on a clock), rule:// (project rules), skill://<plugin>/<name> (a how-to).\n\
 {online}\n\
@@ -234,12 +234,13 @@ How results read:\n\
 - run: the command's output, then `[exit N]`: exit 0 means it succeeded. A long output is cut in the middle: `[N lines not shown: read artifact://<id>:A-B for them]`.\n\
 - A code result: one line, `path:line  signature — what it does`.\n\
 - A call result: `path:line  in <function>: <calling line>` (used-by) or `path:line  calls <function>: <calling line>` (uses).\n\
+- A value trace: source locations and statements, then the possible input origins and what was not followed.\n\
 - `…(masked <kind>)`: a secret value hidden from you (a key, a token, a password). Leave the line that holds it as it is.\n\
 - A failure says what went wrong; its last sentence is the next step.\n\
 \n\
 Find code:\n\
 - By meaning: read graph://search/<words>. When nothing fits, search again with other words.\n\
-- From a result, by its name:\n  its code, what it takes and returns: symbol://<name>\n  exactly where it is used, from the code graph, not a search: graph://used-by/<name>\n  exactly what it uses: graph://uses/<name>\n  what is around it in its file: outline://<path>\n  what a change to it reaches (callers, tests): graph://impact/<name>\n  how two relate (the shortest chain between them): graph://path/<name>/<name>\n\
+- From a result, by its name:\n  its code, what it takes and returns: symbol://<name>\n  exactly where it is used, from the code graph, not a search: graph://used-by/<name>\n  exactly what it uses: graph://uses/<name>\n  what is around it in its file: outline://<path>\n  what a change to it reaches (callers, tests): graph://impact/<name>\n  how two relate (the shortest chain between them): graph://path/<name>/<name>\n  where a Python local value came from before a line: graph://value/<path>?line=<line>&name=<variable>\n\
 - Before you change what a function takes or returns, read graph://used-by/<name>: every call listed there changes with it.\n\
 \n\
 `cx` (on PATH, through run) reaches background agents, their tasks, the board, the code graph, the browser and CortexCode's own plugins; `cx tools` lists its commands, and `cx research deep <topic>` runs a cited research job. To change how CortexCode itself works, edit its skills, prompts and texts in `$CORTEX_HOME/live/plugins/<id>/` (`data/` or `backend/data/`): an edit is live at once.\n"

@@ -28,7 +28,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const GRAPH_VERBS: &[&str] = &["search", "used-by", "uses", "callers", "callees", "impact", "path"];
+const GRAPH_VERBS: &[&str] = &["search", "used-by", "uses", "callers", "callees", "impact", "path", "value"];
 const POSITION_SCHEMES: &[&str] = &["definition", "references", "hover"];
 
 /// How often the status of a project being indexed is asked while waiting for it.

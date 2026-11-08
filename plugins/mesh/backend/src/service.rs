@@ -103,6 +103,9 @@ pub struct Mesh {
     pub ctx: OnceLock<Ctx>,
     pairing: Mutex<Option<Pending>>,
     pub borrows: Mutex<HashMap<String, Borrow>>,
+    /// This app's models another app on this computer runs for it now, by their plugin
+    /// ([`crate::handover`]).
+    pub handed: Mutex<std::collections::BTreeMap<String, cc_protocol::contracts::mesh::UsedModel>>,
     event_subs: Mutex<Vec<EventSub>>,
     pub placements: crate::place::Placements,
     pub links: crate::projects::Links,
@@ -113,8 +116,8 @@ pub struct Mesh {
     pub services: crate::services::Services,
     /// Members may use this computer's model (`mesh.lend`).
     lend: AtomicBool,
-    /// The members that may work on this computer (`mesh.allow`).
-    allowed: Mutex<Vec<String>>,
+    /// The members switched off (`mesh.allow`); every other member may work on this computer.
+    refused: Mutex<Vec<String>>,
     /// The app's store (`crate::store`) and the queue of its ordered writer.
     pub store: OnceLock<(store::Caller, mpsc::UnboundedSender<Write>)>,
     /// The membership log and the settings have been read from the store.
@@ -167,6 +170,7 @@ impl Mesh {
             ctx: OnceLock::new(),
             pairing: Mutex::new(None),
             borrows: Mutex::new(HashMap::new()),
+            handed: Mutex::new(std::collections::BTreeMap::new()),
             event_subs: Mutex::new(Vec::new()),
             placements: crate::place::Placements::default(),
             links: crate::projects::Links::default(),
@@ -174,7 +178,7 @@ impl Mesh {
             local: Mutex::new(HashMap::new()),
             services: crate::services::Services::default(),
             lend: AtomicBool::new(true),
-            allowed: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
             store: OnceLock::new(),
             loaded: tokio::sync::watch::channel(false).0,
         }
@@ -220,7 +224,7 @@ impl Mesh {
             *lock(&self.name) = name;
         }
         self.lend.store(loaded.lend, Ordering::SeqCst);
-        *lock(&self.allowed) = loaded.allowed;
+        *lock(&self.refused) = loaded.refused;
         let mut log = Log { entries: loaded.entries };
         if let Err(error) = log.validate() {
             tracing::warn!(%error, "the membership log is not valid; starting from the valid prefix");
@@ -593,7 +597,7 @@ impl Mesh {
 
     /// Whether a member may work on this computer (`mesh.allow`).
     pub fn may_work(&self, node: &str) -> bool {
-        lock(&self.allowed).iter().any(|allowed| allowed == node)
+        !lock(&self.refused).iter().any(|refused| refused == node)
     }
 
     /// This computer's card as one member gets it: no projects for a member that may not work here.
@@ -617,6 +621,7 @@ impl Mesh {
                     crate::card::refresh_load(ctx, model).await;
                 }
             }
+            self.apply_handover(&mut card);
             if !self.lends() {
                 card.models.clear();
             }
@@ -624,10 +629,11 @@ impl Mesh {
         }
         let card = match self.ctx.get() {
             Some(ctx) => crate::card::build(ctx, &self.me.hex(), &self.name(), &self.home).await,
-            None => Card { node: self.me.hex(), name: self.name(), software: crate::SOFTWARE.to_owned(), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
+            None => Card { node: self.me.hex(), name: self.name(), software: crate::SOFTWARE.to_owned(), sharing_priority: Some(crate::SHARING_PRIORITY), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
         };
         let mut card = card;
         card.services = Self::service_cards(&self.local_shares().await);
+        self.apply_handover(&mut card);
         // A model this computer does not lend is not shown to the members.
         if !self.lends() {
             card.models.clear();
@@ -738,7 +744,7 @@ impl Mesh {
             serving,
             placed: self.placed(),
             lend: self.lends(),
-            allowed: lock(&self.allowed).clone(),
+            allowed: { let refused = lock(&self.refused); members.keys().filter(|node| !refused.contains(*node)).cloned().collect() },
         }
     }
 
@@ -876,14 +882,14 @@ impl Mesh {
                 let params: AllowParams = parse_params(params)?;
                 let node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
                 let list = {
-                    let mut allowed = lock(&self.allowed);
-                    allowed.retain(|allowed| *allowed != node);
-                    if params.allowed {
-                        allowed.push(node.clone());
+                    let mut refused = lock(&self.refused);
+                    refused.retain(|refused| *refused != node);
+                    if !params.allowed {
+                        refused.push(node.clone());
                     }
-                    allowed.clone()
+                    refused.clone()
                 };
-                self.write(Write::Setting(store::ALLOWED_SETTING, json!(list)));
+                self.write(Write::Setting(store::REFUSED_SETTING, json!(list)));
                 // Its sidebar shows this computer's projects, or loses them, now.
                 self.push_card_to(&node).await;
                 self.notify("members");

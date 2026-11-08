@@ -10,10 +10,16 @@
 //!   the frame routes to it (`frame.route.set`) reach the member; this node's own model keeps
 //!   serving everything else.
 //!
+//! A third shape is the handover ([`crate::handover`], `hand_over` below): the client says hello
+//! with scope `handover`, the frame stops this node's model plugin while the client is connected,
+//! and the app that serves its tags first serves the category.
+//!
 //! Closing the client ends it: the frame routes the category to its own plugin again.
 
-use crate::service::Mesh;
+use crate::service::{Mesh, lock};
 use cc_protocol::contracts::lifecycle::{Hello, HelloAck};
+use cc_protocol::contracts::mesh::UsedModel;
+use cc_protocol::contracts::model::SlotsResult;
 use cc_protocol::{Message, RpcError, codes};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -26,6 +32,10 @@ use tokio_util::sync::CancellationToken;
 pub struct Borrow {
     pub category: String,
     pub node: String,
+    /// The member's model the calls name (handover only; empty otherwise).
+    pub plugin: String,
+    /// This app's own model is stopped for it ([`crate::handover`]).
+    pub handover: bool,
     pub provides: Vec<String>,
     stop: CancellationToken,
 }
@@ -95,7 +105,7 @@ impl Mesh {
         let category_owned = category.to_owned();
         let mesh = self.clone();
         let client = self.open_client(category, node, plugin, provides.clone(), "", true, move || mesh.borrow_ended(&category_owned)).await?;
-        let borrow = Borrow { category: category.to_owned(), node: node.to_owned(), provides: provides.clone(), stop: client.stop };
+        let borrow = Borrow { category: category.to_owned(), node: node.to_owned(), plugin: String::new(), handover: false, provides: provides.clone(), stop: client.stop };
         self.borrows.lock().unwrap_or_else(|p| p.into_inner()).insert(category.to_owned(), borrow);
         self.notify("serving");
         Ok(provides)
@@ -281,6 +291,85 @@ impl Mesh {
                 true
             }
             None => false,
+        }
+    }
+
+    /// The handover of this app's model ([`crate::handover`]), each round. When apps before this
+    /// one serve its tags and it has finished what it runs, the frame stops its model plugin for as
+    /// long as this connection lasts, and every call of the category goes to the serving app's
+    /// model. Nothing is recorded: a closed connection (the other app gone, this mesh or frame
+    /// restarted) starts the plugin again, and the next round looks again.
+    pub async fn hand_over(self: &Arc<Self>) {
+        let Some(ctx) = self.ctx.get().cloned() else { return };
+        let current = lock(&self.borrows).get("model").filter(|borrow| borrow.handover).map(|borrow| (borrow.node.clone(), borrow.plugin.clone()));
+        if let Some(current) = current {
+            let handed = lock(&self.handed).iter().next().map(|(plugin, used)| (plugin.clone(), used.clone()));
+            let server = handed.as_ref().and_then(|(_, used)| self.server_for(used));
+            match (handed, server) {
+                (Some((plugin, used)), Some(server)) => {
+                    if (server.node.clone(), server.model.plugin.clone()) != current
+                        && let Err(error) = self.start_handover(&server.node, &server.model.plugin, &plugin, used).await
+                    {
+                        tracing::warn!(%error, "the model stays with the app that serves it now");
+                    }
+                }
+                _ => {
+                    self.stop_borrow("model");
+                    lock(&self.handed).clear();
+                    self.forget_card();
+                    tracing::info!("no app before this one serves this app's model any more: it serves it itself again");
+                }
+            }
+            return;
+        }
+        for (plugin, info) in crate::card::local_models(&ctx).await {
+            if !self.is_handed(&info.tags) || self.model_in_use(&plugin) {
+                continue;
+            }
+            let Some(slots) = ctx.call("model.slots", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { continue };
+            if slots.busy > 0 || slots.queued > 0 {
+                continue;
+            }
+            let used = UsedModel { model_id: info.model_id, family: info.family, tags: info.tags, loaded: false };
+            let Some(server) = self.server_for(&used) else { continue };
+            match self.start_handover(&server.node, &server.model.plugin, &plugin, used).await {
+                Ok(()) => tracing::info!(model = %plugin, to = %server.model.plugin, "this app's model is handed over to an app that serves its tags first"),
+                Err(error) => tracing::warn!(%error, "the model could not be handed over; this app keeps serving it"),
+            }
+            return;
+        }
+    }
+
+    /// Serve the `model` category from the model `lane` of the app `node` in place of this app's
+    /// model `plugin`. A connection that served it until now closes after the new one stands, so
+    /// the plugin does not start in between.
+    async fn start_handover(self: &Arc<Self>, node: &str, lane: &str, plugin: &str, used: UsedModel) -> Result<(), RpcError> {
+        let provides = self.member_provides(node, "model").await?;
+        if provides.is_empty() {
+            return Err(RpcError::new(codes::UNAVAILABLE, "the app that serves this model has no model plugin serving now"));
+        }
+        let mesh = self.clone();
+        let (ended_node, ended_lane) = (node.to_owned(), lane.to_owned());
+        let client = self.open_client("model", node, lane, provides.clone(), "handover", false, move || mesh.handover_ended(&ended_node, &ended_lane)).await?;
+        let borrow = Borrow { category: "model".to_owned(), node: node.to_owned(), plugin: lane.to_owned(), handover: true, provides, stop: client.stop };
+        let previous = lock(&self.borrows).insert("model".to_owned(), borrow);
+        if let Some(previous) = previous {
+            previous.stop();
+        }
+        lock(&self.handed).insert(plugin.to_owned(), used);
+        self.forget_card();
+        self.notify("serving");
+        Ok(())
+    }
+
+    /// The connection to the app serving this app's model closed (not one replaced by a newer).
+    fn handover_ended(&self, node: &str, lane: &str) {
+        let mut borrows = lock(&self.borrows);
+        if borrows.get("model").is_some_and(|borrow| borrow.node == node && borrow.plugin == lane) {
+            borrows.remove("model");
+            drop(borrows);
+            self.forget_card();
+            self.notify("serving");
         }
     }
 

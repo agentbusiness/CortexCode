@@ -7,6 +7,7 @@
 pub mod borrow;
 pub mod card;
 pub mod claims;
+pub mod handover;
 pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
@@ -24,6 +25,9 @@ pub mod words;
 
 /// The app this mesh plugin belongs to, as its card and its local file name it.
 pub const SOFTWARE: &str = "cortexcode";
+
+/// How early this app serves models on its computer (`Card::sharing_priority`): the highest first.
+pub const SHARING_PRIORITY: u32 = 30;
 
 /// The app as the Keychain names it (`<APP> mesh identity`).
 pub const APP: &str = "CortexCode";

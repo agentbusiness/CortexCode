@@ -108,3 +108,8 @@ pub fn now_ms() -> u64 {
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(any(feature = "lang", feature = "memory"))]
+pub mod value_trace;
+#[cfg(feature = "memory")]
+pub mod procedures;

@@ -289,3 +289,10 @@ rules = "learn"
 schema = "schemas/learn.json"
 effort = "none"
 sampling = "decision"
+
+# Cross-episode proposals run only while idle, never in the task protocol.
+[stage.PROCEDURE]
+rules = "procedure"
+schema = "schemas/procedure.json"
+effort = "none"
+sampling = "decision"

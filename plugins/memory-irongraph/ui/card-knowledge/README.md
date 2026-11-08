@@ -12,3 +12,7 @@ theory supported or refuted, answer a question, and Add an item by hand. Refresh
 - **Test:** `npm test`
 
 React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
+
+## Learned procedures
+
+The foldout keeps the existing knowledge tabs and adds review of project-scoped procedure proposals. Owners can permit a trial, review exact-revision uses, approve regular use after sufficient helpful non-origin tasks, reject or withdraw a revision. Completion alone is not evidence of help. See the [source feature guide](../../../../docs/VALUE-TRACING-AND-PROCEDURES.md). This addition has not been built or visually verified in the app.

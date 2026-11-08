@@ -93,6 +93,11 @@ pub trait LanguagePack: Send + Sync + 'static {
     /// [`LanguageInfo::name`] the file matched. Content hash, size, line count and excerpt are the
     /// caller's.
     fn extract(&self, language: &str, file: &SourceFile, ctx: &ExtractContext, facts: &mut FileFacts);
+    /// Optional focused analysis. Ordinary extraction never indexes statement traces.
+    fn value_trace(&self, _params: cc_protocol::contracts::lang::ValueTraceParams) -> Result<cc_protocol::contracts::lang::ValueTrace, RpcError> {
+        Err(RpcError::new(codes::UNAVAILABLE, "Value tracing is not supported for this language; read the function's source."))
+    }
+    fn has_value_trace(&self) -> bool { false }
     /// The probe's sample.
     fn sample(&self) -> Sample;
     /// Commands that check work in this language.
@@ -326,7 +331,11 @@ impl<P: LanguagePack> LangPlugin<P> {
 
     /// Methods served, as `<category>.<method>`.
     pub fn provides(&self) -> Vec<String> {
-        methods::ALL.iter().map(|method| format!("{}.{method}", self.shared.category)).collect()
+        let mut methods: Vec<String> = methods::ALL.iter().map(|method| format!("{}.{method}", self.shared.category)).collect();
+        if self.shared.pack.has_value_trace() {
+            methods.push(format!("{}.{}", self.shared.category, methods::VALUE_TRACE));
+        }
+        methods
     }
 
     pub fn servers(&self) -> Option<Arc<Servers>> {
@@ -450,6 +459,13 @@ impl<P: LanguagePack> LangPlugin<P> {
         match verb {
             methods::DESCRIBE => to_value(&self.describe().await),
             methods::EXTRACT => to_value(&self.extract(parse_params(params)?).await?),
+            methods::VALUE_TRACE => {
+                let request = parse_params(params)?;
+                let pack = self.shared.pack.clone();
+                let result = tokio::task::spawn_blocking(move || pack.value_trace(request)).await
+                    .map_err(|error| RpcError::internal(error.to_string()))??;
+                to_value(&result)
+            }
             methods::DIAGNOSTICS => {
                 let p: DiagnosticsParams = parse_params(params)?;
                 let servers = self.require_servers()?;

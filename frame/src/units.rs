@@ -756,6 +756,16 @@ fn served(frame: &Frame, ids: &[String]) -> Vec<UiPlugin> {
     frame.ui_plugins.list().into_iter().filter(|p| ids.contains(&p.id)).collect()
 }
 
+/// The client that served a plugin's category in a handover is gone: the plugin starts again
+/// (unless a person disabled it in the meantime).
+pub async fn hand_back(frame: &Arc<Frame>, slot: &Arc<supervisor::Slot>) {
+    let id = slot.plugin();
+    let Some(unit) = frame.units.get(&id).filter(|unit| unit.enabled()) else { return };
+    if let Some(spec) = exec_spec(&unit.current(), &frame.units.override_of(&id)) {
+        supervisor::enable(frame, slot, spec).await;
+    }
+}
+
 /// `frame.plugins.disable` / `frame.plugins.enable`.
 pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<PluginToggleResult, RpcError> {
     let _op = frame.units.op.lock().await;

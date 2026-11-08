@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "maxLength": 80},
+    "applicability": {"type": "string", "maxLength": 300},
+    "steps": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 240}},
+    "useful": {"enum": ["no", "yes"]}
+  },
+  "required": ["name", "applicability", "steps", "useful"],
+  "additionalProperties": false
+}

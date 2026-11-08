@@ -252,6 +252,30 @@ async fn graph(host: &dyn Host, scope: &Scope<'_>, path: &str, params: &HashMap<
     let (verb, rest) = path.split_once('/').unwrap_or((path, ""));
     let depth = number(params, "depth");
     match verb {
+        "value" => {
+            if crate::sandbox::host_control_read_denied(&abs(scope, &decode(rest))) {
+                return Err(UriError::new("not_found", "This file is private to the host; choose the project's source."));
+            }
+            let line = number(params, "line").and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0)
+                .ok_or_else(|| UriError::new("bad_uri", "Use graph://value/<path>?line=<line>&name=<variable>, before that line executes."))?;
+            let name = params.get("name").filter(|name| !name.is_empty()).ok_or_else(|| UriError::new("bad_uri", "Name the local variable with &name=<variable>."))?;
+            let request = merge(scope_params(scope), json!({"path": decode(rest), "line": line, "name": name, "max_steps": 40}));
+            let trace: cc_protocol::contracts::memory::ValueTrace = parse(host.call("memory.value_trace", request).await.map_err(|e| rpc(e, CODE_GRAPH))?, "memory.value_trace")?;
+            let mut out = String::new();
+            for step in &trace.steps {
+                let _ = writeln!(out, "{}:{}  {}", trace.path, step.line, step.text);
+                for input in &step.inputs {
+                    let lines: Vec<String> = input.definitions.iter().filter_map(|id| trace.steps.iter().find(|s| s.id == *id)).map(|s| s.line.to_string()).collect();
+                    if !lines.is_empty() { let _ = writeln!(out, "  {} from lines {}", input.name, lines.join(", ")); }
+                    if input.unresolved { let _ = writeln!(out, "  {} also has an unresolved origin", input.name); }
+                }
+            }
+            if trace.steps.is_empty() { out.push_str("No local defining statement was resolved.\n"); }
+            for boundary in &trace.boundaries { let _ = writeln!(out, "{boundary}"); }
+            if trace.truncated { out.push_str("The trace is incomplete; read the selected function's source.\n"); }
+            out.push_str("Read the relevant source before editing.\n");
+            Ok(out)
+        }
         "search" => {
             let text = decode(rest);
             if text.trim().is_empty() {
@@ -376,7 +400,7 @@ async fn graph(host: &dyn Host, scope: &Scope<'_>, path: &str, params: &HashMap<
         "" => {
             Err(UriError::new("bad_uri", "graph:// needs a query: search/<words>, used-by/<name>, uses/<name>, impact/<name>, path/<name>/<name>"))
         }
-        other => Err(UriError::new("bad_uri", format!("unknown graph query `{other}`; use search, used-by, uses, impact or path"))),
+        other => Err(UriError::new("bad_uri", format!("unknown graph query `{other}`; use search, used-by, uses, impact, path or value"))),
     }
 }
 

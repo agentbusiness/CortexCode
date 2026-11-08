@@ -399,6 +399,7 @@ impl Mesh {
                 mesh.refresh_local();
                 mesh.dial_all().await;
                 mesh.sync_machine().await;
+                mesh.hand_over().await;
                 mesh.push_card().await;
                 mesh.auto_place().await;
             }

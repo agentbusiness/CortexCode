@@ -17,7 +17,7 @@ platforms = ["macos", "linux"]
 category = "terminal"
 contract = "terminal@1"
 dir = "backend"
-build = ["cargo", "build", "--release"]
+build = ["python3", "native/build.py"]
 exec = "backend/target/release/cc-terminal"
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
@@ -30,3 +30,7 @@ build = ["npm", "run", "build"]
 dir = "ui/pane"
 id = "terminal.pane"
 slot = "pane.terminal@1"
+
+# Third-party notices travel with the statically linked terminal core.
+[data]
+dirs = ["data"]

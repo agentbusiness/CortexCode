@@ -170,11 +170,18 @@ function writeIfChanged(path, text, mode = 0o644) {
  */
 function starterScript() {
   const exe = process.platform === 'darwin' ? '$apps/$version/CortexCode.app/Contents/MacOS/CortexCode' : '$apps/$version/cortexcode/CortexCode';
-  // The window belongs to the frame's Electron child: opening that running bundle activates it.
+  // The window belongs to the frame's Electron child (`<electron> <ui dir>`). Running that same
+  // command again brings its window forward: the shell keeps one instance, so the second hands over
+  // and quits. Not `open` on the shell's bundle: LaunchServices starts a new Electron without the
+  // ui dir, which shows Electron's own empty default window.
   const forward =
     process.platform === 'darwin'
-      ? `  shell="$(ps -axo ppid=,comm= | awk -v p="$pid" '$1 == p && /\\.app\\/Contents\\/MacOS\\// { sub(/^ *[0-9]+ +/, ""); sub(/\\/Contents\\/MacOS\\/.*/, ""); print; exit }')"
-  [ -n "$shell" ] && open "$shell"
+      ? `  cmd="$(ps -axo ppid=,command= | awk -v p="$pid" '$1 == p && /\\.app\\/Contents\\/MacOS\\// { sub(/^ *[0-9]+ +/, ""); print; exit }')"
+  exe="$(printf '%s\\n' "$cmd" | sed 's#\\(\\.app/Contents/MacOS/[^/ ]*\\) .*#\\1#')"
+  ui="\${cmd#"$exe" }"
+  if [ -n "$cmd" ] && [ "$ui" != "$cmd" ] && [ -x "$exe" ] && [ -d "$ui" ]; then
+    CORTEX_HOME=${shq(HOME)} nohup "$exe" "$ui" >/dev/null 2>&1 </dev/null &
+  fi
 `
       : '';
   const missing =

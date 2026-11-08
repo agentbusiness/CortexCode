@@ -146,6 +146,17 @@ pub struct Card {
     /// number and no names, and a computer that does not know a model's tags leaves it alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelCard>,
+    /// Models of this app that another app on this computer runs for it, because that app serves
+    /// their tags first ([`Card::sharing_priority`]). This app uses them and does not
+    /// lend them; a model server reads this to know what the apps on its computer need.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<UsedModel>,
+    /// How early this app serves models on its computer, said by the app itself: the highest
+    /// serves first, and none at all comes last. An app hands a tag over to an app of a higher
+    /// priority that serves the tag on the same computer: it stops its own model for that tag,
+    /// uses the other app's, and stops lending it. Equal priorities hand nothing over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_priority: Option<u32>,
     /// Every plugin, with the hash of its live data (prompts, skills, texts), so a lender's plugin
     /// is known to behave exactly as the borrower's.
     #[serde(default)]
@@ -174,6 +185,19 @@ pub struct Card {
     #[serde(default)]
     pub projects: Vec<ProjectCard>,
     pub updated_ms: u64,
+}
+
+/// A model an app uses and another app on its computer runs for it ([`Card::uses`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct UsedModel {
+    pub model_id: String,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// This app still has it in memory (it is finishing a call before it stops its model).
+    #[serde(default)]
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

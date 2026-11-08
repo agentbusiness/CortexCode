@@ -1897,12 +1897,19 @@ async fn knowledge_note(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcEr
         let lines: Vec<String> = lessons.iter().map(|item| env.data.text("list_item", &[("text", item.text.trim())])).collect();
         parts.push(env.data.text("lessons_note", &[("text", &lines.join("\n"))]));
     }
+    let procedures = if crate::replay::arm(&entries).is_none() {
+        crate::procedures::recall(&env.host, &env.scope.project_id, journal.session_id(), &env.run_id, &work, &languages).await.items
+    } else { Vec::new() };
+    for procedure in &procedures {
+        let steps: Vec<String> = procedure.steps.iter().enumerate().map(|(i, step)| format!("{}. {}", i + 1, step)).collect();
+        parts.push(env.data.text("procedure_note", &[("when", &procedure.applicability), ("steps", &steps.join("\n"))]));
+    }
     if parts.is_empty() {
         return Ok(());
     }
     let shown: Vec<&str> = lessons.iter().map(|item| item.id.as_str()).collect();
     journal
-        .append(kinds::NOTE, json!({"text": parts.join("\n\n"), "purpose": "knowledge", "run_id": env.run_id, "host_message": true, "decision_seq": route_seq, "lessons": shown}))
+        .append(kinds::NOTE, json!({"text": parts.join("\n\n"), "purpose": "knowledge", "run_id": env.run_id, "host_message": true, "decision_seq": route_seq, "lessons": shown, "procedures": procedures.iter().map(|p| &p.key).collect::<Vec<_>>()}))
         .await
         .map(|_| ())
 }

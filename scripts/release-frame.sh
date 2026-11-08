@@ -58,6 +58,7 @@ stamp_json_version "$repo/ui/package.json" "$version"
 # --- the shell's runtime packages (the same on every platform) ---------------------------------
 [ -f "$repo/ui/node_modules/.package-lock.json" ] || (cd "$repo/ui" && npm ci --no-audit --no-fund)
 electron_version="$(jq -r .version "$repo/ui/node_modules/electron/package.json")"
+electron_release="$electron_version-$ELECTRON_BRANDING"
 
 out="$artifacts/frame/$version"
 rm -rf "$out"
@@ -91,8 +92,8 @@ for platform in $RELEASE_PLATFORMS; do
   tar_dir "$stage" "$frame_file"
   uploads+=("$frame_file")
 
-  # Electron: the released one when its version did not change.
-  electron_asset="$(jq -c --arg p "$platform" --arg e "$electron_version" 'if .frame.electron == $e then (.frame.files[$p].electron // empty) else empty end' "$catalog")"
+  # Electron: the released one when its version and branding did not change.
+  electron_asset="$(jq -c --arg p "$platform" --arg e "$electron_release" 'if .frame.electron == $e then (.frame.files[$p].electron // empty) else empty end' "$catalog")"
   if [ -z "$electron_asset" ]; then
     step "Electron $electron_version for $platform"
     electron_dir="$work/$platform/electron"
@@ -100,7 +101,7 @@ for platform in $RELEASE_PLATFORMS; do
       darwin-arm64) electron_mac_branded "$repo/ui/node_modules/electron" "$electron_dir" "$repo/ui/shell/assets/CortexCode.icns" ;;
       linux-*) electron_linux "$platform" "$electron_version" "$electron_dir" ;;
     esac
-    electron_file="$out/electron-$electron_version-$platform.tar.gz"
+    electron_file="$out/electron-$electron_release-$platform.tar.gz"
     tar_dir "$electron_dir" "$electron_file"
     uploads+=("$electron_file")
     electron_asset="$(asset_json "$electron_file" "$tag")"
@@ -123,7 +124,7 @@ fi
 interface="$(interface_digest)"
 since="$(jq -r --arg i "$interface" 'if .frame.interface == $i then (.frame.interface_since // empty) else empty end' "$catalog")"
 [ -n "$since" ] || since="$version"
-jq --arg v "$version" --arg tag "$tag" --arg e "$electron_version" --arg digest "$(frame_digest)" \
+jq --arg v "$version" --arg tag "$tag" --arg e "$electron_release" --arg digest "$(frame_digest)" \
   --arg interface "$interface" --arg since "$since" --argjson files "$files" \
   '.frame = {version: $v, tag: $tag, electron: $e, digest: $digest, interface: $interface, interface_since: $since, files: $files}' "$catalog" > "$catalog.next"
 mv "$catalog.next" "$catalog"

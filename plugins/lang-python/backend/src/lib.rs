@@ -5,6 +5,7 @@
 pub mod pyproject;
 pub mod python;
 pub mod server;
+pub mod value_trace;
 
 use cc_lang_kit::cc_protocol::contracts::lang::{FileFacts, LanguageInfo, SourceFile, Runner, Verifier};
 use cc_lang_kit::lsp::{Launch, ServerSpec};
@@ -58,6 +59,11 @@ fn strings(items: &[&str]) -> Vec<String> {
 }
 
 impl LanguagePack for PythonPack {
+    fn has_value_trace(&self) -> bool { true }
+
+    fn value_trace(&self, params: cc_lang_kit::cc_protocol::contracts::lang::ValueTraceParams) -> Result<cc_lang_kit::cc_protocol::contracts::lang::ValueTrace, cc_lang_kit::cc_protocol::RpcError> {
+        value_trace::trace(params)
+    }
     fn id(&self) -> &str {
         "python"
     }

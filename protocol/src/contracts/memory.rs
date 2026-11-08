@@ -53,6 +53,15 @@ pub mod methods {
     pub const IMPACT: &str = "memory.impact";
     pub const PATH: &str = "memory.path";
     pub const OUTLINE: &str = "memory.outline";
+    /// Current-file local value origins, computed on demand by the language plugin.
+    pub const VALUE_TRACE: &str = "memory.value_trace";
+    pub const PROCEDURE_EPISODE: &str = "memory.procedure.episode";
+    pub const PROCEDURE_MATERIAL: &str = "memory.procedure.material";
+    pub const PROCEDURE_PROPOSE: &str = "memory.procedure.propose";
+    pub const PROCEDURE_LIST: &str = "memory.procedure.list";
+    pub const PROCEDURE_REVIEW: &str = "memory.procedure.review";
+    pub const PROCEDURE_RECALL: &str = "memory.procedure.recall";
+    pub const PROCEDURE_OUTCOME: &str = "memory.procedure.outcome";
     /// [`super::FocusParams`] -> [`super::FocusResult`]: the definitions and document sections of
     /// one file, each scored by how well it matches a text (what a read is for).
     pub const FOCUS: &str = "memory.focus";
@@ -2618,4 +2627,20 @@ pub struct QueueAckParams {
 pub struct QueueAckResult {
     /// Messages that were waiting for this ack (acking one twice counts once).
     pub acked: u32,
+}
+
+// ----- focused value origins -----
+pub use super::procedures::*;
+pub use super::value_trace::{ValueTrace, ValueInput, ValueStep};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValueTraceParams {
+    #[serde(flatten)]
+    pub scope: Scope,
+    pub path: String,
+    /// Value immediately before this line, not after its assignment.
+    pub line: u32,
+    pub name: String,
+    #[serde(default = "super::value_trace::trace_limit")]
+    pub max_steps: u32,
 }

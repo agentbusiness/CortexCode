@@ -33,6 +33,7 @@ pub mod prewarm;
 pub mod locks;
 pub mod projection;
 pub mod proposal;
+pub mod procedures;
 pub mod prompts;
 pub mod reads;
 pub mod references;
