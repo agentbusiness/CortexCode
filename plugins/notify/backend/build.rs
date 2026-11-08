@@ -29,7 +29,9 @@ fn main() {
         return;
     }
     match build() {
-        Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.display()),
+        // The app's name only, not its folder: a released binary names no folder of the build
+        // computer (the app is found beside the executable first; see native::locate_helper).
+        Ok(path) => println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=built:{}", path.file_name().map_or(path.display().to_string(), |name| name.to_string_lossy().into_owned())),
         Err(reason) => {
             println!("cargo:warning=notification app not built ({reason}); cc-notify will deliver through osascript only");
             println!("cargo:rustc-env=CC_NOTIFY_HELPER_BUILD=absent:{reason}");
