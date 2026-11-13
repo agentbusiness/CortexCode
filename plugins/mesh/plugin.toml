@@ -33,6 +33,9 @@ uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.sess
 # Relay servers members use to reach each other when no direct connection can be made across
 # networks (empty: n0's public relays). A company with its own iroh relay lists its URL here.
 relays = []
+# true: only the relays above, never n0's public ones; with none listed, no relay at all (direct
+# connections only).
+private_relays_only = false
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

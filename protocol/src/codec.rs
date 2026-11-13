@@ -29,8 +29,13 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option
     if length > MAX_FRAME_BYTES {
         return Err(CodecError::TooLarge(length));
     }
-    let mut body = vec![0_u8; length];
-    reader.read_exact(&mut body).await?;
+    // The buffer grows with the bytes that arrive, never to the declared length up front: a peer
+    // that declares a large frame and sends little costs little.
+    let mut body = Vec::with_capacity(length.min(64 * 1024));
+    (&mut *reader).take(length as u64).read_to_end(&mut body).await?;
+    if body.len() < length {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
