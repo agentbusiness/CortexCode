@@ -52,7 +52,7 @@ pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "s
 
 /// An invitation lives this long; it is used once.
 const PAIRING_WINDOW: Duration = Duration::from_secs(3600);
-/// Wrong codes before the window closes by itself.
+/// Attempts on one invitation, failed or under way, before the window closes by itself.
 const PAIRING_ATTEMPTS: u32 = 3;
 /// How long a card is reused before it is built again.
 const CARD_TTL_MS: u64 = 20_000;
@@ -61,11 +61,16 @@ const LOAD_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub relays: Vec<String>,
+    /// Only `relays`, never n0's public ones (`[config] private_relays_only`; off by default).
+    pub private_relays_only: bool,
 }
 
 impl Config {
     pub fn from_value(value: &Value) -> Config {
-        Config { relays: value.get("relays").and_then(Value::as_array).map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default() }
+        Config {
+            relays: value.get("relays").and_then(Value::as_array).map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
+            private_relays_only: value.get("private_relays_only").and_then(Value::as_bool).unwrap_or(false),
+        }
     }
 }
 
@@ -73,7 +78,10 @@ struct Pending {
     code: String,
     expires_ms: u64,
     invitation: String,
+    /// Attempts that ended without a joiner admitted.
     attempts: u32,
+    /// Attempts claimed whose exchange has not ended yet.
+    in_flight: u32,
 }
 
 struct EventSub {
@@ -685,30 +693,54 @@ impl Mesh {
 
     // --- pairing -------------------------------------------------------------------------------
 
-    pub fn pending_code(&self) -> Option<String> {
+    /// A pairing connection claims one of the invitation's attempts before anything is
+    /// exchanged: under the one lock, while the window is open and fewer than
+    /// [`PAIRING_ATTEMPTS`] attempts have failed or are under way, the attempt counts as under
+    /// way and gets the code. `None`: the connection is closed as not pairing. However many
+    /// connections open at once, no more than [`PAIRING_ATTEMPTS`] guesses ever run against one
+    /// code. Every claim ends in [`Mesh::pairing_admit`] or [`Mesh::pairing_attempt_failed`].
+    pub fn claim_pairing(&self) -> Option<String> {
         let mut pairing = lock(&self.pairing);
-        match pairing.as_ref() {
-            Some(pending) if pending.expires_ms > now_ms() => Some(pending.code.clone()),
-            Some(_) => {
-                *pairing = None;
-                None
-            }
-            None => None,
+        if pairing.as_ref().is_some_and(|pending| pending.expires_ms <= now_ms()) {
+            *pairing = None;
         }
+        let pending = pairing.as_mut()?;
+        if pending.attempts + pending.in_flight >= PAIRING_ATTEMPTS {
+            return None;
+        }
+        pending.in_flight += 1;
+        Some(pending.code.clone())
     }
 
-    pub fn pairing_done(&self) {
-        *lock(&self.pairing) = None;
-        self.notify("pairing");
-    }
-
-    pub fn pairing_attempt_failed(&self) {
-        let mut pairing = lock(&self.pairing);
-        if let Some(pending) = pairing.as_mut() {
-            pending.attempts += 1;
-            if pending.attempts >= PAIRING_ATTEMPTS {
-                *pairing = None;
+    /// The admission of a joiner whose attempt proved `code`: the window closes here, under the
+    /// lock, before the log is touched, so one code admits one joiner. An exchange that ends
+    /// after the window closed (another joiner was admitted on the code, the attempts ran out,
+    /// the invitation expired or was replaced) is refused and nothing is added.
+    pub fn pairing_admit(&self, code: &str, record: &JoinerRecord) -> Result<Vec<Entry>, String> {
+        {
+            let mut pairing = lock(&self.pairing);
+            if !pairing.as_ref().is_some_and(|pending| pending.code == code && pending.expires_ms > now_ms()) {
+                return Err("this invitation is no longer open".to_owned());
             }
+            *pairing = None;
+        }
+        self.notify("pairing");
+        self.admit(record)
+    }
+
+    /// A claimed attempt on `code` ended without a joiner admitted: a wrong code, an error, a
+    /// connection that went away, the exchange's deadline. It turns from under way to failed;
+    /// the window closes at [`PAIRING_ATTEMPTS`] failures. Nothing changes when the window is no
+    /// longer this code's.
+    pub fn pairing_attempt_failed(&self, code: &str) {
+        let mut pairing = lock(&self.pairing);
+        let spent = pairing.as_mut().filter(|pending| pending.code == code).is_some_and(|pending| {
+            pending.in_flight = pending.in_flight.saturating_sub(1);
+            pending.attempts += 1;
+            pending.attempts >= PAIRING_ATTEMPTS
+        });
+        if spent {
+            *pairing = None;
         }
         drop(pairing);
         self.notify("pairing");
@@ -720,7 +752,7 @@ impl Mesh {
         let ticket = self.my_addr().map(|addr| crate::net::encode_ticket(&addr)).unwrap_or_default();
         let invitation = if ticket.is_empty() { code.clone() } else { format!("{code}@{ticket}") };
         let expires_ms = now_ms() + PAIRING_WINDOW.as_millis() as u64;
-        *lock(&self.pairing) = Some(Pending { code: code.clone(), expires_ms, invitation: invitation.clone(), attempts: 0 });
+        *lock(&self.pairing) = Some(Pending { code: code.clone(), expires_ms, invitation: invitation.clone(), attempts: 0, in_flight: 0 });
         self.notify("pairing");
         Ok(PairCode { code, expires_ms, invitation })
     }

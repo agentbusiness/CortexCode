@@ -16,7 +16,12 @@
 //! release` (one use of this computer's model for a member's run, when the model has the run's
 //! tag: [`crate::claims`]).
 //!
-//! `cortex/pair/1` runs the pairing exchange while a code is shown ([`crate::pairing`]).
+//! `cortex/pair/2` runs the pairing exchange while a code is shown ([`crate::pairing`]).
+//!
+//! `cortex/live/1` is a member's live connection: a connection of its own, admitted like the
+//! frame's (members only), whose streams and datagrams belong to the app ([`crate::live`]), for
+//! media that must not wait behind requests or behind each other. An app that carries none closes
+//! it. It is dialed only when the app asks ([`Mesh::dial_live`]), never kept by the mesh.
 
 use crate::members::Entry;
 use crate::pairing;
@@ -36,8 +41,15 @@ use tokio_util::sync::CancellationToken;
 
 pub const FRAME_ALPN: &[u8] = b"cortex/frame/1";
 
+/// A member's live connection ([`LiveHandler`], [`Mesh::dial_live`]).
+pub const LIVE_ALPN: &[u8] = b"cortex/live/1";
+
 /// How long a dial may take before the member counts as unreachable for now.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long the inviter gives one pairing exchange, from the connection to the answer. An
+/// exchange that reaches it counts as a failed attempt.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What every member lends every other as a whole category: its model. The services the plugins
 /// share are lent method by method (`crate::services`); everything else is private to the node,
@@ -90,23 +102,68 @@ async fn serve_connection(mesh: Arc<Mesh>, node: String, connection: Connection)
     }
 }
 
+/// A member's live connection: admitted as the frame's are, then the app's ([`crate::live`]).
+#[derive(Debug, Clone)]
+pub struct LiveHandler(pub Arc<Mesh>);
+
+impl ProtocolHandler for LiveHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let node = connection.remote_id().to_string();
+        if !self.0.is_member(&node) {
+            self.0.refresh_local();
+        }
+        if !self.0.is_member(&node) {
+            tracing::info!(node = %&node[..node.len().min(10)], "a live connection from a key that is not a member; closed");
+            connection.close(1u32.into(), b"not a member");
+            return Ok(());
+        }
+        crate::live::serve_live(&self.0, &node, connection).await;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PairHandler(pub Arc<Mesh>);
 
+/// One attempt of the invitation, claimed by a pairing connection (`Mesh::claim_pairing`). Dropped
+/// while still open it counts as failed, however the connection ended: a wrong code, an error,
+/// the deadline, a joiner that went away. A dropped guess is a guess.
+struct PairAttempt {
+    mesh: Arc<Mesh>,
+    code: String,
+    open: bool,
+}
+
+impl Drop for PairAttempt {
+    fn drop(&mut self) {
+        if self.open {
+            self.mesh.pairing_attempt_failed(&self.code);
+        }
+    }
+}
+
 impl ProtocolHandler for PairHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let Some(code) = self.0.pending_code() else {
+        // The attempt is claimed before anything is exchanged, so connections opened at once
+        // cannot each try the code, and the whole exchange has one deadline.
+        let Some(code) = self.0.claim_pairing() else {
             connection.close(2u32.into(), b"not pairing");
             return Ok(());
         };
-        let Ok((send, recv)) = connection.accept_bi().await else { return Ok(()) };
+        let mut attempt = PairAttempt { mesh: self.0.clone(), code: code.clone(), open: true };
+        let deadline = tokio::time::Instant::now() + PAIR_TIMEOUT;
+        let Ok(Ok((send, recv))) = tokio::time::timeout_at(deadline, connection.accept_bi()).await else { return Ok(()) };
         let mut stream = tokio::io::join(recv, send);
         let mesh = self.0.clone();
-        let outcome = pairing::invite(&mut stream, &code, |record| mesh.admit(record)).await;
+        let (me, joiner) = (mesh.me.hex(), connection.remote_id().to_string());
+        // The window closes in `pairing_admit`, before the log is touched: a second exchange on
+        // the same code that ends later is refused there.
+        let exchange = pairing::invite(&mut stream, &code, &me, &joiner, |record| mesh.pairing_admit(&code, record));
+        let outcome = tokio::time::timeout_at(deadline, exchange).await.unwrap_or_else(|_| Err("the pairing exchange took too long".to_owned()));
         match outcome {
             Ok(record) => {
+                attempt.open = false;
                 tracing::info!(name = %record.name, "a computer joined the cortex");
-                self.0.pairing_done();
                 // The members hear of the joiner at once (else they refuse its connection), and it
                 // is dialed.
                 let mesh = self.0.clone();
@@ -117,9 +174,10 @@ impl ProtocolHandler for PairHandler {
             }
             Err(reason) => {
                 tracing::info!(%reason, "a pairing attempt failed");
-                self.0.pairing_attempt_failed();
             }
         }
+        // Still open here: the attempt failed, and is counted.
+        drop(attempt);
         let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
         Ok(())
     }
@@ -362,10 +420,12 @@ impl Mesh {
     /// Bind the endpoint, start the accept loop and the local-network lookup.
     pub async fn start_net(self: &Arc<Self>) -> Result<(), String> {
         let secret = self.me.secret.clone();
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret).alpns(vec![FRAME_ALPN.to_vec(), pairing::ALPN.to_vec()]);
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret).alpns(vec![FRAME_ALPN.to_vec(), pairing::ALPN.to_vec(), LIVE_ALPN.to_vec()]);
         // Relays: the plugin's configured ones (`[config] relays`, for a company with its own), in
         // front of n0's public relays, which carry members on other networks that cannot be
-        // reached directly. A relay sees only encrypted traffic.
+        // reached directly. A relay sees only encrypted traffic. With `[config] private_relays_only`
+        // the configured ones alone, and none of n0's; with none configured, no relay at all
+        // (direct connections only).
         let mut relays: Vec<iroh::RelayUrl> = Vec::new();
         for url in lock_config(self).relays.iter() {
             match url.parse::<iroh::RelayUrl>() {
@@ -373,7 +433,9 @@ impl Mesh {
                 Err(error) => tracing::warn!(url, %error, "a relay URL could not be read"),
             }
         }
-        if !relays.is_empty() {
+        if lock_config(self).private_relays_only {
+            builder = builder.relay_mode(if relays.is_empty() { iroh::RelayMode::Disabled } else { iroh::RelayMode::custom(relays) });
+        } else if !relays.is_empty() {
             let defaults: Vec<iroh::RelayUrl> = iroh::RelayMode::Default.relay_map().urls();
             relays.extend(defaults);
             builder = builder.relay_mode(iroh::RelayMode::custom(relays));
@@ -388,7 +450,7 @@ impl Mesh {
             }
             Err(error) => tracing::warn!(%error, "local-network lookup is not available; members are found by their addresses"),
         }
-        let router = Router::builder(endpoint.clone()).accept(FRAME_ALPN, FrameHandler(self.clone())).accept(pairing::ALPN, PairHandler(self.clone())).spawn();
+        let router = Router::builder(endpoint.clone()).accept(FRAME_ALPN, FrameHandler(self.clone())).accept(pairing::ALPN, PairHandler(self.clone())).accept(LIVE_ALPN, LiveHandler(self.clone())).spawn();
         let _ = self.endpoint.set(endpoint);
         let _ = self.router.set(router);
         let mesh = self.clone();
@@ -459,6 +521,23 @@ impl Mesh {
                 tracing::debug!(node = %&node[..node.len().min(10)], "member not reachable (timeout)");
                 false
             }
+        }
+    }
+
+    /// A live connection to a member, for the app's own streams and datagrams ([`crate::live`]).
+    /// The mesh keeps no record of it: the app holds it and closes it.
+    pub async fn dial_live(&self, node: &str) -> Result<Connection, RpcError> {
+        let unreachable = || {
+            let name = self.member(node).map(|member| member.name).unwrap_or_else(|| "The computer".to_owned());
+            RpcError::new(codes::UNAVAILABLE, format!("{name} is not reachable now")).retryable()
+        };
+        let Some(member) = self.member(node) else { return Err(unreachable()) };
+        let Some(endpoint) = self.endpoint.get() else { return Err(unreachable()) };
+        let Ok(id) = node.parse::<EndpointId>() else { return Err(unreachable()) };
+        let addr = member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id));
+        match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, LIVE_ALPN)).await {
+            Ok(Ok(connection)) => Ok(connection),
+            _ => Err(unreachable()),
         }
     }
 
@@ -556,10 +635,11 @@ impl Mesh {
             let endpoint = endpoint.clone();
             let me = self.clone();
             async move {
+                let inviter = addr.id.to_string();
                 let connection = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, pairing::ALPN)).await.map_err(|_| "no answer".to_owned())?.map_err(|e| e.to_string())?;
                 let (send, recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
                 let mut stream = tokio::io::join(recv, send);
-                let entries = pairing::join(&mut stream, &words, &me.me, &name, my_addr).await?;
+                let entries = pairing::join(&mut stream, &words, &me.me, &inviter, &name, my_addr).await?;
                 let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
                 Ok::<Vec<Entry>, String>(entries)
             }

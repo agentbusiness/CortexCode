@@ -11,6 +11,7 @@ pub mod handover;
 pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
+pub mod live;
 pub mod local;
 pub mod machine;
 pub mod members;
