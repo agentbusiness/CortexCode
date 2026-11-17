@@ -76,6 +76,12 @@ pub struct PrepareParams {
     /// The commit to start from; empty: the main branch's head after the fetch.
     #[serde(default)]
     pub base: String,
+    /// Who the job's commits are made as (author and committer). Both empty: git's own identity
+    /// on this computer.
+    #[serde(default)]
+    pub commit_name: String,
+    #[serde(default)]
+    pub commit_email: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

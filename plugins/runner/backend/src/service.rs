@@ -912,6 +912,8 @@ impl Runner {
         // ignore it yet. In a job that line would be a change no task asked for, so the worktree
         // ignores `tmp/` on its own, outside the tracked files.
         ignore_scratch(std::path::Path::new(&tree.path)).await;
+        // Who the job's commits are made as: what the manager says for this repository.
+        commit_as(std::path::Path::new(&tree.path), params.commit_name.trim(), params.commit_email.trim()).await?;
         let project: Project = host.effect(frame_methods::PROJECT_OPEN, json!({"root": tree.path})).await.and_then(parse_params)?;
         let before = existing.as_ref().map(|(job, _)| job.clone());
         {
@@ -1248,4 +1250,26 @@ async fn ignore_scratch(root: &std::path::Path) {
     if let Err(error) = tokio::fs::write(&path, format!("{text}{separator}/tmp/\n")).await {
         tracing::warn!(%error, "the worktree's exclude file could not be written; the tools will list tmp/ in .gitignore");
     }
+}
+
+/// Set the repository's own git identity (author and committer of every commit made in it) to the
+/// one given; with none given, take back one set before, so git's own identity on this computer
+/// is used. A job must not start with an identity nobody chose for it, so a failure stops it.
+async fn commit_as(root: &std::path::Path, name: &str, email: &str) -> Result<(), RpcError> {
+    let git = |args: Vec<String>| {
+        let root = root.to_owned();
+        async move { tokio::process::Command::new("git").arg("-C").arg(&root).args(&args).output().await }
+    };
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        if name.is_empty() || email.is_empty() {
+            // Not set is not an error.
+            let _ = git(vec!["config".into(), "--unset".into(), key.into()]).await;
+            continue;
+        }
+        let done = git(vec!["config".into(), key.into(), value.into()]).await;
+        if !done.as_ref().is_ok_and(|output| output.status.success()) {
+            return Err(RpcError::internal(format!("the commit identity ({key}) could not be set in {}", root.display())));
+        }
+    }
+    Ok(())
 }
