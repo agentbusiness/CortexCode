@@ -772,6 +772,9 @@ pub async fn set_enabled(frame: &Arc<Frame>, id: &str, enabled: bool) -> Result<
     let mut steps = Vec::new();
     let unit = frame.units.get(id).ok_or_else(|| RpcError::not_found(format!("no plugin `{id}`")))?;
     let current = unit.current();
+    if frame.runner && !enabled && id == "updater" {
+        return Err(RpcError::invalid_params("service mode keeps its updater on"));
+    }
     let ui_ids = Unit::ui_ids(&current);
     if unit.enabled() == enabled {
         return Ok(PluginToggleResult { plugin: frame.units.info_of(&unit), changed: false, steps, ui: Vec::new() });
@@ -1289,7 +1292,7 @@ async fn move_category(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>,
 /// Swap `unit` to `to`: the backend first (the swap engine probes it and keeps the old version on
 /// failure), then the UI packages and shell modules. Returns the backend swap, or the error.
 async fn switch(frame: &Arc<Frame>, unit: &Arc<Unit>, to: Arc<Installed>, why: &str, steps: &mut Vec<SwapStep>) -> Outcome {
-    let enabled = unit.enabled();
+    let enabled = if frame.runner { unit.id == "updater" || unit.enabled() } else { unit.enabled() };
     let mut backend_swap = None;
     if frame.units.is_standby(unit) {
         steps.push(SwapStep { step: "backend".into(), ok: true, ms: 0, detail: "the plugin is on standby; the new version starts when it is switched to".into() });

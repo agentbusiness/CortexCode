@@ -19,8 +19,8 @@ use crate::repetition::{Detector, Verdict};
 use crate::schemas;
 use cc_protocol::contracts::chatflow::{
     KnowledgeAnswerParams,
-    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, FlowState, PlanCommentParams, PlanEditParams, PlanRefParams, PlanUpdateParams,
-    PrewarmParams, PrewarmResult, SessionParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, plan_status, verbs,
+    AgentRunParams, AgentRunResult, ApproveParams, Attachment, AttachmentPutParams, AttachmentPutResult, FlowState, PlanCommentParams, PlanEditParams, PlanPutParams, PlanRefParams, PlanUpdateParams,
+    PrewarmParams, PrewarmResult, ReplanAnswerParams, RunnerSetParams, SessionParams, SteerParams, TurnParams, TurnResult, kinds as chatflow_kinds, plan_status, verbs,
 };
 use crate::{plan, proposal};
 use cc_protocol::contracts::tools::topics as tools_topics;
@@ -65,6 +65,9 @@ pub fn hello() -> Hello {
         verbs::PLAN_REVISE,
         verbs::KNOWLEDGE_ANSWER,
         verbs::PREWARM,
+        verbs::PLAN_PUT,
+        verbs::RUNNER_SET,
+        verbs::REPLAN_ANSWER,
     ]
         .iter()
         .map(|verb| cc_protocol::contracts::frame::flows::method(FLOW, verb))
@@ -1015,6 +1018,42 @@ impl Chatflow {
         Ok(json!({"status": params.status, "changed": true}))
     }
 
+    /// A finished plan handed in whole (a runner's job): recorded as the PLAN stage would have
+    /// written it and `plan.update approved` would have left it, with no model call.
+    async fn plan_put(&self, ctx: Ctx, params: PlanPutParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let mut journal = self.idle_journal(&host, &params.session_id, "a run is going in this conversation; put the plan when it ends").await?;
+        if let Some((_, open)) = plan::open(&journal.entries_vec()) {
+            return Err(RpcError::new(codes::CONFLICT, format!("this conversation has an open plan ({}); implement it or start a new conversation", open.plan_id)));
+        }
+        let made = crate::runner::plan_of(&params.plan).map_err(RpcError::invalid_params)?;
+        let seq = journal.append(chatflow_kinds::PLAN, made.entry("")).await?;
+        Ok(json!({"plan_id": made.plan_id, "version": made.version, "seq": seq}))
+    }
+
+    /// Runner mode on or off for a session: a note the flow reads back ([`crate::runner::on`]).
+    async fn runner_set(&self, ctx: Ctx, params: RunnerSetParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let mut journal = Journal::load(host.clone(), &params.session_id).await?;
+        if crate::runner::on(&journal.entries_vec()) == params.on {
+            return Ok(json!({"on": params.on, "changed": false}));
+        }
+        let text = self.inner.data.get().text(if params.on { "runner_on" } else { "runner_off" }, &[]);
+        journal.append(kinds::NOTE, json!({"text": text, "purpose": crate::runner::MODE, "on": params.on, "host_message": false})).await?;
+        Ok(json!({"on": params.on, "changed": true}))
+    }
+
+    /// The manager's answer to the session's held replan; the waiting run reads it from the note.
+    async fn replan_answer(&self, ctx: Ctx, params: ReplanAnswerParams) -> Result<Value, RpcError> {
+        let host = Host::new(ctx);
+        let journal = Journal::load(host.clone(), &params.session_id).await?;
+        let entries = journal.entries_vec();
+        let Some(held) = crate::runner::pending(&entries) else { return Err(RpcError::not_found("no replan waits for an answer in this conversation")) };
+        let state = if params.accept { "accepted" } else { "refused" };
+        host.journal_set(&params.session_id, held.seq, "state", json!(state)).await?;
+        Ok(json!({"state": state, "changed": true}))
+    }
+
     /// The plan card's Implement: a turn whose route is IMPLEMENT (no router call), the plan named.
     async fn plan_implement(&self, ctx: Ctx, params: PlanRefParams) -> Result<TurnResult, RpcError> {
         let host = Host::new(ctx.clone());
@@ -1868,6 +1907,9 @@ impl Plugin for Chatflow {
                 verbs::PLAN_REVISE => to_value(&this.plan_revise(ctx, parse_params(call.params.clone())?).await?),
                 verbs::PLAN_EDIT => this.plan_edit(ctx, parse_params(call.params.clone())?).await,
                 verbs::PLAN_COMMENT => this.plan_comment(ctx, parse_params(call.params.clone())?).await,
+                verbs::PLAN_PUT => this.plan_put(ctx, parse_params(call.params.clone())?).await,
+                verbs::RUNNER_SET => this.runner_set(ctx, parse_params(call.params.clone())?).await,
+                verbs::REPLAN_ANSWER => this.replan_answer(ctx, parse_params(call.params.clone())?).await,
                 verbs::AGENT_RUN => {
                     let params: AgentRunParams = parse_params(call.params.clone())?;
                     to_value(&this.agent_run(ctx, &call, params).await?)

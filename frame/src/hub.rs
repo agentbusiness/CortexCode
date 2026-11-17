@@ -97,6 +97,8 @@ pub struct Frame {
     pub socket: PathBuf,
     pub port: AtomicU16,
     pub headless: bool,
+    /// Started with `--service`: a runner (docs/RUNNER.md).
+    pub runner: bool,
     /// Calls on the projects, sessions and slot state that came before the records were loaded
     /// from the store, in arrival order; None once loaded ([`Frame::records_ready`]).
     records_waiting: Mutex<Option<Vec<(Arc<Peer>, IncomingRequest)>>>,
@@ -140,6 +142,7 @@ pub struct FrameParts {
     pub token: String,
     pub socket: PathBuf,
     pub headless: bool,
+    pub runner: bool,
     pub machine: Machine,
     pub journal: Journal,
     pub state: StateStore,
@@ -151,8 +154,13 @@ pub struct FrameParts {
 
 impl Frame {
     pub fn new(parts: FrameParts) -> Arc<Frame> {
-        let FrameParts { config, home, token, socket, headless, machine, journal, state, memory, units, live, safe } = parts;
-        let disabled = units.disabled();
+        let FrameParts { config, home, token, socket, headless, runner, machine, journal, state, memory, units, live, safe } = parts;
+        let mut disabled = units.disabled();
+        // A service has no window to turn its updater back on in: it stays on (the saved
+        // preference is kept for the app with its window).
+        if runner {
+            disabled.remove("updater");
+        }
         let ui_plugins = UiPlugins::new(units.ui_sources(), disabled.clone());
         let window_build = ui_plugins.window().map(|window| window.plugin.hash).unwrap_or_default();
         let sup = Supervisor::new(&units.backends(), &disabled);
@@ -178,6 +186,7 @@ impl Frame {
             command_access: crate::access::CommandAccess::default(),
             socket,
             headless,
+            runner,
             live,
             safe,
             machine,

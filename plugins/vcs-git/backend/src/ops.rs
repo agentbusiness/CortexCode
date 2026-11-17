@@ -82,10 +82,18 @@ pub async fn diff_files(
             args.push(merge_base.into());
             args.push("HEAD".into());
         }
+        other if other.starts_with("since:") => {
+            // The working tree, untracked files included, against a commit (a runner job's base).
+            let sha = verify_commit(git, repo, other.trim_start_matches("since:")).await?;
+            let untracked = untracked_paths(git, repo).await?;
+            untracked_set = untracked.iter().map(|p| path_text(p)).collect();
+            index = Some(intent_index(git, repo, scratch, &untracked).await?);
+            args.push(sha.into());
+        }
         other => {
             let Some(rev) = other.strip_prefix("commit:") else {
                 return Err(RpcError::invalid_params(format!(
-                    "unknown diff scope `{other}` (uncommitted | unstaged | staged | branch | commit:<sha>)"
+                    "unknown diff scope `{other}` (uncommitted | unstaged | staged | branch | commit:<sha> | since:<rev>)"
                 )));
             };
             let sha = verify_commit(git, repo, rev).await?;

@@ -851,8 +851,11 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                     fresh_start(env, journal, &task_id, n, &title, &outcome.summary).await?;
                                 }
                                 set_stage(env, journal, status_seq, "plan").await?;
-                                write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: outcome_name.clone(), summary: outcome.summary.clone() }).await?;
-                                continue;
+                                // Written: the work goes on with the new tasks. Refused (a runner
+                                // job): the run ends here with this task as it ended.
+                                if write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: outcome_name.clone(), summary: outcome.summary.clone() }).await? {
+                                    continue;
+                                }
                             }
                             journal.set(plan_seq, "status", json!(if outcome_name == "done" { plan_status::DONE } else { plan_status::IMPLEMENTING })).await?;
                         }
@@ -1206,14 +1209,16 @@ enum PlanMode {
 }
 
 async fn run_plan(env: &RunEnv, journal: &mut Journal, auto: bool) -> Result<(), RpcError> {
-    write_plan(env, journal, if auto { PlanMode::Auto } else { PlanMode::Asked }).await
+    write_plan(env, journal, if auto { PlanMode::Auto } else { PlanMode::Asked }).await.map(|_| ())
 }
 
 /// PLAN (a new plan) or PLAN_EDIT (a plan's next version, with its difference). Nothing is
 /// changed in the repository. An auto plan and a replan are recorded as implementing with the run
 /// as `implement_run` (the Act stage carries their tasks out; they are never the open plan a
 /// later message edits).
-async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Result<(), RpcError> {
+/// False when nothing was written: a runner-mode session's replan that the manager refused
+/// ([`crate::runner::hold`]); the plan stays as it was.
+async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Result<bool, RpcError> {
     // ROUTE's skills are in the conversation already and serve the planner only; each task chooses
     // the skills of its own work.
     let entries = journal.entries_vec();
@@ -1361,6 +1366,15 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         made.diff = Some(diff);
     }
     made.replaces = open_work.iter().filter(|item| output.replaces.contains(&item.label())).map(|item| item.task.id.clone()).collect();
+    // A runner job's plan is the manager's: a replan is offered to it and written only when it
+    // says so.
+    if let PlanMode::Replan { failed, outcome, summary, .. } = &mode
+        && crate::runner::on(&entries)
+        && !crate::runner::hold(env, journal, &made, *failed, outcome, summary).await?
+    {
+        journal.note(&env.run_id, "replan_refused", &env.data.text("replan_refused", &[]), false).await?;
+        return Ok(false);
+    }
     let seq = journal.append(chatflow_kinds::PLAN, made.entry(&env.run_id)).await?;
     if auto {
         journal.set(seq, "implement_run", json!(env.run_id)).await?;
@@ -1370,7 +1384,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     if let Some(previous) = &previous {
         cancel_replaced_tasks(env, previous, &made).await;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The tasks earlier plans of this conversation made that are done now, each once: its title and
@@ -1462,6 +1476,32 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
     stop_replaced_work(env, journal, plan_seq, &current).await?;
     current.replaces.clear();
+    // A runner job's plan is carried out here, one task after the other, as a plan made for a DO
+    // decision is: one working tree, a REVIEW after each task, the next task after the one before
+    // it is verified. The decision carries only the goal; each task's brief, checks and skills
+    // are its own.
+    if crate::runner::on(&entries) {
+        let decision = Decision {
+            missing: String::new(),
+            route: "DO".into(),
+            effort: env.data.effort.default.clone(),
+            symbols: Vec::new(),
+            files: Vec::new(),
+            queries: Vec::new(),
+            brief: current.doc.goal.clone(),
+            checks: Vec::new(),
+            skills: Vec::new(),
+            note: String::new(),
+        };
+        journal.append(kinds::ROUTE, json!({"route": "DO", "stage": "decide", "detail": decision, "plan_id": current.plan_id, "run_id": env.run_id, "by": "host"})).await?;
+        // This run's own version (the Act stage finds the plan by its run), after the decision.
+        let mut mine = current.clone();
+        mine.version = current.version + 1;
+        mine.status = plan_status::IMPLEMENTING.into();
+        mine.diff = None;
+        let seq = journal.append(chatflow_kinds::PLAN, mine.entry(&env.run_id)).await?;
+        return journal.set(seq, "implement_run", json!(env.run_id)).await;
+    }
     if current.tasks.len() <= 1 {
         let mut decision = plan::foreground_decision(&env.data, &current, &env.data.effort.default);
         decision.brief = format!("{}{}", direction(&env.data, &journal.entries_vec()), decision.brief);

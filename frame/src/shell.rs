@@ -170,7 +170,10 @@ async fn supervise(frame: Arc<Frame>) {
             Ok(status) if status.code() == Some(0) => {
                 tracing::info!("the UI was closed by the user; quitting");
                 shell.want.store(false, Ordering::SeqCst);
-                shell.quit.notify_one();
+                // A service goes on without its window.
+                if !frame.runner {
+                    shell.quit.notify_one();
+                }
                 return;
             }
             other => {

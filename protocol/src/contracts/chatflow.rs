@@ -77,6 +77,111 @@ pub mod verbs {
     /// `project_id` and no session (a new conversation being written), the project's chat system
     /// block is prefilled for the conversation about to be created.
     pub const PREWARM: &str = "prewarm";
+    /// Take a finished plan as the session's approved plan, as the PLAN stage would have written
+    /// it and `plan.update approved` would have left it (no model call): [`super::PlanPutParams`]
+    /// -> `{plan_id, version, seq}`. `plan.implement` then carries it out. Host code only (a
+    /// runner, `runner@1`).
+    pub const PLAN_PUT: &str = "plan.put";
+    /// Turn runner mode on or off for a session (a `note` entry, purpose `runner_mode`):
+    /// [`super::RunnerSetParams`] -> `{on, changed}`. In runner mode the session's plan is carried
+    /// out here, one task after the other; a message during a task is the task's next step, not
+    /// a new plan; a replan is held ([`super::topics::REPLAN_HELD`]) until
+    /// [`REPLAN_ANSWER`]; MANAGE publishes its flags ([`super::topics::MANAGE_FLAGS`]) and does
+    /// nothing else.
+    pub const RUNNER_SET: &str = "runner.set";
+    /// Answer the session's held replan: [`super::ReplanAnswerParams`] -> `{state, changed}`.
+    /// Accepted: the new tasks take the place of the tasks still to do. Refused: the run goes on
+    /// with the tasks it had (after a task that ended badly: it ends with that task failed).
+    pub const REPLAN_ANSWER: &str = "replan.answer";
+}
+
+/// One task of a plan handed in whole ([`PlanPut`]). `depends_on` holds numbers of earlier tasks
+/// (1-based positions in the list).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanPutTask {
+    pub title: String,
+    #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub known: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<u32>,
+    #[serde(default)]
+    pub touches: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
+}
+
+/// A finished plan: the document's two fields and the tasks, in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanPut {
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub approach: String,
+    pub tasks: Vec<PlanPutTask>,
+}
+
+/// `chatflow.plan.put`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PlanPutParams {
+    pub session_id: String,
+    pub plan: PlanPut,
+}
+
+/// `chatflow.runner.set`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunnerSetParams {
+    pub session_id: String,
+    pub on: bool,
+}
+
+/// `chatflow.replan.answer`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReplanAnswerParams {
+    pub session_id: String,
+    pub accept: bool,
+}
+
+/// `chatflow.replan.held`: a replan a runner-mode session wants, waiting for
+/// `chatflow.replan.answer`. Also the data of the `note` entry (purpose `replan_held`, with
+/// `state: pending|accepted|refused|dropped`) the answer is recorded on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReplanHeld {
+    pub session_id: String,
+    /// Seq of the `note` entry that holds it.
+    pub seq: u64,
+    /// What the work showed (REVIEW's finding, or how the task ended).
+    pub found: String,
+    /// done (REVIEW after a task that ended well) | failed | stuck | stopped | ...
+    #[serde(default)]
+    pub outcome: String,
+    /// The task it came after (1-based).
+    #[serde(default)]
+    pub after_task: u32,
+    /// The tasks still to do as the planner would write them, numbered as in the new plan.
+    pub tasks: Vec<Value>,
+}
+
+/// One agent of a `chatflow.manage.flags` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ManageFlag {
+    pub agent: String,
+    /// Successful calls that were not edits or check runs since its last edit.
+    pub reading_calls: u32,
+    pub idle_minutes: u64,
+    /// One of the two is past the flow's own limit and the agent was told nothing since its last edit.
+    #[serde(default)]
+    pub flagged: bool,
+}
+
+/// `chatflow.manage.flags`: what MANAGE saw in a runner-mode session (it took no action).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ManageFlags {
+    pub session_id: String,
+    pub agents: Vec<ManageFlag>,
 }
 
 /// What `chatflow.prewarm` warms: a session, or the system block of a project's next conversation.
@@ -456,6 +561,10 @@ pub mod topics {
     /// before the decision is journaled. At most one event per 250 ms per call, and a last one
     /// with `done: true`.
     pub const LIVE: &str = "chatflow.live";
+    /// [`super::ReplanHeld`]: a runner-mode session holds a replan until it is answered.
+    pub const REPLAN_HELD: &str = "chatflow.replan.held";
+    /// [`super::ManageFlags`]: MANAGE's flags in a runner-mode session.
+    pub const MANAGE_FLAGS: &str = "chatflow.manage.flags";
 }
 
 /// One `chatflow.live` event: every top-level string field of the decision written so far (the

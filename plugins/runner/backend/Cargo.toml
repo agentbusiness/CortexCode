@@ -1,0 +1,33 @@
+[package]
+name = "cc-runner"
+description = "CortexCode runner (runner@1): builds for a manager: a job's worktree, its plan carried out by the chat flow, checkpoints, facts, builds and landing."
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+
+# A self-contained plugin: its own workspace, depending only on the protocol.
+[workspace]
+
+[lib]
+name = "cc_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-runner"
+path = "src/bin/cc-runner.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["chatflow", "host", "memory", "runner", "vcs"] }
+libc = "0.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+
+[profile.release]
+debug = 1

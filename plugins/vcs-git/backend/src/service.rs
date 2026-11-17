@@ -6,11 +6,12 @@ use crate::git::{Git, find_executable};
 use crate::github::Github;
 use crate::repo::{Repo, require};
 use crate::watch::{Publish, Watches};
-use crate::{clone, ops, remote, status};
+use crate::{clone, ops, remote, status, work};
 use cc_protocol::contracts::vcs::{
-    BranchParams, CheckpointParams, CloneParams, CommitParams, DevFolderParams, DiffParams, ForkParams, GithubPrParams,
-    GithubPrStateParams, LogParams, MergeParams, PathsParams, PrCreateParams, PushParams, RepoCreateParams, ReposParams,
-    RestoreParams, RootParams, TokenParams, methods,
+    AdvanceParams, BranchParams, CheckpointParams, CloneParams, CommitParams, DevFolderParams, DiffParams, FetchParams, ForkParams,
+    GithubPrParams, GithubPrStateParams, GrepParams, LogParams, MergeParams, MirrorParams, PathsParams, PrCreateParams, PushParams,
+    RebaseParams, RepoCreateParams, ReposParams, ResetParams, RestoreParams, RevParams, RootParams, ShowParams, SquashParams, TokenParams,
+    TreeParams, WorktreeAddParams, WorktreeRemoveParams, methods,
 };
 use cc_protocol::{RpcError, parse_params, to_value};
 use serde_json::Value;
@@ -119,6 +120,15 @@ impl Vcs {
             Err(poisoned) => poisoned.into_inner(),
         };
         locks.entry(repo.top.clone()).or_default().clone()
+    }
+
+    /// The lock of a repository named by its folder (a bare one has no working tree).
+    fn dir_lock(&self, dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = match self.locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locks.entry(dir.to_path_buf()).or_default().clone()
     }
 
     async fn repo(&self, root: &str) -> Result<Repo, RpcError> {
@@ -271,6 +281,79 @@ impl Vcs {
                 let p: DevFolderParams = parse_params(params)?;
                 to_value(&self.github.dev_folder_set(&p.path)?)
             }
+            methods::FETCH => {
+                let p: FetchParams = parse_params(params)?;
+                let dir = work::repo_dir(&p.root)?;
+                let lock = self.dir_lock(&dir);
+                let _guard = lock.lock().await;
+                to_value(&remote::fetch(git, &self.github, &dir, p.remote.as_deref(), p.prune).await?)
+            }
+            methods::MIRROR => {
+                let p: MirrorParams = parse_params(params)?;
+                let lock = self.dir_lock(Path::new(&p.path));
+                let _guard = lock.lock().await;
+                to_value(&work::mirror(git, &self.github, &p.url, &p.path).await?)
+            }
+            methods::WORKTREE_ADD => {
+                let p: WorktreeAddParams = parse_params(params)?;
+                let dir = work::repo_dir(&p.repo)?;
+                let lock = self.dir_lock(&dir);
+                let _guard = lock.lock().await;
+                to_value(&work::worktree_add(git, &dir, &p.path, &p.branch, &p.from).await?)
+            }
+            methods::WORKTREE_REMOVE => {
+                let p: WorktreeRemoveParams = parse_params(params)?;
+                let dir = work::repo_dir(&p.repo)?;
+                let lock = self.dir_lock(&dir);
+                let _guard = lock.lock().await;
+                let removed = work::worktree_remove(git, &dir, &p.path, p.force).await?;
+                to_value(&serde_json::json!({"ok": true, "removed": removed}))
+            }
+            methods::REBASE => {
+                let p: RebaseParams = parse_params(params)?;
+                let repo = self.repo(&p.root).await?;
+                let lock = self.repo_lock(&repo);
+                let _guard = lock.lock().await;
+                to_value(&work::rebase(git, &repo, &p.onto).await?)
+            }
+            methods::RESET => {
+                let p: ResetParams = parse_params(params)?;
+                let repo = self.repo(&p.root).await?;
+                let lock = self.repo_lock(&repo);
+                let _guard = lock.lock().await;
+                to_value(&work::reset(git, &repo, &p.to, p.clean).await?)
+            }
+            methods::SQUASH => {
+                let p: SquashParams = parse_params(params)?;
+                let repo = self.repo(&p.root).await?;
+                let lock = self.repo_lock(&repo);
+                let _guard = lock.lock().await;
+                to_value(&work::squash(git, &repo, &p.base, &p.trailer, &p.groups).await?)
+            }
+            methods::BRANCH_ADVANCE => {
+                let p: AdvanceParams = parse_params(params)?;
+                let dir = work::repo_dir(&p.root)?;
+                let lock = self.dir_lock(&dir);
+                let _guard = lock.lock().await;
+                to_value(&work::advance(git, &dir, &p.branch, &p.to).await?)
+            }
+            methods::REV => {
+                let p: RevParams = parse_params(params)?;
+                to_value(&work::rev(git, &work::repo_dir(&p.root)?, &p.rev).await?)
+            }
+            methods::SHOW => {
+                let p: ShowParams = parse_params(params)?;
+                let text = work::show(git, &work::repo_dir(&p.root)?, &p.rev, &p.path).await?;
+                to_value(&serde_json::json!({"text": text}))
+            }
+            methods::GREP => {
+                let p: GrepParams = parse_params(params)?;
+                to_value(&work::grep(git, &work::repo_dir(&p.root)?, &p.rev, &p.text, &p.under, p.limit).await?)
+            }
+            methods::TREE => {
+                let p: TreeParams = parse_params(params)?;
+                to_value(&work::tree(git, &work::repo_dir(&p.root)?, &p.rev, &p.path).await?)
+            }
             other => Err(RpcError::unknown_method(other)),
         }
     }
@@ -309,4 +392,16 @@ pub const PROVIDES: &[&str] = &[
     methods::GITHUB_CREDENTIAL,
     methods::CLONE,
     methods::DEV_FOLDER_SET,
+    methods::FETCH,
+    methods::MIRROR,
+    methods::WORKTREE_ADD,
+    methods::WORKTREE_REMOVE,
+    methods::REBASE,
+    methods::RESET,
+    methods::SQUASH,
+    methods::BRANCH_ADVANCE,
+    methods::REV,
+    methods::SHOW,
+    methods::GREP,
+    methods::TREE,
 ];

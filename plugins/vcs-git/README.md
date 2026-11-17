@@ -19,3 +19,13 @@ cortex-pack build plugins/vcs-git                  # -> plugins/vcs-git/target/v
 ```
 
 `cortex-pack build plugins/vcs-git --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the backend and the UI package together; Settings > Plugins disables and enables the whole plugin.
+
+## A runner's repositories
+
+For the runner plugin (`runner@1`, `docs/RUNNER.md`), host code only: `vcs.mirror` (a bare
+repository of a source, its branches kept as `refs/remotes/origin/*`), `vcs.fetch`,
+`vcs.worktree.add` / `vcs.worktree.remove`, `vcs.rebase` (a conflict aborts and names the files),
+`vcs.reset`, `vcs.squash` (one commit per group of a trailer), `vcs.branch.advance` (fast-forward
+only), `vcs.rev`, and the reads of a revision without a checkout: `vcs.show`, `vcs.grep`,
+`vcs.tree`. `vcs.diff` also takes the scope `since:<rev>`. A fetch signs in as a push does
+(`backend/src/remote.rs`). Code: `backend/src/work.rs`.

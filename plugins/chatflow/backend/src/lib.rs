@@ -38,6 +38,7 @@ pub mod prompts;
 pub mod reads;
 pub mod references;
 pub mod replay;
+pub mod runner;
 pub mod repetition;
 pub mod schemas;
 pub mod skillsel;

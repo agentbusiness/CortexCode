@@ -985,7 +985,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             // An agent's messages (the session's, another agent's) are its next step inside the task
             // it works on, not a new plan: replanning at each one restarted its reading every time
             // (seen: sixteen plans and the same file read again after each message).
-            if spec.step.is_some() && !matches!(spec.kind, LoopKind::Agent { .. }) {
+            // A runner job's messages are the manager's fixed sentences about the task in work
+            // (undo a change, go on with the task): its next step too, and its plan stays.
+            if spec.step.is_some() && !matches!(spec.kind, LoopKind::Agent { .. }) && !crate::runner::on(&journal.entries_vec()) {
                 return Ok(outcome("steered", steers.join("\n\n"), turns, tool_calls, &changed, None));
             }
         }

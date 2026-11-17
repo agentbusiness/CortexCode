@@ -71,3 +71,12 @@ cortex-pack build plugins/chatflow                  # -> plugins/chatflow/target
 `cortex-pack build plugins/chatflow --install` packs the folder into a `.ccplugin` that the frame installs (`frame.plugins.install`), which hot-swaps the backend and the UI packages together; Settings > Plugins disables and enables the whole plugin.
 
 A conversation is named by its first message (`title_from` in `chatflow.rs`): the first line's first words, at most 48 characters, an opening "please" or "can you" left out. A conversation created with a title (a fix conversation, a security audit) keeps it.
+
+## Runner mode
+
+A session that builds for a manager (`runner@1`, `docs/RUNNER.md`; `backend/src/runner.rs`):
+`plan.put` records a finished plan as approved, `runner.set` turns the mode on (a `note`, purpose
+`runner_mode`). In it `plan.implement` carries the plan out in the session, one task after the
+other; a message during a task is the task's next step; a replan is held (`chatflow.replan.held`,
+a `note` with purpose `replan_held`) until `replan.answer`; MANAGE publishes
+`chatflow.manage.flags` and does nothing else.

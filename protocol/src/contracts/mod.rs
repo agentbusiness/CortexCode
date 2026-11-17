@@ -35,6 +35,8 @@ pub mod model;
 pub mod notify;
 #[cfg(feature = "research")]
 pub mod research;
+#[cfg(feature = "runner")]
+pub mod runner;
 #[cfg(feature = "schedule")]
 pub mod schedule;
 #[cfg(feature = "service")]
@@ -70,6 +72,7 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("update", "update@1"),
     ("mesh", "mesh@1"),
     ("schedule", "schedule@1"),
+    ("runner", "runner@1"),
 ];
 
 /// Families: any number of plugins, each in its own category `<family>-<name>` (lowercase letters,

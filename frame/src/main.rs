@@ -1,6 +1,6 @@
 //! `cortex-frame`: the CortexCode frame.
 //!
-//! `cortex-frame [--config <cortex.toml>] [--headless] [--home <dir>]` (without `--config`: the app
+//! `cortex-frame [--config <cortex.toml>] [--headless] [--service] [--home <dir>]` (without `--config`: the app
 //! bundle's `Contents/Resources/cortex.toml`, or `cortex.toml` beside the binary; a newer frame an
 //! update staged runs instead, see `update.rs`)
 
@@ -54,6 +54,11 @@ struct Cli {
     /// Do not start the Electron shell.
     #[arg(long)]
     headless: bool,
+    /// Service mode (docs/RUNNER.md): a CortexCode that builds for a manager, in the background.
+    /// No window, its own home (`~/.cortexcode-runner` unless `--home` or `CORTEX_HOME` names
+    /// one), the updater kept on (`--runner` is the same flag).
+    #[arg(long = "service", alias = "runner")]
+    runner: bool,
     /// CortexCode home (overrides CORTEX_HOME and the config's `[frame] home`).
     #[arg(long)]
     home: Option<PathBuf>,
@@ -62,6 +67,9 @@ struct Cli {
     #[arg(long)]
     safe: bool,
 }
+
+/// The home of a frame started with `--service` when none is named.
+const SERVICE_HOME: &str = "~/.cortexcode-runner";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -77,10 +85,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // Precedence: --home, then CORTEX_HOME, then [frame] home, then ~/.cortexcode.
+    // Precedence: --home, then CORTEX_HOME, then [frame] home, then ~/.cortexcode. A service never
+    // takes the home of the person's own CortexCode: without --home or CORTEX_HOME it has its own.
     let home_root = match (&cli.home, std::env::var("CORTEX_HOME").ok().filter(|v| !v.is_empty()), &config.home) {
         (Some(home), _, _) => config::absolutize(home),
         (None, Some(env), _) => config::absolutize(&config::expand_tilde(&env)),
+        (None, None, _) if cli.runner => config::expand_tilde(SERVICE_HOME),
         (None, None, Some(home)) => config::resolve(&config.base, home),
         (None, None, None) => config::expand_tilde("~/.cortexcode"),
     };
@@ -203,12 +213,12 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", config.port))?;
     let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
 
-    let want_ui = config.ui && !cli.headless;
+    let want_ui = config.ui && !cli.headless && !cli.runner;
     let live = config.live.clone().unwrap_or_else(|| home.live());
     if cli.safe {
         tracing::warn!("safe mode: plugins read their packaged data only");
     }
-    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless, machine, journal, state, memory, units, live, safe: cli.safe });
+    let frame = Frame::new(FrameParts { config, home: home.clone(), token: token.clone(), socket: socket.clone(), headless: cli.headless || cli.runner, runner: cli.runner, machine, journal, state, memory, units, live, safe: cli.safe });
     frame.port.store(port, Ordering::SeqCst);
     // The machine does not idle-sleep while the frame runs (window open or not); shutdown releases it.
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {

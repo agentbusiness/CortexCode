@@ -6,6 +6,7 @@ pub mod methods {
     pub const STATUS: &str = "vcs.status";
     /// scope: uncommitted (working tree incl. untracked vs HEAD) | unstaged (working tree vs index)
     /// | staged (index vs HEAD) | branch (HEAD vs merge-base with `base`) | commit:<sha> (vs first parent)
+    /// | since:<rev> (working tree incl. untracked vs that commit)
     pub const DIFF: &str = "vcs.diff";
     pub const LOG: &str = "vcs.log";
     pub const BRANCHES: &str = "vcs.branches";
@@ -65,6 +66,40 @@ pub mod methods {
     pub const CLONE: &str = "vcs.clone";
     /// [`super::DevFolderParams`] -> [`super::GithubStatus`]. The folder new clones go into.
     pub const DEV_FOLDER_SET: &str = "vcs.dev_folder.set";
+
+    // A runner's work on its own clones (`runner@1`): a bare mirror of a source, one working tree
+    // per job. Called by host code only; `root`/`repo` is a working tree or a bare repository.
+    /// [`super::FetchParams`] -> [`super::FetchResult`]. Contacts the remote only when called.
+    pub const FETCH: &str = "vcs.fetch";
+    /// [`super::MirrorParams`] -> [`super::MirrorResult`]: a bare repository of `url` at `path`
+    /// (made when absent), then fetched with prune. The source's branches are
+    /// `refs/remotes/origin/*`; `refs/heads/*` are the runner's own, so a prune never takes one.
+    pub const MIRROR: &str = "vcs.mirror";
+    /// [`super::WorktreeAddParams`] -> [`super::WorktreeResult`]: a working tree of `repo` at
+    /// `path` on `branch`, made from `from` when the branch is new.
+    pub const WORKTREE_ADD: &str = "vcs.worktree.add";
+    /// [`super::WorktreeRemoveParams`] -> `{ok}`. The branch stays.
+    pub const WORKTREE_REMOVE: &str = "vcs.worktree.remove";
+    /// [`super::RebaseParams`] -> [`super::RebaseResult`]: the current branch onto `onto`. A
+    /// conflict aborts the rebase and names the files.
+    pub const REBASE: &str = "vcs.rebase";
+    /// [`super::ResetParams`] -> [`super::RevResult`]: the working tree and index back to a commit
+    /// (`clean`: untracked files go too; ignored files stay). Discards work: host code only.
+    pub const RESET: &str = "vcs.reset";
+    /// [`super::SquashParams`] -> [`super::SquashResult`]: the commits after `base` rewritten as
+    /// one commit per group, grouped by a trailer of their messages.
+    pub const SQUASH: &str = "vcs.squash";
+    /// [`super::AdvanceParams`] -> [`super::RevResult`]: fast-forward a branch that no working
+    /// tree has checked out to a commit; refused with `conflict` when it is not a fast-forward.
+    pub const BRANCH_ADVANCE: &str = "vcs.branch.advance";
+    /// [`super::RevParams`] -> [`super::RevResult`]: the commit a revision names.
+    pub const REV: &str = "vcs.rev";
+    /// [`super::ShowParams`] -> `{text}`: a file as it is at a revision, without a checkout.
+    pub const SHOW: &str = "vcs.show";
+    /// [`super::GrepParams`] -> [`super::GrepResult`]: a fixed string in the files of a revision.
+    pub const GREP: &str = "vcs.grep";
+    /// [`super::TreeParams`] -> [`super::TreeResult`]: a folder of a revision (folders end in `/`).
+    pub const TREE: &str = "vcs.tree";
 }
 
 pub mod topics {
@@ -518,4 +553,194 @@ pub struct CloneResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DevFolderParams {
     pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FetchParams {
+    /// A working tree or a bare repository.
+    pub root: String,
+    /// Default `origin`.
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Remove remote-tracking branches the remote no longer has.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FetchResult {
+    pub ok: bool,
+    /// The remote could be reached.
+    pub available: bool,
+    #[serde(default)]
+    pub remote: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MirrorParams {
+    /// Any git remote: an https or ssh address, or a folder.
+    pub url: String,
+    /// Absolute path of the bare repository.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MirrorResult {
+    pub path: String,
+    /// The repository was made by this call.
+    pub created: bool,
+    /// The fetch succeeded.
+    pub ok: bool,
+    pub available: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorktreeAddParams {
+    /// The repository the working tree belongs to (a mirror).
+    pub repo: String,
+    /// Absolute path of the new working tree.
+    pub path: String,
+    pub branch: String,
+    /// The commit a new branch starts from (ignored when the branch exists).
+    pub from: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorktreeResult {
+    pub path: String,
+    pub branch: String,
+    pub head: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorktreeRemoveParams {
+    pub repo: String,
+    pub path: String,
+    /// Remove it also with uncommitted changes in it.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RebaseParams {
+    pub root: String,
+    pub onto: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RebaseResult {
+    pub ok: bool,
+    /// Files in conflict; the rebase was aborted and the branch is as it was.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub head: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResetParams {
+    pub root: String,
+    pub to: String,
+    #[serde(default)]
+    pub clean: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RevParams {
+    pub root: String,
+    pub rev: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RevResult {
+    /// None when the revision names no commit.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+/// One commit a squash makes: the commits whose trailer has `value`, under `message`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SquashGroup {
+    pub value: String,
+    pub message: String,
+}
+
+/// `vcs.squash`: each group's commit holds the tree of the last commit after `base` whose
+/// `trailer` line has the group's value, in the order those commits come (a commit of another
+/// group, or of none, in between goes into the group that ends after it; what follows the last
+/// group's commit goes into the last group). A group without commits is left out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SquashParams {
+    pub root: String,
+    pub base: String,
+    /// The trailer's name (`Request`).
+    pub trailer: String,
+    pub groups: Vec<SquashGroup>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SquashResult {
+    pub head: String,
+    /// The new commits, oldest first.
+    pub commits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AdvanceParams {
+    pub root: String,
+    pub branch: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ShowParams {
+    pub root: String,
+    pub rev: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GrepParams {
+    pub root: String,
+    pub rev: String,
+    /// A fixed string (not a pattern).
+    pub text: String,
+    /// A path to search under.
+    #[serde(default)]
+    pub under: String,
+    /// Default 100.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GrepHit {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GrepResult {
+    pub hits: Vec<GrepHit>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TreeParams {
+    pub root: String,
+    pub rev: String,
+    /// The folder; empty: the top.
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TreeResult {
+    pub entries: Vec<String>,
 }

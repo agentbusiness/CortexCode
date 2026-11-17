@@ -11,6 +11,7 @@ use crate::journal::Journal;
 use crate::schemas::{self, Manage};
 use cc_protocol::RpcError;
 use cc_protocol::contracts::agents::{CancelResult, ListResult, events, methods as agents_methods};
+use cc_protocol::contracts::chatflow::{ManageFlag, ManageFlags, topics as chatflow_topics};
 use cc_protocol::contracts::frame::{JournalEntry, kinds};
 use cc_protocol::contracts::memory::{AgentRecord, Task, methods as memory_methods};
 use serde_json::{Value, json};
@@ -95,12 +96,60 @@ pub fn repeated_failure(entries: &[JournalEntry], task_id: &str) -> bool {
 /// its last edit. A run of one of `checks` (its task's check commands, by the command they run) is a
 /// check run, not reading (seen: an agent named reading while it ran its checks between edits).
 pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (String, bool) {
-    let Some(session_id) = agent.session_id.as_deref() else { return (String::new(), false) };
-    let Ok(journal) = Journal::load(env.host.clone(), session_id).await else { return (String::new(), false) };
+    let Some((entries, measured)) = measured(env, agent, checks).await else { return (String::new(), false) };
+    let Measured { steps, edits, since_edit, checks_since, idle, edited_at, files } = measured;
+    let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER);
+    let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
+    let mut line = env.data.text(
+        "manage_progress",
+        &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("checks", &checks_since.to_string()), ("idle", &idle.to_string())],
+    );
+    let (reading, still) = flags(env, since_edit, idle);
+    if reading {
+        line.push_str(&env.data.text("manage_flag_reading", &[("since", &since_edit.to_string())]));
+    }
+    if still {
+        line.push_str(&env.data.text("manage_flag_idle", &[("idle", &idle.to_string())]));
+    }
+    // Told something it has not acted on with an edit yet: it is working on that.
+    let told_since_edit = told.is_some_and(|told| told.ts_ms > edited_at);
+    // Both ways: what the session last told it, and what it last said (its answer, its question).
+    if let Some(told) = told {
+        let ago = cc_protocol::contracts::now_ms().saturating_sub(told.ts_ms) / 60_000;
+        line.push_str(&env.data.text("manage_told", &[("ago", &ago.to_string()), ("text", &short(str_field(&told.data, "text"), SAID_CHARS))]));
+    }
+    if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
+        line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
+    }
+    (line, (reading || still) && !told_since_edit)
+}
+
+/// What an agent's current run did, counted from its journal ([`progress`] words it).
+struct Measured {
+    steps: usize,
+    edits: usize,
+    /// Successful calls that were neither edits nor check runs since the last edit.
+    since_edit: usize,
+    checks_since: usize,
+    /// Minutes since the run's last entry.
+    idle: u64,
+    edited_at: u64,
+    files: Vec<String>,
+}
+
+/// The two things that need the session: reading past `limits.manage_reading_calls`, no step for
+/// `limits.manage_idle_minutes`.
+fn flags(env: &RunEnv, since_edit: usize, idle: u64) -> (bool, bool) {
+    let limits = &env.data.limits;
+    (limits.manage_reading_calls > 0 && since_edit >= limits.manage_reading_calls as usize, limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes)
+}
+
+/// The agent's journal and the counts of its current run; None when it has no run yet.
+async fn measured(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> Option<(Vec<JournalEntry>, Measured)> {
+    let session_id = agent.session_id.as_deref()?;
+    let journal = Journal::load(env.host.clone(), session_id).await.ok()?;
     let entries = journal.entries_vec();
-    let Some(run_id) = entries.iter().rev().find(|entry| entry.kind == kinds::STATUS).map(|entry| str_field(&entry.data, "run_id").to_owned()) else {
-        return (String::new(), false);
-    };
+    let run_id = entries.iter().rev().find(|entry| entry.kind == kinds::STATUS).map(|entry| str_field(&entry.data, "run_id").to_owned())?;
     let check_bases: Vec<String> = checks.iter().map(|command| crate::repetition::base_command(command)).filter(|base| !base.is_empty()).collect();
     let run: Vec<&JournalEntry> = entries.iter().filter(|entry| str_field(&entry.data, "run_id") == run_id).collect();
     let ok: HashMap<&str, bool> = run
@@ -112,8 +161,7 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (
     // The session's last message to it: calls are counted from it too, so an agent is not told
     // again before it could act on what it was told (seen: one agent told the same thing five
     // times in a minute, and "hold" and "write it now" in turns every few minutes).
-    let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER);
-    let told_at = told.map(|entry| entry.ts_ms).unwrap_or(0);
+    let told_at = entries.iter().rev().find(|entry| entry.kind == kinds::STEER).map(|entry| entry.ts_ms).unwrap_or(0);
     let mut edits = 0;
     let mut since_edit = 0;
     let mut checks_since = 0;
@@ -144,31 +192,23 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (
     }
     let last_ms = run.iter().map(|entry| entry.ts_ms).max().unwrap_or(0);
     let idle = cc_protocol::contracts::now_ms().saturating_sub(last_ms) / 60_000;
-    let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
-    let mut line = env.data.text(
-        "manage_progress",
-        &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("checks", &checks_since.to_string()), ("idle", &idle.to_string())],
-    );
-    let limits = &env.data.limits;
-    let reading = limits.manage_reading_calls > 0 && since_edit >= limits.manage_reading_calls as usize;
-    let still = limits.manage_idle_minutes > 0 && idle >= limits.manage_idle_minutes;
-    if reading {
-        line.push_str(&env.data.text("manage_flag_reading", &[("since", &since_edit.to_string())]));
+    drop(ok);
+    drop(run);
+    Some((entries, Measured { steps, edits, since_edit, checks_since, idle, edited_at, files }))
+}
+
+/// A runner job's session (docs/RUNNER.md): MANAGE's flags go to the manager as
+/// `chatflow.manage.flags`, one entry per open agent, and nothing is done to the agents.
+async fn publish_flags(env: &RunEnv, work: &[OpenWork]) {
+    let mut agents = Vec::new();
+    for item in work {
+        let Some((entries, measured)) = measured(env, &item.agent, &crate::contract::commands(&item.task.contract)).await else { continue };
+        let (reading, still) = flags(env, measured.since_edit, measured.idle);
+        let told_since_edit = entries.iter().rev().find(|entry| entry.kind == kinds::STEER).is_some_and(|told| told.ts_ms > measured.edited_at);
+        agents.push(ManageFlag { agent: item.agent.name.clone(), reading_calls: measured.since_edit as u32, idle_minutes: measured.idle, flagged: (reading || still) && !told_since_edit });
     }
-    if still {
-        line.push_str(&env.data.text("manage_flag_idle", &[("idle", &idle.to_string())]));
-    }
-    // Told something it has not acted on with an edit yet: it is working on that.
-    let told_since_edit = told.is_some_and(|told| told.ts_ms > edited_at);
-    // Both ways: what the session last told it, and what it last said (its answer, its question).
-    if let Some(told) = told {
-        let ago = cc_protocol::contracts::now_ms().saturating_sub(told.ts_ms) / 60_000;
-        line.push_str(&env.data.text("manage_told", &[("ago", &ago.to_string()), ("text", &short(str_field(&told.data, "text"), SAID_CHARS))]));
-    }
-    if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
-        line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
-    }
-    (line, (reading || still) && !told_since_edit)
+    let flags = ManageFlags { session_id: env.session_id.clone(), agents };
+    env.host.ctx().publish(chatflow_topics::MANAGE_FLAGS, serde_json::to_value(&flags).unwrap_or(Value::Null));
 }
 
 /// Characters of an agent's last words, and of the session's last message to it, shown per agent.
@@ -273,6 +313,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     if work.is_empty() {
         let text = env.data.text("manage_none", &[]);
         return journal.note(&env.run_id, "managed", &text, true).await.map(|_| ());
+    }
+    // One supervisor, not two: a runner job's manager gets the flags and decides.
+    if crate::runner::on(&entries) {
+        publish_flags(env, &work).await;
+        let text = env.data.text("managed_flags", &[]);
+        return journal.note(&env.run_id, "managed", &text, false).await.map(|_| ());
     }
     // A routine check-in (not an agent's need or block) when no agent needs the session: nothing to
     // decide, so no model call (seen: 52 check-ins in four hours, most of them telling a working

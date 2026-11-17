@@ -17,3 +17,4 @@ pub mod repo;
 pub mod service;
 pub mod status;
 pub mod watch;
+pub mod work;

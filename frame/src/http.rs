@@ -50,6 +50,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "pid": std::process::id(),
         "uptime_ms": state.started.elapsed().as_millis() as u64,
         "headless": state.frame.headless,
+        "runner": state.frame.runner,
         "ui_running": state.frame.shell.pid() != 0,
     }))
 }

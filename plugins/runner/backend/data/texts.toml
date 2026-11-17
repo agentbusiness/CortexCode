@@ -1,0 +1,22 @@
+# Every short text of cc-runner. `{name}` is filled in by the host; each text must keep exactly the
+# placeholders it is shipped with (checked on load). None of these is read by the model: they are
+# the manager's (the Watch pane's "now" line, refusals).
+
+# ---- "now": the builder's last tool call in plain words --------------------------------------
+now_edit = "editing {target}"
+now_read = "reading {target}"
+now_run = "running {target}"
+now_search = "searching for {target}"
+now_other = "{tool} {target}"
+now_model = "waiting for the model"
+now_approval = "waiting for an approval: {tool}"
+now_replan = "waiting for the answer on a new plan"
+now_plan = "preparing the next task"
+
+# ---- refusals ------------------------------------------------------------------------------------
+stale = "job {job} is at attempt {current}; attempt {attempt} was replaced"
+no_job = "no job {job}; runner.prepare makes one"
+not_running = "job {job} is not running"
+steer_approval = "job {job} waits on an approval; answer it first (a message now could be read as the answer)"
+no_mirror = "no mirror of {repo} on this runner yet; runner.prepare or runner.release makes it"
+dirty = "{files} file(s) changed since the last checkpoint; they are not part of any task's commit"

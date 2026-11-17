@@ -94,7 +94,10 @@ pub fn ensure_scratch(workspace: &Path) -> PathBuf {
     if workspace.join(".git").exists() {
         let ignore = workspace.join(".gitignore");
         let text = std::fs::read_to_string(&ignore).unwrap_or_default();
-        if !text.lines().any(|line| matches!(line.trim(), "tmp" | "tmp/" | "/tmp" | "/tmp/")) {
+        let listed = text.lines().any(|line| matches!(line.trim(), "tmp" | "tmp/" | "/tmp" | "/tmp/"));
+        // Ignored some other way (the repository's own exclude file): the file is left alone.
+        let ignored = listed || std::process::Command::new("git").arg("-C").arg(workspace).args(["check-ignore", "-q", "tmp/"]).status().is_ok_and(|status| status.success());
+        if !ignored {
             let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
             let _ = std::fs::write(&ignore, format!("{text}{separator}/tmp/\n"));
         }

@@ -6,7 +6,7 @@ use crate::git::{Cmd, Git};
 use crate::github::Github;
 use crate::repo::Repo;
 use cc_protocol::RpcError;
-use cc_protocol::contracts::vcs::{PrStatus, PushResult};
+use cc_protocol::contracts::vcs::{FetchResult, PrStatus, PushResult};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -45,20 +45,67 @@ const TOKEN_HELPER: &str =
 /// Whether the repository brings its own way to push to `remote`: a remote that is not plain
 /// github.com (an SSH alias, another host, a user in the URL), or credential, SSH or URL settings
 /// in the repository's own config or in a file included for it (an `includeIf` for its folder).
-async fn own_setup(git: &Git, repo: &Repo, remote: &str) -> Result<bool, RpcError> {
-    let url = git.try_text(&repo.top, ["remote", "get-url", "--push", remote]).await?.unwrap_or_default();
+async fn own_setup(git: &Git, dir: &Path, remote: &str) -> Result<bool, RpcError> {
+    let url = git.try_text(dir, ["remote", "get-url", "--push", remote]).await?.unwrap_or_default();
     let url = url.trim();
     if !(url.starts_with("https://github.com/") || GITHUB_SSH.iter().any(|prefix| url.starts_with(prefix))) {
         return Ok(true);
     }
     const KEYS: &str = r"^(credential\..*|core\.sshcommand|url\..*)$";
-    let listed = |includes: &'static str| git.try_text(&repo.top, ["config", includes, "--show-scope", "--get-regexp", KEYS]);
+    let listed = |includes: &'static str| git.try_text(dir, ["config", includes, "--show-scope", "--get-regexp", KEYS]);
     let with = listed("--includes").await?.unwrap_or_default();
     if with.lines().any(|line| line.starts_with("local\t") || line.starts_with("worktree\t")) {
         return Ok(true);
     }
     let without = listed("--no-includes").await?.unwrap_or_default();
     Ok(with.lines().count() > without.lines().count())
+}
+
+/// A git command in `dir` that talks to `remote` as a push does: the repository's own setup as it
+/// is; otherwise with the GitHub sign-in from Settings, when there is one (the token goes to git
+/// through the command's environment only); otherwise git's defaults. Also says whether the
+/// sign-in is used.
+pub(crate) async fn signed(git: &Git, github: &Github, dir: &Path, remote: &str) -> Result<(Cmd, Option<String>), RpcError> {
+    let token = if own_setup(git, dir, remote).await? { None } else { github.clone_token().await };
+    let mut cmd = git.cmd(dir);
+    if let Some(token) = &token {
+        // The empty helper drops every configured one, so nothing else answers or stores the token.
+        cmd = cmd.args(["-c", "credential.helper=", "-c", TOKEN_HELPER]).env("CORTEX_PUSH_TOKEN", token);
+        for prefix in GITHUB_SSH {
+            cmd = cmd.arg("-c").arg(format!("url.https://github.com/.insteadOf={prefix}"));
+        }
+    }
+    Ok((cmd, token))
+}
+
+/// Fetch `remote` into the repository at `dir` (a working tree or a bare repository), signed in
+/// as a push is.
+pub async fn fetch(git: &Git, github: &Github, dir: &Path, remote: Option<&str>, prune: bool) -> Result<FetchResult, RpcError> {
+    let remote = remote.unwrap_or("origin").to_owned();
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err(RpcError::invalid_params(format!("invalid remote `{remote}`")));
+    }
+    if git.try_text(dir, ["remote", "get-url", remote.as_str()]).await?.is_none() {
+        return Ok(FetchResult { ok: false, available: false, remote, detail: "no such remote in this repository".into() });
+    }
+    let (cmd, token) = signed(git, github, dir, &remote).await?;
+    let mut cmd = cmd.args(["fetch", "--quiet", "--tags"]);
+    if prune {
+        cmd = cmd.arg("--prune");
+    }
+    let output = match cmd.arg(remote.as_str()).detach().timeout(PUSH_TIMEOUT).output().await {
+        Ok(output) => output,
+        Err(error) => return Ok(FetchResult { ok: false, available: false, remote, detail: error.message }),
+    };
+    if output.success() {
+        return Ok(FetchResult { ok: true, available: true, remote, detail: String::new() });
+    }
+    let mut detail = output.stderr_text();
+    if token.is_some() {
+        detail.push_str("; this fetch used the GitHub sign-in from Settings: connect it again there if it has expired");
+    }
+    // git says which of the two it was only in words; a failed fetch changed nothing either way.
+    Ok(FetchResult { ok: false, available: false, remote, detail })
 }
 
 /// Push `branch` to `remote`. The repository's own setup pushes as it is; otherwise the GitHub
@@ -95,15 +142,7 @@ pub async fn push(git: &Git, github: &Github, repo: &Repo, remote: Option<&str>,
     let merge_key = format!("branch.{branch}.merge");
     let has_upstream = git.try_text(&repo.top, ["config", "--get", merge_key.as_str()]).await?.is_some();
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let token = if own_setup(git, repo, &remote).await? { None } else { github.clone_token().await };
-    let mut cmd = git.cmd(&repo.top);
-    if let Some(token) = &token {
-        // The empty helper drops every configured one, so nothing else answers or stores the token.
-        cmd = cmd.args(["-c", "credential.helper=", "-c", TOKEN_HELPER]).env("CORTEX_PUSH_TOKEN", token);
-        for prefix in GITHUB_SSH {
-            cmd = cmd.arg("-c").arg(format!("url.https://github.com/.insteadOf={prefix}"));
-        }
-    }
+    let (cmd, token) = signed(git, github, &repo.top, &remote).await?;
     let mut cmd = cmd.args(["push", "--porcelain"]);
     if !has_upstream {
         cmd = cmd.arg("--set-upstream");
