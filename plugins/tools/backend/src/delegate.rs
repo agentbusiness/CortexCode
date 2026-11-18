@@ -486,7 +486,7 @@ pub async fn start(commands: &Commands, host: &dyn Host, provider: &Provider, re
             }
             let when = when.join(", or when ");
             let line = format!(
-                "Started background job {id} in CortexTerm. You are woken when {when}. Its output so far, its state and the machine's numbers: read cmd://{id}. Stop it: `cx job kill {id}`.\n",
+                "Started background job {id} in CortexTerm. Its output so far, its state and the machine's numbers: read cmd://{id}. You are woken when {when}: go on with the task's other steps meanwhile.\n",
                 id = meta.id
             );
             Outcome::Started { line }

@@ -218,6 +218,22 @@ schema = "schemas/review.json"
 effort = "none"
 sampling = "decision"
 
+# When every task of a plan is done: is each thing the user asked shown done by the runs' output?
+# An ask that is not writes the tasks that meet it (within `replans`).
+[stage.ACCEPT]
+rules = "accept"
+schema = "schemas/accept.json"
+effort = "none"
+sampling = "decision"
+
+# A message the user wrote during a plan task: a question about progress is answered by the host
+# and the task goes on; anything else writes the tasks still to do again.
+[stage.STEER]
+rules = "steer"
+schema = "schemas/steer.json"
+effort = "none"
+sampling = "decision"
+
 [stage.CHECKS]
 rules = ["checks", "check_rules"]
 schema = "schemas/checks.json"

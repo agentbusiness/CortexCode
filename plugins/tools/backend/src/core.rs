@@ -116,6 +116,9 @@ pub struct Core {
     /// Per session: the last refused call (tool and arguments) and how it was refused, so the same
     /// call refused again the same way says so.
     pub refused: Mutex<HashMap<String, (String, String)>>,
+    /// Per session and artifact of a running job: how many bytes of its output the session's last
+    /// read saw, so a read that would show nothing new says so in one line.
+    pub job_reads: Mutex<HashMap<(String, String), usize>>,
     /// Where the `cx` binary was found (linked into `<home>/bin`).
     pub cx: Option<PathBuf>,
     /// The write sandbox's machine-wide policy.
@@ -212,6 +215,7 @@ impl Core {
             created: Mutex::new(HashMap::new()),
             originals: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashMap::new()),
+            job_reads: Mutex::new(HashMap::new()),
             sandbox: crate::sandbox::Policy::new(home, data_dir, &config.sandbox_write_paths),
             config,
             cx,

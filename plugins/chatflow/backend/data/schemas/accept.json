@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "properties": {
+    "asks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ask": {
+            "enum": [
+              "@asks"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "maxLength": 600
+          },
+          "met": {
+            "enum": [
+              "yes",
+              "no",
+              "unshown"
+            ]
+          },
+          "missing": {
+            "type": "string",
+            "maxLength": 600
+          }
+        },
+        "required": [
+          "ask",
+          "evidence",
+          "met",
+          "missing"
+        ],
+        "additionalProperties": false
+      },
+      "maxItems": 40
+    }
+  },
+  "required": [
+    "asks"
+  ],
+  "additionalProperties": false
+}

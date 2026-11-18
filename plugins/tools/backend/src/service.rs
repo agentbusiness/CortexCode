@@ -375,12 +375,32 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             // The card's buttons: `mode` "stop" (SIGTERM) or "kill" (SIGKILL now), and the job's
             // output ends saying the user did it; without a mode (`cx job kill`) it escalates.
             let mode = params.get("mode").and_then(Value::as_str).map(str::to_owned);
+            let from_command = params.get("_command_session").is_some();
             let params: JobParams = parse_params(params)?;
             // A job CortexTerm runs is stopped there.
             if let Some(stopped) = crate::delegate::stop(&core.delegated, host.as_ref(), &params.job_id).await {
                 stopped.map_err(RpcError::internal)?;
                 let meta = core.delegated.get(&params.job_id).unwrap_or_default();
                 return to_value(&delegated_status(&meta));
+            }
+            // A job the model asked to be woken by a line of (`wake.pattern`, not seen yet) carries
+            // the result its work waits for: a command in the model's shell does not stop it (seen:
+            // the full run the user asked for, killed to free memory for a unit-test run). Running
+            // the same command again still replaces it, and the user's card still stops it.
+            if from_command
+                && let Some(meta) = core.jobs.list(None).into_iter().find(|meta| meta.job_id == params.job_id)
+                && meta.state == "running"
+                && meta.wake.pattern.is_some()
+                && !meta.wake_published
+            {
+                return Err(RpcError::new(
+                    cc_protocol::codes::CONFLICT,
+                    format!(
+                        "{} carries the result you are waiting for (you are woken when its output matches /{}/), so it keeps running. To run it with changed code, start the same command again: that replaces it. Go on with the task's other steps.",
+                        meta.job_id,
+                        meta.wake.pattern.unwrap_or_default()
+                    ),
+                ));
             }
             let found = match mode.as_deref() {
                 Some("stop") => core.jobs.stop(&params.job_id, "[stopped by the user]", crate::jobs::StopMode::Term).await,

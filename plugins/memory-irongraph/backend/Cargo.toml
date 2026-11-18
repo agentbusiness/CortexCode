@@ -24,7 +24,7 @@ cc-protocol = { path = "../../../protocol", features = ["hashline", "lang", "mem
 cc-lang-kit = { path = "../../../lang-kit" }
 # The models folder the Cortex apps share (~/.cortex-models), where the embedding model lives.
 cc-shared-models = { path = "../../../shared-models" }
-irongraph-sdk = "=0.1.13"
+irongraph-sdk = "=0.1.14"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

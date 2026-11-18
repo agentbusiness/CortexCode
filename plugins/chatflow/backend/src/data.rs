@@ -56,6 +56,10 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/plan_fields.md", include_str!("../data/prompts/plan_fields.md")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
     ("prompts/manage.md", include_str!("../data/prompts/manage.md")),
+    ("prompts/accept.md", include_str!("../data/prompts/accept.md")),
+    ("prompts/steer.md", include_str!("../data/prompts/steer.md")),
+    ("schemas/accept.json", include_str!("../data/schemas/accept.json")),
+    ("schemas/steer.json", include_str!("../data/schemas/steer.json")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
     ("schemas/manage.json", include_str!("../data/schemas/manage.json")),
     ("schemas/router.json", include_str!("../data/schemas/router.json")),
@@ -73,7 +77,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE", "ACCEPT", "STEER"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -88,6 +92,8 @@ const SCHEMA_NEEDS: &[SchemaNeed] = &[
     ("PROCEDURE", &["name", "applicability", "steps", "useful"], Some(("useful", &["no", "yes"]))),
     ("REVIEW", &["found", "replan"], Some(("replan", &["no", "yes"]))),
     ("MANAGE", &["actions", "replan"], Some(("replan", &["no", "yes"]))),
+    ("ACCEPT", &["asks"], None),
+    ("STEER", &["kind"], Some(("kind", &["question", "change"]))),
 ];
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 

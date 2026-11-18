@@ -780,6 +780,13 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             // The user wrote during the task: the planner writes the tasks still to
                             // do (this one included) from what they ask now.
                             if outcome.outcome == "steered" {
+                                // A question about how the work goes is answered from the plan and
+                                // the task goes on (seen: "how is it going?" rewrote the plan, and
+                                // the new first task was a unit test the user never asked for).
+                                if steer_is_question(env, journal, &plan, n, &outcome.summary).await {
+                                    answer_progress(env, journal, &plan, n).await?;
+                                    continue;
+                                }
                                 set_stage(env, journal, status_seq, "plan").await?;
                                 write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: outcome.outcome.clone(), summary: outcome.summary.clone() }).await?;
                                 continue;
@@ -838,6 +845,22 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 // task's reads, edits and test logs, the prompt grown past 190k).
                                 crate::fit::fold_steps(journal).await?;
                                 continue;
+                            }
+                            // The last task ended well: before the work is reported, each ask of
+                            // the user is checked against what the work's runs printed, and an ask
+                            // not shown met writes the tasks that meet it (seen: a search system
+                            // reported done with its OCR and models switched off, scored against
+                            // the answer key it read its answers from).
+                            if last
+                                && outcome_name == "done"
+                                && plan.replans < env.data.limits.replans
+                                && let Some(unmet) = accept_plan(env, journal, plan_seq).await
+                            {
+                                set_stage(env, journal, status_seq, "plan").await?;
+                                if write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: "unmet".into(), summary: unmet }).await? {
+                                    crate::fit::fold_steps(journal).await?;
+                                    continue;
+                                }
                             }
                             // A task that ended badly: the plan is written again from the first
                             // task not done (the done ones stay), a bounded number of times, and
@@ -1136,6 +1159,216 @@ async fn review_plan(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: 
     }
 }
 
+/// STEER: whether what the user wrote during task `n` only asks how the work goes. A decision that
+/// cannot be read counts as asking something of the work (the planner hears the words).
+async fn steer_is_question(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: u32, text: &str) -> bool {
+    let Some(shape) = env.data.shape("STEER").cloned() else { return false };
+    let title = plan.tasks.get(n as usize - 1).map(|task| task.title.clone()).unwrap_or_default();
+    let live = env.data.text("steer_live", &[("n", &n.to_string()), ("title", &title), ("text", text.trim())]);
+    match decide_json::<schemas::Steer>(env, journal, "STEER", &shape, &live).await {
+        Ok((steer, _)) => steer.kind.trim() == "question",
+        Err(error) => {
+            tracing::warn!(%error, "the STEER decision could not be read; the plan is written again");
+            false
+        }
+    }
+}
+
+/// The plan's progress for the user (a transcript note, no model call): the running task, the
+/// done ones, the session's running background jobs with the end of their output. The model hears
+/// that the user has it and goes on with the task.
+async fn answer_progress(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: u32) -> Result<(), RpcError> {
+    let title = plan.tasks.get(n as usize - 1).map(|task| task.title.clone()).unwrap_or_default();
+    let done: Vec<String> = plan
+        .steps_done
+        .iter()
+        .filter(|step| step.outcome == "done")
+        .filter_map(|step| plan.tasks.get(step.n as usize - 1).map(|task| task.title.clone()))
+        .collect();
+    let done = if done.is_empty() { env.data.text("progress_done_none", &[]) } else { done.join("; ") };
+    let jobs: String = match env.host.get::<cc_protocol::contracts::tools::JobListResult>(tools_methods::JOB_LIST, json!({"session_id": env.session_id})).await {
+        Ok(list) => list
+            .jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .map(|job| {
+                let tail = job.output_tail.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+                env.data.text("progress_job", &[("job_id", &job.job_id), ("tail", tail)])
+            })
+            .collect(),
+        Err(_) => String::new(),
+    };
+    let answer = env.data.text("progress_answer", &[("n", &n.to_string()), ("count", &plan.tasks.len().to_string()), ("title", &title), ("done", &done), ("jobs", &jobs)]);
+    journal.note(&env.run_id, "progress", &answer, false).await?;
+    journal.note(&env.run_id, "progress_go_on", &env.data.text("progress_go_on", &[("n", &n.to_string()), ("title", &title)]), true).await?;
+    Ok(())
+}
+
+/// What the user asked of the work, in their words: from the message that set the direction
+/// ([`direction`]; none: the message that started this run) to now, each message's asks as ROUTE
+/// quoted them (the whole message when it has none) and every message written during the work.
+/// Questions about progress (STATUS) and the Implement button's message ask nothing of the work.
+fn work_asks(entries: &[JournalEntry], run_id: &str) -> Vec<String> {
+    let mut direction_seq: Option<u64> = None;
+    for route in entries.iter().filter(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route") {
+        let set = route.data.get("detail").map(|detail| str_field(detail, "direction").to_owned()).unwrap_or_default();
+        if set == "states" || set == "approves" {
+            direction_seq = entries.iter().filter(|entry| entry.seq < route.seq && entry.kind == kinds::USER_MESSAGE).last().map(|message| message.seq);
+        } else if route.data.get("drops").and_then(Value::as_bool) == Some(true) {
+            direction_seq = None;
+        }
+    }
+    let run_seq = entries.iter().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == run_id).map(|message| message.seq);
+    let Some(start) = direction_seq.or(run_seq) else { return Vec::new() };
+    let mut asks: Vec<String> = Vec::new();
+    let mut add = |text: &str| {
+        let text = text.trim();
+        if !text.is_empty() && !asks.iter().any(|ask| ask == text) {
+            asks.push(text.to_owned());
+        }
+    };
+    for entry in entries.iter().filter(|entry| entry.seq >= start) {
+        if entry.kind == kinds::STEER {
+            add(str_field(&entry.data, "text"));
+            continue;
+        }
+        if entry.kind != kinds::USER_MESSAGE || entry.data.get("implement").is_some() {
+            continue;
+        }
+        let message_run = str_field(&entry.data, "run_id");
+        let route = entries.iter().find(|route| route.kind == kinds::ROUTE && str_field(&route.data, "stage") == "route" && str_field(&route.data, "run_id") == message_run);
+        let detail = route.and_then(|route| route.data.get("detail"));
+        if detail.is_some_and(|detail| str_field(detail, "route") == "STATUS") {
+            continue;
+        }
+        let quoted: Vec<schemas::Ask> = detail.and_then(|detail| detail.get("asks")).cloned().and_then(|asks| serde_json::from_value(asks).ok()).unwrap_or_default();
+        let quoted: Vec<&str> = quoted.iter().map(|ask| ask.quote.trim()).filter(|quote| !quote.is_empty()).collect();
+        if quoted.is_empty() {
+            add(str_field(&entry.data, "text"));
+        } else {
+            quoted.into_iter().for_each(&mut add);
+        }
+    }
+    asks
+}
+
+/// What the work's runs printed, for ACCEPT: the newest result of each command this run's `run`
+/// calls ran (not the plan's checks, not test runs, not a background start), oldest first, and the
+/// background jobs' results. The newest eight: the ones the work ended with.
+fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str, checks: &HashSet<String>) -> Vec<String> {
+    let Some(first) = entries.iter().find(|entry| str_field(&entry.data, "run_id") == run_id).map(|entry| entry.seq) else { return Vec::new() };
+    let results: HashMap<&str, &JournalEntry> =
+        entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && str_field(&entry.data, "run_id") == run_id).map(|entry| (str_field(&entry.data, "call_id"), entry)).collect();
+    let mut runs: Vec<(String, String)> = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.seq >= first) {
+        if entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "job" {
+            let text = str_field(&entry.data, "text").trim();
+            if !text.is_empty() {
+                runs.push((format!("job:{}", entry.seq), data.text("accept_job", &[("text", text)])));
+            }
+            continue;
+        }
+        if entry.kind != kinds::TOOL_CALL || str_field(&entry.data, "run_id") != run_id || str_field(&entry.data, "tool") != "run" {
+            continue;
+        }
+        let command = entry.data.get("args").map(|args| str_field(args, "command").trim().to_owned()).unwrap_or_default();
+        if command.is_empty() || checks.contains(&command) {
+            continue;
+        }
+        let Some(result) = results.get(str_field(&entry.data, "call_id")) else { continue };
+        let display = result.data.get("display").cloned().unwrap_or(Value::Null);
+        if display.get("tests").is_some_and(|tests| !tests.is_null()) || display.get("background").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let exit = display.get("exit_code").and_then(Value::as_i64).map(|code| code.to_string()).unwrap_or_else(|| "-".to_owned());
+        let output = str_field(&result.data, "output").trim_end();
+        runs.retain(|(key, _)| key != &command);
+        runs.push((command.clone(), data.text("accept_run", &[("command", &command), ("exit", &exit), ("output", output)])));
+    }
+    let skip = runs.len().saturating_sub(8);
+    runs.into_iter().skip(skip).map(|(_, text)| text).collect()
+}
+
+/// The host's checks as the newest verification of this run left them, one line each (`cargo
+/// test` passes / fails); empty when the run verified nothing.
+fn host_checks(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
+    let Some(first) = entries.iter().find(|entry| str_field(&entry.data, "run_id") == run_id).map(|entry| entry.seq) else { return String::new() };
+    let Some(report) = entries.iter().rev().filter(|entry| entry.seq >= first && entry.kind == kinds::VERIFICATION).find_map(|entry| entry.data.get("report")) else {
+        return String::new();
+    };
+    let specs: HashMap<&str, &str> = report
+        .get("contract")
+        .and_then(|contract| contract.get("checks"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|check| (str_field(check, "name"), str_field(check, "spec")))
+        .collect();
+    report
+        .get("checks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|check| {
+            let name = str_field(check, "name");
+            let command = specs.get(name).copied().unwrap_or(name);
+            let key = if check.get("ok").and_then(Value::as_bool) == Some(true) { "accept_check_passes" } else { "accept_check_fails" };
+            data.text(key, &[("command", command)])
+        })
+        .collect()
+}
+
+/// ACCEPT when every task of the plan at `plan_seq` is done: each ask of the user judged by what
+/// the work's runs printed. Some(what is not met yet, one line per ask) when an ask is not shown
+/// met; None when every ask is, when there is nothing to judge, or when the decision cannot be
+/// read (the work is reported as it is).
+async fn accept_plan(env: &RunEnv, journal: &mut Journal, plan_seq: u64) -> Option<String> {
+    let shape = env.data.shape("ACCEPT").cloned()?;
+    let entries = journal.entries_vec();
+    let plan = plan::at(&entries, plan_seq)?;
+    let asks = work_asks(&entries, &env.run_id);
+    if asks.is_empty() {
+        return None;
+    }
+    let numbers: Vec<String> = (1..=asks.len()).map(|number| number.to_string()).collect();
+    let shape = shape.filled(schemas::ASKS_PLACEHOLDER, &numbers, None);
+    let checks: HashSet<String> = plan.tasks.iter().flat_map(|task| task.checks.iter().map(|check| check.trim().to_owned())).collect();
+    let runs = project_runs(&env.data, &entries, &env.run_id, &checks);
+    let runs = if runs.is_empty() { env.data.text("accept_no_runs", &[]) } else { runs.join("\n") };
+    let mut files: Vec<String> = plan.steps_done.iter().flat_map(|step| step.changed_files.iter().cloned()).collect();
+    files.sort();
+    files.dedup();
+    let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
+    let list: String = asks.iter().enumerate().map(|(index, ask)| format!("{}. {}\n", index + 1, env.data.text("ask_line", &[("quote", ask)]))).collect();
+    let checks = host_checks(&env.data, &entries, &env.run_id);
+    let checks = if checks.is_empty() { env.data.text("accept_no_checks", &[]) } else { checks };
+    let live = env.data.text("accept_live", &[("asks", list.trim_end()), ("files", &files), ("checks", checks.trim_end()), ("runs", runs.trim_end())]);
+    match decide_json::<schemas::Accept>(env, journal, "ACCEPT", &shape, &live).await {
+        Ok((accept, _)) => {
+            let unmet: String = accept
+                .asks
+                .iter()
+                .filter(|judged| matches!(judged.met.trim(), "no" | "unshown") && !judged.missing.trim().is_empty())
+                .filter_map(|judged| {
+                    let quote = asks.get(judged.ask.trim().parse::<usize>().ok()?.checked_sub(1)?)?;
+                    let evidence = judged.evidence.trim();
+                    let evidence = if evidence.is_empty() { String::new() } else { env.data.text("accept_unmet_evidence", &[("evidence", evidence)]) };
+                    Some(env.data.text("accept_unmet_item", &[("quote", quote), ("missing", judged.missing.trim()), ("evidence", &evidence)]))
+                })
+                .collect();
+            if unmet.is_empty() {
+                return None;
+            }
+            let _ = journal.note(&env.run_id, "accept", &env.data.text("accept_note", &[("unmet", unmet.trim_end())]), false).await;
+            Some(unmet.trim_end().to_owned())
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the ACCEPT decision could not be read; the work is reported as it is");
+            None
+        }
+    }
+}
+
 fn decide_routes(full: Shape, route: &str) -> Shape {
     match route {
         // A plan request ends in a plan: what is still unknown becomes a step of it, not a
@@ -1246,7 +1479,12 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let pending: Vec<plan::PlanTask> = match (&mode, &previous) {
         (PlanMode::Replan { .. }, Some(previous)) => {
             let done = previous.steps_done.iter().filter(|step| step.outcome == "done").count();
-            previous.tasks.iter().skip(done).cloned().collect()
+            // The host's own last task ("Make every check pass") is not the planner's to carry:
+            // it is made again from the checks of the tasks written now ([`final_check_task`]).
+            // Carried, it brought back checks the user had said to drop (seen: `cargo test` back
+            // after "I don't care about unit tests", and the run spent itself on a test again).
+            let fix_title = env.data.text("baseline_task_title", &[]);
+            previous.tasks.iter().skip(done).filter(|task| task.title != fix_title).cloned().collect()
         }
         _ => Vec::new(),
     };
@@ -1275,6 +1513,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             let key = match outcome.as_str() {
                 "done" => "plan_revise_live",
                 "steered" => "plan_steer_live",
+                "unmet" => "plan_unmet_live",
                 _ => "plan_replan_live",
             };
             joined(&[
@@ -1365,6 +1604,9 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         diff.tasks_restored = restored;
         made.diff = Some(diff);
     }
+    if matches!(mode, PlanMode::Replan { .. }) {
+        final_check_task(env, journal, &mut made);
+    }
     made.replaces = open_work.iter().filter(|item| output.replaces.contains(&item.label())).map(|item| item.task.id.clone()).collect();
     // A runner job's plan is the manager's: a replan is offered to it and written only when it
     // says so.
@@ -1385,6 +1627,49 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         cancel_replaced_tasks(env, previous, &made).await;
     }
     Ok(true)
+}
+
+/// A replanned plan's last task, made again by the host: every check the tasks still to do pick,
+/// with what failed before any change, run until each passes. None when they pick no check (the
+/// user's word that the work is judged by its own runs, not by a test suite, holds).
+fn final_check_task(env: &RunEnv, journal: &Journal, made: &mut plan::Plan) {
+    let fix_title = env.data.text("baseline_task_title", &[]);
+    let kept = made.steps_done.len();
+    // The planner's copy of it, written last, gives way to the host's.
+    while made.tasks.len() > kept && made.tasks.last().is_some_and(|task| task.title == fix_title) {
+        made.tasks.pop();
+    }
+    let open: Vec<&plan::PlanTask> = made.tasks.iter().skip(kept).collect();
+    if open.is_empty() {
+        return;
+    }
+    let failures = crate::checks::baseline_failures(journal, &env.run_id);
+    let mut every_check: Vec<String> = Vec::new();
+    for check in open.iter().flat_map(|task| &task.checks).chain(failures.iter().map(|(command, _)| command)) {
+        if !every_check.contains(check) {
+            every_check.push(check.clone());
+        }
+    }
+    if every_check.is_empty() {
+        return;
+    }
+    let n = made.tasks.len() as u32 + 1;
+    let brief = if failures.is_empty() {
+        env.data.text("final_task_brief", &[("checks", &every_check.iter().map(|command| format!("- `{command}`\n")).collect::<String>())])
+    } else {
+        let lines: String = failures
+            .iter()
+            .map(|(command, tests)| {
+                let tests = match tests {
+                    Some(names) if !names.is_empty() => names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "),
+                    _ => env.data.text("baseline_task_unknown", &[]),
+                };
+                env.data.text("baseline_task_failure", &[("command", command), ("tests", &tests)])
+            })
+            .collect();
+        env.data.text("baseline_task_brief", &[("failures", &lines)])
+    };
+    made.tasks.push(plan::PlanTask { n, title: fix_title, brief, checks: every_check, depends_on: ((kept as u32 + 1)..n).collect(), ..Default::default() });
 }
 
 /// The tasks earlier plans of this conversation made that are done now, each once: its title and

@@ -64,6 +64,9 @@ pub const OPEN_WORK_PLACEHOLDER: &str = "@open_work";
 /// again (a task's `from`, the plan's `dropped`): each one is carried on or dropped with a reason;
 /// a fresh plan has none, which removes both properties.
 pub const PENDING_PLACEHOLDER: &str = "@pending";
+/// Placeholder of an enum of the numbers of the user's asks ACCEPT judges ("1" .. the asks shown):
+/// an entry can only be about an ask the host showed.
+pub const ASKS_PLACEHOLDER: &str = "@asks";
 
 impl Shape {
     /// The top-level properties written as free text (a plain string, gated or not), in order:
@@ -505,6 +508,32 @@ pub struct Review {
     pub found: String,
     #[serde(default)]
     pub replan: String,
+}
+
+/// ACCEPT: when every task of a plan is done, each ask of the user judged by what the runs printed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Accept {
+    #[serde(default)]
+    pub asks: Vec<AcceptAsk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AcceptAsk {
+    #[serde(default)]
+    pub ask: String,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub met: String,
+    #[serde(default)]
+    pub missing: String,
+}
+
+/// STEER: what a message the user wrote during a plan task asks for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Steer {
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// MANAGE: what happens to a session's background agents.

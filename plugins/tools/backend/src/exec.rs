@@ -288,6 +288,27 @@ pub async fn read_target(
     if let Some(rest) = target.strip_prefix("artifact://") {
         let (id, suffix) = split_path_range(rest);
         let range = range.map(str::to_owned).or(suffix);
+        // A running job's output read again with nothing new in it: one line instead of the same
+        // output again (seen: ten reads of one job in six minutes, each the same line).
+        let session_id = session.context.session_id.clone();
+        let running = core.jobs.list(Some(session_id.as_str())).into_iter().find(|job| job.artifact == id && job.state == "running");
+        if let Some(job) = &running
+            && range.is_none()
+            && let Ok(bytes) = core.artifacts.read(&id)
+        {
+            let key = (session_id.clone(), id.clone());
+            let seen = core.job_reads.lock().ok().and_then(|reads| reads.get(&key).copied());
+            if let Ok(mut reads) = core.job_reads.lock() {
+                reads.insert(key, bytes.len());
+            }
+            if seen == Some(bytes.len()) {
+                let minutes = util::now_ms().saturating_sub(job.started_ms) / 60_000;
+                return Out::ok(format!(
+                    "{} has printed nothing new since your last read; it is still running ({minutes} min so far). Its result reaches you by itself: go on with the task's other steps.\n",
+                    job.job_id
+                ));
+            }
+        }
         return match core.artifacts.read(&id) {
             Ok(bytes) => match artifacts::render_range(&bytes, &id, range.as_deref(), core.config.read.outline_lines) {
                 Ok(text) => {
@@ -2173,7 +2194,9 @@ fn started_line(job_id: &str, artifact: &str, wake: &Wake) -> String {
             format!("{}, or when {last}", when.join(", when "))
         }
     };
-    format!("Started background job {job_id}. You are woken when {when}. Its output so far: read artifact://{artifact}. Stop it: `cx job kill {job_id}`.\n")
+    // The last sentence is the next step: going on with the task, not stopping the job (seen: a
+    // full run the user asked for, killed by the model to make room for a test run).
+    format!("Started background job {job_id}. Its output so far: read artifact://{artifact}. You are woken when {when}: go on with the task's other steps meanwhile.\n")
 }
 
 // ---------------------------------------------------------------------------------------------

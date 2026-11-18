@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "kind": {
+      "enum": [
+        "question",
+        "change"
+      ]
+    }
+  },
+  "required": [
+    "kind"
+  ],
+  "additionalProperties": false
+}

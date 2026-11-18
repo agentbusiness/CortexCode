@@ -27,6 +27,9 @@ pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, se
     if let Ok(mut originals) = core.originals.lock() {
         originals.remove(session_id);
     }
+    if let Ok(mut job_reads) = core.job_reads.lock() {
+        job_reads.retain(|(session, _), _| session != session_id);
+    }
     if !workspace.is_dir() {
         return removed;
     }

@@ -1,8 +1,9 @@
 //! The baseline check (`tools.tests.baseline`): a session's test command run once more on the code
 //! as it was before its running turn changed it. Tests that pass there too do not check the change
 //! (seen: tests written for the code passed on wrong code, nested tests never ran, and the fix was
-//! taken as done). Each code file the turn's `edit`s changed is put back as it was, test files stay
-//! as they are now, the command runs in a one-off shell with the session's environment, and every
+//! taken as done). Each code file the turn's `edit`s changed is put back as it was, test files and
+//! the tests a code file keeps at its end (Rust's `#[cfg(test)]` module) stay as they are now, a
+//! turn that changed only tests is not checked, the command runs in a one-off shell with the session's environment, and every
 //! file is restored, also when the run fails or is cancelled.
 
 use crate::core::Core;
@@ -74,6 +75,43 @@ fn changed_code(core: &Core, session_id: &str, workspace: &Path) -> Vec<(PathBuf
         .collect()
 }
 
+/// The line that opens a code file's own tests, for languages that keep them in the code file
+/// (Rust's `#[cfg(test)]` module at the end of the file).
+const INLINE_TEST_MARKERS: &[&str] = &["#[cfg(test)]"];
+
+/// Where a file's own tests start: a top-level marker line whose block runs to the end of the file
+/// (its braces balance and it ends with `}`). None when the file keeps no tests at its end.
+fn inline_tests_at(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if INLINE_TEST_MARKERS.iter().any(|marker| line.trim_end() == *marker) {
+            let tail = &text[offset..];
+            let opened = tail.matches('{').count();
+            if opened > 0 && opened == tail.matches('}').count() && tail.trim_end().ends_with('}') {
+                return Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// A code file as it was before the turn, with the tests it holds now: the tests a turn wrote
+/// inside a code file run against the old code too (seen: a Rust test rewritten twelve times,
+/// because putting the file back also put its old test back, which passed on the old code).
+/// Unchanged when the file holds no tests at its end now.
+fn with_current_tests(before: &str, now: &str) -> String {
+    let Some(tests) = inline_tests_at(now) else { return before.to_owned() };
+    let code = match inline_tests_at(before) {
+        Some(start) => &before[..start],
+        None => before,
+    };
+    let mut spliced = code.trim_end().to_owned();
+    spliced.push_str("\n\n");
+    spliced.push_str(&now[tests..]);
+    spliced
+}
+
 /// `tools.tests.baseline`.
 pub async fn check(
     core: &Arc<Core>,
@@ -88,9 +126,21 @@ pub async fn check(
         return Err(RpcError::invalid_params("tools.tests.baseline needs session_id, workspace and command"));
     }
     let root = util::canonical_lenient(&util::expand_home(workspace));
-    let before = changed_code(core, session_id, &root);
+    let before: Vec<(PathBuf, Option<String>)> = changed_code(core, session_id, &root)
+        .into_iter()
+        .map(|(path, original)| {
+            let now = util::read_host_file(&path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            let original = match (original, &now) {
+                (Some(original), Some(now)) => Some(with_current_tests(&original, now)),
+                (original, _) => original,
+            };
+            (path, original)
+        })
+        // A file whose only change is its own tests is the same code before and after.
+        .filter(|(path, original)| original.as_deref().map(str::as_bytes) != util::read_host_file(path).ok().as_deref())
+        .collect();
     if before.is_empty() {
-        return Ok(json!({ "checked": false, "reason": "the turn changed no code file" }));
+        return Ok(json!({ "checked": false, "reason": "the turn changed no code file apart from its tests" }));
     }
     let context = crate::service::host_context(workspace, None, Some(session_id));
     let session = crate::exec::Session { workspace: root.clone(), context: &context, python_env: true };
