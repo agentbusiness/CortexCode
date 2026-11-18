@@ -12,7 +12,7 @@ use shoji::traits::backend::chat_token::TokenStreamMetrics;
 use crate::engine::language_model::grammar::Grammar;
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable, Context, CpuBuffer, GlobalBufferCpuGpu,
+        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable, Context, CpuBuffer, GlobalBufferCpuGpu, GpuBuffer,
         TimestampSpan,
         capture_matcher::{CAPTURE_MATCHER, CaptureMatcherSpan},
         gpu_types::trie::TrieNode as GpuTrieNode,
@@ -275,7 +275,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .map_err(LanguageModelStreamError::Backend)?;
 
                 let input_flat_trie_nodes = input_flat_trie.token_subtrie_ranges().collect::<Box<[GpuTrieNode]>>();
-                let batch_dim = BatchTopology::new(&input_flat_trie_nodes, true);
+                let batch_dim = BatchTopology::new(input_flat_trie_nodes, true);
 
                 // CortexCode patch P7: this chunk's image rows and positions.
                 let chunk_range = chunk_offset..chunk_offset + input_chunk.len();
@@ -683,7 +683,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
 
         let scratch_token_ids;
         let mut constant_token_ids = None;
-        let token_ids: &dyn Buffer<Backend = B> = if let Some(chain_copy) = chain_copy.as_deref() {
+        let token_ids: &dyn GpuBuffer<Backend = B> = if let Some(chain_copy) = chain_copy.as_deref() {
             let mut token_ids = command_buffer
                 .allocate_scratch(DataType::U32.size_in_bytes())
                 .map_err(LanguageModelStreamError::Backend)?;
@@ -701,7 +701,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
         };
 
         let input_flat_trie_nodes = input_flat_trie.token_subtrie_ranges().collect::<Box<[GpuTrieNode]>>();
-        let batch_dim = BatchTopology::new(&input_flat_trie_nodes, full_accept);
+        let batch_dim = BatchTopology::new(input_flat_trie_nodes, full_accept);
 
         self.model_state
             .transformer_state

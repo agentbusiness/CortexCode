@@ -174,7 +174,7 @@ impl<B: Backend> LanguageModel<B> {
         &self,
         token_ids: &[u64],
     ) -> Result<Vec<u16>, String> {
-        use crate::backends::common::{Buffer, BufferRef, CommandBufferEncoding, CommandBufferExecutable, CommandBufferPending};
+        use crate::backends::common::{Buffer, CommandBufferEncoding, CommandBufferExecutable, CommandBufferPending};
         let ids = token_ids.iter().map(|id| *id as u32).collect::<Box<[u32]>>();
         let mut command_buffer =
             self.engine.context.create_command_buffer(Some("token embeddings"), None).map_err(|error| error.to_string())?;

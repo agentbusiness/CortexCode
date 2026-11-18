@@ -181,9 +181,14 @@ fn inside(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+/// The SHA-256 of `bytes` as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Store `bytes` content-addressed in the attachment area; returns the path and the hash.
 pub fn store(home: &Path, bytes: &[u8], extension: &str) -> Result<(PathBuf, String), RpcError> {
-    let sha = format!("{:x}", Sha256::digest(bytes));
+    let sha = sha256_hex(bytes);
     let dir = home.join(AREA);
     std::fs::create_dir_all(&dir).map_err(|error| RpcError::internal(format!("cannot create {}: {error}", dir.display())))?;
     let path = dir.join(format!("{sha}.{extension}"));
@@ -293,7 +298,7 @@ pub fn put(home: &Path, roots: &[PathBuf], params: AttachmentPutParams) -> Resul
                 // so an image can be cached by content; never copied).
                 let small = metadata.len() <= limits::MAX_ATTACHMENT_BYTES;
                 let bytes = if small { std::fs::read(&canonical).ok() } else { None };
-                let sha256 = bytes.as_deref().map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                let sha256 = bytes.as_deref().map(|bytes| sha256_hex(bytes));
                 let size = if kind == attachment_kinds::IMAGE {
                     bytes.as_deref().and_then(image_size).or_else(|| read_head(&canonical).and_then(|head| image_size(&head)))
                 } else {
@@ -499,7 +504,7 @@ pub fn check(ds: &Dataset, attachments: Vec<Attachment>) -> Result<Vec<Attachmen
                     attachment.preview = Some(preview);
                 }
                 if attachment.kind == attachment_kinds::IMAGE && attachment.sha256.is_none() && metadata.len() <= limits::MAX_ATTACHMENT_BYTES {
-                    attachment.sha256 = std::fs::read(&path).ok().map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
+                    attachment.sha256 = std::fs::read(&path).ok().map(|bytes| sha256_hex(&bytes));
                 }
                 if attachment.kind == attachment_kinds::IMAGE && (attachment.width.is_none() || attachment.height.is_none()) {
                     let size = read_head(&path).and_then(|head| image_size(&head));

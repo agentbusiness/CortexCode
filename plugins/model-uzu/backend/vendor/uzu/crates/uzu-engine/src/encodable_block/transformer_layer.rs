@@ -339,7 +339,7 @@ impl<B: Backend> Sublayer<B> {
             if self.legacy_scale_update {
                 self.scale_legacy(&mut hidden, row_count, command_buffer);
             }
-            Ok(hidden)
+            Ok::<_, TransformerLayerError<B>>(hidden)
         })?;
         if self.legacy_scale_residual {
             self.scale_legacy(&mut output, row_count, command_buffer);

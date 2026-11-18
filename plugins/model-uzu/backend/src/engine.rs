@@ -467,8 +467,16 @@ fn spawn_worker<B: Backend>(
         .spawn(move || {
             let started = Instant::now();
             let loaded = (|| -> Result<(Arc<Engine<B>>, LanguageModel<B>), String> {
-                let engine = block_on(Engine::<B>::new()).map_err(|error| format!("cannot start uzu: {error}"))?;
-                let model = block_on(engine.load_language_model(&config.model_dir))
+                // The load is driven by a tokio runtime, not `futures::executor::block_on`: while it
+                // prepares the weights' layout uzu calls `block_on` itself, and that one panics when
+                // it is entered from inside another `block_on` on the same thread.
+                let load = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("cannot start the load runtime: {error}"))?;
+                let engine = load.block_on(Engine::<B>::new()).map_err(|error| format!("cannot start uzu: {error}"))?;
+                let model = load
+                    .block_on(engine.load_language_model(&config.model_dir))
                     .map_err(|error| format!("cannot load {}: {error}", config.model_dir.display()))?;
                 Ok((engine, model))
             })();

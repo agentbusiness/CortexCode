@@ -220,6 +220,15 @@ These default off for new0.7 configs. Current pinned Qwen3.8/LFM2.5 configs have
 Additional kernel stages and upstream attention changes may alter floating-point results;
 no claim of bit-identical inference is made.
 
-The Cortex callers accept upstream's async language-model load API with their existing executor.
+The Cortex engine thread drives upstream's async language-model load with a current-thread tokio
+runtime: 0.7.1's load calls `futures::executor::block_on` itself (the matmul weight layouts,
+`backends/metal/kernel/matmul/layout/`), which panics inside another `block_on` on the same thread.
 No blanket synchronous language-load wrapper is added. All P1–P8 operations are retained;
 full local-difference inventories and the independent source review accompany the migration.
+
+### First build of the0.7.1 rebase — 2026-11-18
+
+The rebase compiled with these corrections: `FlatTrie::len` (test-only upstream) and
+`TrieNode::flat` (dropped upstream) are kept for the retained stream scheduler; `BatchTopology::new`
+takes its nodes by value; the decode pass's token ids are a `&dyn GpuBuffer`, as0.7.1's encoders
+take GPU buffers; the vision tower's GELU activations pass alpha 1.0 (it scales SiLU only).

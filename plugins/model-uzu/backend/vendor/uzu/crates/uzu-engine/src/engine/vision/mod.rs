@@ -549,6 +549,7 @@ impl<B: Backend> VisionModel<B> {
                 &mut inner,
                 count * config.intermediate_size,
                 ActivationType::GELUApprox,
+                1.0,
                 &mut command_buffer,
             );
             let mut out =
@@ -575,6 +576,7 @@ impl<B: Backend> VisionModel<B> {
             &mut inner,
             merged_rows * self.merger_fc1.output_dim,
             ActivationType::GELUExact,
+            1.0,
             &mut command_buffer,
         );
         let mut output = self

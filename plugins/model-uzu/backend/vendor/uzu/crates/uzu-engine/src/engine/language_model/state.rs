@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBufferEncoding, CommandBufferExecutable,
+        Backend, Buffer, CommandBufferEncoding, CommandBufferExecutable,
         CommandBufferPending, Context, CpuBuffer, GlobalBufferCpuGpu,
     },
     encodable_block::{
