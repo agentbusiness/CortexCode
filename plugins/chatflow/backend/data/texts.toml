@@ -94,7 +94,9 @@ repetition = "You repeated {what} and got the same result each time, so repeatin
 repetition_research = " When a fact is missing (how an API, a format or an error works), find out instead of guessing: `cx research deep <topic>` runs a cited research job, and the browser (`cx browser open <url>`) reads a page."
 repeated_text = "the same text"
 reread = "You read {what} already: it is above, unchanged. Work from that view."
-rerun = "You ran {what} again with no edit since its last run: nothing it checks changed, so its earlier output above is still the answer, whatever you filter. Your next step is an edit; when it is your passing check, reply with what changed."
+learn_recheck = "Not an episode: a lesson kept from earlier work, judged again because the rules above changed.\nThe lesson: {lesson}\nWrite `lesson` as it stands. `useful`: by the rules above, as if it were learned now."
+thought_cut = "Your thinking in the step above stopped at its budget. It had got this far:\n{thought}\nGo on from there, without working the task out again: take the step it was leading to."
+rerun = "You ran {what} again with no edit since its last run: nothing it checks changed, so its earlier output above is still the answer, whatever you filter. Your next step is an edit; when it is your passing check, run the software the change is about, then reply with what changed."
 # The same, before the task has changed any file: it is still finding out, so its step comes from the output it has (never "an edit" as what must come next).
 rerun_before_edit = "You ran {what} again with nothing changed since its last run: its earlier output above is still the answer, whatever you filter. Take your next step from that output: read what it names, or make the change it points to."
 checks_no_worse = "The checks fail only outside what this task changed, or where they failed before; the plan's last task makes every check pass: this task is done."
@@ -290,17 +292,19 @@ same_error = "This error came back {edits} more times after other attempts, so i
 same_error_test = "This test failed the same way {edits} more times after changes to the code. Read what the test checks, its input and its expected value, and the code it runs through, and find which of them is wrong before you change the code again."
 same_error_plain = "This error came back {edits} more times after other attempts, so its cause is not on the line it points at: it is in the declaration of a type or value that line uses. Read where it is declared, change it there, then run the check again."
 task_nudge = "Task {n} ({title}) ended without a single tool call, so nothing was done for it. Do the task now with your tools (edit, run, read)."
-plan_replan_live = "Task {n} ({title}) ended {outcome}: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), with the approach changed where the outcome shows it was wrong. Code that works and that no failure runs through is not changed. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task that runs or measures what the user asked for is dropped only when the user said so."
-plan_revise_live = "Task {n} ({title}) is done and showed that the tasks after it must change: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), changed to fit what was found. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task that runs or measures what the user asked for is dropped only when the user said so."
+plan_done_reports = "What the finished tasks reported (established by the work; the tasks still to do build on it, and a report is contradicted only by a new run that shows otherwise):\n{reports}"
+plan_done_report = "- Task {n} ({title}): {summary}\n"
+plan_replan_live = "Task {n} ({title}) ended {outcome}: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), with the approach changed where the outcome shows it was wrong. Code that works and that no failure runs through is not changed. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
+plan_revise_live = "Task {n} ({title}) is done and showed that the tasks after it must change: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), changed to fit what was found. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 failed_before = "\n{count} of the {of} tests `{command}` fails on failed in the host's check before this work began too: {names}."
 failed_before_earlier = "\n{count} of the {of} tests `{command}` fails on failed in the host's check at the start of an earlier request too: {names}."
 failed_before_more = "{names} and {more} more"
-plan_steer_live = "While task {n} ({title}) was running, the user wrote:\n{summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, task {n} included, as a new list numbered from 1 (`depends_on` uses these new numbers), so that together they do what the user asks now. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task that runs or measures what the user asked for is dropped only when the user said so."
+plan_steer_live = "While task {n} ({title}) was running, the user wrote:\n{summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, task {n} included, as a new list numbered from 1 (`depends_on` uses these new numbers), so that together they do what the user asks now. Their words go into a task's `rules` as they stand, copied, never narrowed to what is easier to show. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 review_live = "Task {n} ({title}) is done. The tasks still to do:\n{tasks}\nDo they still fit what the work so far showed?"
 review_task = "{n}. {title}: {brief}"
 plan_unmet_live = "Every task is done, but checked against what the user asked, this is not met yet:\n{summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks that meet it, as a new list numbered from 1 (`depends_on` uses these new numbers): the part to build or fix, then the run of the project, the way the user asked, that shows it done."
 # ACCEPT: the user's asks, then what the work's runs printed, right before the decision.
-accept_live = "The user asked:\n{asks}\n\nThe files the work changed: {files}\n\nThe host's checks:\n{checks}\n\nWhat the work's runs printed (the newest run of each command):\n{runs}\n\nFor each ask, does what is shown prove it done?"
+accept_live = "The user asked:\n{asks}\n\nThe files the work changed: {files}\n\nThe host's checks:\n{checks}\n\nWhat the work's runs printed (the newest run of each command; the checks and test runs are not here):\n{runs}\n\nFor each ask, does what is shown prove it done?"
 accept_check_passes = "- `{command}` passes\n"
 accept_check_fails = "- `{command}` fails\n"
 accept_no_checks = "(none)"
@@ -308,7 +312,8 @@ accept_run = "`{command}` (exit {exit}):\n{output}\n"
 # In place of a run's exit status when the tools plugin hid it (other commands ran after the check: the status was theirs).
 accept_exit_hidden = "not shown: other commands ran after it"
 accept_job = "{text}\n"
-accept_no_runs = "(no run of the project's own commands in this work)"
+accept_no_runs = "(nothing ran but the checks and tests: the software itself was not run in this work)"
+accept_found = "What the reviews between the tasks found (each is the work's own account; a gap named here that no later task closed is not done):\n{found}"
 accept_unmet_item = "- \"{quote}\": {missing}{evidence}\n"
 accept_unmet_evidence = " (the run shows: {evidence})"
 accept_note = "Checked against what you asked, this is not done yet, so the work goes on:\n{unmet}"
@@ -370,6 +375,8 @@ managed_nothing = "Nothing was changed: the agents go on as they are."
 # With no background work going on MANAGE is not a route at all (the grammar leaves it out); this
 # line says what such a message is instead (seen: "continue working on the tasks" after every agent
 # was stopped ended in a reply that could only say "I will").
+plan_restarted = "The same plan, started again where it stopped: its tasks not done start as they stand."
+route_stopped_plan = "No background work of this conversation is going on now. The plan was stopped before these of its tasks were done:\n{tasks}\nAn instruction to continue, resume or run them again, with nothing about the work changed, is IMPLEMENT: they start again as they stand. An instruction that changes the work is DO."
 route_no_open_work = "No background work of this conversation is going on now: nothing is there to stop or steer. An instruction to continue, resume or redo the work is DO."
 # A short message, shown again as the last thing before the decision (seen: "continue" routed by
 # the message before it, "as i said stop" by "so?").

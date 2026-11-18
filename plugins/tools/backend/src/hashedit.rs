@@ -628,7 +628,29 @@ fn reject(doc: &Doc, problems: Vec<Problem>, several: bool) -> Rejection {
 /// Strip copied hashline prefixes (`12:abcd|`) from replacement lines, but only when every non-empty
 /// line carries one and each prefix's tag verifies against the rest of its line (a mechanical
 /// proof that the prefix came from our own rendering, not from the file's content).
+///
+/// Also, line by line, a prefix the model copied in part or indented with the code (`    abcd|`,
+/// seen: a struct's fields each written as `ns5e|    pub doc_id: String`, refused as a syntax error):
+/// taken off only where its tag is the tag of the rest of that line, the same proof.
 pub fn strip_copied_prefixes(lines: &[String]) -> Option<Vec<String>> {
+    if let Some(whole) = strip_whole(lines) {
+        return Some(whole);
+    }
+    let mut stripped_any = false;
+    let out: Vec<String> = lines
+        .iter()
+        .map(|line| match copied_tag_rest(line) {
+            Some(rest) => {
+                stripped_any = true;
+                rest.to_owned()
+            }
+            None => line.clone(),
+        })
+        .collect();
+    stripped_any.then_some(out)
+}
+
+fn strip_whole(lines: &[String]) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(lines.len());
     let mut stripped_any = false;
     for line in lines {
@@ -647,6 +669,15 @@ pub fn strip_copied_prefixes(lines: &[String]) -> Option<Vec<String>> {
         out.push(rest.to_owned());
     }
     stripped_any.then_some(out)
+}
+
+/// The rest of `line` after a copied `[N:]tttt|` prefix (leading spaces allowed) whose tag is the
+/// tag of that rest; None when the line has no such prefix.
+fn copied_tag_rest(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let (head, rest) = trimmed.split_once('|')?;
+    let tag = head.rsplit_once(':').map(|(number, tag)| (number.chars().all(|c| c.is_ascii_digit()) && !number.is_empty()).then_some(tag)).unwrap_or(Some(head))?;
+    (tag.len() == hashline::TAG_LEN && hashline::tag(rest) == tag).then_some(rest)
 }
 
 /// Lines of new text given either as a string or as an array of strings.

@@ -24,6 +24,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// How long a member has to say what it shares.
+const SHARES_ASK: Duration = Duration::from_secs(3);
+
 #[derive(Default)]
 pub struct Services {
     /// `plugin_id@instance` -> what that plugin build shares.
@@ -165,22 +168,38 @@ impl Mesh {
         }
     }
 
-    /// A member's full declarations (asked of it when its card changed).
+    /// A member's declarations, read again when its card changed. A member that does not answer
+    /// within [`SHARES_ASK`] keeps the list read before (none the first time) until its card
+    /// changes again: one silent member must not hold every call of this computer (seen: each
+    /// command handed to CortexTerm waited about 125 s, the time a dead connection takes to close).
     async fn member_shares(&self, node: &str) -> Vec<Share> {
         let updated = lock(&self.cards).get(node).map(|card| card.updated_ms).unwrap_or(0);
-        if let Some((at, shares)) = lock(&self.services.theirs).get(node).cloned()
-            && at == updated
+        let known = lock(&self.services.theirs).get(node).cloned();
+        if let Some((at, shares)) = &known
+            && *at == updated
         {
-            return shares;
+            return shares.clone();
         }
-        let asked = self.call_member(node, "mesh.shares", json!({}), None, CancellationToken::new()).await;
-        let shares = asked.ok().and_then(|value| serde_json::from_value::<ShareList>(value).ok()).map(|list| list.shares).unwrap_or_default();
+        let asked = tokio::time::timeout(SHARES_ASK, self.call_member(node, "mesh.shares", json!({}), None, CancellationToken::new())).await;
+        let shares = match asked {
+            Ok(Ok(value)) => serde_json::from_value::<ShareList>(value).map(|list| list.shares).unwrap_or_default(),
+            _ => {
+                tracing::info!(node = %&node[..node.len().min(10)], "a member did not say what it shares in time; its earlier list is kept");
+                known.map(|(_, shares)| shares).unwrap_or_default()
+            }
+        };
         lock(&self.services.theirs).insert(node.to_owned(), (updated, shares.clone()));
         shares
     }
 
     /// Every service this computer and its members offer, and what a call from here may do there.
     pub async fn services(&self) -> ServicesResult {
+        self.services_of(None).await
+    }
+
+    /// The services of this computer and of its members, or of one member only (`only`): a call
+    /// to a named member asks nothing of the others. The members are asked at once, not in turn.
+    async fn services_of(&self, only: Option<&str>) -> ServicesResult {
         let me = self.me.hex();
         let mut out: Vec<OfferedService> = self
             .local_shares()
@@ -192,18 +211,18 @@ impl Mesh {
         let peers: Vec<(String, String, bool, bool)> = self
             .members()
             .into_values()
-            .filter(|member| member.node != me)
+            .filter(|member| member.node != me && only.is_none_or(|node| member.node == node))
             .map(|member| {
                 let offers = lock(&self.cards).get(&member.node).is_some_and(|card| !card.services.is_empty());
                 (member.node.clone(), member.name.clone(), member.local, offers)
             })
+            .filter(|(_, _, _, offers)| *offers)
             .collect();
-        for (node, name, local, offers) in peers {
-            if !offers {
-                continue;
-            }
-            let reachable = self.connection(&node).is_some();
-            let shares = if reachable { self.member_shares(&node).await } else { Vec::new() };
+        let asked = futures_util::future::join_all(peers.iter().map(|(node, ..)| async move {
+            if self.connection(node).is_some() { (true, self.member_shares(node).await) } else { (false, Vec::new()) }
+        }))
+        .await;
+        for ((node, name, local, _), (reachable, shares)) in peers.into_iter().zip(asked) {
             for share in shares {
                 // A peers-only service is for the apps that share it too.
                 if share.audience == Audience::Peers && !mine.contains(&share.service) {
@@ -225,7 +244,7 @@ impl Mesh {
         if !params.node.is_empty() {
             params.node = self.resolve_node(&params.node).ok_or_else(|| RpcError::not_found("no such member"))?;
         }
-        let offered = self.services().await.services;
+        let offered = self.services_of(Some(params.node.as_str()).filter(|node| !node.is_empty())).await.services;
         let fits = |offer: &&OfferedService| offer.share.service == service && offer.share.method(&params.method).is_some() && offer.reachable;
         let chosen = if params.node.is_empty() {
             // This app first, then another app on this machine; a read may go anywhere.

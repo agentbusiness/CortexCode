@@ -128,11 +128,18 @@ pub async fn settle(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
     Ok(true)
 }
 
+/// The context mark of the last task boundary ([`fold_steps`]).
+pub const TASKS_THROUGH: &str = "tasks_through";
+
 /// Fold the running turn's steps so far into their one note (layer 2 through the newest entry) and
 /// settle the conversation there. For a procedure a tool drives piece by piece (an audit of many
 /// units), each piece then starts from a short history: the pieces done are one note, the tool's
 /// state is on disk, and the engine reads the new piece's steps only, instead of compacting and
 /// re-reading the whole past every few pieces. True when the mark moved.
+///
+/// It is also a task boundary (`TASKS_THROUGH`): the finished task's file reads and the host's
+/// reads for it fold too. The next task finds its own code (seen: every task's reads kept for the
+/// rest of the plan, the prompt starting each task about 7k tokens larger, 77k by the eighth).
 pub async fn fold_steps(journal: &mut Journal) -> Result<bool, RpcError> {
     let Some((context_seq, current)) = journal.context_entry().map(|entry| (entry.seq, Marks::of(entry))) else { return Ok(false) };
     let newest = journal.last_seq();
@@ -140,6 +147,7 @@ pub async fn fold_steps(journal: &mut Journal) -> Result<bool, RpcError> {
         return Ok(false);
     }
     journal.set(context_seq, "steps_through", json!(newest)).await?;
+    journal.set(context_seq, TASKS_THROUGH, json!(newest)).await?;
     let settled_before = journal.context_entry().and_then(|entry| entry.data.get(SETTLED).and_then(Value::as_u64)).unwrap_or(0);
     if newest > settled_before {
         journal.set(context_seq, SETTLED, json!(newest)).await?;

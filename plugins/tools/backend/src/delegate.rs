@@ -42,6 +42,8 @@ const READ: Duration = Duration::from_secs(15);
 /// How long CortexTerm has to take a command handed to it: to answer, or to name its job (it does
 /// so right after its risk check and the start of the process, in milliseconds).
 const ACCEPT: Duration = Duration::from_secs(5);
+/// How long the answer of a foreground run may lag behind its end event before the event is taken.
+const ANSWER_AFTER_END: Duration = Duration::from_secs(2);
 /// Variables of a session's shell that are the machine's or the login shell's, not the session's.
 const NOT_SENT: &[&str] = &["PATH", "HOME", "SHELL", "PWD", "OLDPWD", "SHLVL", "TERM", "_", "USER", "LOGNAME", "TMPDIR", "VIRTUAL_ENV", "PS1", "PS2", "PS4"];
 
@@ -179,11 +181,30 @@ impl CommandMeta {
 pub struct Commands {
     metas: Mutex<HashMap<String, CommandMeta>>,
     graph: std::sync::Arc<crate::graph::Graph>,
+    /// The jobs whose end event came, until a foreground `run` takes its own.
+    ended: Mutex<HashMap<String, Job>>,
+    /// Counts end events, so a waiting `run` hears one that came at any moment.
+    ended_count: tokio::sync::watch::Sender<u64>,
 }
 
 impl Commands {
     pub fn new(graph: std::sync::Arc<crate::graph::Graph>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Commands { metas: Mutex::new(HashMap::new()), graph })
+        std::sync::Arc::new(Commands { metas: Mutex::new(HashMap::new()), graph, ended: Mutex::new(HashMap::new()), ended_count: tokio::sync::watch::Sender::new(0) })
+    }
+
+    fn heard_end(&self, id: &str, job: &Job) {
+        let mut ended = lock(&self.ended);
+        // Only the last few matter: a foreground run takes its own within seconds.
+        if ended.len() > 64 {
+            ended.clear();
+        }
+        ended.insert(id.to_owned(), job.clone());
+        drop(ended);
+        self.ended_count.send_modify(|count| *count += 1);
+    }
+
+    fn take_end(&self, id: &str) -> Option<Job> {
+        lock(&self.ended).remove(id)
     }
 
     fn keep(&self, meta: &CommandMeta) {
@@ -391,6 +412,13 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
     // there, so it does not run twice.
     let accept = tokio::time::sleep(ACCEPT);
     tokio::pin!(accept);
+    // Once the job is named, its end event ends the wait too: an answer that does not follow the
+    // end within `ANSWER_AFTER_END` is not waited for (the event carries the same job).
+    let mut ends = commands.ended_count.subscribe();
+    let mut heard: Option<Job> = None;
+    // Armed (reset) when the end event comes; until then it never fires (`heard` is None).
+    let after_end = tokio::time::sleep(ANSWER_AFTER_END);
+    tokio::pin!(after_end);
     let ran = loop {
         tokio::select! {
             ran = &mut call => break ran,
@@ -400,6 +428,26 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
                 tracing::info!("CortexTerm did not take the command in time; running here");
                 return Outcome::Elsewhere;
             }
+            changed = ends.changed(), if heard.is_none() => {
+                if changed.is_err() {
+                    continue;
+                }
+                if !meta.id.is_empty() && let Some(job) = commands.take_end(&meta.id) {
+                    heard = Some(job);
+                    after_end.as_mut().reset(tokio::time::Instant::now() + ANSWER_AFTER_END);
+                }
+            }
+            _ = &mut after_end, if heard.is_some() => {
+                tracing::info!(id = %meta.id, "CortexTerm's answer did not follow the command's end; its end event is the result");
+                taken.cancel();
+                let job = heard.take().unwrap_or_default();
+                if capture.total == 0 && !job.tail.is_empty() {
+                    let tail = format!("{}\n", job.tail.join("\n"));
+                    capture.push(tail.as_bytes());
+                    on_output(tail.as_bytes());
+                }
+                break Ran::Job(job);
+            }
             Some(item) = items_rx.recv() => match item.get("kind").and_then(Value::as_str) {
                 // The provider names the job first, so a run that is cut off can be found again.
                 Some("job") => {
@@ -407,6 +455,11 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
                         meta.id = id.to_owned();
                         meta.trace = item.get("trace").and_then(Value::as_str).unwrap_or("").trim_start_matches("trace://").to_owned();
                         commands.keep(&meta);
+                        // Its end event may have come before its name did.
+                        if heard.is_none() && let Some(job) = commands.take_end(&meta.id) {
+                            heard = Some(job);
+                            after_end.as_mut().reset(tokio::time::Instant::now() + ANSWER_AFTER_END);
+                        }
                     }
                 }
                 _ => {
@@ -418,6 +471,10 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
             },
         }
     };
+    // The end event of a run whose answer came is not needed any more.
+    if !meta.id.is_empty() {
+        commands.take_end(&meta.id);
+    }
     while let Ok(item) = items_rx.try_recv() {
         if item.get("kind").and_then(Value::as_str) != Some("job")
             && let Some(text) = item.get("text").and_then(Value::as_str)
@@ -563,6 +620,7 @@ pub fn on_event(commands: &Commands, publish: &dyn Fn(&str, Value), topic: &str,
         let was_running = matches!(meta.state.as_str(), "running" | "waiting" | "");
         meta.take(&ended.job);
         commands.keep(&meta);
+        commands.heard_end(&ended.id, &ended.job);
         // A foreground run's end was already its tool result.
         if !meta.background || !was_running {
             return;

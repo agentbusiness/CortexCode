@@ -50,6 +50,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 /// How long the inviter gives one pairing exchange, from the connection to the answer. An
 /// exchange that reaches it counts as a failed attempt.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a member has to take a new stream (a request): milliseconds on a live connection.
+const OPEN_STREAM: Duration = Duration::from_secs(5);
 
 /// What every member lends every other as a whole category: its model. The services the plugins
 /// share are lent method by method (`crate::services`); everything else is private to the node,
@@ -546,7 +548,11 @@ impl Mesh {
         let Some(connection) = self.connection(node) else {
             return Err(RpcError::new(codes::UNAVAILABLE, "the member is not reachable now").retryable());
         };
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| RpcError::new(codes::UNAVAILABLE, format!("cannot open a stream to the member: {e}")).retryable())?;
+        // A connection that still looks open but carries nothing (the member's computer slept, its
+        // path died) would hold the call until it closes, about two minutes: a stream not opened
+        // in time is a member that is not there.
+        let opened = tokio::time::timeout(OPEN_STREAM, connection.open_bi()).await.map_err(|_| RpcError::new(codes::UNAVAILABLE, "the member did not take a stream in time").retryable())?;
+        let (mut send, mut recv) = opened.map_err(|e| RpcError::new(codes::UNAVAILABLE, format!("cannot open a stream to the member: {e}")).retryable())?;
         let id = 1;
         write_message(&mut send, &Message::Req { id, method: method.to_owned(), params }).await.map_err(|e| RpcError::new(codes::UNAVAILABLE, e.to_string()).retryable())?;
         loop {

@@ -1303,6 +1303,18 @@ fn method_owner(header: &str) -> Option<String> {
     (!owner.is_empty()).then(|| owner.to_owned())
 }
 
+/// How many tests `text` switches off, by the markers the common runners read: `#[ignore]` (Rust),
+/// `@pytest.mark.skip`/`skipif`/`xfail` and `@unittest.skip` (Python), `it.skip(`, `test.skip(`,
+/// `describe.skip(`, `xit(`, `xdescribe(`, `it.todo(` (Jest, Vitest, Mocha), `t.Skip(` (Go),
+/// `@Disabled` and `@Ignore` (JUnit), `[Ignore` (NUnit, MSTest), `Skip =` in xUnit's `[Fact(...)]`.
+fn test_switch_offs(text: &str) -> usize {
+    const MARKERS: &[&str] = &[
+        "#[ignore", "@pytest.mark.skip", "@pytest.mark.xfail", "@unittest.skip", "it.skip(", "test.skip(", "describe.skip(", "xit(", "xdescribe(", "xtest(", "it.todo(", "test.todo(", "t.Skip(",
+        "t.SkipNow(", "@Disabled", "@Ignore", "[Ignore", "[Fact(Skip", "[Theory(Skip",
+    ];
+    text.lines().map(str::trim_start).filter(|line| !line.starts_with("//") && !line.starts_with("# ") && MARKERS.iter().any(|marker| line.contains(marker))).count()
+}
+
 fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Commit) -> Out {
     let Commit { absolute, display, old, new, line_map, changed, notes } = commit;
     let old_text = old.clone().unwrap_or_default();
@@ -1321,6 +1333,20 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
                 index + 1
             ),
         );
+    }
+    // A test that existed is never switched off to make a run pass: the check would then say
+    // "passes" about code it no longer runs (seen: two hanging tests marked `#[ignore]` so a task's
+    // `cargo test` went green, and the work was accepted on that green). The scratch folder is free.
+    if old.is_some() && !util::is_inside(&absolute, &util::scratch_dir(&session.workspace)) {
+        let added = test_switch_offs(&new).saturating_sub(test_switch_offs(&old_text));
+        if added > 0 {
+            return Out::fail(
+                "test_switched_off",
+                format!(
+                    "Nothing was written: this edit switches off {added} test(s) in {display} (a skip or ignore marker). A failing or slow test shows what the code must do: fix the code it runs, or make that code fast enough. When you are sure the test itself is wrong, leave it as it is and say why in your reply."
+                ),
+            );
+        }
     }
     let invisible = crate::security::added_invisible(&old_text, &new);
     // An edit of an existing file that adds syntax errors is not written (SWE-agent's guard: a broken
@@ -1544,9 +1570,47 @@ fn parse_ops(edits: &[Value]) -> Result<(Vec<EditOp>, Vec<String>), String> {
                 notes.push(note);
             }
         }
+        // A `—` written into a comment is the JSON escape doubled (the model meant the
+        // character): in a comment nothing reads escapes, so the literal text would stay there
+        // (seen: `—` six characters long in a module's doc comments). Code lines stay as sent.
+        if let Some(decoded) = decode_comment_escapes(&lines) {
+            lines = decoded;
+            let note = "wrote \\uXXXX in comments as the characters they name".to_owned();
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
         ops.push(EditOp { kind, at, to, lines });
     }
     Ok((ops, notes))
+}
+
+/// `lines` with each `\uXXXX` in a comment line (`//`, `#`, `*`, `--`, `;`) written as its
+/// character; None when no comment line holds one.
+fn decode_comment_escapes(lines: &[String]) -> Option<Vec<String>> {
+    static ESCAPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\\u([0-9a-fA-F]{4})").expect("valid"));
+    let comment = |line: &str| {
+        let line = line.trim_start();
+        ["//", "#", "*", "--", ";", "/*"].iter().any(|start| line.starts_with(start)) && !line.starts_with("#[") && !line.starts_with("#!")
+    };
+    if !lines.iter().any(|line| comment(line) && ESCAPE.is_match(line)) {
+        return None;
+    }
+    Some(
+        lines
+            .iter()
+            .map(|line| {
+                if !comment(line) {
+                    return line.clone();
+                }
+                ESCAPE
+                    .replace_all(line, |found: &regex::Captures| {
+                        u32::from_str_radix(&found[1], 16).ok().and_then(char::from_u32).map(String::from).unwrap_or_else(|| found[0].to_owned())
+                    })
+                    .into_owned()
+            })
+            .collect(),
+    )
 }
 
 async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<String, Value>) -> Out {

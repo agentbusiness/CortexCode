@@ -473,9 +473,11 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // The newest read of each file part (its call and its result) stays through this layer, as file
     // reads do through folding: compacting it away sent the model to read the file again (seen: 23
     // re-reads after compactions in one run).
+    // Only within the task at work: a finished task's reads fold at its boundary (`tasks_through`).
+    let tasks_through = mark(crate::fit::TASKS_THROUGH);
     let kept_reads: HashSet<u64> = {
         let mut newest: HashMap<String, (u64, u64)> = HashMap::new();
-        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && is_file_read(entry)) {
+        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through && is_file_read(entry)) {
             if let Some(call) = calls.get(str_field(&result.data, "call_id"))
                 && let Some(target) = target_of(call)
             {
@@ -490,7 +492,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             && entry.seq <= steps_through
             && !bool_field(&entry.data, "interrupted")
             && digests.of(entry, &calls).is_none()
-            && (step_key(entry).is_some() || (entry.kind == kinds::TOOL_RESULT && !is_host(entry)))
+            && (step_key(entry).is_some() || (entry.kind == kinds::TOOL_RESULT && (!is_host(entry) || entry.seq <= tasks_through)))
     };
     // A read answered by a pointer to an identical earlier read (`unchanged`, `repeat_of`): once a
     // compaction no longer shows that earlier read whole, this one shows the text itself.
@@ -706,8 +708,55 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         index += 1;
     }
     flush_host(&mut host_group, &mut messages);
+    // The newest step's thinking stopped at its budget: the step's reasoning is not in the prompt
+    // (`reasoning_steps`), so the next step would think from the start again (seen: ten steps in a
+    // row began "Let me understand the task", each cut before it reached an edit). Where it had got
+    // to comes after everything else, so the earlier prompt stays as the engine cached it.
+    // Only while that step's work goes on: not once a decision, a new task or the user came after it.
+    let step_last = step_keys.last().and_then(|key| entries.iter().rev().find(|entry| step_key(entry).as_ref() == Some(key)).map(|entry| entry.seq));
+    let moved_on = step_last.is_some_and(|last| {
+        entries.iter().any(|entry| {
+            entry.seq > last && (entry.kind == kinds::USER_MESSAGE || (entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "decision_text" | "task_start")))
+        })
+    });
+    if let Some(key) = step_keys.last()
+        && !moved_on
+        && !reasoning_kept.contains(key)
+        && let Some(tail) = cut_thought(entries, key)
+    {
+        messages.push(host_message(ds, &ds.text("thought_cut", &[("thought", &tail)])));
+    }
     messages
 }
+
+/// The end of a step's thinking when it stopped at its budget (the model plugin closes it with one
+/// of [`THINK_CUT`]): its last [`CUT_TAIL_CHARS`] characters before the close, at a line or
+/// sentence start. None when the thought ended on its own.
+fn cut_thought(entries: &[JournalEntry], key: &(String, u64)) -> Option<String> {
+    let reasoning: String = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::REASONING && !bool_field(&entry.data, "interrupted") && step_key(entry).as_ref() == Some(key))
+        .map(|entry| str_field(&entry.data, "text"))
+        .collect();
+    let at = THINK_CUT.iter().filter_map(|close| reasoning.rfind(close)).max()?;
+    let before = reasoning[..at].trim_end();
+    let count = before.chars().count();
+    let tail: String = before.chars().skip(count.saturating_sub(CUT_TAIL_CHARS)).collect();
+    let tail = if count > CUT_TAIL_CHARS {
+        // Start at a line or a sentence, not inside a word.
+        let start = tail.find(['\n', '.']).map(|i| i + 1).filter(|i| *i < tail.len() / 2).unwrap_or(0);
+        tail[start..].trim_start().to_owned()
+    } else {
+        tail
+    };
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// The sentences the model plugins close a thought with at its budget (the current one, and
+/// Qwen's own that older journals hold).
+const THINK_CUT: &[&str] = &["I have thought this through far enough for this step", "Considering the limited time by the user"];
+/// Characters of a cut thought carried into the next step.
+const CUT_TAIL_CHARS: usize = 1500;
 
 /// What plans change about entries in place.
 struct Pins {

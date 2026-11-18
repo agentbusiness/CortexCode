@@ -119,6 +119,15 @@ impl Learner {
                         let _ = again.send(Job::Backlog);
                     }
                     Ok(_) => {
+                        // Lessons kept under earlier rules are judged again by the current ones.
+                        match recheck(&host, &dataset, &park).await {
+                            Ok(true) => {
+                                let _ = again.send(Job::Backlog);
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(%error, "stored lessons were not judged again"),
+                        }
                         if replayer.idle() {
                             match crate::procedures::synthesize(&host, &dataset, &park).await {
                                 Ok(true) => { let _ = again.send(Job::Backlog); }
@@ -887,6 +896,93 @@ async fn score(host: &Host, entries: &[JournalEntry], run_id: &str, steps: &[Ste
         }
     }
     verdicts
+}
+
+/// The stream that records which lesson was judged under which lesson rules.
+const CHECKED_TOPIC: &str = "lessons.checked";
+/// Stored lessons judged again per pass of the worker.
+const RECHECK_PER_PASS: usize = 8;
+
+/// A stable fingerprint of `text` (FNV-1a, 64 bits): the same across builds and machines.
+fn fingerprint(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Judge stored lessons again when the lesson rules (`prompts/learn.md`) changed since they were
+/// kept: one LEARN call each with the lesson as the card, at idle priority, a few per pass. One the
+/// current rules call not useful is withdrawn (seen: "add stub methods returning default values"
+/// kept under rules that did not yet refuse lessons that pass a check by doing less, and shown to
+/// later runs that then wrote stand-ins). Each judgement is recorded, so a lesson is judged once
+/// per version of the rules. True when it judged any (more may wait).
+async fn recheck(host: &Host, data: &Dataset, cancel: &CancellationToken) -> Result<bool, RpcError> {
+    let rules = fingerprint(data.prompt("learn"));
+    let mut checked: HashSet<String> = HashSet::new();
+    let mut from: Option<u64> = None;
+    loop {
+        let read: cc_protocol::contracts::memory::StreamReadResult =
+            host.get(memory_methods::STREAM_READ, json!({"topic": CHECKED_TOPIC, "from_offset": from, "limit": 5000})).await?;
+        for record in &read.records {
+            if str_field(&record.value, "rules") == rules {
+                checked.insert(str_field(&record.value, "id").to_owned());
+            }
+        }
+        if read.end || read.records.is_empty() {
+            break;
+        }
+        from = Some(read.next_offset);
+    }
+    let listed = host.get::<cc_protocol::contracts::memory::KnowledgeListResult>(memory_methods::KNOWLEDGE_LIST, json!({"kind": knowledge::LESSON})).await?;
+    let waiting: Vec<KnowledgeItem> = listed.items.into_iter().filter(|item| !checked.contains(&item.id)).take(RECHECK_PER_PASS).collect();
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let Some(shape) = data.shape("LEARN") else { return Ok(false) };
+    let mut records: Vec<Value> = Vec::new();
+    for item in waiting {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let anchor = match anchor_of(&item.name) {
+            "" => "approach".to_owned(),
+            anchor => anchor.to_owned(),
+        };
+        let anchors = vec![anchor];
+        let shape = shape.clone().filled(ANCHORS_PLACEHOLDER, &anchors, None);
+        let card = data.text("learn_recheck", &[("lesson", item.text.trim())]);
+        let messages = vec![ChatMessage::new("system", data.prompt("learn").to_owned()), ChatMessage::new("user", card)];
+        let params = json!({
+            "messages": messages,
+            "tools": [],
+            "grammar": schemas::grammar(&shape),
+            "sampling": data.sampling("LEARN", false),
+            "thinking": crate::llm::thinking("none"),
+            "priority": "background",
+            "idle_only": true,
+            "cache_key": CACHE_KEY,
+            "max_tokens": 400,
+        });
+        let value = crate::llm::on_best_model(host, CACHE_KEY, Some(cancel), host.call_with(model_methods::CHAT, params, crate::host::Effect::Idempotent, Some(cancel))).await?;
+        let result: ChatResult = cc_protocol::parse_params(value)?;
+        // Only a judgement that reads as one counts: an unreadable answer is asked again next pass.
+        let Ok(judged) = schemas::parse_json::<Learned>(&result.content) else { continue };
+        let useful = judged.useful.trim().to_owned();
+        if useful == "no" {
+            let _ = host
+                .call(memory_methods::KNOWLEDGE_WITHDRAW, json!({"project_id": item.project_id, "id": item.id, "reason": "the lesson rules changed, and judged again it is not a lesson to keep", "by": "chatflow"}))
+                .await;
+            tracing::info!(item = %item.id, lesson = %item.text, "a stored lesson was withdrawn by the current lesson rules");
+        }
+        records.push(json!({"id": item.id, "rules": rules, "useful": useful}));
+    }
+    if !records.is_empty() {
+        host.call(memory_methods::STREAM_APPEND, json!({"topic": CHECKED_TOPIC, "records": records, "retention_days": 3650})).await?;
+    }
+    Ok(true)
 }
 
 /// Earlier runs no instance learned, newest sessions first, at most `limits.learn_backlog_runs`.

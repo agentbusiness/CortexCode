@@ -210,6 +210,13 @@ pub fn open(entries: &[JournalEntry]) -> Option<(u64, Plan)> {
     latest(entries).filter(|(_, plan)| plan.is_open())
 }
 
+/// The newest plan when it was carried out and stopped before every task was done (its agents
+/// stopped or were cancelled, the run ended). The caller knows whether background work still goes
+/// on; this says only what the plan itself records.
+pub fn stopped(entries: &[JournalEntry]) -> Option<(u64, Plan)> {
+    latest(entries).filter(|(_, plan)| plan.status == plan_status::IMPLEMENTING && plan.tasks.iter().any(|task| !plan.steps_done.iter().any(|step| step.n == task.n && step.outcome == "done")))
+}
+
 /// The plan entry at `seq`.
 pub fn at(entries: &[JournalEntry], seq: u64) -> Option<Plan> {
     entries.iter().find(|entry| entry.seq == seq).and_then(parse)

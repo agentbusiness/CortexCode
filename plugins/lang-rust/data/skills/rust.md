@@ -12,6 +12,7 @@ Rust here: get it right, build and test it, code that runs, common errors and th
    - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
    - Unsure of a domain, format, protocol or crate? Look it up: the research plugin, docs.rs, how others solved it:
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
+   - A dependency's method or type you are unsure of: write the call you expect, then run `cargo check`. rustc names the right method, its signature and the trait to import. Then one read of its source (`~/.cargo/registry/src/*/<crate>-<version>/src`, the version from `Cargo.lock`) if the error leaves a question.
 3. **Write whole functions, in slices.**
    - First the simplest complete path (one case, input to result). Run the tests.
    - Add the next behaviour. Run again after every change.

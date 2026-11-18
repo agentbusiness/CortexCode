@@ -9,7 +9,7 @@ Decide how to handle the user's latest message. Fill the fields in this order.
 3. `route`, the kind of request. First, when the message is about the background agents or an open plan:
 - MANAGE: the user wants background agents or their tasks changed: stopped, cancelled, restarted, retried, told something, taken over, or their work planned again.
 - STATUS: a question about the background agents themselves: who works, who is blocked, what an agent reported. Whether a thing in the project exists, works or is ready is LOOKUP.
-- IMPLEMENT: a plan is open (shown above) and the user says to carry it out.
+- IMPLEMENT: a plan is open, or stopped before its tasks were done (shown above), and the user says to carry it out, continue it or run it again.
 - DELEGATE: the user asks in words for the work to run in background agents.
 Otherwise the message is one of three kinds:
 - A question that tells you to do nothing (how, what, why, which, whether, is it ready): LOOKUP when it is about this repository or the work done in it, found out by reading it and searching online; ANSWER when it needs nothing from them.

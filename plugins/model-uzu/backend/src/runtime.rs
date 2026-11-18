@@ -44,9 +44,12 @@ pub fn default_think_budget(effort: Option<&str>) -> u32 {
     }
 }
 
-/// What ends reasoning at the budget: Qwen's own closing sentence for a thinking budget.
+/// What ends reasoning at the budget. Not Qwen's own sentence ("Considering the limited time by
+/// the user, I have to give the solution ... directly now"): it was the last thing the model read
+/// before acting, and it acted on it, with a shortcut in place of the asked part (seen in agent
+/// steps cut at 4096 tokens). The chat flow finds a cut thought by this sentence.
 pub const THINK_BUDGET_CLOSE: &str =
-    "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n";
+    "\n\nI have thought this through far enough for this step; I take the next step from what I worked out above.\n</think>\n\n";
 
 /// `[plugin.config]` of the model plugin.
 #[derive(Debug, Clone, Deserialize, Default, Serialize)]

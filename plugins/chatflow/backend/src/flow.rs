@@ -430,14 +430,19 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             Stage::Route => {
                 set_stage(env, journal, status_seq, "route").await?;
                 let (mut route_shape, catalog, skills_live) = route_shape(env, &entries)?;
-                // IMPLEMENT needs an open plan: otherwise the grammar has none.
-                if plan::open(&entries).is_none() {
-                    route_shape = route_shape.without("route", "IMPLEMENT");
-                }
                 // The session's background work still going, next to the decision: a question about
                 // it is answered from where it stands (seen: "how is it going?" answered with a
                 // greeting while eight agents worked).
                 let open = crate::manage::open_work(env, &entries).await;
+                // A plan that stopped before its tasks were done, with nothing at work: "run the
+                // tasks again" starts its tasks as they stand (IMPLEMENT), not a plan written anew
+                // (seen: after the agent was cancelled, "run the tasks again" went to DO and the
+                // planner wrote the same ten tasks again, then once more for a steer).
+                let stopped = if open.is_empty() { plan::stopped(&entries) } else { None };
+                // IMPLEMENT needs an open or a stopped plan: otherwise the grammar has none.
+                if plan::open(&entries).is_none() && stopped.is_none() {
+                    route_shape = route_shape.without("route", "IMPLEMENT");
+                }
                 // MANAGE needs background work that is going on: with none, there is nothing to
                 // stop or steer and the grammar has no such route (seen: "continue working on the
                 // tasks" after every agent was stopped went to MANAGE, found nothing open, and the
@@ -448,6 +453,15 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let message = journal.entries().filter(|entry| entry.kind == kinds::USER_MESSAGE).last().map(|entry| str_field(&entry.data, "text").to_owned()).unwrap_or_default();
                 let work_live = if !open.is_empty() {
                     env.data.text("route_open_work", &[("work", &crate::manage::work_lines(env, &open))])
+                } else if let Some((_, stopped)) = &stopped {
+                    let left: String = stopped
+                        .tasks
+                        .iter()
+                        .filter(|task| !stopped.steps_done.iter().any(|step| step.n == task.n && step.outcome == "done"))
+                        .map(|task| env.data.text("list_item", &[("text", &task.title)]))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    env.data.text("route_stopped_plan", &[("tasks", &left)])
                 } else if entries.iter().any(|entry| entry.kind == chatflow_kinds::PLAN) {
                     // Said only where a plan was at work in this conversation.
                     env.data.text("route_no_open_work", &[])
@@ -1495,7 +1509,10 @@ fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &
             continue;
         }
         let command = entry.data.get("args").map(|args| str_field(args, "command").trim().to_owned()).unwrap_or_default();
-        if command.is_empty() || checks.contains(&command) {
+        // A check run by hand, piped or after a `cd` (`cargo test 2>&1 | tail -30`), is still the
+        // check: its passing test lines say the tests pass, not what the software does (seen: asks
+        // about the software's results judged met on `test ... ok` lines).
+        if command.is_empty() || checks.contains(&command) || runs_a_check(&command, checks) {
             continue;
         }
         let Some(result) = results.get(str_field(&entry.data, "call_id")) else { continue };
@@ -1516,6 +1533,16 @@ fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &
     }
     let skip = runs.len().saturating_sub(8);
     runs.into_iter().skip(skip).map(|(_, text)| text).collect()
+}
+
+/// Whether one of the shell command's parts (split at `&&`, `||`, `;` and `|`) starts with one
+/// of `checks`.
+fn runs_a_check(command: &str, checks: &HashSet<String>) -> bool {
+    command
+        .split(['|', ';', '&'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| checks.iter().any(|check| !check.is_empty() && (part == check || part.starts_with(&format!("{check} ")))))
 }
 
 /// The host's checks as the newest verification of this run left them, one line each (`cargo
@@ -1635,7 +1662,27 @@ async fn accept_plan(env: &RunEnv, journal: &mut Journal, plan_seq: u64) -> Opti
     let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
     let checks = host_checks(&env.data, &entries, &env.run_id);
     let checks = if checks.is_empty() { env.data.text("accept_no_checks", &[]) } else { checks };
+    // What the reviews between tasks found stays in view of the verdict: a gap a review named and
+    // the plan did not take up is the work's own account of what it left (seen: "CLIP search cannot
+    // run in this repo ... a real gap the remaining tasks don't address", then the ask judged met).
+    let found = reviews_found(&entries, &env.run_id);
+    let runs = if found.is_empty() { runs } else { format!("{runs}\n\n{}", env.data.text("accept_found", &[("found", found.trim_end())])) };
     judge_asks(env, journal, &asks, Shown { files, checks, runs }, json!({"plan_seq": plan_seq})).await
+}
+
+/// What this run's REVIEW decisions found, one line each, oldest first (empty when none found
+/// anything).
+fn reviews_found(entries: &[JournalEntry], run_id: &str) -> String {
+    entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "stage") == "REVIEW" && str_field(&entry.data, "purpose") == "decision_text")
+        .filter_map(|entry| {
+            let raw = entry.data.get("raw").and_then(Value::as_str)?;
+            let decision: Value = serde_json::from_str(raw.trim()).ok()?;
+            let found = decision.get("found")?.as_str()?.trim();
+            (!found.is_empty()).then(|| format!("- {found}\n"))
+        })
+        .collect()
 }
 
 /// The newest finished tree of agents' tasks nobody has judged yet (the agents plugin's
@@ -2014,8 +2061,23 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
                 "unmet" => "plan_unmet_live",
                 _ => "plan_replan_live",
             };
+            // What each finished task reported, in its own words: the plan written again builds on
+            // what the work established (seen: a research task found the model in the project's own
+            // library; two hours later a replan dropped the part as "not compatible", from memory).
+            let reports: String = plan
+                .steps_done
+                .iter()
+                .filter(|step| step.outcome == "done" && !step.summary.trim().is_empty())
+                .map(|step| {
+                    let title = plan.tasks.get(step.n as usize - 1).map(|task| task.title.as_str()).unwrap_or("");
+                    let summary: String = step.summary.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(REPORT_CHARS).collect();
+                    env.data.text("plan_done_report", &[("n", &step.n.to_string()), ("title", title), ("summary", &summary)])
+                })
+                .collect();
+            let reports = if reports.is_empty() { String::new() } else { env.data.text("plan_done_reports", &[("reports", reports.trim_end())]) };
             joined(&[
                 env.data.text("plan_auto_live", &[]),
+                reports,
                 env.data.text(key, &[("n", &failed.to_string()), ("title", &title), ("outcome", outcome), ("summary", summary.trim()), ("done", &done.to_string())]),
             ])
         }
@@ -2422,17 +2484,23 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     let entries = journal.entries_vec();
     let named = journal.get(route_seq).map(|entry| str_field(&entry.data, "plan_id").to_owned()).unwrap_or_default();
     let found = if named.is_empty() { plan::latest(&entries) } else { plan::version_of(&entries, &named) };
-    // Open, or already being implemented by this run (a resumed run).
-    let Some((plan_seq, mut current)) = found.filter(|(seq, plan)| {
-        plan.is_open() || journal.get(*seq).is_some_and(|entry| str_field(&entry.data, "implement_run") == env.run_id)
+    let open_work = crate::manage::open_work(env, &entries).await;
+    // Stopped before its tasks were done, with nothing at work ([`plan::stopped`]): it starts again
+    // as it stands.
+    let stopped = open_work.is_empty() && found.as_ref().is_some_and(|(seq, _)| plan::stopped(&entries).is_some_and(|(at, _)| at == *seq));
+    // Open, or already being implemented by this run (a resumed run), or stopped.
+    let Some((mut plan_seq, mut current)) = found.filter(|(seq, plan)| {
+        plan.is_open() || stopped || journal.get(*seq).is_some_and(|entry| str_field(&entry.data, "implement_run") == env.run_id)
     }) else {
         return journal.note(&env.run_id, "implement_done", &env.data.text("implement_none", &[]), true).await.map(|_| ());
     };
+    if stopped && str_field(&journal.get(plan_seq).map(|entry| entry.data.clone()).unwrap_or_default(), "implement_run") != env.run_id {
+        (plan_seq, current) = restart_stopped(env, journal, current).await?;
+    }
     // One plan is at work in a folder at a time, and the newest wins. Agents still working for a
     // plan written after this one: this plan does not start beside them (seen: "Implement" on an
     // older plan's card while a newer plan's agents worked; two agents did the same task and one
     // deleted the other's files). Agents working for an older plan stop when this one starts.
-    let open_work = crate::manage::open_work(env, &entries).await;
     if let Some(earlier) = earlier_at_work(env, &entries, &open_work).await.filter(|earlier| earlier.plan.plan_id != current.plan_id) {
         let first = |plan_id: &str| entries.iter().find(|entry| entry.kind == chatflow_kinds::PLAN && str_field(&entry.data, "plan_id") == plan_id).map(|entry| entry.seq).unwrap_or(0);
         if first(&earlier.plan.plan_id) > first(&current.plan_id) {
@@ -2672,6 +2740,27 @@ async fn missing_note(env: &RunEnv, plan: &plan::Plan, task: &plan::PlanTask) ->
 
 /// `baseline`: run the plan's checks first (a skill's units check work that is not there yet, so
 /// theirs fail by design and are never a baseline).
+/// A stopped plan as its next version, ready to carry out again: the same tasks, the done ones
+/// kept (by the plan's own record, or by their task's state when agents carried them out), each
+/// other task given a fresh task (its old one was stopped or cancelled). No planner call: nothing
+/// about the work changed.
+async fn restart_stopped(env: &RunEnv, journal: &mut Journal, mut plan: plan::Plan) -> Result<(u64, plan::Plan), RpcError> {
+    let recorded: HashSet<u32> = plan.steps_done.iter().filter(|step| step.outcome == "done").map(|step| step.n).collect();
+    for task in plan.tasks.iter_mut().filter(|task| !recorded.contains(&task.n)) {
+        let Some(id) = task.task_id.clone() else { continue };
+        let finished = env.host.get::<Task>(memory_methods::TASK_GET, json!({"id": id})).await.is_ok_and(|record| record.status == "done");
+        if !finished {
+            task.task_id = None;
+        }
+    }
+    plan.version += 1;
+    plan.status = plan_status::APPROVED.into();
+    plan.diff = None;
+    plan.note = env.data.text("plan_restarted", &[]);
+    let seq = journal.append(chatflow_kinds::PLAN, plan.entry(&env.run_id)).await?;
+    Ok((seq, plan))
+}
+
 async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64, current: &mut plan::Plan, baseline: bool) -> Result<String, RpcError> {
     // The plan's checks on the code before any task: what fails already becomes the last task.
     if baseline && current.tasks.iter().all(|task| task.task_id.is_none()) {
@@ -3187,6 +3276,8 @@ const WORK_OPEN_STALL_ROUNDS: usize = 2;
 /// Short messages are the ones the router answered from the turn before ("so?", "continue", "as i
 /// said stop"); a longer one states its own asks.
 const ROUTE_LATEST_CHARS: usize = 400;
+/// Characters of each finished task's report shown to a plan written again.
+const REPORT_CHARS: usize = 1200;
 
 /// The output of the `done` command of a skill this run used, when it says the work is open (a
 /// non-zero exit); None when no used skill declares one, when every one says finished, or when the
