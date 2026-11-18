@@ -523,7 +523,20 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 set_stage(env, journal, status_seq, "read").await?;
                 let planned = status_reads(&env.scope);
                 let any = env.stops.any();
-                reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await.map(|_| ())
+                let read = reads::run(journal, &env.run_id, &env.scope, planned, &mut done_reads, &any, env.data.limits.reads_per_round).await.map(|_| ());
+                // What each agent this session started is doing now, counted from its own steps:
+                // its record says `working` from the moment it starts, whatever it does since
+                // (seen: "are you sure it is working?" with nothing to answer it from).
+                let entries = journal.entries_vec();
+                let work = crate::manage::open_work(env, &entries).await;
+                if read.is_ok() && !work.is_empty() {
+                    let plan = crate::manage::plan_lines(env, &entries, &work).await;
+                    let (lines, _) = crate::manage::work_lines_with_progress(env, &work).await;
+                    journal
+                        .append(kinds::NOTE, json!({"text": env.data.text("status_work", &[("plan", &plan), ("lines", &lines)]), "purpose": "status_work", "run_id": env.run_id, "host_message": true}))
+                        .await?;
+                }
+                read
             }
             Stage::Manage => {
                 set_stage(env, journal, status_seq, "manage").await?;
@@ -620,6 +633,17 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                     let told = env.data.text("reply_dropped", &[("tasks", &dropped.join("\n"))]);
                     reply_live = [reply_live.as_str(), told.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
                 }
+                // Work this turn did is reported from the host's records of it: each task as it
+                // ended, the checks' last result, each ask as ACCEPT judged it (seen: "all seven
+                // tasks are done and green" written from the tasks' own closing words, with no
+                // check run on any of them).
+                // A plan the agents carried out, judged by this run when its tree finished, is
+                // reported the same way.
+                let recorded = work_outcome(&env.data, &entries, &env.run_id);
+                let recorded = if recorded.is_empty() { tree_outcome(&env.data, &entries, &env.run_id) } else { recorded };
+                if !recorded.is_empty() {
+                    reply_live = [reply_live.as_str(), recorded.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
+                }
                 // The questions last: the text right before the answer is what it answers.
                 let asks = asks_live(&env.data, &entries, &env.run_id, "reply_asks", true);
                 if !asks.is_empty() {
@@ -689,6 +713,9 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         let later: Vec<String> = plan.tasks.iter().filter(|task| task.n > *n).map(|task| task.title.clone()).collect();
                         let goal = plan.doc.goal.clone();
                         let direction = direction(&env.data, &journal.entries_vec());
+                        // The user's own words for the work open every step of it: the plan's goal
+                        // and the task's brief are the planner's wording of them.
+                        let asks = work_asks(&journal.entries_vec(), &env.run_id, Some(&plan.plan_id));
                         // Where this task's work starts in the transcript (the chat nests what
                         // follows under it); not a message for the model.
                         let label = env.data.text("task_start", &[("n", &n.to_string()), ("of", &plan.tasks.len().to_string()), ("title", &planned_task.title)]);
@@ -756,7 +783,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 reads::run(journal, &env.run_id, &env.scope, files, &mut fresh, &any, env.data.limits.reads_per_round).await?;
                             }
                         }
-                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later, direction }))
+                        (Some(task), Some(agent_loop::StepSpec { n: *n, of: plan.tasks.len() as u32, text, done: plan.steps_done.clone(), goal, later, direction, asks }))
                     }
                     None => (foreground_task(env, journal, &decision).await?, None),
                 };
@@ -795,8 +822,18 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             // since its last edit) is done, also when its loop ended with nothing
                             // left to do or was stopped for re-running that same passing check.
                             let task_id = plan.tasks.get(n as usize - 1).and_then(|task| task.task_id.clone()).unwrap_or_default();
-                            let verified = verified_since_last_edit(&journal.entries_vec(), &env.run_id, &task_id);
-                            let outcome = if verified && (outcome.outcome == "stopped" || (outcome.outcome == "done" && outcome.tool_calls == 0)) {
+                            // Only a check counts: the task's own, or one of the project's check
+                            // commands (looked up only when the loop ended in a way this decides).
+                            // A task stopped while the host's own checks kept failing is not made
+                            // done by a narrower run of its own that passed.
+                            let promotable = outcome.verified != Some(false) && (outcome.outcome == "stopped" || (outcome.outcome == "done" && outcome.tool_calls == 0));
+                            let verified = promotable && {
+                                let entries = journal.entries_vec();
+                                let mut checks: Vec<String> = plan.tasks.get(n as usize - 1).map(|task| task.checks.clone()).unwrap_or_default();
+                                checks.extend(crate::verifiers::commands(&crate::verifiers::candidates(env, &run_files(&entries, &env.run_id)).await));
+                                verified_since_last_edit(&entries, &env.run_id, &task_id, &checks)
+                            };
+                            let outcome = if verified {
                                 agent_loop::LoopOutcome { outcome: "done".into(), tool_calls: outcome.tool_calls.max(1), ..outcome.clone() }
                             } else {
                                 outcome.clone()
@@ -818,7 +855,14 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             let did_nothing = outcome.outcome == "done" && outcome.tool_calls == 0;
                             let outcome_name = if did_nothing { "failed".to_owned() } else { outcome.outcome.clone() };
                             let mut done = plan.steps_done.clone();
-                            done.push(plan::StepDone { n, outcome: outcome_name.clone(), summary: outcome.summary.clone(), changed_files: outcome.changed_files.clone() });
+                            done.push(plan::StepDone {
+                                n,
+                                outcome: outcome_name.clone(),
+                                summary: outcome.summary.clone(),
+                                changed_files: outcome.changed_files.clone(),
+                                check: outcome.check.clone(),
+                                check_detail: outcome.check_detail.clone(),
+                            });
                             journal.set(plan_seq, "steps_done", serde_json::to_value(&done)?).await?;
                             // The memory task's state follows the loop (a verified contract set it
                             // already; a task without one is done when its loop ended well).
@@ -832,7 +876,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 // Before the next task: do the tasks still to do fit what this one
                                 // showed (an error elsewhere, a wrong assumption)? If not, they are
                                 // written again now, not after one of them fails.
-                                if plan.replans < env.data.limits.replans
+                                if plan.reviews < env.data.limits.reviews
                                     && let Some(found) = review_plan(env, journal, &plan, n).await
                                 {
                                     set_stage(env, journal, status_seq, "plan").await?;
@@ -851,10 +895,14 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             // not shown met writes the tasks that meet it (seen: a search system
                             // reported done with its OCR and models switched off, scored against
                             // the answer key it read its answers from).
+                            // The check always runs and its verdict is recorded (the report of the
+                            // work tells each ask as it stands); the work goes on for an unmet ask
+                            // within `accepts`, its own count (seen: the replans spent on reviews,
+                            // and the work reported done with no look at what was asked).
                             if last
                                 && outcome_name == "done"
-                                && plan.replans < env.data.limits.replans
                                 && let Some(unmet) = accept_plan(env, journal, plan_seq).await
+                                && plan.accepts < env.data.limits.accepts
                             {
                                 set_stage(env, journal, status_seq, "plan").await?;
                                 if write_plan(env, journal, PlanMode::Replan { plan_seq, failed: n, outcome: "unmet".into(), summary: unmet }).await? {
@@ -894,6 +942,9 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                     "outcome": outcome.outcome,
                                     "changed_files": outcome.changed_files,
                                     "verified": outcome.verified,
+                                    "check": outcome.check,
+                                    "check_detail": outcome.check_detail,
+                                    "summary": outcome.summary,
                                 }),
                             )
                             .await?;
@@ -961,10 +1012,16 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                                 .append(kinds::NOTE, json!({"text": env.data.text("work_open", &[("output", open.trim())]), "purpose": "work_open", "output": open.trim(), "run_id": env.run_id, "host_message": true}))
                                 .await?;
                         } else {
+                            // The message was answered as a question while agents carry a plan
+                            // out: when it asks something of that work, the plan takes it up.
+                            if outcome.outcome == "done" && matches!(route_name.as_str(), "LOOKUP" | "ANSWER") {
+                                asks_reach_plan(env, journal).await?;
+                            }
                             journal
                                 .append(
                                     kinds::NOTE,
-                                    json!({"text": act_note(&outcome), "purpose": "explore_done", "run_id": env.run_id, "host_message": false, "outcome": outcome.outcome}),
+                                    // An answer that used no tool and changed nothing has no work to count.
+                                    json!({"text": if outcome.tool_calls == 0 && outcome.changed_files.is_empty() && outcome.outcome == "done" { String::new() } else { act_note(&outcome) }, "purpose": "explore_done", "run_id": env.run_id, "host_message": false, "outcome": outcome.outcome}),
                                 )
                                 .await?;
                             agent_outcome = Some(outcome);
@@ -1067,7 +1124,10 @@ async fn fresh_start(env: &RunEnv, journal: &mut Journal, task_id: &str, n: u32,
         let Some(call) = calls.get(str_field(&result.data, "call_id")) else { continue };
         let command = call.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str).unwrap_or("").trim().to_owned();
         let exit = result.data.get("display").and_then(|display| display.get("exit_code")).and_then(Value::as_i64);
-        let failed = (exit != Some(0)).then(|| {
+        // A status the tools plugin hid (`exit_hidden`: other commands ran after the check, so the
+        // status was theirs) shows neither a pass nor a failure: the command is not listed.
+        let hidden = result.data.get("display").and_then(|display| display.get("exit_hidden")).and_then(Value::as_bool) == Some(true);
+        let failed = (exit != Some(0) && !hidden).then(|| {
             let output = str_field(&result.data, "output");
             let lines: Vec<&str> = output.lines().collect();
             lines[lines.len().saturating_sub(12)..].join("\n")
@@ -1174,6 +1234,54 @@ async fn steer_is_question(env: &RunEnv, journal: &mut Journal, plan: &plan::Pla
     }
 }
 
+/// The user wrote while agents carried a plan out, and the message was answered as a question.
+/// When its words ask something of that work (STEER, the same decision a message during a task
+/// gets), the session is told once, as a need of its background work: it wakes to MANAGE when this
+/// turn ends, with the asks no task has yet next to its decision (a message to the agent whose
+/// task it is, or the work planned again). Seen: "yes, the spreadsheet files must work too" was
+/// answered "I'll fold them in", reached no task, and the work was reported done without them.
+/// A question that asks nothing of the work leaves nothing behind; the asks stay in the ledger
+/// either way and are judged when the work ends.
+async fn asks_reach_plan(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
+    let entries = journal.entries_vec();
+    let Some(message) = entries.iter().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == env.run_id) else { return Ok(()) };
+    let said = str_field(&message.data, "text").trim().to_owned();
+    if said.is_empty() || of_run(&entries, &env.run_id).iter().any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "asks_heard") {
+        return Ok(());
+    }
+    let open_work = crate::manage::open_work(env, &entries).await;
+    let Some(earlier) = earlier_at_work(env, &entries, &open_work).await else { return Ok(()) };
+    let unplanned = asks_unplanned(&entries, &env.run_id, &earlier.plan.plan_id, true);
+    if unplanned.is_empty() {
+        return Ok(());
+    }
+    let asks_work = match env.data.shape("STEER").cloned() {
+        Some(shape) => match decide_json::<schemas::Steer>(env, journal, "STEER", &shape, &env.data.text("steer_agents_live", &[("text", &said)])).await {
+            Ok((steer, _)) => steer.kind.trim() != "question",
+            Err(error) if error.code == codes::CANCELLED => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "the STEER decision could not be read; the session hears the asks");
+                true
+            }
+        },
+        None => true,
+    };
+    // Decided once per turn, whatever it was (a resumed run does not ask again); a message that
+    // asks nothing of the work is not shown to the session as an ask later ([`asks_unplanned`]).
+    journal
+        .append(
+            kinds::NOTE,
+            // `from_steer`: the message was queued while a run went on and is in the journal as that entry too.
+            json!({"text": "", "purpose": "asks_heard", "run_id": env.run_id, "host_message": false, "message": message.seq, "from_steer": message.data.get("from_steer").cloned().unwrap_or(Value::Null), "asks_work": asks_work}),
+        )
+        .await?;
+    if asks_work {
+        let list = unplanned.iter().enumerate().map(|(index, ask)| format!("{}. {}", index + 1, env.data.text("ask_line", &[("quote", ask)]))).collect::<Vec<_>>().join("\n");
+        journal.note(&env.run_id, "supervise", &env.data.text("supervise_asks", &[("asks", &list)]), true).await?;
+    }
+    Ok(())
+}
+
 /// The plan's progress for the user (a transcript note, no model call): the running task, the
 /// done ones, the session's running background jobs with the end of their output. The model hears
 /// that the user has it and goes on with the task.
@@ -1204,32 +1312,71 @@ async fn answer_progress(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan,
     Ok(())
 }
 
-/// What the user asked of the work, in their words: from the message that set the direction
-/// ([`direction`]; none: the message that started this run) to now, each message's asks as ROUTE
-/// quoted them (the whole message when it has none) and every message written during the work.
-/// Questions about progress (STATUS) and the Implement button's message ask nothing of the work.
-fn work_asks(entries: &[JournalEntry], run_id: &str) -> Vec<String> {
+/// The message the work of plan `plan_id` started with: the user message of the run that wrote the
+/// plan's first version (a plan the host started has none: the user's last message before it), or
+/// of the plan whose tasks it carried on ([`plan::Plan::continues`]), whichever is earlier.
+fn plan_started(entries: &[JournalEntry], plan_id: &str) -> Option<u64> {
+    let mut id = plan_id.to_owned();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut start: Option<u64> = None;
+    while !id.is_empty() && seen.insert(id.clone()) {
+        let Some(first) = entries.iter().find(|entry| entry.kind == chatflow_kinds::PLAN && str_field(&entry.data, "plan_id") == id) else { break };
+        let (run, before) = (str_field(&first.data, "run_id"), first.seq);
+        let message = entries
+            .iter()
+            .find(|entry| entry.seq < before && entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == run)
+            .or_else(|| entries.iter().filter(|entry| entry.seq < before && entry.kind == kinds::USER_MESSAGE).last())
+            .map(|entry| entry.seq);
+        start = match (start, message) {
+            (Some(known), Some(found)) => Some(known.min(found)),
+            (known, found) => known.or(found),
+        };
+        // Every version of a plan carries what it continues; the newest says it as it stands.
+        id = plan::version_of(entries, &id).and_then(|(_, plan)| plan.continues).unwrap_or_default();
+    }
+    start
+}
+
+/// Where the asks of the work begin (the ledger's first message): the earliest of the message that
+/// set the direction ([`direction`]), the message the plan's work started with ([`plan_started`])
+/// and the message that started this run; never before a message that set the earlier direction
+/// aside (ROUTE's `drops`: what was asked before it no longer holds).
+fn asks_start(entries: &[JournalEntry], run_id: &str, plan_id: Option<&str>) -> Option<u64> {
+    let message_before = |route: &JournalEntry| entries.iter().filter(|entry| entry.seq < route.seq && entry.kind == kinds::USER_MESSAGE).last().map(|message| message.seq);
     let mut direction_seq: Option<u64> = None;
+    let mut set_aside: Option<u64> = None;
     for route in entries.iter().filter(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route") {
         let set = route.data.get("detail").map(|detail| str_field(detail, "direction").to_owned()).unwrap_or_default();
         if set == "states" || set == "approves" {
-            direction_seq = entries.iter().filter(|entry| entry.seq < route.seq && entry.kind == kinds::USER_MESSAGE).last().map(|message| message.seq);
+            direction_seq = message_before(route);
         } else if route.data.get("drops").and_then(Value::as_bool) == Some(true) {
             direction_seq = None;
         }
+        if route.data.get("drops").and_then(Value::as_bool) == Some(true) {
+            set_aside = message_before(route);
+        }
     }
     let run_seq = entries.iter().find(|entry| entry.kind == kinds::USER_MESSAGE && str_field(&entry.data, "run_id") == run_id).map(|message| message.seq);
-    let Some(start) = direction_seq.or(run_seq) else { return Vec::new() };
-    let mut asks: Vec<String> = Vec::new();
-    let mut add = |text: &str| {
+    let plan_seq = plan_id.and_then(|id| plan_started(entries, id));
+    let start = [direction_seq, plan_seq, run_seq].into_iter().flatten().min()?;
+    Some(set_aside.map_or(start, |floor| start.max(floor)))
+}
+
+/// What the user asked from entry `start` on, each with the entry it was said in: each message's
+/// asks as ROUTE quoted them (the whole message when it has none) and every message written during
+/// the work. A question about the background agents (STATUS) and a plan card's Implement button
+/// ask nothing of the work.
+fn asks_since(entries: &[JournalEntry], start: u64) -> Vec<(u64, String)> {
+    let mut asks: Vec<(u64, String)> = Vec::new();
+    let mut add = |seq: u64, text: &str| {
         let text = text.trim();
-        if !text.is_empty() && !asks.iter().any(|ask| ask == text) {
-            asks.push(text.to_owned());
+        if !text.is_empty() && !asks.iter().any(|(_, ask)| ask == text) {
+            asks.push((seq, text.to_owned()));
         }
     };
     for entry in entries.iter().filter(|entry| entry.seq >= start) {
         if entry.kind == kinds::STEER {
-            add(str_field(&entry.data, "text"));
+            add(entry.seq, str_field(&entry.data, "text"));
             continue;
         }
         if entry.kind != kinds::USER_MESSAGE || entry.data.get("implement").is_some() {
@@ -1244,12 +1391,48 @@ fn work_asks(entries: &[JournalEntry], run_id: &str) -> Vec<String> {
         let quoted: Vec<schemas::Ask> = detail.and_then(|detail| detail.get("asks")).cloned().and_then(|asks| serde_json::from_value(asks).ok()).unwrap_or_default();
         let quoted: Vec<&str> = quoted.iter().map(|ask| ask.quote.trim()).filter(|quote| !quote.is_empty()).collect();
         if quoted.is_empty() {
-            add(str_field(&entry.data, "text"));
+            add(entry.seq, str_field(&entry.data, "text"));
         } else {
-            quoted.into_iter().for_each(&mut add);
+            quoted.into_iter().for_each(|quote| add(entry.seq, quote));
         }
     }
     asks
+}
+
+/// What the user asked of the work, in their words: the ledger the work is judged by. Every ask
+/// from where the work began ([`asks_start`]) to now counts, whichever turn it was said in: the
+/// request, what the user wrote while the plan was open or carried out, and what they answered in
+/// between (seen: "yes, the spreadsheet files must work too", said while agents worked, was
+/// answered with a promise, reached no task, and the work was judged without it).
+fn work_asks(entries: &[JournalEntry], run_id: &str, plan_id: Option<&str>) -> Vec<String> {
+    let Some(start) = asks_start(entries, run_id, plan_id) else { return Vec::new() };
+    asks_since(entries, start).into_iter().map(|(_, ask)| ask).collect()
+}
+
+/// The asks of the work no plan has taken up yet: said after the newest version of plan `plan_id`
+/// was written. `unheard`: only those the session has not heard at a MANAGE decision yet (told
+/// once: an ask the session answered with a message to an agent is not shown to it again at every
+/// check); a plan written to take them up gets them all.
+pub(crate) fn asks_unplanned(entries: &[JournalEntry], run_id: &str, plan_id: &str, unheard: bool) -> Vec<String> {
+    let Some(start) = asks_start(entries, run_id, Some(plan_id)) else { return Vec::new() };
+    let planned = plan::version_of(entries, plan_id).map(|(seq, _)| seq).unwrap_or(0);
+    let told = if unheard {
+        entries
+            .iter()
+            .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "managed" && entry.data.get("asks_told").and_then(Value::as_bool) == Some(true))
+            .map(|entry| entry.seq)
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // A message STEER read as only a question ([`asks_reach_plan`]) asks nothing a task could take up.
+    let questions: HashSet<u64> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "asks_heard" && entry.data.get("asks_work").and_then(Value::as_bool) == Some(false))
+        .flat_map(|entry| ["message", "from_steer"].into_iter().filter_map(move |field| entry.data.get(field).and_then(Value::as_u64)))
+        .collect();
+    asks_since(entries, start).into_iter().filter(|(seq, _)| *seq > planned && *seq > told && !questions.contains(seq)).map(|(_, ask)| ask).collect()
 }
 
 /// What the work's runs printed, for ACCEPT: the newest result of each command this run's `run`
@@ -1280,7 +1463,13 @@ fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &
         if display.get("tests").is_some_and(|tests| !tests.is_null()) || display.get("background").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        let exit = display.get("exit_code").and_then(Value::as_i64).map(|code| code.to_string()).unwrap_or_else(|| "-".to_owned());
+        // A hidden status (`exit_hidden`: the status was another command's) is said as not shown,
+        // so the run is never read as a pass.
+        let exit = match display.get("exit_code").and_then(Value::as_i64) {
+            Some(code) => code.to_string(),
+            None if display.get("exit_hidden").and_then(Value::as_bool) == Some(true) => data.text("accept_exit_hidden", &[]),
+            None => "-".to_owned(),
+        };
         let output = str_field(&result.data, "output").trim_end();
         runs.retain(|(key, _)| key != &command);
         runs.push((command.clone(), data.text("accept_run", &[("command", &command), ("exit", &exit), ("output", output)])));
@@ -1318,31 +1507,34 @@ fn host_checks(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &s
         .collect()
 }
 
-/// ACCEPT when every task of the plan at `plan_seq` is done: each ask of the user judged by what
-/// the work's runs printed. Some(what is not met yet, one line per ask) when an ask is not shown
-/// met; None when every ask is, when there is nothing to judge, or when the decision cannot be
-/// read (the work is reported as it is).
-async fn accept_plan(env: &RunEnv, journal: &mut Journal, plan_seq: u64) -> Option<String> {
+/// What ACCEPT is shown of the work, each part worded for its place in `accept_live`.
+struct Shown {
+    files: String,
+    checks: String,
+    runs: String,
+}
+
+/// ACCEPT: each of `asks` judged by what is shown of the work. Some(what is not met yet, one line
+/// per ask) when an ask is not shown met; None when every ask is, or when the decision cannot be
+/// read (the work is reported as it is). The verdict on every ask is kept on an `accept` note with
+/// `mark`'s fields (what was judged: a run's own work, or a finished tree of agents' tasks); a
+/// decision that could not be read leaves the note without a verdict, so the same work is not
+/// judged twice.
+async fn judge_asks(env: &RunEnv, journal: &mut Journal, asks: &[String], shown: Shown, mark: Value) -> Option<String> {
     let shape = env.data.shape("ACCEPT").cloned()?;
-    let entries = journal.entries_vec();
-    let plan = plan::at(&entries, plan_seq)?;
-    let asks = work_asks(&entries, &env.run_id);
-    if asks.is_empty() {
-        return None;
-    }
     let numbers: Vec<String> = (1..=asks.len()).map(|number| number.to_string()).collect();
     let shape = shape.filled(schemas::ASKS_PLACEHOLDER, &numbers, None);
-    let checks: HashSet<String> = plan.tasks.iter().flat_map(|task| task.checks.iter().map(|check| check.trim().to_owned())).collect();
-    let runs = project_runs(&env.data, &entries, &env.run_id, &checks);
-    let runs = if runs.is_empty() { env.data.text("accept_no_runs", &[]) } else { runs.join("\n") };
-    let mut files: Vec<String> = plan.steps_done.iter().flat_map(|step| step.changed_files.iter().cloned()).collect();
-    files.sort();
-    files.dedup();
-    let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
     let list: String = asks.iter().enumerate().map(|(index, ask)| format!("{}. {}\n", index + 1, env.data.text("ask_line", &[("quote", ask)]))).collect();
-    let checks = host_checks(&env.data, &entries, &env.run_id);
-    let checks = if checks.is_empty() { env.data.text("accept_no_checks", &[]) } else { checks };
-    let live = env.data.text("accept_live", &[("asks", list.trim_end()), ("files", &files), ("checks", checks.trim_end()), ("runs", runs.trim_end())]);
+    let live = env.data.text("accept_live", &[("asks", list.trim_end()), ("files", &shown.files), ("checks", shown.checks.trim_end()), ("runs", shown.runs.trim_end())]);
+    let marked = |note: Value| {
+        let mut note = note;
+        if let (Some(into), Some(from)) = (note.as_object_mut(), mark.as_object()) {
+            for (key, value) in from {
+                into.insert(key.clone(), value.clone());
+            }
+        }
+        note
+    };
     match decide_json::<schemas::Accept>(env, journal, "ACCEPT", &shape, &live).await {
         Ok((accept, _)) => {
             let unmet: String = accept
@@ -1356,17 +1548,168 @@ async fn accept_plan(env: &RunEnv, journal: &mut Journal, plan_seq: u64) -> Opti
                     Some(env.data.text("accept_unmet_item", &[("quote", quote), ("missing", judged.missing.trim()), ("evidence", &evidence)]))
                 })
                 .collect();
+            // The verdict on every ask is kept with the note: the report of the work tells each ask
+            // as it was judged ([`work_outcome`]), whether or not the work goes on for it.
+            let verdict: Vec<Value> = accept
+                .asks
+                .iter()
+                .filter_map(|judged| {
+                    let quote = asks.get(judged.ask.trim().parse::<usize>().ok()?.checked_sub(1)?)?;
+                    Some(json!({"quote": quote, "met": judged.met.trim(), "missing": judged.missing.trim(), "evidence": judged.evidence.trim()}))
+                })
+                .collect();
+            let text = if unmet.is_empty() { env.data.text("accept_met", &[]) } else { env.data.text("accept_note", &[("unmet", unmet.trim_end())]) };
+            let note = marked(json!({"text": text, "purpose": "accept", "run_id": env.run_id, "host_message": false, "asks": verdict}));
+            if let Err(error) = journal.append(kinds::NOTE, note).await {
+                tracing::warn!(%error, "the ACCEPT verdict could not be recorded");
+            }
             if unmet.is_empty() {
                 return None;
             }
-            let _ = journal.note(&env.run_id, "accept", &env.data.text("accept_note", &[("unmet", unmet.trim_end())]), false).await;
             Some(unmet.trim_end().to_owned())
         }
         Err(error) => {
             tracing::warn!(%error, "the ACCEPT decision could not be read; the work is reported as it is");
+            let note = marked(json!({"text": "", "purpose": "accept", "run_id": env.run_id, "host_message": false}));
+            let _ = journal.append(kinds::NOTE, note).await;
             None
         }
     }
+}
+
+/// ACCEPT when every task of the plan at `plan_seq` is done: each ask of the user judged by what
+/// the work's runs printed ([`judge_asks`]). None also when there is nothing to judge.
+async fn accept_plan(env: &RunEnv, journal: &mut Journal, plan_seq: u64) -> Option<String> {
+    let entries = journal.entries_vec();
+    let plan = plan::at(&entries, plan_seq)?;
+    let asks = work_asks(&entries, &env.run_id, Some(&plan.plan_id));
+    if asks.is_empty() {
+        return None;
+    }
+    let checks: HashSet<String> = plan.tasks.iter().flat_map(|task| task.checks.iter().map(|check| check.trim().to_owned())).collect();
+    let runs = project_runs(&env.data, &entries, &env.run_id, &checks);
+    let runs = if runs.is_empty() { env.data.text("accept_no_runs", &[]) } else { runs.join("\n") };
+    let mut files: Vec<String> = plan.steps_done.iter().flat_map(|step| step.changed_files.iter().cloned()).collect();
+    files.sort();
+    files.dedup();
+    let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
+    let checks = host_checks(&env.data, &entries, &env.run_id);
+    let checks = if checks.is_empty() { env.data.text("accept_no_checks", &[]) } else { checks };
+    judge_asks(env, journal, &asks, Shown { files, checks, runs }, json!({"plan_seq": plan_seq})).await
+}
+
+/// The newest finished tree of agents' tasks nobody has judged yet (the agents plugin's
+/// `delegation_done` note with what each task left: its state, files and last runs), with the plan
+/// version it carried out (the one whose root task it names). None when there is none, when it was
+/// judged already (an `accept` note names it), or when no plan of this conversation made the tree
+/// (work handed over without a plan has no asks ledger to judge by).
+fn unjudged_tree(entries: &[JournalEntry]) -> Option<(u64, Vec<Value>, u64, plan::Plan)> {
+    let done = entries.iter().rev().find(|entry| {
+        entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "delegation_done" && entry.data.get("tasks").and_then(Value::as_array).is_some_and(|tasks| !tasks.is_empty())
+    })?;
+    let judged = entries.iter().any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "accept" && entry.data.get("delegation").and_then(Value::as_u64) == Some(done.seq));
+    if judged {
+        return None;
+    }
+    let root = str_field(&done.data, "task_id");
+    let (plan_seq, plan) = entries.iter().rev().find_map(|entry| plan::parse(entry).filter(|plan| !root.is_empty() && plan.root_task.as_deref() == Some(root)).map(|plan| (entry.seq, plan)))?;
+    let facts = done.data.get("tasks").and_then(Value::as_array).cloned().unwrap_or_default();
+    Some((done.seq, facts, plan_seq, plan))
+}
+
+/// A plan the agents carried out is done as a tree of tasks; whether it is right is judged here,
+/// against what the user asked, before the session reports it (seen: nine agent tasks, none with a
+/// check, reported "done and green" with almost none of the asked work working; acceptance ran
+/// only for plans the session carried out itself).
+/// 1. Each task's end is recorded on the plan, from the agents plugin's facts: the report of the
+///    work says each task's state from these ([`tree_outcome`]).
+/// 2. ACCEPT judges every ask of the work by the tasks' states, the files they changed and what
+///    their agents' runs of the project's own commands printed last.
+/// 3. An ask not shown met, within `limits.accepts`: the tasks that meet it are written (the unmet
+///    replan) and go to agents as the plan did. True then: the work goes on, and the `managed` note
+///    says so.
+/// False when there is no such tree, when every ask is met, or when the acceptance rounds are
+/// spent: the reply is written from what was recorded.
+pub(crate) async fn accept_tree(env: &RunEnv, journal: &mut Journal) -> Result<bool, RpcError> {
+    let entries = journal.entries_vec();
+    let Some((delegation, facts, plan_seq, plan)) = unjudged_tree(&entries) else { return Ok(false) };
+    let fact_of = |task: &plan::PlanTask| facts.iter().find(|fact| task.task_id.as_deref().is_some_and(|id| str_field(fact, "task_id") == id));
+    let list = |fact: &Value, field: &str| -> Vec<String> { fact.get(field).and_then(Value::as_array).into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect() };
+    // Every task of a finished tree is done; what checked it is its state.
+    let steps: Vec<plan::StepDone> = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            let fact = fact_of(task);
+            let (check, detail) = match fact.map(|fact| str_field(fact, "state")).unwrap_or("") {
+                "passed" => ("passed", String::new()),
+                "failed" => ("left", task.checks.join("`, `")),
+                _ => ("", String::new()),
+            };
+            plan::StepDone { n: task.n, outcome: "done".into(), summary: String::new(), changed_files: fact.map(|fact| list(fact, "changed_files")).unwrap_or_default(), check: check.into(), check_detail: detail }
+        })
+        .collect();
+    journal.set(plan_seq, "steps_done", serde_json::to_value(&steps)?).await?;
+    let asks = work_asks(&entries, &env.run_id, Some(&plan.plan_id));
+    let mark = json!({"delegation": delegation, "plan_seq": plan_seq});
+    if asks.is_empty() {
+        // Nothing to judge by: the tree is marked seen, and the reply tells each task's state.
+        journal.append(kinds::NOTE, json!({"text": "", "purpose": "accept", "run_id": env.run_id, "host_message": false, "delegation": delegation, "plan_seq": plan_seq})).await?;
+        return Ok(false);
+    }
+    let mut files: Vec<String> = facts.iter().flat_map(|fact| list(fact, "changed_files")).collect();
+    files.sort();
+    files.dedup();
+    let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
+    let checks: String = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            let state = match fact_of(task).map(|fact| str_field(fact, "state")).unwrap_or("") {
+                "passed" => "accept_task_passed",
+                "failed" => "accept_task_failing",
+                _ => "accept_task_unchecked",
+            };
+            env.data.text("accept_task", &[("title", &task.title), ("state", &env.data.text(state, &[]))])
+        })
+        .collect();
+    let runs: String = facts
+        .iter()
+        .flat_map(|fact| fact.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+        .map(|run| {
+            let exit = run.get("exit_code").and_then(Value::as_i64).map(|code| code.to_string()).unwrap_or_else(|| "-".to_owned());
+            env.data.text("accept_run", &[("command", str_field(&run, "command")), ("exit", &exit), ("output", str_field(&run, "output").trim_end())])
+        })
+        .collect();
+    let runs = if runs.is_empty() { env.data.text("accept_no_runs", &[]) } else { runs };
+    let Some(unmet) = judge_asks(env, journal, &asks, Shown { files, checks, runs }, mark).await else { return Ok(false) };
+    if plan.accepts >= env.data.limits.accepts {
+        return Ok(false);
+    }
+    let failed = plan.tasks.len().max(1) as u32;
+    if !write_plan(env, journal, PlanMode::Replan { plan_seq, failed, outcome: "unmet".into(), summary: unmet.clone() }).await? {
+        return Ok(false);
+    }
+    let Some((new_seq, mut made)) = plan::for_run(&journal.entries_vec(), &env.run_id) else { return Ok(false) };
+    // A rewrite that added no task leaves nothing to start: the work is reported as it stands,
+    // with the asks as they were judged.
+    if made.tasks.len() <= made.steps_done.len() {
+        return Ok(false);
+    }
+    // The tree goes on: its root is open again while the new tasks are worked on.
+    if let Some(root) = made.root_task.clone()
+        && let Err(error) = env.host.get::<Task>(memory_methods::TASK_UPDATE, json!({"id": root, "status": "in_progress"})).await
+    {
+        tracing::warn!(%error, task = %root, "the plan's root task could not be opened again");
+    }
+    let started = match implement_by_agents(env, journal, new_seq, &mut made, false).await {
+        Ok(text) => text,
+        Err(error) if error.code == codes::CANCELLED => return Err(error),
+        Err(error) => env.data.text("implement_failed", &[("error", &error.message)]),
+    };
+    let text = joined(&[env.data.text("accept_note", &[("unmet", &unmet)]), started]);
+    journal.note(&env.run_id, "managed", &text, true).await?;
+    Ok(true)
 }
 
 fn decide_routes(full: Shape, route: &str) -> Shape {
@@ -1381,11 +1724,119 @@ fn decide_routes(full: Shape, route: &str) -> Shape {
     }
 }
 
+/// One task's (or the whole work's) state as the host recorded it, in plain words: how its loop
+/// ended and what the host's checks showed then.
+pub(crate) fn state_text(data: &crate::data::Dataset, outcome: &str, check: &str, detail: &str, summary: &str) -> String {
+    if outcome != "done" {
+        // The first paragraph of what stopped it: the report names the cause, not the whole log.
+        let why = summary.trim().split("\n\n").next().unwrap_or("").trim();
+        return data.text("outcome_state_ended", &[("outcome", outcome), ("summary", why)]);
+    }
+    match check {
+        "passed" => data.text("outcome_state_checked", &[]),
+        "left" => data.text("outcome_state_left", &[("checks", detail)]),
+        "unrun" => data.text("outcome_state_unrun", &[("checks", detail)]),
+        "failed" => data.text("outcome_state_failing", &[("checks", detail)]),
+        _ => data.text("outcome_state_unchecked", &[]),
+    }
+}
+
+/// Each task of `plan` with how it ended and what the checks showed on it, one line each (a task
+/// no loop was started for is "never started": the run ended, or its replans were spent, before it).
+fn tasks_outcome(data: &crate::data::Dataset, plan: &plan::Plan) -> String {
+    plan.tasks
+        .iter()
+        .map(|task| {
+            let n = task.n.to_string();
+            match plan.steps_done.iter().rev().find(|step| step.n == task.n) {
+                Some(step) => {
+                    let state = state_text(data, &step.outcome, &step.check, &step.check_detail, &step.summary);
+                    data.text("outcome_task", &[("n", &n), ("title", &task.title), ("state", &state)])
+                }
+                None => data.text("outcome_task_unstarted", &[("n", &n), ("title", &task.title)]),
+            }
+        })
+        .collect()
+}
+
+/// Each ask as an `accept` note's verdict judged it, one line each, under their heading; empty
+/// when the note holds no verdict.
+fn asks_outcome(data: &crate::data::Dataset, accept: &JournalEntry) -> String {
+    let asks: String = accept
+        .data
+        .get("asks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|ask| {
+            let quote = str_field(ask, "quote");
+            match (str_field(ask, "met"), str_field(ask, "missing")) {
+                ("yes", _) => data.text("outcome_ask_met", &[("quote", quote)]),
+                (_, "") => data.text("outcome_ask_unshown", &[("quote", quote)]),
+                (_, missing) => data.text("outcome_ask_unmet", &[("quote", quote), ("missing", missing)]),
+            }
+        })
+        .collect();
+    if asks.is_empty() { String::new() } else { data.text("outcome_asks", &[("asks", &asks)]) }
+}
+
+/// What the host recorded of the work this run did, for the reply: each task of its plan with how
+/// it ended and what the checks showed on it ([`tasks_outcome`]), the checks as the newest
+/// verification left them, and each ask as ACCEPT judged it when that verdict is of the work as it
+/// ended. Empty for a run that did no work.
+fn work_outcome(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
+    let Some(act) = entries.iter().rev().find(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "purpose") == "act_done") else {
+        return String::new();
+    };
+    let planned = plan::for_run(entries, run_id);
+    let tasks: String = match &planned {
+        Some((_, plan)) if !plan.tasks.is_empty() => tasks_outcome(data, plan),
+        // A change made without a plan: the one loop's own end.
+        _ => {
+            let state = state_text(data, str_field(&act.data, "outcome"), str_field(&act.data, "check"), str_field(&act.data, "check_detail"), str_field(&act.data, "summary"));
+            data.text("outcome_work", &[("state", &state)])
+        }
+    };
+    let checks = host_checks(data, entries, run_id);
+    let checks = if checks.is_empty() { String::new() } else { data.text("outcome_checks", &[("checks", &checks)]) };
+    // ACCEPT's verdict counts when no plan version was written after it (a later version means
+    // more work was done since, which that verdict did not see).
+    let newest_plan = planned.as_ref().map(|(seq, _)| *seq).unwrap_or(0);
+    let asks = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "purpose") == "accept" && entry.data.get("asks").is_some())
+        .filter(|entry| entry.seq > newest_plan)
+        .map(|entry| asks_outcome(data, entry))
+        .unwrap_or_default();
+    data.text("reply_outcome", &[("tasks", &tasks), ("checks", &checks), ("asks", &asks)])
+}
+
+/// What the host recorded of a plan the agents carried out, for the reply of the run that judged
+/// its finished tree ([`accept_tree`]): each task as the agents plugin left it and each ask as
+/// ACCEPT judged it. The verdict is left out when the work goes on (a plan version written after
+/// it with tasks still to do: it is no longer the state of the work). Empty for a run that judged
+/// no tree.
+fn tree_outcome(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
+    let Some(accept) = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "purpose") == "accept" && entry.data.get("delegation").is_some())
+    else {
+        return String::new();
+    };
+    let Some(plan) = accept.data.get("plan_seq").and_then(Value::as_u64).and_then(|seq| plan::at(entries, seq)) else { return String::new() };
+    let goes_on = plan::version_of(entries, &plan.plan_id).is_some_and(|(seq, newest)| seq > accept.seq && newest.tasks.len() > newest.steps_done.len());
+    let asks = if goes_on { String::new() } else { asks_outcome(data, accept) };
+    data.text("reply_outcome", &[("tasks", &tasks_outcome(data, &plan)), ("checks", ""), ("asks", &asks)])
+}
+
 fn act_note(outcome: &LoopOutcome) -> String {
-    let verified = match outcome.verified {
-        Some(true) => " The host's checks pass.",
-        Some(false) => " The host's checks do not pass.",
-        None => "",
+    let verified = match (outcome.verified, outcome.check.as_str()) {
+        (Some(true), _) => " The host's checks pass.",
+        (Some(false), _) => " The host's checks do not pass.",
+        (None, "unrun") => " The host's checks could not run here.",
+        (None, _) => "",
     };
     let files = if outcome.changed_files.is_empty() { "no files".to_owned() } else { outcome.changed_files.join(", ") };
     let calls = if outcome.tool_calls == 1 { "1 tool call".to_owned() } else { format!("{} tool calls", outcome.tool_calls) };
@@ -1473,6 +1924,13 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // The session's background work still open: the plan may take its place (`replaces`).
     let open_work = crate::manage::open_work(env, &entries).await;
     let open_labels: Vec<String> = open_work.iter().map(crate::manage::OpenWork::label).collect();
+    // One plan is at work in a folder at a time, and the host says which: a plan carried out at
+    // once takes the place of an earlier plan of this conversation whose agents still work. That
+    // plan's tasks still to do are carried like a replan's (named in `from`, dropped with why, or
+    // put back), its work stops when this plan starts, and what the user asked of it is asked of
+    // this plan too (seen: a second plan started beside the first; two agents did the same task
+    // and one deleted the other's files).
+    let earlier = if matches!(mode, PlanMode::Auto) { earlier_at_work(env, &entries, &open_work).await } else { None };
     // A plan written again names, for each task still to do from before, the new task that carries
     // it on or why it is dropped (seen: "run the end-to-end test" left out of a rewrite after task
     // 1, never run, the work reported done).
@@ -1486,7 +1944,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             let fix_title = env.data.text("baseline_task_title", &[]);
             previous.tasks.iter().skip(done).filter(|task| task.title != fix_title).cloned().collect()
         }
-        _ => Vec::new(),
+        _ => earlier.as_ref().map(|earlier| earlier.pending.clone()).unwrap_or_default(),
     };
     let pending_titles: Vec<String> = pending.iter().map(|task| task.title.clone()).collect();
     let shape = stage_shape(env, stage)?
@@ -1540,35 +1998,92 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         env.data.text("plan_done_live", &[("items", &items)])
     };
     // Each task's `skills` choose from the catalog, shown last.
-    let open_live = if open_work.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &open_work))]) };
+    // The earlier plan's own work is told with its carried tasks below (it stops); what is listed
+    // here is the work that may go on next to this plan.
+    let beside: Vec<crate::manage::OpenWork> = open_work.iter().filter(|item| earlier.as_ref().is_none_or(|earlier| !earlier.work.contains(&item.task.id))).cloned().collect();
+    let open_live = if beside.is_empty() { String::new() } else { env.data.text("open_work_live", &[("work", &crate::manage::work_lines(env, &beside))]) };
     // The direction the user set, then their latest words as they wrote them, right before how
     // the plan is written: the project's rules and the earlier work are in every prompt, and the
     // planner wrote the old design again from them (seen: twice after the user rejected it).
     let direction_live = direction(&env.data, &entries);
-    let asks = asks_live(&env.data, &entries, &env.run_id, "plan_asks", false);
-    let live = joined(&[direction_live, done_live, open_live, asks, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
+    let mut asks = asks_live(&env.data, &entries, &env.run_id, "plan_asks", false);
+    // A plan the host starts (the session's replan of its agents' work) has no message of its own:
+    // it is shown what the user asked of the work that no plan took up yet.
+    if asks.is_empty()
+        && let Some(earlier) = &earlier
+    {
+        let unplanned = asks_unplanned(&entries, &env.run_id, &earlier.plan.plan_id, false);
+        if !unplanned.is_empty() {
+            let list = unplanned.iter().enumerate().map(|(index, ask)| format!("{}. {}", index + 1, env.data.text("ask_line", &[("quote", ask)]))).collect::<Vec<_>>().join("\n");
+            asks = env.data.text("plan_asks", &[("asks", &list)]);
+        }
+    }
+    let carry_live = match &earlier {
+        Some(earlier) if !pending.is_empty() => {
+            let titles: String = pending.iter().map(|task| env.data.text("list_item", &[("text", &task.title)])).collect::<Vec<_>>().join("\n");
+            env.data.text("plan_carry_live", &[("plan_id", &earlier.plan.plan_id), ("tasks", &titles)])
+        }
+        _ => String::new(),
+    };
+    // The planner thinks before it writes: a constrained call cannot (its grammar takes the whole
+    // generation), so the thinking is a free call of its own, and its notes are the newest thing in
+    // the conversation when the plan is written. For a new plan, and for one written again after a
+    // task ended badly; a review, a steer and an unmet ask each say themselves what must change.
+    let think = match &mode {
+        PlanMode::Auto => true,
+        PlanMode::Asked => previous.is_none(),
+        PlanMode::Replan { outcome, .. } => !matches!(outcome.as_str(), "done" | "steered" | "unmet"),
+    };
+    if think {
+        plan_notes(env, journal, &joined(&[direction_live.clone(), done_live.clone(), open_live.clone(), carry_live.clone(), asks.clone(), edit.clone()])).await?;
+    }
+    let live = joined(&[direction_live, done_live, open_live, carry_live, asks, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
     let (mut doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
+    // A plan written again keeps what the work is for. The goal is the one the user's request
+    // set; the approach and the architecture stay too unless a task ended badly (then the approach
+    // is what changes). Only the user's own words (a steer) rewrite them: written again without
+    // thinking at every review, they drifted from the request (seen: the goal reworded at each
+    // replan until the run the user asked for was no longer in it).
+    if let (PlanMode::Replan { outcome, .. }, Some(previous)) = (&mode, &previous)
+        && outcome != "steered"
+    {
+        let keep = |now: &mut String, before: &String| {
+            if !before.trim().is_empty() {
+                *now = before.clone();
+            }
+        };
+        keep(&mut doc.goal, &previous.doc.goal);
+        if matches!(outcome.as_str(), "done" | "unmet") {
+            keep(&mut doc.approach, &previous.doc.approach);
+            keep(&mut doc.architecture, &previous.doc.architecture);
+        }
+    }
     let mut tasks = plan::merge_same_touches(tasks);
-    let (restored, dropped) = plan::carry_pending(&pending, &output, &mut doc, &mut tasks);
+    let (restored, mut dropped) = plan::carry_pending(&pending, &output, &mut doc, &mut tasks);
     if let (PlanMode::Asked, Some(previous)) = (&mode, &previous) {
         plan::keep_dependencies(previous, &mut tasks);
     }
-    // A task that redoes finished work (the same title, or the same files as a done task) is not
+    // A task that redoes finished work (the same title and the same files as a done task) is not
     // done twice (seen: a second plan wrote the adapter, its SGD and the transport again, and three
-    // agents redid what three others had finished).
+    // agents redid what three others had finished). Both must be the same: a new change to a file
+    // an earlier task touched is new work under another title, and with either one enough, a
+    // follow-up task on the one file an earlier task had changed was left out without a word. Each
+    // task left out is recorded with why, so the report of the work names it.
     if !done.is_empty() {
         let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-        let redone: HashSet<u32> = tasks
+        let redone: Vec<(u32, String)> = tasks
             .iter()
             .filter(|task| {
                 let files: HashSet<String> = plan::touched_files(task).into_iter().collect();
-                done.iter().any(|(title, done_files)| same(title, &task.title) || (!files.is_empty() && files == done_files.iter().cloned().collect::<HashSet<String>>()))
+                done.iter().any(|(title, done_files)| same(title, &task.title) && files == done_files.iter().cloned().collect::<HashSet<String>>())
             })
-            .map(|task| task.n)
+            .map(|task| (task.n, task.title.clone()))
             .collect();
         if !redone.is_empty() && redone.len() < tasks.len() {
-            tasks = plan::drop_tasks(tasks, &redone);
+            let why = env.data.text("plan_redone_why", &[]);
+            dropped.extend(redone.iter().map(|(_, title)| format!("{title}: {why}")));
+            tasks = plan::drop_tasks(tasks, &redone.iter().map(|(n, _)| *n).collect::<HashSet<u32>>());
         }
     }
     wait_where_tasks_meet(env, &mut tasks).await;
@@ -1577,9 +2092,20 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let mut made = match (&mode, &previous) {
         (PlanMode::Replan { outcome, .. }, Some(previous)) => {
             let mut replanned = plan::replanned(previous, doc, tasks, output.note.trim());
-            // The user's word is not a failure: it does not use up the replans.
-            if outcome == "steered" {
-                replanned.replans = previous.replans;
+            // Only a task that ended badly uses up the replans. The user's word is not a failure;
+            // a review after a task that ended well and an ask not shown met each have their own
+            // count (`limits.reviews`, `limits.accepts`).
+            match outcome.as_str() {
+                "steered" => replanned.replans = previous.replans,
+                "done" => {
+                    replanned.replans = previous.replans;
+                    replanned.reviews = previous.reviews + 1;
+                }
+                "unmet" => {
+                    replanned.replans = previous.replans;
+                    replanned.accepts = previous.accepts + 1;
+                }
+                _ => {}
             }
             replanned
         }
@@ -1594,20 +2120,41 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             root_task: None,
             steps_done: Vec::new(),
             replans: 0,
+            reviews: 0,
+            accepts: 0,
             by: String::new(),
             replaces: Vec::new(),
+            // The plan whose place it takes; a next version of the open plan keeps what that
+            // plan continues.
+            continues: earlier.as_ref().map(|earlier| earlier.plan.plan_id.clone()).or_else(|| open.as_ref().and_then(|(_, open)| open.continues.clone())),
         },
     };
-    if let Some(previous) = &previous {
-        let mut diff = plan::diff(previous, &made);
-        diff.tasks_dropped = dropped;
-        diff.tasks_restored = restored;
-        made.diff = Some(diff);
+    match &previous {
+        Some(previous) => {
+            let mut diff = plan::diff(previous, &made);
+            diff.tasks_dropped = dropped;
+            diff.tasks_restored = restored;
+            made.diff = Some(diff);
+        }
+        // A first version has no difference to show, only what the host left out of it or put back.
+        None if !dropped.is_empty() || !restored.is_empty() => {
+            made.diff = Some(plan::PlanDiff { tasks_dropped: dropped, tasks_restored: restored, ..Default::default() });
+        }
+        None => {}
     }
     if matches!(mode, PlanMode::Replan { .. }) {
         final_check_task(env, journal, &mut made);
     }
     made.replaces = open_work.iter().filter(|item| output.replaces.contains(&item.label())).map(|item| item.task.id.clone()).collect();
+    // The earlier plan's work stops with this plan's start, whatever the planner named: its agents'
+    // tasks, and its tasks not started yet (so none starts later beside this plan).
+    if let Some(earlier) = &earlier {
+        for id in earlier.work.iter().chain(earlier.pending.iter().filter_map(|task| task.task_id.as_ref())) {
+            if !made.replaces.contains(id) {
+                made.replaces.push(id.clone());
+            }
+        }
+    }
     // A runner job's plan is the manager's: a replan is offered to it and written only when it
     // says so.
     if let PlanMode::Replan { failed, outcome, summary, .. } = &mode
@@ -1627,6 +2174,90 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         cancel_replaced_tasks(env, previous, &made).await;
     }
     Ok(true)
+}
+
+/// The stage of the planner's thinking before a plan is written ([`plan_notes`]).
+pub(crate) const PLAN_NOTES: &str = "PLAN_NOTES";
+
+/// PLAN_NOTES: the planner thinks the work through before the constrained PLAN call writes it:
+/// one free call with thinking on and no tool use (the tools stay listed so the system block
+/// matches the other calls'; `none` refuses the tool-call token). Its answer streams into the
+/// transcript as it is written and is the newest thing in the conversation when the plan is
+/// written (seen: a plan for a whole system decided in one constrained generation, with a
+/// 1500-character field as its only thought). `live`: what the plan is made from (the direction,
+/// the asks, why it is written again). Off when `limits.plan_think_tokens` is 0. Written once per
+/// plan: a resumed run finds its notes after everything the plan is made from.
+async fn plan_notes(env: &RunEnv, journal: &mut Journal, live: &str) -> Result<(), RpcError> {
+    let budget = env.data.limits.plan_think_tokens;
+    if budget == 0 || env.data.stage(PLAN_NOTES).is_none() {
+        return Ok(());
+    }
+    let entries = journal.entries_vec();
+    let run = of_run(&entries, &env.run_id);
+    let since = run
+        .iter()
+        .filter(|entry| entry.kind == kinds::ROUTE || entry.kind == chatflow_kinds::PLAN || entry.kind == kinds::TOOL_RESULT || entry.kind == kinds::STEER)
+        .map(|entry| entry.seq)
+        .max()
+        .unwrap_or(0);
+    let written = run.iter().any(|entry| {
+        entry.seq > since
+            && entry.kind == kinds::ASSISTANT_MESSAGE
+            && str_field(&entry.data, "stage") == PLAN_NOTES
+            && entry.data.get("streaming").and_then(Value::as_bool) == Some(false)
+            && entry.data.get("interrupted").and_then(Value::as_bool) != Some(true)
+            && !str_field(&entry.data, "text").trim().is_empty()
+    });
+    if written {
+        return Ok(());
+    }
+    let messages = crate::fit::fitted(env, journal, |entries| {
+        let mut messages = base_messages(env, entries);
+        messages.push(prompts::stage_message(&env.data, &env.prefix.role, PLAN_NOTES, live));
+        messages
+    })
+    .await?;
+    let mut call = env.call(PLAN_NOTES, &env.data.effort.default, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
+    call.think_budget = Some(budget);
+    let any = env.stops.any();
+    llm::chat(journal, call, &any).await.map(|_| ())
+}
+
+/// An earlier plan of this conversation still at work in the folder when a new plan is about to
+/// be carried out.
+struct EarlierPlan {
+    /// Its newest version.
+    plan: plan::Plan,
+    /// Its tasks still to do (neither done nor cancelled; the host's own closing and build tasks
+    /// are made again for the new plan, not carried).
+    pending: Vec<plan::PlanTask>,
+    /// The tasks agents of this conversation work on for any plan (memory task ids).
+    work: Vec<String>,
+}
+
+/// The newest plan of this conversation one of whose tasks an agent still works on, with its tasks
+/// still to do; None when no agent works for a plan. Structural: the plans' own task records and
+/// the agents' records, as the memory and agents plugins hold them now.
+async fn earlier_at_work(env: &RunEnv, entries: &[JournalEntry], open_work: &[crate::manage::OpenWork]) -> Option<EarlierPlan> {
+    let planned: HashSet<String> = plan::all(entries).into_iter().flat_map(|plan| plan.tasks.into_iter().filter_map(|task| task.task_id)).collect();
+    let work: Vec<String> = open_work.iter().map(|item| item.task.id.clone()).filter(|id| planned.contains(id)).collect();
+    if work.is_empty() {
+        return None;
+    }
+    let plan_id = entries.iter().rev().filter_map(plan::parse).find(|plan| plan.tasks.iter().any(|task| task.task_id.as_ref().is_some_and(|id| work.contains(id))))?.plan_id;
+    let (_, plan) = plan::version_of(entries, &plan_id)?;
+    let host_titles = [env.data.text("baseline_task_title", &[]), env.data.text("build_task_title", &[])];
+    let mut pending = Vec::new();
+    for task in plan.tasks.iter().filter(|task| !host_titles.contains(&task.title)) {
+        let status = match &task.task_id {
+            Some(id) => env.host.get::<Task>(memory_methods::TASK_GET, json!({"id": id})).await.map(|record| record.status).unwrap_or_default(),
+            None => String::new(),
+        };
+        if !matches!(status.as_str(), "done" | "cancelled") {
+            pending.push(task.clone());
+        }
+    }
+    Some(EarlierPlan { plan, pending, work })
 }
 
 /// A replanned plan's last task, made again by the host: every check the tasks still to do pick,
@@ -1757,6 +2388,23 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     }) else {
         return journal.note(&env.run_id, "implement_done", &env.data.text("implement_none", &[]), true).await.map(|_| ());
     };
+    // One plan is at work in a folder at a time, and the newest wins. Agents still working for a
+    // plan written after this one: this plan does not start beside them (seen: "Implement" on an
+    // older plan's card while a newer plan's agents worked; two agents did the same task and one
+    // deleted the other's files). Agents working for an older plan stop when this one starts.
+    let open_work = crate::manage::open_work(env, &entries).await;
+    if let Some(earlier) = earlier_at_work(env, &entries, &open_work).await.filter(|earlier| earlier.plan.plan_id != current.plan_id) {
+        let first = |plan_id: &str| entries.iter().find(|entry| entry.kind == chatflow_kinds::PLAN && str_field(&entry.data, "plan_id") == plan_id).map(|entry| entry.seq).unwrap_or(0);
+        if first(&earlier.plan.plan_id) > first(&current.plan_id) {
+            let text = env.data.text("implement_newer", &[("plan_id", &current.plan_id), ("newer", &earlier.plan.plan_id), ("goal", earlier.plan.doc.goal.trim())]);
+            return journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ());
+        }
+        for id in earlier.work.iter().chain(earlier.pending.iter().filter_map(|task| task.task_id.as_ref())) {
+            if !current.replaces.contains(id) {
+                current.replaces.push(id.clone());
+            }
+        }
+    }
     journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
     journal.set(plan_seq, "implement_run", json!(env.run_id)).await?;
     stop_replaced_work(env, journal, plan_seq, &current).await?;
@@ -1997,11 +2645,15 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
     }
     materialize_plan_tasks(env, journal, plan_seq, current, &[]).await?;
     let spawned: HashSet<String> = journal.entries().filter(|entry| entry.kind == kinds::AGENT_SPAWNED).map(|entry| str_field(&entry.data, "task_id").to_owned()).collect();
-    let mut text = env.data.text("implement_started", &[("plan_id", &current.plan_id), ("version", &current.version.to_string()), ("count", &current.tasks.len().to_string())]);
+    // The tasks done before (a plan written again after its tree finished keeps them): only the
+    // ones still to do are started and listed, and one that waits only for done tasks is ready.
+    let done: HashSet<u32> = current.steps_done.iter().filter(|step| step.outcome == "done").map(|step| step.n).collect();
+    let open = current.tasks.iter().filter(|task| !done.contains(&task.n)).count();
+    let mut text = env.data.text("implement_started", &[("plan_id", &current.plan_id), ("version", &current.version.to_string()), ("count", &open.to_string())]);
     let mut started = Vec::new();
-    for task in &current.tasks {
+    for task in current.tasks.iter().filter(|task| !done.contains(&task.n)) {
         let Some(task_id) = task.task_id.clone() else { continue };
-        let ready = task.depends_on.is_empty();
+        let ready = task.depends_on.iter().all(|n| done.contains(n));
         if ready && !spawned.contains(&task_id) {
             let record: cc_protocol::contracts::memory::AgentRecord = env
                 .host
@@ -2011,7 +2663,8 @@ async fn implement_by_agents(env: &RunEnv, journal: &mut Journal, plan_seq: u64,
             started.push(record.name.clone());
         }
         let assignee = String::new();
-        let depends = if task.depends_on.is_empty() { String::new() } else { env.data.text("delegated_after", &[("count", &task.depends_on.len().to_string())]) };
+        let waits = task.depends_on.iter().filter(|n| !done.contains(n)).count();
+        let depends = if waits == 0 { String::new() } else { env.data.text("delegated_after", &[("count", &waits.to_string())]) };
         text.push_str(&env.data.text("delegated_task", &[("title", &task.title), ("assignee", &assignee), ("depends", &depends)]));
     }
     if !started.is_empty() {
@@ -2338,9 +2991,20 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
     journal.note(&env.run_id, "knowledge_done", "", false).await.map(|_| ())
 }
 
-/// Whether a plan task's work stands verified: since the task started, a `run` that exited 0
-/// came after the task's last edit (a task that edited nothing counts from its start).
-fn verified_since_last_edit(entries: &[JournalEntry], run_id: &str, task_id: &str) -> bool {
+/// Whether a plan task's work stands verified: since the task started, a check that passed came
+/// after the task's last edit (a task that edited nothing counts from its start). A check is a run
+/// the tools read as a test report with tests in it, or a run of one of `checks` (the task's own
+/// checks and the project's check commands, also with arguments after them). Any other command
+/// that exits 0 shows nothing (seen: a stopped task counted done on an `ls`).
+fn verified_since_last_edit(entries: &[JournalEntry], run_id: &str, task_id: &str, checks: &[String]) -> bool {
+    let checks: Vec<String> = checks.iter().map(|check| crate::repetition::base_command(check)).filter(|check| !check.is_empty()).collect();
+    let is_check = |command: &str, display: &Value| {
+        if display.get("tests").is_some_and(Value::is_object) && display.get("no_tests").and_then(Value::as_bool) != Some(true) {
+            return true;
+        }
+        let base = crate::repetition::base_command(command);
+        !base.is_empty() && checks.iter().any(|check| base == *check || base.starts_with(&format!("{check} ")))
+    };
     let Some(start) = entries
         .iter()
         .rev()
@@ -2349,18 +3013,25 @@ fn verified_since_last_edit(entries: &[JournalEntry], run_id: &str, task_id: &st
     else {
         return false;
     };
-    let mut tools: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // call id -> (tool, its command when it is a run)
+    let mut tools: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
     let mut last_edit = start;
     let mut last_pass = 0;
     for entry in entries.iter().filter(|entry| entry.seq > start) {
         let call_id = str_field(&entry.data, "call_id").to_owned();
         match entry.kind.as_str() {
             kinds::TOOL_CALL if str_field(&entry.data, "run_id") == run_id && entry.data.get("host").and_then(Value::as_bool) != Some(true) => {
-                tools.insert(call_id, str_field(&entry.data, "tool").to_owned());
+                let command = entry.data.get("args").map(|args| str_field(args, "command").to_owned()).unwrap_or_default();
+                tools.insert(call_id, (str_field(&entry.data, "tool").to_owned(), command));
             }
-            kinds::TOOL_RESULT => match tools.get(&call_id).map(String::as_str) {
-                Some("edit") if entry.data.get("ok").and_then(Value::as_bool) == Some(true) => last_edit = entry.seq,
-                Some("run") if entry.data.get("display").and_then(|display| display.get("exit_code")).and_then(Value::as_i64) == Some(0) => last_pass = entry.seq,
+            kinds::TOOL_RESULT => match tools.get(&call_id).map(|(tool, command)| (tool.as_str(), command.as_str())) {
+                Some(("edit", _)) if entry.data.get("ok").and_then(Value::as_bool) == Some(true) => last_edit = entry.seq,
+                Some(("run", command)) => {
+                    let display = entry.data.get("display").cloned().unwrap_or(Value::Null);
+                    if display.get("exit_code").and_then(Value::as_i64) == Some(0) && is_check(command, &display) {
+                        last_pass = entry.seq;
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -2534,6 +3205,19 @@ pub(crate) fn asks_live(data: &crate::data::Dataset, entries: &[JournalEntry], r
     data.text(text, &[("asks", &list)])
 }
 
+/// The closing lines of a STATUS answer: the user's question and the step to take with the agents,
+/// tasks and board the host read. Never empty: a stage message that only names its stage gives the
+/// model nothing to do but repeat it (seen: the whole reply was "[host] Stage: ASK.").
+pub(crate) fn status_live(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &str) -> String {
+    let asks = asks_live(data, entries, run_id, "status_asks", true);
+    if asks.is_empty() { data.text("status_step", &[]) } else { asks }
+}
+
+/// Whether ROUTE sent this run to `route`.
+pub(crate) fn routed(entries: &[JournalEntry], run_id: &str, route: &str) -> bool {
+    entries.iter().any(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == run_id && str_field(&entry.data, "stage") == "route" && str_field(&entry.data, "route") == route)
+}
+
 /// The direction the user set for the whole work: the latest message ROUTE read as laying it out
 /// (`direction: states`: the message), or as accepting the design in the answer before it
 /// (`approves`: that answer and the message); a later message that sets the direction aside
@@ -2555,7 +3239,7 @@ pub(crate) fn direction(data: &crate::data::Dataset, entries: &[JournalEntry]) -
         let said = str_field(&message.data, "text").trim();
         let answer = entries
             .iter()
-            .filter(|entry| entry.seq < message.seq && entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty())
+            .filter(|entry| entry.seq < message.seq && entry.kind == kinds::ASSISTANT_MESSAGE && str_field(&entry.data, "stage") != PLAN_NOTES && !str_field(&entry.data, "text").trim().is_empty())
             .last()
             .map(|entry| str_field(&entry.data, "text").trim().to_owned())
             .unwrap_or_default();

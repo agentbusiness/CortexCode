@@ -103,6 +103,8 @@ pub struct CodeTree {
     sync_lock: Mutex<()>,
     /// A write that failed or was cancelled must be reconciled before content can be skipped.
     sync_pending: AtomicBool,
+    /// A pass over the whole tree is running ([`CodeTree::full_index`]): minutes on a large tree.
+    whole_running: AtomicBool,
     /// Outgoing-edge hash per file as stored in the graph (`File.edge_hash`).
     edge_hashes: Mutex<HashMap<String, String>>,
     /// Directory structure hash as stored (`Repo.structure_hash`).
@@ -493,6 +495,7 @@ impl CodeTree {
             status: Mutex::new(TreeStatus { state: "indexing".into(), externals_state: "pending".into(), ..TreeStatus::default() }),
             sync_lock: Mutex::new(()),
             sync_pending: AtomicBool::new(legacy_pending),
+            whole_running: AtomicBool::new(false),
             edge_hashes: Mutex::new(HashMap::new()),
             structure_hash: Mutex::new(String::new()),
             indexes_created: Mutex::new(false),
@@ -523,6 +526,15 @@ impl CodeTree {
     /// The existing sync gate owns preparation as well as persistence, so concurrent refreshes
     /// cannot compare against an older model and then publish out of order.
     async fn full_index_owned(&self) -> Result<SyncReport, RpcError> {
+        // Said for as long as the pass runs, however it ends (an error, a cancelled call).
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.whole_running.store(true, Ordering::Release);
+        let _running = Running(&self.whole_running);
         let started = Instant::now();
         let snapshot = self.langs.snapshot().await;
         self.note_plugins(&snapshot).await;
@@ -658,6 +670,17 @@ impl CodeTree {
         report.total_ms = started.elapsed().as_millis() as u64;
         tracing::info!(project = %self.ig_name, parse_ms = report.parse_ms, history_ms, resolve_ms = report.resolve_ms, write_ms = report.write_ms, upkeep_ms, repairing, "index phases");
         Ok(report)
+    }
+
+    /// Whether refreshing `paths` now means a pass over the whole tree: one is running, one of the
+    /// paths changes which files belong to the tree (`.gitignore`), or a write that stopped halfway
+    /// is owed its repair. A caller that waits for its own edit does not wait for that (seen: a
+    /// turn that wrote `.gitignore` stood sixteen minutes behind the index dropping 31,000 files).
+    pub fn whole_pass(&self, paths: &[String]) -> bool {
+        self.whole_running.load(Ordering::Acquire)
+            || paths.iter().any(|path| crate::watch::changes_membership(&self.root, &self.root.join(path)))
+            // Pending with the gate free: no sync is writing, so the last one did not finish.
+            || (self.sync_pending.load(Ordering::Acquire) && self.sync_lock.try_lock().is_ok())
     }
 
     /// Re-index specific paths (repository-relative): re-read those that exist, retire the rest.

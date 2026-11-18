@@ -10,11 +10,15 @@ label = "chatflow-data 1"
 
 # Stage rules in each role's byte-stable system prompt, in order: only what that role's calls need.
 # A stage outside its role's list carries its rules in its own trailing stage message: the one-shot
-# grammar stages (CHECKS, SPEC, SPEC_EDIT, PLAN, PLAN_EDIT, DECISIONS) run once per occurrence, so
+# grammar stages (ROUTE, DECIDE, CHECKS, PLAN, PLAN_EDIT, REVIEW, ACCEPT) run once per occurrence, so
 # their rules cost about 100-300 uncached prefill tokens there instead of context on every call.
 [protocol]
-# Chat sessions: the foreground flow.
-chat = ["ROUTE", "DECIDE", "REPLY", "DO", "ASK"]
+# Chat sessions: the stages whose calls repeat within a turn (the work loop's steps, a question's
+# steps, the reply). ROUTE and DECIDE bring their rules in their own message: each runs once per
+# message (DECIDE only for a plan or a delegation), while their rules, about 1100 tokens of
+# routing cases, sat in the prompt of every working step, where none of them applies. The cost is
+# those tokens read again at each ROUTE call instead of once per session.
+chat = ["REPLY", "DO", "ASK"]
 # Background agents: their task loop (their CHECKS decision brings its own rules).
 agent = ["TASK"]
 
@@ -61,14 +65,24 @@ task = "low"
 # Times the plan of a decided change is written again, per turn: a task ended badly, or REVIEW found
 # the tasks still to do no longer fit (the done tasks stay; the rest is planned anew).
 replans = 3
+# Times REVIEW may write the tasks still to do again after a task that ended well, per plan. Its own
+# count: a review is not a failure, and counted as one it used up the replans (seen: three reviews,
+# then a stuck task with no replan left, the tasks after it never started and the work reported).
+reviews = 3
+# Times ACCEPT may send the work on because an ask of the user is not shown met, per plan. Its own
+# count: with the replans spent on reviews and failures, acceptance never ran and the work was
+# reported done unchecked against what was asked.
+accepts = 2
 # Tool calls one plan task may make before it is stuck (0 = no limit). Off: a fixed count stopped
 # tasks that were still converging; stuck is the same failure repeating (`fix_cycles`).
 task_calls = 0
 # Most thinking tokens per step of a plan task: execution, so the work is in tool calls and values
-# come from running code (the effort's own budget, 2048 for low, left room to trace code by hand).
-# 1024: little-coder runs small Qwen models at 2048; the Qwen card warns too little thinking costs
-# retries. A hypothesis to measure (A/B against 2048), not a settled value.
-task_think_tokens = 1024
+# come from running code. 4096: at 1024, 192 of 892 model calls in the journals ended their
+# thinking at the cut (the thought stops on "I have to give the solution based on the thinking
+# directly now"), and a step cut mid-thought reads again to rebuild what it could not finish (see
+# `fix_think_tokens`). little-coder now runs small Qwen models at 4096, and the Qwen card says a
+# lower reasoning effort does not always shorten a task.
+task_think_tokens = 4096
 # A plan task whose same command still fails after this many edit-and-rerun cycles is stuck too
 # (debugging decays within 2-3 attempts): the tasks still to do are written again.
 fix_cycles = 3
@@ -85,13 +99,20 @@ stall_runs = 20
 # 0: at 384, 310 of one agent's 424 steps were cut off mid-thought, and after a cut 61% of its
 # calls were reads (it read to rebuild the plan it could not finish thinking).
 fix_think_tokens = 0
-# Any other agent loop's step (a question, a follow-up). Every step has a budget: the model plugin's
-# own table (4096 for medium) never applies (seen: a loop without a plan step ran 4k thoughts for
-# two hours).
-loop_think_tokens = 1024
+# Any other agent loop's step (a question, a follow-up). Every step has a budget, the same as a
+# plan task's step and for the same reason: no budget at all let the effort's own table apply
+# (seen: a loop without a plan step thought at every step for two hours), and 1024 cut thoughts
+# short (see `task_think_tokens`).
+loop_think_tokens = 4096
 # A reply's thinking (REPLY): the answer is written from what the turn read, so it needs a plan of
 # the answer, not a re-derivation. Without it the model plugin's table applied (16384 at xhigh).
 reply_think_tokens = 2048
+# The planner's thinking before a plan is written (PLAN_NOTES, a free call before the constrained
+# PLAN call, which cannot think): its notes are the newest thing in the conversation when the plan
+# is written. Seen: the plan of a whole system decided in one constrained generation, with a
+# 1500-character field as its only thought; its tasks named files nobody had looked at. 0 = no
+# notes: the plan is written at once, as before.
+plan_think_tokens = 4096
 # What the session that started agents is told about each when it checks on them (MANAGE): an
 # agent with this many calls since its last edit is named as reading without writing (seen: 103
 # reads and no edit in 90 minutes), one with no step for this many minutes as not moving (seen: an
@@ -211,7 +232,7 @@ effort = "none"
 sampling = "decision"
 
 # After a task that ended well, before the next: do the tasks still to do fit what the work
-# showed? `replan` yes writes them again (within `replans`).
+# showed? `replan` yes writes them again (within `reviews`).
 [stage.REVIEW]
 rules = "review"
 schema = "schemas/review.json"
@@ -219,7 +240,7 @@ effort = "none"
 sampling = "decision"
 
 # When every task of a plan is done: is each thing the user asked shown done by the runs' output?
-# An ask that is not writes the tasks that meet it (within `replans`).
+# An ask that is not writes the tasks that meet it (within `accepts`).
 [stage.ACCEPT]
 rules = "accept"
 schema = "schemas/accept.json"
@@ -251,16 +272,18 @@ rules = "reply"
 effort = "decided"
 sampling = "auto"
 
-# EXPERIMENT (2026-10-19, rule checks): `experiment_rule_checks` asks for one check per rule the
-# request states only in words (seen: a rule with no example broken unnoticed). To switch it off,
-# remove the id from DO's and TASK's rules (the prompt file can stay).
+# The experiment of 2026-10-19 (`experiment_rule_checks`: one check per rule the request states only
+# in words) is off since 2026-11-18: with the plan's "a test for each rule" it grew into tests
+# nobody asked for (seen: thirty minutes of test steps while the run the user asked for waited).
+# A change is checked by the project's own tests that cover it and by running what the user asked
+# to run (policy). To switch it on again, add the id to DO's and TASK's rules.
 [stage.DO]
-rules = ["do", "experiment_rule_checks"]
+rules = "do"
 effort = "decided"
 sampling = "auto"
 
 [stage.TASK]
-rules = ["task", "experiment_rule_checks"]
+rules = "task"
 effort = "decided"
 sampling = "auto"
 
@@ -275,6 +298,13 @@ sampling = "auto"
 rules = ["plan", "plan_fields", "check_rules"]
 schema = "schemas/plan.json"
 effort = "none"
+sampling = "auto"
+
+# Before PLAN (a new plan, or one written again after a task ended badly): the planner's notes,
+# free text with thinking, no tools. `limits.plan_think_tokens` = 0 switches it off.
+[stage.PLAN_NOTES]
+rules = "plan_notes"
+effort = "medium"
 sampling = "auto"
 
 # A message while a plan is open: the plan's whole next version.

@@ -5,36 +5,64 @@
 //!   for the `repeat_at`-th time (data, shipped as 3) since the last correction is a repetition;
 //! - the same failing contract report for the third time is a repetition;
 //! - a generation the model plugin stopped as repeating itself (`finish_reason = repeated`) is one.
-//! - the same command (its first command, without output filters and redirections) run for the
+//! - the same command ([`base_command`]: without output filters and redirections) run for the
 //!   `repeat_at`-th time or more with no edit in between is a rerun, whatever its filters show and
 //!   however they end (a `| grep` that matches nothing exits 1): told at each such run that it
 //!   cannot show anything new (seen: a passing test run again eight times, each with another
 //!   `| grep`; clippy run twenty times between two edits, each filter keyed apart by its exit
 //!   status), never a stop.
 //!
-//! The first repetition earns a corrective replanning message; a repetition after that stops the
-//! run with an honest status. A repeated read never stops it: reading a file again changes
+//! The first repetition of a call earns a corrective replanning message; that same call repeating
+//! again after its correction stops the run with an honest status. Another call that repeats later
+//! earns its own correction first: one correction for the whole task stopped a long task at its
+//! second, unrelated repeat. A repeated read never stops it: reading a file again changes
 //! nothing and costs one call, while stopping ends work that may be close to done (seen: a task
 //! stopped mid-fix for reading its own file twice). It earns the correction once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The model's read tool (files, folders, URIs).
 const READ: &str = "read";
 /// The model's command tool.
 const RUN: &str = "run";
 
-/// The command a `run` call is about: its first command that is not `cd`, `echo` or `sleep`,
-/// without what follows a pipe and without redirections (`cargo test x 2>&1 | grep ok` and
-/// `echo ==; cargo test x > log` are both `cargo test x`). Mechanical; empty when none.
+/// Programs that only set the scene for the command a `run` call is about.
+const SETTING: [&str; 5] = ["cd", "echo", "sleep", "printf", "export"];
+
+/// Whether a word sets a shell variable (`NAME=value`): before a command word it is a setting of
+/// that command, alone it is a statement that runs nothing.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else { return false };
+    let mut chars = name.chars();
+    chars.next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The command a `run` call is about: its first command that is not `cd`, `echo`, `sleep`,
+/// `printf` or `export`, without what follows a pipe, without redirections and without the
+/// `NAME=value` settings before it (`cargo test x 2>&1 | grep ok`, `echo ==; cargo test x > log`
+/// and `R=/repo; RUST_BACKTRACE=1 cargo test x` are all `cargo test x`). A statement that only
+/// sets variables is no command.
+/// A command given its script in the call itself (an option `-c` or `-e` followed by a quoted
+/// script, or a here-document) is the whole call, script included: its program and option say
+/// nothing about what it runs (seen: every `python3 -c "…"` of a task counted as one command, and
+/// every line that began `R=/path;`; 55 of 57 rerun notes were about commands never run before).
+/// Mechanical; empty when none.
 pub fn base_command(command: &str) -> String {
-    command
-        .split(|c| c == ';' || c == '\n')
-        .flat_map(|part| part.split("&&"))
-        .flat_map(|part| part.split("||"))
-        .map(|part| part.split('|').next().unwrap_or("").split_whitespace().take_while(|word| !word.contains('>') && !word.starts_with('<')).collect::<Vec<_>>().join(" "))
-        .find(|part| !part.is_empty() && !["cd", "echo", "sleep", "printf"].contains(&part.split(' ').next().unwrap_or("")))
-        .unwrap_or_default()
+    let statements = command.split(|c| c == ';' || c == '\n').flat_map(|part| part.split("&&")).flat_map(|part| part.split("||"));
+    for statement in statements {
+        let head = statement.split('|').next().unwrap_or("");
+        let words: Vec<&str> = head.split_whitespace().skip_while(|word| is_assignment(word)).take_while(|word| !word.contains('>') && !word.starts_with('<')).collect();
+        let Some(program) = words.first() else { continue };
+        if SETTING.contains(program) {
+            continue;
+        }
+        let script_option = words.windows(2).skip(1).any(|pair| matches!(pair[0], "-c" | "-e") && pair[1].starts_with(['"', '\'', '$']));
+        if script_option || head.contains("<<") {
+            return command.trim().to_owned();
+        }
+        return words.join(" ");
+    }
+    String::new()
 }
 
 /// FNV-1a 64: a stable fingerprint (mechanical; equality of bytes, not meaning).
@@ -68,9 +96,9 @@ pub fn canonical(value: &serde_json::Value) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     Fine,
-    /// First repetition since the run started (or since the last user input): replan.
+    /// A call's first repetition since the run started (or since the last user input): replan.
     Replan(String),
-    /// Repeated again after a replan: stop.
+    /// The same call repeated again after its own correction: stop.
     Stop(String),
     /// The same read with the same result for the `READ_REPEAT_AT`-th time: told once that the
     /// content is above (a reread is harmless; it never escalates or stops the run).
@@ -86,18 +114,26 @@ const READ_REPEAT_AT: u32 = 3;
 #[derive(Debug)]
 pub struct Detector {
     seen: HashMap<(String, u64), u32>,
-    corrected: bool,
+    /// The calls (their signatures) that earned their correction already: one of them repeating
+    /// again stops the run. Per call, so a second, unrelated repeat late in a long task gets its
+    /// own correction instead of ending the task.
+    corrected: HashSet<String>,
+    /// A generation stopped as repeating itself was corrected already.
+    text_corrected: bool,
     /// A repeated read was corrected already (it is told once; reads never stop the run).
     read_corrected: bool,
     /// How many identical (call, result) pairs make a repetition (data: `limits.repeat_at`).
     repeat_at: u32,
     /// Base command of the runs since the last edit, with their count.
     runs: HashMap<String, u32>,
+    /// The workspace changed since the last reset (an edit, a command that wrote files): the
+    /// work is past finding out, so a rerun's next step is an edit.
+    edited: bool,
 }
 
 impl Detector {
     pub fn new(repeat_at: u32) -> Self {
-        Self { seen: HashMap::new(), corrected: false, read_corrected: false, repeat_at: repeat_at.max(2), runs: HashMap::new() }
+        Self { seen: HashMap::new(), corrected: HashSet::new(), text_corrected: false, read_corrected: false, repeat_at: repeat_at.max(2), runs: HashMap::new(), edited: false }
     }
 
     /// Canonical signature of a call: arguments with object keys sorted (mechanical).
@@ -155,39 +191,52 @@ impl Detector {
         *count += 1;
         if *count >= self.repeat_at {
             let what = format!("`{}`", signature.chars().take(300).collect::<String>());
-            return self.escalate(what);
+            // This call was corrected before and repeats again: stop. Its first time: its
+            // correction, and every count starts again.
+            if self.corrected.contains(signature) {
+                return Verdict::Stop(what);
+            }
+            self.corrected.insert(signature.to_owned());
+            self.seen.clear();
+            return Verdict::Replan(what);
         }
         Verdict::Fine
     }
 
-    /// The model plugin stopped a generation for repeating itself.
+    /// The model plugin stopped a generation for repeating itself: corrected once, then a stop
+    /// (its own count, apart from the calls').
     pub fn generation_repeated(&mut self) -> Verdict {
-        self.escalate("the same text".to_owned())
-    }
-
-    fn escalate(&mut self, what: String) -> Verdict {
-        if self.corrected {
+        let what = "the same text".to_owned();
+        if self.text_corrected {
             Verdict::Stop(what)
         } else {
-            self.corrected = true;
+            self.text_corrected = true;
             self.seen.clear();
             Verdict::Replan(what)
         }
+    }
+
+    /// Whether the workspace changed since the last reset (the task made an edit).
+    pub fn edited(&self) -> bool {
+        self.edited
     }
 
     /// New input from the user, or a new plan task, resets the detector.
     pub fn reset(&mut self) {
         self.seen.clear();
         self.runs.clear();
-        self.corrected = false;
+        self.corrected.clear();
+        self.text_corrected = false;
         self.read_corrected = false;
+        self.edited = false;
     }
 
     /// The workspace changed (an edit, a command that wrote files): the same call returning the
     /// same output after it is a fix that did not work, not a loop; counting starts again. The
-    /// correction already given stands.
+    /// corrections already given stand.
     pub fn changed(&mut self) {
         self.seen.clear();
         self.runs.clear();
+        self.edited = true;
     }
 }

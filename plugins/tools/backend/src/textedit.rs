@@ -114,7 +114,7 @@ fn match_positions(text: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// Text with the `N:hh|` prefixes of read's lines taken off, when every non-empty line carries one
+/// Text with the `N:hhhh|` prefixes of read's lines taken off, when every non-empty line carries one
 /// whose tag verifies (copied from read output); None otherwise.
 fn strip_prefixes(text: &str) -> Option<String> {
     let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
@@ -122,7 +122,7 @@ fn strip_prefixes(text: &str) -> Option<String> {
 }
 
 /// Exact replacements applied in order, all or nothing. Each `old` must match exactly once unless
-/// `all` is set. A CRLF file accepts `\n` in old/new (converted, journaled). `N:hh|` prefixes
+/// `all` is set. A CRLF file accepts `\n` in old/new (converted, journaled). `N:hhhh|` prefixes
 /// copied from read output into old or new come off (as with anchored edits' text). `path` names
 /// the file in the refusal.
 pub fn replace(path: &str, text: &str, replacements: &[(String, String, bool)]) -> Result<TextChange, TextEditError> {
@@ -138,7 +138,7 @@ pub fn replace(path: &str, text: &str, replacements: &[(String, String, bool)]) 
         for (field, value) in [("old", &mut old), ("new", &mut new)] {
             if let Some(stripped) = strip_prefixes(value) {
                 *value = stripped;
-                notes.push(format!("removed N:hh| prefixes copied into `{field}`"));
+                notes.push(format!("removed N:hhhh| prefixes copied into `{field}`"));
             }
         }
         let (old, new) = if crlf && old.contains('\n') && !old.contains("\r\n") && !current.contains(old.as_str()) {

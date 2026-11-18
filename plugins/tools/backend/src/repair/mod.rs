@@ -927,7 +927,9 @@ fn normalize_op(args: &mut Args, value: Value) -> Result<String, RepairError> {
     }
 }
 
-/// Anchor value: `N:hh` (also from a copied `N:hh|text` line), `0`, or a bare line number. A bare
+/// Anchor value: `N:hhhh` (also from a copied `N:hhhh|text` line), `0`, or a bare line number. An
+/// anchor in the earlier two-character form goes through as written: the edit refuses it as stale
+/// and shows the lines there with their anchors. A bare
 /// number goes through as a number: the edit uses it only while the file is exactly as the session
 /// last read it, and refuses it otherwise (seen: `at: 307` refused while the file had not changed).
 fn anchor_value(args: &mut Args, field: &str, value: Value) -> Result<Value, RepairError> {
@@ -939,7 +941,7 @@ fn anchor_value(args: &mut Args, field: &str, value: Value) -> Result<Value, Rep
         Value::Number(number) => match number.as_u64() {
             Some(0) => Ok(Value::String("0".to_owned())),
             Some(line) => bare(line),
-            None => Err(RepairError::new("bad_argument", format!("`{field}` = {number} is not a line; use the line's anchor N:hh from read output")).tool("edit").field(field)),
+            None => Err(RepairError::new("bad_argument", format!("`{field}` = {number} is not a line; use the line's anchor N:hhhh from read output")).tool("edit").field(field)),
         },
         Value::String(text) => {
             let trimmed = text.trim();
@@ -953,20 +955,23 @@ fn anchor_value(args: &mut Args, field: &str, value: Value) -> Result<Value, Rep
             if trimmed == "0" || trimmed.starts_with("0:") {
                 return Ok(Value::String("0".to_owned()));
             }
+            if cc_protocol::hashline::parse_old_anchor(trimmed).is_some() {
+                return Ok(Value::String(trimmed.to_owned()));
+            }
             if let Ok(line) = trimmed.parse::<u64>() {
                 return bare(line);
             }
             Err(RepairError::new(
                 "bad_argument",
                 format!(
-                    "`{field}` = \"{}\" is not an anchor; copy the N:hh prefix of the line from read output (e.g. \"12:ab\")",
+                    "`{field}` = \"{}\" is not an anchor; copy the N:hhhh prefix of the line from read output (e.g. \"12:abcd\")",
                     trimmed.chars().take(40).collect::<String>()
                 ),
             )
             .tool("edit")
             .field(field))
         }
-        other => Err(RepairError::new("bad_argument", format!("`{field}` must be an anchor like \"12:ab\", got {}", kind_of(&other)))
+        other => Err(RepairError::new("bad_argument", format!("`{field}` must be an anchor like \"12:abcd\", got {}", kind_of(&other)))
             .tool("edit")
             .field(field)),
     }

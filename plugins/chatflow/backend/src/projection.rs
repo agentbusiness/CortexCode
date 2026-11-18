@@ -160,7 +160,12 @@ fn digests(entries: &[JournalEntry], calls: &HashMap<String, &JournalEntry>) -> 
             if digest.calls.last() != Some(&call) {
                 digest.calls.push(call);
             }
-        } else if entry.kind == kinds::ASSISTANT_MESSAGE && !calling.contains(&(run_id.clone(), step)) && !str_field(&entry.data, "text").trim().is_empty() {
+        // The planner's notes before a plan are not an answer: the plan they led to is kept itself.
+        } else if entry.kind == kinds::ASSISTANT_MESSAGE
+            && str_field(&entry.data, "stage") != crate::flow::PLAN_NOTES
+            && !calling.contains(&(run_id.clone(), step))
+            && !str_field(&entry.data, "text").trim().is_empty()
+        {
             // The newest such step; a step's text may be streamed into several entries.
             let newest = answer_step.get(&run_id).copied().unwrap_or(0);
             if step > newest {

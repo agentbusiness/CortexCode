@@ -41,6 +41,28 @@ pub struct Out {
     pub code_hits: Vec<crate::codeskills::CodeHit>,
     /// Files an edit wrote, to check once the edit is done (see [`check_text`]).
     pub checks: Vec<Check>,
+    /// Where a run's time went, phase by phase, in milliseconds ([`Lap`]).
+    pub phases: Vec<(&'static str, u64)>,
+}
+
+/// The time each phase of a call took: the host's own part of a slow call names itself in the log
+/// (seen: commands done in 70 ms whose results came two minutes later, and nothing said where).
+struct Lap {
+    at: Instant,
+    phases: Vec<(&'static str, u64)>,
+}
+
+impl Lap {
+    fn new() -> Lap {
+        Lap { at: Instant::now(), phases: Vec::new() }
+    }
+
+    /// The phase that ends now.
+    fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.phases.push((phase, now.duration_since(self.at).as_millis() as u64));
+        self.at = now;
+    }
 }
 
 /// A file an edit wrote: what its syntax check found, for the result's check line.
@@ -152,16 +174,19 @@ pub async fn execute_in(
     let intent = canonical.args.get("intent").and_then(Value::as_str).unwrap_or("").to_owned();
     // The step log: an edit records itself with the text in hand; a command's effects are found
     // when it ends (the watcher leaves them alone meanwhile).
+    let mut lap = Lap::new();
     let steps = if canonical.tool != "read" { Some(core.steps.open(&session.workspace).await) } else { None };
     if let Some(steps) = &steps {
         steps.begin();
     }
+    lap.mark("step log");
     let mut out = match canonical.tool {
         "read" => exec_read(core, host, &session, &canonical.args).await,
         "edit" => exec_edit(core, host, &session, &canonical.args).await,
         "terminal" => exec_terminal(host, &session, &canonical.args, &cancel).await,
         _ => exec_run(core, host, &session, &canonical.args, &items, cancel).await,
     };
+    lap.mark("tool");
     if let Some(steps) = steps {
         if canonical.tool == "edit" {
             steps.end_quiet();
@@ -171,9 +196,28 @@ pub async fn execute_in(
                 _ => canonical.args.get("command").and_then(Value::as_str).unwrap_or("").chars().take(200).collect(),
             };
             let who = crate::undo::Attribution::session(&session.context.session_id, "run", &detail);
-            let _ = tokio::task::spawn_blocking(move || steps.end(&who)).await;
+            // Files the command deleted that another session made and has not committed are put
+            // back at once (seen: one agent's `rm -r` of "stray" folders took another agent's
+            // verified crates). Run with `permission` and it ran: the user approved this command,
+            // its deletions included.
+            let asked = canonical.args.get("permission").and_then(Value::as_str).is_some_and(|why| !why.trim().is_empty());
+            let (session_id, workspace, core) = (session.context.session_id.clone(), session.workspace.clone(), core.clone());
+            let restored = tokio::task::spawn_blocking(move || match steps.end(&who) {
+                Some(record) if !asked => steps.restore_foreign_deletions(&record, &session_id, &|path: &Path| {
+                    util::is_inside(path, &workspace) && !core.sandbox.protected(path) && !core.sandbox.git_control_write_denied(&workspace, path)
+                }),
+                _ => Vec::new(),
+            })
+            .await
+            .unwrap_or_default();
+            if !restored.is_empty() {
+                // Before the exit line, which stays last.
+                let at = out.output.trim_end_matches('\n').rfind('\n').map_or(0, |index| index + 1);
+                out.output.insert_str(at, &format!("{}\n", crate::undo::restored_note(&restored)));
+            }
         }
     }
+    lap.mark("changes");
     // An edit ends with one check of each file it changed: the syntax check's new errors and the
     // language server's view (type errors, not only syntax), as one list.
     let checks = std::mem::take(&mut out.checks);
@@ -189,6 +233,15 @@ pub async fn execute_in(
     read_hint(&session, canonical.tool, &canonical.args, &mut out);
     same_refusal(core, &session, canonical.tool, &canonical.args, &mut out);
     attach_code_skills(core, host.as_ref(), &session.context.session_id, &mut out).await;
+    lap.mark("checks");
+    // The host's own part of the call (everything but the command) took over a second: the log
+    // says which phase.
+    let total_ms = started.elapsed().as_millis() as u64;
+    let command_ms = out.phases.iter().find(|(phase, _)| *phase == "command").map_or(0, |(_, ms)| *ms);
+    if total_ms.saturating_sub(command_ms) >= 1_000 {
+        let said = |phases: &[(&'static str, u64)]| phases.iter().map(|(phase, ms)| format!("{phase} {ms}")).collect::<Vec<_>>().join(", ");
+        tracing::warn!(tool = canonical.tool, session = %session.context.session_id, total_ms, call = %said(&lap.phases), run = %said(&out.phases), "a slow tool call, by phase (ms)");
+    }
     // What the repair changed in the call's meaning comes first (a rename says nothing).
     if !canonical.shown.is_empty() {
         let lines: String = canonical.shown.iter().map(|line| format!("[{line}]\n")).collect();
@@ -956,12 +1009,7 @@ fn shorten_nested(doc: &Doc, ops: &mut [hashedit::EditOp]) -> Vec<String> {
             let inner_to = ops[inner].to.as_ref().and_then(direct).unwrap_or(inner_at);
             if outer_at < inner_at && outer_to == inner_to {
                 let end = inner_at - 1;
-                let tag = doc.tag(end - 1);
-                let bytes = tag.as_bytes();
-                if bytes.len() != 2 {
-                    continue;
-                }
-                ops[outer].to = Some(hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line: end, tag: [bytes[0], bytes[1]] }));
+                ops[outer].to = Some(hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor::of(end, &doc.lines[end - 1])));
                 said.push(format!("Edit #{} now ends at line {end}, where edit #{} starts: their ranges overlapped.", outer + 1, inner + 1));
             }
         }
@@ -984,6 +1032,9 @@ fn written_lines(ops: &[hashedit::EditOp]) -> usize {
 ///    line stays.
 /// 3. The text ends with a lone closing line and the line right after the range starts with the
 ///    same one (`} else {`): the text's last line goes.
+/// 4. The text starts with the line right before the range (the header of the code it replaces):
+///    the range starts one line earlier (seen: six edits refused for a range one line off, the
+///    host's hint naming the anchor each time).
 #[allow(clippy::too_many_arguments)]
 fn retry_with_range_fix(
     core: &Core,
@@ -991,6 +1042,7 @@ fn retry_with_range_fix(
     session: &Session<'_>,
     doc: &Doc,
     view: Option<&hashedit::View>,
+    shown: &hashedit::Shown,
     ops: &[hashedit::EditOp],
     in_scratch: bool,
     (absolute, display, old, notes): (PathBuf, String, Option<String>, Vec<String>),
@@ -998,21 +1050,16 @@ fn retry_with_range_fix(
     let closing = |text: &str| !text.is_empty() && (text.chars().all(|c| matches!(c, '}' | ')' | ']' | ';' | ',')) || text == "end");
     let line_of = |reference: &hashedit::LineRef| match reference {
         hashedit::LineRef::Tagged(anchor) => Some(anchor.line),
-        hashedit::LineRef::Bare(line) => Some(*line),
+        hashedit::LineRef::Bare(line) | hashedit::LineRef::Old(line) => Some(*line),
         hashedit::LineRef::Start => None,
     };
     // The file's line `line` (1-based), and its anchor.
     let file = |line: usize| if line >= 1 { doc.lines.get(line - 1).map(String::as_str) } else { None };
-    let anchor = |line: usize| -> Option<hashedit::LineRef> {
-        file(line)?;
-        let tag = doc.tag(line - 1);
-        let bytes = tag.as_bytes();
-        (bytes.len() == 2).then(|| hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor { line, tag: [bytes[0], bytes[1]] }))
-    };
+    let anchor = |line: usize| -> Option<hashedit::LineRef> { file(line).map(|text| hashedit::LineRef::Tagged(cc_protocol::hashline::Anchor::of(line, text))) };
     // Two lines are the same line when they differ only in trailing spaces, or are the same lone
     // closing line at another indent.
     let same = |a: &str, b: &str| a.trim_end() == b.trim_end() || (closing(a.trim()) && a.trim() == b.trim());
-    for fix in 1..=3 {
+    for fix in 1..=4 {
         let mut fixed: Vec<hashedit::EditOp> = ops.to_vec();
         let mut said: Vec<String> = Vec::new();
         for (index, op) in fixed.iter_mut().enumerate() {
@@ -1051,6 +1098,20 @@ fn retry_with_range_fix(
                         closer.trim()
                     ));
                 }
+                4 => {
+                    let Some(first) = text.iter().map(|line| line.trim()).find(|line| !line.is_empty()) else { continue };
+                    let Some(before) = start.checked_sub(1).and_then(file).map(str::trim) else { continue };
+                    if before.len() <= 3 || before != first {
+                        continue;
+                    }
+                    let Some(at) = anchor(start - 1) else { continue };
+                    op.at = at;
+                    if op.to.is_none() {
+                        // A replace without `to` named one line: it stays the range's end.
+                        op.to = anchor(start);
+                    }
+                    said.push(format!("edit #{}: `at` is now line {}, because your text starts with that line", index + 1, start - 1));
+                }
                 _ => {
                     let Some(after) = file(end + 1).map(str::trim) else { continue };
                     if !closing(&last) || after.len() <= last.len() || !after.starts_with(last.as_str()) {
@@ -1069,7 +1130,7 @@ fn retry_with_range_fix(
         if said.is_empty() {
             continue;
         }
-        let Ok(applied) = hashedit::apply(doc, view, &fixed) else { continue };
+        let Ok(applied) = hashedit::apply(doc, view, shown, &fixed) else { continue };
         let written: Vec<(usize, usize)> = fixed
             .iter()
             .filter(|op| op.lines.len() > 2)
@@ -1292,7 +1353,8 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     match (&old, &line_map) {
         (Some(old), Some(map)) => {
             let old_hash = util::content_hash(old.as_bytes());
-            core.read_state.record_edit(&session.context.session_id, &absolute, &old_hash, &new_hash, Some(map));
+            // A file shown whole after the edit (below) is the session's picture of it from here.
+            core.read_state.record_edit(&session.context.session_id, &absolute, &old_hash, &new_hash, Some(map), &doc.lines, doc.len() <= WHOLE_AFTER_EDIT);
         }
         _ => core.read_state.record_write(&session.context.session_id, &absolute, &new_hash, &doc.lines),
     }
@@ -1304,8 +1366,8 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
     let mut output = String::new();
     if line_map.is_some() {
         // The prefix is named once here: after a whole-file echo the model doubted whether the
-        // `N:hh|` prefixes were in the file and sent edits that repeated them.
-        let anchors = if edit_format(session.context) == EditFormat::Hashline { ", with new anchors (the `N:hh|` prefix is not part of a line)" } else { "" };
+        // `N:hhhh|` prefixes were in the file and sent edits that repeated them.
+        let anchors = if edit_format(session.context) == EditFormat::Hashline { ", with new anchors (the `N:hhhh|` prefix is not part of a line)" } else { "" };
         // A change inside a function shows that whole function as it now is: the model compares
         // its intent with the real function, never with fragments it pieced together.
         let (shown, whole) = widen_to_definitions(&absolute, &new, &changed);
@@ -1340,6 +1402,12 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
         // The model just wrote it: its shape, not how to read it.
         let _ = writeln!(output, "{verb} {display}.");
         output.push_str(&read::render_outline(&absolute, &display, &new, &doc, false));
+        // The shape names lines, not their anchors: an edit of this file starts with a read of the
+        // part it changes (seen: four made-up tags, each right after a whole write whose result
+        // showed no line with its anchor).
+        if edit_format(session.context) == EditFormat::Hashline {
+            let _ = writeln!(output, "Before you change a part of it, read that part for its anchors: `{display}#Name` or `{display}:A-B`.");
+        }
     }
     // A whole write over the user's file of stubs (the one existing file `content` may write) leaves
     // working code: the rule that now holds goes with the result, where the model looks back at the
@@ -1405,13 +1473,13 @@ fn parse_ops(edits: &[Value]) -> Result<(Vec<EditOp>, Vec<String>), String> {
         // `line` is only produced by the str_replace_editor `insert` mapping (a line number of the
         // file as the session last read it).
         let at = match (edit.get("at"), edit.get("line").and_then(Value::as_u64)) {
-            (Some(at), _) => line_ref(at).ok_or_else(|| format!("edit #{}: `at` is not an anchor like \"12:ab\"", index + 1))?,
+            (Some(at), _) => line_ref(at).ok_or_else(|| format!("edit #{}: `at` is not an anchor like \"12:abcd\"", index + 1))?,
             (None, Some(0)) => LineRef::Start,
             (None, Some(line)) => LineRef::Bare(line as usize),
             (None, None) => return Err(format!("edit #{}: missing `at`", index + 1)),
         };
         let to = match edit.get("to") {
-            Some(value) => Some(line_ref(value).ok_or_else(|| format!("edit #{}: `to` is not an anchor like \"14:cd\"", index + 1))?),
+            Some(value) => Some(line_ref(value).ok_or_else(|| format!("edit #{}: `to` is not an anchor like \"14:cdef\"", index + 1))?),
             None => None,
         };
         let mut lines = match (kind, edit.get("text").and_then(Value::as_str)) {
@@ -1419,10 +1487,10 @@ fn parse_ops(edits: &[Value]) -> Result<(Vec<EditOp>, Vec<String>), String> {
             (_, Some(text)) => text_to_lines(text),
             (_, None) => return Err(format!("edit #{}: `{}` needs `text`", index + 1, kind.name())),
         };
-        // Copied N:hh| prefixes come off silently (journaled in the display).
+        // Copied N:hhhh| prefixes come off silently (journaled in the display).
         if let Some(stripped) = hashedit::strip_copied_prefixes(&lines) {
             lines = stripped;
-            let note = "removed N:hh| prefixes copied into the new text".to_owned();
+            let note = "removed N:hhhh| prefixes copied into the new text".to_owned();
             if !notes.contains(&note) {
                 notes.push(note);
             }
@@ -1577,9 +1645,19 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
         let doc = Doc::parse(&text);
         let hash = util::content_hash(text.as_bytes());
         let view = core.read_state.view(session_id, &absolute, &hash);
+        let shown = core.read_state.shown(session_id, &absolute, &hash);
         reversed.extend(shorten_nested(&doc, &mut ops));
-        return match hashedit::apply(&doc, view.as_ref(), &ops) {
+        return match hashedit::apply(&doc, view.as_ref(), &shown, &ops) {
             Ok(applied) => {
+                // An anchor placed by its tag alone: the model is told where its edit went (the
+                // result shows that place, which its anchor's number does not name).
+                reversed.extend(applied.moved.iter().cloned());
+                // A bare line number was taken: said once, with the form that notices a changed
+                // line (seen: one session, never told, sent bare numbers in 37 calls and had 15
+                // of them refused).
+                if ops.iter().any(|op| matches!(op.at, hashedit::LineRef::Bare(_)) || matches!(op.to, Some(hashedit::LineRef::Bare(_)))) {
+                    reversed.push("Line numbers were taken as lines of the file as last shown. Name a line by its anchor (`12:abcd`, from the lines below): an anchor notices when its line changed.".to_owned());
+                }
                 // One edit replaces at most two definitions of an existing file: a whole rewrite
                 // sent as many line ranges breaks on one range off by a line, and the whole
                 // generation is lost (seen: four 3k-token implementations refused in a row).
@@ -1591,7 +1669,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                     .filter_map(|op| {
                         let line = |reference: &hashedit::LineRef| match reference {
                             hashedit::LineRef::Tagged(anchor) => Some(anchor.line),
-                            hashedit::LineRef::Bare(line) => Some(*line),
+                            hashedit::LineRef::Bare(line) | hashedit::LineRef::Old(line) => Some(*line),
                             hashedit::LineRef::Start => None,
                         };
                         let at = line(&op.at)?;
@@ -1635,7 +1713,7 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                 // again each time). Any other refusal stays as it is.
                 if !out.ok
                     && out.error_kind.as_deref() == Some("syntax_error")
-                    && let Some(fixed) = retry_with_range_fix(core, host, session, &doc, view.as_ref(), &ops, in_scratch, retry)
+                    && let Some(fixed) = retry_with_range_fix(core, host, session, &doc, view.as_ref(), &shown, &ops, in_scratch, retry)
                 {
                     return fixed;
                 }
@@ -1927,16 +2005,21 @@ async fn reserved_elsewhere(core: &Core, host: &Arc<dyn Host>, session: &Session
     for path in paths {
         let Some(other) = core.tree.reserved_by_other(path, &session.context.session_id) else { continue };
         let display = session.display(path);
-        let who = match host.call("frame.session.get", json!({"id": other})).await {
+        // The step is one the agent can take now: its other files, and a word to the holder when
+        // it needs something in this one (seen: five and six calls spent before the next edit).
+        let (who, tell) = match host.call("frame.session.get", json!({"id": other})).await {
             Ok(value) => match value.get("agent").and_then(Value::as_str).filter(|agent| !agent.is_empty()) {
-                Some(agent) => format!("agent @{agent}"),
-                None => "another chat session".to_owned(),
+                Some(agent) => (
+                    format!("agent @{agent}"),
+                    format!(" When your task needs a change in {display} itself, tell them what: `cx agent send {agent} <what you need in {display}>`."),
+                ),
+                None => ("another chat session".to_owned(), String::new()),
             },
-            Err(_) => "another session".to_owned(),
+            Err(_) => ("another session".to_owned(), String::new()),
         };
         return Some(Out::fail(
             "reserved",
-            format!("Not written: {display} is being edited by {who} right now; it frees when their turn ends. Work on another file first, then come back to this one."),
+            format!("Not written: {display} is being edited by {who} right now; it frees when their turn ends.{tell} Work on another file of your task now, then send this edit again."),
         ));
     }
     None
@@ -2519,10 +2602,23 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return Out::fail("call_missing_argument", "run needs `command`".to_owned());
     };
+    let mut lap = Lap::new();
     // A project that runs in a container runs its commands there.
     if let Some(container) = project_container(host, session).await {
         return run_in_container(core, host, session, &container, command, args, cancel).await;
     }
+    lap.mark("container");
+    // A recursive grep that names no folder to leave out skips the folders git ignores (and
+    // .git): they hold build output and dependencies, and walking them fills the result before
+    // the source's matches. Said under the result.
+    let searched = if approval::has_open_recursive_grep(command) {
+        let (git, workspace) = (core.steps.git().map(Path::to_path_buf), session.workspace.clone());
+        let ignored = tokio::task::spawn_blocking(move || approval::ignored_dir_names(git.as_deref(), &workspace)).await.unwrap_or_default();
+        approval::grep_without_ignored(command, &ignored)
+    } else {
+        None
+    };
+    let command = searched.as_ref().map_or(command, |(rewritten, _)| rewritten.as_str());
     // Every command starts in the workspace (see `crate::shell`); a relative `cwd` is from there.
     let shell_cwd = session.workspace.clone();
     let cwd = args.get("cwd").and_then(Value::as_str).map(|cwd| util::resolve(&shell_cwd, cwd));
@@ -2585,6 +2681,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         Ok(runtime) => runtime,
         Err(message) => return Out::fail("sandbox_unavailable", message),
     };
+    lap.mark("sandbox");
     let venv_path = runtime.venv.as_ref().map(|venv| venv.path().to_path_buf());
     let writable = |path: &Path| core.sandbox.writable(path, &session.workspace, venv_path.as_deref(), &runtime.grants);
     let session_id = &session.context.session_id;
@@ -2647,6 +2744,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             crate::security::Gate::Notes(notes) => security_notes.extend(notes),
         }
     }
+    lap.mark("security");
     // A requested plain push goes through the git plugin, the same push as the app's Push
     // button: the repository's own setup first, else the GitHub sign-in from Settings.
     if let Some((remote, branch)) = plain_push(command) {
@@ -2730,6 +2828,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     }
     // The language plugins' installed toolchains (Go, a JDK, shellcheck ...) on the command's PATH.
     let toolchain = crate::langs::toolchain(host.as_ref()).await;
+    lap.mark("toolchain");
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
     // The CortexTerm on this Mac runs it when there is one (`crate::delegate`): a fresh shell, the
     // same sandbox, traced when it is a code run. A command that calls a shell function this
@@ -2739,6 +2838,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     } else {
         crate::delegate::provider(host.as_ref()).await
     };
+    lap.mark("provider");
     if crate::delegate::came_back() {
         let (delegated, host) = (core.delegated.clone(), host.clone());
         tokio::spawn(async move { delegated.resolve(host.as_ref()).await });
@@ -2824,7 +2924,9 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Err(error) => tracing::warn!(%error, "could not copy the tree for a check; running in the tree"),
         }
     }
+    lap.mark("tree copy");
     let repeats = stop_repeats(core, session_id, &effective_cwd, command).await;
+    lap.mark("repeats");
     core.tree.begin_run(&session.workspace, session_id);
     // In CortexTerm when it is here (not a check on a copy of the tree: the copy is this app's).
     let mut delegated = None;
@@ -2838,6 +2940,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Some(_) => ("check", true),
             None => ("shell", false),
         };
+        lap.mark("kind");
         let request = delegation(purpose, monitor, timeout_ms, None, cwd.as_deref().unwrap_or(&session.workspace));
         let sink = items.clone();
         let outcome = crate::delegate::run(&core.delegated, host.as_ref(), provider, &request, cancel.clone(), move |chunk: &[u8]| {
@@ -2891,6 +2994,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             (run, traced)
         }
     };
+    lap.mark("command");
     // EPERM names a path. A program file there could not start: macOS never lets a sandboxed
     // command start a program that takes more rights (setuid tools such as `ps` and `top`), whatever
     // the profile says. Any other path is a refused write.
@@ -2912,6 +3016,7 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             }
         }
     };
+    lap.mark("verifiers");
     let whole = run.output.whole(TEST_VIEW_BYTES).map(|whole| util::relative_paths(&whole, &session.workspace));
     let tests = whole.as_deref().and_then(crate::testout::summary);
     // A test command that found no tests: the host's done check reads it (a check that ran nothing).
@@ -2938,6 +3043,9 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     // Notes on how it ran come before its exit line, which stays last.
     if let Some(note) = &repeats {
         let _ = writeln!(text, "{note}");
+    }
+    if let Some((_, skipped)) = &searched {
+        let _ = writeln!(text, "{}", approval::grep_note(skipped, artifact.is_some()));
     }
     if masked > 0 {
         let _ = writeln!(text, "{}", crate::security::masked_note(masked));
@@ -2971,6 +3079,18 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     if let Some(line) = &traced {
         let _ = writeln!(text, "{line}");
     }
+    // Whether the exit status is the check's own: after `cargo check | grep error; echo done $?`
+    // it is `echo`'s (seen: "check-done 0" over four compile errors, the run taken as passed).
+    let is_check = core.tree.is_check(host.as_ref(), command).await;
+    let check_last = match approval::last_statement(command) {
+        Some(last) if is_check => core.tree.is_check(host.as_ref(), last).await,
+        _ => true,
+    };
+    lap.mark("result");
+    // What `exit_code` tells the chat flow: the check's status when a pipe hid it, nothing when
+    // the status is another command's.
+    let mut shown_code = run.exit_code;
+    let mut exit_hidden = false;
     let (ok, kind) = if run.timed_out {
         let _ = writeln!(text, "{}", timeout_line(timeout_ms, run.running.as_deref()));
         (false, Some("timeout"))
@@ -2986,17 +3106,37 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
     } else {
         match run.exit_code {
             Some(code) => {
-                let _ = writeln!(text, "{}", exit_line(code, run.duration_ms));
                 // A pipe ends with its last command's status: a failure before a `| tail` is said
                 // (seen: `cargo test ... | tail -4` ended `[exit 0]` while the tests crashed).
                 // 141 is a command that stopped because `head` stopped reading: not a failure.
-                if code == 0
-                    && let Some((stage, failed)) = run.pipe_status.iter().enumerate().find(|&(_, &status)| status != 0 && status != 141)
-                {
-                    let which = if stage == 0 { "the command before the first `|`".to_owned() } else { format!("command {} of the pipe", stage + 1) };
-                    let _ = writeln!(text, "[{which} exited {failed}: the exit 0 above is only the pipe's last command]");
+                let failed_stage =
+                    run.pipe_status.iter().enumerate().find(|&(_, &status)| status != 0 && status != 141).map(|(stage, &status)| (stage, status)).filter(|_| code == 0);
+                match failed_stage {
+                    // A check that failed before a `| tail` failed: the run ends with the check's
+                    // status, for the model and for whoever reads `exit_code`.
+                    Some((_, failed)) if is_check && check_last => {
+                        let _ = writeln!(text, "{}", exit_line(failed, run.duration_ms));
+                        let _ = writeln!(text, "[the check exited {failed}; only the pipe's last command exited 0. Run a check whole, without `| tail` or `| grep`: the result shows each failure.]");
+                        shown_code = Some(failed);
+                        (false, Some("nonzero_exit"))
+                    }
+                    Some((stage, failed)) => {
+                        let _ = writeln!(text, "{}", exit_line(code, run.duration_ms));
+                        let which = if stage == 0 { "the command before the first `|`".to_owned() } else { format!("command {} of the pipe", stage + 1) };
+                        let _ = writeln!(text, "[{which} exited {failed}: the exit 0 above is only the pipe's last command]");
+                        (true, None)
+                    }
+                    None => {
+                        let _ = writeln!(text, "{}", exit_line(code, run.duration_ms));
+                        // A check followed by other commands: their status says nothing about it.
+                        if code == 0 && is_check && !check_last {
+                            let _ = writeln!(text, "[exit 0 is the status of the last command, not of the check before it: this run does not show whether the check passed. Run the check as its own command.]");
+                            shown_code = None;
+                            exit_hidden = true;
+                        }
+                        (code == 0, (code != 0).then_some("nonzero_exit"))
+                    }
                 }
-                (code == 0, (code != 0).then_some("nonzero_exit"))
             }
             None => {
                 let _ = writeln!(text, "[finished without an exit status]");
@@ -3004,9 +3144,10 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             }
         }
     };
-    let mut out = Out { ok, output: text, artifact: artifact.clone(), error_kind: kind.map(str::to_owned), code_hits, ..Out::default() };
+    let mut out = Out { ok, output: text, artifact: artifact.clone(), error_kind: kind.map(str::to_owned), code_hits, phases: lap.phases, ..Out::default() };
     out.display = json!({
-        "exit_code": run.exit_code,
+        "exit_code": shown_code,
+        "exit_hidden": exit_hidden,
         "duration_ms": run.duration_ms,
         "timed_out": run.timed_out,
         "cancelled": run.cancelled,

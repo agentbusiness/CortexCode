@@ -8,27 +8,23 @@ Rust here: get it right, build and test it, code that runs, common errors and th
    - When there may be no answer and nothing names a value for it, the signature decides: `Option<T>` gives `None`, `Result<T, E>` gives `Err(...)`. Never a sentinel such as `-1`, `0` or an empty value in their place.
    - Keep existing names, signatures and error enums.
    - The request and the project disagree: say so and ask, instead of silently picking one.
-2. **Before coding, note the request's examples: they are the check, their values copied, never computed.**
+2. **Before coding, note what the request says must hold; an example it gives is a check, its values copied, never computed.**
    - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
    - Unsure of a domain, format, protocol or crate? Look it up: the research plugin, docs.rs, how others solved it:
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 3. **Write whole functions, in slices.**
    - First the simplest complete path (one case, input to result). Run the tests.
    - Add the next behaviour. Run again after every change.
-   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, one or two top-level definitions per call.
    - Change a function: replace it from its attributes and `fn` line to its closing `}`. Never leave part of the old body or a `todo!()` of yours.
    - `unclosed delimiter` after an edit: a block was cut. Fix that first.
-4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests (section 2); fix the first failure's cause, run again.
+4. Run the project's tests (section 2); fix the first failure's cause, run again.
 5. **Before you finish**, check each requirement against the code, including named errors (variant and message). Your own diff holds no `todo!()` or `dbg!`.
 
 **How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
 - One owner: a field or `Box<T>`. Shared and read-only: `&T`, `Rc<T>` (`Arc<T>` across threads). Shared and changed: `Rc<RefCell<T>>` (`Arc<Mutex<T>>` across threads).
-- `Cell<T>` only for small `Copy` values: it never lends `&T`. `RefCell<T>` lends through `borrow()` and `borrow_mut()`, checked at run time.
-- Nodes that point at each other and must hand out `&T` or `&mut T`: each node owned through `Box`, the links as `NonNull<Node<T>>` or raw pointers in `unsafe` blocks with the invariants in `// SAFETY:` comments, freed in `Drop`.
-- `Rc`, `Cell` and `RefCell` make a type neither `Send` nor `Sync`: across threads use `Arc` with `Mutex` or `RwLock`.
-- Variance: `NonNull<T>`, `*const T` and `PhantomData<T>` are covariant in `T`, `*mut T` is invariant. A property the compiler decides is checked by code that compiles only when it holds, in a test: `fn _covariant<'a>(x: List<&'static str>) -> List<&'a str> { x }`; `fn _is_send<T: Send>() {}` called as `_is_send::<List<i32>>()`. It compiles: the property holds.
 - Containers: `HashMap`/`BTreeMap` for lookup, `VecDeque` for both ends, `BinaryHeap` for largest first, `HashSet` for uniqueness.
-- Standard building blocks first: allocate behind a raw pointer with `Box::into_raw`, take back and free with `Box::from_raw`, never `std::alloc` by hand; `NonNull<T>` for a non-null raw pointer.
+- Linked nodes, raw pointers, `unsafe`, a `Drop` that frees, `Send`/`Sync` or variance: read `skill://lang-rust/rust-shared-and-linked-data` first.
 
 ## 2. Run, test, check
 
@@ -51,15 +47,14 @@ cargo clippy --all-targets -- -D warnings        # lint
 - A new file compiles only after `mod name;` in its parent.
 
 **Checking your work.**
-1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/<name>.rs` that uses the crate, run with `cargo test`; they stay in the project. Tests behind a feature run with `cargo test --all-features`; never change `Cargo.toml` (features, dependencies, settings) unless the request asks.
-2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
-3. Build a long input in code from its parts, never typed out: `vec![0; 18]`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+1. Run the project's tests that cover the change (section 2) before and after it, and run what the request asks to run. Tests behind a feature run with `cargo test --all-features`; never change `Cargo.toml` (features, dependencies, settings) unless the request asks.
+2. Add a test when the request asks for one, or when the project already tests the code you changed: the case goes with those tests. Never add a test only to have a check. A test the request asks for, in a project that has none: `tests/<name>.rs` that uses the crate, run with `cargo test`.
+3. An example the request gives is checked with its input and expected value copied, never computed or changed.
 4. Each check shows what the code returned when it fails: `assert_eq!(got, want)`.
 5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
 6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.
 7. After any fix, run all the tests again, the ones that passed too: a fix can break what worked.
 8. A one-off try (call a function, print a value) goes in `tmp/`; git ignores `tmp/`.
-9. Code that frees memory itself (`unsafe`, `Box::from_raw`, a `Drop` impl) gets a test with an element that counts its drops, `struct Counted<'a>(&'a Cell<usize>)` whose `Drop` adds 1: after each remove, pop and drop of the whole, the count equals the elements that left, so a leak or a double free fails the test.
 
 ## 3. Code that runs
 

@@ -2,7 +2,9 @@
  * chat.composer@1 — where text is written and sent. With no run it
  * starts a turn (`chatflow.turn`, creating the conversation first when there is none); while a
  * run goes it steers it (`chatflow.steer`, taken in at the next step) or queues a follow-up; a
- * running agent can be addressed the same way (`agents.steer`). Mode (ask / auto) and Stop are
+ * running agent can be addressed the same way (`agents.steer`). Stop is there for as long as a run
+ * goes, in a conversation (`chatflow.cancel`) and in an agent's session (`agents.stop`), and shows
+ * Stopping from the click until the run has ended. Mode (ask / auto) and Stop are
  * buttons; drafts are kept per conversation in durable state.
  *
  * Attachments (pasted screenshots, dropped or picked files and folders) are made with
@@ -73,7 +75,8 @@ function ComposerPlugin() {
   const [pasteAsFile] = useShared<PasteAsFile>('composer.pasteAsFile', PASTE_AS_FILE);
   const [modes, setModes] = useSlotState<Record<string, 'ask' | 'auto'>>('modes', {});
   const [error, setError] = useState<string | null>(null);
-  const [stopping, setStopping] = useState(false);
+  // The session whose run was told to stop; it shows Stopping until that run has ended.
+  const [stoppingFor, setStoppingFor] = useState<string | null>(null);
   const draftKey = sessionId ?? (projectId ? `new:${projectId}` : 'none');
   const draft = drafts[draftKey] ?? '';
   // The projects a mention can name, listed once a draft has an `@`.
@@ -95,7 +98,10 @@ function ComposerPlugin() {
   const runningAgents = (agents.data ?? []).filter((agent) => ['working', 'running', 'blocked', 'verifying'].includes(agent.status));
   const agentName = session?.kind === 'agent' ? session.agent ?? null : null;
   const running = isRunning(journal.entries) || flow.data?.running === true;
-  if (!running && stopping) setStopping(false);
+  // An agent is also at work between its runs (waiting for a slot, blocked, being verified).
+  const stoppable = running || (agentName !== null && runningAgents.some((agent) => agent.name === agentName));
+  const stopping = stoppable && stoppingFor !== null && stoppingFor === sessionId;
+  if (!stoppable && stoppingFor !== null && stoppingFor === sessionId) setStoppingFor(null);
 
   // While the person writes, the conversation's prompt prefix is prefilled into the model's cache
   // (debounced; once per conversation state), so sending is answered without re-reading it.
@@ -163,7 +169,7 @@ function ComposerPlugin() {
 
   const stop = async () => {
     if (!sessionId) return;
-    setStopping(true);
+    setStoppingFor(sessionId);
     setError(null);
     try {
       if (projectId && agentName) {
@@ -174,8 +180,7 @@ function ComposerPlugin() {
       }
     } catch (cause) {
       setError(errorMessage(cause));
-    } finally {
-      setStopping(false);
+      setStoppingFor(null);
     }
   };
 
@@ -211,6 +216,7 @@ function ComposerPlugin() {
         draft={draft}
         onDraft={(text) => setDrafts((current) => ({ ...current, [draftKey]: text }))}
         running={running}
+        stoppable={stoppable}
         agentSession={agentName}
         agents={runningAgents}
         mode={mode}

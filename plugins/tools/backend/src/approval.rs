@@ -955,3 +955,131 @@ fn inspect_redirect(node: Node, source: &[u8], context: &Context, out: &mut Vec<
         detail: format!("`{operator}` truncates {}", path.display()),
     });
 }
+
+/// The statement a script's exit status comes from: its last statement, and of an `a || b` list
+/// the right side (`b` decides when `a` failed; `a && b` fails with `a`, so it stays whole). The
+/// run tool asks whether a check is in it: after `cargo check | grep error; echo done $?` the
+/// status is `echo`'s, and says nothing about the check (seen: "check-done 0" printed over four
+/// compile errors, the run recorded as passed). None when the script does not parse.
+pub fn last_statement(script: &str) -> Option<&str> {
+    let tree = crate::lang::parse(crate::lang::Lang::Bash, script)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut node = root.named_children(&mut cursor).filter(|node| node.kind() != "comment").last()?;
+    while node.kind() == "list" {
+        let mut inner = node.walk();
+        let or = node.children(&mut inner).any(|child| !child.is_named() && child.kind() == "||");
+        let mut inner = node.walk();
+        let Some(right) = node.named_children(&mut inner).last().filter(|_| or) else { break };
+        node = right;
+    }
+    script.get(node.start_byte()..node.end_byte())
+}
+
+/// The grep commands of a script that search folders recursively and name no folder to leave out:
+/// where each one's program word ends (to add options there) and its words.
+fn open_recursive_greps(script: &str) -> Vec<(usize, Vec<String>)> {
+    let Some(tree) = crate::lang::parse(crate::lang::Lang::Bash, script) else { return Vec::new() };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+    let source = script.as_bytes();
+    let mut found = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command"
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Some(name) = literal(name_node, source)
+            && matches!(program_name(&name), "grep" | "egrep" | "fgrep")
+            && let Some(words) = arguments(node, source).into_iter().collect::<Option<Vec<String>>>()
+        {
+            let options = || words.iter().take_while(|word| word.as_str() != "--");
+            let recursive = options().any(|word| {
+                word == "--recursive" || word == "--dereference-recursive" || (word.starts_with('-') && !word.starts_with("--") && word[1..].contains(['r', 'R']))
+            });
+            let excludes = options().any(|word| word.starts_with("--exclude-dir"));
+            if recursive && !excludes {
+                found.push((name_node.end_byte(), words));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found
+}
+
+/// Whether `script` holds a recursive grep that names no folder to leave out.
+pub fn has_open_recursive_grep(script: &str) -> bool {
+    !open_recursive_greps(script).is_empty()
+}
+
+/// `script` with each recursive grep that names no folder to leave out told to skip `ignored`
+/// (folder names git ignores, and `.git`), and the names it now skips. A name the command itself
+/// spells in a path stays searched (`grep -rn x target/debug` means that folder). None when
+/// nothing changes. (Seen: `grep -rn` walking `target/` for minutes, its matches in build output
+/// filling the result before the source's.)
+pub fn grep_without_ignored(script: &str, ignored: &[String]) -> Option<(String, Vec<String>)> {
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for (at, words) in open_recursive_greps(script) {
+        let named = |dir: &str| words.iter().any(|word| Path::new(word).components().any(|part| part.as_os_str() == dir));
+        let names: Vec<&String> = ignored.iter().filter(|dir| !named(dir.as_str())).collect();
+        if names.is_empty() {
+            continue;
+        }
+        inserts.push((at, names.iter().map(|dir| format!(" --exclude-dir={}", util::shell_quote(dir))).collect()));
+        for name in names {
+            if !skipped.contains(name) {
+                skipped.push(name.clone());
+            }
+        }
+    }
+    if inserts.is_empty() {
+        return None;
+    }
+    inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let mut out = script.to_owned();
+    for (at, text) in inserts {
+        if !out.is_char_boundary(at) {
+            return None;
+        }
+        out.insert_str(at, &text);
+    }
+    Some((out, skipped))
+}
+
+/// The names of the folders git ignores in `workspace` (build output, dependencies), and `.git`.
+/// A name with pattern characters is left out: grep would read it as a pattern. Empty when the
+/// workspace is no repository: nothing says what to leave out there.
+pub fn ignored_dir_names(git: Option<&Path>, workspace: &Path) -> Vec<String> {
+    let Some(git) = git.filter(|_| workspace.join(".git").exists()) else { return Vec::new() };
+    let output = std::process::Command::new(git)
+        .arg("-C")
+        .arg(workspace)
+        .args(["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut names = vec![".git".to_owned()];
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some(folder) = entry.strip_suffix('/') else { continue };
+        let name = folder.rsplit('/').next().unwrap_or(folder);
+        if name.is_empty() || name.contains(['*', '?', '[', ']', '\\']) || names.iter().any(|known| known == name) {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names
+}
+
+/// The note under a search that left folders out; `cut` when its result was shortened.
+pub fn grep_note(skipped: &[String], cut: bool) -> String {
+    let narrow = if cut { " The result is cut: search again with a narrower pattern, or in one folder (`grep -rn <text> src`)." } else { "" };
+    format!("[Searched without the folders git ignores ({}); to search one of them, name it in the command.{narrow}]", skipped.join(", "))
+}

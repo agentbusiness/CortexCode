@@ -9,6 +9,9 @@
 //! (the project's own build and dependency folders), files that existed before the turn, the
 //! workspace's `.cortex-*` files, and everything when the session's user let a command past the
 //! sandbox (an install the user approved makes files they asked for).
+//!
+//! The removed files are one step of the session in the step log (label `cleanup`), so each can be
+//! brought back with `cx undo`; the caller gets their paths to tell the user.
 
 use crate::core::Core;
 use std::path::{Path, PathBuf};
@@ -43,6 +46,10 @@ pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, se
     if core.approved(session_id).iter().any(|class| class.starts_with(cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX)) {
         return removed;
     }
+    // What is taken away is one step of the session, recorded with each file's content in hand:
+    // `cx undo --step N` brings a file back, and the timeline says the host removed it (it was
+    // found only by the next look at the tree before, under that look's label).
+    let mut taken: Vec<(String, Vec<u8>, u32)> = Vec::new();
     for path in new_untracked(workspace, since_ms) {
         let relative = path.strip_prefix(workspace).map(Path::to_path_buf).unwrap_or_else(|_| path.clone());
         let name = relative.to_string_lossy();
@@ -53,13 +60,26 @@ pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, se
         if !made_by_own_command {
             continue;
         }
+        // A file that cannot be read cannot be brought back: it stays.
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mode = std::fs::symlink_metadata(&path)
+            .map(|meta| {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o777
+            })
+            .unwrap_or(0o644);
         if std::fs::remove_file(&path).is_ok() {
+            taken.push((name.clone().into_owned(), bytes, mode));
             removed.push(name.into_owned());
             remove_empty_parents(&path, workspace);
         }
     }
+    log.record_removed(&crate::undo::Attribution::session(session_id, CLEANUP_LABEL, "end of turn: new files the turn's commands left"), &taken);
     removed
 }
+
+/// The step label of a turn's cleanup in the timeline.
+pub const CLEANUP_LABEL: &str = "cleanup";
 
 /// Take back the `/tmp/` line the scratch folder added to a tracked `.gitignore`, when it is the
 /// file's only change (a `.gitignore` the turn created is a new untracked file, removed below).

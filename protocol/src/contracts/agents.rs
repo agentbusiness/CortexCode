@@ -58,7 +58,8 @@ pub mod events {
     pub const BLOCKED: &str = "blocked";
     /// An agent asked the lead for something on the board (`to: lead`).
     pub const NEED: &str = "need";
-    /// Every task of the tree is done and verified.
+    /// Every task of the tree is done. The event's text says what checked each one: its checks
+    /// passed, no check ran on it, or its checks still fail or could not run.
     pub const TREE_DONE: &str = "tree_done";
     /// A regular check-in while the session's agents work: the session looks at each agent's
     /// progress (the host's facts from its journal) and keeps it on its task.

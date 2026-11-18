@@ -7,13 +7,13 @@ Shell scripts here: get it right, run and check them, code that runs, common err
    - The request and the project decide, never a name alone. Keep names, options and the shebang's dialect.
    - "No result" in a script is a non-zero exit status with nothing on stdout (an error message goes to stderr), unless the request or the project names an output for it.
    - The request and the project disagree: say so and ask, instead of silently picking one.
-   - Before coding, note the request's examples: they are the check, their values copied, never computed.
+   - Before coding, note what the request says must hold; an example it gives is a check, its values copied, never computed.
    - Unfamiliar tool, format or protocol: look it up (the research plugin, the man page, how others solved it):
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole units, in slices.**
    - Simplest complete path first (one case, input to result). Run it.
    - Then each next behaviour, running after each.
-   - A new script is written whole with `edit` `content`; an existing script is changed with anchored `edits` only, every change to it in one call.
+   - A new script is written whole with `edit` `content`; an existing script is changed with anchored `edits` only, one or two top-level definitions per call.
    - Replace a function from `name() {` to its closing `}`. Never leave part of the old body, or a second definition (the last wins silently).
 3. **Run it after every change** on a sample input; compare output and exit status:
 
@@ -21,7 +21,7 @@ Shell scripts here: get it right, run and check them, code that runs, common err
 bash -n x.sh && printf 'a b\nc\n' | bash x.sh arg1; echo "exit=$?"
 ```
 
-4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests if any (bats, a test script, `make test`); fix the first failure, run again.
+4. Run the project's tests if any (bats, a test script, `make test`); fix the first failure, run again.
 5. **Before you finish**, check each requirement again, error messages and exit codes included.
 
 ## 2. Run, test, check
@@ -43,9 +43,9 @@ bash x.sh args; echo "exit=$?"  # its set -e, cd and exit stay inside the script
 - `./x.sh` needs `chmod +x`; `sh x.sh` runs it as POSIX sh.
 
 **Checking your work.**
-1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/test_<name>.sh` that runs the script with inputs and compares its output, run with `bash tests/test_<name>.sh`; they stay in the project.
-2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
-3. Build a long input in code from its parts, never typed out: `printf '0 %.0s' $(seq 18)`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+1. Run the project's tests that cover the change (section 2) before and after it, and run what the request asks to run.
+2. Add a test when the request asks for one, or when the project already tests the code you changed: the case goes with those tests. Never add a test only to have a check. A test the request asks for, in a project that has none: `tests/test_<name>.sh` that runs the script with inputs and compares its output, run with `bash tests/test_<name>.sh`.
+3. An example the request gives is checked with its input and expected value copied, never computed or changed.
 4. Each check shows what the code returned when it fails: `[ "$got" = "$want" ] || echo "got: $got"`.
 5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
 6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.

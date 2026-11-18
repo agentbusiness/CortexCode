@@ -3,7 +3,8 @@
 //! the read-before-overwrite guard), and which skills were attached to the session's tool results
 //! by diagnostic code ([`crate::codeskills`]).
 
-use crate::hashedit::View;
+use crate::hashedit::{Shown, View};
+use cc_protocol::hashline;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,27 @@ struct FileState {
     /// the next edit result says it is older (see [`ReadState::take_read_since_edit`]).
     #[serde(default)]
     read_since_edit: bool,
+    /// Every anchor ([`Shown::key`]) of every version of the file the session read or produced:
+    /// what an anchor must be among for its line to be looked for by tag alone.
+    #[serde(default)]
+    shown: HashSet<u64>,
+    /// The content hash of the version the session's last result showed whole, when it did.
+    #[serde(default)]
+    whole_shown: Option<String>,
+}
+
+/// Most anchors kept per file and session. Past it the older ones go and the newest version's
+/// stay: an anchor from a version that far back is refused as stale and read again.
+const SHOWN_MAX: usize = 60_000;
+
+impl FileState {
+    /// The session has this version of the file in a result: its anchors are known to it.
+    fn show(&mut self, lines: &[String]) {
+        if self.shown.len() + lines.len() > SHOWN_MAX {
+            self.shown.clear();
+        }
+        self.shown.extend(lines.iter().enumerate().map(|(index, line)| Shown::key(index + 1, &hashline::tag_bytes(line))));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +77,8 @@ impl ReadState {
             let state = sessions.entry(session.to_owned()).or_default().entry(path.to_path_buf()).or_default();
             state.read_since_edit = true;
             state.seen.insert(hash.to_owned());
+            state.show(lines);
+            state.whole_shown = None;
             state.view =
                 Some(StoredView { base_lines: lines.to_vec(), map: (0..lines.len()).map(Some).collect(), current_hash: hash.to_owned() });
         });
@@ -68,12 +92,25 @@ impl ReadState {
         })
     }
 
-    /// The session changed the file from `old_hash` to `new_hash` with this line map.
-    pub fn record_edit(&self, session: &str, path: &Path, old_hash: &str, new_hash: &str, line_map: Option<&[Option<usize>]>) {
+    /// What the session was shown of the file over time, for the file as it is now (`current_hash`).
+    pub fn shown(&self, session: &str, path: &Path, current_hash: &str) -> Shown {
+        self.with(|sessions| {
+            sessions.get(session).and_then(|files| files.get(path)).map_or_else(Shown::default, |state| Shown {
+                anchors: state.shown.clone(),
+                whole: state.whole_shown.as_deref() == Some(current_hash),
+            })
+        })
+    }
+
+    /// The session changed the file from `old_hash` to `new_hash` with this line map; `lines` are
+    /// the new version's, and `whole` says the edit's result shows all of them.
+    pub fn record_edit(&self, session: &str, path: &Path, old_hash: &str, new_hash: &str, line_map: Option<&[Option<usize>]>, lines: &[String], whole: bool) {
         self.with(|sessions| {
             let state = sessions.entry(session.to_owned()).or_default().entry(path.to_path_buf()).or_default();
             state.seen.insert(new_hash.to_owned());
             state.changed = true;
+            state.show(lines);
+            state.whole_shown = whole.then(|| new_hash.to_owned());
             state.view = match (state.view.take(), line_map) {
                 (Some(stored), Some(step)) if stored.current_hash == old_hash => {
                     let view = View { base_lines: stored.base_lines, map: stored.map }.compose(step);

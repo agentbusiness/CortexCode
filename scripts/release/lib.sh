@@ -86,6 +86,19 @@ load_env() {
   forbidden="${RELEASE_FORBIDDEN:-}"
 }
 
+# runs_on_release_platforms <plugin dir>: true when the plugin runs on one of RELEASE_PLATFORMS
+# (plugin.toml's `platforms`; none listed means every platform).
+runs_on_release_platforms() {
+  local platforms platform os
+  platforms="$("$pack" info "$repo/$1" | jq -c '.plugin.platforms // []')"
+  [ "$platforms" != "[]" ] || return 0
+  for platform in $RELEASE_PLATFORMS; do
+    case "$platform" in darwin-*) os=macos ;; linux-*) os=linux ;; *) continue ;; esac
+    jq -e --arg os "$os" 'index($os) != null' <<<"$platforms" >/dev/null && return 0
+  done
+  return 1
+}
+
 need_mac() {
   [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "releases are built on an Apple Silicon Mac"
 }

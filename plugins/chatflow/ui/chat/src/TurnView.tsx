@@ -120,7 +120,8 @@ export function segments(blocks: readonly Block[]): Segment[] {
 export const TurnView = memo(function TurnView({ turn, actions, live, progress = '', liveLines = [] }: { turn: Turn; actions: TurnActions; live: boolean; progress?: string; liveLines?: string[] }) {
   const route = turn.routes.map((entry) => str(entry.data.route)).filter(Boolean).join(' → ');
   const last = turn.routes.at(-1);
-  const routeDetail = last ? routeText(last) : '';
+  // A route that only answers carries the model's own restatement of the question, not work.
+  const routeDetail = last && !['STATUS', 'ANSWER', 'LOOKUP'].includes(str(last.data.route)) ? routeText(last) : '';
   const parts = segments(turn.blocks);
   const closingAt = parts.map((part) => part.kind).lastIndexOf('group');
   // Scaffolding, then the answer still streaming: the model's progress is shown after the answer.

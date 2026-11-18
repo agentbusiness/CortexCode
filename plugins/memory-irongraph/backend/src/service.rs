@@ -1371,6 +1371,21 @@ impl Memory {
                 } else {
                     let abs: Vec<PathBuf> = paths.iter().map(|p| if Path::new(p).is_absolute() { PathBuf::from(p) } else { tree.root.join(p) }).collect();
                     let rels = expand_paths(&tree.root, &abs, &tree).await;
+                    if tree.whole_pass(&rels) {
+                        // The whole tree is reconciled behind the caller, who asked about its own
+                        // paths: the answer says nothing changed yet, and `indexed` follows.
+                        let (me, project_id, workspace) = (self.clone(), scope.project_id.clone(), scope.workspace.clone());
+                        tokio::spawn(async move {
+                            match tree.refresh_paths(&rels).await {
+                                Ok(report) if report.files_changed + report.files_deleted > 0 => {
+                                    me.publish(topics::INDEXED, indexed_payload(&project_id, workspace.as_deref(), &report));
+                                }
+                                Ok(_) => {}
+                                Err(error) => tracing::warn!(%error, "the index pass behind a refresh failed"),
+                            }
+                        });
+                        return to_value(&SyncReport::default());
+                    }
                     tree.refresh_paths(&rels).await?
                 };
                 if report.files_changed + report.files_deleted > 0 {

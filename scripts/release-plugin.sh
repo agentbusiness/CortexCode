@@ -66,7 +66,8 @@ if [ $changed = 1 ]; then
   for toml in "$repo"/plugins/*/plugin.toml; do
     id="$(basename "$(dirname "$toml")")"
     released="$(jq -r --arg id "$id" '.plugins[$id].digest // empty' "$catalog")"
-    [ "$(plugin_digest "plugins/$id")" = "$released" ] || plugins+=("$id")
+    [ "$(plugin_digest "plugins/$id")" != "$released" ] || continue
+    if runs_on_release_platforms "plugins/$id"; then plugins+=("$id"); else step "$id is not for $RELEASE_PLATFORMS: left for a release that builds them"; fi
   done
   [ ${#plugins[@]} -gt 0 ] || { step "no plugin changed since its release"; exit 0; }
   step "changed since their release: ${plugins[*]}"

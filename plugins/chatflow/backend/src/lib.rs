@@ -42,6 +42,7 @@ pub mod runner;
 pub mod repetition;
 pub mod schemas;
 pub mod skillsel;
+pub mod textcall;
 pub mod typeerrors;
 pub mod verifiers;
 

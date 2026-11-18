@@ -700,6 +700,16 @@ impl Jobs {
                 if let Some(note) = &stopped {
                     notes.insert(0, note.trim().to_owned());
                 }
+                // An end nobody here asked for is said in words at the end of the output, where the
+                // wake and every later read show it: a signal's exit code alone reads as
+                // the program's own, and a job without one as still at work.
+                let asked = stopped.is_some() || current.state == "killed";
+                let signal = exited.and_then(signal_of).filter(|_| !asked);
+                if let Some(signal) = signal {
+                    notes.push(signal_note(signal));
+                } else if exited.is_none() && !asked {
+                    notes.push(LOST_NOTE.to_owned());
+                }
                 if !notes.is_empty() {
                     let text = notes.join("\n");
                     if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&output_path) {
@@ -711,7 +721,7 @@ impl Jobs {
                 // What other writes changed (a published wake) stays.
                 meta.wake_published = current.wake_published;
                 meta.exit_published = current.exit_published;
-                meta.state = if current.state == "killed" || stopped.is_some() {
+                meta.state = if current.state == "killed" || stopped.is_some() || signal.is_some() {
                     "killed".to_owned()
                 } else if exited.is_some() {
                     "exited".to_owned()
@@ -838,6 +848,24 @@ impl Jobs {
         out
     }
 }
+
+/// The signal that ended a command, from the status its shell reported (128 + the signal's number).
+fn signal_of(exit_code: i32) -> Option<i32> {
+    (129..=159).contains(&exit_code).then_some(exit_code - 128)
+}
+
+/// What a job's output ends with when a signal ended its command; the last sentence is the step.
+fn signal_note(signal: i32) -> String {
+    let (name, why) = match signal {
+        libc::SIGKILL => (" (SIGKILL)", " The system ends a process this way when the machine runs out of memory."),
+        libc::SIGTERM => (" (SIGTERM)", ""),
+        _ => ("", ""),
+    };
+    format!("[the job did not end by itself: signal {signal}{name} ended its command, and it is not running any more.{why} Change what made it end this way before you start it again.]")
+}
+
+/// What a job's output ends with when its processes are gone and nothing wrote an exit status.
+const LOST_NOTE: &str = "[the job's processes are gone and left no exit status: something outside the job ended it, and it is not running any more. Start it again only when the task still needs its result.]";
 
 fn process_group_alive(pgid: i32) -> bool {
     // SAFETY: signal 0 only checks whether the group has a member we may signal.

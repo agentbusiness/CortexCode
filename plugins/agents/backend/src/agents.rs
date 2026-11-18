@@ -1145,7 +1145,7 @@ impl Agents {
         let task = task(&host, &task_id).await?;
         match result.outcome.as_str() {
             "done" => {
-                if let Stewarded::Verified = self.steward(&ctx, &host, &record, &task, &result, false).await? {
+                if self.steward(&ctx, &host, &record, &task, &result, false).await?.done() {
                     self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
                 }
                 Ok(())
@@ -1192,9 +1192,12 @@ impl Agents {
         frozen_intact(task)?;
         let (report, outputs) = contract::verify(host, &task.id, &project.root, &task.contract, &CancellationToken::new()).await?;
         record_verification(host, task, &report, &[&session_id]).await;
+        let verdict = contract::Verdict::of(&report);
         let parent = host.session_get(&session_id).await.ok().and_then(|session| session.parent);
         if let Some(parent) = &parent {
-            let _ = host.journal_append(parent, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "agent": record.name})).await;
+            let _ = host
+                .journal_append(parent, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "agent": record.name, "state": verdict.as_str()}))
+                .await;
         }
         host.check_cancelled()?;
         let fresh = agent(host, &record.project_id, &record.name).await?;
@@ -1202,12 +1205,25 @@ impl Agents {
             return Err(RpcError::cancelled());
         }
         let mut updated = fresh;
-        if report.ok || no_worse_and_awaited(host, &session_id, task, &report, &outputs, &result.changed_files, &project.root).await {
-            update_task(host, json!({"id": task.id, "status": "done", "result": format!("verified in the project: {}", result.summary)})).await?;
+        // How the task ends done: its checks passed, nothing checked it, or its checks fail only
+        // where the plan's last task takes over. Each is said as what it is, never as a pass.
+        let standing = match verdict {
+            contract::Verdict::Passed => Some(Stewarded::Verified),
+            contract::Verdict::NotChecked => Some(Stewarded::Unchecked),
+            // Its checks were killed by the machine: nothing to fix in the work, so the agent is
+            // not sent back; said as checks that could not run.
+            contract::Verdict::Unrun => Some(Stewarded::Unrun),
+            contract::Verdict::Failed => {
+                let awaited = no_worse_and_awaited(host, &session_id, task, &report, &outputs, &result.changed_files, &project.root).await;
+                awaited.then_some(Stewarded::KnownFailures)
+            }
+        };
+        if let Some(standing) = standing {
+            let data = self.inner.data.get();
+            update_task(host, json!({"id": task.id, "status": "done", "result": data.text(standing.result_key(), &[("summary", result.summary.trim())])})).await?;
             updated.status = "done".into();
             updated.tasks_done += 1;
             let updated = upsert(ctx, host, updated).await?;
-            let data = self.inner.data.get();
             // What the work left, from the project itself: a file it made and then deleted is named
             // as removed (seen: a handoff listing a file that was gone, and the next agent looking
             // for it nine times).
@@ -1224,10 +1240,11 @@ impl Agents {
             handoff_ended(host, &updated, task, "is done", &result.summary).await;
             let lead = lead_session(host, &updated).await;
             let changed = if changed.is_empty() { data.text("progress_changed_none", &[]) } else { changed };
-            let text = data.text("progress_done", &[("agent", &record.name), ("title", &task.title), ("changed", changed.trim()), ("summary", result.summary.trim())]);
+            let checked = data.text(standing.progress_key(), &[]);
+            let text = data.text("progress_done", &[("agent", &record.name), ("title", &task.title), ("checked", &checked), ("changed", changed.trim()), ("summary", result.summary.trim())]);
             progress_note(host, lead.as_deref(), &text, &updated, true).await;
             let _ = host.call(memory_methods::REFRESH, json!({"project_id": project.id})).await;
-            Ok(Stewarded::Verified)
+            Ok(standing)
         } else {
             update_task(host, json!({"id": task.id, "status": "failed", "result": "the contract fails in the project"})).await?;
             updated.status = "blocked".into();
@@ -1286,12 +1303,59 @@ impl Agents {
             }
         }
         if all_done && host.check_cancelled().is_ok() {
-            let _ = update_task(host, json!({"id": parent_id, "status": "done", "result": "every subtask merged and verified"})).await;
-            if let Some(from) = &from {
-                let _ = host.journal_append(from, kinds::NOTE, json!({"text": "Every delegated task is merged and verified.", "purpose": "delegation_done", "task_id": parent_id})).await;
+            // The tree is done; whether it is right is the session's to judge against what the
+            // user asked. It gets the facts for that: each task with what checked it, the files it
+            // changed and what its agent's runs of the project's own commands printed last (seen:
+            // "Every delegated task is merged and verified" over nine tasks no check had run on).
+            let root_dir = host.project_get(&finished.project_id).await.map(|project| project.root).unwrap_or_default();
+            let known = project_commands(host).await;
+            let mut facts: Vec<Value> = Vec::new();
+            for task in &list.tasks {
+                facts.push(task_facts(host, task, &root_dir, &known).await);
             }
+            let data = self.inner.data.get();
+            let count = |state: &str| facts.iter().filter(|fact| fact_text(fact, "state") == state).count().to_string();
+            let summary = data.text(
+                "tree_done",
+                &[
+                    ("total", &facts.len().to_string()),
+                    ("passed", &count(contract::Verdict::Passed.as_str())),
+                    ("unchecked", &count(contract::Verdict::NotChecked.as_str())),
+                    ("failing", &count(contract::Verdict::Failed.as_str())),
+                ],
+            );
+            let _ = update_task(host, json!({"id": parent_id, "status": "done", "result": summary})).await;
+            if let Some(from) = &from {
+                let _ = host
+                    .journal_append(from, kinds::NOTE, json!({"text": summary, "purpose": "delegation_done", "task_id": parent_id, "tasks": facts}))
+                    .await;
+            }
+            let lines: String = facts
+                .iter()
+                .map(|fact| {
+                    let state = match fact_text(fact, "state") {
+                        "passed" => "tree_task_passed",
+                        "not_checked" => "tree_task_unchecked",
+                        _ => "tree_task_failing",
+                    };
+                    let (changed, removed) = (fact_list(fact, "changed_files"), fact_list(fact, "removed_files"));
+                    let agent = match fact_text(fact, "agent") {
+                        "" => String::new(),
+                        name => data.text("tree_task_agent", &[("agent", name)]),
+                    };
+                    let mut line = data.text("tree_task", &[("title", fact_text(fact, "title")), ("agent", &agent), ("state", &data.text(state, &[]))]);
+                    if !changed.is_empty() {
+                        line.push_str(&data.text("board_changed", &[("files", &changed)]));
+                    }
+                    if !removed.is_empty() {
+                        line.push_str(&data.text("board_removed", &[("files", &removed)]));
+                    }
+                    line.push('\n');
+                    line
+                })
+                .collect();
             let root = task(host, &parent_id).await.ok();
-            supervise(ctx, from.as_deref(), event_of(&finished.project_id, events::TREE_DONE, "", root.as_ref(), ""));
+            supervise(ctx, from.as_deref(), event_of(&finished.project_id, events::TREE_DONE, "", root.as_ref(), format!("{summary}\n{lines}").trim_end()));
         }
     }
 
@@ -1334,7 +1398,12 @@ impl Agents {
             (false, _) => "in_progress",
         };
         let passed = report.checks.iter().filter(|check| check.ok).count();
-        update_task(&host, json!({"id": task.id, "status": status, "result": format!("{passed}/{} checks pass in {workspace}", report.checks.len())})).await?;
+        // A contract without checks ran nothing: said as that, never as "0/0 checks pass".
+        let result = match contract::Verdict::of(&report) {
+            contract::Verdict::NotChecked => self.inner.data.get().text("verify_unchecked", &[("workspace", &workspace)]),
+            _ => format!("{passed}/{} checks pass in {workspace}", report.checks.len()),
+        };
+        update_task(&host, json!({"id": task.id, "status": status, "result": result})).await?;
         Ok(report)
     }
 
@@ -1348,16 +1417,14 @@ impl Agents {
         let task = task(&host, &task_id).await?;
         let result = AgentRunResult { outcome: "done".into(), summary: String::new(), turns: 0, tool_calls: 0, changed_files: vec![], usage: Value::Null };
         let outcome = self.steward(&ctx, &host, &record, &task, &result, true).await?;
-        Ok(match outcome {
-            Stewarded::Verified => {
-                // A task verified later releases the tasks that depend on it.
-                if let Some(session_id) = &record.session_id {
-                    self.start_dependents(&ctx, &host, &task, session_id, &record.mode).await;
-                }
-                MergeOutcome { ok: true, conflicts: vec![], sha: None, detail: "verified in the project".into() }
-            }
-            Stewarded::Failed => MergeOutcome { ok: false, conflicts: vec![], sha: None, detail: "the contract fails in the project".into() },
-        })
+        // A task done later releases the tasks that depend on it.
+        if outcome.done()
+            && let Some(session_id) = &record.session_id
+        {
+            self.start_dependents(&ctx, &host, &task, session_id, &record.mode).await;
+        }
+        // `ok`: the work stands in the project and its task is done; `detail` says what checked it.
+        Ok(MergeOutcome { ok: outcome.done(), conflicts: vec![], sha: None, detail: self.inner.data.get().text(outcome.detail_key(), &[]) })
     }
 
     async fn steer(&self, ctx: Ctx, params: AgentSteerParams) -> Result<Value, RpcError> {
@@ -1406,23 +1473,16 @@ impl Agents {
             return Ok(json!({"finished": true, "verified": task.status == "done"}));
         }
         // What the agent changed, from its session's tool results.
-        let mut changed_files: Vec<String> = Vec::new();
-        if let Ok(entries) = host.journal_read(&session_id, 1).await {
-            for entry in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT) {
-                for file in entry.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-                    if !changed_files.iter().any(|known| known == file) {
-                        changed_files.push(file.to_owned());
-                    }
-                }
-            }
-        }
+        let changed_files = host.journal_read(&session_id, 1).await.map(|entries| changed_files_of(&entries)).unwrap_or_default();
         let summary = self.inner.data.get().text("finished_by_session", &[]);
         let result = AgentRunResult { outcome: "done".into(), summary, turns: 0, tool_calls: 0, changed_files, usage: Value::Null };
-        let verified = matches!(self.steward(&ctx, &host, &record, &task, &result, true).await?, Stewarded::Verified);
-        if verified && !session_id.is_empty() {
+        let outcome = self.steward(&ctx, &host, &record, &task, &result, true).await?;
+        if outcome.done() && !session_id.is_empty() {
             self.start_dependents(&ctx, &host, &task, &session_id, &record.mode).await;
         }
-        Ok(json!({"finished": true, "verified": verified}))
+        // `verified`: the task is done as it stands (the tasks waiting for it started). `state`
+        // says what checked it: `passed`, `not_checked` (no check ran) or `failed`.
+        Ok(json!({"finished": true, "verified": outcome.done(), "state": outcome.state()}))
     }
 
     /// Cancel a task with its subtasks and the tasks waiting for it; their agents stop.
@@ -1776,9 +1836,69 @@ impl Agents {
     }
 }
 
+/// How the merge steward left a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stewarded {
+    /// Done: at least one check ran and every check passes in the project.
     Verified,
+    /// Done with nothing checked: the task's contract holds no check. Never said as a pass.
+    Unchecked,
+    /// Done with its checks not run: the machine killed them (memory, a stop from outside), so
+    /// they show nothing about the work. Never said as a pass, never as a failure to fix.
+    Unrun,
+    /// Done while its checks fail only where they failed before the work or outside its own
+    /// files, and a later task of the plan waits for it (the plan's last task makes them pass).
+    KnownFailures,
+    /// Its checks fail in the project: the agent is blocked.
     Failed,
+}
+
+impl Stewarded {
+    /// The task is done as it stands, so the tasks waiting for it start.
+    fn done(self) -> bool {
+        self != Stewarded::Failed
+    }
+
+    /// The state as records carry it: `passed`, `not_checked` or `failed` (a task done with known
+    /// failures is done and `failed`: its last verification did not pass).
+    fn state(self) -> &'static str {
+        match self {
+            Stewarded::Verified => contract::Verdict::Passed.as_str(),
+            Stewarded::Unchecked | Stewarded::Unrun => contract::Verdict::NotChecked.as_str(),
+            Stewarded::KnownFailures | Stewarded::Failed => contract::Verdict::Failed.as_str(),
+        }
+    }
+
+    /// The text key of a done task's `result`.
+    fn result_key(self) -> &'static str {
+        match self {
+            Stewarded::Unchecked => "result_unchecked",
+            Stewarded::Unrun => "result_unrun",
+            Stewarded::KnownFailures => "result_known_failures",
+            Stewarded::Verified | Stewarded::Failed => "result_verified",
+        }
+    }
+
+    /// The text key of what the session is told about the checks of a finished task.
+    fn progress_key(self) -> &'static str {
+        match self {
+            Stewarded::Unchecked => "progress_unchecked",
+            Stewarded::Unrun => "progress_unrun",
+            Stewarded::KnownFailures => "progress_known_failures",
+            Stewarded::Verified | Stewarded::Failed => "progress_verified",
+        }
+    }
+
+    /// The text key of a merge's `detail`.
+    fn detail_key(self) -> &'static str {
+        match self {
+            Stewarded::Verified => "merge_verified",
+            Stewarded::Unchecked => "merge_unchecked",
+            Stewarded::Unrun => "merge_unrun",
+            Stewarded::KnownFailures => "merge_known_failures",
+            Stewarded::Failed => "merge_failing",
+        }
+    }
 }
 
 fn pick_name(taken: &BTreeSet<&str>) -> String {
@@ -1910,7 +2030,10 @@ fn error_files(output: &str, workspace: &str) -> Option<std::collections::HashSe
 
 async fn record_verification(host: &Host, task: &Task, report: &VerifyReport, sessions: &[&str]) {
     for session in sessions.iter().filter(|session| !session.is_empty()) {
-        if let Err(error) = host.journal_append(session, kinds::VERIFICATION, json!({"task_id": task.id, "report": report})).await {
+        // `state` says what the report showed: `passed`, `failed`, or `not_checked` when the
+        // contract held no check (the report's `ok` is true then: no check failed).
+        let state = contract::Verdict::of(report).as_str();
+        if let Err(error) = host.journal_append(session, kinds::VERIFICATION, json!({"task_id": task.id, "report": report, "state": state})).await {
             tracing::warn!(%error, "could not journal the verification");
         }
     }
@@ -1938,6 +2061,12 @@ async fn graph_context(host: &Host, project: &Project, goal: &str, data: &Datase
 /// (`lang@1` describe), as the chat flow offers them. No files are named before the plan, so a
 /// verifier that checks named files is not offered; empty when nothing applies.
 async fn verifier_candidates(host: &Host, root: &str) -> Vec<Candidate> {
+    let descriptions = lang_descriptions(host).await;
+    verifiers::candidates(std::path::Path::new(root), &descriptions, std::env::var_os("PATH").as_deref(), &[])
+}
+
+/// What the active language plugins say about themselves (`lang@1` describe).
+async fn lang_descriptions(host: &Host) -> Vec<Description> {
     let Ok(listed) = host.get::<Value>(cc_protocol::contracts::frame::methods::PLUGINS_LIST, json!({})).await else { return Vec::new() };
     let mut descriptions: Vec<Description> = Vec::new();
     for entry in listed.get("plugins").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -1949,7 +2078,125 @@ async fn verifier_candidates(host: &Host, root: &str) -> Vec<Candidate> {
             descriptions.push(description);
         }
     }
-    verifiers::candidates(std::path::Path::new(root), &descriptions, std::env::var_os("PATH").as_deref(), &[])
+    descriptions
+}
+
+/// The first words of the commands that check, build or run a project's code, as the active
+/// language plugins declare them (their verifiers and their runners): `["cargo", "test"]`. A
+/// verifier's words stop before its first placeholder (`{files}`).
+async fn project_commands(host: &Host) -> Vec<Vec<String>> {
+    let mut known: Vec<Vec<String>> = Vec::new();
+    for description in lang_descriptions(host).await {
+        let verifiers = description.verifiers.iter().map(|verifier| verifier.command.iter().take_while(|word| !word.contains('{')).cloned().collect::<Vec<String>>());
+        let runners = description.runs.iter().map(|runner| runner.command.clone());
+        for words in verifiers.chain(runners) {
+            if !words.is_empty() && !known.contains(&words) {
+                known.push(words);
+            }
+        }
+    }
+    known
+}
+
+/// Whether a `run` command runs one of the project's own commands: one of its parts (between
+/// `;`, `|`, `&&`, `||` and line ends) starts with a declared command's words, after any leading
+/// `NAME=value` settings. Mechanical: words compared, nothing guessed.
+fn runs_project_command(command: &str, known: &[Vec<String>]) -> bool {
+    command.split(['\n', ';', '|', '&']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().skip_while(|word| word.contains('=') && !word.starts_with('-')).collect();
+        known.iter().any(|prefix| words.len() >= prefix.len() && words.iter().zip(prefix).all(|(word, want)| *word == want.as_str()))
+    })
+}
+
+/// Runs of the project's own commands kept per task of a finished tree (the newest of each
+/// command, the last ones the work ended with), and the characters kept of each one's output.
+const TREE_RUNS_PER_TASK: usize = 3;
+const TREE_RUN_CHARS: usize = 2000;
+
+/// The files a session changed, from its tool results, in the order first changed.
+fn changed_files_of(entries: &[JournalEntry]) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT) {
+        for file in entry.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            if !changed.iter().any(|known| known == file) {
+                changed.push(file.to_owned());
+            }
+        }
+    }
+    changed
+}
+
+/// A text field of a task's facts ([`task_facts`]); empty when absent.
+fn fact_text<'a>(fact: &'a Value, name: &str) -> &'a str {
+    fact.get(name).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A list field of a task's facts, comma-separated; empty when absent.
+fn fact_list(fact: &Value, name: &str) -> String {
+    fact.get(name).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+}
+
+/// One task of a finished tree as its session judges it, all from records (no judgement here):
+/// `{task_id, title, agent, session_id, state, changed_files, removed_files, runs}`.
+/// - `state`: what the task's newest verification showed, `passed`, `failed` or `not_checked` (a
+///   task nothing verified is `not_checked`).
+/// - `changed_files`: the files its agent changed that are in the project now; `removed_files`:
+///   those that are gone.
+/// - `runs`: `[{command, exit_code, tests, output}]`, the newest result of each of its agent's
+///   runs of the project's own commands ([`runs_project_command`], or a run the tools plugin read
+///   as a test run), oldest first, the last [`TREE_RUNS_PER_TASK`]; `output` is the result as the
+///   agent saw it, its last [`TREE_RUN_CHARS`] characters.
+async fn task_facts(host: &Host, task: &Task, root: &str, known: &[Vec<String>]) -> Value {
+    let entries = match task.session_id.as_deref().filter(|session| !session.is_empty()) {
+        Some(session) => host.journal_read(session, 1).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let state = entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.kind == kinds::VERIFICATION && entry.data.get("task_id").and_then(Value::as_str) == Some(task.id.as_str()))
+        .find_map(|entry| match entry.data.get("state").and_then(Value::as_str) {
+            Some(state) => Some(state.to_owned()),
+            // A verification recorded before `state` was: read from its report.
+            None => serde_json::from_value::<VerifyReport>(entry.data.get("report")?.clone()).ok().map(|report| contract::Verdict::of(&report).as_str().to_owned()),
+        })
+        .unwrap_or_else(|| contract::Verdict::NotChecked.as_str().to_owned());
+    let (changed, removed): (Vec<String>, Vec<String>) = changed_files_of(&entries).into_iter().partition(|file| std::path::Path::new(root).join(file).exists());
+    let results: HashMap<&str, &JournalEntry> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT)
+        .filter_map(|entry| Some((entry.data.get("call_id")?.as_str()?, entry)))
+        .collect();
+    let mut runs: Vec<(String, Value)> = Vec::new();
+    for call in entries.iter().filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("tool").and_then(Value::as_str) == Some("run")) {
+        let command = call.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str).unwrap_or("").trim().to_owned();
+        let Some(result) = call.data.get("call_id").and_then(Value::as_str).and_then(|id| results.get(id)) else { continue };
+        let display = result.data.get("display").cloned().unwrap_or(Value::Null);
+        // A background start printed nothing yet; its result comes as the job's own note.
+        if command.is_empty() || display.get("background").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let tests = display.get("tests").is_some_and(|tests| !tests.is_null());
+        if !tests && !runs_project_command(&command, known) {
+            continue;
+        }
+        let output = result.data.get("output").and_then(Value::as_str).unwrap_or("").trim_end();
+        let run = json!({"command": command, "exit_code": display.get("exit_code").cloned().unwrap_or(Value::Null), "tests": tests, "output": contract::tail_of(output, TREE_RUN_CHARS)});
+        runs.retain(|(earlier, _)| earlier != &command);
+        runs.push((command, run));
+    }
+    let skip = runs.len().saturating_sub(TREE_RUNS_PER_TASK);
+    let runs: Vec<Value> = runs.into_iter().skip(skip).map(|(_, run)| run).collect();
+    json!({
+        "task_id": task.id,
+        "title": task.title,
+        "agent": task.assignee,
+        "session_id": task.session_id,
+        "state": state,
+        "changed_files": changed,
+        "removed_files": removed,
+        "runs": runs,
+    })
 }
 
 /// The candidates as the stage message's text; empty when nothing applies.

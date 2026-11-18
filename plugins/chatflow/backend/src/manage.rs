@@ -99,11 +99,20 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (
     let Some((entries, measured)) = measured(env, agent, checks).await else { return (String::new(), false) };
     let Measured { steps, edits, since_edit, checks_since, idle, edited_at, files } = measured;
     let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER);
+    let measured_files = files.clone();
     let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
     let mut line = env.data.text(
         "manage_progress",
         &[("steps", &steps.to_string()), ("edits", &edits.to_string()), ("files", &files), ("since", &since_edit.to_string()), ("checks", &checks_since.to_string()), ("idle", &idle.to_string())],
     );
+    // What the folder holds now, not what the agent last said: a file it changed that is gone
+    // (another agent removed it, or it did) is named (seen: three agents steered to a folder
+    // another agent had deleted, from reports written before it went).
+    let folder = agent.workspace.as_deref().filter(|workspace| !workspace.is_empty()).unwrap_or(env.scope.workspace.as_str());
+    let gone: Vec<&str> = measured_files.iter().map(String::as_str).filter(|file| !std::path::Path::new(folder).join(file).exists()).collect();
+    if !gone.is_empty() {
+        line.push_str(&env.data.text("manage_files_gone", &[("files", &gone.join(", "))]));
+    }
     let (reading, still) = flags(env, since_edit, idle);
     if reading {
         line.push_str(&env.data.text("manage_flag_reading", &[("since", &since_edit.to_string())]));
@@ -220,6 +229,37 @@ fn short(text: &str, chars: usize) -> String {
     if cut.len() < text.len() { format!("{cut}...") } else { cut }
 }
 
+/// Entries of the project folder's top level shown to MANAGE at most.
+const FOLDER_ENTRIES: usize = 60;
+
+/// The project folder's top level as it is now, one line: each entry by name (a folder ends in
+/// `/`), hidden entries left out. Read by the host at the decision, so the session compares the
+/// agents' reports with what is there. Empty when the folder cannot be listed.
+pub fn folder_line(env: &RunEnv) -> String {
+    let Ok(listing) = std::fs::read_dir(&env.scope.workspace) else { return String::new() };
+    let mut names: Vec<String> = listing
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            Some(if entry.path().is_dir() { format!("{name}/") } else { name })
+        })
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort();
+    let more = names.len().saturating_sub(FOLDER_ENTRIES);
+    names.truncate(FOLDER_ENTRIES);
+    let mut shown = names.join(", ");
+    if more > 0 {
+        shown.push_str(&env.data.text("manage_folder_more", &[("count", &more.to_string())]));
+    }
+    env.data.text("manage_folder", &[("entries", &shown)])
+}
+
 /// The plan the background work carries out, task by task with where each stands (done, worked on
 /// by an agent, waiting for the tasks it needs), so each check compares the work with the whole
 /// plan, not each agent with its own task alone. Empty without a plan being carried out.
@@ -308,6 +348,11 @@ pub async fn cancel_tasks(env: &RunEnv, task_ids: &[String]) -> Vec<String> {
 /// happened (the reply reads it); a replan becomes the decision to do the work again, which the
 /// DO path plans (its plan's `replaces` stops what it takes the place of).
 pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
+    // A plan the agents finished is judged against what the user asked before anything else: an
+    // ask not shown met sends the work on, and that is this decision ([`crate::flow::accept_tree`]).
+    if crate::flow::accept_tree(env, journal).await? {
+        return Ok(());
+    }
     let entries = journal.entries_vec();
     let work = open_work(env, &entries).await;
     if work.is_empty() {
@@ -330,14 +375,28 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         .and_then(|entry| entry.data.get("detail").and_then(|detail| detail.get("check")).and_then(Value::as_bool))
         == Some(true);
     let (lines, attention) = work_lines_with_progress(env, &work).await;
-    if check && !attention {
+    // What the user asked of the work while it ran that no plan took up yet: the session hears it
+    // once, right before its decision (seen: "the spreadsheet files must work too", promised in an
+    // answer, in no task, and the work was reported done without it).
+    let unplanned = match crate::plan::latest(&entries).filter(|(_, plan)| plan.status == cc_protocol::contracts::chatflow::plan_status::IMPLEMENTING) {
+        Some((_, plan)) => crate::flow::asks_unplanned(&entries, &env.run_id, &plan.plan_id, true),
+        None => Vec::new(),
+    };
+    if check && !attention && unplanned.is_empty() {
         // Transcript only: the session's conversation does not fill with check-ins that did nothing.
         let text = env.data.text("managed_nothing", &[]);
         return journal.note(&env.run_id, "managed", &text, false).await.map(|_| ());
     }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
     let shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
-    let live = format!("{}{}", plan_lines(env, &entries, &work).await, env.data.text("manage_live", &[("work", &lines)]));
+    let asked = if unplanned.is_empty() {
+        String::new()
+    } else {
+        let list = unplanned.iter().enumerate().map(|(index, ask)| format!("{}. {}", index + 1, env.data.text("ask_line", &[("quote", ask)]))).collect::<Vec<_>>().join("\n");
+        env.data.text("manage_asks", &[("asks", &list)])
+    };
+    // The plan, then the folder as it is now, then each agent's report; what the user asked last.
+    let live = format!("{}{}{}{asked}", plan_lines(env, &entries, &work).await, folder_line(env), env.data.text("manage_live", &[("work", &lines)]));
     let (decision, _) = crate::flow::decide_json::<Manage>(env, journal, "MANAGE", &shape, &live).await?;
     let mut done = Vec::new();
     for action in &decision.actions {
@@ -400,7 +459,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     if done.is_empty() {
         done.push(env.data.text("managed_nothing", &[]));
     }
-    journal.note(&env.run_id, "managed", &done.join("\n"), true).await?;
+    let managed = journal.note(&env.run_id, "managed", &done.join("\n"), true).await?;
+    if !unplanned.is_empty() {
+        // Heard: these asks are not shown to the next check again.
+        journal.set(managed, "asks_told", json!(true)).await?;
+    }
     if replan {
         let detail = json!({
             "missing": "",

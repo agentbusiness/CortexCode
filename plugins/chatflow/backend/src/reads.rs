@@ -535,13 +535,8 @@ pub fn render(tool: &str, value: &Value) -> String {
             if result.agents.is_empty() {
                 return "No agents.".to_owned();
             }
-            result.agents.iter().map(|agent| {
-                if matches!(agent.status.as_str(), "working" | "blocked") {
-                    serde_json::to_string_pretty(agent).unwrap_or_default()
-                } else {
-                    format!("{}: {}", agent.name, agent.status)
-                }
-            }).collect::<Vec<_>>().join("\n")
+            // A name and a state each: ids and timestamps answer nobody's question.
+            result.agents.iter().map(|agent| format!("{}: {}", agent.name, agent.status)).collect::<Vec<_>>().join("\n")
         }),
         memory_methods::SEARCH => serde_json::from_value::<SearchResult>(value.clone()).ok().map(|result| {
             if result.hits.is_empty() {

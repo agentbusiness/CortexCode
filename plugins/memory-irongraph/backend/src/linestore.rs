@@ -10,7 +10,12 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 6] = b"CCLS1\n";
+/// The file form: `CCLS2` holds four-character tags. A file of an earlier form (`CCLS1`, two
+/// characters) is not read and is written again by the next [`LineStore::put`].
+const MAGIC: &[u8; 6] = b"CCLS2\n";
+
+/// Bytes of one line's entry: its offset, then its tag.
+const ENTRY: usize = 4 + hashline::TAG_LEN;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineIndex {
@@ -34,21 +39,22 @@ impl LineIndex {
         Self { offsets, tags }
     }
 
-    /// `N:hh` anchor of a 1-based line.
+    /// `N:hhhh` anchor of a 1-based line.
     pub fn anchor(&self, line: u32) -> Option<String> {
         let tag = self.tags.get((line as usize).checked_sub(1)?)?;
         Some(format!("{line}:{tag}"))
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(10 + self.offsets.len() * 6);
+        let mut out = Vec::with_capacity(10 + self.offsets.len() * ENTRY);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(self.offsets.len() as u32).to_le_bytes());
         for (offset, tag) in self.offsets.iter().zip(&self.tags) {
             out.extend_from_slice(&offset.to_le_bytes());
             let bytes = tag.as_bytes();
-            out.push(bytes.first().copied().unwrap_or(b'0'));
-            out.push(bytes.get(1).copied().unwrap_or(b'0'));
+            for index in 0..hashline::TAG_LEN {
+                out.push(bytes.get(index).copied().unwrap_or(b'0'));
+            }
         }
         out
     }
@@ -58,15 +64,15 @@ impl LineIndex {
             return None;
         }
         let count = u32::from_le_bytes(bytes[6..10].try_into().ok()?) as usize;
-        if bytes.len() != 10 + count * 6 {
+        if bytes.len() != 10 + count * ENTRY {
             return None;
         }
         let mut offsets = Vec::with_capacity(count);
         let mut tags = Vec::with_capacity(count);
         for i in 0..count {
-            let base = 10 + i * 6;
+            let base = 10 + i * ENTRY;
             offsets.push(u32::from_le_bytes(bytes[base..base + 4].try_into().ok()?));
-            tags.push(String::from_utf8_lossy(&bytes[base + 4..base + 6]).into_owned());
+            tags.push(String::from_utf8_lossy(&bytes[base + 4..base + ENTRY]).into_owned());
         }
         Some(Self { offsets, tags })
     }
@@ -88,10 +94,17 @@ impl LineStore {
         self.dir.join(shard).join(format!("{hash}.lines"))
     }
 
-    /// Store the index of `text` under `hash` (no-op when already present).
+    /// Whether the file at `path` is an index in the current form (its first bytes say).
+    fn current(path: &Path) -> bool {
+        use std::io::Read;
+        let mut head = [0u8; 6];
+        std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok() && &head == MAGIC
+    }
+
+    /// Store the index of `text` under `hash` (no-op when already present in the current form).
     pub fn put(&self, hash: &str, text: &str) -> std::io::Result<()> {
         let path = self.path(hash);
-        if path.is_file() {
+        if Self::current(&path) {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
@@ -104,6 +117,7 @@ impl LineStore {
         std::fs::rename(tmp, path)
     }
 
+    /// The index stored under `hash`; None when there is none in the current form.
     pub fn get(&self, hash: &str) -> Option<LineIndex> {
         std::fs::read(self.path(hash)).ok().and_then(|bytes| LineIndex::decode(&bytes))
     }

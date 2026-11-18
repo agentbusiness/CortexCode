@@ -6,7 +6,7 @@ Docker here: get it right, build and lint it, Dockerfiles that run, common error
    - Note: base image and tag, needed files, listening port, command, user, environment.
    - The request and the project decide, never a name alone: read what stage `prod` or service `api` really runs.
    - The request and the project disagree: say so and ask, instead of silently picking one.
-   - Before editing, note the request's examples: they are the check, their values copied, never computed.
+   - Before editing, note what the request says must hold; an example it gives is a check, its values copied, never computed.
    - Unfamiliar base image, tool or setting: look it up (the research plugin, the image's docs, how others solved it):
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole stages, in slices.**

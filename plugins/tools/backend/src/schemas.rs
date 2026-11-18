@@ -79,23 +79,23 @@ pub fn read_spec(offline: bool) -> ToolSpec {
 
 pub fn edit_spec(format: EditFormat) -> ToolSpec {
     let path = json!({"type": "string", "description": "File to change, relative to the workspace; a one-off probe: `tmp/<name>`."});
-    let content = json!({"type": "string", "description": "The whole text of a new file or a file of empty stubs, without read's N:hh| prefixes. An existing file is changed by `edits`, only where it needs changing."});
+    let content = json!({"type": "string", "description": "The whole text of a new file or a file of empty stubs, without read's N:hhhh| prefixes. An existing file is changed by `edits`, only where it needs changing."});
     let (description, properties) = match format {
         EditFormat::Hashline => (
-            "Change a read file by N:hh anchors, at most two top-level definitions per call. New file: `content`.",
+            "Change a read file by N:hhhh anchors, at most two top-level definitions a call. New file: `content`.",
             json!({
                 "intent": intent(),
                 "path": path,
                 "edits": {
                     "type": "array",
-                    "description": "The changes to one or two top-level definitions of the file (a class with its methods is one): checked against the current file and applied together, or none is. If the file changed since your read, nothing is written and you get its current lines with fresh anchors. E.g. {\"op\":\"replace\",\"at\":\"12:ab\",\"to\":\"14:cd\",\"text\":\"...\"}.",
+                    "description": "The changes to one or two top-level definitions of the file (a class with its methods is one): checked against the current file and applied together, or none is. If the file changed since your read, nothing is written and you get its current lines with fresh anchors. E.g. {\"op\":\"replace\",\"at\":\"12:ab3k\",\"to\":\"14:cd7m\",\"text\":\"...\"}.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "op": {"type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "replace or delete lines at..to; insert text after or before line at."},
                             "at": {"type": "string", "description": "Anchor of the (first) line. \"0\" means before line 1 (insert_after only)."},
                             "to": {"type": "string", "description": "Anchor of the last line of a range (replace, delete); leave out for one line."},
-                            "text": {"type": "string", "description": "The new lines, without N:hh| prefixes (replace, insert_after, insert_before)."}
+                            "text": {"type": "string", "description": "The new lines, without N:hhhh| prefixes (replace, insert_after, insert_before)."}
                         },
                         "required": ["op", "at"]
                     }
@@ -108,7 +108,7 @@ pub fn edit_spec(format: EditFormat) -> ToolSpec {
             json!({
                 "intent": intent(),
                 "path": path,
-                "old": {"type": "string", "description": "Exact text to replace, without read's N:hh| prefixes. It must match the file exactly once, whitespace included (or set all)."},
+                "old": {"type": "string", "description": "Exact text to replace, without read's N:hhhh| prefixes. It must match the file exactly once, whitespace included (or set all)."},
                 "new": {"type": "string", "description": "Replacement text."},
                 "all": {"type": "boolean", "description": "Replace every occurrence."},
                 "content": content
@@ -183,9 +183,9 @@ pub fn run_spec() -> ToolSpec {
 pub fn guide(format: EditFormat, offline: bool) -> String {
     let anchors = match format {
         EditFormat::Hashline => {
-            "  N:hh (the line number and a short hash of the line) is the line's anchor: edit names lines by anchor, never by bare line number, and an anchor stops matching once its line changes."
+            "  N:hhhh (the line number and a four-character tag of the line's text) is the line's anchor: edit names lines by anchor, never by bare line number, and an anchor stops matching once its line changes."
         }
-        EditFormat::Replace | EditFormat::Whole => "  The N:hh| prefix is not part of the file: leave it out of what you send to edit.",
+        EditFormat::Replace | EditFormat::Whole => "  The N:hhhh| prefix is not part of the file: leave it out of what you send to edit.",
     };
     let change = match format {
         EditFormat::Hashline => "each function it changed, whole, as it is now (other code: the changed lines and 2 around them), with new anchors; then any lines it removed",
@@ -211,7 +211,7 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
         "Which tool:\n\
 1. read: {read_for}.\n\
 2. edit: to change or write a file (below).\n\
-3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Checks of your work are tests in the project (a project without tests gets them), run whole: no `| tail` or `| grep`, the result shows each failure; a one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
+3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Check your change with the project's own tests that cover it and by running what the user asked to run; add a test when the request asks for one or the project already tests that code. Run a check whole: no `| tail` or `| grep`, the result shows each failure. A one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
 5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through.\n\
 6. {network}\n\
@@ -219,7 +219,7 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
 Give every call a short `intent` first.\n\
 \n\
 Working with files:\n\
-1. Read a file before you change it: its lines come numbered (N:hh|). A long file shows its definitions; read one of them with `path#Name`.\n\
+1. Read a file before you change it: its lines come numbered (N:hhhh|). A long file shows its definitions; read one of them with `path#Name`.\n\
 2. Change an existing file with edit {how}, one or two top-level definitions per call (a class with its methods is one). Never rewrite, reformat or clean up code that works, and never write a file with working code whole again: code the task does not touch stays exactly as it is, unless the user asks to change it.\n\
 3. The result shows each changed function as it is now{fresh}: your next edit uses that. Read the file again only after a command changed it.\n\
 4. Write whole with `content` only a new file, a file of empty stubs, or a probe in the scratch folder `tmp/` (`tmp/<name>`, as often as you like; git ignores it).\n\
@@ -228,7 +228,7 @@ Working with files:\n\
 7. Every edit and command is recorded and can be undone: `cx changed` lists your steps with their numbers, `cx undo --step N` puts back what step N changed. So try the change and run the check; a try that went wrong is one undo, not a reason to read more first.\n\
 \n\
 How results read:\n\
-- A file: `path:` and then its lines as N:hh|text.\n{anchors}\n  A long file shows only its definitions; ⋮ N-M marks lines left out: read path:N-M to see them.\n\
+- A file: `path:` and then its lines as N:hhhh|text.\n{anchors}\n  A long file shows only its definitions; ⋮ N-M marks lines left out: read path:N-M to see them.\n\
 - A folder: one entry per line; a name ending in / is a folder.\n\
 - edit: {change}, then the file's errors, or `No errors.` and the next step.\n\
 - run: the command's output, then `[exit N]`: exit 0 means it succeeded. A long output is cut in the middle: `[N lines not shown: read artifact://<id>:A-B for them]`.\n\
@@ -239,8 +239,8 @@ How results read:\n\
 - A failure says what went wrong; its last sentence is the next step.\n\
 \n\
 Find code:\n\
-- By meaning: read graph://search/<words>. When nothing fits, search again with other words.\n\
-- From a result, by its name:\n  its code, what it takes and returns: symbol://<name>\n  exactly where it is used, from the code graph, not a search: graph://used-by/<name>\n  exactly what it uses: graph://uses/<name>\n  what is around it in its file: outline://<path>\n  what a change to it reaches (callers, tests): graph://impact/<name>\n  how two relate (the shortest chain between them): graph://path/<name>/<name>\n  where a Python local value came from before a line: graph://value/<path>?line=<line>&name=<variable>\n\
+- By meaning first: read graph://search/<words>. When nothing fits, search again with other words. Exact text: `grep -rn <text> .` in run.\n\
+- A result names its code: read it with symbol://<name>. What else read takes (who uses a name, what a change reaches, a file's outline) is listed once, in read's `path`.\n\
 - Before you change what a function takes or returns, read graph://used-by/<name>: every call listed there changes with it.\n\
 \n\
 `cx` (on PATH, through run) reaches background agents, their tasks, the board, the code graph, the browser and CortexCode's own plugins; `cx tools` lists its commands, and `cx research deep <topic>` runs a cited research job. To change how CortexCode itself works, edit its skills, prompts and texts in `$CORTEX_HOME/live/plugins/<id>/` (`data/` or `backend/data/`): an edit is live at once.\n"

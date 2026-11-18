@@ -7,16 +7,16 @@ HTML and CSS here: get it right, serve and check the page, code that runs, error
    - Keep every id, class and attribute the project or its tests use, exactly: scripts and tests select by them.
    - The request and the project decide, never a file or class name alone.
    - The request and the project disagree: say so and ask, instead of silently picking one.
-   - Before coding, note the request's examples: they are the check, their values copied, never computed.
+   - Before coding, note what the request says must hold; an example it gives is a check, its values copied, never computed.
    - Unfamiliar API, format or browser behaviour: look it up (the research plugin, MDN, how others solved it):
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 2. **Write whole blocks, in slices.**
    - Markup showing first. Then each behaviour, checking the page after each.
-   - A new page or stylesheet is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - A new page or stylesheet is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, one or two top-level definitions per call.
    - Markup: replace the element from opening to closing tag. CSS: the whole rule.
    - Never leave a half tag, an unclosed `<div>` or a lost `}`. One missing `}` breaks every rule after it.
 3. **Check it in the browser after every change** (section 2): what is shown, what a click or input changes.
-4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Markup, rules and scripts that work and that the task does not touch stay exactly as they are, unless the user asks to change them. Run the project's tests and validators (section 2); fix the first error first.
+4. Run the project's tests and validators (section 2); fix the first error first.
 5. **Before you finish**, check each requirement again against the served page.
 
 ## 2. Run, test, check
@@ -38,7 +38,7 @@ npx --no -- stylelint "css/**/*.css"                            # when it has a 
 - The HTML server never reports nesting or duplicate ids; html-validate does.
 - Stop servers when done: `cx job list`, `cx job kill <id>`.
 
-**Checking your work.** Run only the request's examples against the served page (input and expected values copied from the request, never changed; no case the request does not give). When the project has tests, run them (`npm test`, its end-to-end tests) and add the request's examples there; a project without tests gets them in `tests/`, the request's examples kept there. When the request gives no examples, open every page or control you changed at least once and check what follows from your inputs. Then ask the browser for actual values.
+**Checking your work.** Check the change on the served page: open every page or control you changed at least once, and check what the request says must show and happen (an example it gives with its input and expected values copied, never changed). Run the project's tests that cover the change (`npm test`, its end-to-end tests) before and after it. Add a test when the request asks for one, or when the project already tests the page you changed: the case goes with those tests, and in a project that has none a requested test goes in `tests/`. Never add a test only to have a check. Then ask the browser for actual values.
 - One line per example, never one assertion that hides the rest.
 - A check fails: find out whether the page or the expected value is wrong; when you cannot tell, say so. When a failure shows how the tests use the page (a selector, a text, a value), apply that everywhere it fits.
 - Run the tests whole, without `| tail` or `| grep`: the result shows each failure.

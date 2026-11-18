@@ -1,3 +1,8 @@
 # The Rust guide is loaded into every session of a Rust project (never a choice).
 [rust]
 always = true
+
+# Read when the work needs it (linked nodes, raw pointers, thread-safety or variance of a type):
+# offered as a choice in Rust projects, never loaded by itself.
+[rust-shared-and-linked-data]
+languages = ["rust"]

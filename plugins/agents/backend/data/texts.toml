@@ -52,8 +52,34 @@ board_conflict = "{title}: merge conflict in {files}; handed back to {agent}"
 board_blocked_by_local = "{title}: {agent}'s work is ready; the merge waits for uncommitted edits in {files} to be committed."
 
 # ---- progress (the delegating session's journal, shown on its card) -------------------------------
-progress_done = "{agent} finished \"{title}\": its checks pass in the project. {changed}\nIts report:\n{summary}"
+# What checked a finished task is said as what it is: a task no check ran on is never told as a
+# pass (seen: nine tasks with no check, each told as "its checks pass in the project").
+progress_done = "{agent} finished \"{title}\": {checked} {changed}\nIts report:\n{summary}"
+progress_verified = "its checks pass in the project."
+progress_unchecked = "no check ran on it, so nothing shows yet that it works."
+progress_unrun = "its checks could not run here (the machine killed them, e.g. for memory), so nothing shows yet that it works."
+progress_known_failures = "its checks still fail, only where they failed before the work or outside its files; the plan's last task makes them pass."
 progress_changed_none = "It changed no file."
 progress_cancelled = "\"{title}\" was cancelled{agent}."
 progress_cancelled_agent = " ({agent} stopped)"
 progress_restarted = "{agent} works on \"{title}\" again."
+
+# ---- what checked a task (task records, merge results, the finished tree) --------------------------
+result_verified = "verified in the project: {summary}"
+result_unchecked = "done; no check ran on it: {summary}"
+result_unrun = "done; its checks could not run here: {summary}"
+result_known_failures = "done; its checks still fail where they failed before or outside its files: {summary}"
+verify_unchecked = "no check ran on it in {workspace}: its contract holds none"
+merge_verified = "verified in the project"
+merge_unchecked = "in the project; no check ran on it"
+merge_unrun = "in the project; its checks could not run here"
+merge_known_failures = "in the project; its checks still fail where they failed before or outside its files"
+merge_failing = "the contract fails in the project"
+# The finished tree, for the session that judges it against what the user asked: the counts, then
+# one line per task.
+tree_done = "Every task is done: {passed} of {total} with passing checks, {unchecked} with no check run on it, {failing} with checks that still fail."
+tree_task = "- \"{title}\"{agent}: {state}."
+tree_task_agent = " ({agent})"
+tree_task_passed = "its checks pass in the project"
+tree_task_unchecked = "no check ran on it"
+tree_task_failing = "its checks still fail in the project"

@@ -189,7 +189,7 @@ gh pr diff 123 --name-only; gh pr diff 123    # changed files, full diff
 gh api repos/{owner}/{repo}/pulls/123/comments --jq '.[] | "\(.path):\(.line) \(.user.login): \(.body)"'   # inline review comments
 gh pr checks 123                              # CI status per check
 gh run list --branch <branch> --limit 5
-gh run view <run-id> --log-failed | tail -80  # only the failing steps' logs
+gh run view <run-id> --log-failed             # only the failing steps' logs, whole
 gh issue view 45 --comments
 gh pr list --state open --search "author:@me"
 ```

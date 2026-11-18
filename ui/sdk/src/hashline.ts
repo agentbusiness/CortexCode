@@ -1,6 +1,6 @@
 /**
  * Hashline anchors (`protocol/src/hashline.rs`, the single definition): a line rendered as
- * `N:hh|text`, where `hh` is a two-character tag of the line's content. Ported here only to
+ * `N:hhhh|text`, where `hhhh` is a four-character tag of the line's content. Ported here only to
  * recognise anchored text structurally — every line must carry the right number and the right
  * tag — so a file shown with anchors can be turned back into its exact content.
  */
@@ -18,15 +18,21 @@ function fnv1a(bytes: Uint8Array): number {
   return hash >>> 0;
 }
 
-/** The two-character tag of one line (content without `\n` / `\r\n`). */
+/** Characters of a tag (`TAG_LEN`). */
+const TAG_LEN = 4;
+
+/** The four-character tag of one line (content without `\n` / `\r\n`). */
 export function tag(line: string): string {
   const content = line.endsWith('\r') ? line.slice(0, -1) : line;
   const hash = fnv1a(encoder.encode(content));
-  const folded = (hash ^ (hash >>> 10) ^ (hash >>> 20) ^ (hash >>> 30)) >>> 0;
-  return ALPHABET[folded & 31]! + ALPHABET[(folded >>> 5) & 31]!;
+  // The high 12 bits folded into the low 20; then five bits per character, lowest first.
+  const folded = (hash ^ (hash >>> 20)) >>> 0;
+  let out = '';
+  for (let index = 0; index < TAG_LEN; index++) out += ALPHABET[(folded >>> (5 * index)) & 31]!;
+  return out;
 }
 
-const ANCHORED = /^(\d+):([0-9a-z]{2})\|(.*)$/s;
+const ANCHORED = /^(\d+):([0-9a-z]{4})\|(.*)$/s;
 
 /**
  * The content lines of anchored text, or null when the text is not entirely anchored lines

@@ -1192,4 +1192,114 @@ impl ProjectLog {
         let mut busy = lock(&self.busy);
         *busy = busy.saturating_sub(1);
     }
+
+    /// Files the host itself took away (a turn's cleanup), as one step of `who`: each path with the
+    /// bytes it held and its mode, read before it was removed. Recorded with the content in hand,
+    /// so `cx undo --step N` brings a file back (a removal nobody recorded could only be found by
+    /// the next look at the tree, under whatever that look was for).
+    pub fn record_removed(&self, who: &Attribution, removed: &[(String, Vec<u8>, u32)]) -> Option<TimelineRecord> {
+        let mut state = lock(&self.state);
+        let mut files = Vec::new();
+        for (path, bytes, mode) in removed {
+            let found = Found { path: path.clone(), before: Some(bytes.clone()), after: None, mode: *mode };
+            if let Some(file) = self.file_change(&found) {
+                state.stats.remove(path);
+                files.push(file);
+            }
+        }
+        if files.is_empty() {
+            return None;
+        }
+        let record = self.append(&mut state, who, files, Vec::new());
+        drop(state);
+        self.publish(record.seq);
+        Some(record)
+    }
+
+    /// After a command of `session_id` ended as `step`: the files it deleted that another session
+    /// made or last changed (the newest earlier standing step of the path is that session's) are
+    /// put back at once, and their paths returned (seen: one agent's `rm -r` of "stray" folders
+    /// took three verified crates of another agent with it). Not put back: a file the command
+    /// moved (the same step wrote its content under another path), a file the session itself or
+    /// the user by hand last changed, and committed work (it left the log; git has it).
+    /// The put-back is a step of the session whose files they are, so the files stay theirs: the
+    /// same delete sent again finds them protected again.
+    pub fn restore_foreign_deletions(&self, step: &TimelineRecord, session_id: &str, allowed: &dyn Fn(&Path) -> bool) -> Vec<String> {
+        let mut state = lock(&self.state);
+        let active = active_set(&state.records);
+        let written: BTreeSet<&str> = step.files.iter().filter_map(|file| file.after.as_deref()).collect();
+        // Owner session -> (path, the deleted content's hash, the file's mode).
+        let mut by_owner: BTreeMap<String, Vec<(String, String, u32)>> = BTreeMap::new();
+        for file in &step.files {
+            let Some(before) = file.before.as_deref() else { continue };
+            if file.after.is_some() || written.contains(before) {
+                continue;
+            }
+            let earlier = state
+                .records
+                .iter()
+                .rev()
+                .filter(|record| record.seq < step.seq && active.contains(&record.seq))
+                .find_map(|record| record.files.iter().find(|known| known.path == file.path).map(|known| (record.session_id.clone(), known.mode)));
+            let Some((Some(owner), mode)) = earlier else { continue };
+            if owner == session_id {
+                continue;
+            }
+            by_owner.entry(owner).or_default().push((file.path.clone(), before.to_owned(), mode));
+        }
+        let mut restored = Vec::new();
+        let mut seqs = Vec::new();
+        for (owner, files) in by_owner {
+            let mut changes = Vec::new();
+            for (path, hash, mode) in files {
+                let absolute = self.workspace.join(&path);
+                if !util::is_inside(&absolute, &self.workspace) || !allowed(&absolute) || absolute.exists() {
+                    continue;
+                }
+                let Ok(bytes) = self.content(&hash) else { continue };
+                if let Some(parent) = absolute.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mode = if mode == 0 { 0o644 } else { mode };
+                let put_back = util::atomic_write_checked(&absolute, &bytes, allowed).and_then(|()| {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(mode))
+                });
+                if put_back.is_err() {
+                    continue;
+                }
+                state.stats.insert(path.clone(), (bytes.len() as u64, 0));
+                let found = Found { path: path.clone(), before: None, after: Some(bytes), mode };
+                if let Some(change) = self.file_change(&found) {
+                    changes.push(change);
+                }
+                restored.push(path);
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            let who = Attribution {
+                actor: "host".to_owned(),
+                session_id: Some(owner),
+                label: "restore".to_owned(),
+                detail: "put back after another session's command deleted them".to_owned(),
+            };
+            seqs.push(self.append(&mut state, &who, changes, Vec::new()).seq);
+        }
+        drop(state);
+        for seq in seqs {
+            self.publish(seq);
+        }
+        restored.sort();
+        restored
+    }
+}
+
+/// What a command's result says after the host put back files it had deleted (see
+/// [`ProjectLog::restore_foreign_deletions`]); the last sentence is the step.
+pub fn restored_note(restored: &[String]) -> String {
+    format!(
+        "[Put back: {}. Another session made them and they are not committed yet, so they are its work, not yours to delete. When your task needs them gone, tell that agent (`cx agent send <agent> <what and why>`); when the user asked you to delete them, run the delete again with `permission` saying so.]",
+        restored.join(", ")
+    )
 }

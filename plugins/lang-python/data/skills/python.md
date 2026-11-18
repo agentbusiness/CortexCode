@@ -8,16 +8,16 @@ Python here: get it right, run and test it, code that runs, common errors and th
    - When there may be no answer and nothing names a value for that case, do what the project already does (`None`, an exception, an empty result); in new code `None` is Python's "no result", not `False` or `-1`.
    - Keep existing names and signatures.
    - The request and the project disagree: say so and ask, instead of silently picking one.
-2. **Before coding, note the request's examples: they are the check, their values copied, never computed.**
+2. **Before coding, note what the request says must hold; an example it gives is a check, its values copied, never computed.**
    - Each behaviour, value, error or limit the request names is one case. A shown requirement list is that list.
    - Unsure of a domain, format or protocol? Look it up: the research plugin, the docs, how others solved it:
      `read research://search/<topic>?sources=web,github&limit=5`, then `read research://fetch/<url>` for the page that explains it.
 3. **Write whole functions, in slices.**
    - First the simplest complete path (one case, input to result). Run the tests.
    - Add the next behaviour. Run again after every change.
-   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, every change to it in one call.
+   - A new file is written whole with `edit` `content`; an existing file is changed with anchored `edits` only, one or two top-level definitions per call.
    - Change a function: replace it from its `def` line to its last line. Never leave part of the old body.
-4. **Never rewrite, reformat or clean up code that works, and never write a working file whole again: change only the lines the task needs.** Code that works and that the task does not touch stays exactly as it is, unless the user asks to change it. Run the project's tests (section 2); fix the first failure's cause, run again.
+4. Run the project's tests (section 2); fix the first failure's cause, run again.
 5. **Before you finish**, check each requirement against the code, including the errors the request or the project names (type and message).
 
 **How the data is held.** Decide it before writing functions, from what each operation returns and changes (`skill://skills-engineering/designing-the-code`):
@@ -46,9 +46,9 @@ python -m unittest -q tests.test_mod             # a project without pytest
 - CI files (`.github/workflows/*.yml`, `Makefile`) show the project's exact test command.
 
 **Checking your work.**
-1. When the project has tests, run them (section 2) before and after the change, and add the request's examples there. A project without tests gets them: `tests/test_<module>.py` with the standard `unittest` (no install), run with `python -m unittest discover -s tests`; they stay in the project.
-2. One check per example of the request, input and expected value copied, never computed or changed; no case the request does not give. When the request gives no examples, run every function you wrote at least once, with checks that follow from the inputs (what goes in comes out, a count after two adds is 2).
-3. Build a long input in code from its parts, never typed out: `[0] * 18`. When an example gives only part of an input, build the whole input and check its size before you trust the result.
+1. Run the project's tests that cover the change (section 2) before and after it, and run what the request asks to run.
+2. Add a test when the request asks for one, or when the project already tests the code you changed: the case goes with those tests. Never add a test only to have a check. A test the request asks for, in a project that has none: `tests/test_<module>.py` with the standard `unittest` (no install), run with `python -m unittest discover -s tests`.
+3. An example the request gives is checked with its input and expected value copied, never computed or changed.
 4. Each check shows what the code returned when it fails: `assert got == want, got`.
 5. Run the tests whole, without `| tail`, `| head` or `| grep`: the result shows each failure and the exit status.
 6. A check fails: find out whether the code, the input you built or the expected value is wrong. When a failure shows how the tests use your code (a type, an exception, a name), apply that everywhere it fits, not only on the failing line.

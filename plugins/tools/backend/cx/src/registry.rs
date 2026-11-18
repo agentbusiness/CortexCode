@@ -410,10 +410,14 @@ fn job_line(job: &Value) -> String {
 
 fn format_job(value: &Value) -> String {
     let tail = s(value, "output_tail");
+    // An ended job says so: its output is whole, and asking again cannot change it (seen: one
+    // job's output read two dozen times in a row).
+    let state = s(value, "state");
+    let ended = if state.is_empty() || state == "running" { "" } else { "The job has ended and this is all it printed: asking again shows the same. Go on from this result.\n" };
     if tail.is_empty() {
-        format!("{}\n", job_line(value))
+        format!("{}\n{ended}", job_line(value))
     } else {
-        format!("{}\n--- output (tail) ---\n{}\n", job_line(value), tail.trim_end())
+        format!("{}\n--- output (tail) ---\n{}\n{ended}", job_line(value), tail.trim_end())
     }
 }
 

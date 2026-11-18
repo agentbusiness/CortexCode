@@ -114,6 +114,14 @@ pub struct StepDone {
     pub summary: String,
     #[serde(default)]
     pub changed_files: Vec<String>,
+    /// What the host's checks showed when the task ended ([`crate::agent_loop::LoopOutcome::check`]):
+    /// passed | left | failed | unrun; empty when no check ran on it. The report of the work says
+    /// each task's state from this, never from the task's own closing words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check: String,
+    /// The commands that state is about (the ones left failing, or that could not run).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check_detail: String,
 }
 
 /// One version of a plan (the data of a `plan` entry, besides `run_id`).
@@ -142,6 +150,14 @@ pub struct Plan {
     /// How many times this plan was written again after one of its tasks ended badly.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub replans: u32,
+    /// How many times REVIEW wrote the tasks still to do again after a task that ended well. Its
+    /// own count: a review is not a failure, and reviews used up what a failed task needed (seen:
+    /// three reviews, then a stuck task with no replan left and the rest never started).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reviews: u32,
+    /// How many times ACCEPT sent the work on because an ask of the user was not shown met.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub accepts: u32,
     /// `user` for a version the user edited by hand (`chatflow.plan.edit`); empty for the planner's.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub by: String,
@@ -149,6 +165,11 @@ pub struct Plan {
     /// agents stopped) when the plan is carried out, then cleared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replaces: Vec<String>,
+    /// The plan whose tasks still to do this one carried on when it took that plan's place while
+    /// it was being carried out (its `plan_id`). What the user asked of that plan is asked of this
+    /// one too (the asks the work is judged by start with the earlier plan's request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -201,6 +222,30 @@ pub fn at(entries: &[JournalEntry], seq: u64) -> Option<Plan> {
 /// and the dropped ones as "title: why".
 pub fn carry_pending(pending: &[PlanTask], output: &PlanOutput, doc: &mut PlanDoc, tasks: &mut Vec<PlanTask>) -> (Vec<String>, Vec<String>) {
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    // A task that carries an earlier one on keeps that task's rules and requirements when it names
+    // none of its own: they are the request's words, and a rewrite lost them (the new task then
+    // had nothing to be judged by).
+    for new in tasks.iter_mut() {
+        let title = new.title.clone();
+        let named: Vec<&String> = output.tasks.iter().filter(|written| same(&written.title, &title)).flat_map(|written| written.from.iter()).collect();
+        let (no_rules, no_covers) = (new.rules.is_empty(), new.covers.is_empty());
+        for before in pending.iter().filter(|before| same(&before.title, &title) || named.iter().any(|from| same(from.as_str(), &before.title))) {
+            if no_rules {
+                for rule in &before.rules {
+                    if !new.rules.contains(rule) {
+                        new.rules.push(rule.clone());
+                    }
+                }
+            }
+            if no_covers {
+                for item in &before.covers {
+                    if !new.covers.contains(item) {
+                        new.covers.push(item.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut restored = Vec::new();
     let mut dropped = Vec::new();
     for task in pending {
@@ -255,8 +300,11 @@ pub fn replanned(previous: &Plan, doc: PlanDoc, new_tasks: Vec<PlanTask>, note: 
         root_task: previous.root_task.clone(),
         steps_done: done,
         replans: previous.replans + 1,
+        reviews: previous.reviews,
+        accepts: previous.accepts,
         by: String::new(),
         replaces: Vec::new(),
+        continues: previous.continues.clone(),
     }
 }
 
@@ -311,8 +359,11 @@ pub struct Known<'a> {
 /// written; at most `max_tasks`; `skills` keeps catalog skills.
 /// Tasks that touch exactly the same files and symbols stay separate small tasks: each later such
 /// task waits for the latest earlier one, so they never run at the same time.
-/// A task that touches nothing joins the task before it (its brief, dependencies, checks,
-/// requirements and skills are kept), and the rest are renumbered.
+/// A task that touches nothing and only verifies joins the task before it (its brief, dependencies,
+/// checks and skills are kept), and the rest are renumbered. A task that touches nothing but
+/// carries rules or requirements, or is the plan's last, stays a task of its own: it is a run the
+/// user asked for (seen: "run the full ingest and evaluate" folded into the task before it, where
+/// it was no one's check, and the run never happened).
 pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     let key = |task: &PlanTask| {
         let mut touches: Vec<String> = task.touches.iter().map(|item| item.trim().trim_start_matches("./").to_owned()).filter(|item| !item.is_empty()).collect();
@@ -324,11 +375,14 @@ pub fn merge_same_touches(tasks: Vec<PlanTask>) -> Vec<PlanTask> {
     let mut renumber: HashMap<u32, u32> = HashMap::new();
     // (task, the earlier task with the same touches it waits for), both in the new numbering.
     let mut waits: Vec<(u32, u32)> = Vec::new();
+    let last = tasks.last().map(|task| task.n);
     for task in tasks {
         let touches = key(&task);
         // A task that touches nothing changes no code (only runs or reviews): it joins the task
-        // before it, whose own checks run its cases.
-        let target = if touches.is_empty() { merged.len().checked_sub(1) } else { None };
+        // before it, whose own checks run its cases. Not a run the plan ends with or one that
+        // makes a rule or a requirement true: that is work of its own.
+        let own_work = Some(task.n) == last || !task.rules.is_empty() || !task.covers.is_empty();
+        let target = if touches.is_empty() && !own_work { merged.len().checked_sub(1) } else { None };
         // Moving this task into an earlier one must not move its work before a prerequisite.
         // A dependency already folded into the target is satisfied inside the combined task.
         let target = target.filter(|index| task.depends_on.iter().all(|dependency| {

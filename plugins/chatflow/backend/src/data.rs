@@ -58,6 +58,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("prompts/manage.md", include_str!("../data/prompts/manage.md")),
     ("prompts/accept.md", include_str!("../data/prompts/accept.md")),
     ("prompts/steer.md", include_str!("../data/prompts/steer.md")),
+    ("prompts/plan_notes.md", include_str!("../data/prompts/plan_notes.md")),
     ("schemas/accept.json", include_str!("../data/schemas/accept.json")),
     ("schemas/steer.json", include_str!("../data/schemas/steer.json")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
@@ -77,7 +78,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE", "ACCEPT", "STEER"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE", "ACCEPT", "STEER", "PLAN_NOTES"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -138,6 +139,14 @@ fn default_replans() -> u32 {
     2
 }
 
+fn default_reviews() -> u32 {
+    3
+}
+
+fn default_accepts() -> u32 {
+    2
+}
+
 fn default_task_calls() -> u32 {
     0
 }
@@ -163,15 +172,19 @@ fn default_stall_runs() -> u32 {
 }
 
 fn default_task_think_tokens() -> u32 {
-    1024
+    4096
 }
 
 fn default_loop_think_tokens() -> u32 {
-    1024
+    4096
 }
 
 fn default_reply_think_tokens() -> u32 {
     2048
+}
+
+fn default_plan_think_tokens() -> u32 {
+    4096
 }
 
 fn default_manage_reading_calls() -> u32 {
@@ -240,6 +253,14 @@ pub struct Limits {
     /// Times the plan of a decided change is written again after a task ended badly, per turn.
     #[serde(default = "default_replans")]
     pub replans: u32,
+    /// Times REVIEW may write the tasks still to do again after a task that ended well, per plan
+    /// (its own count, so reviews never use up the replans a failed task needs).
+    #[serde(default = "default_reviews")]
+    pub reviews: u32,
+    /// Times ACCEPT may send the work on because an ask is not shown met, per plan (its own count,
+    /// so the work is always checked against what the user asked, whatever was replanned before).
+    #[serde(default = "default_accepts")]
+    pub accepts: u32,
     /// Tool calls one plan task may make before it counts as stuck: its loop ends and the tasks
     /// still to do are written again with another approach (within `replans`).
     #[serde(default = "default_task_calls")]
@@ -259,6 +280,10 @@ pub struct Limits {
     /// for the decided effort (16384 for xhigh, minutes of thinking before a word of the answer).
     #[serde(default = "default_reply_think_tokens")]
     pub reply_think_tokens: u32,
+    /// Most thinking tokens of the planner's notes before a plan is written (PLAN_NOTES: the PLAN
+    /// call itself is constrained and cannot think); 0 = no notes, the plan is written at once.
+    #[serde(default = "default_plan_think_tokens")]
+    pub plan_think_tokens: u32,
     /// An agent that made this many calls since its last edit is named to its session as reading
     /// without writing (MANAGE; 0 = never).
     #[serde(default = "default_manage_reading_calls")]

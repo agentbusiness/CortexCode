@@ -139,7 +139,9 @@ pub struct TimelineRecord {
     pub actor: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// `edit` | `run` | `hand` | `host` | `undo` | `redo` | `baseline`
+    /// `edit` | `run` | `hand` | `host` | `undo` | `redo` | `baseline` | `cleanup` (new files a
+    /// turn's commands left, removed when it ended) | `restore` (files put back after another
+    /// session's command deleted them)
     pub label: String,
     /// What the step was for, when known (the tool call's intent, a command's text).
     #[serde(default, skip_serializing_if = "String::is_empty")]

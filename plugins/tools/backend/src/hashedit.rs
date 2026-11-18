@@ -1,12 +1,15 @@
-//! Hashline-anchored edits: a batch of line operations named by `N:hh` anchors, validated against the
-//! current file and applied atomically (all or nothing).
+//! Hashline-anchored edits: a batch of line operations named by `N:hhhh` anchors, validated against
+//! the current file and applied atomically (all or nothing).
 //!
 //! Anchor resolution is mechanical:
-//! - an anchor matches when the current line `N` has tag `hh`;
+//! - an anchor matches when the current line `N` has tag `hhhh`;
 //! - when the session's last view of the file is known and the file has only been changed by this
 //!   session's own edits since, an anchor taken from that view is mapped through the exact line map
 //!   of those edits (a line that the session did not touch keeps its identity);
-//! - if both interpretations exist and disagree, the anchor is ambiguous and the batch is rejected.
+//! - if both interpretations exist and disagree, the anchor is ambiguous and the batch is rejected;
+//! - an anchor neither reading places, whose tag only one line of the file carries, names that
+//!   line, moved, when the session was shown that anchor for this file ([`Shown`]); the result says
+//!   so. In a call where another operation's anchor is refused, such an operation waits with it.
 //!
 //! An anchor that no longer names its line (stale, ambiguous, or a bare number after a change) skips
 //! only its own operation: the others are applied, and the result names each skipped one with the
@@ -15,6 +18,7 @@
 
 use crate::doc::{Doc, text_to_lines};
 use cc_protocol::hashline::{self, Anchor};
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
@@ -48,8 +52,11 @@ impl OpKind {
 /// How an operation names a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineRef {
-    /// `N:hh`
+    /// `N:hhhh`
     Tagged(Anchor),
+    /// `N:hh`, the two-character form of an earlier version: it names no line any more and is
+    /// refused as stale, with the lines there and their anchors.
+    Old(usize),
     /// `0`: before the first line (only for `insert_after`).
     Start,
     /// A bare 1-based line number from a line-number dialect (str_replace_editor `insert_line`).
@@ -64,7 +71,7 @@ impl LineRef {
         if head == "0" {
             return Some(LineRef::Start);
         }
-        hashline::parse_anchor(trimmed).map(LineRef::Tagged)
+        hashline::parse_anchor(trimmed).map(LineRef::Tagged).or_else(|| hashline::parse_old_anchor(trimmed).map(LineRef::Old))
     }
 }
 
@@ -72,6 +79,7 @@ impl std::fmt::Display for LineRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LineRef::Tagged(anchor) => write!(f, "{anchor}"),
+            LineRef::Old(line) => write!(f, "line {line} (a two-character anchor)"),
             LineRef::Start => write!(f, "0"),
             LineRef::Bare(line) => write!(f, "line {line}"),
         }
@@ -114,6 +122,39 @@ impl View {
     }
 }
 
+/// What the session was shown of the file over time, beyond its last view.
+#[derive(Debug, Clone, Default)]
+pub struct Shown {
+    /// Every anchor (line and tag, [`Shown::key`]) of every version of this file the session read
+    /// or produced.
+    pub anchors: HashSet<u64>,
+    /// The session's last result showed the whole file as it is now: a bare line number names
+    /// that line.
+    pub whole: bool,
+}
+
+impl Shown {
+    /// One anchor as a number: the line, then the tag's bytes.
+    pub fn key(line: usize, tag: &[u8]) -> u64 {
+        tag.iter().fold(line as u64, |key, byte| (key << 8) | u64::from(*byte))
+    }
+
+    pub fn has(&self, anchor: &Anchor) -> bool {
+        self.anchors.contains(&Self::key(anchor.line, &anchor.tag))
+    }
+}
+
+/// An anchor placed by its tag alone: the operation, the anchor and the 0-based line it names now.
+struct Moved {
+    op: usize,
+    anchor: Anchor,
+    now: usize,
+}
+
+/// A line whose tag is the anchor's this many lines from the anchor's number is the line the
+/// model meant with the number off (seen: `277:eq` sent for the line shown as `276:eq`).
+const NUMBER_SLIP: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
     /// The anchor's tag does not match the current file (or the line no longer exists).
@@ -122,6 +163,11 @@ pub enum Problem {
     Ambiguous { op: usize, anchor: String, direct: usize, relocated: usize },
     /// A bare line number was used but the file changed since the session's view.
     BareWithoutView { op: usize, line: usize },
+    /// The anchor names `line` now (found by its tag alone), and another operation of the call
+    /// was refused for its anchor: this one is not applied without it.
+    Moved { op: usize, anchor: String, line: usize },
+    /// An anchor in the two-character form of an earlier version.
+    OldForm { op: usize, line: usize },
     /// `to` before `at`, `to` on an insert, `0` on something other than insert_after, ...
     BadRange { op: usize, detail: String },
     /// Two operations touch the same line.
@@ -143,8 +189,11 @@ pub struct Applied {
     pub changed: Vec<(usize, usize)>,
     /// Old index -> new index for every line of the file before the edit.
     pub line_map: Vec<Option<usize>>,
-    /// Anchors that were relocated through the session's view, e.g. "50:ab -> 53".
+    /// Anchors that were relocated through the session's view, e.g. "50:abcd -> 53".
     pub relocations: Vec<String>,
+    /// Anchors placed by their tag alone (the file changed outside the session's view), each as a
+    /// sentence for the model: the edit went to a line other than the one the anchor's number names.
+    pub moved: Vec<String>,
     pub added: usize,
     pub removed: usize,
     /// The operations not applied (their anchors no longer named their lines), said with the lines
@@ -157,19 +206,33 @@ enum Resolved {
     Start,
 }
 
-fn resolve(doc: &Doc, view: Option<&View>, reference: LineRef, op: usize, relocations: &mut Vec<String>) -> Result<Resolved, Problem> {
+fn resolve(
+    doc: &Doc,
+    view: Option<&View>,
+    shown: &Shown,
+    reference: LineRef,
+    op: usize,
+    relocations: &mut Vec<String>,
+    moved: &mut Vec<Moved>,
+) -> Result<Resolved, Problem> {
     match reference {
         LineRef::Start => Ok(Resolved::Start),
+        LineRef::Old(line) => Err(Problem::OldForm { op, line }),
         LineRef::Bare(line) => {
-            let Some(view) = view.filter(|view| view.is_identity(doc.len())) else {
+            // A bare number names a line of the file as the session last saw it whole: its view
+            // when nothing changed since, or the whole file its last result showed (seen: fifteen
+            // refusals right after the session's own edit, whose result had shown the file whole
+            // with these very numbers; seven were sent again unchanged and accepted).
+            if !shown.whole && !view.is_some_and(|view| view.is_identity(doc.len())) {
                 return Err(Problem::BareWithoutView { op, line });
-            };
+            }
             if line == 0 {
                 return Ok(Resolved::Start);
             }
-            match view.map.get(line - 1).copied().flatten() {
-                Some(index) => Ok(Resolved::Line(index)),
-                None => Err(Problem::BadRange { op, detail: format!("line {line} is past the end of the file ({} lines)", doc.len()) }),
+            if line <= doc.len() {
+                Ok(Resolved::Line(line - 1))
+            } else {
+                Err(Problem::BadRange { op, detail: format!("line {line} is past the end of the file ({} lines)", doc.len()) })
             }
         }
         LineRef::Tagged(anchor) => {
@@ -197,11 +260,19 @@ fn resolve(doc: &Doc, view: Option<&View>, reference: LineRef, op: usize, reloca
                 // a line whose tag is the anchor's and the only such line of the file is the line
                 // the anchor named, moved; the edit goes there with a note instead of failing (seen:
                 // eleven refused edits in one run, each costing a read for fresh anchors).
+                // Only for an anchor the session was shown for this file: one read from another
+                // file, or made up, names nothing here (seen: an anchor read from one file sent in
+                // an edit of another matched a line with the same text 196 lines away, and that
+                // line was deleted). A line with the anchor's tag right next to its number is the
+                // line meant with the number off, when the session was shown that line.
                 (false, None) => {
                     let mut tagged = (0..doc.len()).filter(|index| doc.tag(*index).as_bytes() == anchor.tag);
                     match (tagged.next(), tagged.next()) {
-                        (Some(only), None) => {
-                            relocations.push(format!("{anchor} -> line {} (the file changed; found by its tag)", only + 1));
+                        (Some(only), None)
+                            if shown.has(&anchor)
+                                || (only.abs_diff(index) <= NUMBER_SLIP && shown.has(&Anchor { line: only + 1, tag: anchor.tag })) =>
+                        {
+                            moved.push(Moved { op, anchor, now: only });
                             Ok(Resolved::Line(only))
                         }
                         _ => Err(Problem::Stale { op, anchor: anchor.to_string(), line: anchor.line }),
@@ -224,16 +295,18 @@ struct Planned {
 }
 
 /// Validate and apply a batch. `view` must only be passed when the file is unchanged since the
-/// session's last read or own edit (the caller checks the content hash).
-pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, Rejection> {
+/// session's last read or own edit (the caller checks the content hash); `shown` is what the
+/// session was shown of the file over time.
+pub fn apply(doc: &Doc, view: Option<&View>, shown: &Shown, ops: &[EditOp]) -> Result<Applied, Rejection> {
     let mut problems = Vec::new();
     let mut relocations = Vec::new();
-    let mut planned = Vec::new();
+    let mut moved: Vec<Moved> = Vec::new();
+    let mut planned: Vec<Planned> = Vec::new();
     if ops.is_empty() {
         problems.push(Problem::BadRange { op: 0, detail: "the batch contains no operations".to_owned() });
     }
     for (order, op) in ops.iter().enumerate() {
-        let at = match resolve(doc, view, op.at, order, &mut relocations) {
+        let at = match resolve(doc, view, shown, op.at, order, &mut relocations, &mut moved) {
             Ok(at) => at,
             Err(problem) => {
                 problems.push(problem);
@@ -242,7 +315,7 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
         };
         let to = match op.to {
             None => None,
-            Some(reference) => match resolve(doc, view, reference, order, &mut relocations) {
+            Some(reference) => match resolve(doc, view, shown, reference, order, &mut relocations, &mut moved) {
                 Ok(Resolved::Line(index)) => Some(index),
                 Ok(Resolved::Start) => {
                     problems.push(Problem::BadRange { op: order, detail: "`to` cannot be 0".to_owned() });
@@ -299,6 +372,35 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
         }
     }
 
+    // An anchor placed by its tag alone stands on less than one that names its line. In a call
+    // where another operation's anchor is refused, the session's picture of the file is wrong
+    // somewhere: the operations placed by tag wait with the refused ones (seen: four of five
+    // operations refused while the fifth, its range end placed by tag, deleted a constant).
+    let anchor_problem = |problem: &Problem| {
+        matches!(problem, Problem::Stale { .. } | Problem::Ambiguous { .. } | Problem::BareWithoutView { .. } | Problem::Moved { .. } | Problem::OldForm { .. })
+    };
+    if !moved.is_empty() && problems.iter().any(anchor_problem) {
+        let waiting: BTreeSet<usize> = moved.iter().map(|placed| placed.op).collect();
+        for op in &waiting {
+            if let Some(placed) = moved.iter().find(|placed| placed.op == *op)
+                && planned.iter().any(|plan| plan.order == *op)
+            {
+                problems.push(Problem::Moved { op: *op, anchor: placed.anchor.to_string(), line: placed.now + 1 });
+            }
+        }
+        planned.retain(|plan| !waiting.contains(&plan.order));
+        moved.clear();
+    }
+    let mut moved_said = Vec::new();
+    for placed in &moved {
+        relocations.push(format!("{} -> line {} (the file changed; found by its tag)", placed.anchor, placed.now + 1));
+        moved_said.push(format!(
+            "Anchor {} names line {} now: the file changed since you read it, and the edit was made there.",
+            placed.anchor,
+            placed.now + 1
+        ));
+    }
+
     // Overlap: two operations touching a common line, except two inserts sharing an anchor line.
     for i in 0..planned.len() {
         for j in (i + 1)..planned.len() {
@@ -317,7 +419,7 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
 
     // Only anchor problems (a line that moved or changed) skip their own operation; anything else,
     // or nothing left to apply, rejects the batch.
-    let anchor_only = problems.iter().all(|problem| matches!(problem, Problem::Stale { .. } | Problem::Ambiguous { .. } | Problem::BareWithoutView { .. }));
+    let anchor_only = problems.iter().all(anchor_problem);
     if !problems.is_empty() && (!anchor_only || planned.is_empty()) {
         return Err(reject(doc, problems, ops.len() > 1));
     }
@@ -378,7 +480,7 @@ pub fn apply(doc: &Doc, view: Option<&View>, ops: &[EditOp]) -> Result<Applied, 
     }
     let new_doc = doc.rebuild(entries);
     let skipped = if problems.is_empty() { String::new() } else { skipped_text(&new_doc, &line_map, &problems, ops.len() > 1) };
-    Ok(Applied { doc: new_doc, changed, line_map, relocations, added, removed, skipped })
+    Ok(Applied { doc: new_doc, changed, line_map, relocations, moved: moved_said, added, removed, skipped })
 }
 
 /// The operations a partly applied batch skipped, each with the lines around its anchor as they now
@@ -397,6 +499,8 @@ fn skipped_text(new_doc: &Doc, line_map: &[Option<usize>], problems: &[Problem],
             Problem::Stale { op, anchor, line } => (*op, format!("anchor {anchor} is stale"), *line),
             Problem::Ambiguous { op, anchor, direct, .. } => (*op, format!("anchor {anchor} is ambiguous"), *direct),
             Problem::BareWithoutView { op, line } => (*op, format!("line number {line} cannot be used (the file changed)"), *line),
+            Problem::Moved { op, anchor, line } => (*op, format!("anchor {anchor} names line {line} now (the file changed since you read it)"), *line),
+            Problem::OldForm { op, line } => (*op, format!("the anchor of line {line} has a two-character tag; anchors have four now"), *line),
             _ => continue,
         };
         lines.push(format!("{}{why}", label(op)));
@@ -460,6 +564,25 @@ fn reject(doc: &Doc, problems: Vec<Problem>, several: bool) -> Rejection {
                 lines.push(format!("{}line number {line} cannot be used (the file changed since you read it)", label(*op)));
                 regions.push((line.saturating_sub(3).max(1), line + 3));
             }
+            Problem::Moved { op, anchor, line } => {
+                error_kind = "stale_anchor";
+                lines.push(format!("{}anchor {anchor} names line {line} now (the file changed since you read it)", label(*op)));
+                regions.push((line.saturating_sub(3).max(1), line + 3));
+            }
+            Problem::OldForm { op, line } => {
+                error_kind = "stale_anchor";
+                if *line > doc.len() {
+                    lines.push(format!("{}the anchor of line {line} has a two-character tag; anchors have four now (the file has {} lines)", label(*op), doc.len()));
+                    regions.push((doc.len().saturating_sub(3).max(1), doc.len()));
+                } else {
+                    lines.push(format!(
+                        "{}the anchor of line {line} has a two-character tag; anchors have four now (line {line} is {line}:{})",
+                        label(*op),
+                        doc.tag(line - 1)
+                    ));
+                    regions.push((line.saturating_sub(3).max(1), line + 3));
+                }
+            }
             Problem::BadRange { op, detail } => {
                 lines.push(format!("{}{detail}", label(*op)));
             }
@@ -502,7 +625,7 @@ fn reject(doc: &Doc, problems: Vec<Problem>, several: bool) -> Rejection {
     Rejection { problems, message, error_kind }
 }
 
-/// Strip copied hashline prefixes (`12:ab|`) from replacement lines, but only when every non-empty
+/// Strip copied hashline prefixes (`12:abcd|`) from replacement lines, but only when every non-empty
 /// line carries one and each prefix's tag verifies against the rest of its line (a mechanical
 /// proof that the prefix came from our own rendering, not from the file's content).
 pub fn strip_copied_prefixes(lines: &[String]) -> Option<Vec<String>> {

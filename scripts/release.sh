@@ -59,9 +59,12 @@ frame=0
 [ "$(frame_digest)" = "$(jq -r '.frame.digest // empty' "$catalog")" ] || frame=1
 
 plugins=()
+elsewhere=()
 for toml in "$repo"/plugins/*/plugin.toml; do
   id="$(basename "$(dirname "$toml")")"
-  [ "$(plugin_digest "plugins/$id")" = "$(jq -r --arg id "$id" '.plugins[$id].digest // empty' "$catalog")" ] || plugins+=("$id")
+  [ "$(plugin_digest "plugins/$id")" != "$(jq -r --arg id "$id" '.plugins[$id].digest // empty' "$catalog")" ] || continue
+  # A plugin for other platforms only waits for a release that builds them.
+  if runs_on_release_platforms "plugins/$id"; then plugins+=("$id"); else elsewhere+=("$id"); fi
 done
 
 app=0
@@ -77,6 +80,7 @@ say_part() { printf '  %-8s %s\n' "$1" "$2"; }
 step "what changed since the last release ($RELEASE_PLATFORMS):"
 if [ $frame = 1 ]; then say_part frame "yes (now $(jq -r '.frame.version // "none"' "$catalog"))"; else say_part frame "no"; fi
 if [ ${#plugins[@]} -gt 0 ]; then say_part plugins "${plugins[*]}"; else say_part plugins "none"; fi
+[ ${#elsewhere[@]} -eq 0 ] || say_part later "${elsewhere[*]} (not for $RELEASE_PLATFORMS)"
 if [ $app = 1 ]; then say_part app "yes (follows the frame)"; else say_part app "no"; fi
 if [ $npx = 1 ]; then say_part npx "yes"; else say_part npx "no"; fi
 

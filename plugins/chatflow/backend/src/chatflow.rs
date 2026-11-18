@@ -287,6 +287,22 @@ impl Chatflow {
 /// Event topic of data set loads: `{ok, version, sources}` or `{ok: false, error, version}`.
 pub const DATA_TOPIC: &str = "chatflow.data";
 
+/// How long a stopped run's own stop handling may take (a model or tool call ending itself and
+/// journaling that it was cut off) before the work is dropped where it waits.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `work` until it ends or the run is stopped. A stop ends it now: what watches the signal
+/// ends itself inside [`STOP_GRACE`], and work that does not (a call to another plugin, a check
+/// that runs for minutes) is dropped where it waits, so Stop never waits for a step to finish.
+/// `None`: the work was dropped.
+async fn until_stopped<T>(cancel: &CancellationToken, work: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::pin!(work);
+    tokio::select! {
+        outcome = &mut work => Some(outcome),
+        _ = cancel.cancelled() => tokio::time::timeout(STOP_GRACE, &mut work).await.ok(),
+    }
+}
+
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
     data.get(field).and_then(Value::as_str).unwrap_or("")
 }
@@ -791,7 +807,7 @@ impl Chatflow {
             self.set_prewarm(session_id, None);
             let mut journal = Journal::load(host.clone(), session_id).await?;
             let mut ran: Option<RunEnv> = None;
-            let outcome = async {
+            let outcome = until_stopped(&stops.cancel, async {
                 let session = host.session_get(session_id).await?;
                 let env = self
                     .environment(&host, &mut journal, &session, &run_id, &mode, Priority::Foreground, stops.clone(), stage.clone())
@@ -807,8 +823,9 @@ impl Chatflow {
                 let spec = LoopSpec { kind: LoopKind::Foreground, effort: env.data.effort.default.clone(), task: None, step: None };
                 let outcome = agent_loop::run(&env, &mut journal, &spec).await?;
                 Ok(flow::TurnEnd { state: outcome.outcome.clone(), detail: outcome.summary.clone(), route: "DO".into(), agent: Some(outcome) })
-            }
-            .await;
+            })
+            .await
+            .unwrap_or_else(|| Err(RpcError::cancelled()));
             let (state, detail) = match &outcome {
                 Ok(end) => (end.state.clone(), end.detail.clone()),
                 Err(error) if error.code == codes::CANCELLED && stops.park.is_cancelled() => ("parked".into(), String::new()),
@@ -830,9 +847,19 @@ impl Chatflow {
                 let params = json!({"workspace": env.scope.workspace, "session_id": session_id, "since_ms": since_ms});
                 match host.call(cc_protocol::contracts::tools::methods::CLEANUP, params).await {
                     Ok(result) => {
-                        let removed = result.get("removed").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-                        if removed > 0 {
-                            tracing::info!(session = %session_id, removed, "cleared what the turn left behind");
+                        // What the host took away is told to the user, with how to get one back
+                        // (each removal is a step of the log): files a command made can be the
+                        // work itself (a lockfile, generated source), and a silent removal reads
+                        // as the work having vanished (seen: two source files gone when a turn ended).
+                        // For the user only: the model's turn is over.
+                        let removed: Vec<&str> = result.get("removed").and_then(Value::as_array).map(|paths| paths.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                        if !removed.is_empty() {
+                            tracing::info!(session = %session_id, removed = removed.len(), "cleared what the turn left behind");
+                            let data = self.inner.data.get();
+                            let files: String = removed.iter().map(|path| data.text("list_item", &[("text", path)])).collect::<Vec<_>>().join("\n");
+                            journal
+                                .append(kinds::NOTE, json!({"text": data.text("cleanup_removed", &[("files", &files)]), "purpose": "cleanup", "run_id": run_id, "host_message": false, "removed": removed}))
+                                .await?;
                         }
                     }
                     Err(error) => tracing::debug!(%error, "turn cleanup failed"),
@@ -1564,6 +1591,9 @@ impl Chatflow {
             }
         };
         let env = self.environment(&host, &mut journal, &session, &run_id, &params.mode, Priority::Agent, stops.clone(), stage).await?;
+        // The work, ended at once by a stop. The outer error leaves the run as it is (parked, or a
+        // record that could not be written); the inner result is the run's end.
+        let worked: Option<Result<Result<LoopOutcome, RpcError>, RpcError>> = until_stopped(&stops.cancel, async {
         if resumed.is_none() {
             // Pending input addressed to the agent becomes part of this run.
             let first_time = !journal.entries().any(|entry| entry.kind == kinds::USER_MESSAGE);
@@ -1635,6 +1665,20 @@ impl Chatflow {
                 .await?;
             outcome = agent_loop::run(&env, &mut journal, &spec).await;
         }
+        Ok(outcome)
+        })
+        .await;
+        let outcome = match worked {
+            // A stop during the run's preparation (its baseline checks) is the run's end too:
+            // returned as an error it left the session reading as running, with nothing to stop.
+            Some(Err(error)) if error.code == codes::CANCELLED && stops.cancel.is_cancelled() => Err(error),
+            Some(outcome) => outcome?,
+            None => {
+                // Dropped where it waited: the journal is read again before the run's end is written.
+                journal.sync().await?;
+                Err(RpcError::cancelled())
+            }
+        };
         // A run that was cancelled ends cancelled even when its caller went away too (parking
         // it would leave no end status, so it would read as running for ever).
         let cancelled = stops.cancel.is_cancelled();
@@ -1650,10 +1694,12 @@ impl Chatflow {
                 tool_calls: 0,
                 changed_files: vec![],
                 verified: None,
+                check: String::new(),
+                check_detail: String::new(),
             },
             Err(error) => {
                 journal.append(kinds::ERROR, json!({"message": error.message, "code": error.code, "run_id": run_id})).await?;
-                LoopOutcome { outcome: "failed".into(), summary: error.message.clone(), turns: 0, tool_calls: 0, changed_files: vec![], verified: None }
+                LoopOutcome { outcome: "failed".into(), summary: error.message.clone(), turns: 0, tool_calls: 0, changed_files: vec![], verified: None, check: String::new(), check_detail: String::new() }
             }
         };
         // The run goes into the graph (docs/PROJECT-KNOWLEDGE-PLAN.md P5); it cannot fail the run.

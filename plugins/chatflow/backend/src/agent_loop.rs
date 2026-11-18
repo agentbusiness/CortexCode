@@ -235,26 +235,59 @@ pub struct StepSpec {
     /// The direction the user set for the whole work (`flow::direction`), empty when none: it opens
     /// the step's text, before the plan's own goal sentence.
     pub direction: String,
+    /// What the user asked of the work, in their words (`flow::work_asks`): shown before the
+    /// plan's goal and the task, which are the planner's restatements of them.
+    pub asks: Vec<String>,
 }
 
-/// The stage text that tells the loop its step: the step, what the earlier steps did, and that
-/// the host takes the reply as the end of this step (the plan's checks run after the last).
+/// The stage text that tells the loop its step, in the order the model weighs it: the user's own
+/// words for the work, the plan's goal, the task, the tasks left for later, what the earlier tasks
+/// left, and last the steps to take (the plan's checks run after the last task).
+///
+/// The earlier tasks are told as the host recorded them (the files each changed and what the
+/// checks showed on it), never by their own closing words: a task's report of itself was the next
+/// task's picture of the code (seen: "all green" carried from task to task over checks nobody
+/// ran). The one thing kept of a closing reply is each value it chose for the request
+/// (`Assumed: …` lines, the form the DO and TASK rules ask for): a later task must use the same.
 pub fn step_live(data: &Dataset, step: &StepSpec) -> String {
     let done = if step.done.is_empty() {
         String::new()
     } else {
-        let items: String = step.done.iter().map(|done| data.text("do_step_done_item", &[("n", &done.n.to_string()), ("summary", done.summary.trim())])).collect();
+        let items: String = step
+            .done
+            .iter()
+            .map(|done| {
+                let files = if done.changed_files.is_empty() { data.text("do_step_done_no_files", &[]) } else { done.changed_files.join(", ") };
+                let state = crate::flow::state_text(data, &done.outcome, &done.check, &done.check_detail, &done.summary);
+                let assumed: String = done.summary.lines().filter_map(|line| line.find(ASSUMED).map(|at| format!("\n  {}", line[at..].trim()))).collect();
+                data.text("do_step_done_item", &[("n", &done.n.to_string()), ("files", &files), ("state", state.trim()), ("assumed", &assumed)])
+            })
+            .collect();
         data.text("do_step_done", &[("items", &items)])
     };
     let later = if step.later.is_empty() { String::new() } else { data.text("do_step_later", &[("titles", &step.later.join("; "))]) };
     let goal = if step.goal.trim().is_empty() { String::new() } else { data.text("do_step_goal", &[("goal", step.goal.trim())]) };
-    let goal = format!("{}{goal}", step.direction);
-    let mut text = data.text("do_step", &[("goal", &goal), ("n", &step.n.to_string()), ("of", &step.of.to_string()), ("text", step.text.trim()), ("later", &later), ("done", &done)]);
+    let asks = if step.asks.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = step.asks.iter().map(|ask| data.text("list_item", &[("text", &data.text("ask_line", &[("quote", ask.trim())]))])).collect();
+        data.text("do_step_asks", &[("asks", &lines.join("\n"))])
+    };
+    let asks = format!("{}{asks}", step.direction);
+    let mut text = data.text("do_step", &[("asks", &asks), ("goal", &goal), ("n", &step.n.to_string()), ("of", &step.of.to_string()), ("text", step.text.trim()), ("later", &later), ("done", &done)]);
     if step.n >= step.of {
         text.push_str(&data.text("do_step_last", &[]));
     }
     text
 }
+
+/// How a reply marks a value it chose where the request left one open (the DO and TASK rules ask
+/// for this form); a line holding it is carried to the later tasks' step messages.
+const ASSUMED: &str = "Assumed:";
+
+/// Replies in a row holding a tool call as text that are answered with the step to send it as a
+/// call (the next one stands as the reply, so the loop cannot go round on it).
+const TEXT_CALL_NOTES: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoopOutcome {
@@ -265,6 +298,22 @@ pub struct LoopOutcome {
     pub tool_calls: u32,
     pub changed_files: Vec<String>,
     pub verified: Option<bool>,
+    /// What the host's checks showed when the loop ended, for the report of the work:
+    /// `passed` (they ran and pass), `left` (they fail only where they failed before or outside
+    /// what this task changed: left for the plan's last task), `failed`, `unrun` (they could not
+    /// run here); empty when no check ran (the work rests on the model's own runs).
+    pub check: String,
+    /// The commands `check` is about (left failing, failing, or not run), "; " between them.
+    pub check_detail: String,
+}
+
+impl LoopOutcome {
+    /// The outcome with what the host's checks showed.
+    fn checked(mut self, check: &str, detail: String) -> Self {
+        self.check = check.to_owned();
+        self.check_detail = detail;
+        self
+    }
 }
 
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
@@ -831,14 +880,40 @@ pub async fn verify_task(host: &Host, journal: &mut Journal, task: &Task, worksp
 }
 
 fn report_text(data: &Dataset, report: &VerifyReport) -> String {
+    report_lines(data, report, &|_| true)
+}
+
+/// The failing checks of `report` whose errors all sit outside `own` (the files the task changed
+/// and those its changed signatures reached), by name: each such check's output names its errors'
+/// files and none is the task's. A failure that names no file (a failed test, a crash) is never
+/// placed outside. Empty when that would leave no failing check on the task's side: the split
+/// then says nothing the model could act on, and the report is shown whole.
+fn failing_outside(report: &VerifyReport, own: &std::collections::HashSet<String>, workspace: &str) -> std::collections::HashSet<String> {
+    let failing = || report.checks.iter().filter(|check| !check.ok);
+    let outside: std::collections::HashSet<String> = failing()
+        .filter(|check| crate::checks::error_files(&check.output_tail, workspace).is_some_and(|files| files.iter().all(|file| !own.contains(file))))
+        .map(|check| check.name.clone())
+        .collect();
+    if failing().all(|check| outside.contains(&check.name)) { std::collections::HashSet::new() } else { outside }
+}
+
+/// The checks of `report` that `keep` takes, each as its line: passed, or failed with its output.
+fn report_lines(data: &Dataset, report: &VerifyReport, keep: &dyn Fn(&cc_protocol::contracts::agents::CheckResult) -> bool) -> String {
     let mut text = String::new();
-    for check in &report.checks {
+    for check in report.checks.iter().filter(|check| keep(check)) {
         let spec = report.contract.checks.iter().find(|spec| spec.name == check.name).map(|spec| spec.spec.as_str()).unwrap_or("");
         let exit = check.exit_code.map(|code| code.to_string()).unwrap_or_else(|| "none".into());
         if check.ok {
             text.push_str(&data.text("check_passed", &[("command", spec)]));
         } else {
-            text.push_str(&data.text("check_failed", &[("command", spec), ("exit", &exit), ("output", check.output_tail.trim_end())]));
+            // The failing tests by name first, one line each (when the report names every one): the
+            // output under it may be cut, and a cut log sent the model to ask for the rest instead
+            // of fixing.
+            let names = match &check.failed_tests {
+                Some(names) if !names.is_empty() => data.text("check_failing_tests", &[("tests", &names.iter().map(|name| format!("- {name}")).collect::<Vec<_>>().join("\n"))]),
+                _ => String::new(),
+            };
+            text.push_str(&data.text("check_failed", &[("command", spec), ("exit", &exit), ("output", &format!("{names}{}", check.output_tail.trim_end()))]));
         }
     }
     text
@@ -846,7 +921,18 @@ fn report_text(data: &Dataset, report: &VerifyReport) -> String {
 
 /// Finish the run with an outcome.
 fn outcome(outcome: &str, summary: String, turns: u32, tool_calls: u32, changed: &BTreeSet<String>, verified: Option<bool>) -> LoopOutcome {
-    LoopOutcome { outcome: outcome.to_owned(), summary, turns, tool_calls, changed_files: changed.iter().cloned().collect(), verified }
+    LoopOutcome { outcome: outcome.to_owned(), summary, turns, tool_calls, changed_files: changed.iter().cloned().collect(), verified, check: String::new(), check_detail: String::new() }
+}
+
+/// The commands of a report's checks that did not pass, "; " between them.
+fn failing_commands(report: &VerifyReport) -> String {
+    report
+        .checks
+        .iter()
+        .filter(|check| !check.ok)
+        .map(|check| report.contract.checks.iter().find(|spec| spec.name == check.name).map(|spec| spec.spec.as_str()).unwrap_or(check.name.as_str()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Run the loop until the work is done, blocked, stopped, cancelled or parked.
@@ -899,17 +985,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // nothing, and is answered once with the step that makes it a check (seen: a fix "verified" by
     // a jest run that found no tests, and the same failure handed back).
     let mut checked_nothing = false;
-    let mut told_checked_nothing = false;
+    let mut told_checked_nothing: bool;
     // A task that ends with no file changed is answered once with its own title: its check passes
     // on the untouched code too, so it shows nothing (seen: "align the code to the new model" ended
     // on "let me extract it", no edit, and counted done because the build still passed).
-    let mut told_no_change = false;
+    let mut told_no_change: bool;
     // A project file changed after the last passing test run: a "done" then rests on code no test
     // ran, and is answered once with the run that checks it (seen: a fix edited after the green run
     // and handed back failing).
     let mut ran_tests = false;
     let mut edited_after_pass = false;
-    let mut told_edited_after_pass = false;
+    let mut told_edited_after_pass: bool;
     // The last test command that passed after the last change, and how many tests it ran: at
     // "done" the host runs it once on the code as it was before the turn; tests that pass there too
     // do not check the change (seen: tests that passed on wrong code, the fix taken as done).
@@ -920,6 +1006,21 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // back to the model, whose step is to fix it or say why it is safe (seen: the audit ran only
     // when asked, never on the code the model had just written).
     let mut security_checked = false;
+    // Each of these answers is given once per task, also across the loops of one turn (a task
+    // planned again or resumed is the same task: the note the journal holds says it was told), and
+    // within a loop even when an edit makes its condition true again. An answer the model met with
+    // its reasons in words is thereby accepted at the task's next end (seen: "add a test that fails
+    // without your change" sent three times against a task statement that said not to, the model
+    // flipping between the two for 32 steps).
+    let nudge_task = spec.task.as_ref().map(|task| task.title.clone()).or_else(|| spec.step.as_ref().map(|step| step.text.clone())).unwrap_or_default();
+    let told_before = |purpose: &str| {
+        of_run(&entries, &env.run_id).any(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == purpose && entry.data.get("task").and_then(Value::as_str) == Some(nudge_task.as_str()))
+    };
+    told_no_change = told_before("no_change");
+    told_checked_nothing = told_before("no_tests");
+    told_edited_after_pass = told_before("unchecked_edit");
+    let mut told_tests_pass_before = told_before("tests_pass_before");
+    let mut told_security = told_before("security_check");
     // An agent works beside the others of its tree: it hears what bears on its task from them.
     let agent_team = match (&spec.kind, &spec.task) {
         (LoopKind::Agent { .. }, Some(task)) => Some(Team::of(env, task).await),
@@ -939,6 +1040,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             "ASK",
             if crate::flow::work_open_round(&entries, &env.run_id) {
                 env.data.text("work_open_stage", &[])
+            } else if crate::flow::routed(&entries, &env.run_id, "STATUS") {
+                crate::flow::status_live(&env.data, &entries, &env.run_id)
             } else {
                 crate::flow::asks_live(&env.data, &entries, &env.run_id, "ask_asks", true)
             },
@@ -966,6 +1069,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     let mut steps_since_settle = 0u32;
     // An agent's session spoke and the agent has not called a tool since.
     let mut answering_session = false;
+    // Replies in a row that held a tool call written as text and were answered with the step to
+    // send it as a call; after `TEXT_CALL_NOTES` the reply stands as the model's last word.
+    let mut text_calls = 0u32;
     loop {
         if env.stops.park.is_cancelled() {
             return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
@@ -1066,7 +1172,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         };
         step += 1;
         turns += 1;
-        let result = called.result;
+        let content_seq = called.content_seq;
+        let mut result = called.result;
 
         if result.finish_reason == "repeated" {
             // The model plugin stopped the generation for repeating itself; its text stands but is
@@ -1079,6 +1186,32 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_text", &[]), research), true).await?;
             effort = max_effort(&effort, &env.data.effort.escalate);
             continue;
+        }
+
+        // A tool call written into the reply as text is not the model's last word (seen: two agent
+        // tasks ended "done" on such a reply, one with six compile errors on screen). One clean
+        // call of a tool the session has is run as that call; any other call shape is answered
+        // with the step to send it as a call.
+        let mut call_from_text = false;
+        if result.tool_calls.is_empty() {
+            match crate::textcall::find(&result.content, &env.prefix.tools) {
+                crate::textcall::Found::Call { name, arguments, rest } => {
+                    // The transcript shows what ran: the reply's words, then the call.
+                    if let Some(seq) = content_seq {
+                        journal.set(seq, "call_as_text", json!(result.content)).await?;
+                        journal.set(seq, "text", json!(rest)).await?;
+                    }
+                    result.content = rest;
+                    result.tool_calls.push(ToolCall { id: format!("text-{}", uuid::Uuid::new_v4().simple()), name, arguments });
+                    call_from_text = true;
+                }
+                crate::textcall::Found::Shape if text_calls < TEXT_CALL_NOTES => {
+                    text_calls += 1;
+                    journal.note(&env.run_id, "call_as_text", &env.data.text("call_as_text", &[]), true).await?;
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         if result.tool_calls.is_empty() {
@@ -1105,20 +1238,23 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             if let Some(title) = task.as_ref().map(|task| task.title.clone()).filter(|_| changed.is_empty() && !told_no_change) {
                 told_no_change = true;
-                journal.note(&env.run_id, "no_change", &env.data.text("done_no_change", &[("title", &title)]), true).await?;
+                let seq = journal.note(&env.run_id, "no_change", &env.data.text("done_no_change", &[("title", &title)]), true).await?;
+                journal.set(seq, "task", json!(nudge_task)).await?;
                 continue;
             }
             if checked_nothing && !told_checked_nothing {
                 told_checked_nothing = true;
-                journal.note(&env.run_id, "no_tests", &env.data.text("done_without_tests", &[]), true).await?;
+                let seq = journal.note(&env.run_id, "no_tests", &env.data.text("done_without_tests", &[]), true).await?;
+                journal.set(seq, "task", json!(nudge_task)).await?;
                 continue;
             }
             if ran_tests && edited_after_pass && !told_edited_after_pass {
                 told_edited_after_pass = true;
-                journal.note(&env.run_id, "unchecked_edit", &env.data.text("done_after_edit", &[]), true).await?;
+                let seq = journal.note(&env.run_id, "unchecked_edit", &env.data.text("done_after_edit", &[]), true).await?;
+                journal.set(seq, "task", json!(nudge_task)).await?;
                 continue;
             }
-            if let Some((command, ran)) = last_pass.clone().filter(|_| !baseline_checked && !edited_after_pass) {
+            if let Some((command, ran)) = last_pass.clone().filter(|_| !baseline_checked && !edited_after_pass && !told_tests_pass_before) {
                 baseline_checked = true;
                 env.set_stage("verify");
                 let params = json!({"session_id": env.session_id, "workspace": env.scope.workspace, "command": command});
@@ -1127,19 +1263,23 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 match result {
                     Err(error) if error.code == codes::CANCELLED => continue,
                     Ok(result) if baseline_passed(&result, ran) => {
-                        journal.note(&env.run_id, "tests_pass_before", &env.data.text("done_tests_pass_before", &[("command", &command)]), true).await?;
+                        told_tests_pass_before = true;
+                        let seq = journal.note(&env.run_id, "tests_pass_before", &env.data.text("done_tests_pass_before", &[("command", &command)]), true).await?;
+                        journal.set(seq, "task", json!(nudge_task)).await?;
                         continue;
                     }
                     _ => {}
                 }
             }
-            if !changed.is_empty() && !security_checked {
+            if !changed.is_empty() && !security_checked && !told_security {
                 security_checked = true;
                 env.set_stage("verify");
                 let found = crate::checks::security_change(env, &any).await;
                 env.set_stage("act");
                 if let Some(found) = found {
-                    journal.note(&env.run_id, "security_check", &env.data.text("done_security", &[("found", &found)]), true).await?;
+                    told_security = true;
+                    let seq = journal.note(&env.run_id, "security_check", &env.data.text("done_security", &[("found", &found)]), true).await?;
+                    journal.set(seq, "task", json!(nudge_task)).await?;
                     continue;
                 }
             }
@@ -1152,7 +1292,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 Err(error) if error.code == codes::CANCELLED => continue,
                 Err(error) => return Err(error),
             };
-            let fixable = |report: &VerifyReport| report.checks.iter().any(|check| !check.ok && !check.indeterminate);
+            // A check the machine killed (out of memory, a stop from outside) could not run: it says
+            // nothing about the work, so it is neither a failure to fix nor a reason to plan again.
+            let fixable = |report: &VerifyReport| report.checks.iter().any(|check| !check.ok && !check.indeterminate && !contract::killed(check));
             if fixable(&report) {
                 // A check can turn out to be broken in itself only now. The worker may only propose
                 // a revision; the planner accepts or refuses it (the contract is frozen).
@@ -1182,6 +1324,16 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     }
                 }
             }
+            // Every check that did not pass was killed by the machine: the task ends as its loop left
+            // it, and the report of the work says these checks could not run (seen: `cargo test`
+            // killed with status 143 under memory pressure counted as a failing test suite, and the
+            // plan was written again around fixing it, ahead of the run the user had asked for).
+            if !report.ok && report.checks.iter().filter(|check| !check.ok).all(contract::killed) {
+                let commands = failing_commands(&report);
+                journal.note(&env.run_id, "verify", &env.data.text("checks_unrun", &[("checks", &commands)]), false).await?;
+                env.set_stage("act");
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, None).checked("unrun", commands));
+            }
             if !report.ok && !fixable(&report) {
                 // What is left the host cannot decide (manual checks): INDETERMINATE, for a person.
                 let undecided: String = report
@@ -1196,7 +1348,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             }
             env.set_stage("act");
             if report.ok {
-                return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)).checked("passed", String::new()));
             }
             // Only tests that failed before the work fail, and a later task waits for this one
             // (the plan's last task fixes what failed before): this task is done.
@@ -1218,27 +1370,43 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 if env.scope.workspace == env.scope.root {
                     let _ = env.host.call(memory_methods::TASK_UPDATE, json!({"id": task.id, "status": "done"})).await;
                 }
-                return Ok(outcome("done", summary, turns, tool_calls, &changed, Some(true)));
+                // Done as a task, not verified: its checks still fail, and the report of the work
+                // names them (they were recorded as passing here).
+                return Ok(outcome("done", summary, turns, tool_calls, &changed, None).checked("left", failing_commands(&report)));
             }
             let failures = report_text(&env.data, &report);
             match detector.observe("contract", &failures) {
                 Verdict::Stop(_) => {
                     let summary = format!("The contract kept failing the same way after a corrective replan:{failures}");
                     journal.note(&env.run_id, "repeat", &summary, false).await?;
-                    return Ok(outcome("stopped", summary, turns, tool_calls, &changed, Some(false)));
+                    return Ok(outcome("stopped", summary, turns, tool_calls, &changed, Some(false)).checked("failed", failing_commands(&report)));
                 }
                 Verdict::Replan(_) => {
                     journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_checks", &[]), research), true).await?;
                 }
                 Verdict::Fine | Verdict::Reread(_) | Verdict::Rerun(_) => {}
             }
-            let failures = format!("{failures}{}", crate::checks::failed_before(&env.data, journal, &env.run_id, &report));
-            journal.note(&env.run_id, "verify", &prompts::contract_failure(&env.data, &failures), true).await?;
+            let before = crate::checks::failed_before(&env.data, journal, &env.run_id, &report);
+            // A task a later task waits for fixes what fails in the files it changed; the rest is
+            // the plan's last task's. The host says which is which, so the model does not weigh
+            // "touch only your task" against "every check must pass" (seen: one task answered both
+            // ways about ten times, step after step). A task nothing waits for owns every failure.
+            let note = if awaited {
+                let outside = failing_outside(&report, &own, &env.scope.workspace);
+                let mine = report_lines(&env.data, &report, &|check| !outside.contains(&check.name));
+                let others = format!("{}{before}", report_lines(&env.data, &report, &|check| outside.contains(&check.name)));
+                let others = if others.trim().is_empty() { String::new() } else { env.data.text("contract_failure_outside", &[("report", others.trim())]) };
+                env.data.text("contract_failure_task", &[("report", mine.trim_end()), ("outside", &others)])
+            } else {
+                prompts::contract_failure(&env.data, &format!("{failures}{before}"))
+            };
+            journal.note(&env.run_id, "verify", &note, true).await?;
             effort = max_effort(&effort, &env.data.effort.escalate);
             continue;
         }
 
         answering_session = false;
+        text_calls = 0;
         // Journal the model's calls as written, then execute them in order.
         let mut call_seqs = Vec::new();
         for call in &result.tool_calls {
@@ -1544,6 +1712,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         if stopped {
             continue;
         }
+        // Said after the call's result, where the next call is written.
+        if call_from_text {
+            journal.note(&env.run_id, "call_as_text", &env.data.text("call_from_text", &[]), true).await?;
+        }
         if verdicts.iter().any(|verdict| matches!(verdict, Verdict::Stop(_))) {
             let what = verdicts.iter().find_map(|verdict| if let Verdict::Stop(what) = verdict { Some(what.clone()) } else { None }).unwrap_or_default();
             let summary = format!("The work stopped: the agent kept repeating {what} with the same result after a corrective replan.");
@@ -1557,8 +1729,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             // A reread is harmless: said once, plainly, with the step to take.
             journal.note(&env.run_id, "repeat", &env.data.text("reread", &[("what", what)]), true).await?;
         } else if let Some(Verdict::Rerun(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Rerun(_))) {
-            // A passing check run again with nothing changed: the step is to finish.
-            journal.note(&env.run_id, "repeat", &env.data.text("rerun", &[("what", what)]), true).await?;
+            // A command run again with nothing changed. After the task's edits the step is the
+            // next edit, or to finish on a passing check; before any edit the task is still
+            // finding out, and its step comes from the output it has (seen: "your next step is an
+            // edit" sent 22 times to an agent that had not yet found what to change).
+            let key = if detector.edited() { "rerun" } else { "rerun_before_edit" };
+            journal.note(&env.run_id, "repeat", &env.data.text(key, &[("what", what)]), true).await?;
         }
         // A plan task that used its calls without finishing is stuck: it ends here and the flow
         // writes the tasks still to do again with another approach, from where the model says it is.
@@ -1570,6 +1746,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             let last_words = journal
                 .entries()
                 .filter(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && entry.data.get("run_id").and_then(Value::as_str) == Some(env.run_id.as_str()))
+                // The planner's notes before the plan are not the task's own words.
+                .filter(|entry| entry.data.get("stage").and_then(Value::as_str) != Some(crate::flow::PLAN_NOTES))
                 .filter_map(|entry| entry.data.get("text").and_then(Value::as_str).map(str::to_owned))
                 .last()
                 .unwrap_or_default();

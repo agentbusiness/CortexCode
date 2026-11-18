@@ -55,7 +55,8 @@ export function targetLabel(target: Target): string {
  * Where text is written and sent. While a run is going, what is sent
  * steers it — injected at its next step — or waits as a follow-up for after it; a running agent
  * can be addressed the same way. Enter sends, as in any text field; the controls sit inside the
- * field's box: + and the mode (Auto, Ask) on the left, Stop and Send on the right.
+ * field's box: + and the mode (Auto, Ask) on the left, Stop and Send on the right. Stop is there
+ * while something runs; Steer (or Queue) takes Send's place only once a message is written.
  *
  * Attachments: paste an image (a screenshot straight from the clipboard) or files and folders copied
  * in Finder, drop them on the composer, or pick them with + (files and folders in one dialog); each becomes a chip (a preview for images) that can be
@@ -72,6 +73,7 @@ export function Composer({
   draft,
   onDraft,
   running,
+  stoppable,
   agentSession,
   agents,
   mode,
@@ -90,6 +92,8 @@ export function Composer({
   draft: string;
   onDraft: (text: string) => void;
   running: boolean;
+  /** Something of this session can be stopped: its run, or its agent's work. */
+  stoppable: boolean;
   /** The agent this session belongs to, when it is an agent's session. */
   agentSession: string | null;
   agents: AgentRecord[];
@@ -321,6 +325,7 @@ export function Composer({
   };
 
   const ready = making.length === 0;
+  const written = draft.trim() !== '' || attachments.length > 0 || making.length > 0;
   const canSend = (draft.trim() !== '' || attachments.length > 0) && ready && !sending && !disabled;
   const send = async () => {
     const text = draft.trim();
@@ -479,15 +484,20 @@ export function Composer({
             <Menu label="To" value={targetLabel(target)} items={items} title="Where this message goes" className="cx-target" />
           )}
           <div className="grow" />
-          {running && !agentSession && (
-            <button className="detent warn" type="button" onClick={onStop} disabled={stopping}>
+          {/* Stop is there for as long as something runs, and can be pressed again. */}
+          {stoppable && (
+            <button className="detent warn" type="button" onClick={onStop} aria-busy={stopping}
+              title={agentSession ? `Stop @${agentSession} now` : 'Stop the run now'}>
               {stopping ? 'Stopping…' : 'Stop'}
             </button>
           )}
-          <button className="detent send" type="button" disabled={!canSend} onClick={() => void send()}
-            title={ready ? undefined : 'Waiting for attachments'}>
-            {sending ? 'Sending…' : target.type === 'turn' ? 'Send' : target.kind === 'steer' ? 'Steer' : 'Queue'}
-          </button>
+          {/* Send starts a turn; Steer and Queue appear once there is a message for the running work. */}
+          {(target.type === 'turn' || written) && (
+            <button className="detent send" type="button" disabled={!canSend} onClick={() => void send()}
+              title={ready ? undefined : 'Waiting for attachments'}>
+              {sending ? 'Sending…' : target.type === 'turn' ? 'Send' : target.kind === 'steer' ? 'Steer' : 'Queue'}
+            </button>
+          )}
         </div>
       </div>
     </div>
