@@ -1063,14 +1063,16 @@ impl CodeTree {
         // 5. Retire removed nodes (and files that are gone): what links to them stays. Their code
         // edges go, so the files whose edges point at them write their edges again (a definition
         // whose kind changed keeps its sid: those files' edge sets may not differ).
-        // The removed node is matched first, by its sid, and its incoming edges are walked from
-        // it: a pattern that starts at `(a:Code)` walks every code node's edges once per removed
-        // node (seen: one statement ran for minutes when an ignore rule dropped 29,600 files).
+        // The pattern starts at the removed node (IronGraph takes a pattern's first node as its
+        // start) and walks its incoming edges from it. Starting at `(a:Code)`, in the same MATCH
+        // or in a second one after the node is bound, walks every code node's edges once per
+        // removed node (seen: one statement ran for minutes when an ignore rule dropped 29,600
+        // files).
         let mut relinked: HashSet<String> = HashSet::new();
         for chunk in removed.chunks(BATCH_ROWS) {
             let rows = self
                 .run(
-                    &format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) MATCH (a:Code)-[r]->(n) WHERE n.ended_ms IS NULL RETURN DISTINCT a.path", layer::OBSERVED_READ),
+                    &format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})<-[r]-(a:Code) WHERE n.ended_ms IS NULL RETURN DISTINCT a.path", layer::OBSERVED_READ),
                     params! { "sids" => chunk },
                 )
                 .await?;
@@ -1354,8 +1356,8 @@ impl CodeTree {
         let mut statements = 0;
         for chunk in sids.chunks(BATCH_ROWS) {
             self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})-[r]->(:Code) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
-            // The node first, by its sid, then its incoming edges (see step 5 of `sync_prepared`).
-            self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) MATCH (:Code)-[r]->(n) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+            // The pattern starts at the node, then its incoming edges (see step 5 of `sync_prepared`).
+            self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})<-[r]-(:Code) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
             self.run(
                 &format!(
                     "{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $now, n.ended_reason = $reason, n.state = 'gone', n.last_ms = $now",
