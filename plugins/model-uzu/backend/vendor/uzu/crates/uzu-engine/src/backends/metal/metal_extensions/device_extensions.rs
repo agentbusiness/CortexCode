@@ -2,14 +2,13 @@ use core::mem::transmute;
 use std::ffi::CString;
 
 use metal::{MTLDevice, MTLGPUFamily};
+use super::GpuFamilyExt;
 use obfstr::obfstr;
 use objc2::{
     Message,
     ffi::objc_msgSend,
     runtime::{NSObjectProtocol, ProtocolObject, Sel},
 };
-
-use super::GpuFamilyExt;
 
 // Used to bypass objc2's debug-mode class validation for proxy objects like
 // `CaptureMTLDevice` which forward messages at the ObjC runtime level (via
@@ -69,8 +68,7 @@ pub trait DeviceExt: MTLDevice + Message + NSObjectProtocol + Sized {
     fn supports_placement_sparse_resources(&self) -> bool {
         optional_selector_value(self, obfstr!("supportsPlacementSparse"), false)
     }
-
-    /// Newest Apple GPU family the device supports.
+    /// Cortex P5: retain the device's actual newest supported Apple GPU family.
     fn newest_supported_apple_gpu_family(&self) -> MTLGPUFamily {
         MTLGPUFamily::all_cases()
             .into_iter()
@@ -78,6 +76,7 @@ pub trait DeviceExt: MTLDevice + Message + NSObjectProtocol + Sized {
             .find(|family| self.supports_family(*family))
             .expect("unsupported Metal device: uzu requires an Apple GPU")
     }
+
 }
 
 impl DeviceExt for ProtocolObject<dyn MTLDevice> {}

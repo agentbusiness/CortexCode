@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use derive_more::Debug;
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -7,14 +9,14 @@ use crate::{
         Backend, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels,
         kernel::{
             LogitTransformKernel,
-            matmul::{MatmulA, MatmulArguments, MatmulDOps, MatmulKernel, MatmulOutput},
+            matmul::{MatmulA, MatmulArguments, MatmulDOps, MatmulGather, MatmulKernel, MatmulOutput},
         },
     },
     config::{embedding::AnyEmbeddingConfig, weight_matrix::AnyWeightMatrixSpec},
     data_type::DataType,
     encodable_block::{
         embedding_table::{EmbeddingTable, EmbeddingTableError, read_output_signs},
-        linear::{Gather, LinearEncodeError, LinearMatmulError, UntiedReadout},
+        linear::{LinearEncodeError, LinearMatmulError, UntiedReadout},
     },
     safetensors::{ParameterLoaderError, ParameterTree},
 };
@@ -50,6 +52,7 @@ enum EmbeddingTying<B: Backend> {
 
 pub struct Embedding<B: Backend> {
     tying: EmbeddingTying<B>,
+    readout_input_hadamard_factors: Option<Arc<B::GlobalGpuBuffer>>,
     input_scale: f32,
     data_type: DataType,
     logit_transform: Option<LogitTransform<B>>,
@@ -72,28 +75,35 @@ impl<B: Backend> Embedding<B> {
         self.model_dim
     }
 
-    pub fn new(
+    pub fn readout_input_hadamard_factors(&self) -> Option<Arc<B::GlobalGpuBuffer>> {
+        self.readout_input_hadamard_factors.clone()
+    }
+
+    pub async fn new(
         vocab_size: u32,
         model_dim: u32,
         data_type: DataType,
-        config: &AnyEmbeddingConfig,
-        parameter_tree: &ParameterTree<B>,
+        embedding_config: &AnyEmbeddingConfig,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Self, Option<B::GlobalBuffer>), EmbeddingError<B>> {
-        let (tying, readout_input_hadamard_factors) = match config {
+    ) -> Result<(Self, Option<Arc<B::GlobalGpuBuffer>>), EmbeddingError<B>> {
+        if *embedding_config.permute_indices() {
+            parameter_tree.ignore("index_permutation", &[vocab_size], DataType::I32)?;
+        }
+
+        let (tying, readout_input_hadamard_factors) = match embedding_config {
             AnyEmbeddingConfig::TiedEmbeddingConfig(_) => {
                 let embedding_tree = parameter_tree.subtree("embedding");
-                let table = EmbeddingTable::load(vocab_size, model_dim, data_type, &embedding_tree, context)?;
+                let table = EmbeddingTable::load(vocab_size, model_dim, data_type, &embedding_tree, context).await?;
                 if table.as_matrix().is_none() {
                     return Err(EmbeddingError::UnsupportedConfiguration("tied embeddings need a matrix table".into()));
                 }
-                // The output norm fuses the readout's input rotation, so it needs its own copy of the factors.
-                let readout_input_hadamard_factors =
-                    if let AnyWeightMatrixSpec::HybridSpec(_) = embedding_tree.metadata("spec")? {
-                        Some(read_output_signs(&embedding_tree, model_dim)?)
-                    } else {
-                        None
-                    };
+                let spec = embedding_tree.metadata("spec")?;
+                let readout_input_hadamard_factors = if let AnyWeightMatrixSpec::HybridSpec(_) = spec {
+                    Some(Arc::new(read_output_signs(&embedding_tree, model_dim).await?))
+                } else {
+                    None
+                };
                 (
                     EmbeddingTying::Tied {
                         table,
@@ -105,7 +115,7 @@ impl<B: Backend> Embedding<B> {
             AnyEmbeddingConfig::UntiedEmbeddingConfig(_) => {
                 let input_embedding_tree = parameter_tree.subtree("input_embedding");
                 let input_table =
-                    EmbeddingTable::load(vocab_size, model_dim, data_type, &input_embedding_tree, context)?;
+                    EmbeddingTable::load(vocab_size, model_dim, data_type, &input_embedding_tree, context).await?;
                 let output_embedding_tree = parameter_tree.subtree("output_embedding");
                 let output_embedding_spec = output_embedding_tree.metadata("spec")?;
                 let output = UntiedReadout::load(
@@ -115,7 +125,8 @@ impl<B: Backend> Embedding<B> {
                     output_embedding_spec,
                     &output_embedding_tree,
                     context,
-                )?;
+                )
+                .await?;
                 (
                     EmbeddingTying::Untied {
                         input_table,
@@ -126,9 +137,9 @@ impl<B: Backend> Embedding<B> {
             },
         };
 
-        let input_scale = config.input_scale().unwrap_or(1.0);
-        let logit_scale = config.logit_scale().unwrap_or(1.0);
-        let logit_soft_cap = *config.logit_soft_cap();
+        let input_scale = embedding_config.input_scale().unwrap_or(1.0);
+        let logit_scale = embedding_config.logit_scale().unwrap_or(1.0);
+        let logit_soft_cap = *embedding_config.logit_soft_cap();
         let logit_transform = if logit_scale != 1.0 || logit_soft_cap.is_some() {
             let kernel =
                 <B::Kernels as Kernels>::LogitTransformKernel::new(context, data_type, logit_soft_cap.is_some())
@@ -145,6 +156,7 @@ impl<B: Backend> Embedding<B> {
         Ok((
             Self {
                 tying,
+                readout_input_hadamard_factors: readout_input_hadamard_factors.clone(),
                 input_scale,
                 data_type,
                 logit_transform,
@@ -191,18 +203,15 @@ impl<B: Backend> Embedding<B> {
     ) -> Result<B::ScratchBuffer, EmbeddingError<B>> {
         let command_buffer = &mut *command_buffer.debug_group("embedding readout");
 
-        assert!(batch_dim > 0 && output_dim > 0, "Embedding readout requires non-empty dimensions");
+        assert!(
+            batch_dim > 0 && output_dim > 0 && (gather_indices.is_some() || output_dim <= self.vocab_size),
+            "invalid embedding readout dimensions"
+        );
         let mut output_buffer = match &self.tying {
             EmbeddingTying::Untied {
                 output,
                 ..
-            } => {
-                let gather = gather_indices.map(|indices| Gather {
-                    indices,
-                    output_dim,
-                });
-                output.encode(input_buffer, batch_dim, gather, command_buffer)?
-            },
+            } => output.encode(input_buffer, batch_dim, output_dim, gather_indices, command_buffer)?,
             EmbeddingTying::Tied {
                 table,
                 readout,
@@ -219,7 +228,11 @@ impl<B: Backend> Embedding<B> {
                     b_leading_dimension: None,
                     b_transpose: true,
                     output: MatmulOutput::new(&mut output, MatmulDOps::none()),
-                    gather_indices,
+                    gather: gather_indices.map(|indices| MatmulGather {
+                        indices,
+                        first_row: 0,
+                        row_count: self.vocab_size,
+                    }),
                     m: batch_dim,
                     n: output_dim,
                     k: self.model_dim,

@@ -1,18 +1,21 @@
-use std::{any::Any, range::Range};
+use std::{any::Any, range::Range, sync::Arc};
 
 use derive_more::Debug;
 use thiserror::Error;
 
 use crate::{
-    backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, gpu_types::trie::TrieNode,
+    backends::common::{Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding},
+    config::{
+        dflash::DFlashDraftConfig,
+        residual::{AnyResidualConfig, additive::AdditiveResidualConfig},
+        rope::AnyRoPEConfig,
+        token_mixer::AnyTokenMixerConfig,
     },
-    config::{dflash::DFlashDraftConfig, rope::AnyRoPEConfig, token_mixer::AnyTokenMixerConfig},
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
         embedding::{Embedding, EmbeddingError},
-        linear::{Linear, LinearBlockError, LinearEncodeError},
+        linear::{InputRhtParameters, Linear, LinearBlockError, LinearEncodeError},
         mixer::{
             MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
             attention::{
@@ -20,7 +23,7 @@ use crate::{
             },
         },
         mlp::MlpBlockNewError,
-        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        normalization::{Normalization, NormalizationNewError, ShortcutMode},
         transformer_layer::{TransformerLayer, TransformerLayerError},
     },
     safetensors::ParameterTree,
@@ -82,6 +85,7 @@ pub struct DFlash<B: Backend> {
     max_context_length: u32,
     block_size: u32,
     mask_token_id: u32,
+    vocab_size: u32,
     target_feature_input_dim: u32,
     data_type: DataType,
 }
@@ -122,10 +126,11 @@ pub enum DFlashEncodeError<B: Backend> {
 }
 
 impl<B: Backend> DFlash<B> {
-    pub fn new(
+    pub async fn new(
         data_type: DataType,
         config: &DFlashDraftConfig,
-        parameter_tree: &ParameterTree<B>,
+        readout_input_hadamard_factors: Option<Arc<B::GlobalGpuBuffer>>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
     ) -> Result<Self, DFlashNewError<B>> {
         let mask_token_id = config.mask_token_id as u32;
@@ -137,20 +142,22 @@ impl<B: Backend> DFlash<B> {
             false,
             &parameter_tree.subtree("context_projection"),
             context,
-        )?;
+        )
+        .await?;
         let projected_feature_norm = Normalization::new(
             config.model_dim,
             data_type,
+            data_type,
             None,
             ShortcutMode::None,
-            PostLayerScalar::None,
             &config.context_norm_config,
             &parameter_tree.subtree("context_norm"),
             context,
-        )?;
+        )
+        .await?;
         let layers_tree = parameter_tree.subtree("layers");
         let first_layer_config = config.layer_configs.first().expect("DFlash draft model must have at least one layer");
-        let AnyTokenMixerConfig::AttentionConfig(attention_config) = &first_layer_config.mixer_config else {
+        let AnyTokenMixerConfig::AttentionConfig(attention_config) = &first_layer_config.mixer.body_config else {
             return Err(DFlashNewError::InvalidAttentionConfig("DFlash layers must use attention mixers"));
         };
         let layer_kv_dim = 2 * attention_config.num_groups * attention_config.head_dim;
@@ -162,12 +169,13 @@ impl<B: Backend> DFlash<B> {
             false,
             &parameter_tree.subtree("state_kv_projection"),
             context,
-        )?;
-        let layers = config
-            .layer_configs
-            .iter()
-            .zip(0u32..)
-            .map(|(layer_config, index)| {
+        )
+        .await?;
+        // DFlash draft models are hard-coded with an additive residual.
+        let residual_config = AnyResidualConfig::AdditiveResidualConfig(AdditiveResidualConfig::default());
+        let mut layers = Vec::with_capacity(num_layers as usize);
+        for (layer_config, index) in config.layer_configs.iter().zip(0u32..) {
+            layers.push(
                 TransformerLayer::new(
                     config.model_dim,
                     config.hidden_dim,
@@ -175,34 +183,38 @@ impl<B: Backend> DFlash<B> {
                     index,
                     data_type,
                     layer_config,
+                    &residual_config,
                     &layers_tree.subtree(&index.to_string()),
                     context,
                 )
-            })
-            .collect::<Result<Box<[_]>, TransformerLayerError<B>>>()?;
+                .await?,
+            );
+        }
         let output_norm = Normalization::new(
             config.model_dim,
             data_type,
-            None,
-            ShortcutMode::Add,
-            PostLayerScalar::None,
+            data_type,
+            readout_input_hadamard_factors.map(InputRhtParameters::h32),
+            ShortcutMode::None,
             &config.output_norm_config,
             &parameter_tree.subtree("output_norm"),
             context,
-        )?;
+        )
+        .await?;
 
         Ok(Self {
             target_feature_projection,
             projected_feature_norm,
             state_kv_projection,
             layer_kv_dim,
-            layers,
+            layers: layers.into_boxed_slice(),
             output_norm,
             rope_config: config.rope_config.clone(),
             model_dim: config.model_dim,
             max_context_length: *config.rope_config.max_sequence_length(),
             block_size: config.block_size,
             mask_token_id,
+            vocab_size: config.vocab_size,
             target_feature_input_dim: config.model_dim * config.target_layer_ids.len() as u32,
             data_type,
         })
@@ -293,7 +305,7 @@ impl<B: Backend> DFlash<B> {
                 );
             }
         }
-        for ((layer, mixer_state), mut key_value) in
+        for ((layer, mixer_state), key_value) in
             self.layers.iter().zip(state.layer_states.iter_mut()).zip(layer_key_values)
         {
             mixer_state.prepare(state.context_length, num_tokens).map_err(DFlashEncodeError::Backend)?;
@@ -304,7 +316,7 @@ impl<B: Backend> DFlash<B> {
                 .downcast_mut::<AttentionState<B>>()
                 .expect("DFlash draft layer states must be attention states");
             attention
-                .append_projected_kv(&mut key_value, &rope, num_tokens, attention_state, command_buffer)
+                .append_projected_kv(&key_value, &rope, num_tokens, attention_state, command_buffer)
                 .map_err(DFlashEncodeError::Backend)?;
         }
 
@@ -335,25 +347,16 @@ impl<B: Backend> DFlash<B> {
 
         let token_embeddings = target_embedding.encode_lookup(&token_ids, batch_size, command_buffer)?;
 
-        let nodes = (0..batch_size)
-            .map(|index| TrieNode {
-                trie_start: index,
-                trie_end: batch_size - 1,
-                height: index,
-            })
-            .collect::<Box<[_]>>();
-        let batch_topology = BatchTopology::new(&nodes, true);
+        let batch_topology = BatchTopology::flat(batch_size, true);
         let token_positions = (state.context_length..state.context_length + batch_size).collect::<Box<[_]>>();
         let rope = PrecalculatedRoPE::precalculate(&self.rope_config, &token_positions, command_buffer)
             .map_err(DFlashEncodeError::Backend)?;
 
-        let mut hidden = token_embeddings;
-        let mut residual = command_buffer.allocate_scratch(hidden.size()).map_err(DFlashEncodeError::Backend)?;
+        let mut stream = token_embeddings;
         for (layer, mixer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
             mixer_state.prepare(state.context_length, batch_size).map_err(DFlashEncodeError::Backend)?;
-            hidden = layer.encode(
-                hidden,
-                &mut residual,
+            stream = layer.encode(
+                stream,
                 None::<&B::ScratchBuffer>,
                 Some(&rope),
                 &batch_topology,
@@ -363,7 +366,7 @@ impl<B: Backend> DFlash<B> {
         }
         let draft_hidden = self
             .output_norm
-            .encode(&hidden, 0, batch_size, Some(&mut residual), command_buffer)
+            .encode(&stream, 0, batch_size, None::<&mut B::ScratchBuffer>, command_buffer)
             .map_err(DFlashEncodeError::Backend)?;
 
         let row_bytes = size_for_shape(&[target_embedding.model_dim()], DataType::BF16);
@@ -374,7 +377,7 @@ impl<B: Backend> DFlash<B> {
         let logits = target_embedding.encode_readout(
             &lookahead_hidden,
             batch_size - 1,
-            target_embedding.vocab_size(),
+            self.vocab_size,
             None::<&B::ScratchBuffer>,
             false,
             command_buffer,

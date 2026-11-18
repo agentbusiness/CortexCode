@@ -2,7 +2,7 @@ use super::{QuantParams, QuantParamsLayout, WeightsLayout};
 use crate::{
     backends::common::{
         BufferRef,
-        gpu_types::{gemm::GemmBPrologueKind, quantization::QuantizationMode},
+        gpu_types::{gemm::GemmBPrologueKind, quantization::QuantizationMode, trellis::TrellisCodebook},
     },
     data_type::DataType,
 };
@@ -13,10 +13,6 @@ pub struct TrellisFormat {
     pub transition_bits: u32,
     pub restart_columns: Option<u32>,
 }
-
-/// Readable bytes past the last code row (the GEMM loads whole words).
-#[cfg(backend = "metal")]
-pub const TRELLIS_CODES_TAIL_BYTES: usize = 16;
 
 impl TrellisFormat {
     /// Bytes per code row: restart rows pad to 16 bytes, connected rows to a byte.
@@ -43,7 +39,7 @@ pub enum MatmulB<TB: BufferRef> {
     Trellis {
         codes: TB,
         row_scales: TB,
-        codebook: TB,
+        codebook: TrellisCodebook,
         format: TrellisFormat,
     },
 }

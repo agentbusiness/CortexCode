@@ -10,7 +10,7 @@ use crate::{
     encodable_block::{
         batch_topology::BatchTopology,
         embedding::{Embedding, EmbeddingError},
-        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        normalization::{Normalization, NormalizationNewError, ShortcutMode},
         per_layer_embedding::{PerLayerEmbedding, PerLayerEmbeddingError},
         transformer::{RopeRows, Transformer, TransformerEncodeError, TransformerNewError, TransformerState},
     },
@@ -61,10 +61,10 @@ impl<B: Backend> Decoder<B> {
         &self.embedding
     }
 
-    pub fn new(
+    pub async fn new(
         data_type: DataType,
         config: &DecoderConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
     ) -> Result<Self, DecoderError<B>> {
         let (embedding, readout_input_hadamard_factors) = Embedding::new(
@@ -74,24 +74,26 @@ impl<B: Backend> Decoder<B> {
             &config.embedding_config,
             &parameter_tree.subtree("embedding"),
             context,
-        )?;
+        )
+        .await?;
 
-        let embedding_norm = config
-            .embedding_norm_config
-            .as_ref()
-            .map(|norm_config| {
+        let embedding_norm = if let Some(norm_config) = &config.embedding_norm_config {
+            Some(
                 Normalization::new(
                     config.transformer_config.model_dim,
                     data_type,
+                    data_type,
                     None,
                     ShortcutMode::None,
-                    PostLayerScalar::None,
                     norm_config,
                     &parameter_tree.subtree("embedding_norm"),
                     context,
                 )
-            })
-            .transpose()?;
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let per_layer_embedding = if let Some(ple_config) = &config.ple_model_config {
             assert_eq!(
@@ -99,24 +101,29 @@ impl<B: Backend> Decoder<B> {
                 config.transformer_config.layer_configs.len() as u32,
                 "per-layer embedding num_layers must match transformer layer count"
             );
-            Some(PerLayerEmbedding::new(
-                config.transformer_config.model_dim,
-                data_type,
-                ple_config,
-                &parameter_tree.subtree("per_layer_embedding"),
-                context,
-            )?)
+            Some(
+                PerLayerEmbedding::new(
+                    config.transformer_config.model_dim,
+                    data_type,
+                    ple_config,
+                    &parameter_tree.subtree("per_layer_embedding"),
+                    context,
+                )
+                .await?,
+            )
         } else {
             None
         };
 
         let transformer = Transformer::new(
             data_type,
+            data_type,
             readout_input_hadamard_factors,
             &config.transformer_config,
             &parameter_tree.subtree("transformer"),
             context,
-        )?;
+        )
+        .await?;
 
         Ok(Self {
             embedding,

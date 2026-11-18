@@ -39,6 +39,9 @@ const VERSION: u32 = 1;
 const FRESH: Duration = Duration::from_secs(15);
 /// Reads of a job, its output or a moment.
 const READ: Duration = Duration::from_secs(15);
+/// How long CortexTerm has to take a command handed to it: to answer, or to name its job (it does
+/// so right after its risk check and the start of the process, in milliseconds).
+const ACCEPT: Duration = Duration::from_secs(5);
 /// Variables of a session's shell that are the machine's or the login shell's, not the session's.
 const NOT_SENT: &[&str] = &["PATH", "HOME", "SHELL", "PWD", "OLDPWD", "SHLVL", "TERM", "_", "USER", "LOGNAME", "TMPDIR", "VIRTUAL_ENV", "PS1", "PS2", "PS4"];
 
@@ -374,13 +377,29 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
     let asker = Asker { session_id: request.session_id.to_owned(), by: "agent".into() };
     let mut meta = request.meta(provider);
     let (items_tx, mut items_rx) = mpsc::unbounded_channel::<Value>();
-    let call = client::run(&link, provider, "terminal.command.run", request.params(), &asker, items_tx, cancel.clone());
+    // The call's own stop: the session's cancel stops it, and so does giving the hand-over up.
+    let taken = cancel.child_token();
+    let call = client::run(&link, provider, "terminal.command.run", request.params(), &asker, items_tx, taken.clone());
     tokio::pin!(call);
     let mut capture = Capture::new(&request.spill_dir);
     let started = Instant::now();
+    // CortexTerm names the job the moment it starts the command, before any output. A call it has
+    // neither answered nor named a job for within `ACCEPT` was not taken: the app has quit while
+    // the mesh still holds its connection, and the call would wait until that connection gives up
+    // (seen: `cargo check`, 0.8 s, and `find src`, 0.02 s, each returned after about 125 s, with
+    // CortexTerm quit minutes before). It is stopped and the command runs here; nothing started
+    // there, so it does not run twice.
+    let accept = tokio::time::sleep(ACCEPT);
+    tokio::pin!(accept);
     let ran = loop {
         tokio::select! {
             ran = &mut call => break ran,
+            _ = &mut accept, if meta.id.is_empty() => {
+                taken.cancel();
+                forget();
+                tracing::info!("CortexTerm did not take the command in time; running here");
+                return Outcome::Elsewhere;
+            }
             Some(item) = items_rx.recv() => match item.get("kind").and_then(Value::as_str) {
                 // The provider names the job first, so a run that is cut off can be found again.
                 Some("job") => {
@@ -469,7 +488,18 @@ pub async fn start(commands: &Commands, host: &dyn Host, provider: &Provider, re
     let asker = Asker { session_id: request.session_id.to_owned(), by: "agent".into() };
     let mut meta = request.meta(provider);
     let (items_tx, _items_rx) = mpsc::unbounded_channel::<Value>();
-    match client::run(&link, provider, "terminal.command.run", request.params(), &asker, items_tx, CancellationToken::new()).await {
+    // A background start is answered at once (the job, running). No answer within `ACCEPT`: the
+    // app is gone behind a connection the mesh still holds; the call is stopped and the job starts
+    // here (see `run`).
+    let taken = CancellationToken::new();
+    let answer = tokio::time::timeout(ACCEPT, client::run(&link, provider, "terminal.command.run", request.params(), &asker, items_tx, taken.clone())).await;
+    let Ok(ran) = answer else {
+        taken.cancel();
+        forget();
+        tracing::info!("CortexTerm did not take the background command in time; starting it here");
+        return Outcome::Elsewhere;
+    };
+    match ran {
         Ran::Job(job) if job.state == "refused" => {
             let (risk, reason) = job.needs_approval.map(|why| (why.risk, why.reason)).unwrap_or_else(|| ("unknown".into(), "CortexTerm's risk check stopped it".into()));
             Outcome::Refused { risk, reason }

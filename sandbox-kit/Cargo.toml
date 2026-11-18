@@ -17,6 +17,6 @@ path = "src/lib.rs"
 [dependencies]
 # The approval class prefixes (`write_outside:`, `lift:`) stay one definition in the tools contract.
 cc-protocol = { path = "../protocol", features = ["tools"] }
-regex = "1.12"
+regex = "1.13.2"
 libc = "0.2.183"
-sha2 = "0.10"
+sha2 = "0.11.1"

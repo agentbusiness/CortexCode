@@ -2,13 +2,7 @@ use half::{bf16, f16};
 use num_traits::Float;
 use uzu_engine_macros::kernel;
 
-use crate::{
-    backends::{
-        common::gpu_types::hadamard_order::HADAMARD_TRANSFORM_BLOCK_SIZE,
-        cpu::kernel::activation_transform::hadamard_transform,
-    },
-    data_type::DataTypeRepr,
-};
+use crate::{backends::cpu::kernel::activation_transform::hadamard_transform, data_type::DataTypeRepr};
 
 #[kernel(Normalization)]
 #[variants(InputT, f32, f16, bf16)]
@@ -31,15 +25,14 @@ pub fn normalization<
     element_count: u32,
     epsilon: f32,
     scale_offset: f32,
-    post_layer_scalar: f32,
+    mixture_size: u32,
     #[specialize] in_place: bool,
     #[specialize] subtract_mean: bool,
     #[specialize] full_layer: bool,
     #[specialize] copy_to_shortcut: bool,
     #[specialize] residual_add: bool,
     #[specialize] use_hadamard: bool,
-    #[specialize] scale_residual_sum: bool,
-    #[specialize] scale_output: bool,
+    #[specialize] hadamard_size: u32,
     #[specialize] has_biases: bool,
     #[specialize] has_scales: bool,
 ) {
@@ -48,7 +41,7 @@ pub fn normalization<
     assert_eq!(biases.is_some(), has_biases);
     assert_eq!(scales.is_some(), has_scales);
     assert!(copy_to_shortcut || !residual_add);
-    assert!(!use_hadamard || element_count.is_multiple_of(HADAMARD_TRANSFORM_BLOCK_SIZE));
+    assert!(!use_hadamard || element_count.is_multiple_of(hadamard_size));
 
     let input = match in_place {
         true => output as *const InputT,
@@ -59,10 +52,12 @@ pub fn normalization<
     let epsilon = AccumT::from(epsilon).unwrap();
     let scale_offset = AccumT::from(scale_offset).unwrap();
     let element_count_accum = AccumT::from(element_count).unwrap();
-    let mut row = vec![OutputT::zero(); element_count];
+    let mut row = vec![AccumT::zero(); element_count];
+    let mut block = vec![0.0f32; hadamard_size as usize];
 
     for batch in 0..(batch_size as usize) {
         let batch_offset = batch * element_count;
+        let affine_offset = (batch % mixture_size as usize) * element_count;
 
         // Compute mean / rms_inv (+ residual add or copy to shortcut)
         let mut sum = AccumT::zero();
@@ -74,9 +69,6 @@ pub fn normalization<
                 let skip_ptr = unsafe { shortcut.unwrap().add(batch_offset + i) };
                 if residual_add {
                     val = val + unsafe { *skip_ptr };
-                    if scale_residual_sum {
-                        val = InputT::from(val.to_f32().unwrap() * post_layer_scalar).unwrap();
-                    }
                 }
                 unsafe { *skip_ptr = val };
             }
@@ -101,49 +93,42 @@ pub fn normalization<
             } else {
                 unsafe { AccumT::from(*input.add(batch_offset + i)).unwrap() }
             };
-            let normalized: AccumT = (input_val - mean) * rms_inv;
-            let mut result: OutputT = if has_scales {
-                let scale_val = unsafe { AccumT::from(*scales.unwrap().add(i)).unwrap() };
-                if full_layer {
-                    // Full-layer: keep everything in accumulation precision
-                    let scale_with_offset: AccumT = scale_val + scale_offset;
-                    OutputT::from(normalized * scale_with_offset).unwrap()
+            let mut normalized: AccumT = (input_val - mean) * rms_inv;
+            if has_scales {
+                let scale_val = unsafe { AccumT::from(*scales.unwrap().add(affine_offset + i)).unwrap() };
+                let scale_with_offset = scale_val + scale_offset;
+                normalized = if full_layer {
+                    normalized * scale_with_offset
                 } else {
-                    // Only-normalization: cast down to output precision for the scale multiply
-                    let normalized_out = OutputT::from(normalized).unwrap();
-                    let scale_with_offset_out = OutputT::from(scale_val + scale_offset).unwrap();
-                    normalized_out * scale_with_offset_out
-                }
-            } else {
-                OutputT::from(normalized).unwrap()
-            };
-            if has_biases {
-                let bias = unsafe { AccumT::from(*biases.unwrap().add(i)).unwrap() };
-                result = OutputT::from(AccumT::from(result).unwrap() + bias).unwrap();
+                    let product = OutputT::from(normalized).unwrap() * OutputT::from(scale_with_offset).unwrap();
+                    AccumT::from(product).unwrap()
+                };
             }
-            row[i] = result;
+            if !use_hadamard {
+                normalized = AccumT::from(OutputT::from(normalized).unwrap()).unwrap();
+            }
+            if has_biases {
+                normalized = normalized + unsafe { AccumT::from(*biases.unwrap().add(affine_offset + i)).unwrap() };
+            }
+            row[i] = normalized;
         }
 
-        // Input RHT like the Metal kernel: apply the factors, then transform each block, before output scaling
+        // Input RHT like the Metal kernel: apply the factors, then transform each block
         if let Some(factors) = hadamard_factors {
-            for block_start in (0..element_count).step_by(HADAMARD_TRANSFORM_BLOCK_SIZE as usize) {
-                let mut block: [f32; HADAMARD_TRANSFORM_BLOCK_SIZE as usize] = std::array::from_fn(|lane| {
+            for block_start in (0..element_count).step_by(hadamard_size as usize) {
+                for (lane, value) in block.iter_mut().enumerate() {
                     let factor = unsafe { *factors.add(block_start + lane) } as f32;
-                    row[block_start + lane].to_f32().unwrap() * factor
-                });
+                    *value = row[block_start + lane].to_f32().unwrap() * factor;
+                }
                 hadamard_transform(&mut block);
-                for (lane, value) in block.into_iter().enumerate() {
-                    row[block_start + lane] = OutputT::from(value).unwrap();
+                for (lane, &value) in block.iter().enumerate() {
+                    row[block_start + lane] = AccumT::from(value).unwrap();
                 }
             }
         }
 
         for (i, &value) in row.iter().enumerate() {
-            let mut result = value;
-            if scale_output {
-                result = result * OutputT::from(post_layer_scalar).unwrap();
-            }
-            unsafe { *output.add(batch_offset + i) = result };
+            unsafe { *output.add(batch_offset + i) = OutputT::from(value).unwrap() };
         }
     }
 }

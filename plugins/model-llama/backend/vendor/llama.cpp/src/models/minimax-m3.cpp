@@ -64,9 +64,7 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-        // indexer: required on the MoE layers (MiniMax-M3); optional on the leading dense layers, which
-        // run MSA when it is present (MiniMax-M3.1 sets sparse_attention_freq on every layer). A layer
-        // is sparse iff it carries indexer tensors, see llama_model_minimax_m3::is_msa_layer()
+        // indexer optional on dense layers: a layer is sparse iff it carries indexer tensors
         {
             const int idx_flags = i < (int) hparams.n_layer_dense_lead ? TENSOR_NOT_REQUIRED : 0;
             layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, idx_flags);
@@ -102,8 +100,7 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-// tokens per MSA batch chunk so that per_token_elems * tokens stays below 2^31 elements
-// (MSA_MAX_ELEMS overrides the cap, for testing the chunked path at small contexts)
+// keeps per_token_elems * tokens below 2^31 (MSA_MAX_ELEMS overrides, for testing)
 static int64_t msa_tokens_per_chunk(int64_t per_token_elems, int64_t n_tokens) {
     static const int64_t max_elems = [] {
         const char * e = getenv("MSA_MAX_ELEMS");
@@ -117,7 +114,7 @@ bool llama_model_minimax_m3::is_msa_layer(int il) const {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_minimax_m3::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 class llm_graph_input_msa : public llm_graph_input_i {
@@ -234,7 +231,7 @@ ggml_tensor * llama_model_minimax_m3::graph::build_attn_msa_fa(
     return ggml_reshape_2d(ctx0, o, D*HQ, T);
 }
 
-llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     const auto & mm = static_cast<const llama_model_minimax_m3 &>(model);
 
@@ -288,7 +285,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
     if (msa_enabled) {
         const auto * mctx_msa = static_cast<const llama_kv_cache_msa_context *>(mctx);
 
-        msa_kqm = inp_attn->get_kq_mask();
+        msa_kqm = inp_attn->self_attn_mask.raw;
         n_kv  = msa_kqm->ne[0];
         n_tps = msa_kqm->ne[1];        // tokens per stream
         ns    = msa_kqm->ne[3];        // streams in this ubatch
@@ -324,8 +321,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // DFlash/DSpark drafts read the residual stream entering layer il (index n_layer = the last layer's output,
-    // before the final norm); that one needs every row, so the output-row crop moves after the loop
+    // DFlash/DSpark drafts need every row, so the output-row crop moves after the loop
     const bool tap_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     for (int il = 0; il < n_layer; ++il) {
@@ -348,14 +344,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
             cb(Kcur, "Kcur_normed", il);
 
             // partial rotary: only the first n_rot dims are rotated
-            Qcur = ggml_rope_ext(
-                ctx0, Qcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
-            Kcur = ggml_rope_ext(
-                ctx0, Kcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow);
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -377,10 +367,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ik = ggml_reshape_3d(ctx0, ik, n_idx_dim, 1,  n_tokens);
                 iq = build_norm(iq, model.layers[il].index_q_norm, NULL, LLM_NORM_RMS, il);  // +1 baked
                 ik = build_norm(ik, model.layers[il].index_k_norm, NULL, LLM_NORM_RMS, il);
-                iq = ggml_rope_ext(ctx0, iq, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
-                                   freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-                ik = ggml_rope_ext(ctx0, ik, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
-                                   freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                iq = build_rope(iq, inp_pos, il);
+                ik = build_rope(ik, inp_pos, il);
 
                 const auto * mctx_msa_l = static_cast<const llama_kv_cache_msa_context *>(mctx);
                 const auto * mctx_cur = mctx_msa_l->get_base();
@@ -388,12 +376,12 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ik, inp_attn->get_k_idxs_idx(), il));
                 ggml_tensor * ik_kv = mctx_idx->get_k(ctx0, il);
 
-                if (inp_attn->self_k_rot) {
-                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot);
-                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+                if (inp_attn->self_k_rot[il]) {
+                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot[il]);
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
                 }
-                if (inp_attn->self_v_rot) {
-                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+                if (inp_attn->self_v_rot[il]) {
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
                 }
 
                 // Main branch: store K/V, take cache views
@@ -424,6 +412,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     ggml_tensor * iq4 = ggml_reshape_4d(ctx0, iq, n_idx_dim, Hd, 1, ns);
                     ggml_tensor * sc  = ggml_mul_mat(ctx0,
                             ggml_reshape_4d(ctx0, ikp, n_idx_dim, n_ps, 1, ns), iq4);
+                    // the reference computes the indexer scores in F32: https://github.com/huggingface/transformers/blob/0f53828e83f2212060233d2ea552cc76617b8712/src/transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py#L562
                     ggml_prec_set_acc(sc, GGML_PREC_F32);
                     // unmapped positions come out -inf, so they can never rank into the top-k
                     sc = ggml_add_inplace(ctx0, sc,
@@ -477,10 +466,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
                     cur = build_attn_msa_fa(Qcur, kfa, vfa, mfa, Gp, kq_scale, il);
                 } else {
-                    // batch: per stream, in token chunks. The largest intermediates (indexer scores
-                    // [n_ps, Hd, n], block mask expanded to cells [n_kv, n, Hd]) grow with context x tokens;
-                    // chunking keeps every one of them below 2^31 elements (int32 indexing in backend
-                    // kernels, e.g. CUDA pool2d, overflows past that: 270K ctx at -ub 2048).
+                    // chunk tokens: backend kernels index with int32 and overflow past 2^31 elements
                     const int64_t n_chunk = msa_tokens_per_chunk(std::max<int64_t>(n_ps, n_kv)*Hd, n_tps);
                     std::vector<ggml_tensor *> outs;
                     for (int64_t st = 0; st < ns; ++st) {
@@ -495,10 +481,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * v_s = ggml_view_4d(ctx0, v, D, HKV, n_kv, 1,
                                 v->nb[1], v->nb[2], v->nb[3], st*v->nb[3]);
 
-                        // the indexer keys are gathered through the pos -> cell map once per stream
                         ggml_tensor * ikp = ggml_get_rows(ctx0, ik_s, psl_s);   // [n_idx_dim, n_ps]
 
-                        // cache views with groups on ne[3];
                         ggml_tensor * kfa = ggml_permute(ctx0, k_s, 0, 3, 1, 2);
                         ggml_tensor * vfa = ggml_permute(ctx0, v_s, 0, 3, 1, 2);
 
@@ -510,7 +494,6 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                                 iq->nb[1], iq->nb[2], t0*iq->nb[2]);
                         ggml_tensor * pm_s = ggml_view_3d(ctx0, msa->pos_mask, n_ps, 1, nt,
                                 msa->pos_mask->nb[1], msa->pos_mask->nb[1], t0*msa->pos_mask->nb[1]);
-                        // F32 copy of this chunk's rows of the FA (f16) mask for the final mask add
                         ggml_tensor * mf_s = ggml_cast(ctx0, ggml_view_3d(ctx0, msa_kqm, n_kv, nt, 1,
                                 msa_kqm->nb[1], msa_kqm->nb[3], st*msa_kqm->nb[3] + c0*msa_kqm->nb[1]), GGML_TYPE_F32);
                         ggml_tensor * bias_s = ggml_view_3d(ctx0, msa->bias, nblk, 1, nt,
@@ -518,10 +501,10 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * q_s = ggml_view_3d(ctx0, Qcur, D, n_head, nt,
                                 Qcur->nb[1], Qcur->nb[2], t0*Qcur->nb[2]);
 
-                        // block scores, unscaled: only the top-k ordering matters
+                        // unscaled: only the top-k ordering matters
                         ggml_tensor * sc = ggml_mul_mat(ctx0, ikp,
                                 ggml_reshape_2d(ctx0, iq_s, n_idx_dim, Hd*nt));
-                        // indexer scores run in F32
+                        // the reference computes the indexer scores in F32: https://github.com/huggingface/transformers/blob/0f53828e83f2212060233d2ea552cc76617b8712/src/transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py#L562
                         ggml_prec_set_acc(sc, GGML_PREC_F32);
                         sc = ggml_reshape_3d(ctx0, sc, n_ps, Hd, nt);
                         // unmapped positions (holes, padding, empty cells) come out -inf
@@ -570,8 +553,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         cur = ggml_concat(ctx0, cur, outs[i], 1);
                     }
                 }
-                if (inp_attn->self_v_rot) {
-                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot);
+                if (inp_attn->self_v_rot[il]) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot[il]);
                 }
                 cb(cur, "kqv_out", il);
                 if (model.layers[il].wo) {

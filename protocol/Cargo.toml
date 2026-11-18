@@ -52,7 +52,7 @@ tokio = { version = "1.53", features = ["net", "io-util", "sync", "rt", "macros"
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }

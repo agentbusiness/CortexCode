@@ -1,17 +1,17 @@
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(target_family = "wasm")]
-use std::os::wasi::fs::FileExt;
-use std::{cell::Cell, collections::HashMap, fs::File};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use derive_more::Debug;
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    backends::common::{Backend, BufferMut, Context},
+    backends::common::{Backend, Context, CpuBuffer, GlobalBufferCpuGpu},
     data_type::{DataType, DataTypeRepr},
-    utils::{size_for_shape::size_for_shape, strict_serde::DeserializeStrictOwned},
+    utils::{file::File, size_for_shape::size_for_shape, strict_serde::DeserializeStrictOwned},
 };
 
 #[derive(Debug, Error)]
@@ -70,27 +70,29 @@ struct TensorInfo {
     shape: Box<[u32]>,
     data_offsets: (u64, u64),
     #[serde(skip)]
-    read: Cell<bool>,
+    read: AtomicBool,
 }
 
 pub struct ParameterLoader<'a, B: Backend> {
-    file: &'a File,
+    file: File,
     context: &'a B::Context,
     header: Header,
     data_offset: u64,
 }
 
 impl<'a, B: Backend> ParameterLoader<'a, B> {
-    pub fn new(
-        file: &'a File,
+    pub async fn new(
+        path: impl AsRef<Path>,
         context: &'a B::Context,
     ) -> Result<Self, ParameterLoaderError<B>> {
+        let file = File::open(path).await?;
         let mut header_size = [0; 8];
-        file.read_exact_at(&mut header_size, 0)?;
+        file.read_exact_at(&mut header_size, 0).await?;
         let header_size = u64::from_le_bytes(header_size);
         let mut header = vec![0; header_size as usize];
-        file.read_exact_at(&mut header, 8)?;
-        let header: Header = serde_json::from_slice(&header)?;
+        file.read_exact_at(&mut header, 8).await?;
+        let header_json = serde_json::from_slice(&header)?;
+        let header: Header = serde_json::from_value(crate::utils::model_format::header(header_json)?)?;
         Ok(Self {
             file,
             context,
@@ -111,7 +113,7 @@ impl<'a, B: Backend> ParameterLoader<'a, B> {
             .header
             .tensors
             .iter()
-            .filter(|(_, tensor)| !tensor.read.get())
+            .filter(|(_, tensor)| !tensor.read.load(Ordering::Relaxed))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         if unread.is_empty() {
@@ -186,22 +188,36 @@ impl<B: Backend> ParameterTree<'_, B> {
         Ok(tensor)
     }
 
-    pub fn read_buffer(
+    pub fn ignore(
         &self,
         name: &str,
         shape: &[u32],
         dtype: DataType,
-    ) -> Result<B::GlobalBuffer, ParameterLoaderError<B>> {
+    ) -> Result<(), ParameterLoaderError<B>> {
         let tensor = self.tensor(name, shape, dtype)?;
-        let (start, end) = tensor.data_offsets;
-        let mut buffer =
-            self.loader.context.create_buffer((end - start) as usize).map_err(ParameterLoaderError::BackendError)?;
-        self.loader.file.read_exact_at(buffer.as_slice_mut::<u8>(), self.loader.data_offset + start)?;
-        tensor.read.set(true);
-        Ok(buffer)
+        tensor.read.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
-    pub fn read_slice<T: DataTypeRepr>(
+    pub async fn read_buffer(
+        &self,
+        name: &str,
+        shape: &[u32],
+        dtype: DataType,
+    ) -> Result<B::GlobalGpuBuffer, ParameterLoaderError<B>> {
+        let tensor = self.tensor(name, shape, dtype)?;
+        let (start, end) = tensor.data_offsets;
+        let mut buffer = self
+            .loader
+            .context
+            .create_buffer_cpu_gpu((end - start) as usize)
+            .map_err(ParameterLoaderError::BackendError)?;
+        self.loader.file.read_exact_at(buffer.as_slice_mut::<u8>(), self.loader.data_offset + start).await?;
+        tensor.read.store(true, Ordering::Relaxed);
+        buffer.handoff().map_err(ParameterLoaderError::BackendError)
+    }
+
+    pub async fn read_slice<T: DataTypeRepr>(
         &self,
         name: &str,
         shape: &[u32],
@@ -210,8 +226,8 @@ impl<B: Backend> ParameterTree<'_, B> {
         let (start, end) = tensor.data_offsets;
         let size = (end - start) as usize;
         let mut data = vec![T::zeroed(); size / size_of::<T>()];
-        self.loader.file.read_exact_at(bytemuck::cast_slice_mut(&mut data), self.loader.data_offset + start)?;
-        tensor.read.set(true);
+        self.loader.file.read_exact_at(bytemuck::cast_slice_mut(&mut data), self.loader.data_offset + start).await?;
+        tensor.read.store(true, Ordering::Relaxed);
         Ok(data.into_boxed_slice())
     }
 }

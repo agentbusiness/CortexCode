@@ -8,7 +8,6 @@ use syn::{
     Expr, FnArg, GenericArgument, GenericParam, Ident, Item, ItemFn, PathArguments, Type, punctuated::Punctuated,
     token::Comma, visit_mut::VisitMut,
 };
-use walkdir::WalkDir;
 
 use crate::common::{
     codegen::write_tokens,
@@ -18,21 +17,21 @@ use crate::common::{
     gpu_types::GpuTypes,
     identifiers::{ArgumentName, KernelName, KernelPath},
     kernel::{Kernel, KernelArgument, KernelArgumentType, KernelBufferAccess, KernelParameter, KernelParameterType},
+    sources::source_files,
 };
 
 #[derive(PartialEq, Debug)]
-pub enum FunctionArgumentType {
-    Buffer(KernelBufferAccess),
-    Constant(Type, Option<Expr>),
-    Scalar(Type),
+enum FunctionArgumentType {
+    Pointer(KernelBufferAccess),
+    Value(Type),
     Specialization(Type),
 }
 
 #[derive(PartialEq, Debug)]
-pub struct FunctionArgument {
-    pub name: Ident,
-    pub conditional: Option<Expr>,
-    pub ty: FunctionArgumentType,
+struct FunctionArgument {
+    name: Ident,
+    conditional: Option<Expr>,
+    ty: FunctionArgumentType,
 }
 
 impl FunctionArgument {
@@ -44,16 +43,21 @@ impl FunctionArgument {
             name: ArgumentName::from(self.name.to_string()),
             conditional: self.conditional.is_some(),
             ty: match &self.ty {
-                FunctionArgumentType::Buffer(access) => KernelArgumentType::Buffer(access.clone()),
-                FunctionArgumentType::Constant(ty, None) => KernelArgumentType::Constant(
-                    format!("&[{}]", canonicalize_type_text(ty, gpu_type_paths)).into_boxed_str(),
-                ),
-                FunctionArgumentType::Constant(ty, Some(size)) => KernelArgumentType::Constant(
-                    format!("&[{}; {}]", canonicalize_type_text(ty, gpu_type_paths), size.to_token_stream(),)
-                        .into_boxed_str(),
-                ),
-                FunctionArgumentType::Scalar(ty) => {
-                    KernelArgumentType::Constant(canonicalize_type_text(ty, gpu_type_paths).into_boxed_str())
+                FunctionArgumentType::Pointer(access) => KernelArgumentType::Buffer(*access),
+                FunctionArgumentType::Value(ty) => {
+                    let ty = match ty {
+                        Type::Reference(reference) => match &*reference.elem {
+                            Type::Slice(slice) => format!("&[{}]", canonicalize_type_text(&slice.elem, gpu_type_paths)),
+                            Type::Array(array) => format!(
+                                "&[{}; {}]",
+                                canonicalize_type_text(&array.elem, gpu_type_paths),
+                                array.len.to_token_stream()
+                            ),
+                            _ => unreachable!(),
+                        },
+                        ty => canonicalize_type_text(ty, gpu_type_paths),
+                    };
+                    KernelArgumentType::Value(ty.into_boxed_str())
                 },
                 FunctionArgumentType::Specialization(_) => {
                     return None;
@@ -66,17 +70,16 @@ impl FunctionArgument {
         &self,
         gpu_type_paths: &GpuTypePaths,
     ) -> Option<KernelParameter> {
-        Some(KernelParameter {
-            name: self.name.to_string().into_boxed_str(),
-            ty: match &self.ty {
-                FunctionArgumentType::Specialization(ty) => {
-                    KernelParameterType::Value(canonicalize_type_text(ty, gpu_type_paths).into_boxed_str())
-                },
-                _ => {
-                    return None;
-                },
-            },
-        })
+        let FunctionArgumentType::Specialization(ty) = &self.ty else {
+            return None;
+        };
+        Some(
+            FunctionParameter {
+                name: self.name.clone(),
+                ty: FunctionParameterType::Value(ty.clone()),
+            }
+            .to_kernel_parameter(gpu_type_paths),
+        )
     }
 }
 
@@ -109,15 +112,15 @@ fn canonicalize_type_text(
 }
 
 #[derive(PartialEq, Debug)]
-pub enum FunctionParameterType {
+enum FunctionParameterType {
     Type,
     Value(Type),
 }
 
 #[derive(PartialEq, Debug)]
-pub struct FunctionParameter {
-    pub name: Ident,
-    pub ty: FunctionParameterType,
+struct FunctionParameter {
+    name: Ident,
+    ty: FunctionParameterType,
 }
 
 impl FunctionParameter {
@@ -166,11 +169,8 @@ impl CpuCompiler {
             .strip_prefix(&self.src_dir)
             .context("source is not in src_dir")?
             .with_extension("")
-            .as_os_str()
-            .to_str()
-            .unwrap()
-            .split("/")
-            .map(|s| s.to_string())
+            .components()
+            .map(|component| component.as_os_str().to_str().unwrap().to_string())
             .collect();
 
         let source_contents = fs::read_to_string(&source_path).context("cannot read the source file")?;
@@ -395,7 +395,7 @@ impl CpuCompiler {
                             quote! { impl crate::backends::common::BufferMut<Backend = crate::backends::cpu::Cpu> }
                         },
                     },
-                    KernelArgumentType::Constant(ty) => {
+                    KernelArgumentType::Value(ty) => {
                         let ty = gpu_type_paths.resolve_type(ty)?;
                         quote! { #ty }
                     },
@@ -414,7 +414,7 @@ impl CpuCompiler {
             .flat_map(|argument| {
                 let argument_ident = &argument.name;
                 match &argument.ty {
-                    FunctionArgumentType::Buffer(access) => {
+                    FunctionArgumentType::Pointer(access) => {
                         let (buffer_ptr, buffer_ptr_wrapper) = match access {
                             KernelBufferAccess::Read => (
                                 quote! { crate::backends::cpu::buffer::CpuBufferExt::cpu_address(__dsl_buffer).as_ptr().cast::<u8>().cast_const() },
@@ -444,13 +444,12 @@ impl CpuCompiler {
                             })
                         }
                     },
-                    FunctionArgumentType::Constant(_, None) => {
-                        Some(quote! { let #argument_ident = #argument_ident.to_vec().into_boxed_slice(); })
+                    FunctionArgumentType::Value(Type::Reference(reference)) => match &*reference.elem {
+                        Type::Slice(_) => Some(quote! { let #argument_ident = #argument_ident.to_vec().into_boxed_slice(); }),
+                        Type::Array(_) => Some(quote! { let #argument_ident = Box::new(*#argument_ident); }),
+                        _ => unreachable!(),
                     },
-                    FunctionArgumentType::Constant(_, Some(_)) => {
-                        Some(quote! { let #argument_ident = Box::new(*#argument_ident); })
-                    },
-                    FunctionArgumentType::Scalar(_) => None,
+                    FunctionArgumentType::Value(_) => None,
                     FunctionArgumentType::Specialization(_) => {
                         Some(quote! { let #argument_ident = self.#argument_ident; })
                     },
@@ -465,49 +464,39 @@ impl CpuCompiler {
                 quote! { self::#function_ident }
             };
 
-            let function_call_args = function_arguments.iter().map(|argument| {
-                let argument_ident = &argument.name;
+            let function_call_args = function_arguments
+                .iter()
+                .map(|argument| {
+                    let argument_ident = &argument.name;
 
-                match &argument.ty {
-                    FunctionArgumentType::Buffer(_) => {
-                        if argument.conditional.is_some() {
-                            quote! { #argument_ident.map(|p| p.as_ptr() as _) }
-                        } else {
-                            quote! { #argument_ident.as_ptr() as _ }
-                        }
-                    },
-                    FunctionArgumentType::Constant(_, _) => quote! { &*#argument_ident },
-                    FunctionArgumentType::Scalar(_) | FunctionArgumentType::Specialization(_) => {
-                        quote! { #argument_ident }
-                    },
-                }
-            });
-
-            let function_call_args_joined = function_call_args.fold(quote! {}, |a, b| {
-                if !a.is_empty() && !b.is_empty() {
-                    quote! {#a , #b}
-                } else {
-                    quote! {#a #b}
-                }
-            });
+                    match &argument.ty {
+                        FunctionArgumentType::Pointer(_) => {
+                            if argument.conditional.is_some() {
+                                quote! { #argument_ident.map(|p| p.as_ptr() as _) }
+                            } else {
+                                quote! { #argument_ident.as_ptr() as _ }
+                            }
+                        },
+                        FunctionArgumentType::Value(Type::Reference(_)) => quote! { &*#argument_ident },
+                        FunctionArgumentType::Value(_) | FunctionArgumentType::Specialization(_) => {
+                            quote! { #argument_ident }
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
 
             quote! {
-                command_buffer.push_command(move || #monomorphized_function(#function_call_args_joined));
+                command_buffer.push_command(move || #monomorphized_function(#(#function_call_args),*));
             }
         };
 
         let encode_body = if !function_parameters.is_empty() {
-            let mut parameter_idents = function_parameters.iter().map(|p| p.name.clone()).fold(quote! {}, |a, b| {
-                if !a.is_empty() {
-                    quote! {#a , self.#b}
-                } else {
-                    quote! {self.#b}
-                }
-            });
-
-            if function_parameters.len() > 1 {
-                parameter_idents = quote! { (#parameter_idents) };
-            }
+            let parameter_fields = function_parameters.iter().map(|p| &p.name).collect::<Vec<_>>();
+            let parameter_idents = if function_parameters.len() > 1 {
+                quote! { (#(self.#parameter_fields),*) }
+            } else {
+                quote! { #(self.#parameter_fields),* }
+            };
 
             let variant_value_strs: Vec<String> = function_variants
                 .iter()
@@ -554,27 +543,13 @@ impl CpuCompiler {
                     let (match_variants, generic_variants): (Vec<TokenStream>, Vec<TokenStream>) =
                         variants.into_iter().unzip();
 
-                    let mut match_variant = match_variants.iter().fold(quote! {}, |a, b| {
-                        if !a.is_empty() && !b.is_empty() {
-                            quote! {#a , #b}
-                        } else {
-                            quote! {#a #b}
-                        }
-                    });
+                    let match_variant = if match_variants.len() > 1 {
+                        quote! { (#(#match_variants),*) }
+                    } else {
+                        quote! { #(#match_variants),* }
+                    };
 
-                    if match_variants.len() > 1 {
-                        match_variant = quote! { (#match_variant) };
-                    }
-
-                    let generic_variant = generic_variants.iter().fold(quote! {}, |a, b| {
-                        if !a.is_empty() && !b.is_empty() {
-                            quote! {#a , #b}
-                        } else {
-                            quote! {#a #b}
-                        }
-                    });
-
-                    let encode = make_encode(generic_variant);
+                    let encode = make_encode(quote! { #(#generic_variants),* });
 
                     quote! { #match_variant => { #encode } }
                 })
@@ -640,17 +615,20 @@ impl CpuCompiler {
 
     fn parse_type(ty: Type) -> anyhow::Result<FunctionArgumentType> {
         Ok(match ty {
-            Type::Ptr(ty) => FunctionArgumentType::Buffer(if matches!(ty.mutability, syn::PointerMutability::Mut(_)) {
-                KernelBufferAccess::ReadWrite
-            } else {
-                KernelBufferAccess::Read
-            }),
-            Type::Reference(ty) => match *ty.elem {
-                Type::Slice(ty) => FunctionArgumentType::Constant(*ty.elem, None),
-                Type::Array(ty) => FunctionArgumentType::Constant(*ty.elem, Some(ty.len)),
-                ty => bail!("unsupported reference type: {} ({:?})", ty.to_token_stream(), ty),
+            Type::Ptr(ty) => {
+                FunctionArgumentType::Pointer(if matches!(ty.mutability, syn::PointerMutability::Mut(_)) {
+                    KernelBufferAccess::ReadWrite
+                } else {
+                    KernelBufferAccess::Read
+                })
             },
-            Type::Path(ty) => FunctionArgumentType::Scalar(Type::Path(ty)),
+            Type::Reference(ty) => {
+                if !matches!(*ty.elem, Type::Slice(_) | Type::Array(_)) {
+                    bail!("unsupported reference type: {} ({:?})", ty.elem.to_token_stream(), ty.elem);
+                }
+                FunctionArgumentType::Value(Type::Reference(ty))
+            },
+            Type::Path(ty) => FunctionArgumentType::Value(Type::Path(ty)),
             ty => bail!("unsupported type: {} ({:?})", ty.to_token_stream(), ty),
         })
     }
@@ -690,13 +668,9 @@ impl Compiler for CpuCompiler {
         _gpu_types: &GpuTypes,
         gpu_type_paths: &GpuTypePaths,
     ) -> anyhow::Result<HashMap<KernelPath, Box<[Kernel]>>> {
-        let objects = WalkDir::new(&self.src_dir)
+        let objects = source_files(&self.src_dir, "rs")?
             .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_type().is_file() && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
-            })
-            .map(|entry| self.compile(entry.into_path(), gpu_type_paths))
+            .map(|path| self.compile(path, gpu_type_paths))
             .collect::<anyhow::Result<Vec<(KernelPath, Box<[Kernel]>)>>>()
             .context("cannot compile cpu sources")?;
 

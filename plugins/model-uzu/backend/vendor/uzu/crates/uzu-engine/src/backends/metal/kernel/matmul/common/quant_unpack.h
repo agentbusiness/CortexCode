@@ -28,44 +28,141 @@ METAL_FUNC uint decode_zero_point(const device uint8_t* zero_points_row, uint gr
 }
 
 UZU_CONST ushort W4_BITS = 4;
+UZU_CONST uint W4_CODES_PER_WORD = sizeof(uint) * 8 / W4_BITS;
 UZU_CONST uint W4_SIGN_MASK = symmetric_zero_point<W4_BITS>() * 0x11111111u;
 UZU_CONST uint W8_SIGN_MASK = symmetric_zero_point<8>() * 0x01010101u;
 UZU_CONST uint W4_NIBBLE_MASK = 0x0F0F0F0Fu;
+UZU_CONST uint ZERO_POINTS_PER_BYTE = 2;
+UZU_CONST uint W8_MAGIC_FLOAT_OFFSET = 0x4B400000u;
 
-template <typename U, int N, int bits>
-inline void dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local, const bool signed_codes) {
-  static_assert(bits == 4 || bits == 8, "Only int4 and int8 supported");
+UZU_CONST uint W4_PAIR_HALF_BITS = 16;
+UZU_CONST uint W4_PAIR_MANTISSA_BITS = 10;
+UZU_CONST uint W4_PAIR_EXPONENT_BIAS = 15;
 
-  if constexpr (bits == 4) {
-    U s0 = scale;
-    U s1 = scale / static_cast<U>(16.0f);
-    // Keeping literal masks in each arm lets the compiler vectorize the unpack.
-    if (signed_codes) {
-      for (int i = 0; i < (N / 2); i++) {
-        const uint8_t word = w[i] ^ uint8_t(0x88u);
-        w_local[2 * i] = s0 * (word & 0x0f) + bias;
-        w_local[2 * i + 1] = s1 * (word & 0xf0) + bias;
-      }
-    } else {
-      for (int i = 0; i < (N / 2); i++) {
-        w_local[2 * i] = s0 * (w[i] & 0x0f) + bias;
-        w_local[2 * i + 1] = s1 * (w[i] & 0xf0) + bias;
+static METAL_FUNC constexpr uint w4_pair_offset(uint component) {
+  constexpr uint COMPONENTS = W4_PAIR_HALF_BITS / W4_BITS;
+  return W4_BITS * (component < COMPONENTS ? component : COMPONENTS - 1);
+}
+
+static METAL_FUNC constexpr uint w4_pair_position(uint component) {
+  const uint offset = w4_pair_offset(component);
+  return offset + W4_BITS <= W4_PAIR_MANTISSA_BITS ? offset : offset - (W4_PAIR_HALF_BITS - W4_PAIR_MANTISSA_BITS);
+}
+
+template <uint COMPONENT>
+static METAL_FUNC half2 w4_pair_at(uint word) {
+  constexpr uint offset = w4_pair_offset(COMPONENT);
+  constexpr uint position = w4_pair_position(COMPONENT);
+  constexpr uint mask = ((1u << W4_BITS) - 1) << position;
+  constexpr uint exponent = (W4_PAIR_EXPONENT_BIAS + W4_PAIR_MANTISSA_BITS - position) << W4_PAIR_MANTISSA_BITS;
+  return as_type<half2>(
+      ((word >> (offset - position)) & (mask | (mask << W4_PAIR_HALF_BITS))) |
+      (exponent | (exponent << W4_PAIR_HALF_BITS))
+  );
+}
+
+static METAL_FUNC constexpr float w4_pair_bias_value(uint component) {
+  return float(1u << (W4_PAIR_MANTISSA_BITS - w4_pair_position(component)));
+}
+
+static METAL_FUNC half2 w4_pair(uint word, ushort component) {
+  switch (component) {
+  case 0:
+    return w4_pair_at<0>(word);
+  case 1:
+    return w4_pair_at<1>(word);
+  case 2:
+    return w4_pair_at<2>(word);
+  default:
+    return w4_pair_at<3>(word);
+  }
+}
+
+template <uint ORIGIN>
+METAL_FUNC float magic_code_float(uint code) {
+  return as_type<float>(code + W8_MAGIC_FLOAT_OFFSET - ORIGIN);
+}
+
+METAL_FUNC float magic_dequant_bias(float scale) { return -12582912.0f * scale; }
+
+template <typename StageT, typename ComputeT, int N, int bits>
+inline void dequantize(
+    const device uint8_t* w,
+    float scale,
+    float bias,
+    threadgroup StageT* w_local,
+    const bool signed_codes,
+    const uint word_stride = 1
+) {
+  static_assert(bits == 2 || bits == 4 || bits == 8, "Only int2, int4 and int8 supported");
+  static_assert(bits == 8 || N % 2 == 0, "int2 and int4 values are unpacked in pairs");
+  constexpr bool IS_16_BIT_COMPUTE = sizeof(ComputeT) == 2;
+  constexpr bool READ_CODE_WORDS = bits == 4 && N % 8 == 0 && IS_16_BIT_COMPUTE;
+  threadgroup vec<StageT, 2>* pairs = reinterpret_cast<threadgroup vec<StageT, 2>*>(w_local);
+  const ComputeT compute_scale = ComputeT(scale);
+  const ComputeT compute_bias = ComputeT(bias);
+  auto dequantize_code = [&](uint code) { return fma(ComputeT(code), compute_scale, compute_bias); };
+  if constexpr (READ_CODE_WORDS) {
+    const device uint* words = reinterpret_cast<const device uint*>(w);
+    for (int i = 0; i < N / 8; i++) {
+      const uint raw_word = words[i * word_stride];
+      const uint word = signed_codes ? raw_word ^ W4_SIGN_MASK : raw_word;
+      for (int j = 0; j < 4; j++) {
+        pairs[i * 4 + j] = vec<StageT, 2>(
+            vec<ComputeT, 2>(dequantize_code((word >> (8 * j)) & 0x0fu), dequantize_code((word >> (8 * j + 4)) & 0x0fu))
+        );
       }
     }
-  } else if constexpr (bits == 8) {
-    if (signed_codes) {
-      const device int8_t* signed_weights = reinterpret_cast<const device int8_t*>(w);
-      const U adjusted_bias = bias + scale * U(128);
-      for (int i = 0; i < N; i++) {
-        w_local[i] = scale * U(signed_weights[i]) + adjusted_bias;
-      }
-    } else {
-      for (int i = 0; i < N; i++) {
-        w_local[i] = scale * U(w[i]) + bias;
-      }
+  } else if constexpr (bits == 2) {
+    for (int i = 0; i < (N / 2); i++) {
+      const uint code = uint(w[i / 2]) >> (4 * (i % 2));
+      pairs[i] = vec<StageT, 2>(vec<ComputeT, 2>(dequantize_code(code & 0x3u), dequantize_code((code >> 2) & 0x3u)));
+    }
+  } else if constexpr (bits == 4) {
+    const uint sign_flip = signed_codes ? 0x88u : 0u;
+    for (int i = 0; i < (N / 2); i++) {
+      const uint code = uint(w[i / 4 * 4 * word_stride + i % 4]) ^ sign_flip;
+      pairs[i] = vec<StageT, 2>(vec<ComputeT, 2>(dequantize_code(code & 0x0fu), dequantize_code(code >> 4)));
+    }
+  } else {
+    const uint sign_flip = signed_codes ? 0x80u : 0u;
+    for (int i = 0; i < (N / 2); i++) {
+      pairs[i] = vec<StageT, 2>(
+          vec<ComputeT, 2>(dequantize_code(uint(w[2 * i]) ^ sign_flip), dequantize_code(uint(w[2 * i + 1]) ^ sign_flip))
+      );
+    }
+    if constexpr (N % 2 == 1) {
+      w_local[N - 1] = StageT(fma(float(uint(w[N - 1]) ^ sign_flip), scale, bias));
     }
   }
 }
+
+UZU_CONST uint HALF_MANTISSA_BITS = 10;
+UZU_CONST uint HALF_EXPONENT_BIAS = 15;
+
+static METAL_FUNC constexpr uint w2_mantissa_bit(uint t) { return t < 5 ? 2 * t : 2 * t - 6; }
+
+static METAL_FUNC half2 w2_pair(uint word, uint t) {
+  const uint mantissa_bit = w2_mantissa_bit(t);
+  const uint code_mask = 3u << mantissa_bit;
+  const uint exponent = (HALF_EXPONENT_BIAS + HALF_MANTISSA_BITS - mantissa_bit) << HALF_MANTISSA_BITS;
+  const uint codes = (word >> (2 * t - mantissa_bit)) & (code_mask | (code_mask << 16));
+  return as_type<half2>(codes | exponent | (exponent << 16));
+}
+
+static METAL_FUNC constexpr float w2_pair_bias_value(uint t) {
+  return float(1u << (HALF_MANTISSA_BITS - w2_mantissa_bit(t)));
+}
+
+// A byte ored with 0x6400 is the half 1024 plus the byte, so the subtraction is exact.
+METAL_FUNC float4 bytes_to_float(const uint word, const float offset) {
+  const half2 bias = half2(half(1024.0f + offset));
+  const half2 even = as_type<half2>((word & 0x00FF00FFu) | 0x64006400u) - bias;
+  const half2 odd = as_type<half2>(((word >> 8) & 0x00FF00FFu) | 0x64006400u) - bias;
+  return float4(float(even.x), float(odd.x), float(even.y), float(odd.y));
+}
+
+METAL_FUNC float4 int8_to_float(const uint word) { return bytes_to_float(word ^ 0x80808080u, 128.0f); }
 
 } // namespace gemm
 } // namespace uzu

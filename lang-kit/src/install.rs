@@ -306,7 +306,8 @@ pub fn unpack(file: &Path, format: &ArchiveFormat, into: &Path) -> Result<(), St
             for index in 0..archive.len() {
                 let mut entry = archive.by_index(index).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
                 let Some(relative) = entry.enclosed_name() else {
-                    return Err(format!("{} holds an unsafe path {}", file.display(), entry.name()));
+                    let name = entry.name().map_err(|e| format!("cannot read archive entry name: {e}"))?;
+                    return Err(format!("{} holds an unsafe path {name}", file.display()));
                 };
                 let path = into.join(relative);
                 if entry.is_dir() {

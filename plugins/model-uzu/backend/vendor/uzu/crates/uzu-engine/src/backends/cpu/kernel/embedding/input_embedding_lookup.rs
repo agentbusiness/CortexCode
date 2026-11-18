@@ -28,6 +28,7 @@ pub fn input_embedding_lookup<T: DataTypeRepr + Float>(
     output: *mut T,
     batch_size: u32,
     vocab_size: u32,
+    first_row: u32,
     model_dim: u32,
     input_scale: f32,
     #[specialize] table_kind: EmbeddingTableKind,
@@ -59,7 +60,9 @@ pub fn input_embedding_lookup<T: DataTypeRepr + Float>(
     let dense_scale = T::from(input_scale).unwrap();
     for batch in 0..batch_size as usize {
         let row = unsafe { std::slice::from_raw_parts_mut(output.add(batch * dim), dim) };
-        let token = unsafe { *token_ids.add(batch) };
+        let Some(token) = unsafe { *token_ids.add(batch) }.checked_sub(first_row) else {
+            continue;
+        };
         if token >= vocab_size {
             row.fill(T::zero());
             continue;
@@ -79,6 +82,7 @@ pub fn input_embedding_lookup<T: DataTypeRepr + Float>(
                     let scale = unsafe { (*scales.add(index)).to_f32().unwrap() };
                     let offset = token * weights_stride;
                     let code = match quantization_mode {
+                        QuantizationMode::U2 => unreachable!("2-bit weights are not embedding tables"),
                         QuantizationMode::U4 => read_u4(values, 2 * offset + column) as f32,
                         QuantizationMode::I8 => (unsafe { *(values as *const i8).add(offset + column) }) as f32,
                         QuantizationMode::U8 => (unsafe { *values.add(offset + column) }) as f32,

@@ -166,7 +166,7 @@ fn line_counts(before: Option<&[u8]>, after: Option<&[u8]>) -> (u32, u32, bool) 
     }
     let old = before.map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
     let new = after.map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-    let diff = similar::TextDiff::from_lines(&old, &new);
+    let diff = similar::TextDiff::configure().algorithm(similar::Algorithm::RawMyers).diff_lines(&old, &new);
     let (mut added, mut removed) = (0u32, 0u32);
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -1031,7 +1031,7 @@ impl ProjectLog {
         }
         let old_text = old.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
         let new_text = new.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-        let diff = similar::TextDiff::from_lines(&old_text, &new_text)
+        let diff = similar::TextDiff::configure().algorithm(similar::Algorithm::RawMyers).diff_lines(&old_text, &new_text)
             .unified_diff()
             .context_radius(3)
             .header(&format!("a/{}", params.path), &format!("b/{}", params.path))

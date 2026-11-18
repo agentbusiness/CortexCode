@@ -3,6 +3,8 @@
 #include <metal_stdlib>
 
 #include "../../../generated/gemm.h"
+#include "../../../generated/matmul.h"
+#include "../../common/quant_unpack.h"
 
 using namespace metal;
 
@@ -13,6 +15,7 @@ namespace operands {
 template <GemmAPrologueKind PROLOGUE, typename Element, ushort ACTIVATION_GROUP_SIZE, bool CODES_GROUPED_BY_NIBBLE>
 struct LeftOperand {
   UZU_CONST bool QUANTIZED = PROLOGUE == GemmAPrologueKind::Int8Symmetric;
+  UZU_CONST bool PACKED_HALF = PROLOGUE == GemmAPrologueKind::PackedHalf;
   UZU_CONST ushort BITS = QUANTIZED ? 8 : 0;
   UZU_CONST ushort GROUP_SIZE = QUANTIZED ? ACTIVATION_GROUP_SIZE : 0;
   UZU_CONST bool GROUPED_BY_NIBBLE = CODES_GROUPED_BY_NIBBLE;
@@ -44,11 +47,16 @@ struct RightOperand {
   UZU_CONST GemmBPrologueKind SCHEME = PROLOGUE;
   UZU_CONST bool NEEDS_CORRECTION = PROLOGUE == GemmBPrologueKind::ScaleBiasDequant;
 
-  UZU_CONST ushort CODE_ORIGIN = (!QUANTIZED || (BITS_ == 4 && PROLOGUE != GemmBPrologueKind::ScaleSymmetricDequant))
-                                     ? 0
-                                     : ushort(1u << (BITS - 1));
+  UZU_CONST ushort CODE_ORIGIN =
+      (!QUANTIZED || ((BITS_ == 2 || BITS_ == 4) && PROLOGUE != GemmBPrologueKind::ScaleSymmetricDequant))
+          ? 0
+          : ushort(1u << (BITS - 1));
+  UZU_CONST ushort MMA_BLOCK_K = BITS_ == 2 ? 2 * MXU_SIMDGROUP_BLOCK_K : MXU_SIMDGROUP_BLOCK_K;
 
-  static_assert(!QUANTIZED || BITS_ == 4 || BITS_ == 8, "quantized integer weights must use 4 or 8 bits");
+  static_assert(
+      !QUANTIZED || BITS_ == 2 || BITS_ == 4 || BITS_ == 8,
+      "quantized integer weights must use 2, 4 or 8 bits"
+  );
   static_assert(!QUANTIZED || PROLOGUE != GemmBPrologueKind::FullPrecision, "quantized weights need a scheme");
 
   using CodeElement = int8_t;
@@ -58,7 +66,7 @@ struct RightOperand {
   template <ushort BLOCK_K>
   static constexpr ushort outer_block_k() {
     if constexpr (QUANTIZED) {
-      static_assert(GROUP_SIZE_ % MXU_SIMDGROUP_BLOCK_K == 0, "weight groups must contain complete MMA chunks");
+      static_assert(GROUP_SIZE_ % MMA_BLOCK_K == 0, "weight groups must contain complete MMA chunks");
       static_assert(BLOCK_K % GROUP_SIZE_ == 0, "tile block K must contain complete weight groups");
       return GROUP_SIZE_;
     } else {
@@ -73,6 +81,7 @@ struct LeftStorage {
   const device int8_t* codes;
   const device float* scales;
   const device int32_t* group_sums;
+  const device uint* packed_half;
 
   METAL_FUNC const device int32_t* correction_sums() const thread {
     static_assert(Left::QUANTIZED, "correction_sums is only valid for int8 activations");
@@ -88,7 +97,21 @@ struct RightStorage {
   const device typename Right::ScaleElement* biases;
   const device uint8_t* zero_points;
   bool signed_codes;
+  bool hoist_row_metadata;
   GemmBLayout gemm_b_layout;
+
+  METAL_FUNC uint sign_mask() const thread {
+    return signed_codes ? (Right::BITS == 4 ? W4_SIGN_MASK : W8_SIGN_MASK) : 0u;
+  }
+
+  template <typename Index>
+  METAL_FUNC const device uint8_t* row_codes(
+      const Index row,
+      const constant uzu::matmul::GemmParams* params
+  ) const thread {
+    const Index row_stride = Index(params->K) / (8 / Right::BITS);
+    return codes + row * row_stride;
+  }
 
   METAL_FUNC const device typename Right::ScaleElement* bias() const thread {
     static_assert(Right::SCHEME == GemmBPrologueKind::ScaleBiasDequant, "bias is only valid for ScaleBiasDequant");
@@ -102,6 +125,31 @@ struct RightStorage {
     );
     return zero_points;
   }
+
+  template <typename Index>
+  METAL_FUNC Index
+  scale_index(const Index row, const Index group, const constant uzu::matmul::GemmParams* params) const thread {
+    return row * Index(params->scale_output_stride) + group * Index(params->scale_group_stride);
+  }
+
+  METAL_FUNC typename Right::ScaleElement scale(
+      const uint row,
+      const uint group,
+      const constant uzu::matmul::GemmParams* params
+  ) const thread {
+    return scales[scale_index(row, group, params)];
+  }
+
+  METAL_FUNC uint
+  zero_point_index(const uint row, const uint group, const constant uzu::matmul::GemmParams* params) const thread {
+    return row * params->zero_point_output_stride + group * params->zero_point_group_stride;
+  }
+
+  METAL_FUNC uint
+  zero_point(const uint row, const uint group, const constant uzu::matmul::GemmParams* params) const thread {
+    const uint index = zero_point_index(row, group, params);
+    return decode_zero_point<Right::BITS>(zp() + index / ZERO_POINTS_PER_BYTE, index % ZERO_POINTS_PER_BYTE);
+  }
 };
 
 template <typename Left, typename Element>
@@ -109,12 +157,15 @@ METAL_FUNC LeftStorage<Left> pack_left(
     const device Element* a,
     const device int8_t* codes,
     const device float* scales,
-    const device int32_t* group_sums
+    const device int32_t* group_sums,
+    const device uint* packed_half
 ) {
-  if constexpr (Left::QUANTIZED) {
-    return {nullptr, codes, scales, group_sums};
+  if constexpr (Left::PACKED_HALF) {
+    return {nullptr, nullptr, nullptr, nullptr, packed_half};
+  } else if constexpr (Left::QUANTIZED) {
+    return {nullptr, codes, scales, group_sums, nullptr};
   } else {
-    return {a, nullptr, nullptr, nullptr};
+    return {a, nullptr, nullptr, nullptr, nullptr};
   }
 }
 
@@ -125,10 +176,11 @@ METAL_FUNC RightStorage<Right> pack_right(
     const device Element* biases,
     const device uint8_t* zero_points,
     const bool signed_codes,
+    const bool hoist_row_metadata,
     const GemmBLayout gemm_b_layout
 ) {
   if constexpr (!Right::QUANTIZED) {
-    return {dense, nullptr, nullptr, nullptr, nullptr, false, GemmBLayout::RowMajor};
+    return {dense, nullptr, nullptr, nullptr, nullptr, false, false, GemmBLayout::RowMajor};
   } else {
     return {
         nullptr,
@@ -137,6 +189,7 @@ METAL_FUNC RightStorage<Right> pack_right(
         Right::SCHEME == GemmBPrologueKind::ScaleBiasDequant ? biases : nullptr,
         Right::SCHEME == GemmBPrologueKind::ScaleZeroPointDequant ? zero_points : nullptr,
         signed_codes,
+        hoist_row_metadata,
         gemm_b_layout
     };
   }

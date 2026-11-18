@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::{io::{Read, Write}, sync::Arc};
 
 use derive_more::Debug;
 use futures::executor::block_on;
@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     backends::common::{
         Backend, Buffer, BufferMut, BufferRef, CommandBufferEncoding, CommandBufferExecutable,
-        CommandBufferPending, Context,
+        CommandBufferPending, Context, CpuBuffer, GlobalBufferCpuGpu,
     },
     encodable_block::{
         dflash::DFlashState,
@@ -23,7 +23,8 @@ pub use crate::encodable_block::mixer::SnapshotMode;
 
 pub struct LanguageModelState<B: Backend> {
     pub(super) tokens: Vec<u64>,
-    pub(super) last_output_token: Option<u64>, // TODO: this leaks previous LanguageModelStreamOptions
+    /// CortexCode P4: sampled by a dropped stream, not yet fed through the decoder.
+    pub(super) last_output_token: Option<u64>,
     pub(super) prng: PRng,
     pub(super) transformer_state: TransformerState<B>,
     pub(super) speculator_state: Option<DFlashState<B>>,
@@ -85,7 +86,6 @@ impl<B: Backend> LanguageModel<B> {
         sampling_seed: u64,
     ) -> Result<LanguageModelState<B>, LanguageModelCreateEmptyStateError<B>> {
         let tokens = Vec::new();
-        let last_output_token = None;
 
         let prng = PRng::new(sampling_seed);
 
@@ -105,7 +105,7 @@ impl<B: Backend> LanguageModel<B> {
 
         Ok(LanguageModelState {
             tokens,
-            last_output_token,
+            last_output_token: None,
             prng,
             transformer_state,
             speculator_state,
@@ -120,6 +120,7 @@ impl<B: Backend> LanguageModel<B> {
 /// `Full` snapshots can be written to disk and restored into any fresh state of the same model;
 /// `Checkpoint` snapshots can only roll the state they were taken from back to that point.
 pub struct LanguageModelStateSnapshot<B: Backend> {
+    context: Arc<B::Context>,
     mode: SnapshotMode,
     tokens: Vec<u64>,
     max_context_length: Option<u32>,
@@ -146,9 +147,8 @@ pub enum LanguageModelSnapshotError<B: Backend> {
     Malformed(String),
 }
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"UZUSNAP3";
-/// CortexCode patch P7: snapshots written before the rope delta existed (read as delta 0).
-const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"UZUSNAP2";
+// The0.7 KV codes/scales are a different physical format; reject older files before uploading.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"UZUSNAP4";
 
 impl<B: Backend> LanguageModelStateSnapshot<B> {
     pub fn tokens(&self) -> &[u64] {
@@ -199,7 +199,7 @@ impl<B: Backend> LanguageModelStateSnapshot<B> {
                 None => put(out, &[0])?,
                 Some(layer) => {
                     put(out, &[1])?;
-                    write_layer(&mut put, out, layer)?;
+                    write_layer(&mut put, out, layer, &self.context)?;
                 },
             }
         }
@@ -210,7 +210,7 @@ impl<B: Backend> LanguageModelStateSnapshot<B> {
                 put(out, &u64::from(*context_length).to_le_bytes())?;
                 put(out, &(layers.len() as u64).to_le_bytes())?;
                 for layer in layers.iter() {
-                    write_layer(&mut put, out, layer)?;
+                    write_layer(&mut put, out, layer, &self.context)?;
                 }
             },
         }
@@ -222,16 +222,17 @@ fn write_layer<B: Backend>(
     put: &mut impl FnMut(&mut dyn Write, &[u8]) -> std::io::Result<()>,
     out: &mut dyn Write,
     layer: &MixerSnapshot<B>,
-) -> std::io::Result<()> {
+    context: &B::Context,
+) -> Result<(), LanguageModelSnapshotError<B>> {
     put(out, &(layer.scalars.len() as u64).to_le_bytes())?;
     for scalar in layer.scalars.iter() {
         put(out, &scalar.to_le_bytes())?;
     }
     put(out, &(layer.buffers.len() as u64).to_le_bytes())?;
     for buffer in layer.buffers.iter() {
-        let bytes: &[u8] = buffer.as_slice();
+        let bytes = block_on(context.copyout::<u8>(buffer)).map_err(LanguageModelSnapshotError::Backend)?;
         put(out, &(bytes.len() as u64).to_le_bytes())?;
-        put(out, bytes)?;
+        put(out, &bytes)?;
     }
     Ok(())
 }
@@ -297,6 +298,7 @@ impl<B: Backend> LanguageModel<B> {
             .transpose()?;
         block_on(command_buffer.end_encoding().submit().wait_until_completed()).map_err(LanguageModelSnapshotError::Backend)?;
         Ok(LanguageModelStateSnapshot {
+            context: self.engine.context.clone(),
             mode,
             tokens: state.tokens.clone(),
             max_context_length: state.max_context_length,
@@ -360,8 +362,7 @@ impl<B: Backend> LanguageModel<B> {
         reader.bytes(&mut magic)?;
         let has_rope_delta = match &magic {
             SNAPSHOT_MAGIC => true,
-            SNAPSHOT_MAGIC_V2 => false,
-            _ => return Err(malformed("bad magic".into())),
+            _ => return Err(malformed("older or unknown snapshot format; read the prompt again".into())),
         };
         let mode = match reader.u8()? {
             0 => SnapshotMode::Full,
@@ -410,6 +411,7 @@ impl<B: Backend> LanguageModel<B> {
         };
         Ok((
             LanguageModelStateSnapshot {
+                context: self.engine.context.clone(),
                 mode,
                 tokens,
                 max_context_length,
@@ -436,9 +438,9 @@ impl<B: Backend> LanguageModel<B> {
         let mut buffers = Vec::with_capacity(n_buffers);
         for _ in 0..n_buffers {
             let size = reader.count(1 << 40, "buffer byte").map_err(malformed)?;
-            let mut buffer = self.engine.context.create_buffer(size.max(1)).map_err(LanguageModelSnapshotError::Backend)?;
-            reader.bytes((&mut buffer).subrange_mut(..size).as_slice_mut::<u8>())?;
-            buffers.push(buffer);
+            let mut buffer = self.engine.context.create_buffer_cpu_gpu(size.max(1)).map_err(LanguageModelSnapshotError::Backend)?;
+            reader.bytes(&mut buffer.as_slice_mut::<u8>()[..size])?;
+            buffers.push(buffer.handoff().map_err(LanguageModelSnapshotError::Backend)?);
         }
         Ok(MixerSnapshot {
             scalars: scalars.into_boxed_slice(),

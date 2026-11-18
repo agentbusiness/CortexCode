@@ -21,9 +21,10 @@ pub(super) struct GemmSpecialization {
     pub(super) a_prologue: GemmAPrologueKind,
     pub(super) b_prologue: GemmBPrologueKind,
     pub(super) bits_per_b: Option<u32>,
-    pub(super) b_group_size: Option<u32>,
+    pub(super) b_block_k: Option<u32>,
     pub(super) signed_codes: bool,
     pub(super) gemm_b_layout: GemmBLayout,
+    pub(super) hoist_row_metadata: bool,
     pub(super) a_group_size: Option<u32>,
 }
 
@@ -37,6 +38,7 @@ impl GemmSpecialization {
         alignment: GemmAlignment,
         a_prologue: GemmAPrologueKind,
         a_group_size: Option<u32>,
+        row_scaled_weights: bool,
     ) -> Result<Self, GemmSpecializationError> {
         let specialization = Self {
             weights_data_type,
@@ -48,9 +50,12 @@ impl GemmSpecialization {
             a_prologue,
             b_prologue: shape.b_prologue,
             bits_per_b: shape.b_bits,
-            b_group_size: shape.b_group_size,
+            b_block_k: super::super::weight_block_k(shape.b_bits, shape.b_group_size),
             signed_codes: shape.signed_codes,
             gemm_b_layout,
+            hoist_row_metadata: row_scaled_weights
+                && matches!(a_prologue, GemmAPrologueKind::Int8Symmetric | GemmAPrologueKind::PackedHalf)
+                && shape.b_prologue == GemmBPrologueKind::ScaleBiasDequant,
             a_group_size,
         };
         specialization.validate()?;
@@ -61,6 +66,7 @@ impl GemmSpecialization {
         let valid_activation_group = match self.a_prologue {
             GemmAPrologueKind::FullPrecision => self.a_group_size.is_none(),
             GemmAPrologueKind::Int8Symmetric => self.a_group_size == Some(ACTIVATION_SCALE_GROUP_SIZE),
+            GemmAPrologueKind::PackedHalf => self.a_group_size.is_none(),
         };
         if !valid_activation_group {
             return Err(GemmSpecializationError::InvalidAGroupSize {

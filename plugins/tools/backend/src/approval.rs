@@ -1078,6 +1078,94 @@ pub fn ignored_dir_names(git: Option<&Path>, workspace: &Path) -> Vec<String> {
     names
 }
 
+/// A script that only lists files by name: `find <folders> [-type f] [-name <pattern>]`, with
+/// `2>/dev/null` and a closing `| sort` allowed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listing {
+    /// The folders to list, as written (`.` when none was given).
+    pub dirs: Vec<String>,
+    /// The file-name pattern and whether it ignores case (`-iname`); None lists every file.
+    pub name: Option<(String, bool)>,
+}
+
+/// The listing a script asks for, so the run tool can answer it from the project's index instead
+/// of walking the folders (seen: `find src -name '*.rs' | sort` to "list project structure", in a
+/// project whose files the index already holds). None for anything else: another program, another
+/// test (`-newer`, `-size`, `-exec`), a pattern with a character class, a folder outside the
+/// project's reach (`/`, `~`, `..`), a listing that would also name folders (no `-type f` and no
+/// `-name`), or any other command, pipe or redirection.
+pub fn terminal_listing(script: &str) -> Option<Listing> {
+    let mut rest = script.trim();
+    // The answer comes sorted, so a closing `| sort` changes nothing.
+    if let Some((head, tail)) = rest.rsplit_once('|')
+        && tail.trim() == "sort"
+    {
+        rest = head.trim_end();
+    }
+    if let Some(head) = rest.strip_suffix("2>/dev/null") {
+        rest = head.trim_end();
+    }
+    if rest.contains(['|', '>', '<', ';', '&', '$', '`', '(', ')', '!', '{', '}']) || rest.contains('\n') {
+        return None;
+    }
+    let commands = simple_commands(rest);
+    let [words] = commands.as_slice() else { return None };
+    let words: Vec<&str> = words.iter().map(|word| word.as_deref()).collect::<Option<Vec<_>>>()?;
+    let (program, args) = words.split_first()?;
+    if program_name(program) != "find" {
+        return None;
+    }
+    let mut index = 0;
+    let mut dirs: Vec<String> = Vec::new();
+    while index < args.len() && !args[index].starts_with('-') {
+        let dir = args[index];
+        if dir.starts_with(['/', '~']) || Path::new(dir).components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            return None;
+        }
+        dirs.push(dir.to_owned());
+        index += 1;
+    }
+    let mut name: Option<(String, bool)> = None;
+    let mut files_only = false;
+    while index < args.len() {
+        match args[index] {
+            "-type" if args.get(index + 1) == Some(&"f") => files_only = true,
+            option @ ("-name" | "-iname") if name.is_none() => {
+                let pattern = args.get(index + 1)?;
+                if pattern.is_empty() || pattern.contains(['[', ']', '\\', '/']) {
+                    return None;
+                }
+                name = Some(((*pattern).to_owned(), option == "-iname"));
+            }
+            _ => return None,
+        }
+        index += 2;
+    }
+    if !files_only && name.is_none() {
+        return None;
+    }
+    if dirs.is_empty() {
+        dirs.push(".".to_owned());
+    }
+    Some(Listing { dirs, name })
+}
+
+/// Whether a file name matches a `find -name` pattern: `*` is any run of characters, `?` any one
+/// character, every other character itself (a pattern with a character class is not a
+/// [`Listing`]).
+pub fn name_matches(pattern: &str, name: &str, ignore_case: bool) -> bool {
+    let mut expression = String::from("^");
+    for character in pattern.chars() {
+        match character {
+            '*' => expression.push_str(".*"),
+            '?' => expression.push('.'),
+            other => expression.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    expression.push('$');
+    regex::RegexBuilder::new(&expression).case_insensitive(ignore_case).dot_matches_new_line(true).build().is_ok_and(|matcher| matcher.is_match(name))
+}
+
 /// The note under a search that left folders out; `cut` when its result was shortened.
 pub fn grep_note(skipped: &[String], cut: bool) -> String {
     let narrow = if cut { " The result is cut: search again with a narrower pattern, or in one folder (`grep -rn <text> src`)." } else { "" };

@@ -2,16 +2,13 @@ use derive_more::Debug;
 use thiserror::Error;
 
 use crate::{
-    backends::common::{
-        Backend, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels, gpu_types::trie::TrieNode,
-        kernel::PoolingMeanKernel,
-    },
+    backends::common::{Backend, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels, kernel::PoolingMeanKernel},
     config::classifier::{ClassifierConfig, PoolingType},
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
         embedding::{Embedding, EmbeddingError},
-        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        normalization::{Normalization, NormalizationNewError, ShortcutMode},
         prediction_head::{PredictionHead, PredictionHeadError},
         transformer::{Transformer, TransformerEncodeError, TransformerNewError},
     },
@@ -47,10 +44,10 @@ pub struct Classifier<B: Backend> {
 }
 
 impl<B: Backend> Classifier<B> {
-    pub fn new(
+    pub async fn new(
         data_type: DataType,
         config: &ClassifierConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
     ) -> Result<Self, ClassifierError<B>> {
         let (embedding, _) = Embedding::new(
@@ -60,26 +57,30 @@ impl<B: Backend> Classifier<B> {
             &config.embedding_config,
             &parameter_tree.subtree("embedding"),
             context,
-        )?;
+        )
+        .await?;
 
         let embedding_norm = Normalization::new(
             config.transformer_config.model_dim,
             data_type,
+            data_type,
             None,
             ShortcutMode::None,
-            PostLayerScalar::None,
             &config.embedding_norm_config,
             &parameter_tree.subtree("embedding_norm"),
             context,
-        )?;
+        )
+        .await?;
 
         let transformer = Transformer::new(
+            data_type,
             data_type,
             None,
             &config.transformer_config,
             &parameter_tree.subtree("transformer"),
             context,
-        )?;
+        )
+        .await?;
 
         if config.classifier_pooling != PoolingType::Mean {
             return Err(ClassifierError::UnsupportedConfiguration(format!(
@@ -97,7 +98,8 @@ impl<B: Backend> Classifier<B> {
             &config.prediction_head_config,
             &parameter_tree.subtree("prediction_head"),
             context,
-        )?;
+        )
+        .await?;
 
         Ok(Self {
             hidden_dim: config.hidden_dim,
@@ -129,19 +131,12 @@ impl<B: Backend> Classifier<B> {
             .encode(&embedded, 0, batch_dim, None::<&mut B::ScratchBuffer>, command_buffer)
             .map_err(ClassifierError::Backend)?;
 
-        let nodes = (0..batch_dim)
-            .map(|index| TrieNode {
-                trie_start: index,
-                trie_end: batch_dim - 1,
-                height: index,
-            })
-            .collect::<Box<[TrieNode]>>();
         let hidden = self
             .transformer
             .encode(
                 hidden,
                 None::<&B::ScratchBuffer>,
-                &BatchTopology::new(&nodes, true),
+                &BatchTopology::flat(batch_dim, true),
                 Some((0..batch_dim).into()),
                 None,
                 None,

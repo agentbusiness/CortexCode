@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Context, Kernels,
+        Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Context, GpuBuffer, Kernels,
         kernel::{RepetitionPenaltyKernel, UnifiedSamplingKernel},
     },
     data_type::DataType,
@@ -93,7 +93,7 @@ impl<B: Backend> Sampling<B> {
         sampling_range: Range<u32>,
         sampling_method: &SamplingMethod,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
-    ) -> Result<B::GlobalBuffer, B::Error> {
+    ) -> Result<B::GlobalGpuBuffer, B::Error> {
         let command_buffer = &mut *command_buffer.debug_group("sampling");
 
         let sampling_length = sampling_range.end - sampling_range.start;
@@ -139,18 +139,27 @@ impl<B: Backend> Sampling<B> {
             assert!(batch_dim.is_flat(), "repetition_penalty currently only supports flat batches");
             let suffix_repetition_length =
                 suffix_repetition_length.expect("suffix_repetition_length is required for repetition_penalty");
+            let trie = if batch_dim.is_flat() {
+                None
+            } else {
+                Some(command_buffer.allocate_constant_from_slice(batch_dim.nodes())?)
+            };
 
             let mut logits_copy = command_buffer.allocate_scratch(logits.size())?;
             let copy_size = self.vocab_size as usize * sampling_length as usize * self.data_type.size_in_bytes();
             command_buffer.encode_copy(logits.subrange(..copy_size), logits_copy.subrange_mut(..copy_size));
 
-            let repetition_penalty_kernel =
-                <B::Kernels as Kernels>::RepetitionPenaltyKernel::new(command_buffer.context(), self.data_type)?;
+            let repetition_penalty_kernel = <B::Kernels as Kernels>::RepetitionPenaltyKernel::new(
+                command_buffer.context(),
+                self.data_type,
+                trie.is_some(),
+            )?;
             repetition_penalty_kernel.encode(
                 logits,
                 &mut logits_copy,
                 context_ring.expect("context_ring is required for repetition_penalty"),
                 token_ids.expect("token_ids is required for repetition_penalty"),
+                trie.as_ref(),
                 repetition_penalty,
                 presence_penalty,
                 suffix_repetition_length,
@@ -164,10 +173,10 @@ impl<B: Backend> Sampling<B> {
             None
         };
         let logits = match &penalized_logits {
-            Some(logits) => (logits as &dyn Buffer<Backend = B>).subrange(..),
+            Some(logits) => (logits as &dyn GpuBuffer<Backend = B>).subrange(..),
             None => {
                 let (buffer, range) = logits.parts();
-                (buffer as &dyn Buffer<Backend = B>).subrange(range)
+                (buffer as &dyn GpuBuffer<Backend = B>).subrange(range)
             },
         };
 
@@ -193,7 +202,7 @@ impl<B: Backend> Sampling<B> {
             },
         };
 
-        let mut output = command_buffer.context().create_buffer(sampling_length as usize * size_of::<u32>())?;
+        let mut output = command_buffer.context().create_buffer_gpu(sampling_length as usize * size_of::<u32>())?;
 
         kernel.encode(
             logits,

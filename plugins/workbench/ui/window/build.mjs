@@ -174,7 +174,7 @@ function writeManifest() {
 }
 
 buildSdk();
-run(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.json'], DIR);
+run(process.execPath, [path.join(path.dirname(require.resolve('typescript/package.json')), 'bin', 'tsc'), '-p', 'tsconfig.json'], DIR);
 await buildPage();
 await buildVendor();
 writeManifest();

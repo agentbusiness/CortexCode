@@ -12,7 +12,7 @@
     "brand:electron": "node scripts/brand-electron.mjs"
   },
   "dependencies": {
-    "ws": "8.22.0"
+    "ws": "8.23.0"
   },
   "devDependencies": {
     "@codemirror/commands": "6.11.1",
@@ -25,7 +25,7 @@
     "@fontsource-variable/archivo": "5.3.0",
     "@fontsource-variable/source-serif-4": "5.3.1",
     "@lezer/highlight": "1.2.5",
-    "@types/node": "22.20.5",
+    "@types/node": "24.19.2",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@types/ws": "8.18.2",
@@ -33,13 +33,13 @@
     "@xterm/addon-fit": "0.11.0",
     "@xterm/addon-webgl": "0.19.0",
     "@xterm/xterm": "6.0.0",
-    "electron": "44.9.3",
+    "electron": "44.11.4",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1",
-    "typescript": "6.0.3",
-    "vite": "8.3.5"
+    "typescript": "7.0.2",
+    "vite": "8.3.8"
   },
   "workspaces": [
     "sdk"

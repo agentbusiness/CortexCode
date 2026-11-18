@@ -5,11 +5,7 @@ use uzu_engine_macros::kernel;
 use crate::{
     backends::{
         common::{
-            gpu_types::{
-                activation_type::{ActivationType, activation_silu_alpha},
-                gated_act_mul::GatedActMulOp,
-                hadamard_order::HADAMARD_TRANSFORM_BLOCK_SIZE,
-            },
+            gpu_types::{activation_type::ActivationType, gated_act_mul::GatedActMulOp},
             kernel::matmul::Int8CodeLayout,
         },
         cpu::kernel::activation_transform::{hadamard_transform, quantize_transformed_row},
@@ -41,13 +37,22 @@ pub fn gated_act_mul<T: DataTypeRepr + Float>(
     #[optional(clip_gate)] gate_clip_max: Option<f32>,
     #[optional(clip_value)] value_clip_min: Option<f32>,
     #[optional(clip_value)] value_clip_max: Option<f32>,
+    #[expect(unused_variables)]
+    #[optional(ops == GatedActMulOp::PackHalf)]
+    packed_half_out: Option<*mut u32>,
     #[specialize] ops: GatedActMulOp,
     #[specialize] grouped_by_weight_nibble: bool,
     #[specialize] interleaved: bool,
     #[specialize] use_hadamard: bool,
+    #[specialize] hadamard_size: u32,
     #[specialize] activation_scale_group_size: u32,
     #[specialize] sum_group_size: u32,
-    #[specialize] custom_activation_alpha: bool,
+    #[expect(unused_variables)]
+    #[specialize]
+    weight_bits: u32,
+    #[expect(unused_variables)]
+    #[specialize]
+    custom_activation_alpha: bool,
     #[specialize] clip_gate: bool,
     #[specialize] clip_value: bool,
 ) {
@@ -57,7 +62,7 @@ pub fn gated_act_mul<T: DataTypeRepr + Float>(
     assert!(!quantize || use_hadamard, "quantized gate activation requires RHT");
     assert!(!quantize || gated_dim.is_multiple_of(activation_scale_group_size));
     assert!(!emit_group_sums || gated_dim.is_multiple_of(sum_group_size));
-    assert!(!use_hadamard || gated_dim.is_multiple_of(HADAMARD_TRANSFORM_BLOCK_SIZE));
+    assert!(!use_hadamard || gated_dim.is_multiple_of(hadamard_size));
 
     let gated_dim = gated_dim as usize;
     let batch_dim = batch_dim as usize;
@@ -81,11 +86,7 @@ pub fn gated_act_mul<T: DataTypeRepr + Float>(
             } else {
                 gate
             };
-            let activated: T = if custom_activation_alpha && act_type == ActivationType::SILU {
-                activation_silu_alpha(gate, activation_alpha.unwrap())
-            } else {
-                act_type.activate(gate)
-            };
+            let activated: T = act_type.activate(gate, activation_alpha.unwrap_or(1.0));
             let value = if clip_value {
                 let value = value.to_f32().unwrap().clamp(value_clip_min.unwrap(), value_clip_max.unwrap());
                 T::from(value).unwrap()
@@ -105,15 +106,14 @@ pub fn gated_act_mul<T: DataTypeRepr + Float>(
 
         if let Some(transformed) = transformed.as_mut() {
             let factors = hadamard_factors.expect("Hadamard factors are required");
-            for stripe_start in (0..gated_dim).step_by(HADAMARD_TRANSFORM_BLOCK_SIZE as usize) {
-                let mut stripe = [0.0f32; HADAMARD_TRANSFORM_BLOCK_SIZE as usize];
-                for lane in 0..HADAMARD_TRANSFORM_BLOCK_SIZE as usize {
+            let mut stripe = vec![0.0f32; hadamard_size as usize];
+            for stripe_start in (0..gated_dim).step_by(hadamard_size as usize) {
+                for lane in 0..hadamard_size as usize {
                     let gated = stripe_start + lane;
                     stripe[lane] = transformed[gated] * unsafe { *factors.add(gated) } as f32;
                 }
                 hadamard_transform(&mut stripe);
-                transformed[stripe_start..stripe_start + HADAMARD_TRANSFORM_BLOCK_SIZE as usize]
-                    .copy_from_slice(&stripe);
+                transformed[stripe_start..stripe_start + hadamard_size as usize].copy_from_slice(&stripe);
             }
 
             if quantize {

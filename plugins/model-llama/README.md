@@ -2,7 +2,7 @@
 
 `cc-model-llama` serves the `model` category over CPP/1 with **Qwen3.8-27B** on upstream
 llama.cpp's `llama-server`, supervised as a child on loopback. `backend/vendor/llama.cpp` holds
-llama.cpp at `468ad58` (unslothai build b11876), the same sources as CortexTerm's `model-llama`.
+llama.cpp at `c2cf5f9` (unslothai build b12347), the same sources as CortexTerm's `model-llama`.
 Swap policy: drain first. It runs on Linux only; on macOS `model-bonsai` and `model-uzu` serve.
 
 ## The GPU decides

@@ -376,6 +376,12 @@ impl Shells {
                 util::shell_quote(&access.token)
             ));
         }
+        // What the user's login shell has on PATH and this process does not (the app was opened
+        // from the Dock): the session's commands find what the user's terminal finds.
+        for dir in util::login_path().iter().rev() {
+            let dir = util::shell_quote(dir);
+            init.push_str(&format!("case \":$PATH:\" in *:{dir}:*) ;; *) export PATH={dir}:\"$PATH\" ;; esac\n"));
+        }
         if let Some(bin) = &self.config.bin_dir {
             let bin = q(bin);
             init.push_str(&format!("case \":$PATH:\" in *:{bin}:*) ;; *) export PATH={bin}:\"$PATH\" ;; esac\n"));

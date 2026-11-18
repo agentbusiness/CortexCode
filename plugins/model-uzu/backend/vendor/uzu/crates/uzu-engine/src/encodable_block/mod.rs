@@ -1,6 +1,8 @@
 pub mod batch_topology;
 pub mod classifier;
+pub mod confidence_head;
 pub mod convolution;
+pub mod decision;
 pub mod decoder;
 pub mod dflash;
 pub mod embedding;
@@ -11,7 +13,9 @@ pub mod mlp;
 pub mod normalization;
 pub mod per_layer_embedding;
 pub mod prediction_head;
+pub mod residual;
 pub mod sampling;
+pub mod stream_op;
 pub mod transformer;
 pub mod transformer_layer;
 pub mod weaver;

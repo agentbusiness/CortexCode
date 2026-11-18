@@ -1,5 +1,3 @@
-use metal::MTLGPUFamily;
-
 use crate::{
     backends::{
         common::{
@@ -20,11 +18,12 @@ use crate::{
             gpu_types::gemm::{GemmBLayout, GemmTiling},
             kernel::matmul::{
                 GemmKernel, MatmulMetalError,
-                gemm::{self, GemmPlan, GemmProblem},
-                gemv::{GemvKernel, GemvSpecialization},
+                gemm::{self, GemmPlan, GemmProblem, small_batch_format, small_m_weights},
+                gemv::{GemvKernel, GemvSpecialization, GemvTile},
+                layout,
                 matmul_dispatch::MatmulDispatch,
                 matmul_output_work::MatmulOutputWork,
-                qmv::{self, QmvRoute},
+                weight_block_k,
             },
         },
     },
@@ -41,18 +40,23 @@ pub struct MatmulMetalKernel {
 }
 
 pub fn supports_integer_right_operand(shape: &MatmulShape) -> bool {
-    matches!((shape.b_bits, shape.signed_codes), (Some(4), _) | (Some(8), true))
+    matches!((shape.b_bits, shape.signed_codes), (Some(2), false) | (Some(4), _) | (Some(8), true))
 }
 
 impl MatmulMetalKernel {
-    pub fn prefer_gemm_over_gemv(
+    pub fn is_all_bf16(&self) -> bool {
+        all_bf16(self.weights_data_type, self.input_data_type, self.output_data_type)
+    }
+
+    fn prefer_gemm_over_gemv(
         shape: MatmulShape,
         plan: GemmPlan,
         weights_data_type: DataType,
         input_data_type: DataType,
         output_data_type: DataType,
     ) -> bool {
-        if shape.gathered || plan.engine != gemm::GemmEngine::Mxu {
+        // F32 is compiled for GEMV only.
+        if shape.gathered || plan.engine != gemm::GemmEngine::Mxu || weights_data_type == DataType::F32 {
             return false;
         }
         if shape.m == 5
@@ -83,36 +87,30 @@ impl MatmulMetalKernel {
     pub fn choose_dispatch(
         shape: &MatmulShape,
         gemm_b_layout: GemmBLayout,
-        device_name: &str,
         gpu_core_count: u32,
-        apple_gpu_family: MTLGPUFamily,
         supports_mxu: bool,
         weights_data_type: DataType,
         input_data_type: DataType,
         output_data_type: DataType,
     ) -> MatmulDispatch {
-        let all_bf16 = weights_data_type == DataType::BF16
-            && input_data_type == DataType::BF16
-            && output_data_type == DataType::BF16;
-        let problem = GemmProblem::new(*shape, weights_data_type, output_data_type, supports_mxu, apple_gpu_family);
+        let problem = GemmProblem::new(*shape, weights_data_type, output_data_type, supports_mxu);
         if shape.b_is_trellis {
             return MatmulDispatch::Gemm(problem.select_plan());
         }
-        if let Some(route) = qmv::route(device_name, apple_gpu_family, supports_mxu, shape, all_bf16) {
-            return match route {
-                QmvRoute::Tuned(tile) | QmvRoute::MainGemv(tile) => MatmulDispatch::Gemv(
-                    GemvSpecialization::select_tile(
-                        shape,
-                        gemm_b_layout,
-                        weights_data_type,
-                        input_data_type,
-                        output_data_type,
-                        tile,
-                    )
-                    .expect("typed QMV route must contain a legal GEMV tile"),
-                ),
-                QmvRoute::MainGemm(plan) => MatmulDispatch::Gemm(plan),
+        // Small M, one rule for every chip: batched GEMV for M=2..3 (M=2..4 with MXU), the register GEMM above that.
+        if all_bf16(weights_data_type, input_data_type, output_data_type) && small_m_weights(shape).is_some() {
+            if !supports_mxu && let Some(plan) = problem.small_batch_plan(gemm_b_layout) {
+                return MatmulDispatch::Gemm(plan);
+            }
+            let tile = match (supports_mxu, shape.m) {
+                (_, 2..=8) if shape.b_bits == Some(2) => None,
+                (false, 2..=8) => Some(GemvTile::quantized_output_tile(4, 32, shape.m.min(4), 8, 1)),
+                (true, 2..=4) => Some(GemvTile::quantized_output_tile(2, 16, shape.m, 8, 1)),
+                _ => None,
             };
+            if let Some(gemv) = tile.and_then(|tile| GemvSpecialization::select_tile(shape, gemm_b_layout, tile)) {
+                return MatmulDispatch::Gemv(gemv);
+            }
         }
         let gemv = GemvSpecialization::select_shape(
             shape,
@@ -121,7 +119,6 @@ impl MatmulMetalKernel {
             input_data_type,
             output_data_type,
             gpu_core_count,
-            apple_gpu_family,
         );
         let plan = problem.select_plan();
         match gemv {
@@ -144,15 +141,21 @@ impl MatmulMetalKernel {
         Self::choose_dispatch(
             shape,
             gemm_b_layout,
-            &context.device_name,
             context.gpu_core_count,
-            context.apple_gpu_family,
             context.supports_mxu,
             self.weights_data_type,
             self.input_data_type,
             self.output_data_type,
         )
     }
+}
+
+fn all_bf16(
+    weights_data_type: DataType,
+    input_data_type: DataType,
+    output_data_type: DataType,
+) -> bool {
+    (weights_data_type, input_data_type, output_data_type) == (DataType::BF16, DataType::BF16, DataType::BF16)
 }
 
 impl MatmulKernel for MatmulMetalKernel {
@@ -191,7 +194,7 @@ impl MatmulKernel for MatmulMetalKernel {
         shape: &MatmulShape,
         context: &MetalContext,
     ) -> Option<ActivationQuantization> {
-        let weight_group_size = shape.b_group_size?;
+        let weight_group_size = weight_block_k(shape.b_bits, shape.b_group_size)?;
         let emit_group_sums = GemmKernel::requires_activation_group_sums(shape);
         let code_layout = shape.b_bits.and_then(Int8CodeLayout::for_right_bits)?;
         let quantization =
@@ -199,7 +202,6 @@ impl MatmulKernel for MatmulMetalKernel {
         if !context.supports_mxu
             || self.input_data_type != DataType::BF16
             || self.output_data_type != DataType::BF16
-            || shape.a_full_precision
             || !shape.is_quant()
             || shape.params_layout != Some(QuantParamsLayout::GroupOutput)
             || !supports_integer_right_operand(shape)
@@ -208,7 +210,7 @@ impl MatmulKernel for MatmulMetalKernel {
             || !shape.k.is_multiple_of(ACTIVATION_SCALE_GROUP_SIZE)
             || !shape.k.is_multiple_of(weight_group_size)
             || !shape.n.is_multiple_of(32)
-            || shape.b_bits.and_then(|bits| GemmKernel::mxu_tiled_words_per_thread(shape.k, bits)).is_none()
+            || shape.b_bits.and_then(|bits| layout::mxu_tiled_words_per_thread(shape.k, bits)).is_none()
         {
             return None;
         }
@@ -216,49 +218,62 @@ impl MatmulKernel for MatmulMetalKernel {
         Some(quantization)
     }
 
+    /// Load-time: the activation format this linear prepares once (Int8 on MXU, PackedHalf for the small-batch W4
+    /// GEMM, else Bf16). `select_activation_format` decides per batch size whether it is used.
+    fn activation_preparation(
+        &self,
+        shape: &MatmulShape,
+        weights_layout: GemmBLayout,
+        context: &MetalContext,
+    ) -> ActivationFormat {
+        if let Some(quantization) = self.select_activation_quantization(shape, context) {
+            return ActivationFormat::Int8(quantization);
+        }
+        match small_batch_format(*shape, weights_layout) {
+            Some((format, _))
+                if !context.supports_mxu
+                    && shape.params_layout == Some(QuantParamsLayout::GroupOutput)
+                    && all_bf16(self.weights_data_type, self.input_data_type, self.output_data_type) =>
+            {
+                format
+            },
+            _ => ActivationFormat::Bf16,
+        }
+    }
+
+    /// Encode-time: `prepared` when this batch size has a kernel for it, else Bf16 (GEMV keeps Bf16 input).
     fn select_activation_format(
         &self,
         bf16_shape: &MatmulShape,
         weights_layout: GemmBLayout,
+        prepared: ActivationFormat,
         context: &MetalContext,
     ) -> ActivationFormat {
-        if bf16_shape.params_layout != Some(QuantParamsLayout::GroupOutput)
-            || !supports_integer_right_operand(bf16_shape)
-            || matches!(self.select_dispatch(bf16_shape, weights_layout, context), MatmulDispatch::Gemv(_))
-        {
-            return ActivationFormat::Bf16;
-        }
-        if weights_layout == GemmBLayout::MxuTiled {
-            return ActivationFormat::Int8;
-        }
-
-        let a8_shape = MatmulShape {
-            a_full_precision: false,
-            ..*bf16_shape
+        let dispatch = |shape: &MatmulShape| self.select_dispatch(shape, weights_layout, context);
+        let usable = match prepared {
+            ActivationFormat::PackedHalf {
+                ..
+            } => matches!(
+                dispatch(&MatmulShape { a: prepared, ..*bf16_shape }),
+                MatmulDispatch::Gemm(plan) if plan.tiling.is_small_batch_variant()
+            ),
+            ActivationFormat::Int8(_) => matches!(dispatch(bf16_shape), MatmulDispatch::Gemm(_)),
+            _ => false,
         };
-        match self.select_dispatch(&a8_shape, weights_layout, context) {
-            MatmulDispatch::Gemm(plan) if plan.engine == gemm::GemmEngine::Mxu => ActivationFormat::Int8,
-            _ => ActivationFormat::Bf16,
+        if usable {
+            prepared
+        } else {
+            ActivationFormat::Bf16
         }
     }
 
     fn optimize_weights_layout(
         &self,
         a8_shape: &MatmulShape,
-        weights: &mut <Metal as Backend>::GlobalBuffer,
+        weights: &mut <Metal as Backend>::GlobalGpuBuffer,
         context: &MetalContext,
-    ) -> Result<GemmBLayout, MetalError> {
-        if self.select_activation_quantization(a8_shape, context).is_none() {
-            return Ok(GemmBLayout::RowMajor);
-        }
-        GemmKernel::prepare_gemm_b_layout(
-            weights,
-            a8_shape.n,
-            a8_shape.k,
-            a8_shape.b_bits.expect("quantized weights"),
-            context,
-        )?;
-        Ok(GemmBLayout::MxuTiled)
+    ) -> Result<(GemmBLayout, bool), MetalError> {
+        layout::prepare(self, a8_shape, weights, context)
     }
 
     fn encode(

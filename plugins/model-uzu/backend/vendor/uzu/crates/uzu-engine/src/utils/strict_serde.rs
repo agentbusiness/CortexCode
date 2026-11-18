@@ -14,13 +14,25 @@ macro_rules! impl_strict {
   };
 }
 
-impl_strict!(Unsupported, String, f32, u32, u64, usize, bool, serde_json::Map<String, serde_json::Value>);
+impl_strict!(
+    Unsupported,
+    String,
+    f32,
+    u32,
+    u64,
+    usize,
+    bool,
+    serde_json::Value,
+    serde_json::Map<String, serde_json::Value>
+);
 
 impl<'de, T: DeserializeStrict<'de>> DeserializeStrict<'de> for Box<T> {}
 impl<'de, T: DeserializeStrict<'de>> DeserializeStrict<'de> for Box<[T]> {}
 impl<'de, T: DeserializeStrict<'de>> DeserializeStrict<'de> for Option<T> {}
+impl<'de, T: DeserializeStrict<'de>, const N: usize> DeserializeStrict<'de> for [T; N] where [T; N]: Deserialize<'de> {}
 impl<'de, A: DeserializeStrict<'de>, B: DeserializeStrict<'de>> DeserializeStrict<'de> for (A, B) {}
 impl<'de, const V: bool> DeserializeStrict<'de> for MustBeBool<V> {}
+impl<'de, const V: u64> DeserializeStrict<'de> for monostate::MustBeU64<V> {}
 impl<'de, V: ConstStr> DeserializeStrict<'de> for MustBeStr<V> {}
 
 pub fn required<'de, D: Deserializer<'de>, T: DeserializeStrict<'de>>(deserializer: D) -> Result<T, D::Error> {

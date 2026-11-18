@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Context, Kernels,
+        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Context, GpuBuffer, Kernels,
         kernel::{
             ConvTreeScanKernel, DeltaNetConvPackKernel, DeltaNetConvScanKernel, DeltaNetConvUpdateKernel,
             DeltaNetNormGateKernel, DeltaNetPrefillKernel, DeltaNetPrefillPrepKernel, DeltaNetUpdateKernel,
@@ -16,7 +16,7 @@ use crate::{
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
-        linear::{Linear, LinearBlockError},
+        linear::{InputRhtParameters, Linear, LinearBlockError},
         mixer::{
             Mixer, MixerEncodeError, MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
             attention::rope::PrecalculatedRoPE,
@@ -49,8 +49,8 @@ enum DeltaNetSuffixStatus<B: Backend> {
 }
 
 pub struct DeltaNetState<B: Backend> {
-    conv_state: B::GlobalBuffer,
-    ssm_state: B::GlobalBuffer,
+    conv_state: B::GlobalGpuBuffer,
+    ssm_state: B::GlobalGpuBuffer,
     suffix_status: Option<DeltaNetSuffixStatus<B>>,
     state_advance: <B::Kernels as Kernels>::StateAdvanceKernel,
     is_empty: bool,
@@ -123,12 +123,14 @@ impl<B: Backend> MixerState<B> for DeltaNetState<B> {
         if self.suffix_status.is_some() {
             return Err(MixerSnapshotError::Busy("delta net state has an unaccepted suffix"));
         }
-        let mut conv_state = command_buffer.context().create_buffer(self.conv_state.size()).map_err(MixerSnapshotError::Backend)?;
-        command_buffer.encode_copy(&self.conv_state, &mut conv_state);
-        let mut ssm_state = command_buffer.context().create_buffer(self.ssm_state.size()).map_err(MixerSnapshotError::Backend)?;
-        command_buffer.encode_copy(&self.ssm_state, &mut ssm_state);
+        let mut conv_state = command_buffer.context().create_buffer_gpu(self.conv_state.size()).map_err(MixerSnapshotError::Backend)?;
+        if self.is_empty { command_buffer.encode_fill(&mut conv_state, 0); }
+        else { command_buffer.encode_copy(&self.conv_state, &mut conv_state); }
+        let mut ssm_state = command_buffer.context().create_buffer_gpu(self.ssm_state.size()).map_err(MixerSnapshotError::Backend)?;
+        if self.is_empty { command_buffer.encode_fill(&mut ssm_state, 0); }
+        else { command_buffer.encode_copy(&self.ssm_state, &mut ssm_state); }
         Ok(MixerSnapshot {
-            scalars: Box::new([]),
+            scalars: Box::new([u64::from(self.is_empty)]),
             buffers: Box::new([conv_state, ssm_state]),
         })
     }
@@ -141,6 +143,12 @@ impl<B: Backend> MixerState<B> for DeltaNetState<B> {
         if self.suffix_status.is_some() {
             return Err(MixerSnapshotError::Busy("delta net state has an unaccepted suffix"));
         }
+        //0.7 defers zero initialization until the first encode; retain that state across restore.
+        let is_empty = match snapshot.scalars.as_ref() {
+            [0] => false,
+            [1] => true,
+            _ => return Err(MixerSnapshotError::Mismatch("recurrent snapshot empty-state flag differs".into())),
+        };
         if snapshot.buffers.len() != 2 {
             return Err(MixerSnapshotError::Mismatch("delta net snapshot has the wrong number of buffers".into()));
         }
@@ -152,6 +160,7 @@ impl<B: Backend> MixerState<B> for DeltaNetState<B> {
         }
         command_buffer.encode_copy(&snapshot.buffers[0], &mut self.conv_state);
         command_buffer.encode_copy(&snapshot.buffers[1], &mut self.ssm_state);
+        self.is_empty = is_empty;
         Ok(())
     }
 }
@@ -168,16 +177,17 @@ pub struct DeltaNet<B: Backend> {
     kernel_size: u32,
     outer_data_type: DataType,
     in_projection: Box<dyn Linear<B>>,
-    conv_weight: B::GlobalBuffer,
-    conv_bias: Option<B::GlobalBuffer>,
+    conv_weight: B::GlobalGpuBuffer,
+    conv_bias: Option<B::GlobalGpuBuffer>,
     conv_update: <B::Kernels as Kernels>::DeltaNetConvUpdateKernel,
     conv_pack: <B::Kernels as Kernels>::DeltaNetConvPackKernel,
     conv_scan: <B::Kernels as Kernels>::DeltaNetConvScanKernel,
     conv_tree_scan: <B::Kernels as Kernels>::ConvTreeScanKernel,
-    a_log: B::GlobalBuffer,
-    dt_bias: B::GlobalBuffer,
-    norm_weight: B::GlobalBuffer,
+    a_log: B::GlobalGpuBuffer,
+    dt_bias: B::GlobalGpuBuffer,
+    norm_weight: B::GlobalGpuBuffer,
     norm_epsilon: f32,
+    output_gate_alpha: f32,
     delta_net_update: <B::Kernels as Kernels>::DeltaNetUpdateKernel,
     delta_net_prefill_prep: <B::Kernels as Kernels>::DeltaNetPrefillPrepKernel,
     delta_net_tree_prep: <B::Kernels as Kernels>::DeltaNetPrefillPrepKernel,
@@ -201,13 +211,13 @@ pub enum DeltaNetNewError<B: Backend> {
 }
 
 impl<B: Backend> DeltaNet<B> {
-    pub fn new(
+    pub async fn new(
         hidden_dim: u32,
         outer_data_type: DataType,
         config: &DeltaNetConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Self, Option<B::GlobalBuffer>), DeltaNetNewError<B>> {
+    ) -> Result<(Self, Option<InputRhtParameters<B>>), DeltaNetNewError<B>> {
         if config.kernel_size != 4 {
             return Err(DeltaNetNewError::UnsupportedConfiguration(format!(
                 "kernel_size must be 4, got {}",
@@ -248,14 +258,15 @@ impl<B: Backend> DeltaNet<B> {
                 false,
                 &parameter_tree.subtree("in_proj"),
                 context,
-            )?;
+            )
+            .await?;
 
         let conv_config = &config.conv_config;
         let conv_tree = parameter_tree.subtree("conv");
 
-        let conv_weight = conv_tree.read_buffer("weights", &[conv_dim, config.kernel_size], INNER_DATA_TYPE)?;
+        let conv_weight = conv_tree.read_buffer("weights", &[conv_dim, config.kernel_size], INNER_DATA_TYPE).await?;
         let conv_bias = if conv_config.has_biases {
-            Some(conv_tree.read_buffer("biases", &[conv_dim], INNER_DATA_TYPE)?)
+            Some(conv_tree.read_buffer("biases", &[conv_dim], INNER_DATA_TYPE).await?)
         } else {
             None
         };
@@ -280,13 +291,17 @@ impl<B: Backend> DeltaNet<B> {
         )
         .map_err(DeltaNetNewError::Backend)?;
 
-        let a_log = parameter_tree.read_buffer("a_log", &[config.num_heads], INNER_DATA_TYPE)?;
-        let dt_bias = parameter_tree.read_buffer("dt_bias", &[config.num_heads], INNER_DATA_TYPE)?;
-        let norm_weight = parameter_tree.read_buffer("norm.scales", &[config.value_head_dim], INNER_DATA_TYPE)?;
+        let a_log = parameter_tree.read_buffer("a_log", &[config.num_heads], INNER_DATA_TYPE).await?;
+        let dt_bias = parameter_tree.read_buffer("dt_bias", &[config.num_heads], INNER_DATA_TYPE).await?;
+        let norm_weight = parameter_tree.read_buffer("norm.scales", &[config.value_head_dim], INNER_DATA_TYPE).await?;
         let norm_epsilon = config.norm_config.epsilon;
-        let delta_net_update =
-            <B::Kernels as Kernels>::DeltaNetUpdateKernel::new(context, outer_data_type, config.head_dim)
-                .map_err(DeltaNetNewError::Backend)?;
+        let delta_net_update = <B::Kernels as Kernels>::DeltaNetUpdateKernel::new(
+            context,
+            outer_data_type,
+            config.head_dim,
+            config.output_gate.act_type(),
+        )
+        .map_err(DeltaNetNewError::Backend)?;
         let delta_net_prefill_prep = <B::Kernels as Kernels>::DeltaNetPrefillPrepKernel::new(
             context,
             outer_data_type,
@@ -308,8 +323,12 @@ impl<B: Backend> DeltaNet<B> {
         let delta_net_prefill =
             <B::Kernels as Kernels>::DeltaNetPrefillKernel::new(context, outer_data_type, config.head_dim)
                 .map_err(DeltaNetNewError::Backend)?;
-        let delta_net_norm_gate = <B::Kernels as Kernels>::DeltaNetNormGateKernel::new(context, outer_data_type)
-            .map_err(DeltaNetNewError::Backend)?;
+        let delta_net_norm_gate = <B::Kernels as Kernels>::DeltaNetNormGateKernel::new(
+            context,
+            outer_data_type,
+            config.output_gate.act_type(),
+        )
+        .map_err(DeltaNetNewError::Backend)?;
         let tree_verify =
             if <<B::Kernels as Kernels>::DeltaNetTreeVerify as DeltaNetTreeVerifyTrait>::is_supported(context) {
                 Some(
@@ -321,6 +340,7 @@ impl<B: Backend> DeltaNet<B> {
                             num_v_heads: config.num_heads,
                             head_k_dim: config.head_dim,
                             head_v_dim: config.value_head_dim,
+                            act_type: config.output_gate.act_type(),
                         },
                     )
                     .map_err(DeltaNetNewError::Backend)?,
@@ -346,7 +366,8 @@ impl<B: Backend> DeltaNet<B> {
             false,
             &parameter_tree.subtree("out_proj"),
             context,
-        )?;
+        )
+        .await?;
 
         Ok((
             Self {
@@ -371,6 +392,7 @@ impl<B: Backend> DeltaNet<B> {
                 dt_bias,
                 norm_weight,
                 norm_epsilon,
+                output_gate_alpha: config.output_gate.alpha(),
                 delta_net_update,
                 delta_net_prefill_prep,
                 delta_net_tree_prep,
@@ -466,6 +488,7 @@ impl<B: Backend> DeltaNet<B> {
                     conv_dim: self.conv_dim,
                     total_proj_dim: self.total_proj_dim,
                     norm_epsilon: self.norm_epsilon,
+                    activation_alpha: self.output_gate_alpha,
                     tree_size,
                 },
                 command_buffer,
@@ -482,6 +505,182 @@ impl<B: Backend> DeltaNet<B> {
             parents: batch_dim.parents().into(),
         });
         Ok(output)
+    }
+
+    // Runs a fully accepted batch from zero conv and SSM states that live only for this encode.
+    fn encode_stateless(
+        &self,
+        hidden: B::ScratchBuffer,
+        batch_dim: &BatchTopology,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        assert!(batch_dim.full_accept(), "stateless delta net doesn't support trie");
+
+        let mut conv_state = command_buffer
+            .allocate_scratch_for_shape(&[self.conv_dim, self.kernel_size - 1], INNER_DATA_TYPE)
+            .map_err(MixerEncodeError::Backend)?;
+        command_buffer.encode_fill(&mut conv_state, 0);
+
+        let mut ssm_state = command_buffer
+            .allocate_scratch_for_shape(&[self.num_heads, self.value_head_dim, self.head_dim], INNER_DATA_TYPE)
+            .map_err(MixerEncodeError::Backend)?;
+        command_buffer.encode_fill(&mut ssm_state, 0);
+
+        let in_projected = self.in_projection.encode(hidden, batch_dim.size(), command_buffer)?;
+
+        self.encode_flat(in_projected, batch_dim.size(), &mut conv_state, &mut ssm_state, command_buffer)
+    }
+
+    fn encode_flat(
+        &self,
+        mut in_projected: B::ScratchBuffer,
+        suffix_length: u32,
+        conv_state: &mut dyn GpuBuffer<Backend = B>,
+        ssm_state: &mut dyn GpuBuffer<Backend = B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let mut delta_output = command_buffer
+            .allocate_scratch_for_shape(&[suffix_length, self.value_dim], self.outer_data_type)
+            .map_err(MixerEncodeError::Backend)?;
+        if suffix_length == 1 {
+            self.conv_update.encode(
+                &self.conv_weight,
+                self.conv_bias.as_ref(),
+                &mut in_projected,
+                &mut *conv_state,
+                self.kernel_size,
+                self.conv_dim,
+                self.kernel_size - 1,
+                command_buffer,
+            );
+
+            self.delta_net_update.encode(
+                &in_projected,
+                &self.a_log,
+                &self.dt_bias,
+                &self.norm_weight,
+                &mut *ssm_state,
+                &mut delta_output,
+                self.num_heads,
+                self.num_groups,
+                self.value_head_dim,
+                self.key_dim,
+                self.value_dim,
+                self.norm_epsilon,
+                self.output_gate_alpha,
+                command_buffer,
+            );
+        } else {
+            let conv_tile_tokens = suffix_length.div_ceil(CONV_TILES).max(CONV_MIN_TILE_TOKENS);
+            debug_assert!(conv_tile_tokens >= self.kernel_size - 1);
+            let mut packed = command_buffer
+                .allocate_scratch_for_shape(&[CONV_TILES, self.kernel_size - 1, self.conv_dim], INNER_DATA_TYPE)
+                .map_err(MixerEncodeError::Backend)?;
+            self.conv_pack.encode(
+                &*conv_state,
+                &in_projected,
+                &mut packed,
+                suffix_length,
+                conv_tile_tokens,
+                self.total_proj_dim,
+                self.conv_dim,
+                command_buffer,
+            );
+            self.conv_scan.encode(
+                &packed,
+                &self.conv_weight,
+                self.conv_bias.as_ref(),
+                &mut in_projected,
+                &mut *conv_state,
+                suffix_length,
+                conv_tile_tokens,
+                self.conv_dim,
+                self.total_proj_dim,
+                command_buffer,
+            );
+            if let Some(chunked) = self.chunked.as_ref().filter(|chunked| chunked.should_use(suffix_length)) {
+                chunked
+                    .encode(
+                        DeltaNetChunkedPrefillArgs {
+                            in_projected: &in_projected,
+                            a_log: &self.a_log,
+                            dt_bias: &self.dt_bias,
+                            ssm_state,
+                            delta_output: &mut delta_output,
+                            num_heads: self.num_heads,
+                            num_groups: self.num_groups,
+                            value_head_dim: self.value_head_dim,
+                            key_dim: self.key_dim,
+                            value_dim: self.value_dim,
+                            suffix_len: suffix_length,
+                        },
+                        command_buffer,
+                    )
+                    .map_err(MixerEncodeError::Backend)?;
+            } else {
+                let mut prep_q_norm = command_buffer
+                    .allocate_scratch_for_shape(&[suffix_length, self.key_dim], INNER_DATA_TYPE)
+                    .map_err(MixerEncodeError::Backend)?;
+                let mut prep_k_norm = command_buffer
+                    .allocate_scratch_for_shape(&[suffix_length, self.key_dim], INNER_DATA_TYPE)
+                    .map_err(MixerEncodeError::Backend)?;
+                let mut prep_beta = command_buffer
+                    .allocate_scratch_for_shape(&[suffix_length, self.num_heads], INNER_DATA_TYPE)
+                    .map_err(MixerEncodeError::Backend)?;
+                let mut prep_decay = command_buffer
+                    .allocate_scratch_for_shape(&[suffix_length, self.num_heads], INNER_DATA_TYPE)
+                    .map_err(MixerEncodeError::Backend)?;
+                self.delta_net_prefill_prep.encode(
+                    &in_projected,
+                    &self.a_log,
+                    &self.dt_bias,
+                    &mut prep_q_norm,
+                    &mut prep_k_norm,
+                    None::<&mut B::ScratchBuffer>,
+                    &mut prep_beta,
+                    &mut prep_decay,
+                    self.num_heads,
+                    self.num_groups,
+                    self.key_dim,
+                    self.value_dim,
+                    suffix_length,
+                    command_buffer,
+                );
+                self.delta_net_prefill.encode(
+                    &prep_q_norm,
+                    &prep_k_norm,
+                    &prep_beta,
+                    &prep_decay,
+                    &in_projected,
+                    &mut *ssm_state,
+                    &mut delta_output,
+                    self.num_heads,
+                    self.num_groups,
+                    self.value_head_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    suffix_length,
+                    self.value_head_dim.div_ceil(16),
+                    command_buffer,
+                );
+            }
+            self.delta_net_norm_gate.encode(
+                &mut delta_output,
+                &in_projected,
+                &self.norm_weight,
+                self.num_heads,
+                self.value_head_dim,
+                self.value_dim,
+                self.conv_dim,
+                self.total_proj_dim,
+                self.norm_epsilon,
+                self.output_gate_alpha,
+                suffix_length,
+                command_buffer,
+            );
+        }
+
+        Ok(self.out_projection.encode(delta_output, suffix_length, command_buffer)?)
     }
 }
 
@@ -500,9 +699,11 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
         context: &B::Context,
     ) -> Result<Box<dyn MixerState<B>>, B::Error> {
         let conv_state =
-            context.create_buffer(size_for_shape(&[self.conv_dim, self.kernel_size - 1], INNER_DATA_TYPE))?;
-        let ssm_state = context
-            .create_buffer(size_for_shape(&[self.num_heads, self.value_head_dim, self.head_dim], INNER_DATA_TYPE))?;
+            context.create_buffer_gpu(size_for_shape(&[self.conv_dim, self.kernel_size - 1], INNER_DATA_TYPE))?;
+        let ssm_state = context.create_buffer_gpu(size_for_shape(
+            &[self.num_heads, self.value_head_dim, self.head_dim],
+            INNER_DATA_TYPE,
+        ))?;
 
         let state_advance = <B::Kernels as Kernels>::StateAdvanceKernel::new(
             context,
@@ -529,11 +730,13 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
         state: Option<MaybeMut<dyn MixerState<B>>>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
-        let command_buffer = &mut *command_buffer.debug_group("delta net");
-
         assert!(precalculated_rope.is_none(), "unexpected rope for delta net mixer");
 
-        let state = state.expect("delta net requires state");
+        let command_buffer = &mut *command_buffer.debug_group("delta net");
+        let Some(state) = state else {
+            return self.encode_stateless(hidden, batch_dim, command_buffer);
+        };
+
         let state = state.downcast::<DeltaNetState<B>>().expect("incorrect type of delta net state");
         let MaybeMut::Mut(state) = state else {
             panic!("delta net doesn't support immutable state");
@@ -547,158 +750,24 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
             state.is_empty = false;
         }
 
-        let mut in_projected = self.in_projection.encode(hidden, batch_dim.size(), command_buffer)?;
+        let in_projected = self.in_projection.encode(hidden, batch_dim.size(), command_buffer)?;
 
         if !batch_dim.full_accept() {
             let output = self.encode_tree_verify(&in_projected, batch_dim, state, command_buffer)?;
-
             return Ok(output);
         }
 
-        let mut delta_output = command_buffer
-            .allocate_scratch_for_shape(&[batch_dim.size(), self.value_dim], self.outer_data_type)
-            .map_err(MixerEncodeError::Backend)?;
-        if batch_dim.size() == 1 {
-            self.conv_update.encode(
-                &self.conv_weight,
-                self.conv_bias.as_ref(),
-                &mut in_projected,
-                &mut state.conv_state,
-                self.kernel_size,
-                self.conv_dim,
-                self.kernel_size - 1,
-                command_buffer,
-            );
-
-            self.delta_net_update.encode(
-                &in_projected,
-                &self.a_log,
-                &self.dt_bias,
-                &self.norm_weight,
-                &mut state.ssm_state,
-                &mut delta_output,
-                self.num_heads,
-                self.num_groups,
-                self.value_head_dim,
-                self.key_dim,
-                self.value_dim,
-                self.norm_epsilon,
-                command_buffer,
-            );
-        } else {
-            let conv_tile_tokens = batch_dim.size().div_ceil(CONV_TILES).max(CONV_MIN_TILE_TOKENS);
-            debug_assert!(conv_tile_tokens >= self.kernel_size - 1);
-            let mut packed = command_buffer
-                .allocate_scratch_for_shape(&[CONV_TILES, self.kernel_size - 1, self.conv_dim], INNER_DATA_TYPE)
-                .map_err(MixerEncodeError::Backend)?;
-            self.conv_pack.encode(
-                &state.conv_state,
-                &in_projected,
-                &mut packed,
-                batch_dim.size(),
-                conv_tile_tokens,
-                self.total_proj_dim,
-                self.conv_dim,
-                command_buffer,
-            );
-            self.conv_scan.encode(
-                &packed,
-                &self.conv_weight,
-                self.conv_bias.as_ref(),
-                &mut in_projected,
-                &mut state.conv_state,
-                batch_dim.size(),
-                conv_tile_tokens,
-                self.conv_dim,
-                self.total_proj_dim,
-                command_buffer,
-            );
-            if let Some(chunked) = self.chunked.as_ref().filter(|chunked| chunked.should_use(batch_dim.size())) {
-                chunked
-                    .encode(
-                        DeltaNetChunkedPrefillArgs {
-                            in_projected: &in_projected,
-                            a_log: &self.a_log,
-                            dt_bias: &self.dt_bias,
-                            ssm_state: &mut state.ssm_state,
-                            delta_output: &mut delta_output,
-                            num_heads: self.num_heads,
-                            num_groups: self.num_groups,
-                            value_head_dim: self.value_head_dim,
-                            key_dim: self.key_dim,
-                            value_dim: self.value_dim,
-                            suffix_len: batch_dim.size(),
-                        },
-                        command_buffer,
-                    )
-                    .map_err(MixerEncodeError::Backend)?;
-            } else {
-                let mut prep_q_norm = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), self.key_dim], INNER_DATA_TYPE)
-                    .map_err(MixerEncodeError::Backend)?;
-                let mut prep_k_norm = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), self.key_dim], INNER_DATA_TYPE)
-                    .map_err(MixerEncodeError::Backend)?;
-                let mut prep_beta = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), self.num_heads], INNER_DATA_TYPE)
-                    .map_err(MixerEncodeError::Backend)?;
-                let mut prep_decay = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), self.num_heads], INNER_DATA_TYPE)
-                    .map_err(MixerEncodeError::Backend)?;
-                self.delta_net_prefill_prep.encode(
-                    &in_projected,
-                    &self.a_log,
-                    &self.dt_bias,
-                    &mut prep_q_norm,
-                    &mut prep_k_norm,
-                    None::<&mut B::ScratchBuffer>,
-                    &mut prep_beta,
-                    &mut prep_decay,
-                    self.num_heads,
-                    self.num_groups,
-                    self.key_dim,
-                    self.value_dim,
-                    batch_dim.size(),
-                    command_buffer,
-                );
-                self.delta_net_prefill.encode(
-                    &prep_q_norm,
-                    &prep_k_norm,
-                    &prep_beta,
-                    &prep_decay,
-                    &in_projected,
-                    &mut state.ssm_state,
-                    &mut delta_output,
-                    self.num_heads,
-                    self.num_groups,
-                    self.value_head_dim,
-                    self.key_dim,
-                    self.value_dim,
-                    batch_dim.size(),
-                    self.value_head_dim.div_ceil(16),
-                    command_buffer,
-                );
-            }
-            self.delta_net_norm_gate.encode(
-                &mut delta_output,
-                &in_projected,
-                &self.norm_weight,
-                self.num_heads,
-                self.value_head_dim,
-                self.value_dim,
-                self.conv_dim,
-                self.total_proj_dim,
-                self.norm_epsilon,
-                batch_dim.size(),
-                command_buffer,
-            );
-        }
+        let output = self.encode_flat(
+            in_projected,
+            batch_dim.size(),
+            &mut state.conv_state,
+            &mut state.ssm_state,
+            command_buffer,
+        )?;
 
         state.suffix_status = Some(DeltaNetSuffixStatus::Flat {
             suffix_length: batch_dim.size(),
         });
-
-        let output = self.out_projection.encode(delta_output, batch_dim.size(), command_buffer)?;
 
         Ok(output)
     }

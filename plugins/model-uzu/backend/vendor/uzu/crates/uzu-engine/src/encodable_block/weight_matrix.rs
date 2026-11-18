@@ -3,9 +3,13 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, BufferCpuAccessible, BufferMut,
-        gpu_types::{quantization::QuantizationMode, quantization_method::QuantizationMethod},
-        kernel::matmul::{MatmulB, QuantParams, QuantParamsLayout, QuantizedB, QuantizedCorrection, WeightsLayout},
+        Backend,
+        gpu_types::{
+            quantization::QuantizationMode, quantization_method::QuantizationMethod, trellis::TrellisCodebook,
+        },
+        kernel::matmul::{
+            MatmulB, QuantParams, QuantParamsLayout, QuantizedB, QuantizedCorrection, TrellisFormat, WeightsLayout,
+        },
     },
     config::weight_matrix::{AnyWeightMatrixSpec, Layout},
     data_type::DataType,
@@ -20,251 +24,208 @@ pub enum WeightMatrixError<B: Backend> {
     UnsupportedConfiguration(String),
 }
 
-#[derive(Clone, Copy)]
-pub struct QuantizationInfo {
-    pub mode: QuantizationMode,
-    pub method: QuantizationMethod,
-    pub group_size: u32,
-}
-
-pub struct ParsedWeightSpec {
-    pub layout: Layout,
-    pub quantization: Option<QuantizationInfo>,
-}
-
-pub fn parse_spec<B: Backend>(spec: &AnyWeightMatrixSpec) -> Result<ParsedWeightSpec, WeightMatrixError<B>> {
-    let (layout, quantized) = match spec {
-        AnyWeightMatrixSpec::FullPrecisionSpec(spec) => (spec.layout.clone(), None),
-        AnyWeightMatrixSpec::MLXSpec(spec) => {
-            (spec.layout.clone(), Some((spec.bits, spec.group_size, QuantizationMethod::ScaleBias)))
-        },
-        AnyWeightMatrixSpec::IntSpec(spec) => (
-            spec.layout.clone(),
-            Some((
-                spec.bits,
-                spec.group_size,
-                if spec.is_symmetric {
-                    QuantizationMethod::ScaleSymmetric
-                } else {
-                    QuantizationMethod::ScaleZeroPoint
-                },
-            )),
-        ),
-        spec => return Err(WeightMatrixError::UnsupportedConfiguration(format!("{spec:?}"))),
-    };
-    let quantization = match quantized {
-        None => None,
-        Some((bits, group_size, method)) => {
-            let mode = match bits {
-                4 => QuantizationMode::U4,
-                8 => QuantizationMode::U8,
-                _ => {
-                    return Err(WeightMatrixError::UnsupportedConfiguration(format!(
-                        "{method} bits={bits}, group_size={group_size}"
-                    )));
-                },
-            };
-            if group_size == 0 {
-                return Err(WeightMatrixError::UnsupportedConfiguration("group size must be non-zero".into()));
-            }
-            Some(QuantizationInfo {
-                mode,
-                method,
-                group_size,
-            })
-        },
-    };
-    Ok(ParsedWeightSpec {
-        layout,
-        quantization,
-    })
-}
-
-struct Quantized<B: Backend> {
-    scales: B::GlobalBuffer,
-    correction: QuantizedCorrection<B::GlobalBuffer>,
-    params: QuantParams,
-    info: QuantizationInfo,
-    signed_codes: bool,
-    weights_layout: WeightsLayout<B>,
-}
-
 pub struct WeightMatrix<B: Backend> {
-    values: B::GlobalBuffer,
-    quantized: Option<Quantized<B>>,
+    values: B::GlobalGpuBuffer,
+    encoding: WeightEncoding<B>,
+}
+
+enum WeightEncoding<B: Backend> {
+    Dense,
+    Quantized {
+        scales: B::GlobalGpuBuffer,
+        correction: QuantizedCorrection<B::GlobalGpuBuffer>,
+        params: QuantParams,
+        mode: QuantizationMode,
+        group_size: u32,
+        signed_codes: bool,
+        weights_layout: WeightsLayout<B>,
+    },
+    Trellis {
+        row_scales: B::GlobalGpuBuffer,
+        codebook: TrellisCodebook,
+        format: TrellisFormat,
+    },
 }
 
 impl<B: Backend> WeightMatrix<B> {
-    pub fn load(
+    pub async fn load(
         output_dim: u32,
         input_dim: u32,
         data_type: DataType,
         spec: AnyWeightMatrixSpec,
         required_layout: Layout,
-        tree: &ParameterTree<B>,
+        tree: &ParameterTree<'_, B>,
     ) -> Result<Self, WeightMatrixError<B>> {
-        let ParsedWeightSpec {
-            layout,
-            quantization: quantization_info,
-        } = parse_spec(&spec)?;
+        let (layout, quantized) = match spec {
+            AnyWeightMatrixSpec::FullPrecisionSpec(spec) => (spec.layout, None),
+            AnyWeightMatrixSpec::MLXSpec(spec) => {
+                (spec.layout, Some((spec.bits, spec.group_size, QuantizationMethod::ScaleBias)))
+            },
+            AnyWeightMatrixSpec::IntSpec(spec) => (
+                spec.layout,
+                Some((
+                    spec.bits,
+                    spec.group_size,
+                    if spec.is_symmetric {
+                        QuantizationMethod::ScaleSymmetric
+                    } else {
+                        QuantizationMethod::ScaleZeroPoint
+                    },
+                )),
+            ),
+            AnyWeightMatrixSpec::QtipGaussianSpec(spec) => {
+                if spec.layout != Layout::OutputInput || required_layout != Layout::OutputInput {
+                    return Err(WeightMatrixError::UnsupportedConfiguration(format!(
+                        "Trellis requires OutputInput layout, got stored={:?}, requested={required_layout:?}",
+                        spec.layout
+                    )));
+                }
+                let format = TrellisFormat {
+                    vector_width: spec.vector_width,
+                    transition_bits: spec.transition_bits,
+                    restart_columns: (spec.restart_columns != 0).then_some(spec.restart_columns),
+                };
+                let code_shape = [output_dim, format.code_row_bytes(input_dim)];
+                let values = tree.read_buffer("codes", &code_shape, DataType::U8).await?;
+                let row_scales = tree.read_buffer("scales", &[output_dim], DataType::F32).await?;
+                return Ok(Self {
+                    values,
+                    encoding: WeightEncoding::Trellis {
+                        row_scales,
+                        codebook: spec.codebook,
+                        format,
+                    },
+                });
+            },
+            spec => return Err(WeightMatrixError::UnsupportedConfiguration(format!("{spec:?}"))),
+        };
         if layout != required_layout {
             return Err(WeightMatrixError::UnsupportedConfiguration(format!(
                 "expected {required_layout:?} weight layout, got {layout:?}"
             )));
         }
-        let (rows, columns) = physical_shape(&layout, output_dim, input_dim);
+        let (rows, columns) = match layout {
+            Layout::OutputInput => (output_dim, input_dim),
+            Layout::InputOutput => (input_dim, output_dim),
+        };
 
-        let Some(info) = quantization_info else {
-            let values = tree.read_buffer("weights", &[rows, columns], data_type)?;
+        let Some((bits, group_size, method)) = quantized else {
+            let values = tree.read_buffer("weights", &[rows, columns], data_type).await?;
             return Ok(Self {
                 values,
-                quantized: None,
+                encoding: WeightEncoding::Dense,
             });
         };
+        let mode = QuantizationMode::from_unsigned_bits(bits).ok_or_else(|| {
+            WeightMatrixError::UnsupportedConfiguration(format!("{method} bits={bits}, group_size={group_size}"))
+        })?;
         // Parameters swap the weight axes once K is grouped: output-input stores [G, N], input-output stores [N, G].
         let params_layout = match layout {
             Layout::OutputInput => QuantParamsLayout::GroupOutput,
             Layout::InputOutput => QuantParamsLayout::OutputGroup,
         };
 
-        let group_size = info.group_size;
-        let packing_divisor = info.mode.packing_divisor();
-        let storage_data_type = info.mode.storage_type();
+        let packing_divisor = mode.packing_divisor();
         if !columns.is_multiple_of(packing_divisor) {
             return Err(WeightMatrixError::UnsupportedConfiguration(format!(
                 "stored columns {columns} are not divisible by packing divisor {packing_divisor}"
             )));
         }
-        let groups = columns.div_ceil(group_size);
-
-        let values = tree.read_buffer("weights", &[rows, columns / packing_divisor], storage_data_type)?;
-        let params = QuantParams::new(params_layout, rows, groups);
-        let load_plane =
-            |name: &str, shape: [u32; 2], storage_type: DataType| -> Result<B::GlobalBuffer, WeightMatrixError<B>> {
-                Ok(tree.read_buffer(name, &shape, storage_type)?)
-            };
-        let scales = load_plane("scales", params.scale_shape(), data_type)?;
-        let correction = match info.method {
+        let values = tree.read_buffer("weights", &[rows, columns / packing_divisor], mode.storage_type()).await?;
+        let params = QuantParams::new(params_layout, rows, columns.div_ceil(group_size));
+        let scales = tree.read_buffer("scales", &params.scale_shape(), data_type).await?;
+        let correction = match method {
             QuantizationMethod::ScaleBias => {
-                QuantizedCorrection::Biases(load_plane("biases", params.scale_shape(), data_type)?)
+                QuantizedCorrection::Biases(tree.read_buffer("biases", &params.scale_shape(), data_type).await?)
             },
-            QuantizationMethod::ScaleZeroPoint => QuantizedCorrection::ZeroPoints(load_plane(
-                "zero_points",
-                params.zero_point_shape(info.mode),
-                info.mode.storage_type(),
-            )?),
+            QuantizationMethod::ScaleZeroPoint => QuantizedCorrection::ZeroPoints(
+                tree.read_buffer("zero_points", &params.zero_point_shape(mode), mode.storage_type()).await?,
+            ),
             QuantizationMethod::ScaleSymmetric => QuantizedCorrection::Symmetric,
         };
 
         Ok(Self {
             values,
-            quantized: Some(Quantized {
+            encoding: WeightEncoding::Quantized {
                 scales,
                 correction,
                 params,
-                info,
+                mode,
+                group_size,
                 signed_codes: false,
                 weights_layout: Default::default(),
-            }),
+            },
         })
     }
 
-    pub fn values(&self) -> &B::GlobalBuffer {
+    pub fn values(&self) -> &B::GlobalGpuBuffer {
         &self.values
     }
 
-    pub fn quantization(&self) -> Option<QuantizationInfo> {
-        self.quantized.as_ref().map(|quantized| quantized.info)
+    pub fn scales(&self) -> Option<&B::GlobalGpuBuffer> {
+        self.matmul_b().quantized().map(|quantized| quantized.scales)
     }
 
-    pub fn scales(&self) -> Option<&B::GlobalBuffer> {
-        self.quantized.as_ref().map(|quantized| &quantized.scales)
+    pub fn zero_points(&self) -> Option<&B::GlobalGpuBuffer> {
+        self.matmul_b().quantized()?.zero_points()
     }
 
-    pub fn zero_points(&self) -> Option<&B::GlobalBuffer> {
-        self.quantized.as_ref()?.correction.zero_points()
+    pub fn biases(&self) -> Option<&B::GlobalGpuBuffer> {
+        self.matmul_b().quantized()?.biases()
     }
 
-    pub fn biases(&self) -> Option<&B::GlobalBuffer> {
-        self.quantized.as_ref()?.correction.biases()
-    }
-
-    pub fn matmul_b(&self) -> MatmulB<&B::GlobalBuffer> {
-        let Some(quantized) = self.quantized.as_ref() else {
-            return MatmulB::FullPrecision {
+    pub fn matmul_b(&self) -> MatmulB<&B::GlobalGpuBuffer> {
+        match &self.encoding {
+            WeightEncoding::Dense => MatmulB::FullPrecision {
                 b: &self.values,
-            };
-        };
-        let mode = quantized.info.mode;
-        let group_size = quantized.info.group_size;
-        let signed_codes = quantized.signed_codes;
-        MatmulB::Quantized(QuantizedB {
-            codes: &self.values,
-            scales: &quantized.scales,
-            correction: quantized.correction.as_ref(),
-            params: quantized.params,
-            mode,
-            group_size,
-            signed_codes,
-            weights_layout: quantized.weights_layout,
-        })
+            },
+            WeightEncoding::Quantized {
+                scales,
+                correction,
+                params,
+                mode,
+                group_size,
+                signed_codes,
+                weights_layout,
+            } => MatmulB::Quantized(QuantizedB {
+                codes: &self.values,
+                scales,
+                correction: correction.as_ref(),
+                params: *params,
+                mode: *mode,
+                group_size: *group_size,
+                signed_codes: *signed_codes,
+                weights_layout: *weights_layout,
+            }),
+            WeightEncoding::Trellis {
+                row_scales,
+                codebook,
+                format,
+            } => MatmulB::Trellis {
+                codes: &self.values,
+                row_scales,
+                codebook: *codebook,
+                format: *format,
+            },
+        }
     }
 
     pub fn optimize_weights_layout<E>(
         &mut self,
-        optimize: impl FnOnce(&mut B::GlobalBuffer) -> Result<WeightsLayout<B>, E>,
+        optimize: impl FnOnce(&mut B::GlobalGpuBuffer) -> Result<(WeightsLayout<B>, bool), E>,
     ) -> Result<(), E> {
-        let Some(quantized) =
-            self.quantized.as_mut().filter(|quantized| quantized.weights_layout == WeightsLayout::<B>::default())
+        let WeightEncoding::Quantized {
+            weights_layout,
+            signed_codes,
+            ..
+        } = &mut self.encoding
         else {
             return Ok(());
         };
-        quantized.weights_layout = optimize(&mut self.values)?;
+        if *weights_layout != WeightsLayout::<B>::default() {
+            return Ok(());
+        }
+        (*weights_layout, *signed_codes) = optimize(&mut self.values)?;
         Ok(())
-    }
-
-    pub fn try_prepare_a8_storage(&mut self) -> bool {
-        let Some(quantized) = self.quantized.as_mut() else {
-            return false;
-        };
-        quantized.prepare_a8_storage(&mut self.values)
-    }
-
-    pub fn a8_signed_codes(&self) -> Option<bool> {
-        self.quantized.as_ref().map(|quantized| quantized.info.mode != QuantizationMode::U4)
-    }
-}
-
-impl<B: Backend> Quantized<B> {
-    fn prepare_a8_storage(
-        &mut self,
-        values: impl BufferMut<Buffer: BufferCpuAccessible>,
-    ) -> bool {
-        if self.params.layout() != QuantParamsLayout::GroupOutput {
-            return false;
-        }
-        if self.info.mode != QuantizationMode::U4 {
-            if !self.signed_codes
-                && let Some(sign_flip_mask) = self.info.mode.weight_codes_sign_flip_mask()
-            {
-                let broadcast_mask = u64::from(sign_flip_mask) * 0x0101_0101_0101_0101;
-                let (prefix, words, suffix) = bytemuck::pod_align_to_mut::<u8, u64>(values.as_slice_mut());
-                words.iter_mut().for_each(|word| *word ^= broadcast_mask);
-                prefix.iter_mut().chain(suffix.iter_mut()).for_each(|code| *code ^= sign_flip_mask);
-            }
-            self.signed_codes = true;
-        }
-        true
-    }
-}
-
-fn physical_shape(
-    layout: &Layout,
-    output_dim: u32,
-    input_dim: u32,
-) -> (u32, u32) {
-    match layout {
-        Layout::OutputInput => (output_dim, input_dim),
-        Layout::InputOutput => (input_dim, output_dim),
     }
 }

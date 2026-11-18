@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,14 @@ pub const DEFAULT_LOG_TAIL: u64 = 1000;
 
 /// Output of a build, pull, compose or CLI step kept for its error message (items carry all of it).
 const STEP_OUTPUT: usize = 1 << 20;
+/// How long Docker has to answer `status`. A healthy daemon lists and inspects in well under a
+/// second; a hung one holds each call for a minute before it fails (seen: Docker Desktop answering
+/// `docker ps` with a 500 after 62 s, and every command of a session waiting 124 s for it, in a
+/// project that has no container).
+const STATUS_LIMIT: Duration = Duration::from_secs(4);
+/// After Docker gave no answer, how long `status` goes without asking it again.
+const SILENT_FOR: Duration = Duration::from_secs(60);
+const DOCKER_SILENT: &str = "Docker does not answer: restart Docker Desktop";
 
 /// Plugin configuration (`[backend.config]` / `[plugin.config]`).
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +347,11 @@ pub struct Containers {
     /// Container id -> how commands run: user and per-command environment (resolved).
     settings: Mutex<HashMap<String, ExecSettings>>,
     busy: Mutex<HashSet<String>>,
+    /// When Docker last gave `status` no answer within [`STATUS_LIMIT`]: for [`SILENT_FOR`] after
+    /// it, `status` answers from memory without asking Docker again.
+    silent: Mutex<Option<Instant>>,
+    /// Docker listed every container of this plugin once: `entries` holds them all since.
+    listed: AtomicBool,
     publish: Publish,
     /// Calls to the memory plugin (the seeds of roots live in the app's graph).
     call: Caller,
@@ -385,6 +399,8 @@ impl Containers {
             shells: Mutex::new(HashMap::new()),
             settings: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            silent: Mutex::new(None),
+            listed: AtomicBool::new(false),
             publish,
             call,
             stopping: CancellationToken::new(),
@@ -1648,13 +1664,53 @@ impl Containers {
             Ok(docker) => docker,
             Err(message) => return Ok(self.unreachable(&root, &message)),
         };
-        let found = match self.lookup(&docker, &root).await {
-            Ok(found) => found,
-            Err(error) if error.code == codes::UNAVAILABLE => {
+        // Callers ask this before every command: a Docker that does not answer must not hold them.
+        let silent = |at: Option<Instant>| {
+            if let Ok(mut silent) = self.silent.lock() {
+                *silent = at;
+            }
+        };
+        let listed = self.listed.load(Ordering::SeqCst);
+        // A project without a container is not a question for Docker: once every container of
+        // this plugin was listed, memory holds them all (an attach adds its own), so a root that
+        // is not there has none.
+        if listed && self.remembered(&root).is_none() {
+            return Ok(None);
+        }
+        if self.silent.lock().ok().and_then(|at| *at).is_some_and(|at| at.elapsed() < SILENT_FOR) {
+            return Ok(self.unreachable(&root, DOCKER_SILENT));
+        }
+        // The first question lists them all, once. The docker process is killed when the call is
+        // dropped at the limit.
+        if !listed {
+            return match tokio::time::timeout(STATUS_LIMIT, self.list_all(&docker)).await {
+                Ok(Ok(_)) => {
+                    silent(None);
+                    Ok(self.remembered(&root).map(|entry| entry.info))
+                }
+                Ok(Err(error)) if error.code == codes::UNAVAILABLE => {
+                    Ok(self.unreachable(&root, &error.message))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    silent(Some(Instant::now()));
+                    Ok(self.unreachable(&root, DOCKER_SILENT))
+                }
+            };
+        }
+        // It has one: how it is now (running, stopped, gone) is Docker's to say.
+        let found = match tokio::time::timeout(STATUS_LIMIT, self.lookup(&docker, &root)).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(error)) if error.code == codes::UNAVAILABLE => {
                 return Ok(self.unreachable(&root, &error.message));
             }
-            Err(error) => return Err(error),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                silent(Some(Instant::now()));
+                return Ok(self.unreachable(&root, DOCKER_SILENT));
+            }
         };
+        silent(None);
         Ok(self.settle(&root, found))
     }
 
@@ -1698,15 +1754,20 @@ impl Containers {
             Ok(docker) => docker,
             Err(message) => return Ok(self.list_unreachable(&message)),
         };
-        let ids = match self.ps(&docker, None).await {
-            Ok(ids) => ids,
+        match self.list_all(&docker).await {
             Err(error) if error.code == codes::UNAVAILABLE => {
-                return Ok(self.list_unreachable(&error.message));
+                Ok(self.list_unreachable(&error.message))
             }
-            Err(error) => return Err(error),
-        };
+            listed => listed,
+        }
+    }
+
+    /// Every container of this plugin as Docker reports it now; memory then holds them all
+    /// ([`Self::status`] answers a root that has none without asking Docker).
+    async fn list_all(&self, docker: &Docker) -> Result<ListResult, RpcError> {
+        let ids = self.ps(docker, None).await?;
         let found: Vec<Entry> = self
-            .inspect(&docker, &ids)
+            .inspect(docker, &ids)
             .await?
             .iter()
             .map(entry_of)
@@ -1717,6 +1778,7 @@ impl Containers {
             self.store(&entry.info.root.clone(), Some(entry.clone()));
             containers.push(entry.info);
         }
+        self.listed.store(true, Ordering::SeqCst);
         let remembered: Vec<String> = self
             .entries
             .lock()

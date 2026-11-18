@@ -9,7 +9,7 @@ use crate::{
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
-        linear::LinearEncodeError,
+        linear::{InputRhtParameters, LinearEncodeError},
         mixer::{
             attention::{Attention, AttentionEncodeError, AttentionNewError, rope::PrecalculatedRoPE},
             delta_net::{DeltaNet, DeltaNetNewError},
@@ -73,7 +73,7 @@ pub enum SnapshotMode {
 /// CortexCode patch P1: a copy of one mixer state (scalars plus CPU-accessible buffer copies).
 pub struct MixerSnapshot<B: Backend> {
     pub scalars: Box<[u64]>,
-    pub buffers: Box<[B::GlobalBuffer]>,
+    pub buffers: Box<[B::GlobalGpuBuffer]>,
 }
 
 #[derive(Debug, Error)]
@@ -137,18 +137,18 @@ pub enum MixerNewError<B: Backend> {
 }
 
 impl<B: Backend> dyn Mixer<B> {
-    pub fn new(
+    pub async fn new(
         hidden_dim: u32,
         data_type: DataType,
         rope_config: Option<&AnyRoPEConfig>, // TODO: this shouldn't exist
         config: &AnyTokenMixerConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Box<dyn Mixer<B>>, Option<B::GlobalBuffer>), MixerNewError<B>> {
+    ) -> Result<(Box<dyn Mixer<B>>, Option<InputRhtParameters<B>>), MixerNewError<B>> {
         match config {
             AnyTokenMixerConfig::AttentionConfig(config) => {
                 let (attention, in_projection_input_hadamard_factors) =
-                    Attention::new(hidden_dim, data_type, rope_config, config, parameter_tree, context)?;
+                    Attention::new(hidden_dim, data_type, rope_config, config, parameter_tree, context).await?;
 
                 Ok((Box::new(attention), in_projection_input_hadamard_factors))
             },
@@ -156,7 +156,7 @@ impl<B: Backend> dyn Mixer<B> {
                 assert!(rope_config.is_none(), "unexpected rope for delta net mixer");
 
                 let (delta_net, in_projection_input_hadamard_factors) =
-                    DeltaNet::new(hidden_dim, data_type, config, parameter_tree, context)?;
+                    DeltaNet::new(hidden_dim, data_type, config, parameter_tree, context).await?;
 
                 Ok((Box::new(delta_net), in_projection_input_hadamard_factors))
             },
@@ -164,10 +164,11 @@ impl<B: Backend> dyn Mixer<B> {
                 assert!(rope_config.is_none(), "unexpected rope for short conv mixer");
 
                 let (short_conv, in_projection_input_hadamard_factors) =
-                    ShortConv::new(hidden_dim, data_type, config, parameter_tree, context)?;
+                    ShortConv::new(hidden_dim, data_type, config, parameter_tree, context).await?;
 
                 Ok((Box::new(short_conv), in_projection_input_hadamard_factors))
             },
+            AnyTokenMixerConfig::SparseAttentionConfig(_) => todo!("sparse attention"),
         }
     }
 }

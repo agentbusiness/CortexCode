@@ -3,7 +3,7 @@ name = "cc-mesh"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 publish = false
 description = "CortexCode mesh@1 plugin: this person's instances linked by key, paired with a short code, exchanging capability cards and lending a model or hands through the frame's contracts."
 
@@ -27,15 +27,15 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 iroh = "1.4"
-ignore = "0.4"
+ignore = "0.4.34"
 iroh-mdns-address-lookup = "0.6"
 spake2 = "0.4"
-sha2 = "0.10"
+sha2 = "0.11.1"
 rand = "0.10"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23.1"
 data-encoding = "2"
-sysinfo = "0.37"
+sysinfo = "0.40.4"
 libc = "0.2.183"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

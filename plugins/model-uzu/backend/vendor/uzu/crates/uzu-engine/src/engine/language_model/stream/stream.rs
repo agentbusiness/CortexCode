@@ -8,11 +8,11 @@ use std::{
 use futures::executor::block_on;
 use shoji::traits::backend::chat_token::TokenStreamMetrics;
 
-#[cfg(grammar)]
+
 use crate::engine::language_model::grammar::Grammar;
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable, Context,
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, CommandBufferExecutable, Context, CpuBuffer, GlobalBufferCpuGpu,
         TimestampSpan,
         capture_matcher::{CAPTURE_MATCHER, CaptureMatcherSpan},
         gpu_types::trie::TrieNode as GpuTrieNode,
@@ -47,7 +47,8 @@ impl<B: Backend> ForwardPassChaining<B> {
         &'a mut self,
         tokens: &mut Vec<u64>,
         timestamps: Option<&Sender<Box<[TimestampSpan]>>>,
-        #[cfg(grammar)] grammar: Option<&mut Grammar>,
+        context: &B::Context,
+         grammar: Option<&mut Grammar>,
     ) -> Result<(u64, Option<&'a B::ScratchBuffer>), LanguageModelStreamError<B>> {
         match self {
             Self::Constant {
@@ -59,7 +60,7 @@ impl<B: Backend> ForwardPassChaining<B> {
                 for pending in replace(&mut in_flight.pending, Box::new([])) {
                     wait(pending, timestamps).await.map_err(LanguageModelStreamError::Backend)?;
                 }
-                let output_tokens = in_flight.output_tokens.as_slice::<u32>();
+                let output_tokens = context.copyout::<u32>(&*in_flight.output_tokens).await.map_err(LanguageModelStreamError::Backend)?;
                 assert_eq!(output_tokens.len(), 1);
                 let token_id = output_tokens[0] as u64;
                 let output_norm = in_flight.output_norm.take();
@@ -68,7 +69,7 @@ impl<B: Backend> ForwardPassChaining<B> {
                     output_norm,
                 };
                 tokens.push(token_id);
-                #[cfg(grammar)]
+                
                 if let Some(grammar) = grammar {
                     grammar.accept_token(token_id)?;
                 }
@@ -102,8 +103,8 @@ struct DecodingStatePending<B: Backend> {
     capture_span: Option<CaptureMatcherSpan>,
     hidden_features: Option<Box<[B::ScratchBuffer]>>,
     output_norm: Option<B::ScratchBuffer>,
-    output_tokens: Arc<B::GlobalBuffer>,
-    _input_token_source: Option<Arc<B::GlobalBuffer>>,
+    output_tokens: Arc<B::GlobalGpuBuffer>,
+    _input_token_source: Option<Arc<B::GlobalGpuBuffer>>,
 }
 
 enum DecodingState<B: Backend> {
@@ -141,7 +142,7 @@ pub struct LanguageModelStream<'a, B: Backend> {
     model_state: &'a mut LanguageModelState<B>,
     options: LanguageModelStreamOptions,
     allocation_pool: Arc<B::AllocationPool>,
-    context_ring: Option<B::GlobalBuffer>,
+    context_ring: Option<B::GlobalGpuBuffer>,
     decoding_state: DecodingState<B>,
     metrics: TokenStreamMetrics,
 }
@@ -173,7 +174,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             let mut context_ring = model
                 .engine
                 .context
-                .create_buffer(size_for_shape(&[2 + suffix_repetition_length], DataType::U32))
+                .create_buffer_cpu_gpu(size_for_shape(&[2 + suffix_repetition_length], DataType::U32))
                 .map_err(LanguageModelStreamError::Backend)?;
 
             // CortexCode patch P3: an empty window when only generated tokens are penalized.
@@ -193,7 +194,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .collect::<Box<[_]>>(),
             );
 
-            Some(context_ring)
+            Some(context_ring.handoff().map_err(LanguageModelStreamError::Backend)?)
         } else {
             None
         };
@@ -334,7 +335,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                         None
                     };
 
-                    #[cfg(grammar)]
+                    
                     let bitmask = if let Some(grammar) = options.grammar.as_mut() {
                         let mut bitmask = command_buffer
                             .allocate_constant(
@@ -350,8 +351,6 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     } else {
                         None
                     };
-                    #[cfg(not(grammar))]
-                    let bitmask = None::<B::ConstantBuffer>;
 
                     output_norm = decoder_output.final_hidden;
                     let sampled_row = batch_dim.size() - 1;
@@ -450,7 +449,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                 seed_token,
             } => {
                 self.model_state.tokens.push(seed_token);
-                #[cfg(grammar)]
+                
                 if let Some(grammar) = self.options.grammar.as_mut() {
                     let _ = grammar.accept_token(seed_token); // TODO: this should not be ignored
                 }
@@ -473,16 +472,15 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                             .await
                             .map_err(LanguageModelStreamError::Backend)?;
                     }
-                    let sampled_tokens = forward_pass_pending
-                        .output_tokens
-                        .as_slice::<u32>()
+                    let sampled_tokens = self.model.engine.context
+                        .copyout::<u32>(&*forward_pass_pending.output_tokens).await.map_err(LanguageModelStreamError::Backend)?
                         .iter()
                         .map(|x| *x as u64)
                         .collect::<Box<[u64]>>();
                     let flat_trie = forward_pass_pending.input_trie.linearize();
                     let full = flat_trie.accept(
                         &sampled_tokens,
-                        #[cfg(grammar)]
+                        
                         self.options.grammar.as_mut(),
                     )?;
                     let output_norm = forward_pass_pending.output_norm.map(|norm| {
@@ -597,7 +595,8 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .resolve(
                         &mut self.model_state.tokens,
                         self.options.timestamps.as_ref(),
-                        #[cfg(grammar)]
+                        &self.model.engine.context,
+                        
                         self.options.grammar.as_mut(),
                     )
                     .await?
@@ -624,7 +623,8 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .resolve(
                         &mut self.model_state.tokens,
                         self.options.timestamps.as_ref(),
-                        #[cfg(grammar)]
+                        &self.model.engine.context,
+                        
                         self.options.grammar.as_mut(),
                     )
                     .await?;
@@ -638,7 +638,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     self.model.decoder.embedding(),
                     shape,
                     &self.options.sampling_method,
-                    #[cfg(grammar)]
+                    
                     self.options.grammar.as_mut(),
                     &self.model_state.prng,
                     self.allocation_pool.clone(),
@@ -723,7 +723,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
         )?;
         let logits = decoder_output.logits.unwrap();
 
-        #[cfg(grammar)]
+        
         let (bitmask, mut command_buffer) = if let Some(grammar) = self.options.grammar.as_mut() {
             if chain_copy.is_some() {
                 pending.push(command_buffer.end_encoding().submit());
@@ -746,7 +746,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .map_err(LanguageModelStreamError::Backend)?;
 
                 prev_output
-                    .resolve(&mut self.model_state.tokens, self.options.timestamps.as_ref(), Some(grammar))
+                    .resolve(&mut self.model_state.tokens, self.options.timestamps.as_ref(), &self.model.engine.context, Some(grammar))
                     .await?;
                 if grammar.next_bitmask(bitmask.as_slice_mut()) {
                     (Some(bitmask), command_buffer)
@@ -771,8 +771,6 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
         } else {
             (None, command_buffer)
         };
-        #[cfg(not(grammar))]
-        let bitmask = None::<B::ConstantBuffer>;
 
         let seeds = if matches!(self.options.sampling_method, SamplingMethod::Stochastic { .. }) {
             Some(
@@ -864,7 +862,8 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                 .resolve(
                     &mut self.model_state.tokens,
                     self.options.timestamps.as_ref(),
-                    #[cfg(grammar)]
+                    &self.model.engine.context,
+                    
                     self.options.grammar.as_mut(),
                 )
                 .await?
@@ -914,7 +913,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                         .map_err(LanguageModelStreamError::Backend)?;
                 }
 
-                Some(in_flight.output_tokens.as_slice::<u32>()[0] as u64)
+                Some(self.model.engine.context.copyout::<u32>(&*in_flight.output_tokens).await.map_err(LanguageModelStreamError::Backend)?[0] as u64)
             },
             DecodingState::Accepting {
                 full,

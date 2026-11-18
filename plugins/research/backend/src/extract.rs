@@ -21,7 +21,7 @@ use crate::text::{normalize_date, squash};
 use dom_smoothie::{Config as ReadabilityConfig, Readability, TextMode};
 
 /// Bumped when extraction changes, so cached documents are extracted again from their stored bytes.
-pub const EXTRACTOR_VERSION: u32 = 1;
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Extracted {

@@ -67,7 +67,7 @@ unsafe extern "C" {
 }
 
 /// The engine's revision (the vendored fork, see `vendor/llama.cpp/REVISION`).
-pub const REVISION: &str = "PrismML llama.cpp prism 0082ac24a89ae62132041b40e2c0170e278a98f4";
+pub const REVISION: &str = "PrismML llama.cpp prism 3f035ba664f8f08c3d9432b6421f8f1a0da1f37a";
 
 fn error_text(buffer: &[u8]) -> String {
     let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());

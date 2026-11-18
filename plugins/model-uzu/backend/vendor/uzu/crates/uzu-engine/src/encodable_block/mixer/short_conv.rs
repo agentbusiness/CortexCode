@@ -10,7 +10,7 @@ use crate::{
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
-        linear::{Linear, LinearBlockError},
+        linear::{InputRhtParameters, Linear, LinearBlockError},
         mixer::{Mixer, MixerEncodeError, MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode, attention::rope::PrecalculatedRoPE},
     },
     safetensors::{ParameterLoaderError, ParameterTree},
@@ -27,7 +27,7 @@ enum ShortConvStateSuffixStatus<B: Backend> {
 }
 
 pub struct ShortConvState<B: Backend> {
-    conv_state: B::GlobalBuffer,
+    conv_state: B::GlobalGpuBuffer,
     suffix_state: Option<ShortConvStateSuffixStatus<B>>,
     is_empty: bool,
 }
@@ -81,10 +81,11 @@ impl<B: Backend> MixerState<B> for ShortConvState<B> {
         if self.suffix_state.is_some() {
             return Err(MixerSnapshotError::Busy("short conv state has an unaccepted suffix"));
         }
-        let mut conv_state = command_buffer.context().create_buffer(self.conv_state.size()).map_err(MixerSnapshotError::Backend)?;
-        command_buffer.encode_copy(&self.conv_state, &mut conv_state);
+        let mut conv_state = command_buffer.context().create_buffer_gpu(self.conv_state.size()).map_err(MixerSnapshotError::Backend)?;
+        if self.is_empty { command_buffer.encode_fill(&mut conv_state, 0); }
+        else { command_buffer.encode_copy(&self.conv_state, &mut conv_state); }
         Ok(MixerSnapshot {
-            scalars: Box::new([]),
+            scalars: Box::new([u64::from(self.is_empty)]),
             buffers: Box::new([conv_state]),
         })
     }
@@ -97,6 +98,12 @@ impl<B: Backend> MixerState<B> for ShortConvState<B> {
         if self.suffix_state.is_some() {
             return Err(MixerSnapshotError::Busy("short conv state has an unaccepted suffix"));
         }
+        //0.7 defers zero initialization until the first encode; retain that state across restore.
+        let is_empty = match snapshot.scalars.as_ref() {
+            [0] => false,
+            [1] => true,
+            _ => return Err(MixerSnapshotError::Mismatch("recurrent snapshot empty-state flag differs".into())),
+        };
         if snapshot.buffers.len() != 1 {
             return Err(MixerSnapshotError::Mismatch("short conv snapshot has the wrong number of buffers".into()));
         }
@@ -104,6 +111,7 @@ impl<B: Backend> MixerState<B> for ShortConvState<B> {
             return Err(MixerSnapshotError::Mismatch("short conv conv_state size differs".into()));
         }
         command_buffer.encode_copy(&snapshot.buffers[0], &mut self.conv_state);
+        self.is_empty = is_empty;
         Ok(())
     }
 }
@@ -118,8 +126,8 @@ pub struct ShortConv<B: Backend> {
     short_conv_prefill: <B::Kernels as Kernels>::ShortConvPrefillKernel,
     short_conv_decode: <B::Kernels as Kernels>::ShortConvDecodeKernel,
     short_conv_trie: <B::Kernels as Kernels>::ShortConvTrieKernel,
-    conv_weight: B::GlobalBuffer,
-    conv_bias: Option<B::GlobalBuffer>,
+    conv_weight: B::GlobalGpuBuffer,
+    conv_bias: Option<B::GlobalGpuBuffer>,
 }
 
 #[derive(Debug, Error)]
@@ -135,13 +143,13 @@ pub enum ShortConvNewError<B: Backend> {
 }
 
 impl<B: Backend> ShortConv<B> {
-    pub fn new(
+    pub async fn new(
         hidden_dim: u32,
         data_type: DataType,
         config: &ShortConvConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Self, Option<B::GlobalBuffer>), ShortConvNewError<B>> {
+    ) -> Result<(Self, Option<InputRhtParameters<B>>), ShortConvNewError<B>> {
         let kernel_size = config.kernel_size;
         if kernel_size < 2 {
             return Err(ShortConvNewError::UnsupportedConfiguration(format!(
@@ -157,7 +165,8 @@ impl<B: Backend> ShortConv<B> {
             false,
             &parameter_tree.subtree("in_projection"),
             context,
-        )?;
+        )
+        .await?;
 
         let out_projection = <dyn Linear<B>>::new(
             hidden_dim,
@@ -166,16 +175,17 @@ impl<B: Backend> ShortConv<B> {
             false,
             &parameter_tree.subtree("out_projection"),
             context,
-        )?;
+        )
+        .await?;
 
         let conv_tree = parameter_tree.subtree("conv");
 
         let conv_data_type = DataType::F32;
-        let conv_weight = conv_tree.read_buffer("weights", &[hidden_dim, kernel_size], conv_data_type)?;
+        let conv_weight = conv_tree.read_buffer("weights", &[hidden_dim, kernel_size], conv_data_type).await?;
 
         let has_bias = config.conv_config.has_biases;
         let conv_bias = if has_bias {
-            Some(conv_tree.read_buffer("biases", &[hidden_dim], conv_data_type)?)
+            Some(conv_tree.read_buffer("biases", &[hidden_dim], conv_data_type).await?)
         } else {
             None
         };
@@ -221,7 +231,7 @@ impl<B: Backend> ShortConv<B> {
             in_projected,
             &self.conv_weight,
             self.conv_bias.as_ref(),
-            None::<&B::GlobalBuffer>,
+            None::<&B::GlobalGpuBuffer>,
             &mut conv_output,
             &mut state.conv_state,
             1,
@@ -321,7 +331,7 @@ impl<B: Backend> Mixer<B> for ShortConv<B> {
         context: &B::Context,
     ) -> Result<Box<dyn MixerState<B>>, B::Error> {
         let conv_state =
-            context.create_buffer(size_for_shape(&[self.kernel_size - 1, self.hidden_dim], self.data_type))?;
+            context.create_buffer_gpu(size_for_shape(&[self.kernel_size - 1, self.hidden_dim], self.data_type))?;
 
         Ok(Box::new(ShortConvState {
             conv_state,

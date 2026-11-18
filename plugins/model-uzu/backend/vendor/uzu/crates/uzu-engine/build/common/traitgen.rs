@@ -53,7 +53,7 @@ pub fn traitgen(
                         quote! { impl crate::backends::common::BufferMut<Backend = Self::Backend> }
                     },
                 },
-                KernelArgumentType::Constant(ty) => {
+                KernelArgumentType::Value(ty) => {
                     let ty = gpu_type_paths
                         .resolve_type(ty)
                         .with_context(|| format!("invalid type for argument `{}`", a.name))?;
@@ -96,16 +96,25 @@ pub fn traitgen_all(
 
     let mut kernels: HashMap<KernelPath, Box<[Kernel]>> = HashMap::new();
 
+    let mut mismatches = Vec::new();
+
     for backend_kernels in backends_kernels {
         for (file_path, file_kernels) in backend_kernels {
             if let Some(cached_kernels) = kernels.get(&file_path) {
                 if cached_kernels != &file_kernels {
-                    bail!("{cached_kernels:?} != {file_kernels:?}");
+                    mismatches.push(format!(
+                        "kernel metadata mismatch at {}:\nfirst:  {cached_kernels:?}\nsecond: {file_kernels:?}",
+                        file_path.join("::")
+                    ));
                 }
             } else {
                 kernels.insert(file_path, file_kernels);
             }
         }
+    }
+
+    if !mismatches.is_empty() {
+        bail!("{}", mismatches.join("\n\n"));
     }
 
     let mut kernel_traits = Vec::new();

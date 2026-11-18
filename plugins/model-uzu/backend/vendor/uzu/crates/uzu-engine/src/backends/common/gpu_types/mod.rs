@@ -6,6 +6,7 @@
 
 pub mod activation_transform;
 pub mod activation_type;
+pub mod confidence_head;
 pub mod d4s4;
 pub mod embedding;
 pub mod gated_act_mul;
@@ -14,6 +15,7 @@ pub mod hadamard_order;
 pub mod kv_cache_update;
 pub mod kv_layout;
 pub mod matmul;
+pub mod qkv_norm;
 pub mod quantization;
 pub mod quantization_method;
 pub mod ring;

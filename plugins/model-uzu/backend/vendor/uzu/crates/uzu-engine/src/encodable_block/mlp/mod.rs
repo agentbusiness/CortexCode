@@ -9,7 +9,7 @@ use crate::{
     config::mlp::AnyMLPConfig,
     data_type::DataType,
     encodable_block::{
-        linear::LinearEncodeError,
+        linear::{InputRhtParameters, LinearEncodeError},
         mlp::dense::{DenseMlp, DenseMlpNewError},
     },
     safetensors::ParameterTree,
@@ -41,18 +41,19 @@ pub enum MlpBlockNewError<B: Backend> {
 }
 
 impl<B: Backend> dyn Mlp<B> {
-    pub fn new(
+    pub async fn new(
         model_dimension: u32,
         hidden_dimension: u32,
         data_type: DataType,
         config: &AnyMLPConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Box<dyn Mlp<B>>, Option<B::GlobalBuffer>), MlpBlockNewError<B>> {
+    ) -> Result<(Box<dyn Mlp<B>>, Option<InputRhtParameters<B>>), MlpBlockNewError<B>> {
         match config {
             AnyMLPConfig::DenseMLPConfig(config) => {
                 let (dense, up_input_hadamard_factors) =
-                    DenseMlp::new(model_dimension, hidden_dimension, data_type, config, parameter_tree, context)?;
+                    DenseMlp::new(model_dimension, hidden_dimension, data_type, config, parameter_tree, context)
+                        .await?;
 
                 Ok((Box::new(dense), up_input_hadamard_factors))
             },

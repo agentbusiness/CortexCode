@@ -9,15 +9,15 @@ use std::{
 
 use metal::{
     MTL4CommandAllocator, MTL4CommandQueue, MTL4CommandQueueDescriptor, MTLCaptureTarget, MTLComputePipelineState,
-    MTLDevice, MTLDeviceExt, MTLEvent, MTLEventExt, MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLSparsePageSize,
+    MTLDevice, MTLDeviceExt, MTLEvent, MTLEventExt, MTLFunctionConstantValues, MTLLibrary, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLSparsePageSize,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use parking_lot::Mutex;
 
 use crate::backends::{
     common::{
-        Backend, Context, DeviceCapabilities,
+        Backend, BufferRef, Context, CpuBuffer, DeviceCapabilities,
         allocator::{block::BlockAllocator, pool::PoolAllocator},
         capture_matcher::CAPTURE_MATCHER,
     },
@@ -34,8 +34,6 @@ use crate::backends::{
     },
 };
 
-pub(super) const LARGE_MIN_GPU_CORES: u32 = 30;
-
 pub(super) struct SparseState {
     pub did_ops: bool,
     pub event_value: u64,
@@ -44,7 +42,6 @@ pub(super) struct SparseState {
 pub struct MetalContext {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub gpu_core_count: u32,
-    pub apple_gpu_family: MTLGPUFamily,
     pub supports_mxu: bool,
     pub device_name: String,
     pub(super) residency_set: Arc<Mutex<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
@@ -126,7 +123,6 @@ impl Context for MetalContext {
 
         let device_name = device.name();
         let gpu_core_count = device.gpu_core_count();
-        let apple_gpu_family = device.newest_supported_apple_gpu_family();
         let supports_mxu = device.supports_mxu();
 
         let peak_memory_usage = Arc::new(AtomicUsize::new(0));
@@ -164,7 +160,6 @@ impl Context for MetalContext {
         Ok(Arc::new_cyclic(|weak_self: &Weak<Self>| Self {
             device,
             gpu_core_count,
-            apple_gpu_family,
             supports_mxu,
             device_name,
             residency_set: Arc::new(Mutex::new(residency_set)),
@@ -196,7 +191,7 @@ impl Context for MetalContext {
         crate::backends::common::DeviceFacts {
             name: Some(self.device_name.clone()),
             gpu_cores: Some(self.gpu_core_count),
-            gpu_family: Some(format!("{:?}", self.apple_gpu_family)),
+            gpu_family: Some(format!("{:?}", self.device.newest_supported_apple_gpu_family())),
             matrix_units: Some(self.supports_mxu),
             recommended_working_set_bytes: Some(self.device.recommended_max_working_set_size()),
             allocated_bytes: Some(self.device.current_allocated_size() as u64),
@@ -212,10 +207,17 @@ impl Context for MetalContext {
         MetalCommandBufferEncoding::new(self.weak_self.upgrade().unwrap(), name, allocation_pool)
     }
 
-    fn create_buffer(
+    fn create_buffer_gpu(
         &self,
         size: usize,
-    ) -> Result<<Metal as Backend>::GlobalBuffer, MetalError> {
+    ) -> Result<<Metal as Backend>::GlobalGpuBuffer, MetalError> {
+        self.block_allocator.allocate(size, |size| MetalDenseBuffer::new(&self.weak_self.upgrade().unwrap(), size))
+    }
+
+    fn create_buffer_cpu_gpu(
+        &self,
+        size: usize,
+    ) -> Result<<Metal as Backend>::GlobalBufferCpuGpu, MetalError> {
         self.block_allocator.allocate(size, |size| MetalDenseBuffer::new(&self.weak_self.upgrade().unwrap(), size))
     }
 
@@ -224,6 +226,17 @@ impl Context for MetalContext {
         capacity: usize,
     ) -> Result<<Self::Backend as Backend>::SparseBuffer, <Self::Backend as Backend>::Error> {
         MetalSparseBuffer::new(self.weak_self.upgrade().unwrap(), capacity)
+    }
+
+    async fn copyout<T: bytemuck::AnyBitPattern>(
+        &self,
+        buffer: impl BufferRef<Backend = Metal, Buffer = <Self::Backend as Backend>::GlobalGpuBuffer>,
+    ) -> Result<Vec<T>, MetalError> {
+        let (buffer, range) = buffer.parts();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(buffer.cpu_ptr().as_ptr().cast::<u8>().add(range.start), range.iter().len())
+        };
+        Ok(bytemuck::cast_slice(bytes).to_vec())
     }
 
     fn create_allocation_pool(&self) -> Arc<<Metal as Backend>::AllocationPool> {
@@ -242,7 +255,7 @@ impl Context for MetalContext {
     }
 
     fn device_capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::empty();
+        let mut capabilities = DeviceCapabilities::GLOBAL_BUFFERS_CPU_ACCESSIBLE;
         if self.device.supports_placement_sparse_resources() {
             capabilities |= DeviceCapabilities::SPARSE_BUFFERS;
         }

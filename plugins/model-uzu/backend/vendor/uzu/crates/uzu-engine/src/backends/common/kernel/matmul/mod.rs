@@ -6,14 +6,14 @@ mod matmul_b;
 mod output;
 pub mod routing;
 
-pub use arguments::MatmulArguments;
+pub use arguments::{MatmulArguments, MatmulGather};
 pub use d_ops::MatmulDOps;
 pub use kernel::MatmulKernel;
-pub use matmul_a::{Int8CodeLayout, MatmulA};
-pub use matmul_b::{MatmulB, QuantizedB, QuantizedCorrection};
-#[cfg(backend = "metal")]
-pub use matmul_b::{TRELLIS_CODES_TAIL_BYTES, TrellisFormat};
-pub use output::{MatmulOutput, MatmulOutputError};
+pub use matmul_a::{Int8CodeLayout, MatmulA, packed_half_bytes};
+pub use matmul_b::{MatmulB, QuantizedB, QuantizedCorrection, TrellisFormat};
+pub use output::MatmulOutput;
+#[cfg(any(backend = "cpu", backend = "metal", backend = "vulkan"))] // TODO: webgpu
+pub use output::MatmulOutputError;
 pub use routing::{ActivationFormat, MatmulShape};
 
 use crate::backends::common::{
@@ -55,6 +55,10 @@ impl QuantParams {
             row_count,
             group_count,
         }
+    }
+
+    pub const fn is_per_row(self) -> bool {
+        self.group_count == 1
     }
 
     pub const fn layout(self) -> QuantParamsLayout {
@@ -99,15 +103,16 @@ impl QuantParams {
         packing_divisor: u32,
     ) -> QuantParamsStrides {
         let row_values = self.padded_values_per_row(packing_divisor);
-        match self.layout {
-            QuantParamsLayout::OutputGroup => QuantParamsStrides {
-                output_stride: row_values,
-                group_stride: 1,
-            },
-            QuantParamsLayout::GroupOutput => QuantParamsStrides {
-                output_stride: 1,
-                group_stride: row_values,
-            },
+        let (output_stride, mut group_stride) = match self.layout {
+            QuantParamsLayout::OutputGroup => (row_values, 1),
+            QuantParamsLayout::GroupOutput => (1, row_values),
+        };
+        if self.is_per_row() {
+            group_stride = 0;
+        }
+        QuantParamsStrides {
+            output_stride,
+            group_stride,
         }
     }
 

@@ -1,0 +1,4 @@
+llama.cpp source vendored from unslothai/llama.cpp
+commit c2cf5f983a01bc2ea7a5d68a7ce4fb171e6fe335 (c2cf5f9), build b12347 (release tag b12347-mix-241a0f3)
+source tarball sha256 bc280e70bba1a486b8f294ce1b0b4a255d67efbd9fb3db2e58dba920d94d5be0
+Published release source asset, not the Git-tag archive. Local prompt-cache patches documented in PATCHES.md.

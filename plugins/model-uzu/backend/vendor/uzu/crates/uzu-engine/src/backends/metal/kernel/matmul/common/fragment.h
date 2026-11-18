@@ -303,20 +303,22 @@ struct Fragment {
       bool ALIGNED_N = false,
       class Ptr,
       class FragmentRowStride = Int<1>,
-      class FragmentColStride = Int<1>>
+      class FragmentColStride = Int<1>,
+      class ColStride = Int<1>>
   METAL_FUNC void store_safe(
       const ushort simd_lane_id,
       Ptr destination,
-      const int leading_dimension,
+      const int row_stride,
       const short2 tile_dimensions,
       FragmentRowStride fragment_row_stride = {},
-      FragmentColStride fragment_col_stride = {}
+      FragmentColStride fragment_col_stride = {},
+      ColStride col_stride = {}
   ) thread {
     transfer<STORE, SAFE, ALIGNED_M, ALIGNED_N>(
         simd_lane_id,
         destination,
-        leading_dimension,
-        Int<1>{},
+        row_stride,
+        col_stride,
         tile_dimensions.y,
         tile_dimensions.x,
         fragment_row_stride,
@@ -357,6 +359,45 @@ struct Fragment {
       store_safe(simd_lane_id, destination, leading_dimension, tile_dimensions);
     } else {
       store(simd_lane_id, destination, leading_dimension);
+    }
+  }
+
+  template <ushort K_SLICES, ushort OUTPUT_GROUPS>
+  METAL_FUNC bool reduce_k_slices(
+      threadgroup ElementType* partials,
+      const thread ThreadContext& thread_context
+  ) thread {
+    if constexpr (K_SLICES == 1) {
+      return true;
+    } else {
+      static_assert(ELEMENTS_PER_FRAGMENT % 2 == 0, "K-slice partials are stored as 2- or 4-wide vectors");
+      constexpr ushort WIDTH = ELEMENTS_PER_FRAGMENT % 4 == 0 ? 4 : 2;
+      constexpr ushort VECTORS = ELEMENTS_PER_FRAGMENT / WIDTH;
+      using Vector = metal::vec<ElementType, WIDTH>;
+      const ushort k_slice = ushort(thread_context.simdgroup_index) / OUTPUT_GROUPS;
+      const ushort output_group = ushort(thread_context.simdgroup_index) % OUTPUT_GROUPS;
+      const ushort lane = ushort(thread_context.simd_lane_id);
+      threadgroup Vector* group_partials = reinterpret_cast<threadgroup Vector*>(partials) +
+                                           output_group * (K_SLICES - 1) * VECTORS * METAL_SIMD_SIZE + lane;
+      thread Vector* values = reinterpret_cast<thread Vector*>(elements());
+      if (k_slice != 0) {
+        METAL_PRAGMA_UNROLL
+        for (ushort v = 0; v < VECTORS; ++v) {
+          group_partials[((k_slice - 1) * VECTORS + v) * METAL_SIMD_SIZE] = values[v];
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (k_slice != 0) {
+        return false;
+      }
+      METAL_PRAGMA_UNROLL
+      for (ushort slice = 1; slice < K_SLICES; ++slice) {
+        METAL_PRAGMA_UNROLL
+        for (ushort v = 0; v < VECTORS; ++v) {
+          values[v] += group_partials[((slice - 1) * VECTORS + v) * METAL_SIMD_SIZE];
+        }
+      }
+      return true;
     }
   }
 
@@ -432,6 +473,21 @@ private:
         }
       }
     });
+  }
+};
+
+template <typename T, ushort ROWS, ushort COLS, class Ops, class Generator>
+struct GeneratedFragment {
+  using ElementType = T;
+  using FragmentOpsType = Ops;
+  using ThreadVectorType = typename Ops::template ThreadVector<T>;
+  UZU_CONST ushort ROW_FRAGMENTS = ROWS;
+  UZU_CONST ushort COL_FRAGMENTS = COLS;
+  UZU_CONST bool MMA_TRANSPOSE = false;
+  Generator generator;
+
+  METAL_FUNC ThreadVectorType fragment_at(const ushort row, const ushort col) const thread {
+    return generator(row, col);
   }
 };
 

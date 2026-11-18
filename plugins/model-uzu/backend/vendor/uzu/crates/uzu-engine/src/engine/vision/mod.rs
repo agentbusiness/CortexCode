@@ -14,7 +14,8 @@
 //! channels produce zero outputs that the zero columns of the output projection ignore, and the
 //! softmax scale stays `1/sqrt(72)`: the result equals the unpadded attention.
 
-use std::{fs::File, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
+use futures::executor::block_on;
 
 use half::bf16;
 use parking_lot::Mutex;
@@ -23,17 +24,17 @@ use thiserror::Error;
 use crate::{
     backends::common::{
         Backend, BufferMut, BufferRef, CommandBufferEncoding, CommandBufferExecutable, CommandBufferPending,
-        Context, Kernels,
-        gpu_types::activation_type::ActivationType,
+        Context, CpuBuffer, GlobalBufferCpuGpu, Kernels,
+        gpu_types::{activation_type::ActivationType, qkv_norm::QKVNormParams},
         kernel::{
             ActivationKernel, AttentionArguments, AttentionInput, AttentionKernel, AttentionKernelConfig,
-            AttentionPrepareKernel, FullPrecisionInput,
+            AttentionPrepareKernel,
             NormalizationKernel, TensorAddScaleKernel,
-            matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulOutput},
+            matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulGather, MatmulKernel, MatmulOutput},
         },
     },
     data_type::DataType,
-    encodable_block::mixer::attention::KVCacheView,
+    encodable_block::mixer::attention::{KVCache, KVCacheView},
     engine::Engine,
     safetensors::{ParameterLoader, ParameterLoaderError, ParameterTree},
 };
@@ -134,15 +135,15 @@ pub enum VisionError<B: Backend> {
 }
 
 struct Linear<B: Backend> {
-    weights: B::GlobalBuffer,
-    biases: B::GlobalBuffer,
+    weights: B::GlobalGpuBuffer,
+    biases: B::GlobalGpuBuffer,
     input_dim: u32,
     output_dim: u32,
 }
 
 struct LayerNorm<B: Backend> {
-    scales: B::GlobalBuffer,
-    biases: B::GlobalBuffer,
+    scales: B::GlobalGpuBuffer,
+    biases: B::GlobalGpuBuffer,
 }
 
 struct Block<B: Backend> {
@@ -181,10 +182,10 @@ pub struct VisionModel<B: Backend> {
 fn buffer_from<B: Backend, T: bytemuck::NoUninit + bytemuck::AnyBitPattern>(
     context: &B::Context,
     data: &[T],
-) -> Result<B::GlobalBuffer, B::Error> {
-    let mut buffer = context.create_buffer(std::mem::size_of_val(data).max(1))?;
-    (&mut buffer).subrange_mut(..std::mem::size_of_val(data)).copyin(data);
-    Ok(buffer)
+) -> Result<B::GlobalGpuBuffer, B::Error> {
+    let mut buffer = context.create_buffer_cpu_gpu(std::mem::size_of_val(data).max(1))?;
+    buffer.as_slice_mut::<u8>()[..std::mem::size_of_val(data)].copy_from_slice(bytemuck::cast_slice(data));
+    buffer.handoff()
 }
 
 impl<B: Backend> Engine<B> {
@@ -195,8 +196,7 @@ impl<B: Backend> Engine<B> {
         weights: &Path,
         config: VisionModelConfig,
     ) -> Result<VisionModel<B>, VisionError<B>> {
-        let file = File::open(weights)?;
-        let loader = ParameterLoader::new(&file, &*self.context)?;
+        let loader = block_on(ParameterLoader::new(weights, &*self.context))?;
         let model = VisionModel::load(self.context.clone(), config, &loader.tree().subtree("model").subtree("visual"))?;
         loader.assert_all_tensors_read()?;
         Ok(model)
@@ -221,16 +221,16 @@ impl<B: Backend> VisionModel<B> {
         let backend = VisionError::Backend;
         let linear = |tree: &ParameterTree<B>, input_dim: u32, output_dim: u32| -> Result<Linear<B>, VisionError<B>> {
             Ok(Linear {
-                weights: tree.read_buffer("weight", &[output_dim, input_dim], DataType::BF16)?,
-                biases: tree.read_buffer("bias", &[output_dim], DataType::BF16)?,
+                weights: block_on(tree.read_buffer("weight", &[output_dim, input_dim], DataType::BF16))?,
+                biases: block_on(tree.read_buffer("bias", &[output_dim], DataType::BF16))?,
                 input_dim,
                 output_dim,
             })
         };
         let layer_norm = |tree: &ParameterTree<B>, dim: u32| -> Result<LayerNorm<B>, VisionError<B>> {
             let to_f32 = |values: Box<[bf16]>| values.iter().map(|value| value.to_f32()).collect::<Vec<f32>>();
-            let scales = to_f32(tree.read_slice::<bf16>("weight", &[dim])?);
-            let biases = to_f32(tree.read_slice::<bf16>("bias", &[dim])?);
+            let scales = to_f32(block_on(tree.read_slice::<bf16>("weight", &[dim]))?);
+            let biases = to_f32(block_on(tree.read_slice::<bf16>("bias", &[dim]))?);
             Ok(LayerNorm {
                 scales: buffer_from::<B, f32>(&context, &scales).map_err(backend)?,
                 biases: buffer_from::<B, f32>(&context, &biases).map_err(backend)?,
@@ -238,18 +238,18 @@ impl<B: Backend> VisionModel<B> {
         };
 
         let patch_tree = tree.subtree("patch_embed").subtree("proj");
-        let patch_weights = patch_tree.read_slice::<bf16>(
+        let patch_weights = block_on(patch_tree.read_slice::<bf16>(
             "weight",
             &[hidden, config.in_channels, config.temporal_patch_size, config.patch_size, config.patch_size],
-        )?;
+        ))?;
         let patch = Linear {
             weights: buffer_from::<B, bf16>(&context, &patch_weights).map_err(backend)?,
-            biases: patch_tree.read_buffer("bias", &[hidden], DataType::BF16)?,
+            biases: block_on(patch_tree.read_buffer("bias", &[hidden], DataType::BF16))?,
             input_dim: config.patch_dim(),
             output_dim: hidden,
         };
         let position_table =
-            tree.subtree("pos_embed").read_slice::<bf16>("weight", &[config.num_position_embeddings, hidden])?;
+            block_on(tree.subtree("pos_embed").read_slice::<bf16>("weight", &[config.num_position_embeddings, hidden]))?;
 
         let mut blocks = Vec::with_capacity(config.depth as usize);
         for index in 0..config.depth {
@@ -257,8 +257,8 @@ impl<B: Backend> VisionModel<B> {
             let attention = block.subtree("attn");
             // QKV: rows [q heads, k heads, v heads] × 72, each head padded to `padded` rows.
             let qkv_tree = attention.subtree("qkv");
-            let qkv_weights = qkv_tree.read_slice::<bf16>("weight", &[3 * hidden, hidden])?;
-            let qkv_biases = qkv_tree.read_slice::<bf16>("bias", &[3 * hidden])?;
+            let qkv_weights = block_on(qkv_tree.read_slice::<bf16>("weight", &[3 * hidden, hidden]))?;
+            let qkv_biases = block_on(qkv_tree.read_slice::<bf16>("bias", &[3 * hidden]))?;
             let (hd, pd, width) = (head_dim as usize, padded as usize, hidden as usize);
             let mut weights = vec![bf16::ZERO; 3 * heads * pd * width];
             let mut biases = vec![bf16::ZERO; 3 * heads * pd];
@@ -278,7 +278,7 @@ impl<B: Backend> VisionModel<B> {
             };
             // Output projection: columns per head padded the same way.
             let proj_tree = attention.subtree("proj");
-            let proj_weights = proj_tree.read_slice::<bf16>("weight", &[hidden, hidden])?;
+            let proj_weights = block_on(proj_tree.read_slice::<bf16>("weight", &[hidden, hidden]))?;
             let mut padded_proj = vec![bf16::ZERO; width * heads * pd];
             for row in 0..width {
                 for head in 0..heads {
@@ -289,7 +289,7 @@ impl<B: Backend> VisionModel<B> {
             }
             let proj = Linear {
                 weights: buffer_from::<B, bf16>(&context, &padded_proj).map_err(backend)?,
-                biases: proj_tree.read_buffer("bias", &[hidden], DataType::BF16)?,
+                biases: block_on(proj_tree.read_buffer("bias", &[hidden], DataType::BF16))?,
                 input_dim: config.num_heads * padded,
                 output_dim: hidden,
             };
@@ -310,40 +310,7 @@ impl<B: Backend> VisionModel<B> {
         let merger_fc2 = linear(&merger.subtree("linear_fc2"), merged, config.out_hidden_size)?;
 
         let context_ref = context.as_ref();
-        let kernels = VisionKernels {
-            matmul: Mutex::new(
-                <B::Kernels as Kernels>::MatmulKernel::new(context_ref, DataType::BF16, DataType::BF16, DataType::BF16)
-                    .map_err(VisionError::Matmul)?,
-            ),
-            norm: <B::Kernels as Kernels>::NormalizationKernel::new(
-                context_ref,
-                DataType::BF16,
-                DataType::F32,
-                DataType::BF16,
-                DataType::F32,
-                false,
-                true,
-                true,
-                false,
-                false,
-                false,
-                false,
-                false,
-                true,
-                true,
-            )
-            .map_err(backend)?,
-            activation: <B::Kernels as Kernels>::ActivationKernel::new(context_ref, DataType::BF16, true).map_err(backend)?,
-            add: <B::Kernels as Kernels>::TensorAddScaleKernel::new(context_ref, DataType::BF16, true).map_err(backend)?,
-            prepare: <B::Kernels as Kernels>::AttentionPrepareKernel::new(
-                context_ref,
-                DataType::BF16,
-                DataType::F32,
-                true,
-                true,
-            )
-            .map_err(backend)?,
-            attention: <B::Kernels as Kernels>::AttentionKernel::new(
+        let attention = <B::Kernels as Kernels>::AttentionKernel::new(
                 context_ref,
                 AttentionKernelConfig {
                     head_dim: padded,
@@ -358,7 +325,24 @@ impl<B: Backend> VisionModel<B> {
                     data_type: DataType::BF16,
                 },
             )
-            .map_err(VisionError::Attention)?,
+            .map_err(VisionError::Attention)?;
+        let kernels = VisionKernels {
+            matmul: Mutex::new(
+                <B::Kernels as Kernels>::MatmulKernel::new(context_ref, DataType::BF16, DataType::BF16, DataType::BF16)
+                    .map_err(VisionError::Matmul)?,
+            ),
+            norm: <B::Kernels as Kernels>::NormalizationKernel::new(
+                context_ref, DataType::BF16, DataType::F32, DataType::BF16, DataType::F32,
+                false, true, true, false, false, false, 1, true, true,
+            ).map_err(backend)?,
+            activation: <B::Kernels as Kernels>::ActivationKernel::new(context_ref, DataType::BF16, true).map_err(backend)?,
+            add: <B::Kernels as Kernels>::TensorAddScaleKernel::new(context_ref, DataType::BF16, true, true).map_err(backend)?,
+            prepare: <B::Kernels as Kernels>::AttentionPrepareKernel::new(
+                context_ref, DataType::BF16, DataType::F32, padded, true, config.num_heads,
+                attention.kv_layout().backend_opaque_layout, true, false, false, false, false, 0,
+            ).map_err(backend)?,
+            attention,
+
         };
         Ok(Self {
             context,
@@ -407,7 +391,7 @@ impl<B: Backend> VisionModel<B> {
                             ..MatmulDOps::none()
                         },
                     ),
-                    gather_indices: None::<&B::GlobalBuffer>,
+                    gather: None::<MatmulGather<&B::GlobalGpuBuffer>>,
                     m: rows,
                     n: linear.output_dim,
                     k: linear.input_dim,
@@ -433,12 +417,12 @@ impl<B: Backend> VisionModel<B> {
             Some(&norm.biases),
             &mut output,
             None::<&mut B::ScratchBuffer>,
-            None::<&B::GlobalBuffer>,
+            None::<&B::GlobalGpuBuffer>,
             rows,
             self.config.hidden_size,
             self.config.layer_norm_epsilon,
             0.0,
-            1.0,
+            1,
             command_buffer,
         );
         Ok(output)
@@ -476,7 +460,7 @@ impl<B: Backend> VisionModel<B> {
 
         // The residual stream lives across command buffers.
         let mut residual =
-            self.context.create_buffer((elements as usize) * DataType::BF16.size_in_bytes()).map_err(backend)?;
+            self.context.create_buffer_gpu((elements as usize) * DataType::BF16.size_in_bytes()).map_err(backend)?;
         let pool = self.context.create_allocation_pool();
         let submit = |command_buffer: <B::CommandBuffer as crate::backends::common::CommandBuffer>::Encoding| {
             futures::executor::block_on(command_buffer.end_encoding().submit().wait_until_completed())
@@ -490,7 +474,7 @@ impl<B: Backend> VisionModel<B> {
         let input = command_buffer.allocate_constant_from_slice(patches).map_err(backend)?;
         self.matmul(&input, count, &self.patch, &mut residual, &mut command_buffer)?;
         let position_rows = command_buffer.allocate_constant_from_slice(&positions).map_err(backend)?;
-        self.kernels.add.encode(None::<&B::GlobalBuffer>, &position_rows, &mut residual, elements, elements, 1.0, &mut command_buffer);
+        self.kernels.add.encode(None::<&B::GlobalGpuBuffer>, Some(&position_rows), &mut residual, elements, elements, 1.0, &mut command_buffer);
         drop(input);
         drop(position_rows);
         submit(command_buffer)?;
@@ -511,54 +495,47 @@ impl<B: Backend> VisionModel<B> {
                 .map_err(backend)?;
             self.matmul(&normed, count, &block.qkv, &mut qkv, &mut command_buffer)?;
             drop(normed);
-            let mut queries =
-                command_buffer.allocate_scratch_for_shape(&[heads, count, padded], DataType::BF16).map_err(backend)?;
-            let mut keys =
-                command_buffer.allocate_scratch_for_shape(&[count, heads, padded], DataType::BF16).map_err(backend)?;
-            let mut values =
-                command_buffer.allocate_scratch_for_shape(&[count, heads, padded], DataType::BF16).map_err(backend)?;
+            let layout = self.kernels.attention.kv_layout();
+            let mut kv = KVCache::allocate_scratch(layout, count, &mut command_buffer).map_err(backend)?;
+            let query_count = heads as usize * count as usize;
+            let mut queries = command_buffer.allocate_scratch(query_count * padded as usize).map_err(backend)?;
+            let mut query_scales = command_buffer.allocate_scratch(query_count * DataType::BF16.size_in_bytes()).map_err(backend)?;
             self.kernels.prepare.encode(
-                &qkv,
-                &mut queries,
-                Some(&mut keys),
-                Some(&mut values),
-                Some(&cos),
-                Some(&sin),
-                heads,
-                Some(heads),
-                padded,
-                Some(config.head_dim()),
-                Some(0),
-                block.qkv.output_dim,
-                count,
-                &mut command_buffer,
+                &qkv, &mut queries, &mut query_scales,
+                Some(kv.k_codes.as_mut()), Some(kv.k_scales.as_mut()),
+                Some(kv.v_codes.as_mut()), Some(kv.v_scales.as_mut()),
+                Some(&cos), Some(&sin),
+                None::<&B::GlobalGpuBuffer>, None::<&B::GlobalGpuBuffer>, None::<&B::GlobalGpuBuffer>,
+                None::<&B::GlobalGpuBuffer>, None::<&B::GlobalGpuBuffer>, None::<&mut B::GlobalGpuBuffer>,
+                QKVNormParams::default(), heads, Some(config.head_dim()), 0,
+                block.qkv.output_dim, count, count, None, &mut command_buffer,
             );
             drop(qkv);
             let attended = self
                 .kernels
                 .attention
                 .encode(
-                    AttentionInput::FullPrecision(FullPrecisionInput {
-                        queries: &queries,
-                        keys: &keys,
-                        values: &values,
-                    }),
+                    AttentionInput {
+                        query_codes: &queries, query_scales: &query_scales,
+                        k_codes: kv.k_codes.as_ref(), k_scales: kv.k_scales.as_ref(),
+                        v_codes: kv.v_codes.as_ref(), v_scales: kv.v_scales.as_ref(),
+                    },
                     AttentionArguments {
                         suffix_length: count,
-                        trie: None::<&B::GlobalBuffer>,
+                        trie: None::<&B::GlobalGpuBuffer>,
                         sinks: None,
                         cache: KVCacheView::full(0),
-                        gate: None::<&B::GlobalBuffer>,
+                        gate: None::<&B::GlobalGpuBuffer>,
                     },
                     &mut command_buffer,
                 )
                 .map_err(VisionError::Attention)?;
-            drop((queries, keys, values));
+            drop((queries, query_scales, kv));
             let mut projected =
                 command_buffer.allocate_scratch_for_shape(&[count, hidden], DataType::BF16).map_err(backend)?;
             self.matmul(&attended, count, &block.proj, &mut projected, &mut command_buffer)?;
             drop(attended);
-            self.kernels.add.encode(None::<&B::GlobalBuffer>, &projected, &mut residual, elements, elements, 1.0, &mut command_buffer);
+            self.kernels.add.encode(None::<&B::GlobalGpuBuffer>, Some(&projected), &mut residual, elements, elements, 1.0, &mut command_buffer);
             drop(projected);
             // MLP.
             let normed = self.layer_norm(&residual, count, &block.norm2, &mut command_buffer)?;
@@ -568,7 +545,7 @@ impl<B: Backend> VisionModel<B> {
             self.matmul(&normed, count, &block.fc1, &mut inner, &mut command_buffer)?;
             drop(normed);
             self.kernels.activation.encode(
-                None::<&B::GlobalBuffer>,
+                None::<&B::GlobalGpuBuffer>,
                 &mut inner,
                 count * config.intermediate_size,
                 ActivationType::GELUApprox,
@@ -578,7 +555,7 @@ impl<B: Backend> VisionModel<B> {
                 command_buffer.allocate_scratch_for_shape(&[count, hidden], DataType::BF16).map_err(backend)?;
             self.matmul(&inner, count, &block.fc2, &mut out, &mut command_buffer)?;
             drop(inner);
-            self.kernels.add.encode(None::<&B::GlobalBuffer>, &out, &mut residual, elements, elements, 1.0, &mut command_buffer);
+            self.kernels.add.encode(None::<&B::GlobalGpuBuffer>, Some(&out), &mut residual, elements, elements, 1.0, &mut command_buffer);
             drop((out, cos, sin));
             submit(command_buffer)?;
         }
@@ -594,7 +571,7 @@ impl<B: Backend> VisionModel<B> {
         self.matmul(&normed, merged_rows, &self.merger_fc1, &mut inner, &mut command_buffer)?;
         drop(normed);
         self.kernels.activation.encode(
-            None::<&B::GlobalBuffer>,
+            None::<&B::GlobalGpuBuffer>,
             &mut inner,
             merged_rows * self.merger_fc1.output_dim,
             ActivationType::GELUExact,
@@ -602,13 +579,13 @@ impl<B: Backend> VisionModel<B> {
         );
         let mut output = self
             .context
-            .create_buffer((merged_rows * config.out_hidden_size) as usize * DataType::BF16.size_in_bytes())
+            .create_buffer_gpu((merged_rows * config.out_hidden_size) as usize * DataType::BF16.size_in_bytes())
             .map_err(backend)?;
         self.matmul(&inner, merged_rows, &self.merger_fc2, &mut output, &mut command_buffer)?;
         drop(inner);
         submit(command_buffer)?;
         drop(residual);
-        let values = (&output).as_slice::<bf16>().to_vec();
+        let values = block_on(self.context.copyout::<bf16>(&output)).map_err(backend)?;
         drop(output);
         Ok(values)
     }

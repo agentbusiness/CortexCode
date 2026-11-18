@@ -468,8 +468,7 @@ fn spawn_worker<B: Backend>(
             let started = Instant::now();
             let loaded = (|| -> Result<(Arc<Engine<B>>, LanguageModel<B>), String> {
                 let engine = block_on(Engine::<B>::new()).map_err(|error| format!("cannot start uzu: {error}"))?;
-                let model = engine
-                    .load_language_model(&config.model_dir)
+                let model = block_on(engine.load_language_model(&config.model_dir))
                     .map_err(|error| format!("cannot load {}: {error}", config.model_dir.display()))?;
                 Ok((engine, model))
             })();

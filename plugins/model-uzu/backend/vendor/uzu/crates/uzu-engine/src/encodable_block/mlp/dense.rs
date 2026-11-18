@@ -8,7 +8,7 @@ use crate::{
     config::mlp::dense_mlp::DenseMLPConfig,
     data_type::DataType,
     encodable_block::{
-        linear::{Linear, LinearBlockError},
+        linear::{InputRhtParameters, Linear, LinearBlockError},
         mlp::{Mlp, MlpEncodeError, gate_act_mul::MlpGateActMulEncodable},
     },
     safetensors::ParameterTree,
@@ -29,14 +29,14 @@ pub enum DenseMlpNewError<B: Backend> {
 }
 
 impl<B: Backend> DenseMlp<B> {
-    pub fn new(
+    pub async fn new(
         model_dimension: u32,
         hidden_dimension: u32,
         data_type: DataType,
         config: &DenseMLPConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
-    ) -> Result<(Self, Option<B::GlobalBuffer>), DenseMlpNewError<B>> {
+    ) -> Result<(Self, Option<InputRhtParameters<B>>), DenseMlpNewError<B>> {
         let (up, up_input_hadamard_factors) = <dyn Linear<B>>::new_with_input_rht(
             model_dimension,
             2 * hidden_dimension,
@@ -44,7 +44,8 @@ impl<B: Backend> DenseMlp<B> {
             config.has_up_biases,
             &parameter_tree.subtree("up_projection"),
             context,
-        )?;
+        )
+        .await?;
 
         let (down, down_input_preparation) = <dyn Linear<B>>::new_for_fused_input(
             hidden_dimension,
@@ -53,7 +54,8 @@ impl<B: Backend> DenseMlp<B> {
             config.has_down_biases,
             &parameter_tree.subtree("down_projection"),
             context,
-        )?;
+        )
+        .await?;
 
         let gate = MlpGateActMulEncodable::new(
             hidden_dimension,
@@ -87,7 +89,7 @@ impl<B: Backend> Mlp<B> for DenseMlp<B> {
         let command_buffer = &mut *command_buffer.debug_group("mlp (dense)");
 
         let fused_up = self.up.encode(input, batch_dim, command_buffer)?;
-        let act_format = self.down.select_activation_format(batch_dim, command_buffer.context());
+        let act_format = self.down.select_activation_format(batch_dim, None, command_buffer.context());
         let down_input = self
             .gate
             .encode_for_linear(&fused_up, batch_dim, act_format, command_buffer)

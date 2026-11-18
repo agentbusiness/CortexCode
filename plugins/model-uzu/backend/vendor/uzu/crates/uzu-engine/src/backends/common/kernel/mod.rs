@@ -1,4 +1,4 @@
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "webgpu", backend = "cpu"))]
 use std::{convert::Infallible, marker::PhantomData};
 
 use crate::backends::common::Backend;
@@ -11,16 +11,15 @@ pub mod gated_act_mul;
 pub mod kv_layout;
 pub mod matmul;
 pub mod radix_top_k_small;
-#[cfg(any(backend = "cpu", test))]
+#[cfg(any(backend = "metal", backend = "vulkan"))]
+pub mod tree_verify_blocks;
 mod trellis;
 
 pub use activation_transform::{ActivationQuantization, ActivationTransform};
-pub use attention::{
-    AttentionArguments, AttentionInput, AttentionKernel, AttentionKernelConfig, FullPrecisionInput, Int8Input, KVFormat,
-};
+pub use attention::{AttentionArguments, AttentionInput, AttentionKernel, AttentionKernelConfig};
 pub use gated_act_mul::{GatedActMul, GatedActMulSettings};
+pub use matmul::ActivationFormat;
 
-#[cfg(any(backend = "cpu", test))]
 pub use crate::backends::common::kernel::trellis::mixing_dimension;
 
 include!(concat!(env!("OUT_DIR"), "/traits.rs"));
@@ -36,7 +35,7 @@ pub trait Kernels: Sized {
     type RadixTopKSmall: radix_top_k_small::RadixTopKSmall<Backend = Self::Backend>;
 }
 
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "webgpu", backend = "cpu"))]
 pub struct Unsupported<B: Backend> {
     never: Infallible,
     _marker: PhantomData<fn() -> B>,

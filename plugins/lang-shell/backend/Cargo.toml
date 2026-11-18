@@ -28,4 +28,4 @@ tempfile = "3.27"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
 # A release archive shaped like ShellCheck's, for the installer test.
 tar = "0.4.46"
-flate2 = "1.1"
+flate2 = "1.1.11"

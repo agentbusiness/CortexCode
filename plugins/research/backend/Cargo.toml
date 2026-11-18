@@ -28,21 +28,21 @@ tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.13.5", features = ["gzip", "brotli", "deflate"] }
 url = "2.5.8"
 percent-encoding = "2"
-encoding_rs = "0.8"
+encoding_rs = "0.8.44"
 # Readability (a maintained port of Mozilla's Readability.js) and its DOM (also used for result pages
 # and meta tags).
-dom_smoothie = "0.18.2"
-dom_query = "0.28"
+dom_smoothie = "0.19.0"
+dom_query = "0.29.0"
 # PDF text (lopdf underneath, re-exported).
 pdf-extract = "0.12.1"
 # Atom (arXiv, Reddit RSS).
 roxmltree = "0.21"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
-sha2 = "0.10"
-uuid = { version = "1.23", features = ["v4"] }
+sha2 = "0.11.1"
+uuid = { version = "1.29.3", features = ["v4"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27"
-toml = "1.1.8"
+toml = "1.2.1"

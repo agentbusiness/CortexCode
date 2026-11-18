@@ -11,7 +11,7 @@ use crate::{
     data_type::DataType,
     encodable_block::{
         linear::{Linear, LinearBlockError, LinearEncodeError},
-        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        normalization::{Normalization, NormalizationNewError, ShortcutMode},
     },
     safetensors::ParameterTree,
 };
@@ -31,6 +31,7 @@ pub enum PredictionHeadError<B: Backend> {
 pub struct PredictionHead<B: Backend> {
     hidden_dim: u32,
     activation: ActivationType,
+    activation_alpha: f32,
     dense_projection: Box<dyn Linear<B>>,
     activation_kernel: <B::Kernels as Kernels>::ActivationKernel,
     normalization: Normalization<B>,
@@ -38,12 +39,12 @@ pub struct PredictionHead<B: Backend> {
 }
 
 impl<B: Backend> PredictionHead<B> {
-    pub fn new(
+    pub async fn new(
         hidden_dim: u32,
         num_labels: u32,
         data_type: DataType,
         config: &PredictionHeadConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
     ) -> Result<Self, PredictionHeadError<B>> {
         let dense_projection = <dyn Linear<B>>::new(
@@ -53,29 +54,34 @@ impl<B: Backend> PredictionHead<B> {
             config.use_dense_bias,
             &parameter_tree.subtree("dense"),
             context,
-        )?;
+        )
+        .await?;
 
         let activation = config.activation.act_type();
+        let activation_alpha = config.activation.alpha();
         let activation_kernel = <B::Kernels as Kernels>::ActivationKernel::new(context, data_type, true)
             .map_err(PredictionHeadError::Backend)?;
 
         let normalization = Normalization::new(
             hidden_dim,
             data_type,
+            data_type,
             None,
             ShortcutMode::None,
-            PostLayerScalar::None,
             &config.normalization_config,
             &parameter_tree.subtree("norm"),
             context,
-        )?;
+        )
+        .await?;
 
         let readout =
-            <dyn Linear<B>>::new(hidden_dim, num_labels, data_type, true, &parameter_tree.subtree("readout"), context)?;
+            <dyn Linear<B>>::new(hidden_dim, num_labels, data_type, true, &parameter_tree.subtree("readout"), context)
+                .await?;
 
         Ok(Self {
             hidden_dim,
             activation,
+            activation_alpha,
             dense_projection,
             activation_kernel,
             normalization,
@@ -97,6 +103,7 @@ impl<B: Backend> PredictionHead<B> {
             &mut hidden,
             self.hidden_dim,
             self.activation,
+            self.activation_alpha,
             command_buffer,
         );
         let normalized = self

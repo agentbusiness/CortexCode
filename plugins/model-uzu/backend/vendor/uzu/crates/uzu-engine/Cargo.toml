@@ -13,9 +13,7 @@ build = "build/main.rs"
 workspace = true
 
 [features]
-default = ["cpu", "metal", "grammar"]
-
-cpu = [] # TODO: move libm here
+default = ["metal", "cpu"]
 
 metal = [
     "dep:rayon",
@@ -28,9 +26,36 @@ metal = [
     "dep:blake3",
     "dep:xxhash-rust",
     "dep:metal",
+    "dep:rangemap",
 ]
 
-grammar = ["dep:xgrammar", "dep:schemars", "dep:llguidance", "dep:toktrie_hf_tokenizers"]
+webgpu = [
+    "dep:rayon",
+    "dep:serde_json",
+    "dep:blake3",
+    "dep:shader-slang",
+    "dep:shader-slang-sys",
+    "dep:regex",
+    "dep:naga",
+    "dep:wgpu",
+]
+
+grammar = [] # Compatibility feature: upstream0.7 always exposes constrained decoding.
+vulkan = [
+    "cpu",
+    "dep:ash",
+    "dep:vk-mem",
+    "dep:dirs",
+    "dep:shader-slang",
+    "dep:blake3",
+    "dep:serde_json",
+    "dep:regex",
+    "dep:rayon",
+    "dep:spirv",
+    "dep:rangemap",
+]
+
+cpu = [] # TODO: move libm here
 
 [build-dependencies]
 anyhow.workspace = true
@@ -43,17 +68,25 @@ syn.workspace = true
 prettyplease.workspace = true
 itertools.workspace = true
 rhai.workspace = true
+shader-slang = { workspace = true, optional = true }
+shader-slang-sys = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+naga = { workspace = true, optional = true, features = ["wgsl-in"] }
+spirv = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+serde_json = { workspace = true, features = ["unbounded_depth"], optional = true }
+rayon = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos"))'.build-dependencies]
-rayon = { workspace = true, optional = true }
 clang-ast = { workspace = true, optional = true }
 depfile = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-serde_json = { workspace = true, features = ["unbounded_depth"], optional = true }
-blake3 = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, features = ["xxh3"], optional = true }
 
 [dependencies]
+llguidance.workspace = true
+toktrie_hf_tokenizers.workspace = true
+schemars.workspace = true
 uzu-engine-macros.workspace = true
 bitflags.workspace = true
 derive_more = { workspace = true, features = ["debug"] }
@@ -64,13 +97,17 @@ serde_json.workspace = true
 monostate.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
-rangemap.workspace = true
+rangemap = { workspace = true, optional = true }
 bytemuck = { workspace = true, features = ["derive"] }
 num-traits.workspace = true
 libm.workspace = true
 futures.workspace = true
 itertools.workspace = true
 parking_lot.workspace = true
+wgpu = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
+vk-mem = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos"))'.dependencies]
 objc2 = { workspace = true, optional = true }
@@ -78,8 +115,23 @@ obfstr = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, features = ["xxh3"], optional = true }
 metal = { workspace = true, optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+llguidance = { workspace = true, features = ["wasm"] }
+tokenizers = { workspace = true, features = ["unstable_wasm"] }
+wgpu = { workspace = true, optional = true, features = ["fragile-send-sync-non-atomic-wasm"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = [
+    "Blob",
+    "DomException",
+    "File",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "Navigator",
+    "StorageManager",
+    "Window",
+] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-xgrammar = { workspace = true, optional = true }
-llguidance = { workspace = true, optional = true }
-toktrie_hf_tokenizers = { workspace = true, optional = true }
-schemars = { workspace = true, optional = true }
+async-fs.workspace = true
+

@@ -6,8 +6,6 @@ pub enum GrammarError {
     GrammarReject,
     #[error("XGrammar error: {0}")]
     XGrammar(String),
-    #[error("XGrammar compilation error: {0}")]
-    Compile(#[from] xgrammar::CompileError),
     #[error("Grammar error: {0}")]
     Guidance(String),
 }

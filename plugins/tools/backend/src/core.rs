@@ -189,6 +189,11 @@ fn link_program(bin_dir: &Path, name: &str, target: &Path) {
 impl Core {
     pub fn new(home: &Path, data_dir: &Path, config: Config) -> Arc<Core> {
         let bash = find_bash(config.bash.as_deref());
+        // The user's login shell is asked for its PATH now, off the plugin's own work, so the
+        // first command does not pay for it (see `util::login_path`).
+        let _ = std::thread::Builder::new().name("login-path".to_owned()).spawn(|| {
+            let _ = crate::util::login_path();
+        });
         let bin_dir = home.join("bin");
         let cx = find_cx(config.cx_path.as_deref());
         if let Some(cx) = &cx {

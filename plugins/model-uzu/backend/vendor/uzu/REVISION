@@ -1,2 +1,4 @@
-1763a366c048e2065343619a28524d493faf5391
-https://github.com/trymirai/uzu main, 2026-10-28T17:29:40+08:00 (release 0.6.13 plus 14 commits, up to #1027; before the WebGPU runtime merge f1231705)
+90f8bdb7be9cbe0285efe96e37509a1041ddb138
+https://github.com/trymirai/uzu tag0.7.1, reviewed2026-11-18
+Archive SHA2566b083018764051deb9046b57ba9d97739a6b459d257d3ca0bca89117698a31ee
+CortexCode P1-P8 rebased; local stream scheduler retained; source-only candidate, not built.

@@ -24,8 +24,8 @@ tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 # SCSS: tree-sitter-scss 1.0.0 (tree-sitter-grammars) fails on `!default` and `@extend`; the
 # scss-modern grammar (ABI 15) parses current SCSS (module system, flags, control flow).
-tree-sitter-scss-modern = "0.1.0"
-# Binds `tree-sitter >=0.21` directly (ABI 14); cargo unifies it on the kit's tree-sitter 0.25.
+tree-sitter-scss-modern = "0.2.0"
+# Binds `tree-sitter >=0.21` directly (ABI 14); cargo unifies it on the kit's tree-sitter 0.27.
 tree-sitter-less = "1.0.0"
 serde_json = "1.0.149"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time"] }

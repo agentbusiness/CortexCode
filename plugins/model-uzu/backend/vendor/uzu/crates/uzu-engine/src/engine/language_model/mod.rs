@@ -1,4 +1,4 @@
-use std::{fs::File, io, io::BufReader, path::Path, sync::Arc};
+use std::{io, path::Path, sync::Arc};
 
 use derive_more::Debug;
 use thiserror::Error;
@@ -6,7 +6,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     backends::common::{Backend, Context, DeviceCapabilities, Kernels, kernel::ContextRingUpdateKernel},
-    config::{model::language_model::LanguageModelConfig, token_codec::AnyTokenCodecConfig},
+    config::model::language_model::LanguageModelConfig,
     data_type::DataType,
     encodable_block::{
         decoder::{Decoder, DecoderError},
@@ -15,6 +15,7 @@ use crate::{
     engine::Engine,
     safetensors::{ParameterLoader, ParameterLoaderError},
     speculators::dflash_tfm::{DFlashSpeculatorLoadError, DFlashTfmSpeculator},
+    utils::file,
 };
 pub use crate::{config::model::generation::GenerationConfig, utils::strict_serde::Unsupported};
 
@@ -23,7 +24,6 @@ pub mod images;
 pub mod state;
 pub mod stream;
 
-#[cfg(grammar)]
 pub mod grammar;
 
 pub struct LanguageModel<B: Backend> {
@@ -33,9 +33,7 @@ pub struct LanguageModel<B: Backend> {
     sampling: Sampling<B>,
     context_ring_update: <B::Kernels as Kernels>::ContextRingUpdateKernel,
     generation_config: GenerationConfig,
-    end_of_thinking_tag: Option<String>,
     tokenizer: Arc<Tokenizer>,
-    #[cfg(grammar)]
     vocab_size: usize,
 }
 
@@ -58,21 +56,20 @@ pub enum EngineLoadLanguageModelError<B: Backend> {
 }
 
 impl<B: Backend> Engine<B> {
-    pub fn load_language_model(
+    pub async fn load_language_model(
         self: &Arc<Self>,
         model_path: &Path,
     ) -> Result<LanguageModel<B>, EngineLoadLanguageModelError<B>> {
-        let config: LanguageModelConfig =
-            serde_json::from_reader(BufReader::new(File::open(model_path.join("config.json"))?))?;
+        let config_json = serde_json::from_slice(&file::read(model_path.join("config.json")).await?)?;
+        let config: LanguageModelConfig = serde_json::from_value(crate::utils::model_format::config(config_json)?)?;
 
-        let weights_file = File::open(model_path.join("model.safetensors"))?;
-        let weight_loader = ParameterLoader::new(&weights_file, &*self.context)?;
+        let weight_loader = ParameterLoader::new(model_path.join("model.safetensors"), &*self.context).await?;
 
         // TODO
         let speculator_path = model_path.join("speculator");
-        let speculator_path = speculator_path.exists().then_some(speculator_path);
+        let speculator_path = file::exists(&speculator_path).await.then_some(speculator_path);
 
-        let tokenizer = Arc::new(Tokenizer::from_file(model_path.join("tokenizer.json"))?);
+        let tokenizer = Arc::new(Tokenizer::from_bytes(file::read(model_path.join("tokenizer.json")).await?)?);
 
         let data_type = DataType::BF16;
 
@@ -81,18 +78,19 @@ impl<B: Backend> Engine<B> {
             &config.decoder_config,
             &weight_loader.tree().subtree("decoder"),
             self.context.as_ref(),
-        )?;
+        )
+        .await?;
 
         assert!(
             speculator_path.is_none() || decoder.speculation_supported(),
             "attempted to load speculator for a model that doesn't support one"
         );
 
-        let speculator = speculator_path
-            .as_deref()
-            .map(|speculator_path| DFlashTfmSpeculator::new(speculator_path, self.context.clone()))
-            .transpose()?
-            .flatten();
+        let speculator = if let Some(speculator_path) = speculator_path.as_deref() {
+            DFlashTfmSpeculator::new(speculator_path, decoder.embedding(), self.context.clone()).await?
+        } else {
+            None
+        };
 
         let sampling = Sampling::new(config.decoder_config.vocab_size, data_type);
 
@@ -102,12 +100,6 @@ impl<B: Backend> Engine<B> {
         weight_loader.assert_all_tensors_read()?;
 
         let generation_config = config.generation_config;
-        let end_of_thinking_tag = match &config.token_codec_config {
-            AnyTokenCodecConfig::ChatCodecConfig(token_codec_config) => token_codec_config.end_of_thinking_tag.clone(),
-            AnyTokenCodecConfig::RawTextCodecConfig(_) => None,
-        };
-
-        #[cfg(grammar)]
         let vocab_size = config.decoder_config.vocab_size as usize;
 
         Ok(LanguageModel {
@@ -117,9 +109,7 @@ impl<B: Backend> Engine<B> {
             sampling,
             context_ring_update,
             generation_config,
-            end_of_thinking_tag,
             tokenizer,
-            #[cfg(grammar)]
             vocab_size,
         })
     }
@@ -169,10 +159,6 @@ impl<B: Backend> LanguageModel<B> {
         &self.generation_config
     }
 
-    pub fn end_of_thinking_tag(&self) -> Option<&str> {
-        self.end_of_thinking_tag.as_deref()
-    }
-
     pub fn tokenizer(&self) -> &Arc<Tokenizer> {
         &self.tokenizer
     }
@@ -198,12 +184,12 @@ impl<B: Backend> LanguageModel<B> {
             .embedding()
             .encode_lookup(&constant, ids.len() as u32, &mut command_buffer)
             .map_err(|error| error.to_string())?;
-        let mut out = self.engine.context.create_buffer(embedded.size()).map_err(|error| error.to_string())?;
+        let mut out = self.engine.context.create_buffer_gpu(embedded.size()).map_err(|error| error.to_string())?;
         command_buffer.encode_copy(&embedded, &mut out);
         drop(embedded);
         drop(constant);
         futures::executor::block_on(command_buffer.end_encoding().submit().wait_until_completed())
             .map_err(|error| error.to_string())?;
-        Ok((&out).as_slice::<u16>().to_vec())
+        futures::executor::block_on(self.engine.context.copyout::<u16>(&out)).map_err(|error| error.to_string())
     }
 }

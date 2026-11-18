@@ -25,20 +25,20 @@ cc-protocol = { path = "../../../protocol", features = ["model", "memory"] }
 cc-model-kit = { path = "../../../model-kit" }
 # The models folder the Cortex apps share (~/.cortex-models).
 cc-shared-models = { path = "../../../shared-models" }
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 llguidance = { version = "1.9.1", default-features = false, features = ["lark"] }
 toktrie_hf_tokenizers = "1.9.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 futures-util = "0.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
-sha2 = "0.10.9"
-sha1 = "0.10.6"
+sha2 = "0.11.1"
+sha1 = "0.11.0"
 libc = "0.2.182"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 

@@ -142,3 +142,84 @@ draft model's RoPE capacity. uzu cut only the tree, so a generation that reached
 positions of the context panicked ("DFlash block positions exceed configured RoPE capacity") and the
 conversation was lost. With fewer positions left than a block, the stream decodes without drafting
 and ends at the context's end as a plain stream does.
+
+
+## P1–P8 rebase onto Uzu0.7.1 — 2026-11-18
+
+Upstream90f8bdb7be9cbe0285efe96e37509a1041ddb138 (tag0.7.1), source SHA256
+6b083018764051deb9046b57ba9d97739a6b459d257d3ca0bca89117698a31ee.
+
+P1: snapshot buffers now use GlobalGpuBuffer. The snapshot retains its backend context;
+write_to copies the completed GPU payload out through Context::copyout, while read_state_snapshot
+uploads through create_buffer_cpu_gpu/handoff. Attention copies all four KVCache code/scale
+buffers and records the complete KVLayout; older or different physical layouts fail restore,
+so the existing owner re-prefills the conversation. Append-only checkpoints remain length-only;
+ring checkpoints copy their rows. UZUSNAP4 rejects UZUSNAP2/3 immediately at the magic
+header, before reading or uploading their old layout. DeltaNet/short-convolution/drafter states stay covered.
+
+P2: llguidance remains the grammar provider. Upstream0.7 always exposes constrained decoding;
+the grammar feature name remains as a compatibility feature. Tokenizer JSON still bridges
+llguidance's own adapter; the engine tokenizers dependency is0.23.2 to match the plugin's
+concrete tokenizer value. The obsolete xgrammar compile-error variant is removed.
+
+P3/P4: presence penalty, sampling seed, generated-only penalty window, speculation control,
+context capacity and pending-output operations remain. Sampling kernels keep the original
+per-distinct-token presence penalty. Stream public methods keep existing callers unchanged.
+
+P5/P6: device facts, KV byte accounting (from KVLayout code+scale sizes), allocator trimming
+remain. Both CPU and Metal GPU buffer kinds follow the0.7.1 API.
+
+P7: vision uses async ParameterLoader reads driven synchronously at the existing caller API;
+uploads use CPU/GPU handoff and outputs use Context::copyout. The removed full-precision attention
+interface is replaced by0.7.1's query/KV code+scale preparation with the same padded head count,
+non-causal mask, original head-dimension scale and two-dimensional RoPE tables. Vision attention
+now follows upstream quantization and can change image embeddings/generated text numerically.
+Image input overlay, MRoPE positions, rope delta, DFlash verification positions and snapshot
+rope delta remain. Older KV snapshots are rejected rather than reinterpreted.
+
+P8: the full DFlash draft block must fit the remaining context; retained.
+
+Additional retained local stream design: Uzu0.7.1 introduced pipelined eager generation.
+Cortex's existing stream state machine is retained and adapted to GPU copyout because its
+scheduler interleaves one forward pass at a time and its callers use pending-output/empty-input
+continuation. This preserves those interfaces instead of silently switching scheduler semantics.
+
+No builds, tests, benchmarks, checks or app execution performed. Source candidate only.
+
+
+### Complete0.7 rebase corrections
+
+P1 also carries the new recurrent `is_empty` state in a validated0/1 snapshot scalar.
+Restoring a used state into a fresh one must not trigger0.7's deferred initialization and erase
+the restored context. An empty snapshot payload is explicitly zeroed instead of copying
+uninitialized device allocations. UZUSNAP4 rejects old2/3 headers before parsing/uploading.
+P5 restores the removed GPU-family enumeration/accessor and derives the report from the device.
+P3 optional Vulkan math/signatures and Slang stub signatures match the presence-penalty API;
+portable grammar dependencies include llguidance's explicit wasm feature on wasm32.
+
+## P9: persisted0.6 model packages at the0.7 load boundary
+
+`utils/model_format.rs` normalizes known0.6 structural fields in memory before strict typed
+configuration reading. Installed model/config/weight files, tensor payloads and byte offsets are
+unchanged. All public model-loading/discovery boundaries and the DFlash loader use it. Safetensors
+headers normalize names and serialized HybridSpec metadata, keeping original dtype/shape/ranges
+and read tracking. Mixed schemas, unknown fields and migrated-name collisions remain errors.
+
+Old transformer layers become explicit additive residual sublayers, preserving every norm,
+convolution and body configuration. Embeddings keep the old no-index-permutation setting;
+DeltaNet keeps the old fixed SiLU alpha1 gate. HybridSpec moves the old Hadamard block size and
+processing mode into HadamardSpec; sign tensor names stay unchanged. Old SpeculatorModelConfig
+is unwrapped and its tensor/metadata `speculator.` root removed in memory. ChatCodec's parser
+pattern moves into ResponseFormat. Cortex's own template/reasoning parser continues reading
+its untouched original model config, including its original thinking tag.
+
+PLE remains an epilogue injection, followed by a scalar when present. Rare0.6 scalar layers
+without PLE require two explicit legacy sublayer hooks: scale the combined mixer residual
+before MLP pre-normalization, and scale the MLP post-normalized update before its residual add.
+These default off for new0.7 configs. Current pinned Qwen3.8/LFM2.5 configs have no PLE/scalars.
+Additional kernel stages and upstream attention changes may alter floating-point results;
+no claim of bit-identical inference is made.
+
+The Cortex callers accept upstream's async language-model load API with their existing executor.
+No blanket synchronous language-load wrapper is added. All P1–P8 operations are retained;
+full local-difference inventories and the independent source review accompany the migration.

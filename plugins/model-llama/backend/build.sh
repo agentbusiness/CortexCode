@@ -20,7 +20,7 @@ cmake -S "$here/vendor/llama.cpp" -B "$build" -DCMAKE_BUILD_TYPE=Release -DCMAKE
   -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
   -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF \
   -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
-  -DLLAMA_BUILD_NUMBER=11876 -DLLAMA_BUILD_COMMIT=468ad58
+  -DLLAMA_BUILD_NUMBER=12347 -DLLAMA_BUILD_COMMIT=c2cf5f9
 jobs="$(nproc 2>/dev/null || echo 4)"
 # The backends are their own targets (llama-server does not link them): build everything.
 cmake --build "$build" --config Release -j "$jobs"

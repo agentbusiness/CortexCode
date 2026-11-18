@@ -3,7 +3,7 @@
 `cc-model-uzu` serves the `model` category over CPP/1 with Mirai's [uzu](https://github.com/trymirai/uzu)
 engine (Rust, Metal, the M5 matrix units, speculative decoding with each model's bundled
 speculator) embedded **in-process** as a library: `backend/vendor/uzu` holds the engine crates at
-`391abc29abb26f18aa812f6f02e8b023aed11364` (release 0.6.7, see `backend/vendor/uzu/REVISION`) with the
+`90f8bdb7be9cbe0285efe96e37509a1041ddb138` (release 0.7.1, see `backend/vendor/uzu/REVISION`) with the
 patches in `backend/vendor/uzu/PATCHES.md`. There is no HTTP server inside and no subprocess. Swap policy:
 drain first. The plugin is one self-contained folder (`plugin.toml`; the Rust
 workspace in `backend/`, the card and settings panels in `ui/`); its only
@@ -239,3 +239,17 @@ tower and feeds its output to the Mirai M language model.
 Still to verify on the 27B (needs the model run): answers on real screenshots against
 Qwen3.8-27B UD-Q4_K_M + mmproj (the 4-bit Mirai M was distilled on text only), DFlash acceptance
 after images, and prefill/encode latency end to end.
+
+## 2026-11-18 dependency migration (unreleased source)
+
+The engine is Uzu0.7.1 with Cortex's P1–P8 retained and adapted to the new CPU/GPU buffer and
+KVCache interfaces. The caller awaits asynchronous language-model loading. The load boundary
+translates known0.6 model configuration and safetensors names/metadata in memory; installed
+model weights and their catalog revisions are unchanged. Pinned Qwen/LFM model configuration
+and tensor headers were inspected without loading a model.
+
+Snapshots use UZUSNAP4 and preserve recurrent initialization flags. Older physical snapshots
+are rejected and existing cold-prefill fallbacks re-read the conversation tokens. Vision now
+uses the upstream quantized attention interface, which can change image embeddings/results.
+See backend/vendor/uzu/PATCHES.md for the full patch retention and compatibility details.
+These source changes have not been compiled, packaged, installed or run.

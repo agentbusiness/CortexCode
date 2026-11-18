@@ -16,7 +16,7 @@ use crate::{
 
 pub trait MatmulKernel: Sized + Send + Sync {
     type Backend: Backend<Kernels: Kernels<MatmulKernel = Self>>;
-    type Error: Error + 'static;
+    type Error: Error + Send + 'static;
     type WeightsLayout: Copy + Default + PartialEq + Send + Sync;
 
     fn new(
@@ -47,10 +47,20 @@ pub trait MatmulKernel: Sized + Send + Sync {
         None
     }
 
+    fn activation_preparation(
+        &self,
+        _shape: &MatmulShape,
+        _weights_layout: Self::WeightsLayout,
+        _context: &<Self::Backend as Backend>::Context,
+    ) -> ActivationFormat {
+        ActivationFormat::Bf16
+    }
+
     fn select_activation_format(
         &self,
         _bf16_shape: &MatmulShape,
         _weights_layout: Self::WeightsLayout,
+        _prepared: ActivationFormat,
         _context: &<Self::Backend as Backend>::Context,
     ) -> ActivationFormat {
         ActivationFormat::Bf16
@@ -58,10 +68,10 @@ pub trait MatmulKernel: Sized + Send + Sync {
 
     fn optimize_weights_layout(
         &self,
-        _a8_shape: &MatmulShape,
-        _weights: &mut <Self::Backend as Backend>::GlobalBuffer,
+        a8_shape: &MatmulShape,
+        _weights: &mut <Self::Backend as Backend>::GlobalGpuBuffer,
         _context: &<Self::Backend as Backend>::Context,
-    ) -> Result<Self::WeightsLayout, <Self::Backend as Backend>::Error> {
-        Ok(Self::WeightsLayout::default())
+    ) -> Result<(Self::WeightsLayout, bool), <Self::Backend as Backend>::Error> {
+        Ok((Self::WeightsLayout::default(), a8_shape.signed_codes))
     }
 }

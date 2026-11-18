@@ -2,7 +2,10 @@ use crate::{
     backends::common::{
         Backend, BufferMut, BufferRef, CommandBuffer, Kernels,
         gpu_types::{activation_transform::ActivationTransformOp, hadamard_order::HADAMARD_TRANSFORM_BLOCK_SIZE},
-        kernel::{ActivationTransformKernel, matmul::Int8CodeLayout},
+        kernel::{
+            ActivationTransformKernel,
+            matmul::{ActivationFormat, Int8CodeLayout},
+        },
     },
     data_type::DataType,
 };
@@ -16,7 +19,7 @@ fn assert_row_width(element_count: u32) {
 
 pub const ACTIVATION_SCALE_GROUP_SIZE: u32 = 128;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivationQuantization {
     scale_group_size: u32,
     sum_group_size: Option<u32>,
@@ -30,12 +33,13 @@ impl ActivationQuantization {
         emit_group_sums: bool,
         code_layout: Int8CodeLayout,
     ) -> Option<Self> {
-        (scale_group_size == ACTIVATION_SCALE_GROUP_SIZE && (!emit_group_sums || matches!(weight_group_size, 32 | 64)))
-            .then_some(Self {
-                scale_group_size,
-                sum_group_size: emit_group_sums.then_some(weight_group_size),
-                code_layout,
-            })
+        (scale_group_size == ACTIVATION_SCALE_GROUP_SIZE
+            && (!emit_group_sums || matches!(weight_group_size, 32 | 64 | 128)))
+        .then_some(Self {
+            scale_group_size,
+            sum_group_size: emit_group_sums.then_some(weight_group_size),
+            code_layout,
+        })
     }
 
     pub const fn scale_group_size(self) -> u32 {
@@ -55,7 +59,7 @@ pub struct ActivationTransform<B: Backend> {
     kernel: <B::Kernels as Kernels>::ActivationTransformKernel,
     in_place: bool,
     has_bias: bool,
-    quantization: Option<ActivationQuantization>,
+    format: ActivationFormat,
 }
 
 impl<B: Backend> ActivationTransform<B> {
@@ -64,71 +68,101 @@ impl<B: Backend> ActivationTransform<B> {
         data_type: DataType,
         bias_data_type: Option<DataType>,
         ops: ActivationTransformOp,
+        hadamard_size: u32,
         in_place: bool,
-        quantization: Option<ActivationQuantization>,
+        format: ActivationFormat,
     ) -> Result<Self, B::Error> {
         let has_bias = bias_data_type.is_some();
-        let (codes_grouped_by_nibble, scale_group_size, sum_group_size) = match quantization {
-            Some(q) => (q.code_layout.is_grouped_by_nibble(), q.scale_group_size, q.sum_group_size),
-            None => (false, HADAMARD_TRANSFORM_BLOCK_SIZE, None),
+        let (codes_grouped_by_nibble, scale_group_size, sum_group_size, weight_bits) = match format {
+            ActivationFormat::Int8(q) => (
+                q.code_layout().is_grouped_by_nibble(),
+                q.scale_group_size(),
+                q.sum_group_size().unwrap_or(q.scale_group_size()),
+                0,
+            ),
+            ActivationFormat::PackedHalf {
+                block_k,
+                bits,
+            } => (false, HADAMARD_TRANSFORM_BLOCK_SIZE, block_k, bits),
+            ActivationFormat::Bf16 | ActivationFormat::Trellis => {
+                (false, HADAMARD_TRANSFORM_BLOCK_SIZE, HADAMARD_TRANSFORM_BLOCK_SIZE, 0)
+            },
         };
         let kernel = <B::Kernels as Kernels>::ActivationTransformKernel::new(
             context,
             data_type,
             bias_data_type.unwrap_or(data_type),
             ops,
+            hadamard_size,
             codes_grouped_by_nibble,
             in_place,
             scale_group_size,
-            sum_group_size.unwrap_or(HADAMARD_TRANSFORM_BLOCK_SIZE),
+            sum_group_size,
+            weight_bits,
             has_bias,
         )?;
         Ok(Self {
             kernel,
             in_place,
             has_bias,
-            quantization,
+            format,
         })
     }
 
     pub fn input_rht(
         context: &B::Context,
         data_type: DataType,
+        hadamard_size: u32,
         in_place: bool,
     ) -> Result<Self, B::Error> {
-        Self::new(context, data_type, None, ActivationTransformOp::InputRht, in_place, None)
+        Self::new(
+            context,
+            data_type,
+            None,
+            ActivationTransformOp::InputRht,
+            hadamard_size,
+            in_place,
+            ActivationFormat::Bf16,
+        )
     }
 
     pub fn output_rht(
         context: &B::Context,
         data_type: DataType,
         bias_data_type: Option<DataType>,
+        hadamard_size: u32,
         in_place: bool,
     ) -> Result<Self, B::Error> {
-        Self::new(context, data_type, bias_data_type, ActivationTransformOp::OutputRht, in_place, None)
+        Self::new(
+            context,
+            data_type,
+            bias_data_type,
+            ActivationTransformOp::OutputRht,
+            hadamard_size,
+            in_place,
+            ActivationFormat::Bf16,
+        )
     }
 
     pub fn quantize(
         context: &B::Context,
         data_type: DataType,
-        quantization: ActivationQuantization,
+        hadamard_size: u32,
+        quantization: ActivationFormat,
     ) -> Result<Self, B::Error> {
-        let op = quantization
-            .sum_group_size()
-            .map_or(ActivationTransformOp::Quantize, |_| ActivationTransformOp::QuantizeWithGroupSums);
-        Self::new(context, data_type, None, op, false, Some(quantization))
+        let op = match quantization {
+            ActivationFormat::Int8(q) if q.sum_group_size().is_some() => ActivationTransformOp::QuantizeWithGroupSums,
+            ActivationFormat::Int8(_) => ActivationTransformOp::Quantize,
+            ActivationFormat::PackedHalf {
+                ..
+            } => ActivationTransformOp::PackHalf,
+            ActivationFormat::Bf16 | ActivationFormat::Trellis => unreachable!(),
+        };
+        Self::new(context, data_type, None, op, hadamard_size, false, quantization)
     }
 
-    pub fn scale_group_size(&self) -> u32 {
-        self.quantization.expect("quantized activation transform required").scale_group_size()
-    }
-
-    pub fn sum_group_size(&self) -> Option<u32> {
-        self.quantization.expect("quantized activation transform required").sum_group_size()
-    }
-
-    pub fn code_layout(&self) -> Int8CodeLayout {
-        self.quantization.expect("quantized activation transform required").code_layout()
+    pub fn format(&self) -> ActivationFormat {
+        self.format
     }
 
     /// `input` and `output` must be distinct buffers.
@@ -141,18 +175,19 @@ impl<B: Backend> ActivationTransform<B> {
         element_count: u32,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) {
-        assert!(self.quantization.is_none() && !self.in_place && !self.has_bias);
+        assert!(self.format == ActivationFormat::Bf16 && !self.in_place && !self.has_bias);
         assert_row_width(element_count);
         self.kernel.encode(
             Some(input),
             Some(output),
-            None::<&B::GlobalBuffer>,
+            None::<&B::GlobalGpuBuffer>,
             None::<&mut B::ScratchBuffer>,
             None::<&mut B::ScratchBuffer>,
             None::<&mut B::ScratchBuffer>,
             rht_factors,
             batch_size,
             element_count,
+            None::<&mut B::ScratchBuffer>,
             command_buffer,
         );
     }
@@ -161,12 +196,12 @@ impl<B: Backend> ActivationTransform<B> {
         &self,
         data: impl BufferMut<Backend = B>,
         rht_factors: impl BufferRef<Backend = B>,
-        bias: Option<&B::GlobalBuffer>,
+        bias: Option<&B::GlobalGpuBuffer>,
         batch_size: u32,
         element_count: u32,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) {
-        assert!(self.quantization.is_none() && self.in_place && self.has_bias == bias.is_some());
+        assert!(self.format == ActivationFormat::Bf16 && self.in_place && self.has_bias == bias.is_some());
         assert_row_width(element_count);
         self.kernel.encode(
             None::<&B::ScratchBuffer>,
@@ -178,6 +213,7 @@ impl<B: Backend> ActivationTransform<B> {
             rht_factors,
             batch_size,
             element_count,
+            None::<&mut B::ScratchBuffer>,
             command_buffer,
         );
     }
@@ -193,7 +229,9 @@ impl<B: Backend> ActivationTransform<B> {
         element_count: u32,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) {
-        let quantization = self.quantization.expect("quantized activation transform required");
+        let ActivationFormat::Int8(quantization) = self.format else {
+            panic!("quantized activation transform required")
+        };
         assert_row_width(element_count);
         assert!(
             element_count.is_multiple_of(quantization.scale_group_size()),
@@ -206,13 +244,40 @@ impl<B: Backend> ActivationTransform<B> {
         self.kernel.encode(
             Some(input),
             None::<&mut B::ScratchBuffer>,
-            None::<&B::GlobalBuffer>,
+            None::<&B::GlobalGpuBuffer>,
             Some(q_out),
             Some(scales_out),
             group_sums_out,
             rht_factors,
             batch_size,
             element_count,
+            None::<&mut B::ScratchBuffer>,
+            command_buffer,
+        );
+    }
+
+    pub fn encode_pack_half(
+        &self,
+        input: impl BufferRef<Backend = B>,
+        output: impl BufferMut<Backend = B>,
+        rht_factors: impl BufferRef<Backend = B>,
+        batch_size: u32,
+        element_count: u32,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) {
+        assert!(matches!(self.format, ActivationFormat::PackedHalf { .. }) && batch_size <= 8);
+        assert_row_width(element_count);
+        self.kernel.encode(
+            Some(input),
+            None::<&mut B::ScratchBuffer>,
+            None::<&B::GlobalGpuBuffer>,
+            None::<&mut B::ScratchBuffer>,
+            None::<&mut B::ScratchBuffer>,
+            None::<&mut B::ScratchBuffer>,
+            rht_factors,
+            batch_size,
+            element_count,
+            Some(output),
             command_buffer,
         );
     }

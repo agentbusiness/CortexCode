@@ -1,18 +1,18 @@
-use std::range::Range;
+use std::{range::Range, sync::Arc};
 
 use derive_more::Debug;
 use thiserror::Error;
 
 use crate::{
-    backends::common::{
-        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels, kernel::TensorAddScaleKernel,
-    },
+    backends::common::{Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding},
     config::{rope::AnyRoPEConfig, transformer::TransformerConfig},
     data_type::DataType,
     encodable_block::{
         batch_topology::BatchTopology,
+        linear::InputRhtParameters,
         mixer::{MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode, attention::rope::PrecalculatedRoPE},
-        normalization::{Normalization, NormalizationNewError, PostLayerScalar, ShortcutMode},
+        normalization::{Normalization, NormalizationNewError, ShortcutMode},
+        residual::{ResidualEncodeError, ResidualHead, ResidualNewError},
         transformer_layer::{TransformerLayer, TransformerLayerError},
     },
     safetensors::ParameterTree,
@@ -177,6 +177,10 @@ pub enum TransformerNewError<B: Backend> {
     Layer(#[from] TransformerLayerError<B>),
     #[error("Normalization error: {0}")]
     Normalization(#[from] NormalizationNewError<B>),
+    #[error("Residual error: {0}")]
+    Residual(#[from] ResidualNewError<B>),
+    #[error("Readout expects RHT-rotated input but there is no output norm to apply it")]
+    UnappliedReadoutRht,
 }
 
 #[derive(Debug, Error)]
@@ -185,94 +189,113 @@ pub enum TransformerEncodeError<B: Backend> {
     Backend(#[source] B::Error),
     #[error("Layer error: {0}")]
     Layer(#[from] TransformerLayerError<B>),
+    #[error("Residual encoding error: {0}")]
+    Residual(#[from] ResidualEncodeError<B>),
+    #[error("Hidden features require an additive residual")]
+    HiddenFeaturesRequireAdditiveResidual,
 }
 
 pub struct Transformer<B: Backend> {
     ropes: Box<[AnyRoPEConfig]>,
     layers: Box<[(TransformerLayer<B>, Option<usize>)]>,
-    output_norm: Normalization<B>,
+    output_norm: Option<Normalization<B>>,
     model_dim: u32,
-    residual_add: <B::Kernels as Kernels>::TensorAddScaleKernel,
+    residual_head: ResidualHead<B>,
 }
 
 impl<B: Backend> Transformer<B> {
-    pub fn new(
-        data_type: DataType,
-        output_norm_hadamard_factors: Option<B::GlobalBuffer>,
+    pub async fn new(
+        input_data_type: DataType,
+        output_data_type: DataType,
+        output_norm_hadamard_factors: Option<Arc<B::GlobalGpuBuffer>>,
         transformer_config: &TransformerConfig,
-        parameter_tree: &ParameterTree<B>,
+        parameter_tree: &ParameterTree<'_, B>,
         context: &B::Context,
     ) -> Result<Self, TransformerNewError<B>> {
         let mut ropes: Vec<AnyRoPEConfig> = Vec::new();
 
-        let num_layers = transformer_config.layer_configs.len() as u32;
-        let layers = transformer_config
-            .layer_configs
-            .iter()
-            .zip(0u32..)
-            .map(|(layer_config, layer_index)| {
-                let layer_loader = parameter_tree.subtree(&format!("layers.{}", layer_index));
-
-                let rope = layer_config.rope_config.as_ref().map(|layer_rope_config| {
-                    ropes.iter().position(|rope_config| rope_config == layer_rope_config).unwrap_or_else(|| {
-                        ropes.push(layer_rope_config.clone());
-                        ropes.len() - 1
-                    })
-                });
-
-                let layer = TransformerLayer::new(
-                    transformer_config.model_dim,
-                    transformer_config.hidden_dim,
-                    num_layers,
-                    layer_index,
-                    data_type,
-                    layer_config,
-                    &layer_loader,
-                    context,
-                )?;
-
-                Ok((layer, rope))
-            })
-            .collect::<Result<Box<[_]>, TransformerNewError<B>>>()?;
-
-        let output_norm = Normalization::new(
+        let residual_config = transformer_config.residual_config.clone();
+        let residual_head = ResidualHead::new(
+            &residual_config,
             transformer_config.model_dim,
-            data_type,
-            output_norm_hadamard_factors,
-            ShortcutMode::Add,
-            PostLayerScalar::None,
-            &transformer_config.output_norm_config,
-            &parameter_tree.subtree("output_norm"),
+            input_data_type,
+            &parameter_tree.subtree("residual_head"),
             context,
-        )?;
+        )
+        .await?;
 
-        let residual_add = <B::Kernels as Kernels>::TensorAddScaleKernel::new(context, data_type, false)
-            .map_err(TransformerNewError::Backend)?;
+        let num_layers = transformer_config.layer_configs.len() as u32;
+        let mut layers = Vec::with_capacity(num_layers as usize);
+        for (layer_config, layer_index) in transformer_config.layer_configs.iter().zip(0u32..) {
+            let layer_loader = parameter_tree.subtree(&format!("layers.{}", layer_index));
+
+            let rope = layer_config.rope_config.as_ref().map(|layer_rope_config| {
+                ropes.iter().position(|rope_config| rope_config == layer_rope_config).unwrap_or_else(|| {
+                    ropes.push(layer_rope_config.clone());
+                    ropes.len() - 1
+                })
+            });
+
+            let layer = TransformerLayer::new(
+                transformer_config.model_dim,
+                transformer_config.hidden_dim,
+                num_layers,
+                layer_index,
+                input_data_type,
+                layer_config,
+                &residual_config,
+                &layer_loader,
+                context,
+            )
+            .await?;
+
+            layers.push((layer, rope));
+        }
+
+        let output_norm = match (&transformer_config.output_norm_config, output_norm_hadamard_factors) {
+            (Some(output_norm_config), hadamard_factors) => Some(
+                Normalization::new(
+                    transformer_config.model_dim,
+                    input_data_type,
+                    output_data_type,
+                    hadamard_factors.map(InputRhtParameters::h32),
+                    ShortcutMode::None,
+                    output_norm_config,
+                    &parameter_tree.subtree("output_norm"),
+                    context,
+                )
+                .await?,
+            ),
+            (None, Some(_)) => return Err(TransformerNewError::UnappliedReadoutRht),
+            (None, None) => None,
+        };
 
         Ok(Self {
             ropes: ropes.into_boxed_slice(),
-            layers,
+            layers: layers.into_boxed_slice(),
             output_norm,
             model_dim: transformer_config.model_dim,
-            residual_add,
+            residual_head,
         })
     }
 
-    fn capture_residual(
+    fn capture_hidden_feature(
         &self,
-        shortcut: impl BufferRef<Backend = B>,
-        hidden: impl BufferRef<Backend = B>,
-        batch_size: u32,
+        stream: impl BufferRef<Backend = B>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, B::Error> {
-        let mut output = command_buffer.allocate_scratch(hidden.size())?;
-        let elements = batch_size * self.model_dim;
-        self.residual_add.encode(Some(shortcut), hidden, &mut output, elements, elements, 1.0, command_buffer);
-        Ok(output)
+        let mut copy = command_buffer.allocate_scratch(stream.size())?;
+        command_buffer.encode_copy(stream, &mut copy);
+        Ok(copy)
+    }
+
+    pub fn model_dim(&self) -> u32 {
+        self.model_dim
     }
 
     pub fn speculation_supported(&self) -> bool {
-        self.layers.iter().all(|(layer, _rope)| layer.mixer.speculation_supported())
+        matches!(self.residual_head, ResidualHead::Additive)
+            && self.layers.iter().all(|(layer, _rope)| layer.mixer.speculation_supported())
     }
 
     pub fn max_context_length(&self) -> Option<u32> {
@@ -362,14 +385,20 @@ impl<B: Backend> Transformer<B> {
         rope_rows: Option<RopeRows<'_>>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<TransformerEncodeOutput<B>, TransformerEncodeError<B>> {
-        let mut hidden = input;
+        if hidden_feature_layer_indices.is_some() && !matches!(self.residual_head, ResidualHead::Additive) {
+            return Err(TransformerEncodeError::HiddenFeaturesRequireAdditiveResidual);
+        }
+
+        let mut stream = self
+            .residual_head
+            .expand(input, batch_dim.size(), command_buffer)
+            .map_err(TransformerEncodeError::Backend)?;
         let layer_count = if output_range.is_none() && hidden_feature_layer_indices.is_none() {
             self.prefill_cache_layer_count()
         } else {
             self.layers.len()
         };
 
-        let mut shortcut = command_buffer.allocate_scratch(hidden.size()).map_err(TransformerEncodeError::Backend)?;
         let mut hidden_features =
             hidden_feature_layer_indices.map(|indices| (0..indices.len()).map(|_| None).collect::<Vec<_>>());
 
@@ -428,21 +457,14 @@ impl<B: Backend> Transformer<B> {
                 None
             };
 
-            hidden = layer.encode(
-                hidden,
-                &mut shortcut,
-                per_layer_inputs,
-                precalculated_rope,
-                batch_dim,
-                layer_state,
-                command_buffer,
-            )?;
+            stream =
+                layer.encode(stream, per_layer_inputs, precalculated_rope, batch_dim, layer_state, command_buffer)?;
 
             if let (Some(hidden_features), Some(indices)) = (&mut hidden_features, hidden_feature_layer_indices) {
                 for (feature_index, &layer_index) in indices.iter().enumerate() {
                     if layer_index == layer.layer_index {
                         let feature = self
-                            .capture_residual(&shortcut, &hidden, batch_dim.size(), command_buffer)
+                            .capture_hidden_feature(&stream, command_buffer)
                             .map_err(TransformerEncodeError::Backend)?;
                         hidden_features[feature_index] = Some(feature);
                     }
@@ -472,19 +494,29 @@ impl<B: Backend> Transformer<B> {
             });
         };
 
-        let output_normalized = self
-            .output_norm
-            .encode(
-                &hidden,
-                output_range.start,
-                output_range.end - output_range.start,
-                Some(&mut shortcut),
-                command_buffer,
-            )
-            .map_err(TransformerEncodeError::Backend)?;
+        let output_row_count = output_range.end - output_range.start;
+        let (hidden, row_offset) =
+            match self.residual_head.readout(&stream, output_range.start, output_row_count, command_buffer)? {
+                Some(hidden) => (hidden, 0),
+                None => (stream, output_range.start),
+            };
+        let output = match &self.output_norm {
+            Some(output_norm) => output_norm
+                .encode(&hidden, row_offset, output_row_count, None::<&mut B::ScratchBuffer>, command_buffer)
+                .map_err(TransformerEncodeError::Backend)?,
+            None if row_offset == 0 => hidden,
+            None => {
+                let row_size = hidden.size() / batch_dim.size() as usize;
+                let rows = row_offset as usize * row_size..(row_offset + output_row_count) as usize * row_size;
+                let mut output =
+                    command_buffer.allocate_scratch(rows.end - rows.start).map_err(TransformerEncodeError::Backend)?;
+                command_buffer.encode_copy((&hidden).subrange(rows), &mut output);
+                output
+            },
+        };
 
         Ok(TransformerEncodeOutput {
-            output: Some(output_normalized),
+            output: Some(output),
             hidden_features,
         })
     }

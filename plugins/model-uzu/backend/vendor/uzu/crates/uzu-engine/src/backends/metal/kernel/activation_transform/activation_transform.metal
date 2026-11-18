@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 #include "../common/activation_quantization.h"
 #include "../common/defines.h"
+#include "../common/packed_half_activation.h"
 #include "../common/conversion.h"
 #include "../common/dsl.h"
 #include "../common/thread_context.h"
@@ -16,13 +17,14 @@ using namespace uzu::activation_transform;
 
 #define QUANTIZED (ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums)
 #define EMITS_GROUP_SUMS (ops == ActivationTransformOp::QuantizeWithGroupSums)
+#define PACKED_HALF (ops == ActivationTransformOp::PackHalf)
 
 template <typename T, typename BiasT>
 VARIANTS(T, float, bfloat)
 VARIANTS(BiasT, float, bfloat)
 PUBLIC KERNEL(ActivationTransform)(
     const device T* input OPTIONAL(!in_place),
-    device T* fp_out OPTIONAL(!QUANTIZED),
+    device T* fp_out OPTIONAL(!QUANTIZED && !PACKED_HALF),
     const device BiasT* bias OPTIONAL(has_bias),
     device int8_t* q_out OPTIONAL(QUANTIZED),
     device float* scales_out OPTIONAL(QUANTIZED),
@@ -30,11 +32,14 @@ PUBLIC KERNEL(ActivationTransform)(
     const device int32_t* rht_factors,
     constant uint& batch_size,
     constant uint& element_count,
+    device uint* packed_half_out OPTIONAL(PACKED_HALF),
     const ActivationTransformOp ops SPECIALIZE,
+    const uint hadamard_size SPECIALIZE,
     const bool grouped_by_weight_nibble SPECIALIZE,
     const bool in_place SPECIALIZE,
     const uint activation_scale_group_size SPECIALIZE,
     const uint sum_group_size SPECIALIZE,
+    const uint weight_bits SPECIALIZE,
     const bool has_bias SPECIALIZE,
     uint activation_tile_index GROUPS(element_count.div_ceil(TILE_ELEMENTS)),
     uint batch_index GROUPS(batch_size),
@@ -47,33 +52,40 @@ PUBLIC KERNEL(ActivationTransform)(
 
   const bool input_rht = ops != ActivationTransformOp::OutputRht;
   const ushort lane_index = thread_context.simd_lane_id;
-  const uint first_index = activation_tile_index * TILE_ELEMENTS + thread_index * HADAMARD_VECTOR_SIZE;
+  const uint first_index = activation_tile_index * TILE_ELEMENTS + thread_index * hadamard::VECTOR_SIZE;
   const bool in_bounds = first_index < element_count;
   const uint element_index = batch_index * element_count + first_index;
 
   float4 values = 0.0f;
   int4 factors = 0;
   if (in_bounds) {
-    values = float4(load_hadamard_vector(input + element_index));
-    factors = load_hadamard_vector(rht_factors + first_index);
+    values = float4(load_vec4(input + element_index));
+    factors = load_vec4(rht_factors + first_index);
     if (input_rht) {
       values *= float4(factors);
     }
   }
-  values = simdgroup_hadamard_transform_vector(lane_index, values);
+  values = hadamard::simdgroup_transform_vector(lane_index, values, hadamard_size);
   if (!input_rht) {
     values *= float4(factors);
   }
 
-  if (!QUANTIZED) {
+  if (!QUANTIZED && !PACKED_HALF) {
     if (in_bounds) {
       if (has_bias) {
         if constexpr (metal::is_same_v<T, bfloat>) {
-          values = uzu::bfloat_to_float(vec<bfloat, HADAMARD_VECTOR_SIZE>(values));
+          values = uzu::bfloat_to_float(vec<bfloat, hadamard::VECTOR_SIZE>(values));
         }
-        values += float4(load_hadamard_vector(bias + first_index));
+        values += float4(load_vec4(bias + first_index));
       }
-      store_hadamard_vector(fp_out + element_index, values);
+      store_vec4(fp_out + element_index, values);
+    }
+    return;
+  }
+
+  if (PACKED_HALF) {
+    if (in_bounds) {
+      store_packed_half(values, lane_index, first_index, batch_index, sum_group_size, weight_bits, packed_half_out);
     }
     return;
   }

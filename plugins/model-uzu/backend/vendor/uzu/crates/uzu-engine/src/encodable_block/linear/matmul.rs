@@ -4,19 +4,19 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, BufferRef, CommandBuffer, CommandBufferEncoding,
+        Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding,
         kernel::{
-            ActivationQuantization, Kernels,
+            Kernels,
             matmul::{
-                ActivationFormat, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulOutput,
-                MatmulShape,
+                ActivationFormat, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulGather, MatmulKernel,
+                MatmulOutput, MatmulShape,
             },
         },
     },
     config::weight_matrix::{AnyWeightMatrixSpec, Layout},
     data_type::DataType,
     encodable_block::{
-        linear::{Gather, Linear, LinearEncodeError, LinearInput},
+        linear::{Linear, LinearEncodeError, LinearInput},
         weight_matrix::{WeightMatrix, WeightMatrixError},
     },
     safetensors::{ParameterLoaderError, ParameterTree},
@@ -41,40 +41,47 @@ pub enum LinearMatmulError<B: Backend> {
 pub struct LinearMatmul<B: Backend> {
     kernel: Mutex<<B::Kernels as Kernels>::MatmulKernel>,
     matrix: WeightMatrix<B>,
-    biases: Option<B::GlobalBuffer>,
-    output_hadamard_factors: Option<B::GlobalBuffer>,
+    biases: Option<B::GlobalGpuBuffer>,
+    output_hadamard_factors: Option<B::GlobalGpuBuffer>,
     input_dim: u32,
     output_dim: u32,
     output_data_type: DataType,
+    prepared_activation_format: ActivationFormat,
 }
 
-fn load_biases<B: Backend>(
+async fn load_biases<B: Backend>(
     weights_data_type: DataType,
     output_data_type: DataType,
     output_dim: u32,
-    parameter_tree: Option<&ParameterTree<B>>,
-) -> Result<Option<B::GlobalBuffer>, LinearMatmulError<B>> {
+    parameter_tree: Option<&ParameterTree<'_, B>>,
+) -> Result<Option<B::GlobalGpuBuffer>, LinearMatmulError<B>> {
     if parameter_tree.is_some() && weights_data_type != output_data_type {
         return Err(LinearMatmulError::UnsupportedConfiguration(format!(
             "mixed precision linear with biases is not supported: weights={weights_data_type:?}, output={output_data_type:?}",
         )));
     }
-    Ok(parameter_tree.map(|tree| tree.read_buffer("biases", &[output_dim], weights_data_type)).transpose()?)
+    Ok(if let Some(tree) = parameter_tree {
+        Some(tree.read_buffer("biases", &[output_dim], weights_data_type).await?)
+    } else {
+        None
+    })
 }
 
 impl<B: Backend> LinearMatmul<B> {
-    /// Loads a linear over any parsed spec — full precision, MLX or Int. Hybrid
-    /// compositions live in the wrappers, not here.
-    pub fn load(
+    pub(super) fn output_dim(&self) -> u32 {
+        self.output_dim
+    }
+
+    pub async fn load(
         input_dim: u32,
         output_dim: u32,
         weights_data_type: DataType,
         input_data_type: DataType,
         output_data_type: DataType,
         spec: AnyWeightMatrixSpec,
-        output_hadamard_factors: Option<B::GlobalBuffer>,
-        weights_tree: &ParameterTree<B>,
-        bias_tree: Option<&ParameterTree<B>>,
+        output_hadamard_factors: Option<B::GlobalGpuBuffer>,
+        weights_tree: &ParameterTree<'_, B>,
+        bias_tree: Option<&ParameterTree<'_, B>>,
         context: &B::Context,
     ) -> Result<Self, LinearMatmulError<B>> {
         for data_type in [weights_data_type, input_data_type, output_data_type] {
@@ -84,14 +91,15 @@ impl<B: Backend> LinearMatmul<B> {
         }
 
         let matrix =
-            WeightMatrix::load(output_dim, input_dim, weights_data_type, spec, Layout::OutputInput, weights_tree)?;
-        if output_hadamard_factors.is_some() && matrix.quantization().is_none() {
+            WeightMatrix::load(output_dim, input_dim, weights_data_type, spec, Layout::OutputInput, weights_tree)
+                .await?;
+        if output_hadamard_factors.is_some() && matrix.matmul_b().quantized().is_none() {
             return Err(LinearMatmulError::UnsupportedConfiguration(
                 "fused output-hadamard factors require quantized weights".into(),
             ));
         }
 
-        let biases = load_biases(weights_data_type, output_data_type, output_dim, bias_tree)?;
+        let biases = load_biases(weights_data_type, output_data_type, output_dim, bias_tree).await?;
 
         let kernel =
             <B::Kernels as Kernels>::MatmulKernel::new(context, weights_data_type, input_data_type, output_data_type)
@@ -105,39 +113,56 @@ impl<B: Backend> LinearMatmul<B> {
             input_dim,
             output_dim,
             output_data_type,
+            prepared_activation_format: ActivationFormat::Bf16,
         })
     }
 
-    pub(super) fn prepare_a8_matmul(
+    pub(super) fn prepare_activation(
         &mut self,
         context: &B::Context,
-    ) -> Result<Option<ActivationQuantization>, B::Error> {
-        let mut candidate = self.matmul_shape(1, false);
-        let Some(signed_codes) = self.matrix.a8_signed_codes() else {
-            return Ok(None);
-        };
-        candidate.signed_codes = signed_codes;
-        let kernel = self.kernel.lock();
-        let quantization = kernel.select_activation_quantization(&candidate, context);
-        if quantization.is_none() || !self.matrix.try_prepare_a8_storage() {
-            return Ok(None);
+    ) -> Result<ActivationFormat, B::Error> {
+        {
+            let shape = self.matmul_shape(1, ActivationFormat::Bf16);
+            let kernel = self.kernel.lock();
+            self.matrix.optimize_weights_layout(|weights| kernel.optimize_weights_layout(&shape, weights, context))?;
         }
-        self.matrix.optimize_weights_layout(|weights| kernel.optimize_weights_layout(&candidate, weights, context))?;
-        Ok(quantization)
+        let shape = self.matmul_shape(1, ActivationFormat::Bf16);
+        self.prepared_activation_format =
+            self.kernel.lock().activation_preparation(&shape, self.matmul_b().weights_layout(), context);
+        Ok(self.prepared_activation_format)
     }
 
-    pub(super) fn encode_with_a(
+    pub(super) fn encode_columns(
         &self,
         a: MatmulA<impl BufferRef<Backend = B>>,
         batch_dim: u32,
-        gather: Option<Gather<impl BufferRef<Backend = B>>>,
+        output: &mut B::ScratchBuffer,
+        column: u32,
+        column_count: u32,
+        row_stride: u32,
+        gather: Option<MatmulGather<impl BufferRef<Backend = B>>>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
-    ) -> Result<B::ScratchBuffer, LinearEncodeError<B>> {
-        let (output_dim, gather_indices) =
-            gather.map_or((self.output_dim, None), |gather| (gather.output_dim, Some(gather.indices)));
-        let mut output = command_buffer
-            .allocate_scratch_for_shape(&[batch_dim, output_dim], self.output_data_type)
-            .map_err(LinearEncodeError::Backend)?;
+    ) -> Result<(), LinearEncodeError<B>> {
+        let element = self.output_data_type.size_in_bytes();
+        let first_byte = column as usize * element;
+        let written_bytes = ((batch_dim as usize - 1) * row_stride as usize + column_count as usize) * element;
+        let output = MatmulOutput {
+            values: output.subrange_mut(first_byte..first_byte + written_bytes),
+            row_stride: Some(row_stride),
+            ops: self.d_ops(),
+        };
+        self.encode_output(a, batch_dim, column_count, gather, output, command_buffer)
+    }
+
+    fn encode_output(
+        &self,
+        a: MatmulA<impl BufferRef<Backend = B>>,
+        batch_dim: u32,
+        output_dim: u32,
+        gather: Option<MatmulGather<impl BufferRef<Backend = B>>>,
+        output: MatmulOutput<'_, B, impl BufferMut<Backend = B>>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<(), LinearEncodeError<B>> {
         self.kernel
             .lock()
             .encode(
@@ -146,23 +171,21 @@ impl<B: Backend> LinearMatmul<B> {
                     b: self.matmul_b(),
                     b_leading_dimension: None,
                     b_transpose: true,
-                    output: MatmulOutput::new(&mut output, self.d_ops()),
-                    gather_indices,
+                    output,
+                    gather,
                     m: batch_dim,
                     n: output_dim,
                     k: self.input_dim,
                 },
                 command_buffer,
             )
-            .map_err(LinearEncodeError::Matmul)?;
-
-        Ok(output)
+            .map_err(LinearEncodeError::Matmul)
     }
 
     fn matmul_shape(
         &self,
         batch_dim: u32,
-        a_full_precision: bool,
+        a: ActivationFormat,
     ) -> MatmulShape {
         let b = self.matmul_b();
         MatmulShape {
@@ -176,14 +199,14 @@ impl<B: Backend> LinearMatmul<B> {
             b_bits: b.bits_per_b(),
             b_group_size: b.group_size(),
             signed_codes: b.signed_codes(),
-            a_full_precision,
+            a,
             gathered: false,
             params_layout: b.quant_params_layout(),
             d_transform: self.d_ops().mask(),
         }
     }
 
-    fn matmul_b(&self) -> MatmulB<&B::GlobalBuffer> {
+    fn matmul_b(&self) -> MatmulB<&B::GlobalGpuBuffer> {
         self.matrix.matmul_b()
     }
 
@@ -203,15 +226,33 @@ impl<B: Backend> Linear<B> for LinearMatmul<B> {
         batch_dim: u32,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, LinearEncodeError<B>> {
-        self.encode_with_a(input.as_matmul_a(), batch_dim, None::<Gather<&B::ScratchBuffer>>, command_buffer)
+        let mut output = command_buffer
+            .allocate_scratch_for_shape(&[batch_dim, self.output_dim], self.output_data_type)
+            .map_err(LinearEncodeError::Backend)?;
+        self.encode_output(
+            input.as_ref(),
+            batch_dim,
+            self.output_dim,
+            None::<MatmulGather<&B::ScratchBuffer>>,
+            MatmulOutput::new(&mut output, self.d_ops()),
+            command_buffer,
+        )?;
+        Ok(output)
     }
 
     fn select_activation_format(
         &self,
         batch_dim: u32,
+        output_dim: Option<u32>,
         context: &B::Context,
     ) -> ActivationFormat {
-        let bf16_shape = self.matmul_shape(batch_dim, true);
-        self.kernel.lock().select_activation_format(&bf16_shape, self.matmul_b().weights_layout(), context)
+        let mut shape = self.matmul_shape(batch_dim, ActivationFormat::Bf16);
+        shape.n = output_dim.unwrap_or(self.output_dim);
+        self.kernel.lock().select_activation_format(
+            &shape,
+            self.matmul_b().weights_layout(),
+            self.prepared_activation_format,
+            context,
+        )
     }
 }

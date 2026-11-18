@@ -1,11 +1,11 @@
 use crate::{
     backends::{
         common::{
-            Backend, BufferCpuAccessible, BufferMut, BufferRef, Kernels,
-            gpu_types::quantization::QuantizationMode,
+            Backend, BufferMut, BufferRef, CpuBuffer, Kernels,
+            gpu_types::{hadamard_order::HADAMARD_TRANSFORM_BLOCK_SIZE, quantization::QuantizationMode},
             kernel::{
                 ActivationTransform, TensorAddBiasKernel,
-                matmul::{Int8CodeLayout, MatmulA, MatmulArguments, MatmulKernel},
+                matmul::{Int8CodeLayout, MatmulA, MatmulArguments, MatmulKernel, MatmulOutput},
             },
         },
         cpu::{
@@ -15,7 +15,7 @@ use crate::{
             context::CpuContext,
             kernel::matmul::{
                 MatmulCpuError,
-                reference::{WeightData, read_bf16, write_bf16},
+                reference::{WeightData, load, store},
             },
         },
     },
@@ -24,6 +24,9 @@ use crate::{
 };
 
 pub struct MatmulCpuKernel {
+    weights_data_type: DataType,
+    input_data_type: DataType,
+    output_data_type: DataType,
     output_rht: ActivationTransform<Cpu>,
     bias_add: <<Cpu as Backend>::Kernels as Kernels>::TensorAddBiasKernel,
 }
@@ -40,18 +43,22 @@ impl MatmulKernel for MatmulCpuKernel {
         output_data_type: DataType,
     ) -> Result<Self, Self::Error> {
         for data_type in [weights_data_type, input_data_type, output_data_type] {
-            if data_type != DataType::BF16 {
+            if !matches!(data_type, DataType::BF16 | DataType::F32) {
                 return Err(MatmulCpuError::UnsupportedDataType(data_type));
             }
         }
-        let output_rht = ActivationTransform::output_rht(context, DataType::BF16, None, true)?;
+        let output_rht =
+            ActivationTransform::output_rht(context, output_data_type, None, HADAMARD_TRANSFORM_BLOCK_SIZE, true)?;
         let bias_add = <<Cpu as Backend>::Kernels as Kernels>::TensorAddBiasKernel::new(
             context,
-            DataType::BF16,
-            DataType::BF16,
+            output_data_type,
+            weights_data_type,
             true,
         )?;
         Ok(Self {
+            weights_data_type,
+            input_data_type,
+            output_data_type,
             output_rht,
             bias_add,
         })
@@ -78,10 +85,15 @@ impl MatmulKernel for MatmulCpuKernel {
             m,
             n,
             k,
-            gather_indices,
+            gather,
             ..
         } = arguments;
-        let (mut d, ops) = output.into_contiguous(n, "CpuMatmul")?;
+        let row_stride = output.checked_row_stride(n)? as usize;
+        let MatmulOutput {
+            values: mut d,
+            ops,
+            ..
+        } = output;
         let output_scale = ops.ab_scale;
         let bias_buffer = ops.bias;
         let post_rht = ops.rht_factors;
@@ -107,7 +119,7 @@ impl MatmulKernel for MatmulCpuKernel {
                 offset,
             } => {
                 let (values, range) = values.parts();
-                let byte_offset = range.start + offset * DataType::BF16.size_in_bytes();
+                let byte_offset = range.start + offset;
                 AData::FullPrecision(SendPtr(
                     values.cpu_address().as_ptr().cast::<u8>().cast_const().wrapping_byte_add(byte_offset),
                 ))
@@ -116,14 +128,16 @@ impl MatmulKernel for MatmulCpuKernel {
                 values,
                 scales,
                 group_sums: _,
-                scale_group_size: a_group_size,
-                code_layout,
+                quantization,
             } => {
+                let a_group_size = quantization.scale_group_size();
+                let code_layout = quantization.code_layout();
                 let compatible = matches!(a_group_size, 32 | 64 | 128)
                     && k.is_multiple_of(a_group_size)
-                    && matches!(b.group_size(), Some(32 | 64 | 128))
-                    && b.quantized()
-                        .is_some_and(|quantized| matches!(quantized.mode, QuantizationMode::U4 | QuantizationMode::U8));
+                    && b.quantized().is_some_and(|quantized| {
+                        matches!(quantized.mode, QuantizationMode::U2 | QuantizationMode::U4 | QuantizationMode::U8)
+                            && (quantized.params.is_per_row() || matches!(quantized.group_size, 32 | 64 | 128))
+                    });
                 if !compatible {
                     return Err(MatmulCpuError::IncompatibleA {
                         path: "CpuMatmul",
@@ -143,7 +157,10 @@ impl MatmulKernel for MatmulCpuKernel {
                     code_layout,
                 }
             },
-            MatmulA::Trellis {
+            MatmulA::PackedHalf {
+                ..
+            }
+            | MatmulA::Trellis {
                 ..
             } => {
                 return Err(MatmulCpuError::UnsupportedLayout {
@@ -152,29 +169,43 @@ impl MatmulKernel for MatmulCpuKernel {
             },
         };
         let bias_ptr = bias_buffer.map(|bias| SendPtr(bias.cpu_ptr().as_ptr().cast::<u8>().cast_const()));
-        let gather_ptr = gather_indices.map(|indices| {
-            let (indices, range) = indices.parts();
-            SendPtr(indices.cpu_address().as_ptr().cast::<u32>().cast_const().wrapping_byte_add(range.start))
+        let gather_window = gather.map(|gather| {
+            let (indices, range) = gather.indices.parts();
+            (
+                SendPtr(indices.cpu_address().as_ptr().cast::<u32>().cast_const().wrapping_byte_add(range.start)),
+                gather.first_row as usize,
+                gather.row_count as usize,
+            )
         });
         let (d_buffer, d_range) = d.reborrow().parts();
         let d_ptr = SendPtrMut(d_buffer.cpu_address().as_ptr().cast::<u8>().wrapping_byte_add(d_range.start));
 
         let weight_data = WeightData::from_b(b, b_leading_dimension, b_transpose, k_u, n_u)?;
 
+        let weights_data_type = self.weights_data_type;
+        let input_data_type = self.input_data_type;
+        let output_data_type = self.output_data_type;
         let bias_after_rht = post_rht.is_some();
         command_buffer.push_command(move || {
             unsafe {
                 for row in 0..m_u {
                     for col in 0..n_u {
-                        // Gather remaps output column `col` to B-row `gather_indices[row * n + col]`.
-                        let b_col = match gather_ptr {
-                            Some(g) => *g.as_ptr().add(row * n_u + col) as usize,
+                        // Gather remaps output column `col` to B-row `gather_indices[row * n + col] - first_row`.
+                        let b_col = match gather_window {
+                            Some((indices, first_row, row_count)) => {
+                                let gathered_row = *indices.as_ptr().add(row * n_u + col) as usize;
+                                let b_col = gathered_row.wrapping_sub(first_row);
+                                if b_col >= row_count {
+                                    continue;
+                                }
+                                b_col
+                            },
                             None => col,
                         };
                         let mut accumulator = 0.0f32;
                         for inner in 0..k_u {
                             let a_value = match a_data {
-                                AData::FullPrecision(ptr) => read_bf16(ptr.as_ptr(), row * k_u + inner),
+                                AData::FullPrecision(ptr) => load(ptr.as_ptr(), input_data_type, row * k_u + inner),
                                 AData::Int8 {
                                     values,
                                     scales,
@@ -200,7 +231,7 @@ impl MatmulKernel for MatmulCpuKernel {
                                     } else {
                                         inner * leading_dimension + b_col
                                     };
-                                    read_bf16(ptr.as_ptr(), index)
+                                    load(ptr.as_ptr(), weights_data_type, index)
                                 },
                                 WeightData::Quantized {
                                     weights,
@@ -228,7 +259,7 @@ impl MatmulKernel for MatmulCpuKernel {
                                     let group_index = inner / group_size;
                                     let metadata_index = b_col * scale_strides.output_stride as usize
                                         + group_index * scale_strides.group_stride as usize;
-                                    let scale = read_bf16(scales.as_ptr(), metadata_index);
+                                    let scale = load(scales.as_ptr(), weights_data_type, metadata_index);
                                     let midpoint = (1u32 << (bits - 1)) as f32;
                                     let zero_point = zero_points.as_ref().map(|(zp, strides)| {
                                         let zero_point_index = b_col * strides.output_stride as usize
@@ -248,7 +279,7 @@ impl MatmulKernel for MatmulCpuKernel {
                                     let bias_term = if let Some(zp) = zero_point {
                                         -scale * zp
                                     } else if let Some(b) = biases {
-                                        read_bf16(b.as_ptr(), metadata_index)
+                                        load(b.as_ptr(), weights_data_type, metadata_index)
                                     } else {
                                         -scale * midpoint
                                     };
@@ -258,15 +289,15 @@ impl MatmulKernel for MatmulCpuKernel {
                             accumulator += a_value * b_value;
                         }
 
-                        let output_index = row * n_u + col;
+                        let output_index = row * row_stride + col;
                         let mut value = output_scale * accumulator;
                         if !bias_after_rht && let Some(bias) = bias_ptr {
-                            value += read_bf16(bias.as_ptr(), col);
+                            value += load(bias.as_ptr(), weights_data_type, col);
                         }
                         if let Some(cap) = soft_cap {
                             value = cap * (value / cap).tanh();
                         }
-                        write_bf16(d_ptr.as_ptr(), output_index, value);
+                        store(d_ptr.as_ptr(), output_data_type, output_index, value);
                     }
                 }
             }

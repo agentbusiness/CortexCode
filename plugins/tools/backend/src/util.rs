@@ -345,6 +345,38 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// The folders on the PATH of the user's login shell that this process's PATH lacks, in the login
+/// shell's order. An app opened from the Dock or Finder gets the system's PATH, without what the
+/// user's shell files add (seen: the app opened from its Dock icon, and `cargo`, on PATH only
+/// through `~/.zshrc`, was "command not found" in every command while a terminal found it).
+/// Asked once from the user's own shell, started as a login and interactive shell so it reads the
+/// files a terminal reads; empty when the shell cannot be asked or adds nothing.
+pub fn login_path() -> &'static [String] {
+    static FOUND: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        const MARK: &str = "__CORTEX_LOGIN_PATH__";
+        let shell = std::env::var("SHELL").ok().filter(|shell| Path::new(shell).is_file()).unwrap_or_else(|| "/bin/zsh".to_owned());
+        let output = std::process::Command::new(&shell)
+            .args(["-l", "-i", "-c", &format!("printf '\\n{MARK}%s\\n' \"$PATH\"")])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let Ok(output) = output else { return Vec::new() };
+        let text = String::from_utf8_lossy(&output.stdout);
+        // The shell's files may print before it: the marked line is the answer.
+        let Some(login) = text.lines().rev().find_map(|line| line.strip_prefix(MARK)) else { return Vec::new() };
+        let own = std::env::var("PATH").unwrap_or_default();
+        let have: std::collections::HashSet<&str> = own.split(':').collect();
+        let mut missing: Vec<String> = Vec::new();
+        for dir in login.split(':').filter(|dir| dir.starts_with('/') && !have.contains(dir)) {
+            if !missing.iter().any(|known| known == dir) && Path::new(dir).is_dir() {
+                missing.push(dir.to_owned());
+            }
+        }
+        missing
+    })
+}
+
 /// Quote a string for POSIX shells (single quotes).
 pub fn shell_quote(text: &str) -> String {
     if !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b)) {

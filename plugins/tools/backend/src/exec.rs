@@ -928,7 +928,7 @@ fn render_regions(doc: &Doc, changed: &[(usize, usize)]) -> String {
 }
 
 fn unified_diff(old: &str, new: &str, path: &str) -> String {
-    similar::TextDiff::from_lines(old, new).unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
+    similar::TextDiff::configure().algorithm(similar::Algorithm::RawMyers).diff_lines(old, new).unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
 }
 
 /// The line range (`a-b`, 1-based) of the one definition of `file` that `name` names: its last
@@ -977,6 +977,55 @@ fn definition_range(session: &Session<'_>, file: &str, name: &str) -> Result<Str
             Err(format!("`{name}` names {} definitions in {file}; name the one you mean with its type, e.g. {file}#Type::{last}:\n{}", many.len(), listed.join("\n")))
         }
     }
+}
+
+/// How long the project's index has to name its files for a listing; past it the command runs.
+const LISTING_ASK: Duration = Duration::from_secs(3);
+
+/// A listing of files by name, answered from the project's index (`memory.files`): the paths as
+/// `find` prints them, sorted, for the files the index holds that are on disk now. None when a
+/// folder is not a folder of the workspace, the index does not answer within `LISTING_ASK`, or it
+/// names no file the listing asks for (an index still being built, or a file made a moment ago,
+/// must not read as "there is none"): the command then runs as written.
+async fn listed_from_index(host: &dyn Host, session: &Session<'_>, cwd: &Path, listing: &approval::Listing) -> Option<String> {
+    // Each folder as written, and its path inside the workspace ("" for the workspace itself).
+    let mut folders: Vec<(String, String)> = Vec::new();
+    for dir in &listing.dirs {
+        let absolute = util::resolve(cwd, dir);
+        if !util::is_inside(&absolute, &session.workspace) || !absolute.is_dir() {
+            return None;
+        }
+        let inside = absolute.strip_prefix(&session.workspace).ok()?.to_string_lossy().trim_matches('/').to_owned();
+        folders.push((dir.trim_end_matches('/').to_owned(), inside));
+    }
+    let request = json!({"project_id": session.context.project_id, "workspace": session.workspace.to_string_lossy()});
+    let answer = tokio::time::timeout(LISTING_ASK, host.call(cc_protocol::contracts::memory::methods::FILES, request)).await.ok()?.ok()?;
+    let paths: Vec<&str> = answer.get("paths")?.as_array()?.iter().filter_map(Value::as_str).collect();
+    let mut lines: Vec<String> = Vec::new();
+    for (written, inside) in &folders {
+        for path in &paths {
+            let below = if inside.is_empty() {
+                Some(*path)
+            } else {
+                path.strip_prefix(inside.as_str()).and_then(|rest| rest.strip_prefix('/'))
+            };
+            let Some(below) = below else { continue };
+            let file_name = below.rsplit('/').next().unwrap_or(below);
+            if listing.name.as_ref().is_some_and(|(pattern, ignore_case)| !approval::name_matches(pattern, file_name, *ignore_case)) {
+                continue;
+            }
+            if !session.workspace.join(path).is_file() {
+                continue;
+            }
+            lines.push(format!("{written}/{below}"));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    lines.dedup();
+    Some(format!("{}\n[Listed from the project's index, not by walking the folders.]\n", lines.join("\n")))
 }
 
 /// Files of at most this many lines are shown whole after an edit: the same size a read shows whole.
@@ -2330,8 +2379,8 @@ async fn exec_terminal(host: &Arc<dyn Host>, session: &Session<'_>, args: &Map<S
             let workspace = session.workspace.display().to_string();
             let program = args.get("program").and_then(Value::as_str).filter(|p| !p.trim().is_empty());
             // A project that runs in a container gets its terminals there.
-            let container = match host.call("container.status", json!({"root": workspace})).await {
-                Ok(Value::Object(info)) if info.get("state").and_then(Value::as_str) == Some("running") => {
+            let container = match container_status(host.as_ref(), &workspace).await {
+                Some(Value::Object(info)) if info.get("state").and_then(Value::as_str) == Some("running") => {
                     match host.call("container.shell_command", json!({"root": workspace})).await {
                         Ok(value) => value
                             .get("argv")
@@ -2459,6 +2508,17 @@ async fn map_container_paths(host: &Arc<dyn Host>, session: &Session<'_>, args: 
     (!changed.is_empty()).then(|| format!("container path {}", changed.join(", ")))
 }
 
+/// How long the container plugin has to say whether the project runs in a container. Every command
+/// asks first, so no answer in time means "on the Mac", the same as its answer when Docker is not
+/// there (seen: a hung Docker Desktop, and each command of a session starting 124 s late).
+const CONTAINER_ASK: Duration = Duration::from_secs(6);
+
+/// The container plugin's `container.status` for `root`; None when it has none, fails or does not
+/// answer within [`CONTAINER_ASK`].
+async fn container_status(host: &dyn Host, root: &str) -> Option<Value> {
+    tokio::time::timeout(CONTAINER_ASK, host.call("container.status", json!({"root": root}))).await.ok()?.ok()
+}
+
 /// A project whose commands run in a container (the container plugin's `container.status`).
 struct ProjectContainer {
     id: String,
@@ -2468,7 +2528,7 @@ struct ProjectContainer {
 /// The session's project container when one is running; None when the project runs on the Mac
 /// (or no container plugin is installed).
 async fn project_container(host: &Arc<dyn Host>, session: &Session<'_>) -> Option<ProjectContainer> {
-    let info = host.call("container.status", json!({"root": session.workspace.display().to_string()})).await.ok()?;
+    let info = container_status(host.as_ref(), &session.workspace.display().to_string()).await?;
     let field = |name: &str| info.get(name).and_then(Value::as_str).map(str::to_owned);
     (field("state").as_deref() == Some("running")).then(|| ProjectContainer {
         id: field("id").unwrap_or_default(),
@@ -2656,6 +2716,15 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
         let mut out = exec_read(core, host, session, &read_args).await;
         out.output = format!("(Shown with the read tool, so the lines carry anchors for edit; use read for files.)\n{}", out.output);
         return out;
+    }
+    // A plain listing of files by name (`find src -name '*.rs' | sort`) is answered from the
+    // project's index, which holds the project's files already: no walk of the folders, build
+    // output and data included (seen: that very command run to "list project structure"). When
+    // the index does not answer in time or names no such file, the command runs as written.
+    if let Some(listing) = crate::approval::terminal_listing(command)
+        && let Some(text) = listed_from_index(host.as_ref(), session, &effective_cwd, &listing).await
+    {
+        return Out::ok(text);
     }
     // A here-document into the scratch folder `tmp/` or outside the project (`/tmp/x`) runs: a
     // refusal there protects nothing and costs a step. Project files go through edit.
@@ -3319,6 +3388,16 @@ fn delegate_request<'a>(
     path.extend(toolchain.path.iter().cloned());
     if let Some(bin) = core.shells.bin_dir() {
         path.push(bin.to_string_lossy().into_owned());
+    }
+    // The other app runs the command with its own PATH, which is the system's when it was opened
+    // from the Dock: the folders this session's own shell has, and the ones the user's login shell
+    // adds, go with the command, in that order (seen: `cargo check` handed over was "command not
+    // found" while `which cargo` in the session's own shell, two minutes later, found it).
+    let own = std::env::var("PATH").unwrap_or_default();
+    for dir in util::login_path().iter().map(String::as_str).chain(own.split(':')) {
+        if dir.starts_with('/') && !path.iter().any(|known| known == dir) {
+            path.push(dir.to_owned());
+        }
     }
     let mut writable: Vec<String> = vec![workspace.to_string_lossy().into_owned(), util::scratch_dir(workspace).to_string_lossy().into_owned()];
     writable.extend(venv.iter().map(|venv| venv.to_string_lossy().into_owned()));

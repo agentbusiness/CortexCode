@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufReader, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use derive_more::Debug;
 use thiserror::Error;
@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod classifier_model;
+pub mod decision_model;
 pub mod language_model;
 /// CortexCode patch P7: vision encoder (image input).
 pub mod vision;
@@ -60,6 +61,7 @@ impl<B: Backend> Engine<B> {
 pub enum ModelType {
     LanguageModel,
     Classifier,
+    Decision,
 }
 
 #[derive(Debug, Error)]
@@ -70,34 +72,43 @@ pub enum ResolveModelTypeError {
     UnableToDeserializeConfig(#[from] serde_json::Error),
 }
 
-pub fn resolve_model_type(model_path: &Path) -> Result<ModelType, ResolveModelTypeError> {
-    Ok(match read_model_config(model_path)? {
+pub async fn resolve_model_type(model_path: &Path) -> Result<ModelType, ResolveModelTypeError> {
+    Ok(match read_model_config(model_path).await? {
         AnyModelConfig::LanguageModelConfig(_) => ModelType::LanguageModel,
         AnyModelConfig::ClassifierModelConfig(_) => ModelType::Classifier,
+        AnyModelConfig::DecisionModelConfig(_) => ModelType::Decision,
     })
 }
 
-pub fn resolve_model_sampling_method(model_path: &Path) -> Result<Option<SamplingMethod>, ResolveModelTypeError> {
-    Ok(match read_model_config(model_path)? {
+pub async fn resolve_model_sampling_method(model_path: &Path) -> Result<Option<SamplingMethod>, ResolveModelTypeError> {
+    Ok(match read_model_config(model_path).await? {
         AnyModelConfig::LanguageModelConfig(config) => Some(config.generation_config.default_sampling_method()),
         AnyModelConfig::ClassifierModelConfig(_) => None,
+        AnyModelConfig::DecisionModelConfig(config) => Some(config.generation_config.default_sampling_method()),
     })
 }
 
-pub fn resolve_model_context_length(model_path: &Path) -> Result<Option<u32>, ResolveModelTypeError> {
-    let transformer = match read_model_config(model_path)? {
+pub async fn resolve_model_context_length(model_path: &Path) -> Result<Option<u32>, ResolveModelTypeError> {
+    let transformer = match read_model_config(model_path).await? {
         AnyModelConfig::LanguageModelConfig(config) => config.decoder_config.transformer_config,
         AnyModelConfig::ClassifierModelConfig(_) => return Ok(None),
+        AnyModelConfig::DecisionModelConfig(config) => config.decoder_config.transformer_config,
     };
     Ok(transformer
         .layer_configs
         .iter()
-        .filter(|layer| matches!(layer.mixer_config, AnyTokenMixerConfig::AttentionConfig(_)))
+        .filter(|layer| {
+            matches!(
+                layer.mixer.body_config,
+                AnyTokenMixerConfig::AttentionConfig(_) | AnyTokenMixerConfig::SparseAttentionConfig(_)
+            )
+        })
         .filter_map(|layer| layer.rope_config.as_ref().map(|rope| *rope.max_sequence_length()))
         .min())
 }
 
-fn read_model_config(model_path: &Path) -> Result<AnyModelConfig, ResolveModelTypeError> {
-    let file = File::open(model_path.join("config.json"))?;
-    Ok(serde_json::from_reader(BufReader::new(file))?)
+async fn read_model_config(model_path: &Path) -> Result<AnyModelConfig, ResolveModelTypeError> {
+    let bytes = crate::utils::file::read(model_path.join("config.json")).await?;
+    let value = crate::utils::model_format::config(serde_json::from_slice(&bytes)?)?;
+    Ok(serde_json::from_value(value)?)
 }
