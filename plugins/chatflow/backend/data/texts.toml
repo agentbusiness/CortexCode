@@ -367,7 +367,16 @@ managed_message = "Told {agent}: {text}"
 managed_failed = "{action} {agent} failed: {error}"
 managed_replan = "The work is planned again: {brief}"
 managed_nothing = "Nothing was changed: the agents go on as they are."
-route_open_work = "Background work of this conversation is going on now:\n{work}\nA question about those agents (who works, who is blocked, what one reported) is STATUS. Whether a thing in the project exists, works or is ready is LOOKUP, even while that work goes on."
+# With no background work going on MANAGE is not a route at all (the grammar leaves it out); this
+# line says what such a message is instead (seen: "continue working on the tasks" after every agent
+# was stopped ended in a reply that could only say "I will").
+route_no_open_work = "No background work of this conversation is going on now: nothing is there to stop or steer. An instruction to continue, resume or redo the work is DO."
+# A short message, shown again as the last thing before the decision (seen: "continue" routed by
+# the message before it, "as i said stop" by "so?").
+route_latest = "The user's latest message, the one to decide about:\n{message}"
+route_other_message = "Your `asks` quoted words from earlier messages. Decide about the latest message only: its own words go in `quote`, and its route is what those words ask for."
+host_echo = "Your reply repeated the host's message instead of answering. Answer the user's latest message now, in your own words."
+route_open_work ="Background work of this conversation is going on now:\n{work}\nA question about those agents (who works, who is blocked, what one reported) is STATUS. Whether a thing in the project exists, works or is ready is LOOKUP, even while that work goes on."
 reply_open_work = "Background work of this conversation, as its records stand now:\n{work}"
 # The direction the user set for the whole work (`flow::direction`): it opens every plan and task.
 direction_live = "The direction the user set for the whole work:\n{direction}\nEvery task serves this direction. Where the project's own rules, its documents or the earlier work point another way, this direction wins.\n\n"

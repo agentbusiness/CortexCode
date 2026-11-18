@@ -409,10 +409,18 @@ impl<P: LanguagePack> LangPlugin<P> {
         }
         let pack = self.shared.pack.clone();
         let ctx = ExtractContext { root: params.root.map(PathBuf::from) };
-        let files = tokio::task::spawn_blocking(move || extract_batch(&*pack, &jobs, &ctx))
+        let mut files = tokio::task::spawn_blocking(move || extract_batch(&*pack, &jobs, &ctx))
             .await
             .map_err(|e| RpcError::internal(e.to_string()))?
             .map_err(RpcError::internal)?;
+        // The answer carries no code: the code graph reads a definition's code from the file at
+        // its lines. Sent, every nested definition repeats its text once per level (seen: a 7 MB
+        // page answered with 77 MB, over what one message holds, on every index pass).
+        for file in &mut files {
+            for symbol in &mut file.symbols {
+                symbol.code = String::new();
+            }
+        }
         Ok(ExtractResult { files })
     }
 

@@ -438,12 +438,53 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 // it is answered from where it stands (seen: "how is it going?" answered with a
                 // greeting while eight agents worked).
                 let open = crate::manage::open_work(env, &entries).await;
-                let skills_live = if open.is_empty() {
-                    skills_live
+                // MANAGE needs background work that is going on: with none, there is nothing to
+                // stop or steer and the grammar has no such route (seen: "continue working on the
+                // tasks" after every agent was stopped went to MANAGE, found nothing open, and the
+                // turn ended in a reply that could only say "I will").
+                if open.is_empty() {
+                    route_shape = route_shape.without("route", "MANAGE");
+                }
+                let message = journal.entries().filter(|entry| entry.kind == kinds::USER_MESSAGE).last().map(|entry| str_field(&entry.data, "text").to_owned()).unwrap_or_default();
+                let work_live = if !open.is_empty() {
+                    env.data.text("route_open_work", &[("work", &crate::manage::work_lines(env, &open))])
+                } else if entries.iter().any(|entry| entry.kind == chatflow_kinds::PLAN) {
+                    // Said only where a plan was at work in this conversation.
+                    env.data.text("route_no_open_work", &[])
                 } else {
-                    joined(&[env.data.text("route_open_work", &[("work", &crate::manage::work_lines(env, &open))]), skills_live])
+                    String::new()
                 };
+                // A short message is shown again as the last thing before the decision: its asks
+                // and its route are about these words (seen: "continue" routed by the message
+                // before it, "as i said stop" by "so?"; five of 26 turns of one conversation). A
+                // long message carries its own asks and is not repeated.
+                let latest_live = if message.trim().is_empty() || message.chars().count() > ROUTE_LATEST_CHARS {
+                    String::new()
+                } else {
+                    env.data.text("route_latest", &[("message", message.trim())])
+                };
+                let skills_live = joined(&[work_live, skills_live, latest_live]);
                 let routed = decide_json::<RouterDecision>(env, journal, "ROUTE", &route_shape, &skills_live).await;
+                // Every ask quotes words that are not in the latest message: the decision is about
+                // another message, so its route is too. Decided once more, told so; a second such
+                // decision stands with the message itself as its one ask (below).
+                let routed = match routed {
+                    Ok((decision, raw)) => {
+                        let mut asks = decision.asks.clone();
+                        let elsewhere = anchor_asks(&mut asks, &message);
+                        if !decision.asks.is_empty() && elsewhere.len() == decision.asks.len() {
+                            let again = joined(&[skills_live.clone(), env.data.text("route_other_message", &[])]);
+                            match decide_json::<RouterDecision>(env, journal, "ROUTE", &route_shape, &again).await {
+                                Ok(pair) => Ok(pair),
+                                Err(error) if error.code == codes::CANCELLED => Err(error),
+                                Err(_) => Ok((decision, raw)),
+                            }
+                        } else {
+                            Ok((decision, raw))
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
                 let (decision, raw) = match routed {
                     Ok(pair) => pair,
                     Err(error) if error.code == codes::CANCELLED => continue,
@@ -484,7 +525,6 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 let teaches = decision.teaches == "yes";
                 let drops = decision.drops == "yes";
                 // The asks are the user's latest message, never the conversation before it.
-                let message = journal.entries().filter(|entry| entry.kind == kinds::USER_MESSAGE).last().map(|entry| str_field(&entry.data, "text").to_owned()).unwrap_or_default();
                 let unanchored = anchor_asks(&mut decision.asks, &message);
                 journal
                     .append(
@@ -3142,6 +3182,11 @@ fn local_task(env: &RunEnv, id: &str, brief: &str, contract: cc_protocol::contra
 /// settled line is a unit the model is still reading (seen: 68 lines read, then a progress reply);
 /// two is the model repeating itself.
 const WORK_OPEN_STALL_ROUNDS: usize = 2;
+
+/// A user message of at most this many characters is shown again right before the ROUTE decision.
+/// Short messages are the ones the router answered from the turn before ("so?", "continue", "as i
+/// said stop"); a longer one states its own asks.
+const ROUTE_LATEST_CHARS: usize = 400;
 
 /// The output of the `done` command of a skill this run used, when it says the work is open (a
 /// non-zero exit); None when no used skill declares one, when every one says finished, or when the

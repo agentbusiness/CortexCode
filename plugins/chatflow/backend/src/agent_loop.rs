@@ -1072,6 +1072,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // Replies in a row that held a tool call written as text and were answered with the step to
     // send it as a call; after `TEXT_CALL_NOTES` the reply stands as the model's last word.
     let mut text_calls = 0u32;
+    // A reply that repeated the host's message was answered already (once per loop).
+    let mut host_echoed = false;
     loop {
         if env.stops.park.is_cancelled() {
             return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
@@ -1192,6 +1194,15 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // tasks ended "done" on such a reply, one with six compile errors on screen). One clean
         // call of a tool the session has is run as that call; any other call shape is answered
         // with the step to send it as a call.
+        // A reply that begins with the host's own mark repeats the host's message instead of
+        // answering (seen: "[host] Stage: ASK." given as the whole answer, twice in one
+        // conversation). It is not the model's last word: told so once, and it answers again.
+        if result.tool_calls.is_empty() && !host_echoed && result.content.trim_start().starts_with(env.data.text("host_prefix", &[]).as_str()) {
+            host_echoed = true;
+            journal.note(&env.run_id, "host_echo", &env.data.text("host_echo", &[]), true).await?;
+            continue;
+        }
+
         let mut call_from_text = false;
         if result.tool_calls.is_empty() {
             match crate::textcall::find(&result.content, &env.prefix.tools) {

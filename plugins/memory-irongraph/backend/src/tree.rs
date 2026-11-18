@@ -58,7 +58,7 @@ pub struct TreeStatus {
     pub external_symbols: u64,
     /// Language -> (plugin category, plugin version, files) of the files a language plugin extracted.
     pub language_plugins: BTreeMap<String, (String, String, u64)>,
-    /// (extension, text | binary) -> (files, an example path) of files no language plugin covers.
+    /// (extension, text) -> (files, an example path) of the text files no language plugin covers.
     pub uncovered: BTreeMap<(String, String), (u64, String)>,
     /// Files a language plugin could not extract now: (path, plugin, error, indexed as `text` | `kept`).
     pub problems: Vec<(String, String, String, String)>,
@@ -229,7 +229,8 @@ pub fn scan(root: &Path) -> Vec<String> {
     files
 }
 
-/// Every file but CORTEX.md (the rules file) is indexed.
+/// Every file name but CORTEX.md (the rules file) is indexed; a file that is not text drops out
+/// when it is read ([`read_one`]).
 pub fn indexed_name(rel: &str) -> bool {
     rel.rsplit('/').next() != Some("CORTEX.md")
 }
@@ -239,22 +240,30 @@ fn is_text(head: &[u8]) -> bool {
     !head.contains(&0) && std::str::from_utf8(head).map(|_| true).unwrap_or_else(|error| error.error_len().is_none())
 }
 
-/// Text files larger than this are recorded like binary ones (metadata and their leading text):
-/// a data dump is not read in full on every index pass.
+/// Text files larger than this are recorded by their metadata and leading text only: a data dump
+/// is not read in full on every index pass.
 const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What reading one file found.
 pub enum Read {
-    /// Complete facts (text or binary, no plugin covers the file; or a covered file that is not
-    /// UTF-8) and the text for the line store.
+    /// Complete facts (text no plugin covers; or a covered file that is not UTF-8) and the text
+    /// for the line store.
     Done(FileFacts, String),
     /// A source for its language plugin.
     Source(Source),
 }
 
+/// A file's modification time in nanoseconds (0 when the file system does not say).
+fn modified_ns(meta: &std::fs::Metadata) -> u64 {
+    meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
 /// Read one file and match it to its language plugin (structural rules): by name (exact name,
-/// pattern, extension), else by the `#!` line of a text file; a file no plugin covers is text or
-/// binary by its content.
+/// pattern, extension), else by the `#!` line of a text file; a file no plugin covers is indexed
+/// when its content is text. A file that is not text (a NUL byte or invalid UTF-8 in its first
+/// bytes: images, PDFs, spreadsheets, archives, weights) is not indexed: nothing in it can be
+/// searched or read as lines, and a data folder of them outnumbers the project's own files
+/// (seen: 29,600 of a project's 29,659 files).
 pub fn read_one(root: &Path, rel: &str, snapshot: &Snapshot) -> Option<Read> {
     let abs = root.join(rel);
     let meta = std::fs::metadata(&abs).ok()?;
@@ -263,20 +272,19 @@ pub fn read_one(root: &Path, rel: &str, snapshot: &Snapshot) -> Option<Read> {
         let mut head = [0u8; 8192];
         let read = std::fs::File::open(&abs).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).ok()?;
         let head = &head[..read];
-        let text = is_text(head);
-        if text {
-            pick = snapshot.by_shebang(&String::from_utf8_lossy(&head[..head.len().min(512)]));
+        if !is_text(head) {
+            return None;
         }
-        if pick.is_none() && (!text || meta.len() > MAX_TEXT_BYTES) {
+        pick = snapshot.by_shebang(&String::from_utf8_lossy(&head[..head.len().min(512)]));
+        if pick.is_none() && meta.len() > MAX_TEXT_BYTES {
             // Identity by size and modification time: no full read.
-            let modified = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
             let facts = FileFacts {
                 path: rel.to_owned(),
-                language: if text { TEXT } else { BINARY }.to_owned(),
-                sid_prefix: if text { "txt" } else { "bin" }.to_owned(),
-                content_hash: hash_hex(format!("{}:{modified}", meta.len()).as_bytes()),
+                language: TEXT.to_owned(),
+                sid_prefix: "txt".to_owned(),
+                content_hash: hash_hex(format!("{}:{}", meta.len(), modified_ns(&meta)).as_bytes()),
                 size: meta.len(),
-                text: text.then(|| facts::excerpt(&String::from_utf8_lossy(head))),
+                text: Some(facts::excerpt(&String::from_utf8_lossy(head))),
                 ..FileFacts::default()
             };
             return Some(Read::Done(facts, String::new()));
@@ -285,13 +293,21 @@ pub fn read_one(root: &Path, rel: &str, snapshot: &Snapshot) -> Option<Read> {
     let bytes = std::fs::read(&abs).ok()?;
     match String::from_utf8(bytes) {
         Ok(text) => {
-            let facts = FileFacts::of_text(rel, &text);
+            let mut facts = FileFacts::of_text(rel, &text);
+            // What the file was on disk when its facts were made: a later pass over the whole
+            // tree keeps the facts while both still hold ([`unchanged_on_disk`]).
+            facts.disk_size = meta.len();
+            facts.modified_ns = modified_ns(&meta);
             Some(match pick {
                 Some(pick) => Read::Source(Source::new(facts, text, pick)),
                 None => Read::Done(facts, text),
             })
         }
         Err(error) => {
+            // A file a plugin's name rule covers that is not text (a `.ts` video) is not indexed.
+            if error.as_bytes().iter().take(8192).any(|byte| *byte == 0) {
+                return None;
+            }
             // A text file with a stray invalid byte past its sample is still indexed as text; a
             // source file is too, with the reason its plugin did not see it.
             let text = String::from_utf8_lossy(error.as_bytes()).into_owned();
@@ -302,6 +318,39 @@ pub fn read_one(root: &Path, rel: &str, snapshot: &Snapshot) -> Option<Read> {
             Some(Read::Done(facts, text))
         }
     }
+}
+
+/// Split the scanned `rels` into the files whose facts `known` (the model) already holds and that
+/// are the same on disk (size and modification time as when they were read), and the rest, which
+/// are read and extracted. Kept are only facts made from a full read by the file's plugin or as
+/// plain text; a file whose facts depend on other files (a manifest: its dependencies and
+/// commands are resolved against lockfiles and the tree) is always read again.
+fn unchanged_on_disk(root: &Path, rels: Vec<String>, known: &BTreeMap<String, Arc<FileFacts>>) -> (Vec<Arc<FileFacts>>, Vec<String>) {
+    let split: Vec<Result<Arc<FileFacts>, String>> = rels
+        .into_par_iter()
+        .map(|rel| {
+            let held = known.get(&rel).filter(|facts| {
+                facts.modified_ns != 0
+                    && matches!(facts.origin, Origin::Plugin { .. } | Origin::Uncovered)
+                    && facts.dependencies.is_empty()
+                    && facts.commands.is_empty()
+                    && std::fs::metadata(root.join(&rel)).is_ok_and(|meta| meta.is_file() && meta.len() == facts.disk_size && modified_ns(&meta) == facts.modified_ns)
+            });
+            match held {
+                Some(facts) => Ok(facts.clone()),
+                None => Err(rel),
+            }
+        })
+        .collect();
+    let mut kept = Vec::new();
+    let mut rest = Vec::new();
+    for entry in split {
+        match entry {
+            Ok(facts) => kept.push(facts),
+            Err(rel) => rest.push(rel),
+        }
+    }
+    (kept, rest)
 }
 
 /// Read `rels` under `root` in parallel and extract the sources with their language plugins.
@@ -391,6 +440,8 @@ fn keep_extracted(facts: FileFacts, stored: Option<&StoredFile>) -> FileFacts {
         content_hash: facts.content_hash,
         size: facts.size,
         lines: facts.lines,
+        disk_size: facts.disk_size,
+        modified_ns: facts.modified_ns,
         // A parsed file keeps no leading text (code is read from the file).
         text: None,
         origin: Origin::Kept { plugin, reason },
@@ -540,9 +591,23 @@ impl CodeTree {
         self.note_plugins(&snapshot).await;
         let root = self.root.clone();
         let rels = tokio::task::spawn_blocking(move || scan(&root)).await.map_err(|e| RpcError::internal(format!("scan task failed: {e}")))?;
-        self.files_done.store(0, Ordering::Relaxed);
-        self.files_total.store(rels.len() as u64, Ordering::Relaxed);
-        let parsed = parse_counted(&self.langs, &snapshot, &self.root, rels, Some(self.files_done.clone())).await?;
+        // A pass in a process that already indexed this tree keeps the facts of files that did not
+        // change on disk: only the others are read and extracted. Not after a write that did not
+        // finish (every file is written again, with its text), and not when the language plugins
+        // changed. The first pass of a process holds no facts and reads every file.
+        let (held, rels) = if !self.sync_pending.load(Ordering::Acquire) && self.coverage_key.lock().await.as_deref() == Some(snapshot.key.as_str()) {
+            let known = self.model.read().await.files.clone();
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || unchanged_on_disk(&root, rels, &known)).await.map_err(|e| RpcError::internal(format!("stat task failed: {e}")))?
+        } else {
+            (Vec::new(), rels)
+        };
+        let held_paths: HashSet<String> = held.iter().map(|facts| facts.path.clone()).collect();
+        self.files_done.store(held.len() as u64, Ordering::Relaxed);
+        self.files_total.store((held.len() + rels.len()) as u64, Ordering::Relaxed);
+        let mut parsed = parse_counted(&self.langs, &snapshot, &self.root, rels, Some(self.files_done.clone())).await?;
+        parsed.extend(held.iter().map(|facts| (FileFacts::clone(facts), String::new())));
+        drop(held);
         // Unreadable files drop out of the index: every file it covers is in now.
         self.files_total.store(parsed.len() as u64, Ordering::Relaxed);
         self.files_done.store(parsed.len() as u64, Ordering::Relaxed);
@@ -638,11 +703,18 @@ impl CodeTree {
                         None => format!("{}: not stored", facts.path),
                     });
                 }
+                // A file whose facts were kept was not read: its line index is this process's own.
+                let held = held_paths.contains(&facts.path);
                 // The line store may have been cleaned independently; keep it complete.
                 if unchanged {
-                    self.lines.put(&facts.content_hash, &text).map_err(|e| RpcError::internal(format!("line store: {e}")))?;
+                    if !held {
+                        self.lines.put(&facts.content_hash, &text).map_err(|e| RpcError::internal(format!("line store: {e}")))?;
+                    }
                     model.files.insert(facts.path.clone(), Arc::new(facts));
                 } else {
+                    // Written again although its facts were kept (the graph holds another
+                    // version of it): the write needs its text.
+                    let text = if held { String::from_utf8_lossy(&std::fs::read(self.root.join(&facts.path)).unwrap_or_default()).into_owned() } else { text };
                     changed.push((facts, text));
                 }
             }
@@ -991,10 +1063,16 @@ impl CodeTree {
         // 5. Retire removed nodes (and files that are gone): what links to them stays. Their code
         // edges go, so the files whose edges point at them write their edges again (a definition
         // whose kind changed keeps its sid: those files' edge sets may not differ).
+        // The removed node is matched first, by its sid, and its incoming edges are walked from
+        // it: a pattern that starts at `(a:Code)` walks every code node's edges once per removed
+        // node (seen: one statement ran for minutes when an ignore rule dropped 29,600 files).
         let mut relinked: HashSet<String> = HashSet::new();
         for chunk in removed.chunks(BATCH_ROWS) {
             let rows = self
-                .run(&format!("{} UNWIND $sids AS s MATCH (a:Code)-[r]->(n:Code {{sid: s}}) WHERE n.ended_ms IS NULL RETURN DISTINCT a.path", layer::OBSERVED_READ), params! { "sids" => chunk })
+                .run(
+                    &format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) MATCH (a:Code)-[r]->(n) WHERE n.ended_ms IS NULL RETURN DISTINCT a.path", layer::OBSERVED_READ),
+                    params! { "sids" => chunk },
+                )
                 .await?;
             statements += 1;
             relinked.extend(rows.column(0).filter_map(Value::as_str).map(str::to_owned));
@@ -1276,7 +1354,8 @@ impl CodeTree {
         let mut statements = 0;
         for chunk in sids.chunks(BATCH_ROWS) {
             self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}})-[r]->(:Code) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
-            self.run(&format!("{} UNWIND $sids AS s MATCH (:Code)-[r]->(n:Code {{sid: s}}) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
+            // The node first, by its sid, then its incoming edges (see step 5 of `sync_prepared`).
+            self.run(&format!("{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) MATCH (:Code)-[r]->(n) WHERE n.ended_ms IS NULL DELETE r", layer::OBSERVED_WRITE), params! { "sids" => chunk }).await?;
             self.run(
                 &format!(
                     "{} UNWIND $sids AS s MATCH (n:Code {{sid: s}}) WHERE n.ended_ms IS NULL SET n.ended_ms = $now, n.ended_reason = $reason, n.state = 'gone', n.last_ms = $now",

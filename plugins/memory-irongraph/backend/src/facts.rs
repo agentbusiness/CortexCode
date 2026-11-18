@@ -23,8 +23,9 @@ pub use lang::{
 /// The language name of a text file no language plugin covers (Markdown, JSON, YAML, configs, plain
 /// text, data): a file node with its leading text, searchable.
 pub const TEXT: &str = "text";
-/// The language name of a file that is not text (images, fonts, weights): a file node with its path,
-/// type and size.
+/// The language name earlier versions gave a file that is not text (images, fonts, weights). Such
+/// a file is not indexed any more ([`crate::tree::read_one`]); a graph may still hold these nodes
+/// until the next pass over the tree retires them.
 pub const BINARY: &str = "binary";
 
 /// Where a file's facts came from.
@@ -84,6 +85,13 @@ pub struct FileFacts {
     /// plugin's `describe`.
     pub sid_prefix: String,
     pub origin: Origin,
+    /// The file's size and modification time (nanoseconds) on disk when it was read in full for
+    /// these facts; `modified_ns` 0 when it was not (metadata only, or not UTF-8). Kept in this
+    /// process only: a pass over the whole tree does not read a file again while both hold.
+    #[serde(skip)]
+    pub disk_size: u64,
+    #[serde(skip)]
+    pub modified_ns: u64,
 }
 
 impl FileFacts {
