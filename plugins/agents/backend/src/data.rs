@@ -68,6 +68,14 @@ pub struct SchedulerConfig {
     pub working_context_tokens: u64,
     /// Longest share of a window the model may spend restoring spilled conversations.
     pub pool_restore_share: f64,
+    /// Agents a frontier CLI (Claude Code, Codex) works for at once: their own lane, outside the
+    /// local model's limit (docs/FRONTIER-AGENTS.md).
+    #[serde(default = "default_frontier_parallel")]
+    pub frontier_parallel: u32,
+}
+
+fn default_frontier_parallel() -> u32 {
+    6
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,7 +298,13 @@ impl Dataset {
             return Err("stages.toml: a value is out of range".into());
         }
         let sched = &raw.scheduler;
-        if sched.min == 0 || (sched.max != 0 && (sched.min > sched.max || sched.start > sched.max)) || sched.tick_ms == 0 || sched.window_ms == 0 || !(0.0..=10.0).contains(&sched.gain) {
+        if sched.min == 0
+            || (sched.max != 0 && (sched.min > sched.max || sched.start > sched.max))
+            || sched.tick_ms == 0
+            || sched.window_ms == 0
+            || !(0.0..=10.0).contains(&sched.gain)
+            || sched.frontier_parallel == 0
+        {
             return Err("stages.toml: [scheduler] values are out of range".into());
         }
         let schema: Value = serde_json::from_str(text_of(&plan.schema)?).map_err(|error| format!("{}: {error}", plan.schema))?;

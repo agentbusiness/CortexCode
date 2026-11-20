@@ -80,6 +80,9 @@ pub struct WorkerInfo {
     /// Where the CLI was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// What the CLI's `--version` says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// The model its runs use (absent for `local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

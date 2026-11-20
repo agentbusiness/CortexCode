@@ -1,6 +1,7 @@
 /**
- * workbench.sidebar@1 — projects, and under each project its conversations and its agents with
- * their live state. Everything listed runs in parallel; selecting a row only changes what the
+ * workbench.sidebar@1 — projects, and under each project its conversations, each with the agents
+ * it started indented under it (agents started elsewhere in a list of their own), with their live
+ * state. Everything listed runs in parallel; selecting a row only changes what the
  * other regions show. The projects are this computer's, then the joined CortexCode instances'
  * (`mesh.projects`, identified by `mesh.peers`), each with its description; another computer's
  * name is set in blue
@@ -10,7 +11,7 @@
  * or because macOS did not show it — marks its session's row until the session is opened.
  */
 
-import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Caret,
   ComputerScope,
@@ -513,6 +514,42 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   // Agents whose model calls run on another computer (`mesh.status` placed): their role in blue.
   const mesh = useQuery<{ placed?: Array<{ session_id: string; name: string }> }>('mesh.status', (c) => c.call('mesh.status', {}), { topics: ['mesh.changed'] });
   const away = new Map((row.node ? [] : mesh.data?.placed ?? []).map((placed) => [placed.session_id, placed.name]));
+  // Each agent sits under the conversation that started it; one whose starter is not a listed
+  // conversation (another agent's, or one deleted since) stays in the Agents list below.
+  const chatIds = new Set(chats.map((session) => session.id));
+  const agentsOf = new Map<string, AgentRow[]>();
+  for (const agentRow of agentRows) {
+    if (agentRow.parent && chatIds.has(agentRow.parent)) agentsOf.set(agentRow.parent, [...(agentsOf.get(agentRow.parent) ?? []), agentRow]);
+  }
+  const looseAgents = agentRows.filter((agentRow) => !agentRow.parent || !chatIds.has(agentRow.parent));
+
+  const agentItem = (agentRow: AgentRow) => {
+    const notice = agentRow.sessionId && selectedSession !== agentRow.sessionId ? notices.get(agentRow.sessionId) : undefined;
+    return (
+      <li key={agentRow.name} className={['cx-row', agentRow.sessionId && selectedSession === agentRow.sessionId ? 'sel' : '', needsYou(agentRow.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
+        data-agent={agentRow.name} data-status={agentRow.status} data-notice={notice?.kind}>
+        <button type="button" disabled={!agentRow.sessionId} onClick={() => agentRow.sessionId && onSelect(agentRow.sessionId)}
+          title={agentRow.sessionId ? `Show @${agentRow.name}'s session${notice ? ` — ${notice.title}` : ''}` : `@${agentRow.name} has no session yet`}>
+          <div className="t"><span className="cx-at">@{agentRow.name}</span>{agentRow.title ? <span className="cx-task"> · {agentRow.title}</span> : null}</div>
+          <div className="r">
+            <StatePip status={agentRow.status} />
+            <span className={`ap${statusTone(agentRow.status)}`}>{STATUS_LABEL[agentRow.status] ?? agentRow.status}</span>
+            {agentRow.role && (agentRow.sessionId && away.has(agentRow.sessionId)
+              ? <span className="ap cx-away" title={`Its model runs on ${away.get(agentRow.sessionId)}`}>{agentRow.role}</span>
+              : <span className="ap faint">{agentRow.role}</span>)}
+            {notice && <NoticeTag notice={notice} />}
+            <span className="grow" />
+            {agentRow.updated ? <span className="ap faint">{ago(agentRow.updated, now)}</span> : null}
+          </div>
+        </button>
+        <DeleteButton what="agent" verb="Stop" detail="its run ends and its task is cancelled; what it changed stays in the files"
+          onDelete={async () => {
+            await onStopAgent(agentRow.name);
+            await Promise.all([agents.refresh(), sessions.refresh()]);
+          }} />
+      </li>
+    );
+  };
 
   return (
     <section className={`cx-proj${isSelected ? ' on' : ''}${row.node ? ' cx-proj-remote' : ''}`} data-project={project.id} data-node={row.node ?? undefined}>
@@ -541,12 +578,21 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
         <>
           <ul className="lst cx-sessions" aria-label={`Conversations in ${project.name}`}>
             {chats.map((session) => (
-              <SessionRow key={session.id} session={session} now={now} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
-                selected={selectedSession === session.id} onSelect={() => onSelect(session.id)}
-                onDelete={async () => {
-                  await onDeleteSession(session.id);
-                  await sessions.refresh();
-                }} />
+              <Fragment key={session.id}>
+                <SessionRow session={session} now={now} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
+                  selected={selectedSession === session.id} onSelect={() => onSelect(session.id)}
+                  onDelete={async () => {
+                    await onDeleteSession(session.id);
+                    await sessions.refresh();
+                  }} />
+                {agentsOf.has(session.id) && (
+                  <li className="cx-children" data-children-of={session.id}>
+                    <ul className="lst cx-agents cx-nested" aria-label={`Agents started by ${session.title.trim() || 'this conversation'}`}>
+                      {(agentsOf.get(session.id) ?? []).map(agentItem)}
+                    </ul>
+                  </li>
+                )}
+              </Fragment>
             ))}
             {sessions.data && chats.length === 0 && (
               <li className="cx-none">
@@ -556,40 +602,14 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
               </li>
             )}
           </ul>
-          {agentRows.length > 0 && (
+          {looseAgents.length > 0 && (
             <>
               <div className="cx-sub">
                 <span className="ap faint">Agents</span>
-                <span className="ap faint">{agentRows.filter((row) => isActive(row.status)).length} active</span>
+                <span className="ap faint">{looseAgents.filter((agentRow) => isActive(agentRow.status)).length} active</span>
               </div>
               <ul className="lst cx-agents" aria-label={`Agents in ${project.name}`}>
-                {agentRows.map((row) => {
-                  const notice = row.sessionId && selectedSession !== row.sessionId ? notices.get(row.sessionId) : undefined;
-                  return (
-                    <li key={row.name} className={['cx-row', row.sessionId && selectedSession === row.sessionId ? 'sel' : '', needsYou(row.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
-                      data-agent={row.name} data-status={row.status} data-notice={notice?.kind}>
-                      <button type="button" disabled={!row.sessionId} onClick={() => row.sessionId && onSelect(row.sessionId)}
-                        title={row.sessionId ? `Show @${row.name}'s session${notice ? ` — ${notice.title}` : ''}` : `@${row.name} has no session yet`}>
-                        <div className="t"><span className="cx-at">@{row.name}</span>{row.title ? <span className="cx-task"> · {row.title}</span> : null}</div>
-                        <div className="r">
-                          <StatePip status={row.status} />
-                          <span className={`ap${statusTone(row.status)}`}>{STATUS_LABEL[row.status] ?? row.status}</span>
-                          {row.role && (row.sessionId && away.has(row.sessionId)
-                            ? <span className="ap cx-away" title={`Its model runs on ${away.get(row.sessionId)}`}>{row.role}</span>
-                            : <span className="ap faint">{row.role}</span>)}
-                          {notice && <NoticeTag notice={notice} />}
-                          <span className="grow" />
-                          {row.updated ? <span className="ap faint">{ago(row.updated, now)}</span> : null}
-                        </div>
-                      </button>
-                      <DeleteButton what="agent" verb="Stop" detail="its run ends and its task is cancelled; what it changed stays in the files"
-                        onDelete={async () => {
-                          await onStopAgent(row.name);
-                          await Promise.all([agents.refresh(), sessions.refresh()]);
-                        }} />
-                    </li>
-                  );
-                })}
+                {looseAgents.map(agentItem)}
               </ul>
             </>
           )}
@@ -726,6 +746,8 @@ interface AgentRow {
   sessionId: string | null;
   title: string | null;
   updated: number;
+  /** The session that started it (its session's parent). */
+  parent: string | null;
 }
 
 function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
@@ -738,6 +760,7 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       sessionId: record.session_id ?? null,
       title: record.task_id ?? null,
       updated: record.updated_ms,
+      parent: null,
     });
   }
   for (const session of sessions) {
@@ -748,13 +771,14 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       if (existing.sessionId && existing.sessionId !== session.id) continue;
       existing.sessionId = existing.sessionId ?? session.id;
       existing.title = session.title || existing.title;
+      existing.parent = session.parent ?? existing.parent;
       // A persisted running session must not resurrect an agent its controller already ended.
       if (session.status === 'running' && !leavesList(existing.status)) existing.status = 'running';
       // Its run was stopped from its session: the agent is stopped too, unless it had finished.
       else if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
       existing.updated = Math.max(existing.updated, session.updated_ms);
     } else {
-      rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms });
+      rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
     }
   }
   return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);

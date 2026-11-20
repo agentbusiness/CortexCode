@@ -53,6 +53,12 @@
 #cc .cx-none button .t{font-style:italic;color:var(--ink-3);font-size:14px;}
 #cc .cx-none button:hover .t{color:var(--ink);}
 
+/* Agents under the conversation that started them: indented a little, with a thin guide line. */
+#cc .cx-sessions li.cx-children{padding:0;margin:0 0 2px 0;list-style:none;}
+#cc .cx-agents.cx-nested{margin:0 0 0 14px;border-left:1px solid var(--rule);}
+#cc .cx-agents.cx-nested li.cx-row>button:first-child{padding-left:10px;}
+#cc .cx-agents.cx-nested .t{font-size:13px;}
+
 #cc .cx-sub{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px 2px 16px;}
 #cc .cx-task{color:var(--ink-2);}
 /* Agents are orange, so they never read as a remote project (counter blue). */

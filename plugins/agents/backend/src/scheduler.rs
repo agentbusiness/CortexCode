@@ -1,7 +1,8 @@
 //! The agent queue: who runs and who waits. The number allowed in flight (`limit`) is set by the
 //! control loop ([`crate::control`]); this queue never exceeds it: an agent starts only when fewer
 //! than `limit` are running here. An agent whose model calls a joined computer serves (`remote`)
-//! takes no place in that count: the limit is this computer's model's.
+//! takes no place in that count: the limit is this computer's model's. Nor does an agent a frontier
+//! CLI works for (`frontier`): those have their own fixed limit (`frontier_limit`).
 
 use std::collections::VecDeque;
 
@@ -24,6 +25,11 @@ pub struct Scheduler {
     pub queued: VecDeque<AgentKey>,
     /// Running agents whose model calls run on a joined computer.
     pub remote: Vec<AgentKey>,
+    /// Agents a frontier CLI works for (queued or running): they take no place in `limit` (this
+    /// computer's model is not theirs) and run up to `frontier_limit` at once.
+    pub frontier: Vec<AgentKey>,
+    /// Frontier agents allowed at once (data: `[scheduler] frontier_parallel`).
+    pub frontier_limit: u32,
     /// Highest number of agents ever running at once (for verification and reporting).
     pub peak: u32,
 }
@@ -46,7 +52,27 @@ impl Scheduler {
         self.running.retain(|running| running != key);
         self.queued.retain(|queued| queued != key);
         self.remote.retain(|remote| remote != key);
+        self.frontier.retain(|frontier| frontier != key);
         self.fill()
+    }
+
+    /// Whether a frontier CLI works for this agent (set before it is queued).
+    pub fn mark_frontier(&mut self, key: &AgentKey, frontier: bool) {
+        self.frontier.retain(|known| known != key);
+        if frontier {
+            self.frontier.push(key.clone());
+        }
+    }
+
+    /// A new frontier limit. Returns the agents to start now.
+    pub fn set_frontier_limit(&mut self, limit: u32) -> Vec<AgentKey> {
+        self.frontier_limit = limit.max(1);
+        self.fill()
+    }
+
+    /// Frontier agents running now.
+    pub fn frontier_running(&self) -> usize {
+        self.running.iter().filter(|key| self.frontier.contains(key)).count()
     }
 
     /// An agent runs on a joined computer's model: started now if it was queued, and out of this
@@ -65,7 +91,7 @@ impl Scheduler {
 
     /// Agents running on this computer's model.
     pub fn local_running(&self) -> usize {
-        self.running.iter().filter(|key| !self.remote.contains(key)).count()
+        self.running.iter().filter(|key| !self.remote.contains(key) && !self.frontier.contains(key)).count()
     }
 
     /// Remove a queued agent that has not started.
@@ -82,14 +108,23 @@ impl Scheduler {
         self.fill()
     }
 
+    /// Start queued agents, in order, while their lane has room: this computer's model (`limit`)
+    /// or the frontier CLIs (`frontier_limit`). An agent whose lane is full keeps its place.
     fn fill(&mut self) -> Vec<AgentKey> {
         let limit = self.limit.max(1) as usize;
+        let frontier_limit = self.frontier_limit.max(1) as usize;
         let mut started = Vec::new();
-        while self.local_running() < limit {
-            let Some(next) = self.queued.pop_front() else { break };
-            self.running.push(next.clone());
-            started.push(next);
+        let mut waiting = VecDeque::new();
+        while let Some(next) = self.queued.pop_front() {
+            let room = if self.frontier.contains(&next) { self.frontier_running() < frontier_limit } else { self.local_running() < limit };
+            if room {
+                self.running.push(next.clone());
+                started.push(next);
+            } else {
+                waiting.push_back(next);
+            }
         }
+        self.queued = waiting;
         self.peak = self.peak.max(self.running.len() as u32);
         started
     }

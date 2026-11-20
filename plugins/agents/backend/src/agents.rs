@@ -856,7 +856,11 @@ impl Agents {
                 usage.pop_front();
             }
             let scheduler = lock(&self.inner.scheduler);
-            let mut window = window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32);
+            // The local model's control loop counts only the agents its model serves: frontier
+            // agents have their own lane.
+            let running = scheduler.running.len().saturating_sub(scheduler.frontier_running()) as u32;
+            let queued = scheduler.queued.iter().filter(|key| !scheduler.frontier.contains(key)).count() as u32;
+            let mut window = window_of(&usage, config.window_ms, running, queued);
             (window.restores, window.restore_share) = lock(&self.inner.model).restores_in(config.window_ms);
             window
         };
@@ -1006,8 +1010,18 @@ impl Agents {
     }
 
     async fn enqueue(&self, ctx: Ctx, key: AgentKey) {
-        self.ensure_controller(&Host::new(ctx.clone())).await;
-        let start = lock(&self.inner.scheduler).enqueue(key);
+        let host = Host::new(ctx.clone());
+        self.ensure_controller(&host).await;
+        // A frontier agent waits in the frontier lane, whose limit is the data set's.
+        let frontier = agent(&host, &key.project_id, &key.name).await.is_ok_and(|record| workers::frontier(&record.worker));
+        let frontier_limit = self.inner.data.get().scheduler.frontier_parallel;
+        let start = {
+            let mut scheduler = lock(&self.inner.scheduler);
+            scheduler.mark_frontier(&key, frontier);
+            let mut start = scheduler.set_frontier_limit(frontier_limit);
+            start.extend(scheduler.enqueue(key));
+            start
+        };
         for key in start {
             self.start(ctx.clone(), key);
         }
@@ -1021,6 +1035,10 @@ impl Agents {
         let queued: Vec<AgentKey> = lock(&self.inner.scheduler).queued.iter().cloned().collect();
         for key in queued {
             let Ok(record) = agent(&host, &key.project_id, &key.name).await else { continue };
+            // A frontier agent's work is its CLI's: no model to place.
+            if workers::frontier(&record.worker) {
+                continue;
+            }
             let Some(session_id) = record.session_id else { continue };
             if self.place_agent(&host, &session_id, true).await.is_some() {
                 let start = lock(&self.inner.scheduler).start_remote(&key);
@@ -1148,6 +1166,7 @@ impl Agents {
                 let label = listed.workers.iter().find(|info| info.id == record.worker).map(|info| info.label.clone()).unwrap_or_else(|| record.worker.clone());
                 record.worker = workers::LOCAL.to_owned();
                 record = upsert(&ctx, &host, record).await?;
+                lock(&self.inner.scheduler).mark_frontier(&key, false);
                 if let Ok(current) = task(&host, &task_id).await {
                     let reason = format!("{label} cannot work now: {problem}");
                     let text = self.inner.data.get().text("progress_worker_fallback", &[("agent", &record.name), ("title", &current.title), ("reason", &reason)]);
@@ -1156,20 +1175,39 @@ impl Agents {
                 }
             }
         }
-        let result = if workers::frontier(&record.worker) {
+        let mut frontier_result = None;
+        if workers::frontier(&record.worker) {
             // A frontier CLI does the task in the project's folder; its run is the agent's run.
             let current = task(&host, &task_id).await?;
             let project = host.project_get(&record.project_id).await?;
             let data = self.inner.data.get();
             let ended = self.inner.frontier.run(&host, &data, &record, &current, &project.root, &cancel).await?;
-            if ended.external_session.is_some() && ended.external_session != record.external_session {
-                record.external_session = ended.external_session.clone();
+            if ended.start_failed {
+                // It never got to the work (e.g. a CLI too old for its model): the local model
+                // takes the task now, in the same run, and the lead is told why.
+                let label = crate::frontier::label(&record.worker);
+                let reason = format!("{label} could not start: {}", ended.error.clone().unwrap_or_else(|| ended.result.summary.clone()));
+                record.worker = workers::LOCAL.to_owned();
+                record.external_session = None;
                 record = upsert(&ctx, &host, record).await?;
+                // It counts on the local model's side from now on.
+                lock(&self.inner.scheduler).mark_frontier(&key, false);
+                let text = data.text("progress_worker_fallback", &[("agent", &record.name), ("title", &current.title), ("reason", &reason)]);
+                let lead = lead_session(&host, &record).await;
+                progress_note(&host, lead.as_deref(), &text, &record, true).await;
+            } else {
+                if ended.external_session.is_some() && ended.external_session != record.external_session {
+                    record.external_session = ended.external_session.clone();
+                    record = upsert(&ctx, &host, record).await?;
+                }
+                if ended.result.outcome == "waiting" {
+                    return self.waiting(&ctx, &host, record, &current, ended.question.unwrap_or_default()).await;
+                }
+                frontier_result = Some(ended.result);
             }
-            if ended.result.outcome == "waiting" {
-                return self.waiting(&ctx, &host, record, &current, ended.question.unwrap_or_default()).await;
-            }
-            ended.result
+        }
+        let result = if let Some(result) = frontier_result {
+            result
         } else {
             // Its model calls: here when this computer's model is free, else a joined computer's
             // free model (then its place here goes to the next queued agent).
@@ -1749,7 +1787,9 @@ impl Agents {
         let scheduler = lock(&self.inner.scheduler);
         let window = {
             let usage = lock(&self.inner.usage);
-            let mut window = window_of(&usage, config.window_ms, scheduler.running.len() as u32, scheduler.queued.len() as u32);
+            let running = scheduler.running.len().saturating_sub(scheduler.frontier_running()) as u32;
+            let queued = scheduler.queued.iter().filter(|key| !scheduler.frontier.contains(key)).count() as u32;
+            let mut window = window_of(&usage, config.window_ms, running, queued);
             (window.restores, window.restore_share) = lock(&self.inner.model).restores_in(config.window_ms);
             window
         };
@@ -1766,6 +1806,7 @@ impl Agents {
                 "why": adjustments.last().and_then(|last| last.get("reason").cloned()).unwrap_or_else(|| json!("initial limit")),
                 "bounds": {"min": config.min, "max": config.max, "ceiling": controller.as_ref().and_then(|c| c.ceiling)},
                 "peak": scheduler.peak,
+                "frontier": {"running": scheduler.frontier_running(), "limit": config.frontier_parallel},
                 "model": lock(&self.inner.model).to_json(),
                 "metrics": window_json(&window),
                 "throughput_by_limit": controller.as_ref().map(|c| c.samples.iter().map(|(limit, tps)| json!({"limit": limit, "tokens_per_s": tps})).collect::<Vec<_>>()).unwrap_or_default(),

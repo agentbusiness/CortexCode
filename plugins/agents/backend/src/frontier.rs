@@ -75,6 +75,11 @@ fn defaults(worker: &str) -> (&'static str, &'static str, &'static str) {
     }
 }
 
+/// A worker's name as the user reads it.
+pub fn label(worker: &str) -> &'static str {
+    defaults(worker).0
+}
+
 /// How a run ended, for the agents plugin.
 pub struct RunEnd {
     pub result: AgentRunResult,
@@ -82,18 +87,37 @@ pub struct RunEnd {
     pub external_session: Option<String>,
     /// The question to the lead, when the run ended `waiting`.
     pub question: Option<String>,
+    /// The CLI failed before it did any work (it could not start, or refused the model): the
+    /// task is the local model's now, and the worker cannot be used until it is looked at again.
+    pub start_failed: bool,
+    /// The CLI's own failure text, when it failed.
+    pub error: Option<String>,
+}
+
+/// One CLI as detection found it.
+#[derive(Clone, Default)]
+struct Found {
+    path: Option<PathBuf>,
+    /// Why it cannot work (not installed, not signed in); None when it can.
+    problem: Option<String>,
+    /// What `<cli> --version` says.
+    version: Option<String>,
 }
 
 #[derive(Default)]
 struct Detected {
     at: Option<Instant>,
-    found: HashMap<String, (Option<PathBuf>, Option<String>)>,
+    found: HashMap<String, Found>,
 }
 
 /// Frontier workers: detection and the runs going now (for steering).
 #[derive(Default)]
 pub struct Frontier {
     detected: Mutex<Detected>,
+    /// Per worker: why its last run failed before doing any work (e.g. a CLI too old for its
+    /// model). Kept until the CLIs are looked at again fresh (the settings panel opening, a
+    /// choice) or one of its runs works.
+    failures: Mutex<HashMap<String, String>>,
     live: Mutex<HashMap<AgentKey, mpsc::UnboundedSender<()>>>,
 }
 
@@ -189,23 +213,37 @@ async fn sign_in_problem(worker: &str, path: &Path) -> Option<String> {
     }
 }
 
+/// What `<cli> --version` says (its first line), when it answers.
+async fn version_of(path: &Path) -> Option<String> {
+    let mut command = Command::new(path);
+    command.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    let output = tokio::time::timeout(STATUS_TIMEOUT, command.output()).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().next().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned)
+}
+
 impl Frontier {
-    /// The CLIs found and their sign-in, asked again when `fresh` or after [`DETECT_FOR`].
-    async fn detect(&self, fresh: bool) -> HashMap<String, (Option<PathBuf>, Option<String>)> {
+    /// The CLIs found, their versions and sign-in, asked again when `fresh` or after
+    /// [`DETECT_FOR`]. A fresh look also forgets the runs that could not start: the user may have
+    /// updated or signed in since.
+    async fn detect(&self, fresh: bool) -> HashMap<String, Found> {
         {
             let detected = lock(&self.detected);
             if !fresh && detected.at.is_some_and(|at| at.elapsed() < DETECT_FOR) {
                 return detected.found.clone();
             }
         }
+        if fresh {
+            lock(&self.failures).clear();
+        }
         let mut found = HashMap::new();
         for worker in [workers::CLAUDE, workers::OPENAI] {
             let path = find_cli(worker);
-            let problem = match &path {
-                Some(path) => sign_in_problem(worker, path).await,
-                None => Some("it is not installed on this computer".to_owned()),
+            let (problem, version) = match &path {
+                Some(path) => (sign_in_problem(worker, path).await, version_of(path).await),
+                None => (Some("it is not installed on this computer".to_owned()), None),
             };
-            found.insert(worker.to_owned(), (path, problem));
+            found.insert(worker.to_owned(), Found { path, problem, version });
         }
         let mut detected = lock(&self.detected);
         detected.at = Some(Instant::now());
@@ -220,15 +258,20 @@ impl Frontier {
         let mut list = vec![WorkerInfo { id: workers::LOCAL.to_owned(), label: "Local".to_owned(), installed: true, signed_in: true, ..WorkerInfo::default() }];
         for worker in [workers::CLAUDE, workers::OPENAI] {
             let (label, model, effort) = defaults(worker);
-            let (path, problem) = found.get(worker).cloned().unwrap_or((None, Some("it was not looked for".to_owned())));
+            let Found { path, problem, version } = found.get(worker).cloned().unwrap_or(Found { problem: Some("it was not looked for".to_owned()), ..Found::default() });
             let model = setting(host, &format!("agents.{worker}.model")).await.unwrap_or_else(|| model.to_owned());
             let effort = setting(host, &format!("agents.{worker}.effort")).await.unwrap_or_else(|| effort.to_owned());
+            let signed_in = path.is_some() && problem.is_none();
+            // A run that could not start says what stops it (in the CLI's own words).
+            let failure = lock(&self.failures).get(worker).cloned();
+            let problem = problem.or_else(|| failure.map(|failure| format!("its last run could not start: {failure}")));
             list.push(WorkerInfo {
                 id: worker.to_owned(),
                 label: label.to_owned(),
                 installed: path.is_some(),
-                signed_in: path.is_some() && problem.is_none(),
+                signed_in,
                 path: path.map(|path| path.to_string_lossy().into_owned()),
+                version,
                 model: Some(model),
                 effort: Some(effort),
                 problem,
@@ -312,6 +355,13 @@ impl Frontier {
         };
         let outcome = run.go(cancel).await;
         lock(&self.live).remove(&key);
+        if let Ok(end) = &outcome {
+            if end.start_failed {
+                lock(&self.failures).insert(worker.to_owned(), end.error.clone().unwrap_or_else(|| end.result.summary.clone()));
+            } else if matches!(end.result.outcome.as_str(), "done" | "waiting" | "blocked") {
+                lock(&self.failures).remove(worker);
+            }
+        }
         outcome
     }
 }
@@ -366,6 +416,11 @@ impl Run<'_> {
         // reservations free, and what it changed is read from the step log.
         let _ = self.host.call(tools_methods::CLEANUP, json!({"workspace": self.root, "session_id": self.session_id, "since_ms": started_ms})).await;
         let changed_files = changed_since(&self.host, self.root, &self.session_id, started_ms).await;
+        let raw_error = match &ended {
+            Err(error) if error.code != codes::CANCELLED => Some(error.message.trim().to_owned()),
+            Ok(turn) => turn.error.as_deref().map(str::trim).filter(|error| !error.is_empty()).map(str::to_owned),
+            _ => None,
+        };
         let (outcome, summary, question) = match ended {
             Err(error) if error.code == codes::CANCELLED => ("cancelled".to_owned(), self.data.text("frontier_cancelled", &[]), None),
             Err(error) => ("failed".to_owned(), self.data.text("frontier_failed", &[("error", &error.message)]), None),
@@ -383,7 +438,10 @@ impl Run<'_> {
             _ => SessionStatus::Failed,
         };
         let _ = self.host.session_status(&self.session_id, status).await;
-        Ok(RunEnd { result, external_session: self.external.clone(), question })
+        // Failed with no tool call made: the CLI never got to the work (it did not start, or it
+        // refused its model or its sign-in), so nothing of the task was done by it.
+        let start_failed = result.outcome == "failed" && self.tool_calls == 0;
+        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error })
     }
 
     /// The run's first message: the task on its first run; else what waits for it (the lead's

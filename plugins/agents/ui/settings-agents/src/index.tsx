@@ -13,7 +13,7 @@ interface Scheduler {
   running: string[];
   queued: string[];
   max_parallel: number;
-  detail?: { why?: string; bounds?: { min?: number; max?: number }; model?: { slots?: number; room?: number } };
+  detail?: { why?: string; bounds?: { min?: number; max?: number }; model?: { slots?: number; room?: number }; frontier?: { running?: number; limit?: number } };
 }
 
 interface WorkerInfo {
@@ -22,6 +22,7 @@ interface WorkerInfo {
   installed: boolean;
   signed_in: boolean;
   path?: string;
+  version?: string;
   model?: string;
   effort?: string;
   problem?: string;
@@ -81,6 +82,13 @@ function Workers() {
           {active?.label} agents do every change ({active?.model}, {active?.effort} effort), working in the project's folder through CortexCode's tools. Your conversation plans, watches and directs them; it does not change files itself.
         </p>
       )}
+      {data.workers
+        .filter((worker) => worker.id !== 'local' && worker.installed)
+        .map((worker) => (
+          <p key={`${worker.id}-version`} className="hint" data-version={worker.id}>
+            {worker.label}: {worker.version ?? 'version unknown'}{worker.path ? ` · ${worker.path}` : ''}
+          </p>
+        ))}
       {data.fallback && <p className="hint" data-fallback>{data.fallback}</p>}
       {data.workers
         .filter((worker) => worker.id !== 'local' && worker.problem)
@@ -115,6 +123,11 @@ function AgentDefaults() {
             {scheduler.data.detail?.model?.room ? `, starting at the ${scheduler.data.detail.model.room} full-size conversations the model's memory holds, minus one for you` : ''}. It steps down when agents measurably slow your own chat or push each other out of memory, and up while more agents raise throughput.
             {scheduler.data.detail?.why && scheduler.data.detail.why !== 'initial limit' ? <> Last change: {scheduler.data.detail.why}.</> : null}
           </p>
+          {scheduler.data.detail?.frontier?.limit ? (
+            <p className="cx-settings-line" data-frontier-limit={scheduler.data.detail.frontier.limit}>
+              Claude and OpenAI agents: up to {scheduler.data.detail.frontier.limit} at once, outside the local limit · {scheduler.data.detail.frontier.running ?? 0} running.
+            </p>
+          ) : null}
         </>
       ) : scheduler.error ? <ServiceProblem service="agents" state={scheduler} /> : <p className="hint">Reading the scheduler…</p>}
     </div>

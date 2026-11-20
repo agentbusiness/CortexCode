@@ -78,6 +78,9 @@ foreground_tpot_ms = 150
 # Pool pressure: the limit steps down when restoring spilled conversations from disk takes more
 # than this share of a window (agents evicting each other).
 pool_restore_share = 0.1
+# Agents a frontier CLI (Claude Code, Codex) works for at once: their own lane, not this computer's
+# model's, so the limit above does not count them.
+frontier_parallel = 6
 # A higher limit is kept only when it raises agent throughput by at least this fraction.
 gain = 0.05
 # Re-measure the neighbours of a held limit after this long (ms).
