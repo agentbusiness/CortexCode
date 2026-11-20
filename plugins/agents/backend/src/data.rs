@@ -29,6 +29,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("schemas/plan.json", include_str!("../data/schemas/plan.json")),
     ("prompts/review.md", include_str!("../data/prompts/review.md")),
     ("schemas/review.json", include_str!("../data/schemas/review.json")),
+    ("prompts/worker.md", include_str!("../data/prompts/worker.md")),
 ];
 
 const EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];

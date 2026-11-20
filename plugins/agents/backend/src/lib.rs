@@ -1,7 +1,7 @@
 //! `cc-agents`: CortexCode's background agents (`agents@1`): delegation of a goal into a task tree
-//! with contracts (planned by the model over the code graph), named agents in copy-on-write
-//! workspaces, the scheduler, host-run contract verification, the project board and the merge
-//! steward.
+//! with contracts (planned by the model over the code graph), named agents working in the
+//! project's own folder (the local model's, or a frontier CLI's: `frontier`), the scheduler,
+//! host-run contract verification, the project board and the merge steward.
 //!
 //! Agents, tasks and board messages live in the graph (memory) and the agents' journals (frame);
 //! the plugin holds only its scheduler queue, rebuilt on activation from the agent records.
@@ -13,6 +13,7 @@ pub mod agents;
 pub mod contract;
 pub mod control;
 pub mod data;
+pub mod frontier;
 pub mod graph;
 pub mod host;
 pub mod journal;

@@ -10,8 +10,8 @@ use cc_protocol::contracts::frame::{ProjectDeleted, SessionDeleted, topics as fr
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
-    ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
-    JobListParams, JobParams, JobStatus, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
+    AgentEnvParams, AgentEnvResult, ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
+    JobListParams, JobParams, JobStatus, McpCallParams, McpCallResult, McpListParams, McpListResult, McpTool, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
     SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
     WorkspaceListResult, WorkspaceRemoveParams, methods, topics,
 };
@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// The methods a command in the model's shells may call (`cx`): its session's background jobs.
-pub const COMMANDS: &[&str] = &[methods::JOB_LIST, methods::JOB_STATUS, methods::JOB_KILL];
+/// The methods a command in the model's shells may call (`cx`): its session's background jobs, and
+/// its session's model tools for `cx mcp` (the MCP server a frontier worker's CLI starts).
+pub const COMMANDS: &[&str] = &[methods::JOB_LIST, methods::JOB_STATUS, methods::JOB_KILL, methods::MCP_LIST, methods::MCP_CALL];
 
 pub const PROVIDES: &[&str] = &[
     methods::SCHEMAS,
@@ -53,6 +54,9 @@ pub const PROVIDES: &[&str] = &[
     methods::SHARES,
     methods::SECURITY_SCAN,
     methods::SECURITY_DEPS,
+    methods::MCP_LIST,
+    methods::MCP_CALL,
+    methods::AGENT_ENV,
 ];
 
 pub struct ToolsPlugin {
@@ -161,6 +165,7 @@ pub(crate) fn host_context(workspace: &str, project_id: Option<&str>, session_id
         workspace: workspace.to_owned(),
         mode: "auto".to_owned(),
         edit_format: None,
+        lead: false,
     }
 }
 
@@ -168,13 +173,13 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
     let Call { method, params, items, cancel } = call;
     match method.as_str() {
         methods::SCHEMAS => {
-            let params: SchemasParams = if params.is_null() { SchemasParams { edit_format: None, workspace: None } } else { parse_params(params)? };
+            let params: SchemasParams = if params.is_null() { SchemasParams { edit_format: None, workspace: None, lead: false } } else { parse_params(params)? };
             let offline = params
                 .workspace
                 .as_deref()
                 .filter(|workspace| !workspace.is_empty())
                 .is_some_and(|workspace| util::canonical_lenient(&util::expand_home(workspace)).join(crate::sandbox::OFFLINE_MARKER).exists());
-            let mut result = schemas::schemas(EditFormat::parse(params.edit_format.as_deref()), offline);
+            let mut result = if params.lead { schemas::lead_schemas(offline) } else { schemas::schemas(EditFormat::parse(params.edit_format.as_deref()), offline) };
             // The services this machine's apps share, one tool each.
             for spec in crate::services::specs(host.as_ref()).await {
                 result.versions[spec.name.as_str()] = json!("service@1");
@@ -637,6 +642,77 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::SHARES => to_value(&crate::share::shares()),
         methods::SECURITY_SCAN | methods::SECURITY_DEPS => crate::share::security(&method, params).await,
+        methods::MCP_LIST => {
+            let params: McpListParams = parse_params(params)?;
+            let offline = util::canonical_lenient(&util::expand_home(&params.workspace)).join(crate::sandbox::OFFLINE_MARKER).exists();
+            let mut result = schemas::schemas(EditFormat::parse(None), offline);
+            for spec in crate::services::specs(host.as_ref()).await {
+                result.tools.push(spec);
+            }
+            let tools = result.tools.into_iter().map(|spec| McpTool { name: spec.name, description: spec.description, input_schema: spec.parameters }).collect();
+            to_value(&McpListResult { tools, guide: result.guide })
+        }
+        methods::MCP_CALL => {
+            // Only a command's call: the frame stamps its session, and that session is the one the
+            // call works for (its reservations, sandbox, step log and approvals).
+            let Some(session_id) = params.get("_command_session").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned) else {
+                return Err(RpcError::new(codes::CONTRACT_VIOLATION, "tools.mcp.call is for a command of a session (cx mcp)"));
+            };
+            let params: McpCallParams = parse_params(params)?;
+            let project_id = host
+                .call(cc_protocol::contracts::frame::methods::SESSION_GET, json!({"id": session_id}))
+                .await
+                .ok()
+                .and_then(|session| session.get("project_id").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            let arguments = match &params.arguments {
+                Value::Null => "{}".to_owned(),
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let call = ToolCall {
+                id: params.call_id.clone().filter(|id| !id.is_empty()).unwrap_or_else(|| format!("mcp-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])),
+                name: params.name.clone(),
+                arguments,
+            };
+            let context = ExecContext { project_id, session_id, workspace: params.workspace.clone(), mode: "auto".to_owned(), edit_format: None, lead: false };
+            let child_cancel = cancel.child_token();
+            let task = tokio::spawn(async move { exec::execute(&core, &host, ExecuteParams { context, call }, items, child_cancel).await });
+            let guard = CancelOnDrop(cancel.clone());
+            let outcome = task.await.map_err(|error| RpcError::internal(format!("tool task failed: {error}")))?;
+            drop(guard);
+            // An approval the model cannot give: what was asked stays in the text, so the worker
+            // tells its lead instead of waiting.
+            to_value(&McpCallResult { ok: outcome.ok && !outcome.needs_approval, text: outcome.output, changed_files: outcome.changed_files })
+        }
+        methods::AGENT_ENV => {
+            if params.get("_command_session").is_some() {
+                return Err(RpcError::new(codes::CONTRACT_VIOLATION, "tools.agent.env is for plugins, not commands"));
+            }
+            let params: AgentEnvParams = parse_params(params)?;
+            let workspace = util::canonical_lenient(&util::expand_home(&params.workspace));
+            let runtime = core
+                .runtime(host.as_ref(), &params.session_id, &workspace, false)
+                .await
+                .map_err(|message| RpcError::new(codes::UNAVAILABLE, message))?;
+            let cx = core.cx.clone().ok_or_else(|| RpcError::new(codes::UNAVAILABLE, "the cx command is not installed beside the tools plugin"))?;
+            let project_id = host
+                .call(cc_protocol::contracts::frame::methods::SESSION_GET, json!({"id": params.session_id}))
+                .await
+                .ok()
+                .and_then(|session| session.get("project_id").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("CORTEX_COMMAND_URL".to_owned(), runtime.command_access.url.clone());
+            env.insert("CORTEX_COMMAND_TOKEN".to_owned(), runtime.command_access.token.clone());
+            env.insert("CORTEX_SESSION_ID".to_owned(), params.session_id.clone());
+            env.insert("CORTEX_WORKSPACE".to_owned(), workspace.to_string_lossy().into_owned());
+            env.insert("CORTEX_HOME".to_owned(), core.home.to_string_lossy().into_owned());
+            if !project_id.is_empty() {
+                env.insert("CORTEX_PROJECT_ID".to_owned(), project_id);
+            }
+            to_value(&AgentEnvResult { env, cx: cx.to_string_lossy().into_owned() })
+        }
         other => Err(RpcError::unknown_method(other)),
     }
 }
@@ -755,6 +831,7 @@ pub async fn probe(core: &Arc<Core>, host: Arc<dyn Host>) -> ProbeReport {
         workspace: scratch.to_string_lossy().into_owned(),
         mode: "auto".into(),
         edit_format: None,
+        lead: false,
     };
     let call = |name: &str, args: Value| ExecuteParams {
         context: context.clone(),

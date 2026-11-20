@@ -172,6 +172,22 @@ pub async fn execute_in(
         canonical.notes.push("a read of `run:<command>` ran as run".to_owned());
     }
     let intent = canonical.args.get("intent").and_then(Value::as_str).unwrap_or("").to_owned();
+    // A lead session while frontier agents do the work changes no file (docs/FRONTIER-AGENTS.md).
+    if context.lead && matches!(canonical.tool, "edit" | "terminal") {
+        return ToolOutcome {
+            ok: false,
+            output: "Not done: you lead this work, and agents change the files. Write the change as a task for an agent in your answer.".to_owned(),
+            display: Value::Null,
+            tool: canonical.tool.to_owned(),
+            args: Value::Object(canonical.args.clone()),
+            intent,
+            changed_files: Vec::new(),
+            artifact: None,
+            needs_approval: false,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error_kind: Some("lead_no_edit".to_owned()),
+        };
+    }
     // The step log: an edit records itself with the text in hand; a command's effects are found
     // when it ends (the watcher leaves them alone meanwhile).
     let mut lap = Lap::new();

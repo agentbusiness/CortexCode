@@ -2520,8 +2520,8 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     // A runner job's plan is carried out here, one task after the other, as a plan made for a DO
     // decision is: one working tree, a REVIEW after each task, the next task after the one before
     // it is verified. The decision carries only the goal; each task's brief, checks and skills
-    // are its own.
-    if crate::runner::on(&entries) {
+    // are its own. A lead session carries nothing out here: every task goes to an agent.
+    if !env.lead && crate::runner::on(&entries) {
         let decision = Decision {
             missing: String::new(),
             route: "DO".into(),
@@ -2543,7 +2543,7 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
         let seq = journal.append(chatflow_kinds::PLAN, mine.entry(&env.run_id)).await?;
         return journal.set(seq, "implement_run", json!(env.run_id)).await;
     }
-    if current.tasks.len() <= 1 {
+    if !env.lead && current.tasks.len() <= 1 {
         let mut decision = plan::foreground_decision(&env.data, &current, &env.data.effort.default);
         decision.brief = format!("{}{}", direction(&env.data, &journal.entries_vec()), decision.brief);
         return journal
@@ -2829,13 +2829,22 @@ async fn agent_capacity(env: &RunEnv) -> u64 {
 async fn parallel_implementation(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
     let Some((plan_seq, mut current)) = plan::for_run(&entries, &env.run_id) else { return Ok(()) };
-    if current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || agent_capacity(env).await == 0 {
+    // A lead session hands every plan to agents, one task or many: it does not change files.
+    if !env.lead && (current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || agent_capacity(env).await == 0) {
+        return Ok(());
+    }
+    if current.tasks.is_empty() {
         return Ok(());
     }
     journal.set(plan_seq, "status", json!(plan_status::IMPLEMENTING)).await?;
     match implement_by_agents(env, journal, plan_seq, &mut current, true).await {
         Ok(text) => journal.note(&env.run_id, "implement_done", &text, true).await.map(|_| ()),
         Err(error) if error.code == codes::CANCELLED => Err(error),
+        // A lead session never does the work here: the failure is its answer.
+        Err(error) if env.lead => {
+            journal.set(plan_seq, "status", json!(plan_status::APPROVED)).await?;
+            journal.note(&env.run_id, "implement_done", &env.data.text("implement_failed", &[("error", &error.message)]), true).await.map(|_| ())
+        }
         // The agents could not take it: the Act stage does it here, task by task, as without the mesh.
         Err(error) => {
             tracing::warn!(%error, "the plan's tasks could not go to agents; carried out here");
@@ -2854,7 +2863,8 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
     let Some((uri, (list_command, unit_done))) = skillsel::of_decision(&route).into_iter().find_map(|uri| env.prefix.skill_units.get(&uri).cloned().map(|commands| (uri, commands))) else {
         return Ok(false);
     };
-    if agent_capacity(env).await == 0 {
+    // A lead session's units go to agents whatever this computer's local capacity is.
+    if !env.lead && agent_capacity(env).await == 0 {
         return Ok(false);
     }
     let check = cc_protocol::contracts::memory::ContractCheck { name: "units".to_owned(), kind: "command".to_owned(), spec: list_command, expect: None };

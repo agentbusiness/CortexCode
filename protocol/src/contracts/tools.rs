@@ -79,6 +79,77 @@ pub mod methods {
     /// severity, fixed?, command?}]}`: the project's locked dependencies checked against OSV.
     /// Shared as `tools.security` version 1; only for apps on this machine.
     pub const SECURITY_DEPS: &str = "tools.security.deps.get";
+    /// [`super::McpListParams`] -> [`super::McpListResult`]: the model tools of a command's session
+    /// as MCP tools (`cx mcp`, the server a frontier CLI starts): the same specs and guide the chat
+    /// flow's models get. A command in the model's shells may call it.
+    pub const MCP_LIST: &str = "tools.mcp.list";
+    /// [`super::McpCallParams`] -> [`super::McpCallResult`]: one tool call of a command's session
+    /// (`cx mcp`), executed as the chat flow's own calls are: the session's file reservations,
+    /// write sandbox, step log and approvals. Only from a command (`_command_session`).
+    pub const MCP_CALL: &str = "tools.mcp.call";
+    /// [`super::AgentEnvParams`] -> [`super::AgentEnvResult`]: what a frontier CLI working for an
+    /// agent session needs to reach the app: the session's command access and where `cx` is. For
+    /// plugins only (the agents plugin starting a frontier worker), never a command.
+    pub const AGENT_ENV: &str = "tools.agent.env";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct McpListParams {
+    /// The command's workspace (the frame holds it to the command's own).
+    pub workspace: String,
+}
+
+/// One tool in MCP's shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpTool {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema of the arguments.
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpListResult {
+    pub tools: Vec<McpTool>,
+    /// How every tool's result reads and which tool to use (the tools guide).
+    pub guide: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpCallParams {
+    pub workspace: String,
+    pub name: String,
+    /// The arguments as the client sent them (an object).
+    #[serde(default)]
+    pub arguments: Value,
+    /// The client's id for the call (journal and log only).
+    #[serde(default)]
+    pub call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpCallResult {
+    pub ok: bool,
+    /// The tool result as the model reads it.
+    pub text: String,
+    /// Files the call changed (relative to the workspace).
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentEnvParams {
+    pub session_id: String,
+    pub workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentEnvResult {
+    /// `CORTEX_COMMAND_URL`, `CORTEX_COMMAND_TOKEN`, `CORTEX_SESSION_ID`, `CORTEX_WORKSPACE`,
+    /// `CORTEX_PROJECT_ID` and `CORTEX_HOME` for the CLI and the `cx mcp` it starts.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The `cx` binary the CLI starts as its MCP server.
+    pub cx: String,
 }
 
 /// Approval classes beyond the ask-mode action classes.
@@ -267,6 +338,10 @@ pub struct SchemasParams {
     /// that say so up front.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The specs and guide of a lead session while frontier agents do the work
+    /// (docs/FRONTIER-AGENTS.md): read and run only, and a guide that sends changes to agents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lead: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -290,6 +365,10 @@ pub struct ExecContext {
     pub mode: String,
     #[serde(default)]
     pub edit_format: Option<String>,
+    /// A lead session while frontier agents do the work: it does not change files (`edit` and
+    /// `terminal` are refused; changes go to agents).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lead: bool,
 }
 
 fn default_mode() -> String {

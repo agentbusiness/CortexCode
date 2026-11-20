@@ -83,3 +83,18 @@ tree_task_agent = " ({agent})"
 tree_task_passed = "its checks pass in the project"
 tree_task_unchecked = "no check ran on it"
 tree_task_failing = "its checks still fail in the project"
+
+# ---- frontier workers (Claude Code, Codex; docs/FRONTIER-AGENTS.md) -------------------------------
+# The task as the worker reads it; the step to take is last.
+frontier_task = "Your task: {title}\n\n{brief}"
+frontier_plan = "\n\nThe planner's steps:\n{plan}"
+frontier_touches = "\n\nThe code this task claims: {touches}."
+frontier_checks = "\n\nIt is done when these pass from the project root:{checks}"
+frontier_go = "\n\nStart with the code the task names: read it with the cortex tools, then make the change."
+frontier_failed = "The worker's run failed: {error}"
+frontier_cancelled = "The worker's run was stopped."
+frontier_no_report = "The worker ended without its report."
+# Said to the lead (its journal) and on the board.
+progress_waiting = "{agent} asks about \"{title}\": {question}\nAnswer it to {agent} (steer): the answer is its next message."
+progress_worker_fallback = "{agent} works on \"{title}\" with the local model: {reason}"
+board_waiting = "Waiting for the lead on \"{title}\": {question}"

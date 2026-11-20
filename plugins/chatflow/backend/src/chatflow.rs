@@ -484,8 +484,10 @@ impl Chatflow {
         let data = self.inner.data.get();
         // A background agent's system prompt carries its task loop's rules only.
         let role = if matches!(priority, Priority::Agent) { crate::data::ROLE_AGENT } else { crate::data::ROLE_CHAT };
+        // A user's conversation leads while frontier agents do the work: its tools only look.
+        let lead = !matches!(priority, Priority::Agent) && crate::lead::leads(host, session).await;
         let skills_changed_ms = self.inner.skills_changed_ms.load(Ordering::SeqCst);
-        let prefix: Prefix = context::ensure(journal, &project.id, &data, role, skills_changed_ms).await?;
+        let prefix: Prefix = context::ensure(journal, &project.id, &data, role, lead, skills_changed_ms).await?;
         let workspace = if session.workspace.is_empty() { project.root.clone() } else { session.workspace.clone() };
         let info = context::model_info(host).await;
         // A session runs on one model: its first run records it, and a run on another model (after
@@ -523,6 +525,7 @@ impl Chatflow {
             data,
             stage,
             image_input,
+            lead,
         })
     }
 
@@ -582,7 +585,8 @@ impl Chatflow {
         let project = host.project_get(project_id).await?;
         self.ensure_project_open(&host, &project.id, &project.root).await;
         let data = self.inner.data.get();
-        let prefix = context::build(&host, &project.id, &data, crate::data::ROLE_CHAT).await?;
+        let lead = crate::lead::frontier_active(&host).await;
+        let prefix = context::build(&host, &project.id, &data, crate::data::ROLE_CHAT, lead).await?;
         if prefix.ctx_window == 0 {
             return Ok(PrewarmResult { state: "skipped".into(), messages: 0 });
         }
@@ -629,7 +633,8 @@ impl Chatflow {
         self.ensure_project_open(&host, &project.id, &project.root).await;
         let data = self.inner.data.get();
         let skills_changed_ms = self.inner.skills_changed_ms.load(Ordering::SeqCst);
-        let prefix = context::ensure(&mut journal, &project.id, &data, crate::data::ROLE_CHAT, skills_changed_ms).await?;
+        let lead = crate::lead::leads(&host, &session).await;
+        let prefix = context::ensure(&mut journal, &project.id, &data, crate::data::ROLE_CHAT, lead, skills_changed_ms).await?;
         let image_input = context::model_info(&host).await.is_some_and(|info| info.accepts_images());
         // A turn may have started while the prefix was read: its own calls keep the cache.
         if self.active(&params.session_id).is_some() {

@@ -168,6 +168,9 @@ pub struct RunEnv {
     pub stage: std::sync::Arc<std::sync::Mutex<String>>,
     /// The model takes image content parts (`model.info`); attached images are then shown to it.
     pub image_input: bool,
+    /// The session leads frontier agents ([`crate::lead`]): it changes no file, and every change
+    /// of its work goes to agents.
+    pub lead: bool,
 }
 
 impl RunEnv {
@@ -615,6 +618,7 @@ async fn execute_call(env: &RunEnv, journal: &mut Journal, call_seq: Option<u64>
             workspace: env.scope.workspace.clone(),
             mode: env.mode.clone(),
             edit_format: None,
+            lead: env.lead,
         },
         "call": call,
     });

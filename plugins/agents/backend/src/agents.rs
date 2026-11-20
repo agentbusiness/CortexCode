@@ -1,5 +1,6 @@
-//! The `cc-agents` plugin (`agents@1`): delegation into a task tree with contracts, named agents in
-//! copy-on-write workspaces, the scheduler, host-run verification, the board and the merge steward.
+//! The `cc-agents` plugin (`agents@1`): delegation into a task tree with contracts, named agents
+//! working in the project's own folder (the local model's agent loop, or a frontier CLI:
+//! [`crate::frontier`]), the scheduler, host-run verification, the board and the merge steward.
 //!
 //! Agents, tasks and board messages live in the graph (memory) and the agents' journals (frame);
 //! this plugin holds only the scheduler's queue, which it rebuilds on activation from the agent
@@ -15,7 +16,7 @@ use crate::data::{Data, Dataset, Loaded};
 use crate::schemas::{self, Plan, PlannedTask, Review, parse_json};
 use cc_protocol::contracts::agents::{
     AgentRefParams, AgentSteerParams, CancelParams, HandoffParams, CancelResult, DelegateParams, DelegateResult, ListParams, ListResult, MergeOutcome,
-    MergeParams, ProposeParams, ProposeResult, SchedulerState, SpawnParams, Supervise, VerifyParams, VerifyReport, events, methods, topics,
+    MergeParams, ProposeParams, ProposeResult, SchedulerState, SpawnParams, Supervise, VerifyParams, VerifyReport, events, methods, topics, workers,
 };
 use cc_protocol::contracts::chatflow::{AgentRunResult, verbs as chatflow_verbs};
 use cc_protocol::contracts::frame::{JournalEntry, Project, ProjectListResult, SessionCreateParams, SessionKind, flows, kinds, methods as frame_methods};
@@ -67,6 +68,8 @@ pub fn hello() -> Hello {
         methods::MERGE,
         methods::SCHEDULER,
         methods::PROPOSE,
+        methods::WORKERS,
+        methods::WORKER_SET,
     ]
     .iter()
     .map(|method| (*method).to_owned())
@@ -246,6 +249,8 @@ struct Inner {
     self_checked: Mutex<std::collections::HashSet<(String, String)>>,
     tasks: tokio_util::task::TaskTracker,
     park: CancellationToken,
+    /// Frontier workers (Claude Code, Codex): detection and the runs going now.
+    frontier: Arc<crate::frontier::Frontier>,
 }
 
 #[derive(Clone)]
@@ -273,6 +278,7 @@ impl Agents {
                 self_checked: Mutex::new(std::collections::HashSet::new()),
                 tasks: tokio_util::task::TaskTracker::new(),
                 park: CancellationToken::new(),
+                frontier: Arc::new(crate::frontier::Frontier::default()),
             }),
         })
     }
@@ -712,6 +718,9 @@ impl Agents {
                 flow: params.flow.clone(),
             })
             .await?;
+        // Who does its work: the worker that can work now (a frontier CLI when chosen and signed
+        // in, else the local model's agent loop).
+        let worker = self.inner.frontier.workers(&host, false).await.active;
         let record = upsert(&ctx, &host, AgentRecord {
             name: name.clone(),
             project_id: project.id.clone(),
@@ -725,6 +734,8 @@ impl Agents {
             tasks_failed: 0,
             updated_ms: now_ms(),
             mode: params.mode.clone(),
+            worker,
+            external_session: None,
         })
         .await?;
         // The claim freezes the contract: from here on only a revision accepted by someone other
@@ -1127,21 +1138,55 @@ impl Agents {
             .and_then(|task| task.get("effort").and_then(Value::as_str).map(str::to_owned))
             .filter(|effort| !effort.is_empty())
             .unwrap_or_else(|| self.inner.data.get().effort.default.clone());
-        // Its model calls: here when this computer's model is free, else a joined computer's free
-        // model (then its place here goes to the next queued agent).
-        let already_remote = lock(&self.inner.scheduler).remote.contains(&key);
-        if !already_remote
-            && let Some(name) = self.place_agent(&host, &session_id, false).await
-        {
-            tracing::info!(agent = %key.name, on = %name, "the agent's model calls run on a joined computer");
-            let start = lock(&self.inner.scheduler).start_remote(&key);
-            for key in start {
-                self.start(ctx.clone(), key);
+        let mut record = record;
+        // A frontier worker that cannot work now (signed out, uninstalled) hands its task to the
+        // local model's agent loop; the lead is told why.
+        if workers::frontier(&record.worker) {
+            let listed = self.inner.frontier.workers(&host, false).await;
+            let problem = listed.workers.iter().find(|info| info.id == record.worker).map(|info| info.problem.clone()).unwrap_or_else(|| Some("it is unknown".to_owned()));
+            if let Some(problem) = problem {
+                let label = listed.workers.iter().find(|info| info.id == record.worker).map(|info| info.label.clone()).unwrap_or_else(|| record.worker.clone());
+                record.worker = workers::LOCAL.to_owned();
+                record = upsert(&ctx, &host, record).await?;
+                if let Ok(current) = task(&host, &task_id).await {
+                    let reason = format!("{label} cannot work now: {problem}");
+                    let text = self.inner.data.get().text("progress_worker_fallback", &[("agent", &record.name), ("title", &current.title), ("reason", &reason)]);
+                    let lead = lead_session(&host, &record).await;
+                    progress_note(&host, lead.as_deref(), &text, &record, true).await;
+                }
             }
         }
-        let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await;
-        let _ = host.call(mesh_methods::PLACE_END, json!({"session_id": session_id})).await;
-        let result = result?;
+        let result = if workers::frontier(&record.worker) {
+            // A frontier CLI does the task in the project's folder; its run is the agent's run.
+            let current = task(&host, &task_id).await?;
+            let project = host.project_get(&record.project_id).await?;
+            let data = self.inner.data.get();
+            let ended = self.inner.frontier.run(&host, &data, &record, &current, &project.root, &cancel).await?;
+            if ended.external_session.is_some() && ended.external_session != record.external_session {
+                record.external_session = ended.external_session.clone();
+                record = upsert(&ctx, &host, record).await?;
+            }
+            if ended.result.outcome == "waiting" {
+                return self.waiting(&ctx, &host, record, &current, ended.question.unwrap_or_default()).await;
+            }
+            ended.result
+        } else {
+            // Its model calls: here when this computer's model is free, else a joined computer's
+            // free model (then its place here goes to the next queued agent).
+            let already_remote = lock(&self.inner.scheduler).remote.contains(&key);
+            if !already_remote
+                && let Some(name) = self.place_agent(&host, &session_id, false).await
+            {
+                tracing::info!(agent = %key.name, on = %name, "the agent's model calls run on a joined computer");
+                let start = lock(&self.inner.scheduler).start_remote(&key);
+                for key in start {
+                    self.start(ctx.clone(), key);
+                }
+            }
+            let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await;
+            let _ = host.call(mesh_methods::PLACE_END, json!({"session_id": session_id})).await;
+            result?
+        };
         let task = task(&host, &task_id).await?;
         match result.outcome.as_str() {
             "done" => {
@@ -1428,10 +1473,50 @@ impl Agents {
     }
 
     async fn steer(&self, ctx: Ctx, params: AgentSteerParams) -> Result<Value, RpcError> {
-        let host = Host::new(ctx);
+        let host = Host::new(ctx.clone());
         let record = agent(&host, &params.project_id, &params.agent).await?;
-        let session_id = record.session_id.ok_or_else(|| RpcError::invalid_params("the agent has no session"))?;
+        let session_id = record.session_id.clone().ok_or_else(|| RpcError::invalid_params("the agent has no session"))?;
+        if workers::frontier(&record.worker) {
+            return self.steer_frontier(ctx, &host, record, &session_id, &params).await;
+        }
         host.call(&flow_method(&host, &session_id, chatflow_verbs::STEER).await, forwarded_steer(&session_id, &params)).await
+    }
+
+    /// A steer for a frontier agent: a `steer` entry in its journal, taken as its next message. A
+    /// running CLI takes it when its turn ends; an agent waiting for its lead works again, with
+    /// the steer (the lead's answer) as the first message of its resumed session.
+    async fn steer_frontier(&self, ctx: Ctx, host: &Host, mut record: AgentRecord, session_id: &str, params: &AgentSteerParams) -> Result<Value, RpcError> {
+        let seq = host.journal_append(session_id, kinds::STEER, json!({"text": params.text, "kind": "steer", "target": "chat", "consumed": false})).await?;
+        let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
+        if self.inner.frontier.nudge(&key) {
+            return Ok(json!({"seq": seq, "delivered": "running"}));
+        }
+        if record.status == "waiting" {
+            record.status = "working".into();
+            let record = upsert(&ctx, host, record).await?;
+            if let Some(task_id) = &record.task_id {
+                let text = self.inner.data.get().text("board_restart", &[("title", &task(host, task_id).await.map(|task| task.title).unwrap_or_default())]);
+                board(host, &record.project_id, "status", &record.name, &text, std::slice::from_ref(task_id)).await;
+            }
+            lock(&self.inner.cancellations).remove(&key);
+            self.enqueue(ctx, key).await;
+            return Ok(json!({"seq": seq, "delivered": "resumed"}));
+        }
+        // Not running and not waiting: the steer is the first message of its next run (a restart).
+        Ok(json!({"seq": seq, "delivered": "queued"}))
+    }
+
+    /// A frontier agent asked its lead and waits: its place in the scheduler goes to the next
+    /// agent, and the lead is told the question (the answer, a steer, resumes the agent).
+    async fn waiting(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, question: String) -> Result<(), RpcError> {
+        record.status = "waiting".into();
+        let record = upsert(ctx, host, record).await?;
+        let data = self.inner.data.get();
+        board(host, &record.project_id, "status", &record.name, &data.text("board_waiting", &[("title", &current.title), ("question", &question)]), std::slice::from_ref(&current.id)).await;
+        let lead = lead_session(host, &record).await;
+        progress_note(host, lead.as_deref(), &data.text("progress_waiting", &[("agent", &record.name), ("title", &current.title), ("question", &question)]), &record, true).await;
+        supervise(ctx, lead.as_deref(), event_of(&record.project_id, events::NEED, &record.name, Some(current), &question));
+        Ok(())
     }
 
     /// Stop an agent: its run ends, its task is cancelled with the tasks waiting for it (they would
@@ -1472,8 +1557,13 @@ impl Agents {
         if finished(&task.status) {
             return Ok(json!({"finished": true, "verified": task.status == "done"}));
         }
-        // What the agent changed, from its session's tool results.
-        let changed_files = host.journal_read(&session_id, 1).await.map(|entries| changed_files_of(&entries)).unwrap_or_default();
+        // What the agent changed, from its session's tool results (a frontier agent's, from the
+        // step log: its tool results come through its CLI and carry no file list).
+        let changed_files = if workers::frontier(&record.worker) {
+            crate::frontier::changed_since(&host, record.workspace.as_deref().unwrap_or_default(), &session_id, 0).await
+        } else {
+            host.journal_read(&session_id, 1).await.map(|entries| changed_files_of(&entries)).unwrap_or_default()
+        };
         let summary = self.inner.data.get().text("finished_by_session", &[]);
         let result = AgentRunResult { outcome: "done".into(), summary, turns: 0, tool_calls: 0, changed_files, usage: Value::Null };
         let outcome = self.steward(&ctx, &host, &record, &task, &result, true).await?;
@@ -2317,6 +2407,17 @@ impl Plugin for Agents {
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),
                 methods::SCHEDULER => to_value(&this.scheduler_state()),
                 methods::PROPOSE => to_value(&this.propose(ctx, parse_params(params)?).await?),
+                methods::WORKERS => {
+                    // `{fresh: true}` asks the CLIs again (the settings panel when it opens).
+                    let fresh = params.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+                    to_value(&this.inner.frontier.workers(&Host::new(ctx), fresh).await)
+                }
+                methods::WORKER_SET => {
+                    let params: cc_protocol::contracts::agents::WorkerSetParams = parse_params(params)?;
+                    let result = this.inner.frontier.set(&Host::new(ctx.clone()), &params.worker).await?;
+                    ctx.publish(topics::WORKERS_CHANGED, json!({"chosen": result.chosen, "active": result.active}));
+                    to_value(&result)
+                }
                 other => Err(RpcError::unknown_method(other)),
             }
         })

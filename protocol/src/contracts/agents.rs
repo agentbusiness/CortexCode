@@ -41,11 +41,79 @@ pub mod methods {
     /// its frozen contract; the planner (a fresh context, never the worker) accepts or refuses it,
     /// and an accepted revision is recorded with the old hash and the reason.
     pub const PROPOSE: &str = "agents.contract.propose";
+    /// `{}` -> [`super::WorkersResult`]: who does agent work on this computer: the local model's
+    /// agents, or a frontier CLI (Claude Code, Codex) found installed and signed in. `active` is the
+    /// chosen worker when it can work now, else `local` (with `fallback` saying why).
+    pub const WORKERS: &str = "agents.workers";
+    /// [`super::WorkerSetParams`] -> [`super::WorkersResult`]: choose who does agent work (the
+    /// setting `agents.worker`). A frontier worker must be installed and signed in.
+    pub const WORKER_SET: &str = "agents.worker.set";
+}
+
+/// Who does an agent's work ([`methods::WORKERS`]).
+pub mod workers {
+    /// The local model, through the chat flow's agent loop (as before frontier workers).
+    pub const LOCAL: &str = "local";
+    /// Claude Code, headless.
+    pub const CLAUDE: &str = "claude";
+    /// Codex, headless.
+    pub const OPENAI: &str = "openai";
+    pub const ALL: &[&str] = &[LOCAL, CLAUDE, OPENAI];
+
+    /// A worker that is a frontier CLI (the lead session then does not edit; see
+    /// docs/FRONTIER-AGENTS.md).
+    pub fn frontier(worker: &str) -> bool {
+        worker == CLAUDE || worker == OPENAI
+    }
+}
+
+/// One worker this computer could use ([`WorkersResult::workers`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WorkerInfo {
+    /// One of [`workers`].
+    pub id: String,
+    pub label: String,
+    /// The CLI was found (always true for `local`).
+    pub installed: bool,
+    /// The CLI says it is signed in (always true for `local`).
+    pub signed_in: bool,
+    /// Where the CLI was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The model its runs use (absent for `local`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The effort its runs use (absent for `local`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Why it cannot be chosen now, in plain words (absent when it can).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WorkersResult {
+    /// The setting `agents.worker` (`local` when unset).
+    pub chosen: String,
+    /// Who does agent work now: `chosen` when it can, else `local`.
+    pub active: String,
+    /// Why `active` is not `chosen`, in plain words (absent when they are the same).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    pub workers: Vec<WorkerInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerSetParams {
+    /// One of [`workers`].
+    pub worker: String,
 }
 
 pub mod topics {
     /// `{agent, project_id, status, task_id}`
     pub const AGENT_CHANGED: &str = "agents.changed";
+    /// `{chosen, active}`: who does agent work changed (the setting `agents.worker`).
+    pub const WORKERS_CHANGED: &str = "agents.workers.changed";
     /// A [`super::Supervise`]: something in a session's delegated work needs that session's
     /// decision (an agent blocked, a need for the lead, the whole tree done). The chat flow tells
     /// the session and, when nothing runs in it, wakes it to decide.

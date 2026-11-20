@@ -681,7 +681,7 @@ impl WorkStore {
         let now = now_ms();
         self.run(
             &format!(
-                "{} MERGE (a:Agent {{name: $name}}) SET a.project_id = $project, a.role = $role, a.charter = $charter, a.session_id = $session, a.task_id = $task, a.workspace = $workspace, a.tasks_done = $done, a.tasks_failed = $failed, a.updated_ms = $updated, a.mode = $mode, {}, a.state = null, {}",
+                "{} MERGE (a:Agent {{name: $name}}) SET a.project_id = $project, a.role = $role, a.charter = $charter, a.session_id = $session, a.task_id = $task, a.workspace = $workspace, a.tasks_done = $done, a.tasks_failed = $failed, a.updated_ms = $updated, a.mode = $mode, a.worker = $worker, a.external_session = $external, {}, a.state = null, {}",
                 layer::WORKSPACE_WRITE,
                 revive("a"),
                 span("a")
@@ -689,7 +689,8 @@ impl WorkStore {
             params! {
                 "name" => record.name, "project" => record.project_id, "role" => record.role, "charter" => record.charter,
                 "session" => record.session_id, "task" => record.task_id, "workspace" => record.workspace, "done" => record.tasks_done,
-                "failed" => record.tasks_failed, "updated" => record.updated_ms, "mode" => record.mode.clone(), "now" => now
+                "failed" => record.tasks_failed, "updated" => record.updated_ms, "mode" => record.mode.clone(),
+                "worker" => record.worker.clone(), "external" => record.external_session.clone(), "now" => now
             },
         )
         .await?;
@@ -719,7 +720,7 @@ impl WorkStore {
         let rows = self
             .run(
                 &format!(
-                    "{} MATCH (a:Agent) WHERE a.ended_ms IS NULL RETURN a.name, a.project_id, a.role, a.charter, a.status, a.session_id, a.task_id, a.workspace, a.tasks_done, a.tasks_failed, a.updated_ms, a.mode",
+                    "{} MATCH (a:Agent) WHERE a.ended_ms IS NULL RETURN a.name, a.project_id, a.role, a.charter, a.status, a.session_id, a.task_id, a.workspace, a.tasks_done, a.tasks_failed, a.updated_ms, a.mode, a.worker, a.external_session",
                     layer::WORKSPACE_READ
                 ),
                 Map::new(),
@@ -741,6 +742,8 @@ impl WorkStore {
                 tasks_failed: n(r, 9) as u32,
                 updated_ms: n(r, 10),
                 mode: opt_s(r, 11).filter(|mode| !mode.is_empty()).unwrap_or_else(|| "auto".into()),
+                worker: opt_s(r, 12).filter(|worker| !worker.is_empty()).unwrap_or_else(|| "local".into()),
+                external_session: opt_s(r, 13).filter(|id| !id.is_empty()),
             })
             .collect();
         agents.sort_by(|a, b| a.name.cmp(&b.name));

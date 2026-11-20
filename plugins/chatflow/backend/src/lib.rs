@@ -23,6 +23,7 @@ pub mod guides;
 pub mod host;
 pub mod impact;
 pub mod journal;
+pub mod lead;
 pub mod learn;
 pub mod live;
 pub mod llm;

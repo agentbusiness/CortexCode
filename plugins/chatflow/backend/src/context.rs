@@ -297,12 +297,14 @@ async fn always_section(host: &Host, data: &Dataset, always: &[(String, String)]
 /// (`skills_changed_ms`) or before the project's languages were known is rebuilt once (the new
 /// prompts and catalog take effect on the next call); otherwise it stays byte-identical, so the
 /// conversation stays in the model's cache across turns.
-pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, role: &str, skills_changed_ms: u64) -> Result<Prefix, RpcError> {
+pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, role: &str, lead: bool, skills_changed_ms: u64) -> Result<Prefix, RpcError> {
     let project = ProjectFacts::read(journal.host(), project_id).await;
     let languages = project.languages.clone();
     if let Some(entry) = journal.context_entry()
         && entry.data.get("data_version").and_then(Value::as_str) == Some(data.version().as_str())
         && entry.data.get("role").and_then(Value::as_str) == Some(role)
+        // Leading frontier agents or not: another tool set, so the prefix is rebuilt when it flips.
+        && entry.data.get("lead").and_then(Value::as_bool).unwrap_or(false) == lead
         // The catalog follows the project once: a prefix built before the graph knew the languages
         // is rebuilt when they are known. After that it stays frozen for the session: a language
         // that shows up later (a text file, a build's output) rebuilt it mid-session, the project
@@ -321,7 +323,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
     let (steps_through, settled_through) = (mark("steps_through"), mark(crate::fit::SETTLED));
     let tasks_through = mark(crate::fit::TASKS_THROUGH);
     let host = journal.host().clone();
-    let (prefix, facts) = build_with(&host, project_id, data, role, project).await?;
+    let (prefix, facts) = build_with(&host, project_id, data, role, lead, project).await?;
     journal
         .append(
             extra_kinds::CONTEXT,
@@ -346,6 +348,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
                 "skill_units": prefix.skill_units.iter().map(|(uri, (units, unit_done))| (uri.clone(), json!({"units": units, "unit_done": unit_done}))).collect::<serde_json::Map<String, Value>>(),
                 "guides": prefix.guides,
                 "role": role,
+                "lead": lead,
                 "languages": languages,
             }),
         )
@@ -365,9 +368,9 @@ pub struct BuiltFacts {
 
 /// The prefix for `role` in the project as it is now: what a session without one journals, and what
 /// the project's next conversation starts with (prefilled before it exists, `chatflow.prewarm`).
-pub async fn build(host: &Host, project_id: &str, data: &Dataset, role: &str) -> Result<Prefix, RpcError> {
+pub async fn build(host: &Host, project_id: &str, data: &Dataset, role: &str, lead: bool) -> Result<Prefix, RpcError> {
     let project = ProjectFacts::read(host, project_id).await;
-    Ok(build_with(host, project_id, data, role, project).await?.0)
+    Ok(build_with(host, project_id, data, role, lead, project).await?.0)
 }
 
 /// The project's own contract as a prompt section: its `AGENTS.md`, else `CLAUDE.md` (a file that
@@ -536,10 +539,11 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
     }
 }
 
-async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, mut project: ProjectFacts) -> Result<(Prefix, BuiltFacts), RpcError> {
+async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, lead: bool, mut project: ProjectFacts) -> Result<(Prefix, BuiltFacts), RpcError> {
     let root = host.project_get(project_id).await.map(|project| project.root).unwrap_or_default();
-    // The project's folder: an offline one gets a tools guide that says so before any call.
-    let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({"workspace": root})).await?;
+    // The project's folder: an offline one gets a tools guide that says so before any call. A
+    // lead session gets the lead's tools (read and run) and the guide that sends changes to agents.
+    let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({"workspace": root, "lead": lead})).await?;
     let info = model_info(host).await;
     let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native, data.limits.context_tokens)).unwrap_or(0);
 

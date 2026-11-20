@@ -1003,7 +1003,8 @@ pub struct AgentRecord {
     pub role: String,
     #[serde(default)]
     pub charter: String,
-    /// idle | working | blocked | done | stopped
+    /// idle | working | waiting (a frontier agent asked its lead and waits for the answer) |
+    /// blocked | done | stopped
     pub status: String,
     #[serde(default)]
     pub session_id: Option<String>,
@@ -1019,6 +1020,14 @@ pub struct AgentRecord {
     /// The approval mode its runs use (`auto` | `ask`), as it was spawned with.
     #[serde(default = "default_agent_mode")]
     pub mode: String,
+    /// Who does its work (`agents::workers`): `local` (the chat flow's agent loop) or a frontier
+    /// CLI (`claude`, `openai`). Empty in records from before workers: `local`.
+    #[serde(default)]
+    pub worker: String,
+    /// The frontier CLI's own session id, so a later run resumes the same conversation (absent for
+    /// local agents and before the first run).
+    #[serde(default)]
+    pub external_session: Option<String>,
 }
 
 fn default_agent_mode() -> String {

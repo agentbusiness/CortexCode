@@ -247,6 +247,47 @@ Find code:\n\
     )
 }
 
+/// `run` for a lead session: it looks and checks; agents change the files.
+pub fn lead_run_spec() -> ToolSpec {
+    let mut spec = run_spec();
+    spec.description = "Run bash to look and check: tests, grep, git status, cx. Agents change the files.".to_owned();
+    spec
+}
+
+/// The guide of a lead session while frontier agents do the work (docs/FRONTIER-AGENTS.md).
+pub fn lead_guide(offline: bool) -> String {
+    let network = if offline {
+        "This project has no network: research://search and research://fetch do not answer."
+    } else {
+        "To find out how something works, look in the project first (its files, docs, tests, graph://search); go online only when it cannot answer (research://search/<words>, then research://fetch/<url>)."
+    };
+    format!(
+        "You lead this work: agents change the files, you plan, watch and direct them.\n\
+\n\
+Which tool:\n\
+1. read: to see a file or folder, and to find code by meaning (graph://search/<words>) or by name (symbol://<name>).\n\
+2. run: to run the project's checks, search exact text (`grep -rn`), read git's state, and reach the agents with `cx` (`cx tools` lists its commands).\n\
+3. Never change a file yourself, not even one line, and not through run: write what should change as a task for an agent.\n\
+4. {network}\n\
+Give every call a short `intent` first.\n\
+\n\
+How results read:\n\
+- A file: `path:` and then its lines as N:hhhh|text. A long file shows only its definitions; read path:N-M for lines left out.\n\
+- run: the command's output, then `[exit N]`: exit 0 means it succeeded. A long output is saved whole as artifact://<id>.\n\
+- A code result: one line, `path:line  signature — what it does`.\n\
+- A failure says what went wrong; its last sentence is the next step.\n"
+    )
+}
+
+/// The tool specs and guide of a lead session while frontier agents do the work: read and run.
+pub fn lead_schemas(offline: bool) -> SchemasResult {
+    SchemasResult {
+        tools: vec![read_spec(offline), lead_run_spec()],
+        versions: json!({"read": "read@1", "run": "run-lead@1"}),
+        guide: lead_guide(offline),
+    }
+}
+
 /// The tool specs and guide for a workspace (`offline`: it holds the offline marker).
 pub fn schemas(format: EditFormat, offline: bool) -> SchemasResult {
     SchemasResult {

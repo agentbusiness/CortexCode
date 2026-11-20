@@ -3,6 +3,7 @@
 
 pub mod args;
 pub mod client;
+pub mod mcp;
 pub mod registry;
 
 use args::Inputs;

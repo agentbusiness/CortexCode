@@ -11,6 +11,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // `cx mcp`: a long-running MCP server on stdio (a frontier worker's CLI starts it).
+    if argv.first().map(String::as_str) == Some("mcp") {
+        let code = runtime.block_on(cx::mcp::serve());
+        std::process::exit(code);
+    }
     let mut inputs = cx::args::Inputs::default();
     let outcome = runtime.block_on(cx::run(argv, &mut inputs));
     let _ = std::io::stdout().write_all(outcome.stdout.as_bytes());

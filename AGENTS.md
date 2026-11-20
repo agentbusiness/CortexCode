@@ -3,6 +3,9 @@
 CortexCode is a local coding agent: a Rust frame that runs everything as plugins (chat flow, model,
 memory and code graph, tools, language plugins, skills, agents) and an Electron UI. Its model is a
 small local one (Qwen3.8-27B, 4-bit, on uzu), offline. Design notes: `docs/BRAINSTORM.md`.
+Optionally, agent work goes to a frontier CLI found on the computer (Claude Code or Codex,
+headless, through CortexCode's tools over MCP) while the local model leads; that needs the
+network (`docs/FRONTIER-AGENTS.md`).
 
 ## The lens: design for the small model
 
