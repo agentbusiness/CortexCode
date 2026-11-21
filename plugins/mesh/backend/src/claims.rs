@@ -38,7 +38,8 @@
 //! (`mesh.reserve`): a session that leads others' work keeps its large conversation in the pool
 //! while it waits for them. A reservation counts like a held use's tokens for every other use,
 //! here or from a member, so another use is given the model only when it fits beside it; the
-//! reserving session's own calls here run inside it (its tokens are not counted twice).
+//! reserving session's own calls here run inside it (its tokens are not counted twice). It counts
+//! at most what leaves room for the use asking, so a model nothing else holds always takes a use.
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
@@ -161,7 +162,11 @@ impl Mesh {
             .iter()
             .filter(|reservation| reservation.plugin == plugin && !(requester.is_empty() && reservation.session == session))
             .map(|reservation| u64::from(reservation.tokens))
-            .sum();
+            .sum::<u64>()
+            // A reservation keeps room, it never shuts the model: on a model nothing else holds,
+            // a use always fits (else a lead reserving too much waits forever on agents that
+            // wait on it).
+            .min(pool.saturating_sub(need));
         if foreground && requester.is_empty() {
             let person_holds = holders().any(|holder| holder.foreground && holder.requester.is_empty());
             let person_runs = slots.slots.iter().any(|slot| slot.busy && slot.priority == Some(Priority::Foreground)) || slots.queued_by_priority.foreground > 0;

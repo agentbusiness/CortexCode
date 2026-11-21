@@ -8,9 +8,10 @@
 //! and never looks at the CLIs or the setting itself. Without an agents plugin, nothing leads.
 
 use crate::host::Host;
+use crate::journal::Journal;
 use cc_protocol::contracts::agents::{WorkersResult, methods as agents_methods, workers};
-use cc_protocol::contracts::frame::{Session, SessionKind};
-use serde_json::json;
+use cc_protocol::contracts::frame::{Session, SessionKind, kinds};
+use serde_json::{Value, json};
 
 /// Whether a frontier worker does agent work now.
 pub async fn frontier_active(host: &Host) -> bool {
@@ -24,6 +25,21 @@ pub async fn frontier_active(host: &Host) -> bool {
 /// agent work.
 pub async fn leads(host: &Host, session: &Session) -> bool {
     session.kind == SessionKind::Chat && frontier_active(host).await
+}
+
+/// What a lead's conversation holds in the model's pool now: its newest call's prompt and
+/// answer (that prompt held the whole conversation). 0 before its first call. Never the context
+/// window: a reservation of the window leaves no room for the agents the lead waits for.
+pub fn held_tokens(journal: &Journal) -> u32 {
+    journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::USAGE)
+        .last()
+        .map(|usage| {
+            let tokens = |field: &str| usage.data.get(field).and_then(Value::as_u64).unwrap_or(0);
+            u32::try_from(tokens("prompt_tokens") + tokens("completion_tokens")).unwrap_or(u32::MAX)
+        })
+        .unwrap_or(0)
 }
 
 /// Lead sessions whose model reservation this instance holds (to give them all back when lead

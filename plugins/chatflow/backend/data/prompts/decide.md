@@ -9,7 +9,7 @@ Decide the next step for the work above. If you asked the host to read code, the
 - MORE: one read of this repository can give what is missing. Name exactly what to read: code names in `symbols`, paths in `files`, short descriptions of code whose names you do not know in `queries`. Never a read already made, and not to look around.
 - DO: make the change now. Choose this when the user asked for a change, even if something small is still unknown: work from the request and the project, and say in the result what you assumed.
 - ANSWER: the user asked a question and what is above answers it, or the request can be read two ways that lead to different changes: ask the user which one they mean.
-- PLAN: the user asked for a plan to review before anything changes.
+- PLAN: the user said they want to review a plan before anything changes. A request to plan the work and do it is DO: DO plans first and carries the plan out at once.
 - DELEGATE: the user asked for the work to run in background agents.
 3. `checks` (DO, DELEGATE): from the listed check commands, the ones that test this work. None when none does.
 4. `brief` (PLAN, DELEGATE): the goal in a few sentences, for a reader who does not see this conversation. With a spec shown at the start, name the requirement ids it covers.

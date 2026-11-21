@@ -181,7 +181,7 @@ delegated_task = "\n- {title}{assignee}{depends}"
 delegated_assignee = " -> {name}"
 delegated_after = " (after {count})"
 delegated_agents = "\nAgents started: {names}."
-delegation_failed = "Delegation failed: {error}. Nothing was started."
+delegation_failed = "The background agents could not take the work ({error}); nothing was started there. The work is planned and carried out here instead."
 delegation_unreadable = "Delegated, but the agents plugin's answer could not be read: {error}"
 delegate_context = "Work as stated: {work}\nNot yet known when delegating: {missing}"
 

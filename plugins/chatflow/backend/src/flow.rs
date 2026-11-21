@@ -1110,10 +1110,27 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                         journal.note(&env.run_id, "delegated", &text, true).await.map(|_| ())
                     }
                     Err(error) if error.code == codes::CANCELLED => continue,
-                    Err(error) => journal
-                        .note(&env.run_id, "delegated", &env.data.text("delegation_failed", &[("error", &error.to_string())]), true)
-                        .await
-                        .map(|_| ()),
+                    // Nothing was started: the work goes on here, planned and carried out as a DO
+                    // decision, instead of a reply that promises it for a later turn (seen: "on
+                    // the next turn I will…", and the user had to ask why nothing happened).
+                    Err(error) => {
+                        journal.note(&env.run_id, "delegated", &env.data.text("delegation_failed", &[("error", &error.to_string())]), true).await?;
+                        let effort = schemas::effort_or_default(str_field(&detail, "effort"));
+                        let decision = json!({
+                            "missing": "",
+                            "route": "DO",
+                            "effort": effort,
+                            "symbols": [],
+                            "files": detail.get("files").cloned().unwrap_or_else(|| json!([])),
+                            "queries": [],
+                            "brief": goal,
+                            "checks": detail.get("checks").cloned().unwrap_or_else(|| json!([])),
+                            "skills": [],
+                            "note": "",
+                            "by": "host",
+                        });
+                        journal.append(kinds::ROUTE, json!({"route": "DO", "stage": "decide", "detail": decision, "run_id": env.run_id})).await.map(|_| ())
+                    }
                 }
             }
             Stage::Plan { auto, .. } => {

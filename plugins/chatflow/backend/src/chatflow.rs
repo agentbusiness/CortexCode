@@ -537,9 +537,10 @@ impl Chatflow {
         let lead = !matches!(priority, Priority::Agent) && crate::lead::leads(host, session).await;
         let skills_changed_ms = self.inner.skills_changed_ms.load(Ordering::SeqCst);
         let prefix: Prefix = context::ensure(journal, &project.id, &data, role, lead, skills_changed_ms).await?;
-        // A lead keeps this computer's model for its whole conversation, between its calls too.
+        // A lead keeps this computer's model for its whole conversation, between its calls too:
+        // as much as the conversation holds, so its agents fit beside it.
         if lead {
-            crate::lead::reserve(host, &session.id, prefix.ctx_window, true).await;
+            crate::lead::reserve(host, &session.id, crate::lead::held_tokens(journal), true).await;
         }
         let workspace = if session.workspace.is_empty() { project.root.clone() } else { session.workspace.clone() };
         let info = context::model_info(host).await;
@@ -955,7 +956,7 @@ impl Chatflow {
                 // pool for their reports), and gives it back when nothing of its work is open.
                 if env.lead {
                     let open = crate::manage::open_work(env, &journal.entries_vec()).await;
-                    crate::lead::reserve(&env.host, session_id, env.prefix.ctx_window, !open.is_empty()).await;
+                    crate::lead::reserve(&env.host, session_id, crate::lead::held_tokens(&journal), !open.is_empty()).await;
                 }
             }
             // Messages that arrived too late for this run, then queued follow-ups, each start a turn.
