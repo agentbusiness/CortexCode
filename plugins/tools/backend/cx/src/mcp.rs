@@ -4,8 +4,8 @@
 //! to that session by the frame's command access), so the file reservations, the write sandbox,
 //! the step log and undo cover the frontier agent as they cover a local one.
 //!
-//! Beside the session's model tools it offers two of its own: `ask_lead` (a question to the lead
-//! session, which the lead answers as the agent's next message) and `board` (the project's board).
+//! Beside the session's model tools it offers lead questions/progress, the project's board and
+//! `view_page`: fresh, session-owned browser evidence delivered as MCP image content.
 //!
 //! The wire: JSON-RPC 2.0, one message per line on stdin and stdout (MCP's stdio transport).
 //! Requests are served one after another, in the order they come.
@@ -21,6 +21,7 @@ const KNOWN_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const ASK_LEAD: &str = "ask_lead";
 const TELL_LEAD: &str = "tell_lead";
 const BOARD: &str = "board";
+const VIEW_PAGE: &str = "view_page";
 
 /// Where the agent works, from the environment the agents plugin started the CLI with.
 struct Scope {
@@ -101,6 +102,7 @@ impl Server {
             .ok()
             .and_then(|listed| listed.get("guide").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default();
+        let guide = format!("{guide}\nFor rendered pixels, use view_page with your tab id from run `cx browser open <url>`. Use run for browser actions; take a fresh snapshot after the page changes.");
         json!({
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": false}},
@@ -150,12 +152,31 @@ impl Server {
                 "properties": {"minutes": {"type": "integer", "description": "Only messages of the last N minutes (default 120)."}},
             },
         }));
+        tools.push(json!({
+            "name": VIEW_PAGE,
+            "description": "See the current page or visible element; use run for browser actions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "string", "description": "Your tab id returned by run `cx browser open <url>`."},
+                    "target": {"type": ["string", "null"], "description": "ref=N from the latest snapshot, or a CSS selector. Empty or null views the viewport."},
+                },
+                "required": ["tab_id"],
+                "additionalProperties": false,
+            },
+        }));
         Ok(json!({"tools": tools}))
     }
 
     async fn tool_call(&mut self, params: &Value) -> Value {
         let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
         let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        if name == VIEW_PAGE {
+            return match self.view_page(&arguments).await {
+                Ok(result) => result,
+                Err(text) => json!({"content": [{"type": "text", "text": text}], "isError": true}),
+            };
+        }
         let (ok, text) = match name.as_str() {
             ASK_LEAD => self.ask_lead(&arguments).await,
             TELL_LEAD => self.tell_lead(&arguments).await,
@@ -169,6 +190,39 @@ impl Server {
             },
         };
         json!({"content": [{"type": "text", "text": text}], "isError": !ok})
+    }
+
+    /// The browser owns capture, tab authorization and artifact recording. The worker supplies
+    /// no path and cx reads no file; the frame stamps this command connection's session.
+    async fn view_page(&mut self, arguments: &Value) -> Result<Value, String> {
+        let tab = arguments.get("tab_id").and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty())
+            .ok_or_else(|| "Give your tab_id returned by run `cx browser open <url>`.".to_owned())?;
+        let target = match arguments.get("target") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) if text.trim().is_empty() => None,
+            Some(Value::String(text)) => Some(text.trim()),
+            _ => return Err("Give target as ref=N or a CSS selector, or leave it empty for the viewport.".to_owned()),
+        };
+        let view = self.call("browser.view", json!({"tab_id": tab, "target": target})).await
+            .map_err(|error| format!("The page could not be viewed ({error}). Use run to inspect the browser state."))?;
+        let image = view.get("image").ok_or_else(|| "The browser returned no pixels. Update the browser plugin before viewing the page again.".to_owned())?;
+        let mime = image.get("mime_type").and_then(Value::as_str).unwrap_or_default();
+        let data = image.get("data").and_then(Value::as_str).unwrap_or_default();
+        let side = |name: &str| view.get(name).and_then(Value::as_u64).is_some_and(|n| n > 0 && n <= 1536);
+        if mime != "image/jpeg" || data.is_empty() || data.len() > 4 * (2 * 1024 * 1024_usize).div_ceil(3) || !side("width") || !side("height") {
+            return Err("The browser returned an unsupported image. View a smaller visible element.".to_owned());
+        }
+        let field = |name: &str| view.get(name).and_then(Value::as_str).unwrap_or_default();
+        let text = format!("{}\n{}\nScreenshot: {}", field("title"), field("url"), field("path"));
+        Ok(json!({
+            "content": [{"type": "text", "text": text}, {"type": "image", "data": data, "mimeType": mime}],
+            "structuredContent": {
+                "path": view.get("path"), "url": view.get("url"), "title": view.get("title"),
+                "width": view.get("width"), "height": view.get("height"), "clip": view.get("clip"),
+                "target": view.get("target"), "captured_ms": view.get("captured_ms"),
+            },
+            "isError": false,
+        }))
     }
 
     /// A progress line for the lead (board kind `progress`, to the lead): the agents plugin puts it

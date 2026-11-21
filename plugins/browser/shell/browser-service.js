@@ -6,7 +6,7 @@
  * session partition so cookies and storage survive restarts.
  */
 
-import { WebContentsView, session } from 'electron';
+import { WebContentsView, session, nativeImage } from 'electron';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -28,6 +28,11 @@ export class RpcError extends Error {
 }
 
 export const PARTITION = 'persist:cortex-browser';
+
+// Inline worker evidence stays below the tool clients' image budgets. Artifact files use the
+// same bytes the worker actually received, not an unrelated full-resolution screenshot.
+const VIEW_MAX_SIDE = 1536;
+const VIEW_MAX_BYTES = 2 * 1024 * 1024;
 
 /** Size a tab lays out at before the pane has ever been shown. */
 const HISTORY_LIMIT = 1000;
@@ -115,6 +120,12 @@ class Tab {
    */
   onEvent(method, params) {
     switch (method) {
+      case 'Page.frameNavigated':
+        if (!params.frame?.parentId) this.refs.clear();
+        return;
+      case 'DOM.documentUpdated':
+        this.refs.clear();
+        return;
       case 'Runtime.consoleAPICalled': {
         const args = params.args ?? [];
         if (args.length > 64) this.consoleClipped += 1;
@@ -204,7 +215,7 @@ export class BrowserService {
   /**
    * @param {{ window: import('electron').BrowserWindow, home: string,
    *   publish: (topic: string, data: unknown) => void, log: (line: string) => void,
-   *   record?: (file: { path: string, kind: string, bytes: number, mime: string, url: string, sessionId: string | null, width?: number, height?: number }) => void }} options
+   *   record?: (file: { path: string, kind: string, bytes: number, mime: string, url: string, sessionId: string | null, width?: number, height?: number, captured_ms?: number, target?: string, clip_x?: number, clip_y?: number, clip_width?: number, clip_height?: number }) => Promise<void> }} options
    */
   constructor(options) {
     this.window = options.window;
@@ -212,7 +223,7 @@ export class BrowserService {
     this.publish = options.publish;
     this.log = options.log;
     /** Records a file the browser wrote as an `Artifact` node in the graph (the bytes stay a file). */
-    this.record = options.record ?? (() => {});
+    this.record = options.record ?? (async () => {});
     /** @type {Map<string, Tab>} */
     this.tabs = new Map();
     /** @type {string | null} */
@@ -228,7 +239,7 @@ export class BrowserService {
       const file = path.join(this.home, 'artifacts', 'browser', 'downloads', `${Date.now()}-${item.getFilename()}`);
       item.setSavePath(file);
       item.once('done', (_done, state) => {
-        if (state === 'completed') this.record({ path: file, kind: 'download', bytes: item.getReceivedBytes(), mime: item.getMimeType(), url: item.getURL(), sessionId: null });
+        if (state === 'completed') void this.record({ path: file, kind: 'download', bytes: item.getReceivedBytes(), mime: item.getMimeType(), url: item.getURL(), sessionId: null }).catch((error) => this.log(`download artifact not recorded: ${error}`));
       });
     });
   }
@@ -327,9 +338,11 @@ export class BrowserService {
         await fs.mkdir(dir, { recursive: true });
         const file = path.join(dir, `${tab.id}-${Date.now()}.png`);
         await fs.writeFile(file, bytes);
-        this.record({ path: file, kind: 'screenshot', bytes: bytes.length, mime: 'image/png', url: tab.wc.getURL(), sessionId: tab.sessionId, width, height });
+        await this.record({ path: file, kind: 'screenshot', bytes: bytes.length, mime: 'image/png', url: tab.wc.getURL(), sessionId: tab.sessionId, width, height });
         return { path: file, width, height };
       }
+      case 'browser.view':
+        return this.view(params);
       case 'browser.console': {
         const tab = this.tab(params);
         const since = typeof params.since_ms === 'number' ? params.since_ms : 0;
@@ -521,6 +534,99 @@ export class BrowserService {
     await tab.cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
     await tab.cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
     await tab.cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  }
+
+  /** Fresh pixels, never a caller-supplied file. The command session comes from the frame.
+   * @param {any} params
+   */
+  async view(params) {
+    if (typeof params._command_session !== 'string' || !params._command_session) {
+      throw new RpcError('invalid_params', 'View a page through the worker connection for the session that opened its tab.');
+    }
+    const tab = this.tab(params);
+    if (params.target != null && typeof params.target !== 'string') {
+      throw new RpcError('invalid_params', 'Give target as ref=N or a CSS selector, or leave it empty for the viewport.');
+    }
+    const target = params.target?.trim() || null;
+    if (target && target.length > 4096) throw new RpcError('invalid_params', 'The target is too long. Use a ref from a fresh browser snapshot.');
+
+    const before = await tab.cdp('Page.getFrameTree');
+    const frame = before.frameTree.frame;
+    const metrics = await tab.cdp('Page.getLayoutMetrics');
+    const viewport = metrics.cssVisualViewport;
+    const layout = metrics.cssLayoutViewport;
+    if (!viewport || !layout || ![viewport.pageX, viewport.pageY, viewport.clientWidth, viewport.clientHeight, layout.pageX, layout.pageY].every(Number.isFinite)
+        || viewport.clientWidth <= 0 || viewport.clientHeight <= 0) {
+      throw new RpcError('unavailable', 'The page has no visible viewport. Open the browser pane and try again.');
+    }
+    let clip = { x: viewport.pageX, y: viewport.pageY, width: viewport.clientWidth, height: viewport.clientHeight };
+    let node = null;
+    /** @type {number[][] | null} */
+    let originalQuads = null;
+    if (target) {
+      node = await this.resolve(tab, target);
+      const { quads } = await tab.cdp('DOM.getContentQuads', { backendNodeId: node });
+      if (!Array.isArray(quads) || quads.length === 0 || quads.length > 1024
+          || !quads.every((quad) => Array.isArray(quad) && quad.length === 8 && quad.every(Number.isFinite))) {
+        throw new RpcError('not_found', 'The target has no visible box. Take a fresh snapshot or use run to scroll it into view.');
+      }
+      originalQuads = quads;
+      // Content quads are layout-viewport-relative; capture clips use document CSS coordinates.
+      // Clamp to the visual viewport as well (its offset differs when the page is zoomed).
+      const xs = quads.flatMap((quad) => [quad[0], quad[2], quad[4], quad[6]]);
+      const ys = quads.flatMap((quad) => [quad[1], quad[3], quad[5], quad[7]]);
+      const left = Math.max(viewport.pageX, layout.pageX + Math.min(...xs));
+      const top = Math.max(viewport.pageY, layout.pageY + Math.min(...ys));
+      const right = Math.min(viewport.pageX + viewport.clientWidth, layout.pageX + Math.max(...xs));
+      const bottom = Math.min(viewport.pageY + viewport.clientHeight, layout.pageY + Math.max(...ys));
+      if (right <= left || bottom <= top) {
+        throw new RpcError('not_found', 'The target is outside the viewport. Use run to scroll it into view, then take a fresh snapshot.');
+      }
+      clip = { x: left, y: top, width: right - left, height: bottom - top };
+    }
+    const scale = Math.min(1, VIEW_MAX_SIDE / clip.width, VIEW_MAX_SIDE / clip.height);
+    const { data } = await tab.cdp('Page.captureScreenshot', {
+      format: 'jpeg', quality: 85, fromSurface: true, captureBeyondViewport: false, clip: { ...clip, scale },
+    });
+    const capturedMs = Date.now();
+    const after = await tab.cdp('Page.getFrameTree');
+    const nextMetrics = await tab.cdp('Page.getLayoutMetrics');
+    const nextViewport = nextMetrics.cssVisualViewport;
+    const nextLayout = nextMetrics.cssLayoutViewport;
+    if (after.frameTree.frame.id !== frame.id || after.frameTree.frame.loaderId !== frame.loaderId
+        || after.frameTree.frame.url !== frame.url || !nextViewport || !nextLayout
+        || nextLayout.pageX !== layout.pageX || nextLayout.pageY !== layout.pageY
+        || ['pageX', 'pageY', 'clientWidth', 'clientHeight', 'scale'].some((key) => nextViewport[key] !== viewport[key])) {
+      throw new RpcError('unavailable', 'The page moved during capture. Take a fresh snapshot, then view it again.');
+    }
+    if (node !== null && originalQuads) {
+      const { quads } = await tab.cdp('DOM.getContentQuads', { backendNodeId: node });
+      if (!Array.isArray(quads) || quads.length !== originalQuads.length
+          || originalQuads.some((quad, index) => !Array.isArray(quads[index]) || quad.some((value, point) => value !== quads[index][point]))) {
+        throw new RpcError('unavailable', 'The element moved during capture. Take a fresh snapshot, then view it again.');
+      }
+    }
+    let image = nativeImage.createFromBuffer(Buffer.from(data, 'base64'));
+    if (image.isEmpty()) throw new RpcError('unavailable', 'The page returned no image. View the page again.');
+    const size = image.getSize();
+    if (size.width <= 0 || size.height <= 0) throw new RpcError('unavailable', 'The page returned no visible pixels. View the page again.');
+    const resize = Math.min(1, VIEW_MAX_SIDE / size.width, VIEW_MAX_SIDE / size.height);
+    if (resize < 1) image = image.resize({ width: Math.max(1, Math.floor(size.width * resize)), height: Math.max(1, Math.floor(size.height * resize)), quality: 'best' });
+    let bytes = image.toJPEG(85);
+    if (bytes.length > VIEW_MAX_BYTES) bytes = image.toJPEG(60);
+    if (bytes.length > VIEW_MAX_BYTES) throw new RpcError('unavailable', 'The image is too large. View a smaller visible element.');
+    const { width, height } = image.getSize();
+    const url = frame.url;
+    const title = tab.wc.getTitle();
+    const dir = path.join(this.home, 'artifacts', 'browser');
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${tab.id}-${randomUUID()}.jpg`);
+    await fs.writeFile(file, bytes);
+    await this.record({
+      path: file, kind: 'screenshot', bytes: bytes.length, mime: 'image/jpeg', url, sessionId: tab.sessionId, width, height,
+      captured_ms: capturedMs, ...(target ? { target } : {}), clip_x: clip.x, clip_y: clip.y, clip_width: clip.width, clip_height: clip.height,
+    });
+    return { path: file, url, title, width, height, captured_ms: capturedMs, clip, target, image: { mime_type: 'image/jpeg', data: bytes.toString('base64') } };
   }
 
   /**

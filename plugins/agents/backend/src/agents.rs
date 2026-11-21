@@ -1588,7 +1588,7 @@ impl Agents {
         let host = Host::new(ctx.clone());
         let listed = self.inner.frontier.workers(&host, false).await;
         if !workers::frontier(&listed.active) {
-            return Err(RpcError::new(codes::UNAVAILABLE, listed.fallback.unwrap_or_else(|| "no frontier worker is chosen".to_owned())));
+            return Err(RpcError::new(cc_protocol::contracts::agents::PLAN_DECLINED_CODE, listed.fallback.unwrap_or_else(|| "no frontier worker is chosen".to_owned())));
         }
         let project = host.project_get(&params.project_id).await?;
         self.open_project(&host, &project).await;
@@ -1649,13 +1649,16 @@ impl Agents {
                     }
                     None => {
                         record.status = "stopped".into();
-                        Err(RpcError::new(codes::UNAVAILABLE, end.error.unwrap_or(end.result.summary)))
+                        Err(RpcError::new(cc_protocol::contracts::agents::PLAN_DECLINED_CODE, end.error.unwrap_or(end.result.summary)))
                     }
                 }
             }
             Err(error) => {
                 record.status = "stopped".into();
-                Err(error)
+                // A stop stays a stop; anything else is a plan no frontier agent wrote, which the
+                // asker writes itself at once (never asked again: seen three flagged planning runs
+                // in a row before the local planner took over).
+                Err(if error.code == codes::CANCELLED { error } else { RpcError::new(cc_protocol::contracts::agents::PLAN_DECLINED_CODE, error.message) })
             }
         };
         let _ = upsert(&ctx, &host, record).await;

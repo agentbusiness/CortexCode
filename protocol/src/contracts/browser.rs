@@ -16,6 +16,9 @@ pub mod methods {
     pub const SNAPSHOT: &str = "browser.snapshot";
     /// PNG screenshot written to a file; returns the path.
     pub const SCREENSHOT: &str = "browser.screenshot";
+    /// [`super::ViewParams`] -> [`super::ViewResult`]: fresh, bounded pixels of a command's own
+    /// tab (or a visible element), with a graph-linked artifact. No input file path is accepted.
+    pub const VIEW: &str = "browser.view";
     /// Console messages since the tab opened (or since `since_ms`).
     pub const CONSOLE: &str = "browser.console";
     /// Network requests with status and timing.
@@ -101,6 +104,48 @@ pub struct ScreenshotResult {
     pub path: String,
     pub width: u32,
     pub height: u32,
+}
+
+/// A visual read for a command session. The frame stamps `_command_session`; the browser
+/// refuses tabs owned by another session, including unowned tabs. An empty target means viewport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewParams {
+    pub tab_id: String,
+    /// `ref=N` from the latest snapshot, or a CSS selector. Only its visible portion is captured.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// Document CSS coordinates of the visible area captured. These are evidence of that capture,
+/// not lasting click coordinates: a later page state needs a fresh snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewClip {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewResult {
+    pub path: String,
+    pub url: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub captured_ms: u64,
+    pub clip: ViewClip,
+    #[serde(default)]
+    pub target: Option<String>,
+    /// JPEG, at most 1536 pixels on either side and 2 MiB before base64 encoding. Bytes stay in
+    /// the artifact file and this transient response, never in a graph property or journal note.
+    pub image: ViewImage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewImage {
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

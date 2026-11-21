@@ -87,7 +87,8 @@ function AgentRow({ agent, task }: { agent: AgentRecord; task: Task | undefined 
       <span className="cx-at">@{agent.name}</span>
       <span className="t">{task?.title ?? agent.task_id ?? agent.role}</span>
       <span className="grow" />
-      <span className={`ap ${agent.status === 'blocked' ? 'hot' : 'faint'}`}>{agent.status === 'blocked' ? 'blocked' : facts.stage || agent.status}</span>
+      {/* Its questions and blockers go to its lead, which decides by itself: said as that. */}
+      <span className="ap faint">{agent.status === 'blocked' ? 'lead decides' : agent.status === 'waiting' ? 'asked lead' : facts.stage || agent.status}</span>
       <span className="ap faint cx-agent-time">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, '0')}</span>
     </button>
   );

@@ -74,9 +74,10 @@ function Card() {
 
   const kv = useKv();
   const sessions = useSessions(projectId);
-  const waiting = (sessions.data ?? []).filter((session) => session.status === 'waiting').length
-    + (agents.data ?? []).filter((agent) => agent.status === 'blocked').length;
-  const running = (agents.data ?? []).filter((agent) => ['working', 'running', 'blocked', 'verifying'].includes(agent.status)).length;
+  // What needs the person: a conversation of theirs waiting for them (an approval, a question to
+  // them). An agent never does: its questions and blockers go to its lead, which decides itself.
+  const waiting = (sessions.data ?? []).filter((session) => session.status === 'waiting' && session.kind !== 'agent').length;
+  const running = (agents.data ?? []).filter((agent) => ['working', 'running', 'blocked', 'waiting', 'verifying'].includes(agent.status)).length;
   const parts: string[] = [];
   if (waiting > 0) parts.push(`${waiting} need${waiting === 1 ? 's' : ''} you`);
   if (kv) parts.push(`KV ${Math.round(kv.share)}%`);

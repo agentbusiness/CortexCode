@@ -151,3 +151,88 @@ pub struct Snapshot {
     #[serde(default)]
     pub input_base64: bool,
 }
+
+// Optional terminal@1 inspection/completion response declarations, shared with CortexTerm.
+// Declarations do not advertise methods or install handlers in CortexCode.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Threat {
+    /// The rule's id (`pipe-to-shell`, `fake-password-prompt`, `hidden-text`, ...).
+    pub rule: String,
+    /// high | medium
+    pub severity: String,
+    /// One plain sentence: what it would do.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScriptFetchParams {
+    /// An http(s) URL.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Script {
+    /// The URL it came from after redirects.
+    pub url: String,
+    /// The script (about the first 200 KB of it).
+    pub text: String,
+    /// Its whole size.
+    pub bytes: u64,
+    /// More than `text` holds.
+    #[serde(default)]
+    pub truncated: bool,
+    pub threats: Vec<Threat>,
+    /// Bounded static effect evidence, when this provider supports it. Never execution approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<ScriptAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScriptAnalysis {
+    pub statements: u32,
+    pub findings: Vec<ScriptEffect>,
+    pub limits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScriptEffect {
+    pub rule: String,
+    /// 1-based original script line, not an excerpt-relative position.
+    pub line: u32,
+    pub related_lines: Vec<u32>,
+    pub explanation: String,
+    pub assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CompleteParams {
+    pub term_id: String,
+    pub line: String,
+    /// Byte offset of the cursor in `line`.
+    pub cursor: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Completion {
+    pub value: String,
+    /// command | file | dir | branch | flag | history | host | process
+    pub kind: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Completions {
+    /// Byte offset in `line` where the completed word starts (it is replaced by `value`).
+    pub from: u32,
+    /// Exclusive byte end of the word to replace. Older providers omit it (replace to cursor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<u32>,
+    pub items: Vec<Completion>,
+    /// A whole-line suggestion from history (ghost text), when one fits the line so far.
+    #[serde(default)]
+    pub suggestion: Option<String>,
+}

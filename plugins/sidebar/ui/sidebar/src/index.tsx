@@ -459,9 +459,9 @@ function StripProject({ project, remote, notices, selected, selectedSession, onS
       })}
       {agentRows.map((row) => {
         const notice = row.sessionId && selectedSession !== row.sessionId ? notices.get(row.sessionId) : undefined;
-        const state = notice ? `${STATUS_LABEL[row.status] ?? row.status}; ${notice.label}: ${notice.title}` : STATUS_LABEL[row.status] ?? row.status;
+        const state = notice ? `${agentLabel(row.status)}; ${notice.label}: ${notice.title}` : agentLabel(row.status);
         return (
-          <button key={row.name} type="button" className={`cx-strip-mark cx-strip-agent${row.sessionId && selectedSession === row.sessionId ? ' sel' : ''}${needsYou(row.status) ? ' cx-attn' : ''}${notice ? ' cx-notice' : ''}`}
+          <button key={row.name} type="button" className={`cx-strip-mark cx-strip-agent${row.sessionId && selectedSession === row.sessionId ? ' sel' : ''}${notice ? ' cx-notice' : ''}`}
             data-strip-agent={row.name} data-status={row.status} data-notice={notice?.kind} disabled={!row.sessionId} aria-label={`@${row.name}, ${state}`}
             title={`@${row.name}${row.title ? ` · ${row.title}` : ''} · ${project.name} — ${state}`} onClick={() => row.sessionId && onSelect(row.sessionId)}>
             <span className="cx-strip-code"><span className="cx-strip-at">@</span>{markCode(row.name).slice(0, 2)}</span>
@@ -526,14 +526,14 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   const agentItem = (agentRow: AgentRow) => {
     const notice = agentRow.sessionId && selectedSession !== agentRow.sessionId ? notices.get(agentRow.sessionId) : undefined;
     return (
-      <li key={agentRow.name} className={['cx-row', agentRow.sessionId && selectedSession === agentRow.sessionId ? 'sel' : '', needsYou(agentRow.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
+      <li key={agentRow.name} className={['cx-row', agentRow.sessionId && selectedSession === agentRow.sessionId ? 'sel' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ') || undefined}
         data-agent={agentRow.name} data-status={agentRow.status} data-notice={notice?.kind}>
         <button type="button" disabled={!agentRow.sessionId} onClick={() => agentRow.sessionId && onSelect(agentRow.sessionId)}
           title={agentRow.sessionId ? `Show @${agentRow.name}'s session${notice ? ` — ${notice.title}` : ''}` : `@${agentRow.name} has no session yet`}>
           <div className="t"><span className="cx-at">@{agentRow.name}</span>{agentRow.title ? <span className="cx-task"> · {agentRow.title}</span> : null}</div>
           <div className="r">
             <StatePip status={agentRow.status} />
-            <span className={`ap${statusTone(agentRow.status)}`}>{STATUS_LABEL[agentRow.status] ?? agentRow.status}</span>
+            <span className={`ap${agentTone(agentRow.status)}`}>{agentLabel(agentRow.status)}</span>
             {agentRow.role && (agentRow.sessionId && away.has(agentRow.sessionId)
               ? <span className="ap cx-away" title={`Its model runs on ${away.get(agentRow.sessionId)}`}>{agentRow.role}</span>
               : <span className="ap faint">{agentRow.role}</span>)}
@@ -726,6 +726,24 @@ function isActive(status: string): boolean {
   return status === 'running' || status === 'working' || needsYou(status);
 }
 
+/**
+ * An agent's state as the person reads it. An agent never asks the person: its questions and its
+ * blockers go to the conversation that leads it, which decides on them by itself. So no agent row
+ * says "Needs you" or carries the attention mark; only a conversation of the person's does, when
+ * it waits for them (an approval, a question to them).
+ */
+const AGENT_STATUS_LABEL: Record<string, string> = { waiting: 'Asked lead', blocked: 'Lead decides' };
+
+function agentLabel(status: string): string {
+  return AGENT_STATUS_LABEL[status] ?? STATUS_LABEL[status] ?? status;
+}
+
+function agentTone(status: string): string {
+  if (status === 'failed') return ' live';
+  if (['running', 'working', 'waiting', 'blocked', 'verifying'].includes(status)) return ' origin';
+  return ' faint';
+}
+
 /** Waiting (an ask-mode call to allow) and blocked need the person; rubric is spent on them. */
 function needsYou(status: string): boolean {
   return status === 'waiting' || status === 'blocked';
@@ -781,7 +799,7 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
     }
   }
-  return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(needsYou(b.status)) - Number(needsYou(a.status)) || Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
+  return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);
 }
 
 export default definePlugin({ slot: 'workbench.sidebar@1', component: SidebarRoot });

@@ -368,18 +368,31 @@ fn data_dir(ctx: &Ctx) -> PathBuf {
 /// Whether the last status of a journal says a run is in progress.
 /// The text of the newest supervision note no MANAGE decided yet (written after the last
 /// `managed` note), if any.
+/// The agents' needs no MANAGE has decided yet, all of them, oldest first (None: none). A MANAGE
+/// decided what was in the conversation when it began (its route), not what arrived while it ran
+/// (seen: three agents asked within a minute; the MANAGE woken by the first answered it, its
+/// `managed` note came after the other two, and those two were taken as decided and waited for
+/// good).
 fn unanswered_supervision(journal: &Journal) -> Option<String> {
-    let decided = journal
+    let managed_runs: HashSet<&str> = journal
         .entries()
         .filter(|entry| entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "managed")
+        .map(|entry| str_field(&entry.data, "run_id"))
+        .collect();
+    // Where each deciding MANAGE began: its route entry.
+    let decided = journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "route") == "MANAGE" && str_field(&entry.data, "stage") == "route" && managed_runs.contains(str_field(&entry.data, "run_id")))
         .map(|entry| entry.seq)
         .max()
         .unwrap_or(0);
-    journal
+    let open: Vec<String> = journal
         .entries()
         .filter(|entry| entry.seq > decided && entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "supervise")
-        .last()
-        .map(|entry| str_field(&entry.data, "text").to_owned())
+        .map(|entry| str_field(&entry.data, "text").trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!open.is_empty()).then(|| open.join("\n\n"))
 }
 
 fn running_status(journal: &Journal) -> Option<JournalEntry> {

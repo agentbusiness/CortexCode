@@ -13,7 +13,7 @@ import { BrowserService } from './browser-service.js';
 
 const PROVIDES = [
   'browser.open', 'browser.navigate', 'browser.tabs', 'browser.close', 'browser.snapshot',
-  'browser.screenshot', 'browser.console', 'browser.network', 'browser.eval', 'browser.click',
+  'browser.screenshot', 'browser.view', 'browser.console', 'browser.network', 'browser.eval', 'browser.click',
   'browser.type', 'browser.press', 'browser.metrics', 'browser.cdp', 'browser.select',
   'browser.back', 'browser.forward', 'browser.reload',
 ];
@@ -44,7 +44,7 @@ export async function load(api) {
     home: api.home,
     publish: (topic, data) => link?.publish(topic, data),
     log: api.log,
-    record: (file) => void recordArtifact(store, file).catch((error) => api.log(`artifact ${file.path} not recorded: ${error}`)),
+    record: (file) => recordArtifact(store, file),
   });
   link = api.serve(
     { plugin_id: 'cortex-ui-browser', version: api.version, category: 'browser', contract: 'browser@1', provides: PROVIDES, commands: COMMANDS, subscribes: [], swap: 'blue_green' },
@@ -75,12 +75,16 @@ let machineKey = null;
  * A file the browser wrote, as `(:Artifact {key: path, kind, bytes, mime, url, …})` linked to the
  * session whose tab made it, else to this machine (`docs/GRAPH-MODEL.md`).
  * @param {{ call(method: string, params?: unknown): Promise<unknown> }} store
- * @param {{ path: string, kind: string, bytes: number, mime: string, url: string, sessionId: string | null, width?: number, height?: number }} file
+ * @param {{ path: string, kind: string, bytes: number, mime: string, url: string, sessionId: string | null, width?: number, height?: number, captured_ms?: number, target?: string, clip_x?: number, clip_y?: number, clip_width?: number, clip_height?: number }} file
  */
 async function recordArtifact(store, file) {
   if (!machineKey) machineKey = String(/** @type {{ key: string }} */ (await store.call('memory.graph.machine', {})).key);
   const props = { path: file.path, kind: file.kind, bytes: file.bytes, mime: file.mime, url: file.url, created_ms: Date.now() };
   if (file.width) Object.assign(props, { width: file.width, height: file.height });
+  for (const field of /** @type {const} */ (['captured_ms', 'clip_x', 'clip_y', 'clip_width', 'clip_height'])) {
+    if (file[field] !== undefined) Object.assign(props, { [field]: file[field] });
+  }
+  if (file.target) Object.assign(props, { target: file.target });
   const node = { label: 'Artifact', key: file.path, props };
   const from = { label: 'Artifact', key: file.path };
   const onMachine = { from, rel: 'ON', to: { label: 'Machine', key: machineKey } };

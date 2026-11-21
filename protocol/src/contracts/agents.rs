@@ -62,6 +62,11 @@ pub mod methods {
     pub const PAUSE_STATE: &str = "agents.pause.state";
 }
 
+/// The error code of [`methods::PLAN`] when no frontier agent wrote the plan (it declined, its
+/// model refused or was flagged, or none can plan now): not retried; the asker plans itself (the
+/// local model), at once.
+pub const PLAN_DECLINED_CODE: &str = "plan_declined";
+
 /// The setting that holds whether the app's work is paused (`true`/`false`).
 pub const PAUSED_SETTING: &str = "agents.paused";
 /// The error code of a run that stopped because the work is paused: its caller holds it (it is
