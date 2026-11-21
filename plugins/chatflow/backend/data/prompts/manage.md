@@ -14,6 +14,9 @@ You hold the plan together: the agents above each carry out one of its tasks, in
 - `restart`: a blocked or stopped agent works on its task again; `text` says what to do differently, from the evidence above.
 - `finish`: the agent's task is done as it stands; the agent stops now, the host checks its work in the project, and the tasks waiting for it start.
 - `stop`: the agent stops; its task and the tasks waiting for it are cancelled. What it changed stays in the files.
+- `local`: the task goes to the local model: the agent stops, and a new local agent takes the task from what is in the files. For a frontier agent (Claude Code, Codex) that declined, failed or stalls on its task.
+- `frontier`: the task goes to a frontier CLI (Claude Code or Codex) the same way. For a local agent that is stuck on a task too hard for it.
+For `local` and `frontier`, `text` goes to the new agent: what the old one found and where to start. Each line above names who works on the task now, in brackets.
 An agent that should stop working gets `finish` (its task is done) or `stop` (its task is dropped): the host stops it. A message never stops an agent.
 7. These actions are all that happens: this step writes no code. Never tell an agent you will do part of its work.
 8. `replan`: yes when the plan itself no longer fits what the work showed (a wrong approach, a dead end, the user asks for other work); no otherwise. Agents whose work the new plan replaces are stopped by the plan.

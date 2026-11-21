@@ -149,6 +149,19 @@ impl Shape {
         fill(self, placeholder, values, max).unwrap_or(Shape::Obj(Vec::new()))
     }
 
+    /// The same shape with `value` removed from every enum at any depth (e.g. MANAGE's per-agent
+    /// `action` without `frontier` when no frontier CLI can work).
+    pub fn without_anywhere(&self, value: &str) -> Shape {
+        match self {
+            Shape::OneOf(values) => Shape::OneOf(values.iter().filter(|v| v.as_str() != value).cloned().collect()),
+            Shape::Obj(properties) => Shape::Obj(properties.iter().map(|(key, shape)| (key.clone(), shape.without_anywhere(value))).collect()),
+            Shape::List(item) => Shape::List(Box::new(item.without_anywhere(value))),
+            Shape::ListMax(item, most) => Shape::ListMax(Box::new(item.without_anywhere(value)), *most),
+            Shape::Gated { on, when, inner } => Shape::Gated { on: on.clone(), when: when.clone(), inner: Box::new(inner.without_anywhere(value)) },
+            other => other.clone(),
+        }
+    }
+
     /// The same shape with one value removed from a top-level enum (e.g. DECIDE without MORE once
     /// the read rounds are spent).
     pub fn without(&self, field: &str, value: &str) -> Shape {

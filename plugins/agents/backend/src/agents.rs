@@ -15,7 +15,7 @@ use crate::plan;
 use crate::data::{Data, Dataset, Loaded};
 use crate::schemas::{self, Plan, PlannedTask, Review, parse_json};
 use cc_protocol::contracts::agents::{
-    AgentRefParams, AgentSteerParams, CancelParams, HandoffParams, CancelResult, DelegateParams, DelegateResult, ListParams, ListResult, MergeOutcome,
+    AgentRefParams, AgentSteerParams, AgentWorkerParams, CancelParams, HandoffParams, CancelResult, DelegateParams, DelegateResult, ListParams, ListResult, MergeOutcome,
     MergeParams, ProposeParams, ProposeResult, SchedulerState, SpawnParams, Supervise, VerifyParams, VerifyReport, events, methods, topics, workers,
 };
 use cc_protocol::contracts::chatflow::{AgentRunResult, verbs as chatflow_verbs};
@@ -70,6 +70,7 @@ pub fn hello() -> Hello {
         methods::PROPOSE,
         methods::WORKERS,
         methods::WORKER_SET,
+        methods::AGENT_WORKER,
         methods::PLAN,
         methods::PAUSE,
         methods::PAUSE_STATE,
@@ -1743,6 +1744,75 @@ impl Agents {
         Ok(())
     }
 
+    /// One agent's task goes to another worker (`agents.agent.worker`), the same way a declined
+    /// task does: the agent stops, and a new agent of that worker takes the task under the same
+    /// lead, in a session of its own (the old worker's conversation is not in front of it), from
+    /// what is in the files. The lead and the board are told.
+    async fn switch_worker(&self, ctx: Ctx, params: AgentWorkerParams) -> Result<AgentRecord, RpcError> {
+        let host = Host::new(ctx.clone());
+        let record = agent(&host, &params.project_id, &params.agent).await?;
+        let Some(task_id) = record.task_id.clone() else {
+            return Err(RpcError::invalid_params(format!("{} has no task to move", record.name)));
+        };
+        let current = task(&host, &task_id).await?;
+        if record.status == "done" || finished(&current.status) {
+            return Err(RpcError::invalid_params(format!("{} finished \"{}\"; nothing is left to move", record.name, current.title)));
+        }
+        let target = self.worker_for(&host, params.worker.trim()).await?;
+        if target == record.worker {
+            return Ok(record);
+        }
+        let lead = lead_session(&host, &record).await;
+        let old = self.halt(&ctx, &host, record).await?;
+        let data = self.inner.data.get();
+        let from = crate::frontier::label(&old.worker);
+        let to = crate::frontier::label(&target);
+        let new = self
+            .spawn(ctx.clone(), SpawnParams {
+                project_id: old.project_id.clone(),
+                task_id: current.id.clone(),
+                name: None,
+                role: Some(old.role.clone()),
+                from_session: lead.clone(),
+                mode: old.mode.clone(),
+                flow: None,
+                worker: Some(target.clone()),
+            })
+            .await?;
+        let vars = [("agent", old.name.as_str()), ("from", from), ("to", to), ("title", current.title.as_str()), ("new", new.name.as_str())];
+        board(&host, &old.project_id, "status", &old.name, &data.text("board_moved", &vars), std::slice::from_ref(&current.id)).await;
+        progress_note(&host, lead.as_deref(), &data.text("progress_moved", &vars), &old, true).await;
+        Ok(new)
+    }
+
+    /// The worker an agent's task may go to now: `local`, a frontier CLI by id when it can work,
+    /// or `frontier` (the chosen CLI when it can work, else the first that can). A CLI that
+    /// cannot work is refused with its reason, and the agent keeps its worker.
+    async fn worker_for(&self, host: &Host, asked: &str) -> Result<String, RpcError> {
+        if asked == workers::LOCAL {
+            return Ok(workers::LOCAL.to_owned());
+        }
+        let listed = self.inner.frontier.workers(host, false).await;
+        let ready = |id: &str| listed.workers.iter().any(|info| info.id == id && info.problem.is_none());
+        let pick = if asked == workers::FRONTIER {
+            let chosen = workers::frontier(&listed.chosen).then(|| listed.chosen.clone()).filter(|chosen| ready(chosen));
+            chosen.or_else(|| [workers::CLAUDE, workers::OPENAI].into_iter().find(|id| ready(id)).map(str::to_owned))
+        } else if workers::frontier(asked) {
+            ready(asked).then(|| asked.to_owned())
+        } else {
+            return Err(RpcError::invalid_params(format!("unknown worker `{asked}` (expected local, frontier, {}, {})", workers::CLAUDE, workers::OPENAI)));
+        };
+        pick.ok_or_else(|| {
+            let why: Vec<String> = listed
+                .workers
+                .iter()
+                .filter(|info| workers::frontier(&info.id) && (asked == workers::FRONTIER || info.id == asked))
+                .map(|info| format!("{}: {}", info.label, info.problem.clone().unwrap_or_default()))
+                .collect();
+            RpcError::invalid_params(format!("no frontier CLI can work now ({}); the agent keeps its worker. Sign one in under Settings > Agents.", why.join("; ")))
+        })
+    }
+
     /// A frontier agent asked its lead and waits: its place in the scheduler goes to the next
     /// agent, and the lead is told the question (the answer, a steer, resumes the agent).
     async fn waiting(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, question: String) -> Result<(), RpcError> {
@@ -2684,6 +2754,7 @@ impl Plugin for Agents {
                 methods::STOP => this.stop(ctx, parse_params(params)?).await,
                 methods::FINISH => this.finish(ctx, parse_params(params)?).await,
                 methods::RESTART => to_value(&this.restart(ctx, parse_params(params)?).await?),
+                methods::AGENT_WORKER => to_value(&this.switch_worker(ctx, parse_params(params)?).await?),
                 methods::CANCEL => to_value(&this.cancel(ctx, parse_params(params)?).await?),
                 methods::VERIFY => to_value(&this.verify(ctx, parse_params(params)?).await?),
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),

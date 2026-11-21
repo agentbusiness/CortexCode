@@ -63,8 +63,10 @@
 #cc .cx-task{color:var(--ink-2);}
 /* Agents are orange, so they never read as a remote project (counter blue). */
 #cc .cx-agents .cx-at,#cc .cx-agents .ap.origin{color:var(--rubric-lift);}
-/* An agent whose model runs on another computer: its role in the counter blue of other computers. */
-#cc .cx-agents .ap.cx-away{color:var(--counter);}
+/* Who does the work: a conversation's or agent's model on another computer names that computer in
+   the counter blue of other computers; a frontier CLI (Claude Code, Codex) is set in ink. */
+#cc .cx-sidebar .ap.cx-worker.cx-away{color:var(--counter);}
+#cc .cx-sidebar .ap.cx-worker.cx-frontier{color:var(--ink);font-weight:600;}
 #cc .cx-agents .cx-pip-running,#cc .cx-agents .cx-pip-working,#cc .cx-agents .cx-pip-in_progress,#cc .cx-agents .cx-pip-verifying{background:var(--rubric-lift);}
 
 

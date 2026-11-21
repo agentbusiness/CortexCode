@@ -5,8 +5,9 @@
  * other regions show. The projects are this computer's, then the joined CortexCode instances'
  * (`mesh.projects`, identified by `mesh.peers`), each with its description; another computer's
  * name is set in blue
- * and its rows talk to that computer, where the project's sessions, files and memory live. An agent
- * whose model runs on another computer has its role in that blue. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
+ * and its rows talk to that computer, where the project's sessions, files and memory live. Every
+ * conversation and agent row says who does its work: Local, a frontier CLI (Claude Code, Codex), or,
+ * in that blue, the computer its model calls run on. Its bar hosts `sidebar.actions@1` (open project, new chat, and any other
  * action dropped in). A notification CortexCode showed only here — because its window was in front,
  * or because macOS did not show it — marks its session's row until the session is opened.
  */
@@ -459,10 +460,10 @@ function StripProject({ project, remote, notices, selected, selectedSession, onS
       })}
       {agentRows.map((row) => {
         const notice = row.sessionId && selectedSession !== row.sessionId ? notices.get(row.sessionId) : undefined;
-        const state = notice ? `${agentLabel(row.status)}; ${notice.label}: ${notice.title}` : agentLabel(row.status);
+        const state = `${notice ? `${agentLabel(row.status)}; ${notice.label}: ${notice.title}` : agentLabel(row.status)}; ${workerLabel(row.worker)}`;
         return (
           <button key={row.name} type="button" className={`cx-strip-mark cx-strip-agent${row.sessionId && selectedSession === row.sessionId ? ' sel' : ''}${notice ? ' cx-notice' : ''}`}
-            data-strip-agent={row.name} data-status={row.status} data-notice={notice?.kind} disabled={!row.sessionId} aria-label={`@${row.name}, ${state}`}
+            data-strip-agent={row.name} data-worker={row.worker} data-status={row.status} data-notice={notice?.kind} disabled={!row.sessionId} aria-label={`@${row.name}, ${state}`}
             title={`@${row.name}${row.title ? ` · ${row.title}` : ''} · ${project.name} — ${state}`} onClick={() => row.sessionId && onSelect(row.sessionId)}>
             <span className="cx-strip-code"><span className="cx-strip-at">@</span>{markCode(row.name).slice(0, 2)}</span>
             <StatePip status={row.status} />
@@ -534,9 +535,8 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
           <div className="r">
             <StatePip status={agentRow.status} />
             <span className={`ap${agentTone(agentRow.status)}`}>{agentLabel(agentRow.status)}</span>
-            {agentRow.role && (agentRow.sessionId && away.has(agentRow.sessionId)
-              ? <span className="ap cx-away" title={`Its model runs on ${away.get(agentRow.sessionId)}`}>{agentRow.role}</span>
-              : <span className="ap faint">{agentRow.role}</span>)}
+            <WorkerTag worker={agentRow.worker} away={agentRow.sessionId ? away.get(agentRow.sessionId) : undefined} />
+            {agentRow.role && <span className="ap faint">{agentRow.role}</span>}
             {notice && <NoticeTag notice={notice} />}
             <span className="grow" />
             {agentRow.updated ? <span className="ap faint">{ago(agentRow.updated, now)}</span> : null}
@@ -579,7 +579,7 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
           <ul className="lst cx-sessions" aria-label={`Conversations in ${project.name}`}>
             {chats.map((session) => (
               <Fragment key={session.id}>
-                <SessionRow session={session} now={now} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
+                <SessionRow session={session} now={now} away={away.get(session.id)} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
                   selected={selectedSession === session.id} onSelect={() => onSelect(session.id)}
                   onDelete={async () => {
                     await onDeleteSession(session.id);
@@ -619,8 +619,10 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   );
 }
 
-function SessionRow({ session, selected, onSelect, onDelete, now, notice }: {
+function SessionRow({ session, selected, onSelect, onDelete, now, notice, away }: {
   session: Session;
+  /** The computer its model calls run on, when not this one. */
+  away?: string;
   selected: boolean;
   onSelect: () => void;
   onDelete: () => Promise<void>;
@@ -636,6 +638,7 @@ function SessionRow({ session, selected, onSelect, onDelete, now, notice }: {
         <div className="r">
           <StatePip status={session.status} />
           <span className={`ap${statusTone(session.status)}`}>{STATUS_LABEL[session.status] ?? session.status}</span>
+          <WorkerTag worker="local" away={away} />
           {notice && <NoticeTag notice={notice} />}
           <span className="grow" />
           <span className="ap faint">{ago(session.updated_ms, now)}</span>
@@ -760,6 +763,8 @@ function statusTone(status: string): string {
 interface AgentRow {
   name: string;
   status: string;
+  /** Who does its work (`agents.agent.worker`): `local`, `claude` or `openai`. */
+  worker: string;
   role: string | null;
   sessionId: string | null;
   title: string | null;
@@ -768,12 +773,28 @@ interface AgentRow {
   parent: string | null;
 }
 
+/** Who does a session's or an agent's work, as a short tag: the local model or a frontier CLI. */
+const WORKER_LABEL: Record<string, string> = { local: 'Local', claude: 'Claude Code', openai: 'Codex' };
+
+function workerLabel(worker: string): string {
+  return WORKER_LABEL[worker] ?? worker;
+}
+
+/** A tag saying who does the work: the local model (blue with the computer's name when its model
+ * calls run on another computer) or a frontier CLI. */
+function WorkerTag({ worker, away }: { worker: string; away?: string }) {
+  if (worker === 'local' && away) return <span className="ap cx-worker cx-away" data-worker="local" title={`The local model, on ${away}`}>{away}</span>;
+  const label = workerLabel(worker);
+  return <span className={`ap cx-worker${worker === 'local' ? ' faint' : ' cx-frontier'}`} data-worker={worker} title={worker === 'local' ? 'Runs on the local model' : `Runs on ${label}`}>{label}</span>;
+}
+
 function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
   const rows = new Map<string, AgentRow>();
   for (const record of records) {
     rows.set(record.name, {
       name: record.name,
       status: record.status,
+      worker: (record as AgentRecord & { worker?: string }).worker || 'local',
       role: record.role,
       sessionId: record.session_id ?? null,
       title: record.task_id ?? null,
@@ -796,7 +817,7 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       else if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
       existing.updated = Math.max(existing.updated, session.updated_ms);
     } else {
-      rows.set(name, { name, status: session.status, role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
+      rows.set(name, { name, status: session.status, worker: 'local', role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
     }
   }
   return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);

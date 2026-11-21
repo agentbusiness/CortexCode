@@ -48,6 +48,12 @@ pub mod methods {
     /// [`super::WorkerSetParams`] -> [`super::WorkersResult`]: choose who does agent work (the
     /// setting `agents.worker`). A frontier worker must be installed and signed in.
     pub const WORKER_SET: &str = "agents.worker.set";
+    /// [`super::AgentWorkerParams`] -> [`crate::contracts::memory::AgentRecord`]: one agent's task
+    /// goes to another worker (the local model, or a frontier CLI that can work now): the agent
+    /// stops and a new agent of that worker takes the same task, under the same lead, in a
+    /// session of its own, from what is in the files. Its record is the answer; an agent already
+    /// on that worker is the answer as it is.
+    pub const AGENT_WORKER: &str = "agents.agent.worker";
     /// [`super::FrontierPlanParams`] -> [`super::FrontierPlanResult`]: a frontier agent writes a
     /// plan and changes nothing (its tools only look): a planning agent session under the asking
     /// session, its run answered with the plan in the asker's JSON Schema. Unavailable when no
@@ -122,6 +128,9 @@ pub mod workers {
     /// Codex, headless.
     pub const OPENAI: &str = "openai";
     pub const ALL: &[&str] = &[LOCAL, CLAUDE, OPENAI];
+    /// Any frontier CLI that can work now ([`super::methods::AGENT_WORKER`]): the chosen one
+    /// first.
+    pub const FRONTIER: &str = "frontier";
 
     /// A worker that is a frontier CLI (the lead session then does not edit; see
     /// docs/FRONTIER-AGENTS.md).
@@ -172,6 +181,15 @@ pub struct WorkersResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerSetParams {
     /// One of [`workers`].
+    pub worker: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkerParams {
+    pub project_id: String,
+    pub agent: String,
+    /// One of [`workers`], or [`workers::FRONTIER`]: the chosen frontier CLI when it can work
+    /// now, else the first that can.
     pub worker: String,
 }
 

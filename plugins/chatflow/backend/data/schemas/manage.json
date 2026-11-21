@@ -16,7 +16,9 @@
               "finish",
               "stop",
               "restart",
-              "message"
+              "message",
+              "local",
+              "frontier"
             ]
           },
           "text": {

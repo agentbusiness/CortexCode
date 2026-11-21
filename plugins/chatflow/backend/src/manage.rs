@@ -10,7 +10,7 @@ use crate::agent_loop::RunEnv;
 use crate::journal::Journal;
 use crate::schemas::{self, Manage};
 use cc_protocol::RpcError;
-use cc_protocol::contracts::agents::{CancelResult, ListResult, events, methods as agents_methods};
+use cc_protocol::contracts::agents::{CancelResult, ListResult, WorkersResult, events, methods as agents_methods, workers};
 use cc_protocol::contracts::chatflow::{ManageFlag, ManageFlags, topics as chatflow_topics};
 use cc_protocol::contracts::frame::{JournalEntry, kinds};
 use cc_protocol::contracts::memory::{AgentRecord, Task, methods as memory_methods};
@@ -313,8 +313,31 @@ fn work_line(env: &RunEnv, item: &OpenWork) -> String {
     let repeated = if item.repeated { env.data.text("manage_repeat", &[]) } else { String::new() };
     env.data.text(
         "manage_line",
-        &[("agent", &item.agent.name), ("title", &item.task.title), ("state", &item.agent.status), ("detail", &format!("{}{repeated}", result.unwrap_or_default()))],
+        &[
+            ("agent", &item.agent.name),
+            ("worker", worker_label(&item.agent.worker)),
+            ("title", &item.task.title),
+            ("state", &item.agent.status),
+            ("detail", &format!("{}{repeated}", result.unwrap_or_default())),
+        ],
     )
+}
+
+/// Who does an agent's work, as the lead reads it.
+fn worker_label(worker: &str) -> &'static str {
+    match worker {
+        workers::CLAUDE => "Claude Code",
+        workers::OPENAI => "Codex",
+        _ => "local model",
+    }
+}
+
+/// Whether a frontier CLI can take an agent's task now (`agents.workers`).
+async fn frontier_ready(env: &RunEnv) -> bool {
+    match env.host.get::<WorkersResult>(agents_methods::WORKERS, json!({})).await {
+        Ok(listed) => listed.workers.iter().any(|info| workers::frontier(&info.id) && info.problem.is_none()),
+        Err(_) => false,
+    }
 }
 
 /// The session's last message to `agent` when the agent has edited nothing since (it is still
@@ -388,7 +411,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         return journal.note(&env.run_id, "managed", &text, false).await.map(|_| ());
     }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
-    let shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
+    let mut shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
+    // `frontier` only while a frontier CLI can take a task now (the host knows; the model does not
+    // pick what would be refused).
+    if !frontier_ready(env).await {
+        shape = shape.without_anywhere(workers::FRONTIER);
+    }
     let asked = if unplanned.is_empty() {
         String::new()
     } else {
@@ -432,6 +460,18 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
                     Err(error) => Err(error),
                 }
             }
+            // The agent's task goes to the other worker: a new agent takes it (agents.agent.worker);
+            // `text` reaches the new agent as its first steer.
+            "local" | "frontier" => match env.host.get::<AgentRecord>(agents_methods::AGENT_WORKER, json!({"project_id": env.scope.project_id, "agent": name, "worker": action.action})).await {
+                Ok(moved) if moved.name == name => Ok(env.data.text("managed_same_worker", &[("agent", name), ("worker", worker_label(&moved.worker))])),
+                Ok(moved) => {
+                    if !text.is_empty() {
+                        let _ = env.host.call(agents_methods::STEER, json!({"project_id": env.scope.project_id, "agent": moved.name, "text": text, "kind": "steer"})).await;
+                    }
+                    Ok(env.data.text("managed_moved", &[("agent", name), ("new", &moved.name), ("worker", worker_label(&moved.worker))]))
+                }
+                Err(error) => Err(error),
+            },
             // One message per agent until it edits: a check-in sends nothing to an agent still working
             // on what it was told (seen: "READING WITHOUT WRITING" sent eight times to one agent, once
             // at 30 edits and one call since its last edit); a need or a block may answer at once,
