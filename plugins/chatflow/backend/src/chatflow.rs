@@ -86,6 +86,8 @@ pub fn hello() -> Hello {
         frame_topics::PLUGIN_STATE.to_owned(),
         frame_topics::PROJECT_CHANGED.to_owned(),
         cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED.to_owned(),
+        // The app's work paused or resumed (the header's Pause).
+        agents_topics::PAUSED.to_owned(),
     ];
     hello
 }
@@ -135,6 +137,8 @@ struct Inner {
     learner: std::sync::OnceLock<crate::learn::Learner>,
     /// Owns the whole replay, including preparation and the gap between its arms.
     replay: Mutex<ReplayState>,
+    /// Cancelled while the app's work is paused (`agents.paused`); a fresh one after Resume.
+    pause: Mutex<CancellationToken>,
 }
 
 #[derive(Default)]
@@ -233,6 +237,7 @@ impl Chatflow {
                 skills_changed_ms: AtomicU64::new(0),
                 learner: std::sync::OnceLock::new(),
                 replay: Mutex::new(ReplayState::default()),
+                pause: Mutex::new(CancellationToken::new()),
             }),
         })
     }
@@ -401,11 +406,40 @@ impl Chatflow {
         if runs.get(session_id).is_some_and(|handle| handle.done.borrow().is_none()) {
             return None;
         }
-        let stops = Stops { cancel: cancel.map(|token| token.child_token()).unwrap_or_default(), park: self.inner.park.child_token() };
+        // A run registered while the work is paused gets a paused signal at once: it starts, and
+        // stops at its first step until Resume.
+        let pause = self.inner.pause.lock().map(|pause| pause.child_token()).unwrap_or_default();
+        let stops = Stops { cancel: cancel.map(|token| token.child_token()).unwrap_or_default(), park: self.inner.park.child_token(), pause };
         let stage = Arc::new(Mutex::new("starting".to_owned()));
         let (sender, done) = watch::channel(None);
         runs.insert(session_id.to_owned(), RunHandle { run_id: run_id.to_owned(), stops: stops.clone(), stage: stage.clone(), done });
         Some((stops, stage, sender))
+    }
+
+    /// The app's work paused (every run stops at its next step's start, and a new one stops at its
+    /// first) or resumed (a fresh signal, and every conversation stopped mid-turn goes on).
+    fn set_paused(&self, ctx: &Ctx, paused: bool) {
+        let resumed = {
+            let mut pause = self.inner.pause.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if paused {
+                pause.cancel();
+                false
+            } else if pause.is_cancelled() {
+                *pause = CancellationToken::new();
+                true
+            } else {
+                false
+            }
+        };
+        if resumed {
+            let this = self.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = this.resume_all(ctx).await {
+                    tracing::warn!(%error, "could not resume the conversations stopped for the pause");
+                }
+            });
+        }
     }
 
     /// Keep `prewarm` as the session's (None ends the one kept; dropping a prewarm cancels it).
@@ -841,6 +875,10 @@ impl Chatflow {
                 }
             };
             if state == "parked" {
+                // Stopped for the app's Pause: said in the conversation; Resume goes on from here.
+                if stops.pause.is_cancelled() && !stops.park.is_cancelled() {
+                    let _ = journal.append(kinds::NOTE, json!({"text": self.inner.data.get().text("paused_note", &[]), "purpose": "paused", "run_id": run_id, "host_message": false})).await;
+                }
                 return Ok(());
             }
             journal.sync().await?;
@@ -1567,7 +1605,17 @@ impl Chatflow {
         items: cc_protocol::ItemSink,
     ) -> Result<AgentRunResult, RpcError> {
         let host = Host::new(ctx.clone());
-        let parked = || RpcError::new(codes::UNAVAILABLE, "the chat flow is restarting; call again to continue").retryable();
+        // Stopped for the app's Pause: its caller holds the agent until Resume (not a failure, and
+        // calling again before then only stops again). Else the chat flow is restarting.
+        let pause = stops.pause.clone();
+        let park = stops.park.clone();
+        let parked = move || {
+            if pause.is_cancelled() && !park.is_cancelled() {
+                RpcError::new(cc_protocol::contracts::agents::PAUSED_CODE, "the app's work is paused; it goes on after Resume")
+            } else {
+                RpcError::new(codes::UNAVAILABLE, "the chat flow is restarting; call again to continue").retryable()
+            }
+        };
         let Some(_lock) = locks::lock(&data_dir(&ctx), &params.session_id, &stops.park).await.map_err(|error| RpcError::internal(error.to_string()))? else {
             return Err(parked());
         };
@@ -1987,10 +2035,19 @@ impl Plugin for Chatflow {
             let learner = this.inner.learner.get_or_init(|| crate::learn::Learner::start(Host::new(ctx.clone()), this.inner.data.clone(), this.inner.park.clone(), paths, replayer));
             learner.backlog();
             this.warm_projects(ctx.clone());
-            // Resume in the background: activation must not wait for a predecessor's lock.
+            // Resume in the background: activation must not wait for a predecessor's lock. Work the
+            // user paused stays paused across restarts and updates: nothing resumes until Resume.
             let task_ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Err(error) = this.resume_all(task_ctx).await {
+                let paused = Host::new(task_ctx.clone())
+                    .call(cc_protocol::contracts::records::methods::SETTINGS_GET, json!({"path": cc_protocol::contracts::agents::PAUSED_SETTING}))
+                    .await
+                    .ok()
+                    .and_then(|setting| setting.get("value").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if paused {
+                    this.set_paused(&task_ctx, true);
+                } else if let Err(error) = this.resume_all(task_ctx).await {
                     tracing::warn!(%error, "could not scan sessions to resume");
                 }
             });
@@ -1999,6 +2056,12 @@ impl Plugin for Chatflow {
     }
 
     fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        if topic == agents_topics::PAUSED
+            && let Some(paused) = data.get("paused").and_then(Value::as_bool)
+        {
+            self.set_paused(&ctx, paused);
+            return Box::pin(async {});
+        }
         if topic == SKILLS_CHANGED {
             self.inner.skills_changed_ms.store(cc_protocol::contracts::now_ms(), Ordering::SeqCst);
         }

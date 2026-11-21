@@ -401,7 +401,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
     let mut effort = "medium".to_owned();
     let mut agent_outcome = None;
     loop {
-        if env.stops.park.is_cancelled() {
+        if env.stops.park.is_cancelled() || env.stops.pause.is_cancelled() {
             return Ok(TurnEnd { state: "parked".into(), detail: String::new(), route: route_name, agent: None });
         }
         if env.stops.cancel.is_cancelled() {

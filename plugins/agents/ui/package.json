@@ -8,6 +8,7 @@
     "build": "npm run build --workspaces --if-present"
   },
   "workspaces": [
+    "band-pause",
     "board",
     "card-agents",
     "card-board",

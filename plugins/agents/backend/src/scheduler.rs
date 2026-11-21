@@ -32,6 +32,11 @@ pub struct Scheduler {
     pub frontier_limit: u32,
     /// Highest number of agents ever running at once (for verification and reporting).
     pub peak: u32,
+    /// The app's work is paused: nothing starts until Resume.
+    pub paused: bool,
+    /// Agents whose run stopped for the pause: when their run ends they go back to the front of
+    /// the queue (not out of it), to start again on Resume.
+    pub held: Vec<AgentKey>,
 }
 
 impl Scheduler {
@@ -52,7 +57,26 @@ impl Scheduler {
         self.running.retain(|running| running != key);
         self.queued.retain(|queued| queued != key);
         self.remote.retain(|remote| remote != key);
-        self.frontier.retain(|frontier| frontier != key);
+        // Stopped for the pause: it waits at the front of the queue, in its lane.
+        if self.held.contains(key) {
+            self.held.retain(|held| held != key);
+            self.queued.push_front(key.clone());
+        } else {
+            self.frontier.retain(|frontier| frontier != key);
+        }
+        self.fill()
+    }
+
+    /// The agent's run stopped for the pause: when it ends, the agent waits in the queue.
+    pub fn hold(&mut self, key: &AgentKey) {
+        if !self.held.contains(key) {
+            self.held.push(key.clone());
+        }
+    }
+
+    /// Pause (nothing starts) or resume. Returns the agents to start now.
+    pub fn set_paused(&mut self, paused: bool) -> Vec<AgentKey> {
+        self.paused = paused;
         self.fill()
     }
 
@@ -111,6 +135,9 @@ impl Scheduler {
     /// Start queued agents, in order, while their lane has room: this computer's model (`limit`)
     /// or the frontier CLIs (`frontier_limit`). An agent whose lane is full keeps its place.
     fn fill(&mut self) -> Vec<AgentKey> {
+        if self.paused {
+            return Vec::new();
+        }
         let limit = self.limit.max(1) as usize;
         let frontier_limit = self.frontier_limit.max(1) as usize;
         let mut started = Vec::new();

@@ -105,3 +105,9 @@ frontier_plan_title = "Plan: {goal}"
 # Progress the lead hears while frontier agents work.
 progress_planning = "{agent} plans \"{goal}\" (a frontier agent: it reads, changes nothing, and answers with the plan)."
 progress_said = "{agent} on \"{title}\": {text}"
+# A frontier agent that will not do its task: a local agent takes it.
+board_declined = "{worker} declined \"{title}\" ({reason}); a local agent takes it."
+progress_declined = "{agent} ({worker}) declined \"{title}\": {reason}\n{local} takes the task with the local model and all of its tools."
+# The app's work paused (the header's Pause): a frontier agent stopped after its last tool call.
+frontier_paused = "Paused after the last finished step; it goes on after Resume."
+frontier_resume = "The work was paused and is resumed now. Check where you left off (the files you changed, your last steps above) and continue the task from there."

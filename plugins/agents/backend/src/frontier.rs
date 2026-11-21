@@ -58,7 +58,7 @@ fn report_schema() -> Value {
         "additionalProperties": false,
         "required": ["status", "summary", "question"],
         "properties": {
-            "status": {"type": "string", "enum": ["done", "waiting", "blocked"]},
+            "status": {"type": "string", "enum": ["done", "waiting", "blocked", "declined"]},
             "summary": {"type": "string"},
             "question": {"type": "string"},
         },
@@ -121,6 +121,8 @@ pub struct Frontier {
     /// choice) or one of its runs works.
     failures: Mutex<HashMap<String, String>>,
     live: Mutex<HashMap<AgentKey, mpsc::UnboundedSender<()>>>,
+    /// Cancelled while the app's work is paused; a fresh one after Resume.
+    pause: Mutex<CancellationToken>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -307,6 +309,21 @@ impl Frontier {
         Ok(self.workers(host, false).await)
     }
 
+    /// Pause (true) or resume (false) the frontier agents' runs: a paused run stops at its next
+    /// step boundary (no tool call in flight) and ends `paused`.
+    pub fn set_paused(&self, paused: bool) {
+        let mut pause = lock(&self.pause);
+        if paused {
+            pause.cancel();
+        } else if pause.is_cancelled() {
+            *pause = CancellationToken::new();
+        }
+    }
+
+    fn pause_token(&self) -> CancellationToken {
+        lock(&self.pause).clone()
+    }
+
     /// Tell a running frontier agent that a steer waits in its journal (false: none is running).
     pub fn nudge(&self, key: &AgentKey) -> bool {
         lock(&self.live).get(key).is_some_and(|sender| sender.send(()).is_ok())
@@ -346,6 +363,7 @@ impl Frontier {
         }
 
         let journal = Journal::load(host.clone(), &session_id).await?;
+        let job_kind = if matches!(job, Job::Task(_)) { JobKind::Task } else { JobKind::Plan };
         let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
         let (sender, nudges) = mpsc::unbounded_channel();
         lock(&self.live).insert(key.clone(), sender);
@@ -371,6 +389,10 @@ impl Frontier {
             usage: json!({}),
             agent: record.name.clone(),
             lead: host.session_get(&session_id).await.ok().and_then(|session| session.parent),
+            refusal: None,
+            // A plan is one step of its lead's turn: it is never paused on its own.
+            pause: if matches!(job_kind, JobKind::Task) { self.pause_token() } else { CancellationToken::new() },
+            in_flight: 0,
         };
         let outcome = run.go(cancel).await;
         lock(&self.live).remove(&key);
@@ -383,6 +405,13 @@ impl Frontier {
         }
         outcome
     }
+}
+
+/// Which kind of job a run is (kept past the job itself).
+#[derive(Clone, Copy)]
+enum JobKind {
+    Task,
+    Plan,
 }
 
 /// What a frontier run is for.
@@ -483,6 +512,12 @@ struct Run<'a> {
     agent: String,
     /// The lead session (the agent session's parent): it sees each message the agent writes.
     lead: Option<String>,
+    /// The model stopped with a refusal (Claude's `stop_reason: "refusal"`), with what it said.
+    refusal: Option<String>,
+    /// Cancelled when the app's work is paused: the run stops at the next step boundary.
+    pause: CancellationToken,
+    /// Tool calls started and not answered yet (a pause waits for them).
+    in_flight: u32,
 }
 
 /// What one CLI turn ended with.
@@ -492,6 +527,10 @@ struct TurnEnd {
     report: Option<Value>,
     /// The CLI's own failure, in its words.
     error: Option<String>,
+    /// The model refused (its API's refusal stop), with what it said.
+    refused: Option<String>,
+    /// The work was paused (the app's Pause): the CLI stopped at a step boundary.
+    paused: bool,
 }
 
 impl Run<'_> {
@@ -517,11 +556,17 @@ impl Run<'_> {
             _ => None,
         };
         let mut report = None;
+        let paused = matches!(&ended, Ok(turn) if turn.paused);
+        if paused {
+            // Its next run carries this as its first message: where it stopped, and to go on.
+            let _ = self.journal.append(kinds::STEER, json!({"text": self.data.text("frontier_resume", &[]), "kind": "followup", "target": "chat", "consumed": false})).await;
+        }
         let (outcome, summary, question) = match ended {
+            Ok(_) if paused => ("paused".to_owned(), self.data.text("frontier_paused", &[]), None),
             Err(error) if error.code == codes::CANCELLED => ("cancelled".to_owned(), self.data.text("frontier_cancelled", &[]), None),
             Err(error) => ("failed".to_owned(), self.data.text("frontier_failed", &[("error", &error.message)]), None),
             Ok(turn) => match &self.job {
-                Job::Task(_) => judge(self.data, &turn),
+                Job::Task(_) => judge(self.data, &turn, self.tool_calls),
                 // A plan is done when its report is the plan (an object with its tasks).
                 Job::Plan { .. } => match (&turn.error, turn.report) {
                     (Some(error), _) => ("failed".to_owned(), self.data.text("frontier_failed", &[("error", error.trim())]), None),
@@ -541,8 +586,9 @@ impl Run<'_> {
             .await;
         let status = match outcome.as_str() {
             "done" => SessionStatus::Done,
-            "cancelled" => SessionStatus::Cancelled,
-            "waiting" | "blocked" => SessionStatus::Waiting,
+            // Declined: its task went to a local agent, so this session's work is over.
+            "cancelled" | "declined" => SessionStatus::Cancelled,
+            "waiting" | "blocked" | "paused" => SessionStatus::Waiting,
             _ => SessionStatus::Failed,
         };
         let _ = self.host.session_status(&self.session_id, status).await;
@@ -644,12 +690,23 @@ impl Run<'_> {
         let mut lines = BufReader::new(stdout).lines();
         let mut stdin = Some(stdin);
         let mut last = TurnEnd::default();
+        let mut pausing = false;
         loop {
+            // Paused, with no tool call in flight: the CLI stops here; its session keeps the
+            // conversation, and the resumed run goes on from it.
+            if pausing && self.in_flight == 0 {
+                let _ = child.start_kill();
+                return Ok(TurnEnd { paused: true, ..TurnEnd::default() });
+            }
             let line = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = child.start_kill();
                     return Err(RpcError::cancelled());
+                }
+                _ = self.pause.cancelled(), if !pausing => {
+                    pausing = true;
+                    continue;
                 }
                 line = lines.next_line() => line,
             };
@@ -673,10 +730,13 @@ impl Run<'_> {
                         self.usage = usage.clone();
                     }
                     last = claude_turn_end(&event);
+                    if let Some(refusal) = self.refusal.take() {
+                        last.refused = Some(refusal);
+                    }
                     // The lead's answers and steers that came during the turn are its next message;
                     // with none, the input ends and the CLI finishes.
                     match self.next_message().await? {
-                        Some(text) if last.error.is_none() => {
+                        Some(text) if last.error.is_none() && last.refused.is_none() && !pausing => {
                             if let Some(input) = stdin.as_mut() {
                                 send_user(input, &text).await?;
                             }
@@ -697,6 +757,12 @@ impl Run<'_> {
     }
 
     async fn claude_assistant(&mut self, event: &Value) -> Result<(), RpcError> {
+        // A refusal stop: the model will not go on with this work (what it said is the reason).
+        if event.pointer("/message/stop_reason").and_then(Value::as_str) == Some("refusal") {
+            let said: Vec<&str> = event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten().filter_map(|part| part.get("text").and_then(Value::as_str)).collect();
+            let said = said.join(" ").trim().to_owned();
+            self.refusal = Some(if said.is_empty() { "the model stopped with a refusal".to_owned() } else { said });
+        }
         for part in event.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
             match str_field(part, "type") {
                 "text" => {
@@ -748,7 +814,9 @@ impl Run<'_> {
         let ended = loop {
             let turn = self.codex_turn(&message, &schema_file, cancel).await;
             match turn {
-                Ok(turn) if turn.error.is_none() => match self.next_message().await {
+                // Paused between turns: the next turn waits for Resume.
+                Ok(turn) if turn.error.is_none() && !turn.paused && self.pause.is_cancelled() => break Ok(TurnEnd { paused: true, ..TurnEnd::default() }),
+                Ok(turn) if turn.error.is_none() && !turn.paused => match self.next_message().await {
                     Ok(Some(text)) => message = text,
                     Ok(None) => break Ok(turn),
                     Err(error) => break Err(error),
@@ -798,12 +866,23 @@ impl Run<'_> {
         let mut lines = BufReader::new(stdout).lines();
         let mut end = TurnEnd::default();
         let mut last_message: Option<String> = None;
+        let mut pausing = false;
         loop {
+            // Paused, with no tool call in flight: the CLI stops here; its session keeps the
+            // conversation, and the resumed run goes on from it.
+            if pausing && self.in_flight == 0 {
+                let _ = child.start_kill();
+                return Ok(TurnEnd { paused: true, ..TurnEnd::default() });
+            }
             let line = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = child.start_kill();
                     return Err(RpcError::cancelled());
+                }
+                _ = self.pause.cancelled(), if !pausing => {
+                    pausing = true;
+                    continue;
                 }
                 line = lines.next_line() => line,
             };
@@ -907,6 +986,7 @@ impl Run<'_> {
     async fn tool_call(&mut self, call_id: &str, name: &str, input: &Value) -> Result<(), RpcError> {
         self.step += 1;
         self.tool_calls += 1;
+        self.in_flight += 1;
         let tool = name.strip_prefix(&format!("mcp__{MCP_SERVER}__")).unwrap_or(name);
         let raw_arguments = input.to_string();
         self.journal
@@ -919,6 +999,7 @@ impl Run<'_> {
     }
 
     async fn tool_result(&mut self, call_id: &str, ok: bool, output: &str) -> Result<(), RpcError> {
+        self.in_flight = self.in_flight.saturating_sub(1);
         self.journal.append(kinds::TOOL_RESULT, json!({"call_id": call_id, "ok": ok, "output": output, "run_id": self.run_id})).await?;
         Ok(())
     }
@@ -943,7 +1024,11 @@ pub fn task_text(data: &Dataset, task: &Task) -> String {
 }
 
 /// How the run ended, from its last turn: the outcome, the summary and a question to the lead.
-fn judge(data: &Dataset, turn: &TurnEnd) -> (String, String, Option<String>) {
+fn judge(data: &Dataset, turn: &TurnEnd, tool_calls: u32) -> (String, String, Option<String>) {
+    // The model's own refusal (its API's refusal stop): the task is the local model's.
+    if let Some(refusal) = &turn.refused {
+        return ("declined".to_owned(), refusal.trim().to_owned(), None);
+    }
     if let Some(error) = &turn.error {
         let error = error.trim();
         return ("failed".to_owned(), data.text("frontier_failed", &[("error", if error.is_empty() { "no reason given" } else { error })]), None);
@@ -956,7 +1041,13 @@ fn judge(data: &Dataset, turn: &TurnEnd) -> (String, String, Option<String>) {
         "waiting" if !question.is_empty() => ("waiting".to_owned(), summary, Some(question)),
         // Waiting without a question: nothing for the lead to answer, so the run is blocked.
         "waiting" | "blocked" => ("blocked".to_owned(), if summary.is_empty() { question } else { summary }, None),
-        // Not the report's shape: its text is the summary, and the steward judges the work.
+        // It will not do the task: the local model takes it (with the model's reason).
+        "declined" => ("declined".to_owned(), summary, None),
+        // Not the report's shape, with no tool call made: it answered in prose instead of working
+        // (a refusal in its own words), so the task is the local model's.
+        _ if tool_calls == 0 => ("declined".to_owned(), if summary.is_empty() { report.as_str().unwrap_or_default().trim().to_owned() } else { summary }, None),
+        // Not the report's shape after working: its text is the summary, and the steward judges
+        // the work.
         _ => ("done".to_owned(), if summary.is_empty() { report.as_str().unwrap_or_default().to_owned() } else { summary }, None),
     }
 }
@@ -967,13 +1058,13 @@ fn claude_turn_end(event: &Value) -> TurnEnd {
     if is_error {
         let text = str_field(event, "result");
         let error = if text.is_empty() { str_field(event, "subtype").replace('_', " ") } else { text.to_owned() };
-        return TurnEnd { report: None, error: Some(error) };
+        return TurnEnd { report: None, error: Some(error), refused: None, paused: false };
     }
     let report = match event.get("structured_output") {
         Some(output) if output.is_object() => Some(output.clone()),
         _ => Some(report_value(str_field(event, "result"))),
     };
-    TurnEnd { report, error: None }
+    TurnEnd { report, error: None, refused: None, paused: false }
 }
 
 /// The report's JSON from a final message (its text when it is not JSON).
@@ -1029,19 +1120,27 @@ fn tail_of(stderr: Option<tokio::process::ChildStderr>) -> tokio::task::JoinHand
     })
 }
 
-/// The files a session changed in the project since a time, from the tools plugin's step log.
+/// The files a session changed in the project since a time, from the tools plugin's step log: the
+/// net change of each file (as it was before the session's first step that touched it against
+/// after its last), so a file that came and went (build output, a scratch file the run's cleanup
+/// removed) or ended as it began is not a change, and an undone step counts for nothing.
 pub async fn changed_since(host: &Host, root: &str, session_id: &str, since_ms: u64) -> Vec<String> {
     let Ok(timeline) = host.get::<TimelineResult>(tools_methods::TIMELINE, json!({"workspace": root, "session_id": session_id, "since_ms": since_ms})).await else {
         return Vec::new();
     };
-    let mut changed: Vec<String> = Vec::new();
-    // Oldest first, so the list reads in the order the work went.
-    for record in timeline.records.iter().rev().filter(|record| !record.undone) {
+    // Per file, in the order the work went: its content before the first step, after the last.
+    let mut net: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for record in timeline.records.iter().rev().filter(|record| !record.undone && record.undoes.is_empty()) {
         for file in &record.files {
-            if !changed.iter().any(|known| known == &file.path) {
-                changed.push(file.path.clone());
+            match at.get(&file.path) {
+                Some(&index) => net[index].2 = file.after.clone(),
+                None => {
+                    at.insert(file.path.clone(), net.len());
+                    net.push((file.path.clone(), file.before.clone(), file.after.clone()));
+                }
             }
         }
     }
-    changed
+    net.into_iter().filter(|(_, before, after)| before != after).map(|(path, _, _)| path).collect()
 }

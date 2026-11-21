@@ -71,6 +71,8 @@ pub fn hello() -> Hello {
         methods::WORKERS,
         methods::WORKER_SET,
         methods::PLAN,
+        methods::PAUSE,
+        methods::PAUSE_STATE,
     ]
     .iter()
     .map(|method| (*method).to_owned())
@@ -85,6 +87,9 @@ pub fn hello() -> Hello {
     hello.subscribes = vec![chatflow_topics::USAGE.to_owned(), memory_topics::BOARD_POSTED.to_owned()];
     hello
 }
+
+/// When the app's work was paused (ms; 0 when it is not), beside `agents.paused`.
+const PAUSED_SINCE_SETTING: &str = "agents.paused_since";
 
 /// Event topic of limit changes: `{ts_ms, from, to, reason, metrics, model}`.
 pub const SCHEDULER_TOPIC: &str = "agents.scheduler";
@@ -252,6 +257,8 @@ struct Inner {
     park: CancellationToken,
     /// Frontier workers (Claude Code, Codex): detection and the runs going now.
     frontier: Arc<crate::frontier::Frontier>,
+    /// When the app's work was paused (None: it is not).
+    paused_since: Mutex<Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -280,6 +287,7 @@ impl Agents {
                 tasks: tokio_util::task::TaskTracker::new(),
                 park: CancellationToken::new(),
                 frontier: Arc::new(crate::frontier::Frontier::default()),
+                paused_since: Mutex::new(None),
             }),
         })
     }
@@ -642,6 +650,7 @@ impl Agents {
                     from_session: Some(params.from_session.clone()),
                     mode: params.mode.clone(),
                     flow: None,
+                    worker: None,
                 })
                 .await?;
             agents.push(record);
@@ -685,7 +694,7 @@ impl Agents {
         // No checks are named for a hand-off: none means no contract (the work is judged by its
         // result, which goes back to the asker).
         let task: Task = host.get(memory_methods::TASK_CREATE, json!({"project_id": project.id, "title": title, "brief": brief, "contract": Contract::default()})).await?;
-        self.spawn(ctx, SpawnParams { project_id: project.id.clone(), task_id: task.id, name: None, role: Some(HANDOFF_ROLE.to_owned()), from_session: Some(asker.id), mode: params.mode, flow: Some(flow) }).await
+        self.spawn(ctx, SpawnParams { project_id: project.id.clone(), task_id: task.id, name: None, role: Some(HANDOFF_ROLE.to_owned()), from_session: Some(asker.id), mode: params.mode, flow: Some(flow), worker: None }).await
     }
 
     async fn spawn(&self, ctx: Ctx, params: SpawnParams) -> Result<AgentRecord, RpcError> {
@@ -721,7 +730,10 @@ impl Agents {
             .await?;
         // Who does its work: the worker that can work now (a frontier CLI when chosen and signed
         // in, else the local model's agent loop).
-        let worker = self.inner.frontier.workers(&host, false).await.active;
+        let worker = match params.worker.clone().filter(|worker| workers::ALL.contains(&worker.as_str())) {
+            Some(worker) => worker,
+            None => self.inner.frontier.workers(&host, false).await.active,
+        };
         let record = upsert(&ctx, &host, AgentRecord {
             name: name.clone(),
             project_id: project.id.clone(),
@@ -1130,6 +1142,11 @@ impl Agents {
             }
             // Stopping frees the scheduler slot too; only plugin parking prevents new starts.
             let next = lock(&this.inner.scheduler).finished(&key);
+            // While pausing, each agent that reached its stop is told to the header.
+            let pausing = lock(&this.inner.scheduler).paused;
+            if pausing {
+                ctx.publish(topics::PAUSED, serde_json::to_value(this.pause_state()).unwrap_or_default());
+            }
             if !this.inner.park.is_cancelled() {
                 for key in next {
                     this.start(ctx.clone(), key);
@@ -1196,6 +1213,10 @@ impl Agents {
                 let text = data.text("progress_worker_fallback", &[("agent", &record.name), ("title", &current.title), ("reason", &reason)]);
                 let lead = lead_session(&host, &record).await;
                 progress_note(&host, lead.as_deref(), &text, &record, true).await;
+            } else if ended.result.outcome == "declined" {
+                // The frontier model will not do this task: a local agent takes it, in a session of
+                // its own (the refusal is not in front of it), with the local model's full tools.
+                return self.declined(&ctx, &host, record, &current, ended.result.summary).await;
             } else {
                 if ended.external_session.is_some() && ended.external_session != record.external_session {
                     record.external_session = ended.external_session.clone();
@@ -1203,6 +1224,12 @@ impl Agents {
                 }
                 if ended.result.outcome == "waiting" {
                     return self.waiting(&ctx, &host, record, &current, ended.question.unwrap_or_default()).await;
+                }
+                // Stopped for the app's Pause after its last tool call: it waits in the queue, and
+                // its CLI session goes on after Resume (told where it stopped).
+                if ended.result.outcome == "paused" {
+                    lock(&self.inner.scheduler).hold(&key);
+                    return Ok(());
                 }
                 frontier_result = Some(ended.result);
             }
@@ -1224,7 +1251,15 @@ impl Agents {
             }
             let result = call_agent_run(&host, &session_id, &task_id, &effort, &record.mode, &cancel).await;
             let _ = host.call(mesh_methods::PLACE_END, json!({"session_id": session_id})).await;
-            result?
+            match result {
+                // Stopped for the app's Pause at a step's start: it waits in the queue, and its
+                // run goes on from the same step after Resume.
+                Err(error) if error.code == cc_protocol::contracts::agents::PAUSED_CODE => {
+                    lock(&self.inner.scheduler).hold(&key);
+                    return Ok(());
+                }
+                other => other?,
+            }
         };
         let task = task(&host, &task_id).await?;
         match result.outcome.as_str() {
@@ -1314,10 +1349,10 @@ impl Agents {
             let (kept, removed): (Vec<&String>, Vec<&String>) = result.changed_files.iter().partition(|file| std::path::Path::new(&project.root).join(file).exists());
             let mut changed = String::new();
             if !kept.is_empty() {
-                changed.push_str(&data.text("board_changed", &[("files", &kept.iter().map(|file| file.as_str()).collect::<Vec<_>>().join(", "))]));
+                changed.push_str(&data.text("board_changed", &[("files", &files_text(kept.iter().map(|file| file.as_str())))]));
             }
             if !removed.is_empty() {
-                changed.push_str(&data.text("board_removed", &[("files", &removed.iter().map(|file| file.as_str()).collect::<Vec<_>>().join(", "))]));
+                changed.push_str(&data.text("board_removed", &[("files", &files_text(removed.iter().map(|file| file.as_str())))]));
             }
             let post = data.text("board_done", &[("title", &task.title), ("summary", result.summary.trim()), ("changed", &changed)]);
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
@@ -1379,6 +1414,7 @@ impl Agents {
                         from_session: from.clone(),
                         mode: mode.to_owned(),
                         flow: None,
+                        worker: None,
                     }) => spawned,
                 };
                 if let Err(error) = spawned {
@@ -1624,6 +1660,84 @@ impl Agents {
         };
         let _ = upsert(&ctx, &host, record).await;
         answer
+    }
+
+    /// Pause or resume all the app's work (the header's button). Paused: nothing new starts, the
+    /// frontier runs stop after their tool call under way, the chat flow's runs (conversations and
+    /// local agents) stop at their next step's start; every one goes on from there on Resume. The
+    /// setting keeps the state across restarts and updates; the event tells the chat flow and the
+    /// header.
+    async fn pause(&self, ctx: Ctx, paused: bool) -> Result<cc_protocol::contracts::agents::PauseState, RpcError> {
+        let host = Host::new(ctx.clone());
+        host.call(cc_protocol::contracts::records::methods::SETTINGS_SET, json!({"path": cc_protocol::contracts::agents::PAUSED_SETTING, "value": paused, "by": "user", "description": "The app's work is paused (the header's Pause)."})).await?;
+        let since = if paused { now_ms() } else { 0 };
+        let _ = host.call(cc_protocol::contracts::records::methods::SETTINGS_SET, json!({"path": PAUSED_SINCE_SETTING, "value": since, "by": "user"})).await;
+        self.apply_pause(&ctx, paused, since);
+        let state = self.pause_state();
+        ctx.publish(topics::PAUSED, serde_json::to_value(&state).unwrap_or_default());
+        Ok(state)
+    }
+
+    /// The pause in force here: the frontier runs' signal, the scheduler's hold, and on Resume the
+    /// agents that wait start.
+    fn apply_pause(&self, ctx: &Ctx, paused: bool, since: u64) {
+        self.inner.frontier.set_paused(paused);
+        *lock(&self.inner.paused_since) = (paused && since > 0).then_some(since);
+        let start = lock(&self.inner.scheduler).set_paused(paused);
+        for key in start {
+            self.start(ctx.clone(), key);
+        }
+    }
+
+    /// The pause as the setting left it (at start: it survives restarts and updates).
+    async fn load_pause(&self, ctx: &Ctx) {
+        let host = Host::new(ctx.clone());
+        let read = |path: &'static str| {
+            let host = host.clone();
+            async move { host.call(cc_protocol::contracts::records::methods::SETTINGS_GET, json!({"path": path})).await.ok().and_then(|setting| setting.get("value").cloned()) }
+        };
+        let paused = read(cc_protocol::contracts::agents::PAUSED_SETTING).await.and_then(|value| value.as_bool()).unwrap_or(false);
+        if paused {
+            let since = read(PAUSED_SINCE_SETTING).await.and_then(|value| value.as_u64()).unwrap_or(0);
+            self.apply_pause(ctx, true, since);
+        }
+    }
+
+    fn pause_state(&self) -> cc_protocol::contracts::agents::PauseState {
+        let scheduler = lock(&self.inner.scheduler);
+        cc_protocol::contracts::agents::PauseState {
+            paused: scheduler.paused,
+            since_ms: *lock(&self.inner.paused_since),
+            finishing: if scheduler.paused { scheduler.running.iter().map(AgentKey::label).collect() } else { Vec::new() },
+        }
+    }
+
+    /// A frontier agent declined its task (it said so, or its model refused): it stops, and a new
+    /// local agent takes the same task, under the same lead, in a session of its own, with the
+    /// local model's agent loop and all of its tools. The lead and the board are told why.
+    async fn declined(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, reason: String) -> Result<(), RpcError> {
+        let label = crate::frontier::label(&record.worker);
+        let lead = lead_session(host, &record).await;
+        let reason = if reason.trim().is_empty() { "it gave no reason".to_owned() } else { reason.trim().to_owned() };
+        record.status = "stopped".into();
+        let record = upsert(ctx, host, record).await?;
+        let data = self.inner.data.get();
+        board(host, &record.project_id, "status", &record.name, &data.text("board_declined", &[("title", &current.title), ("worker", label), ("reason", &reason)]), std::slice::from_ref(&current.id)).await;
+        let local = self
+            .spawn(ctx.clone(), SpawnParams {
+                project_id: record.project_id.clone(),
+                task_id: current.id.clone(),
+                name: None,
+                role: Some(record.role.clone()),
+                from_session: lead.clone(),
+                mode: record.mode.clone(),
+                flow: None,
+                worker: Some(workers::LOCAL.to_owned()),
+            })
+            .await?;
+        let text = data.text("progress_declined", &[("agent", &record.name), ("worker", label), ("title", &current.title), ("reason", &reason), ("local", &local.name)]);
+        progress_note(host, lead.as_deref(), &text, &record, true).await;
+        Ok(())
     }
 
     /// A frontier agent asked its lead and waits: its place in the scheduler goes to the next
@@ -2354,7 +2468,41 @@ fn fact_text<'a>(fact: &'a Value, name: &str) -> &'a str {
 
 /// A list field of a task's facts, comma-separated; empty when absent.
 fn fact_list(fact: &Value, name: &str) -> String {
-    fact.get(name).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+    files_text(fact.get(name).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str))
+}
+
+/// Files named one by one up to this many; more are said by folder.
+const FILES_NAMED: usize = 12;
+/// Folders named when files are said by folder.
+const FOLDERS_NAMED: usize = 12;
+
+/// Files as the lead and the board read them: each path when there are a few; when there are many
+/// (a copied tree, build output) how many, by folder, so the lead reads what happened and where
+/// (seen: one agent's report naming 30,000 files, 600k tokens, and the lead's context full).
+fn files_text<'a>(files: impl Iterator<Item = &'a str>) -> String {
+    let files: Vec<&str> = files.collect();
+    if files.len() <= FILES_NAMED {
+        return files.join(", ");
+    }
+    // The folder a file is said under: its first two folders (`plugins/mesh/`), or its one folder.
+    let folder = |path: &str| -> String {
+        let parts: Vec<&str> = path.split('/').collect();
+        match parts.len() {
+            0 | 1 => "./".to_owned(),
+            2 => format!("{}/", parts[0]),
+            _ => format!("{}/{}/", parts[0], parts[1]),
+        }
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for file in &files {
+        *counts.entry(folder(file)).or_default() += 1;
+    }
+    let mut folders: Vec<(String, usize)> = counts.into_iter().collect();
+    folders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let named: Vec<String> = folders.iter().take(FOLDERS_NAMED).map(|(folder, count)| format!("{folder} ({count})")).collect();
+    let rest = folders.len().saturating_sub(FOLDERS_NAMED);
+    let more = if rest == 0 { String::new() } else { format!(" and {rest} more folder(s)") };
+    format!("{} files: {}{more}", files.len(), named.join(", "))
 }
 
 /// One task of a finished tree as its session judges it, all from records (no judgement here):
@@ -2538,6 +2686,11 @@ impl Plugin for Agents {
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),
                 methods::SCHEDULER => to_value(&this.scheduler_state()),
                 methods::PROPOSE => to_value(&this.propose(ctx, parse_params(params)?).await?),
+                methods::PAUSE => {
+                    let params: cc_protocol::contracts::agents::PauseParams = parse_params(params)?;
+                    to_value(&this.pause(ctx, params.paused).await?)
+                }
+                methods::PAUSE_STATE => to_value(&this.pause_state()),
                 methods::PLAN => to_value(&this.plan_frontier(ctx, parse_params(params)?, call.cancel.clone()).await?),
                 methods::WORKERS => {
                     // `{fresh: true}` asks the CLIs again (the settings panel when it opens).
@@ -2567,6 +2720,8 @@ impl Plugin for Agents {
             this.start_checks(&ctx);
             tokio::spawn(async move {
                 this.load_adjustments(&ctx).await;
+                // Work the user paused stays paused across restarts and updates.
+                this.load_pause(&ctx).await;
                 if let Err(error) = this.readopt(ctx).await {
                     tracing::warn!(%error, "could not re-adopt working agents");
                 }

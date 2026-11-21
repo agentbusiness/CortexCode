@@ -117,6 +117,10 @@ pub struct Stops {
     /// This instance is shutting down: stop at a boundary without a terminal status, so the
     /// successor resumes.
     pub park: CancellationToken,
+    /// The app's work is paused (the header's Pause): stop at the next step's start, never inside
+    /// a step (the model call and its tool calls finish), without a terminal status, so Resume
+    /// goes on from there. Not part of [`Stops::any`]: nothing under way is cut by it.
+    pub pause: CancellationToken,
 }
 
 /// Cancels the forwarding task when its caller finishes, including error exits.
@@ -1079,7 +1083,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // A reply that repeated the host's message was answered already (once per loop).
     let mut host_echoed = false;
     loop {
-        if env.stops.park.is_cancelled() {
+        if env.stops.park.is_cancelled() || env.stops.pause.is_cancelled() {
             return Ok(outcome("parked", String::new(), turns, tool_calls, &changed, None));
         }
         if env.stops.cancel.is_cancelled() {

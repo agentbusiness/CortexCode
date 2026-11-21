@@ -1,0 +1,35 @@
+{
+  "name": "@cortex-ui/agents-band-pause",
+  "version": "0.1.0",
+  "description": "Pause and Resume all the app's work, in the band: every run stops at its next step and goes on from there.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "cortex": {
+    "id": "agents.band-pause",
+    "slot": "workbench.band@1",
+    "label": "Pause",
+    "order": 5
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@cortex/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cortex/sdk": "file:../../../../ui/sdk",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.8"
+  }
+}

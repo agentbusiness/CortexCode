@@ -545,7 +545,10 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, l
     // lead session gets the lead's tools (read and run) and the guide that sends changes to agents.
     let schemas: SchemasResult = host.get(tools_methods::SCHEMAS, json!({"workspace": root, "lead": lead})).await?;
     let info = model_info(host).await;
-    let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native, data.limits.context_tokens)).unwrap_or(0);
+    // A lead session works beside frontier agents with the local model to itself: it gets all the
+    // context the model takes (its native window within the pool), whatever the data set's cap.
+    let cap = if lead { 0 } else { data.limits.context_tokens };
+    let ctx_window = info.as_ref().map(|info| conversation_window(info.ctx_total, info.ctx_native, cap)).unwrap_or(0);
 
     let mut rules = Vec::new();
     for scope in ["global", project_id] {

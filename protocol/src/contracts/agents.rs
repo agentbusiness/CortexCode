@@ -53,6 +53,35 @@ pub mod methods {
     /// session, its run answered with the plan in the asker's JSON Schema. Unavailable when no
     /// frontier worker can work now (the asker then plans as before).
     pub const PLAN: &str = "agents.plan";
+    /// [`super::PauseParams`] -> [`super::PauseState`]: pause or resume all the app's work. Paused,
+    /// every run stops at its next step boundary (the model call and the tool calls under way
+    /// finish first), nothing new starts, and the state survives restarts and updates (the setting
+    /// [`super::PAUSED_SETTING`]). Resumed, every run goes on from where it stopped.
+    pub const PAUSE: &str = "agents.pause";
+    /// `{}` -> [`super::PauseState`].
+    pub const PAUSE_STATE: &str = "agents.pause.state";
+}
+
+/// The setting that holds whether the app's work is paused (`true`/`false`).
+pub const PAUSED_SETTING: &str = "agents.paused";
+/// The error code of a run that stopped because the work is paused: its caller holds it (it is
+/// not a failure, and calling again before Resume only pauses again).
+pub const PAUSED_CODE: &str = "paused";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PauseParams {
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PauseState {
+    pub paused: bool,
+    /// When the work was paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Agents still finishing their current step before they stop.
+    #[serde(default)]
+    pub finishing: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +175,9 @@ pub mod topics {
     pub const AGENT_CHANGED: &str = "agents.changed";
     /// `{chosen, active}`: who does agent work changed (the setting `agents.worker`).
     pub const WORKERS_CHANGED: &str = "agents.workers.changed";
+    /// A [`super::PauseState`]: the app's work was paused or resumed (and, while pausing, each time
+    /// an agent reached its stop).
+    pub const PAUSED: &str = "agents.paused";
     /// A [`super::Supervise`]: something in a session's delegated work needs that session's
     /// decision (an agent blocked, a need for the lead, the whole tree done). The chat flow tells
     /// the session and, when nothing runs in it, wakes it to decide.
@@ -247,6 +279,10 @@ pub struct SpawnParams {
     /// The agent session's flow (absent: the asking session's, else the project's first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<String>,
+    /// Who does its work ([`workers`]); absent: whoever does agent work now
+    /// ([`methods::WORKERS`] `active`). `local` takes back a task a frontier agent declined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
