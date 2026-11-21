@@ -67,6 +67,13 @@ pub mod methods {
     pub const CLAIM: &str = "mesh.claim";
     /// [`super::ClaimParams`] -> `{}`: the use is over; the resource is free for the next run.
     pub const RELEASE: &str = "mesh.release";
+    /// [`super::ReserveParams`] -> `{reserved: [plugin]}`: hold part of this computer's own model
+    /// of a tag for one session beyond its calls: its context stays in the model's pool between
+    /// them (a session that leads others' work and waits for them with a large conversation).
+    /// Another use is given the model only when it fits beside the reservation; the session's own
+    /// calls here run inside it. `reserve: false` gives it back. Kept in memory: the session states
+    /// it again when it goes on.
+    pub const RESERVE: &str = "mesh.reserve";
     /// [`super::LendParams`] -> [`super::MeshStatus`]: whether members may use this computer's
     /// model (off: its card shows no model and its claims are refused); this computer still uses
     /// theirs.
@@ -459,6 +466,21 @@ pub struct ClaimParams {
     /// context pool while it runs (0: unknown, any model, one slot's share).
     #[serde(default)]
     pub tokens: u32,
+}
+
+/// [`methods::RESERVE`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReserveParams {
+    pub session_id: String,
+    /// This computer's own models of this tag are reserved.
+    #[serde(default = "crate::contracts::model::default_tag")]
+    pub tag: String,
+    /// The context to keep for the session (tokens).
+    #[serde(default)]
+    pub tokens: u32,
+    /// false: the reservation is given back.
+    #[serde(default = "claim_waits")]
+    pub reserve: bool,
 }
 
 fn claim_waits() -> bool {

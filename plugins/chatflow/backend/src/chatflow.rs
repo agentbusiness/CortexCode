@@ -88,6 +88,8 @@ pub fn hello() -> Hello {
         cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED.to_owned(),
         // The app's work paused or resumed (the header's Pause).
         agents_topics::PAUSED.to_owned(),
+        // Who does agent work changed: lead mode may have ended.
+        agents_topics::WORKERS_CHANGED.to_owned(),
     ];
     hello
 }
@@ -522,6 +524,10 @@ impl Chatflow {
         let lead = !matches!(priority, Priority::Agent) && crate::lead::leads(host, session).await;
         let skills_changed_ms = self.inner.skills_changed_ms.load(Ordering::SeqCst);
         let prefix: Prefix = context::ensure(journal, &project.id, &data, role, lead, skills_changed_ms).await?;
+        // A lead keeps this computer's model for its whole conversation, between its calls too.
+        if lead {
+            crate::lead::reserve(host, &session.id, prefix.ctx_window, true).await;
+        }
         let workspace = if session.workspace.is_empty() { project.root.clone() } else { session.workspace.clone() };
         let info = context::model_info(host).await;
         // A session runs on one model: its first run records it, and a run on another model (after
@@ -932,6 +938,12 @@ impl Chatflow {
                 let conversation = |entries: &[JournalEntry]| crate::prewarm::conversation(&env.prefix, &env.data, entries, env.image_input);
                 let prewarm = crate::fit::prepare(env, &mut journal, u64::MAX, env.data.limits.compact_idle_tokens, crate::prewarm::When::Idle, conversation).await;
                 self.set_prewarm(session_id, prewarm);
+                // A lead keeps its model while its agents still work (its conversation stays in the
+                // pool for their reports), and gives it back when nothing of its work is open.
+                if env.lead {
+                    let open = crate::manage::open_work(env, &journal.entries_vec()).await;
+                    crate::lead::reserve(&env.host, session_id, env.prefix.ctx_window, !open.is_empty()).await;
+                }
             }
             // Messages that arrived too late for this run, then queued follow-ups, each start a turn.
             let next = journal.pending_steers("steer").into_iter().chain(journal.pending_steers("followup")).next();
@@ -2056,6 +2068,11 @@ impl Plugin for Chatflow {
     }
 
     fn event(&self, ctx: Ctx, topic: String, data: Value) -> BoxFuture<'static, ()> {
+        // Lead mode ended: the leads' model reservations go back.
+        if topic == agents_topics::WORKERS_CHANGED && data.get("active").and_then(Value::as_str).is_some_and(|active| !cc_protocol::contracts::agents::workers::frontier(active)) {
+            let host = Host::new(ctx.clone());
+            return Box::pin(async move { crate::lead::release_all(&host).await });
+        }
         if topic == agents_topics::PAUSED
             && let Some(paused) = data.get("paused").and_then(Value::as_bool)
         {

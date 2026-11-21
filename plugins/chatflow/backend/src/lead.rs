@@ -25,3 +25,33 @@ pub async fn frontier_active(host: &Host) -> bool {
 pub async fn leads(host: &Host, session: &Session) -> bool {
     session.kind == SessionKind::Chat && frontier_active(host).await
 }
+
+/// Lead sessions whose model reservation this instance holds (to give them all back when lead
+/// mode ends). Runtime state, like the claims themselves: the mesh keeps reservations in memory.
+static RESERVED: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Keep (or give back) this computer's model for a lead session between its calls
+/// (`mesh.reserve`): the lead's large conversation stays in the model's pool while it waits for
+/// its agents, and a member's work is placed here only when it fits beside it. Without the mesh
+/// plugin nothing is kept, and nothing needs to be.
+pub async fn reserve(host: &Host, session_id: &str, tokens: u32, keep: bool) {
+    let params = json!({"session_id": session_id, "tag": crate::chatflow::FLOW, "tokens": tokens, "reserve": keep});
+    if let Err(error) = host.call(cc_protocol::contracts::mesh::methods::RESERVE, params).await {
+        tracing::debug!(%error, "the model was not reserved for the lead");
+        return;
+    }
+    let mut reserved = RESERVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if keep {
+        reserved.insert(session_id.to_owned());
+    } else {
+        reserved.remove(session_id);
+    }
+}
+
+/// Lead mode ended (the local model does agent work again): every lead's reservation goes back.
+pub async fn release_all(host: &Host) {
+    let sessions: Vec<String> = RESERVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().cloned().collect();
+    for session in sessions {
+        reserve(host, &session, 0, false).await;
+    }
+}

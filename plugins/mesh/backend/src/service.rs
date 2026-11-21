@@ -45,6 +45,7 @@ pub const PROVIDES: &[&str] = &[
     methods::LINK,
     methods::CLAIM,
     methods::RELEASE,
+    methods::RESERVE,
     methods::SERVICES,
     methods::SERVICE_CALL,
 ];
@@ -976,6 +977,22 @@ impl Mesh {
                 let params: ClaimParams = parse_params(params)?;
                 self.release(&params.session_id).await;
                 Ok(json!({}))
+            }
+            methods::RESERVE => {
+                let params: cc_protocol::contracts::mesh::ReserveParams = parse_params(params)?;
+                // This computer's own models of the tag (a model another app lends here is not
+                // this app's to keep).
+                let plugins: Vec<String> = match (params.reserve, self.ctx.get()) {
+                    (true, Some(ctx)) => crate::card::local_models(ctx)
+                        .await
+                        .into_iter()
+                        .filter(|(_, info)| info.tags.iter().any(|tag| tag == &params.tag))
+                        .map(|(plugin, _)| plugin)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                self.reserve(&params.session_id, &plugins, params.tokens);
+                Ok(json!({"reserved": plugins}))
             }
             methods::LINK => {
                 let mut params: NodeParams = parse_params(params)?;

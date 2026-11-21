@@ -33,6 +33,12 @@
 //! states, and at least one slot's share (the pool over its slots; a claim that states none takes
 //! just that). A model takes a call only when the pool has room for it. A call too big for what is
 //! free waits, and the calls behind it wait behind it, so it runs when the running ones have ended.
+//!
+//! A session may also reserve part of this computer's own model beyond its calls
+//! (`mesh.reserve`): a session that leads others' work keeps its large conversation in the pool
+//! while it waits for them. A reservation counts like a held use's tokens for every other use,
+//! here or from a member, so another use is given the model only when it fits beside it; the
+//! reserving session's own calls here run inside it (its tokens are not counted twice).
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
@@ -65,6 +71,14 @@ const MEMBER_ANSWER: Duration = Duration::from_secs(10);
 pub struct Lending {
     holders: Vec<Holder>,
     waiting: Vec<Waiter>,
+    reserved: Vec<Reservation>,
+}
+
+/// Part of this computer's model `plugin` kept for one session beyond its calls.
+struct Reservation {
+    session: String,
+    plugin: String,
+    tokens: u32,
 }
 
 struct Holder {
@@ -128,7 +142,7 @@ impl Mesh {
     /// uses held, and fewer slots busy, than it has slots), nothing waits for one and its context
     /// pool has room for the call's `tokens`; or, for a person's call made here, no other person's
     /// call holds or runs it and the context other uses state leaves it room.
-    async fn model_free_for(&self, requester: &str, foreground: bool, plugin: &str, tokens: u32) -> bool {
+    async fn model_free_for(&self, requester: &str, session: &str, foreground: bool, plugin: &str, tokens: u32) -> bool {
         let Some(ctx) = self.ctx.get() else { return false };
         let Some(slots) = ctx.call("model.slots", crate::card::for_model(plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()) else { return false };
         // The pool the slots share (0: not known, slots alone decide) and one slot's share of it.
@@ -140,17 +154,25 @@ impl Mesh {
         let need = u64::from(tokens).max(share).min(pool);
         let lending = lock(&self.claims.lending);
         let holders = || lending.holders.iter().filter(|holder| holder.plugin == plugin);
+        // What sessions keep of the pool beyond their calls; a call of the reserving session on
+        // this computer runs inside its own reservation.
+        let reserved: u64 = lending
+            .reserved
+            .iter()
+            .filter(|reservation| reservation.plugin == plugin && !(requester.is_empty() && reservation.session == session))
+            .map(|reservation| u64::from(reservation.tokens))
+            .sum();
         if foreground && requester.is_empty() {
             let person_holds = holders().any(|holder| holder.foreground && holder.requester.is_empty());
             let person_runs = slots.slots.iter().any(|slot| slot.busy && slot.priority == Some(Priority::Foreground)) || slots.queued_by_priority.foreground > 0;
             let stated: u64 = holders().map(|holder| u64::from(holder.tokens)).sum();
-            return !person_holds && !person_runs && (pool == 0 || stated + need <= pool);
+            return !person_holds && !person_runs && (pool == 0 || stated + reserved + need <= pool);
         }
         // A held use may not run yet, and work that does not claim runs without a holder: the
         // larger of the two counts the slots taken.
         let taken = holders().count().max(slots.busy as usize);
         let held = holders().map(|holder| u64::from(holder.tokens).max(share)).sum::<u64>().max(u64::from(slots.busy) * share);
-        taken < slots.slots.len().max(1) && slots.queued == 0 && (pool == 0 || held + need <= pool)
+        taken < slots.slots.len().max(1) && slots.queued == 0 && (pool == 0 || held + reserved + need <= pool)
     }
 
     /// Lend this computer's model `plugin` for one use: at once when it is free and no older run
@@ -160,7 +182,7 @@ impl Mesh {
         // A person here waits only for an older person here; anyone else for any older run.
         let person = foreground && requester.is_empty();
         let older_waits = lock(&self.claims.lending).waiting.iter().any(|waiter| waiter.plugin == plugin && waiter.since < since && (!person || (waiter.foreground && waiter.requester.is_empty())));
-        if !older_waits && self.model_free_for(requester, foreground, plugin, tokens).await {
+        if !older_waits && self.model_free_for(requester, session, foreground, plugin, tokens).await {
             let mut lending = lock(&self.claims.lending);
             lending.holders.retain(|holder| !(holder.requester == requester && holder.session == session));
             lending.holders.push(Holder { requester: requester.to_owned(), session: session.to_owned(), plugin: plugin.to_owned(), foreground, tokens });
@@ -195,10 +217,25 @@ impl Mesh {
         self.claims.freed.notify_one();
     }
 
-    /// A use of this computer's model `plugin` is held or waited for.
+    /// A use of this computer's model `plugin` is held, reserved or waited for.
     pub fn model_in_use(&self, plugin: &str) -> bool {
         let lending = lock(&self.claims.lending);
-        lending.holders.iter().any(|holder| holder.plugin == plugin) || lending.waiting.iter().any(|waiter| waiter.plugin == plugin)
+        lending.holders.iter().any(|holder| holder.plugin == plugin)
+            || lending.reserved.iter().any(|reservation| reservation.plugin == plugin)
+            || lending.waiting.iter().any(|waiter| waiter.plugin == plugin)
+    }
+
+    /// Keep `tokens` of each of this computer's models `plugins` for `session` beyond its calls
+    /// (stated again: replaced), or give the session's reservations back (`plugins` empty).
+    pub fn reserve(&self, session: &str, plugins: &[String], tokens: u32) {
+        let mut lending = lock(&self.claims.lending);
+        lending.reserved.retain(|reservation| reservation.session != session);
+        for plugin in plugins {
+            lending.reserved.push(Reservation { session: session.to_owned(), plugin: plugin.clone(), tokens });
+        }
+        drop(lending);
+        // Less kept: a waiting use may fit now.
+        self.claims.freed.notify_one();
     }
 
     /// A member went away: what it held or waited for here is over.
@@ -248,7 +285,7 @@ impl Mesh {
                     if !person && held_back.contains(&plugin) {
                         continue;
                     }
-                    if self.model_free_for(&requester, foreground, &plugin, tokens).await {
+                    if self.model_free_for(&requester, &session, foreground, &plugin, tokens).await {
                         next = Some((requester, session));
                         break;
                     }

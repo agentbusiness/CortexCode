@@ -22,7 +22,7 @@ swap = "blue_green"
 provides = [
   "mesh.status", "mesh.pair.start", "mesh.pair.join", "mesh.pair.cancel", "mesh.members", "mesh.revoke",
   "mesh.leave", "mesh.name", "mesh.card", "mesh.peers", "mesh.call", "mesh.place", "mesh.place.end",
-  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release",
+  "mesh.capacity", "mesh.projects", "mesh.link", "mesh.claim", "mesh.release", "mesh.reserve",
 ]
 subscribes = ["model.", "plugin.state", "plugin.swapped", "session.changed", "project.", "memory.knowledge.changed"]
 publishes = ["mesh.changed"]
