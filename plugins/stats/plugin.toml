@@ -1,0 +1,19 @@
+# Plugin manifest (plugin.toml, schema ccplugin/1). One folder is one plugin, the same in every Cortex
+# app (the standard). Paths are relative to this folder.
+
+[plugin]
+id = "stats"
+name = "Statistics"
+version = "0.1.0"
+description = "Writes what every process of the app collected about itself (its errors, warnings and served calls) as Parquet day files, kept 30 days, and delivers them to a CortexManage on the mesh that manages the app's repository."
+license = "UNLICENSED"
+platforms = ["macos", "linux"]
+
+[backend]
+category = "stats"
+contract = "stats@1"
+dir = "backend"
+build = ["cargo", "build", "--release"]
+exec = "backend/target/release/cc-stats"
+provides = ["stats.record"]
+uses = ["mesh.card", "mesh.services", "mesh.service.call"]

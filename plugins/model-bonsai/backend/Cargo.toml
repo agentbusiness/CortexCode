@@ -22,6 +22,7 @@ path = "src/lib.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["model", "memory"] }
+cc-stats-kit = { path = "../../../stats-kit" }
 cc-model-kit = { path = "../../../model-kit" }
 # The models folder the Cortex apps share (~/.cortex-models).
 cc-shared-models = { path = "../../../shared-models" }

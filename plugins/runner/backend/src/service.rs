@@ -514,8 +514,9 @@ impl Runner {
 
     // ---- approvals -------------------------------------------------------------------------------
 
-    /// The builder asks before a call: what the plan lists is approved by the host; anything
-    /// else waits for the manager's answer (it is in the facts).
+    /// The builder asks before a call: what the plan lists is approved by the host, anything else
+    /// is refused by it at once. A job never waits for an answer: nobody is asked, the builder
+    /// decides how to go on without it.
     async fn approval_asked(&self, ctx: &Ctx, job_id: &str, seq: u64) {
         let (session_id, listed) = {
             let jobs = lock(&self.inner.jobs);
@@ -524,12 +525,9 @@ impl Runner {
             let listed = !approval.classes.is_empty() && approval.classes.iter().all(|class| live.job.approve.iter().any(|allowed| allowed == class));
             (live.job.session_id.clone(), listed)
         };
-        if !listed {
-            return;
-        }
         let host = Host::new(ctx.clone());
-        if let Err(error) = host.effect(&flows::method(FLOW, verbs::APPROVE), json!({"session_id": session_id, "seq": seq, "approve": true})).await {
-            tracing::warn!(%error, job = %job_id, "an approval the plan lists could not be given");
+        if let Err(error) = host.effect(&flows::method(FLOW, verbs::APPROVE), json!({"session_id": session_id, "seq": seq, "approve": listed})).await {
+            tracing::warn!(%error, job = %job_id, listed, "an approval could not be answered");
         }
     }
 
@@ -1118,7 +1116,10 @@ impl Runner {
                 jobs.push(facts);
             }
         }
-        Ok(json!({"jobs": jobs}))
+        // The repositories this runner holds a mirror of, by their source: work for one goes here first.
+        let mut repos: Vec<String> = lock(&self.inner.repos).values().map(|repo| repo.url.clone()).collect();
+        repos.sort();
+        Ok(json!({"jobs": jobs, "repos": repos}))
     }
 
     /// The worktree and the project go; the branch stays in the mirror.

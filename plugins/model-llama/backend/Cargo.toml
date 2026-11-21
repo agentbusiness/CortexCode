@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["memory", "mesh", "model", "preserve_order"] }
+cc-stats-kit = { path = "../../../stats-kit" }
 # The models folder the Cortex apps share (~/.cortex-models), where Gemma lives.
 cc-shared-models = { path = "../../../shared-models" }
 serde = { version = "1.0.228", features = ["derive"] }

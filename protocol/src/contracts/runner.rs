@@ -16,7 +16,7 @@ pub mod methods {
     pub const START: &str = "runner.start";
     /// `{job_id}` -> [`super::Facts`].
     pub const GET: &str = "runner.get";
-    /// `{}` -> `{jobs: [Facts]}`.
+    /// `{}` -> `{jobs: [Facts], repos: [url]}`: its jobs, and the sources it holds a mirror of.
     pub const LIST: &str = "runner.list";
     /// `{job_id, attempt}` -> [`super::Facts`]: cancel the run; the worktree stays.
     pub const STOP: &str = "runner.stop";
@@ -129,7 +129,8 @@ pub struct StartParams {
     pub protected: Vec<String>,
     #[serde(default)]
     pub standard_change: bool,
-    /// Approval classes the plan lists; every other approval question is refused.
+    /// Approval classes the plan lists; the runner refuses every other approval question at once,
+    /// so a job never waits for an answer.
     #[serde(default)]
     pub approve: Vec<String>,
     /// Lines for every commit's trailer (`Package: pk-0142`, `Charter: …`).

@@ -10,13 +10,14 @@
 //!   (`terminal.command`, `system.schedule`); the frame routes it by the category as any call.
 //! - A **method** ends with a verb from a fixed list, and the verb alone says what the method may
 //!   do ([`access_of`]): `list`, `get`, `read` look; `create`, `edit`, `delete` change what is
-//!   stored; `run`, `stop` make something happen on the machine. A method whose verb is not on the
+//!   stored; `run`, `stop` make something happen on the machine; `send` hands the service a
+//!   record about the caller itself (its errors, its metrics: `reports`). A method whose verb is not on the
 //!   list cannot be shared.
 //! - A plugin that shares answers `<category>.shares` with a [`ShareList`]: each service with a
 //!   one-line description and each method with its description and a JSON schema of its params,
 //!   written for people and models alike (the host turns them into model tools).
-//! - Where a call may come from: `read` from any member; `edit` and `run` only from apps on the
-//!   same machine (a session runs where its project is, so its calls are local there). There is
+//! - Where a call may come from: `read` and `send` from any member; `edit` and `run` only from
+//!   apps on the same machine (a session runs where its project is, so its calls are local there). There is
 //!   nothing to set: what a plugin declares is always shared under these rules.
 //! - Who it is for: the provider declares it ([`Audience`]), so no app names another app's
 //!   service to keep it from its model. `models` (the default) may be a model tool; `apps` is for
@@ -42,6 +43,8 @@ pub enum Access {
     Edit,
     /// run, stop: makes something happen on the machine.
     Run,
+    /// send: hands over a record about the caller itself; it changes nothing else.
+    Send,
 }
 
 impl Access {
@@ -50,12 +53,18 @@ impl Access {
             Access::Read => "read",
             Access::Edit => "edit",
             Access::Run => "run",
+            Access::Send => "send",
         }
+    }
+
+    /// Whether a member on another computer may call it: looking, and sending about itself.
+    pub fn from_anywhere(self) -> bool {
+        matches!(self, Access::Read | Access::Send)
     }
 }
 
 /// The verbs a shared method may end with, and what each may do.
-pub const VERBS: [(&str, Access); 8] = [
+pub const VERBS: [(&str, Access); 9] = [
     ("list", Access::Read),
     ("get", Access::Read),
     ("read", Access::Read),
@@ -64,6 +73,7 @@ pub const VERBS: [(&str, Access); 8] = [
     ("delete", Access::Edit),
     ("run", Access::Run),
     ("stop", Access::Run),
+    ("send", Access::Send),
 ];
 
 /// What a method may do, from its last word; None when it is not a shareable verb.

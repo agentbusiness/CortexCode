@@ -88,7 +88,7 @@ impl Mesh {
             return Err(refuse(format!("`{method}` is not shared with members")));
         };
         let local = self.is_local(node);
-        if access != Access::Read && !local {
+        if !access.from_anywhere() && !local {
             return Err(refuse(format!(
                 "`{method}` {}s on this machine only for apps on this machine: work runs where its project is",
                 access.as_str()
@@ -205,7 +205,7 @@ impl Mesh {
             .local_shares()
             .await
             .into_iter()
-            .map(|share| OfferedService { node: me.clone(), name: self.name(), here: true, local: true, reachable: true, share, access: vec![Access::Read, Access::Edit, Access::Run] })
+            .map(|share| OfferedService { node: me.clone(), name: self.name(), here: true, local: true, reachable: true, share, access: vec![Access::Read, Access::Edit, Access::Run, Access::Send] })
             .collect();
         let mine: Vec<String> = out.iter().map(|offer| offer.share.service.clone()).collect();
         let peers: Vec<(String, String, bool, bool)> = self
@@ -228,7 +228,7 @@ impl Mesh {
                 if share.audience == Audience::Peers && !mine.contains(&share.service) {
                     continue;
                 }
-                let access = if local { vec![Access::Read, Access::Edit, Access::Run] } else { vec![Access::Read] };
+                let access = if local { vec![Access::Read, Access::Edit, Access::Run, Access::Send] } else { vec![Access::Read, Access::Send] };
                 out.push(OfferedService { node: node.clone(), name: name.clone(), here: false, local, reachable, share, access });
             }
         }
@@ -248,15 +248,15 @@ impl Mesh {
         let fits = |offer: &&OfferedService| offer.share.service == service && offer.share.method(&params.method).is_some() && offer.reachable;
         let chosen = if params.node.is_empty() {
             // This app first, then another app on this machine; a read may go anywhere.
-            offered.iter().filter(fits).find(|o| o.here).or_else(|| offered.iter().filter(fits).find(|o| o.local)).or_else(|| if access == Access::Read { offered.iter().find(fits) } else { None })
+            offered.iter().filter(fits).find(|o| o.here).or_else(|| offered.iter().filter(fits).find(|o| o.local)).or_else(|| if access.from_anywhere() { offered.iter().find(fits) } else { None })
         } else {
             offered.iter().filter(fits).find(|o| o.node == params.node)
         };
         let Some(offer) = chosen else {
-            let where_ = if access == Access::Read { "on the network" } else { "on this machine" };
+            let where_ = if access.from_anywhere() { "on the network" } else { "on this machine" };
             return Err(RpcError::new(codes::UNAVAILABLE, format!("no app {where_} offers `{}` now", params.method)));
         };
-        if access != Access::Read && !offer.local {
+        if !access.from_anywhere() && !offer.local {
             return Err(RpcError::new(codes::CONTRACT_VIOLATION, format!("`{}` runs only on the machine where your work runs; {} is another computer", params.method, offer.name)));
         }
         if offer.node == me {

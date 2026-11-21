@@ -20,6 +20,7 @@ path = "src/lib.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["hashline", "lang", "memory", "model", "notify", "skills"] }
+cc-stats-kit = { path = "../../../stats-kit" }
 # Its own skills (data/skills, the skills format of the language and skills plugins).
 cc-lang-kit = { path = "../../../lang-kit" }
 # The models folder the Cortex apps share (~/.cortex-models), where the embedding model lives.

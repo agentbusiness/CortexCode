@@ -629,10 +629,7 @@ const REAP_EVERY: Duration = Duration::from_secs(60);
 
 /// Serve `pack` to the frame until it shuts the plugin down; returns the process exit code.
 pub fn run_pack<P: LanguagePack>(pack: P) -> i32 {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("CORTEX_LOG").unwrap_or_else(|_| "warn".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    cc_stats_kit::start("CORTEX_LOG", "warn", &format!("cc-lang-{}", pack.id()), env!("CARGO_PKG_VERSION"));
     let category = format!("lang-{}", pack.id());
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,

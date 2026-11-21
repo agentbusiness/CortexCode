@@ -24,6 +24,7 @@ procedure_note = "A method reviewed by the owner for this project. Use only when
 # Under a failure: what was learned the last time this failure came (one line each).
 # A replay of a lesson (replay.rs) asks nobody for approval.
 replay_denied = "Not run: this is a replay with nobody to approve it. Continue without this command."
+runner_denied = "Not run: this job runs with nobody to approve anything, and nobody will answer. Do not ask and do not wait. Do the task without this call: find a way that stays inside the workspace and the sandbox, or leave this step out and say in the task's result what was not done and why. Then continue with the task."
 lessons_failure = "This failed the same way in earlier work; what worked then:\n{text}"
 # LEARN: one episode of a finished run, in host words (the stage's user message).
 learn_card = "Languages: {languages}. The run ended {outcome}.\n{body}\nWrite the lesson this episode teaches, then judge it."

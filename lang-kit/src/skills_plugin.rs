@@ -173,10 +173,7 @@ impl Plugin for SkillsPlugin {
 /// `skills-<id>` until the frame shuts the plugin down; returns the
 /// process exit code. `version` is the plugin build's (its crate's `CARGO_PKG_VERSION`).
 pub fn run_skills_plugin(id: &str, name: &str, version: &str, skills_dir: Option<PathBuf>) -> i32 {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("CORTEX_LOG").unwrap_or_else(|_| "warn".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    cc_stats_kit::start("CORTEX_LOG", "warn", &format!("cc-skills-{id}"), version);
     let category = format!("skills-{id}");
     if contract_of(&category) != Some(contract::CONTRACT) {
         eprintln!("cc-{category}: `{id}` is not a skills id (lowercase letters, digits and -)");

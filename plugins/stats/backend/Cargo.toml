@@ -1,0 +1,22 @@
+[package]
+name = "cc-stats"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+publish = false
+description = "stats@1 plugin: writes the app's errors and call counts as Parquet day files and delivers them to a CortexManage on the mesh."
+
+# Own workspace: the plugin builds (and ships) on its own.
+[workspace]
+
+[[bin]]
+name = "cc-stats"
+path = "src/main.rs"
+
+[dependencies]
+cc-protocol = { path = "../../../protocol", features = ["mesh", "release", "reports", "service"] }
+cc-stats-kit = { path = "../../../stats-kit", features = ["files"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"

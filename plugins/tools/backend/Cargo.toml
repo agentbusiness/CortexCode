@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 cc-protocol = { path = "../../../protocol", features = ["agents", "hashline", "lang", "memory", "mesh", "model", "skills", "tools", "vcs"] }
+cc-stats-kit = { path = "../../../stats-kit" }
 # The write sandbox, shared with CortexTerm.
 cc-sandbox-kit = { path = "../../../sandbox-kit" }
 # The caller's side of shared services and their text for a model, shared with CortexTerm.

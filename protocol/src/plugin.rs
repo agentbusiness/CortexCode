@@ -24,6 +24,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+/// Told of every category call this process served: its method, how long it took, how it ended.
+pub type CallObserver = fn(&str, Duration, &Result<Value, RpcError>);
+
+static CALL_OBSERVER: OnceLock<CallObserver> = OnceLock::new();
+
+/// Set the observer of served calls (`stats-kit` counts them); the first one set stays.
+pub fn observe_calls(observer: CallObserver) {
+    let _ = CALL_OBSERVER.set(observer);
+}
+
+/// Told once the plugin has joined its frame, with its connection (`stats-kit` starts handing its
+/// records over).
+pub type ConnectedHook = fn(Ctx);
+
+static CONNECTED_HOOK: OnceLock<ConnectedHook> = OnceLock::new();
+
+/// Set what runs once the plugin has joined its frame; the first one set stays.
+pub fn on_connected(hook: ConnectedHook) {
+    let _ = CONNECTED_HOOK.set(hook);
+}
+
 /// Environment the frame gives every plugin process.
 #[derive(Debug, Clone)]
 pub struct PluginEnv {
@@ -101,6 +122,11 @@ impl Ctx {
     }
 
     /// Version of the frame this plugin is connected to (from its hello acknowledgement).
+    /// Where this app's statistics are written (`stats-kit`): `<home>/stats`.
+    pub fn stats_root(&self) -> PathBuf {
+        self.env.home.join("stats")
+    }
+
     pub fn frame_version(&self) -> Option<String> {
         self.ack.get().map(|ack| ack.frame_version.clone())
     }
@@ -276,11 +302,17 @@ impl<P: Plugin> Handler for Host<P> {
                 _ => match admitted {
                     None => Err(RpcError::new(codes::DRAINING, "this plugin instance is draining").retryable()),
                     Some(_guard) => {
+                        let started = Instant::now();
+                        let observed = CALL_OBSERVER.get().map(|observer| (*observer, method.clone()));
                         let call = Call { method, params, items: responder.sink(), cancel: cancel.clone() };
-                        tokio::select! {
+                        let outcome = tokio::select! {
                             outcome = plugin.handle(ctx, call) => outcome,
                             _ = cancel.cancelled() => Err(RpcError::cancelled()),
+                        };
+                        if let Some((observer, method)) = observed {
+                            observer(&method, started.elapsed(), &outcome);
                         }
+                        outcome
                     }
                 },
             };
@@ -326,6 +358,9 @@ pub async fn run_plugin<P: Plugin>(mut hello: Hello, plugin: Arc<P>) -> Result<(
     }
     let _ = ctx.ack.set(ack);
     ctx.ack_ready.notify_waiters();
+    if let Some(hook) = CONNECTED_HOOK.get() {
+        hook(ctx.clone());
+    }
     tokio::select! {
         _ = exit.cancelled() => {}
         _ = conn.wait_closed() => {}

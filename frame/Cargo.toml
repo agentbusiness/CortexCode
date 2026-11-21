@@ -18,7 +18,8 @@ resolver = "3"
 
 [dependencies]
 # preserve_order: the frame relays requests and events with their JSON key order intact.
-cc-protocol = { path = "../protocol", features = ["preserve_order"] }
+cc-protocol = { path = "../protocol", features = ["preserve_order", "reports"] }
+cc-stats-kit = { path = "../stats-kit" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 tokio = { version = "1.53", features = ["full"] }

@@ -712,12 +712,35 @@ enum Approval {
     Stopped,
 }
 
+/// Whether this session builds for a manager (runner mode), or was started by one that does (an
+/// agent a job's session delegated to): then nobody is there to answer.
+async fn unattended(env: &RunEnv, journal: &Journal) -> bool {
+    if crate::runner::on(&journal.entries_vec()) {
+        return true;
+    }
+    let mut next = env.host.session_get(&env.session_id).await.ok().and_then(|session| session.parent);
+    // Delegation is a few levels deep at most; the walk stops at a session without a parent.
+    for _ in 0..8 {
+        let Some(id) = next else { return false };
+        if env.host.journal_read(&id, 0).await.is_ok_and(|entries| crate::runner::on(&entries)) {
+            return true;
+        }
+        next = env.host.session_get(&id).await.ok().and_then(|session| session.parent);
+    }
+    false
+}
+
 /// Wait for the user's answer to an ask-mode call (an `approval` entry the UI answers through
 /// `chatflow.approve`), then run the call again with the approved classes.
 async fn await_approval(env: &RunEnv, journal: &mut Journal, call: &ToolCall, outcome: &ToolOutcome, existing: Option<u64>) -> Result<Approval, RpcError> {
     // A replay (`replay.rs`) has nobody to ask: what needs approval is not run.
     if crate::replay::arm(&journal.entries_vec()).is_some() {
         return Ok(Approval::Answered(env.data.text("replay_denied", &[])));
+    }
+    // A job a manager runs has nobody to ask either: no person is there, the computer may be a
+    // server. What needs approval is not run, at once, and the builder goes on without it.
+    if unattended(env, journal).await {
+        return Ok(Approval::Answered(env.data.text("runner_denied", &[])));
     }
     let classes: Vec<String> = outcome
         .display

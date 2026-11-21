@@ -5,6 +5,7 @@ use cc_tools::service::{COMMANDS, PROVIDES, ToolsPlugin};
 use std::sync::Arc;
 
 fn main() {
+    cc_stats_kit::start("CORTEX_LOG", "warn", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {

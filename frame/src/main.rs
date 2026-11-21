@@ -167,8 +167,12 @@ fn init_logging(home: &Home) -> std::io::Result<()> {
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false))
         .with(tracing_subscriber::fmt::layer().with_writer(std::sync::Mutex::new(file)).with_ansi(false).with_target(false))
+        .with(cc_stats_kit::errors::ErrorLayer)
         .try_init()
-        .map_err(|error| std::io::Error::other(error.to_string()))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    // The frame's own errors, as every plugin's: `<home>/stats`, delivered by the mesh.
+    cc_stats_kit::begin(cc_stats_kit::Recorder { part: "frame".into(), version: env!("CARGO_PKG_VERSION").into(), node: String::new() });
+    Ok(())
 }
 
 async fn run(cli: Cli, config: Config, home: Home) -> ExitCode {
@@ -224,6 +228,25 @@ async fn serve(cli: Cli, config: Config, home: Home) -> Result<(), String> {
     if let Err(error) = frame.power.hold(power::FRAME_HOLDER, power::FRAME_REASON, power::FRAME_PEER) {
         tracing::error!(%error, "cannot keep the machine awake");
     }
+
+    // The frame's own errors and calls go to the stats plugin once a minute, as every plugin's do.
+    let stats_frame = frame.clone();
+    tokio::spawn(async move {
+        loop {
+            cc_stats_kit::next_window().await;
+            let Some(route) = stats_frame.route(cc_protocol::contracts::reports::STATS) else { continue };
+            let mut batches = cc_stats_kit::take().into_iter();
+            while let Some(batch) = batches.next() {
+                let Ok(params) = serde_json::to_value(&batch) else { continue };
+                if route.conn.call_timeout(cc_protocol::contracts::reports::methods::RECORD, params, Duration::from_secs(30)).await.is_err() {
+                    let mut back = vec![batch];
+                    back.extend(batches);
+                    cc_stats_kit::give_back(back);
+                    break;
+                }
+            }
+        }
+    });
 
     // Accept plugin connections.
     let accept_frame = frame.clone();
