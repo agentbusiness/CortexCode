@@ -577,6 +577,12 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
       {open && (
         <>
           <ul className="lst cx-sessions" aria-label={`Conversations in ${project.name}`}>
+            <li className="cx-new">
+              <button type="button" onClick={onNewChat} disabled={creating} title={`Start a new session in ${project.name}`}>
+                <span className="cx-new-plus" aria-hidden="true">+</span>
+                <span className="cx-new-label">{creating ? 'Starting…' : 'New session'}</span>
+              </button>
+            </li>
             {chats.map((session) => (
               <Fragment key={session.id}>
                 <SessionRow session={session} now={now} away={away.get(session.id)} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
@@ -594,13 +600,6 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
                 )}
               </Fragment>
             ))}
-            {sessions.data && chats.length === 0 && (
-              <li className="cx-none">
-                <button type="button" onClick={onNewChat} disabled={creating}>
-                  <span className="t">{creating ? 'Starting…' : 'Start the first conversation'}</span>
-                </button>
-              </li>
-            )}
           </ul>
           {looseAgents.length > 0 && (
             <>

@@ -2061,13 +2061,14 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         .with_catalog(&catalog, skills_max);
     // The planner is told how its plan is used: carried out at once task by task (auto), written
     // again after a task ended badly, or the next version of the open plan.
-    // Agents free to run tasks now (joined computers and local scheduler slots): the planner hears
-    // the number only. An auto plan with free agents runs its independent tasks as agents at once
+    // An auto plan whose tasks agents can take runs its independent tasks as agents at once
     // (`parallel_implementation`), so the planner is told that instead of "here, one at a time".
-    let free = agent_capacity(env).await;
+    // Whether agents can take them is structural ([`agents_can_take`]), never how many are free
+    // this moment: the work this plan replaces still holds its places while it is written.
+    let parallel = agents_can_take(env).await;
     let edit = match &mode {
         // A lead session's plan is cut for frontier agents (`plan_lead`, below), not for the local one.
-        PlanMode::Auto if free > 0 && !env.lead => env.data.text("plan_auto_parallel_live", &[("count", &free.to_string())]),
+        PlanMode::Auto if parallel && !env.lead => env.data.text("plan_auto_parallel_live", &[]),
         PlanMode::Auto => env.data.text("plan_auto_live", &[]),
         PlanMode::Replan { failed, outcome, summary, .. } => {
             let plan = previous.clone().unwrap_or_default();
@@ -2879,30 +2880,36 @@ async fn mesh_capacity(env: &RunEnv) -> u64 {
     env.host.get::<Value>(cc_protocol::contracts::mesh::methods::CAPACITY, json!({"tag": crate::chatflow::FLOW})).await.ok().and_then(|capacity| capacity.get("free").and_then(Value::as_u64)).unwrap_or(0)
 }
 
-/// How many agents could start a task now: joined computers, plus the agents scheduler's free
-/// slots on this machine when its limit holds two or more (one slot is the same work, one task at
-/// a time, so the foreground does it).
-async fn agent_capacity(env: &RunEnv) -> u64 {
+/// Whether agents could take a plan's independent tasks: a joined computer free for the session's
+/// model calls, or this machine's agents scheduler allowed two or more agents in flight (its
+/// bound `max`, 0 = none; one in flight is the same work as the foreground, one task at a time).
+/// The bound, never the limit or the places free now: the limit is a passing guard that steps down
+/// while a foreground call waits for the model (the planner's own call included) and lifts again,
+/// the agents of the work a plan replaces hold their places until it starts, and tasks past the
+/// limit queue and start as places free (seen: a replan written while the plan it replaced still
+/// had four agents saw none free, was told "here, one at a time", and chained every task).
+async fn agents_can_take(env: &RunEnv) -> bool {
     let local = env
         .host
         .get::<cc_protocol::contracts::agents::SchedulerState>(agents_methods::SCHEDULER, json!({"project_id": env.scope.project_id}))
         .await
         .ok()
-        .filter(|state| state.max_parallel >= 2)
-        .map(|state| u64::from(state.max_parallel).saturating_sub(state.running.len() as u64))
-        .unwrap_or(0);
-    mesh_capacity(env).await + local
+        .is_some_and(|state| {
+            let max = state.detail.get("bounds").and_then(|bounds| bounds.get("max")).and_then(Value::as_u64).unwrap_or(u64::from(state.max_parallel));
+            max == 0 || max >= 2
+        });
+    local || mesh_capacity(env).await > 0
 }
 
-/// The auto plan just written: when two of its tasks could run at the same time and an agent
-/// (a joined computer or a local scheduler slot) is free to take one, every task goes to the agents now (the ready ones start, the
+/// The auto plan just written: when two of its tasks could run at the same time and agents can
+/// take them ([`agents_can_take`]), every task goes to the agents now (the ready ones start, the
 /// rest as what they depend on finishes, each agent's model placed by the mesh), and this turn
 /// ends with the delegation note. Otherwise the Act stage carries the plan out here, task by task.
 async fn parallel_implementation(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
     let Some((plan_seq, mut current)) = plan::for_run(&entries, &env.run_id) else { return Ok(()) };
     // A lead session hands every plan to agents, one task or many: it does not change files.
-    if !env.lead && (current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || agent_capacity(env).await == 0) {
+    if !env.lead && (current.tasks.len() < 2 || !plan::has_parallel(&current.tasks) || !agents_can_take(env).await) {
         return Ok(());
     }
     if current.tasks.is_empty() {
@@ -2936,7 +2943,7 @@ async fn units_delegation(env: &RunEnv, journal: &mut Journal, route_seq: u64) -
         return Ok(false);
     };
     // A lead session's units go to agents whatever this computer's local capacity is.
-    if !env.lead && agent_capacity(env).await == 0 {
+    if !env.lead && !agents_can_take(env).await {
         return Ok(false);
     }
     let check = cc_protocol::contracts::memory::ContractCheck { name: "units".to_owned(), kind: "command".to_owned(), spec: list_command, expect: None };

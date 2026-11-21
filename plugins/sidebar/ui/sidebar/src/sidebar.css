@@ -50,8 +50,14 @@
 #cc .cx-sidebar .lst .t{font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 #cc .cx-sidebar .lst .r{margin-top:2px;align-items:center;gap:8px;}
 #cc .cx-sidebar .lst .r .ap{white-space:nowrap;}
-#cc .cx-none button .t{font-style:italic;color:var(--ink-3);font-size:14px;}
-#cc .cx-none button:hover .t{color:var(--ink);}
+/* Every open project's list starts with a New session row, always there. */
+#cc .cx-sidebar .lst li.cx-new>button{display:flex;align-items:center;gap:8px;padding-top:6px;padding-bottom:6px;color:var(--ink-3);}
+#cc .cx-sidebar .lst li.cx-new>button:hover:not(:disabled){color:var(--rubric);}
+#cc .cx-new-plus{
+  display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;box-sizing:border-box;
+  border:1px solid currentColor;font-family:var(--font-apparatus);font-size:11px;font-weight:600;line-height:1;
+}
+#cc .cx-new-label{font-family:var(--font-apparatus);font-size:10.5px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;}
 
 /* Agents under the conversation that started them: indented a little, with a thin guide line. */
 #cc .cx-sessions li.cx-children{padding:0;margin:0 0 2px 0;list-style:none;}
