@@ -97,6 +97,9 @@ pub mod methods {
 pub struct McpListParams {
     /// The command's workspace (the frame holds it to the command's own).
     pub workspace: String,
+    /// The lead's tools (read and run; a planning agent changes nothing).
+    #[serde(default)]
+    pub lead: bool,
 }
 
 /// One tool in MCP's shape.
@@ -125,6 +128,9 @@ pub struct McpCallParams {
     /// The client's id for the call (journal and log only).
     #[serde(default)]
     pub call_id: Option<String>,
+    /// A call of the lead's tools: `edit` and `terminal` are refused.
+    #[serde(default)]
+    pub lead: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

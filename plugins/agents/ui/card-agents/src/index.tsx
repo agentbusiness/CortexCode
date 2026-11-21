@@ -20,7 +20,8 @@ import {
 } from '@cortex/sdk';
 import './agents.css';
 
-const ACTIVE = ['working', 'running', 'blocked', 'verifying'];
+// A finished agent (done, stopped) leaves the card; one waiting for its lead's answer stays.
+const ACTIVE = ['working', 'running', 'blocked', 'waiting', 'verifying'];
 
 /** What an agent's journal says about its run: since when, which stage, how fast, which checks passed. */
 export function runFacts(entries: readonly JournalEntry[]): { since: number | null; stage: string; tokensPerSecond: number | null; passed: number | null; checked: number | null } {

@@ -1118,6 +1118,8 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
             }
             Stage::Plan { auto, .. } => {
                 set_stage(env, journal, status_seq, "plan").await?;
+                // A lead session's plan is written by a frontier planning agent (`write_plan`),
+                // and every one of its tasks goes to agents (`parallel_implementation`).
                 run_plan(env, journal, auto).await?;
                 if auto {
                     parallel_implementation(env, journal).await?;
@@ -2047,7 +2049,8 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // (`parallel_implementation`), so the planner is told that instead of "here, one at a time".
     let free = agent_capacity(env).await;
     let edit = match &mode {
-        PlanMode::Auto if free > 0 => env.data.text("plan_auto_parallel_live", &[("count", &free.to_string())]),
+        // A lead session's plan is cut for frontier agents (`plan_lead`, below), not for the local one.
+        PlanMode::Auto if free > 0 && !env.lead => env.data.text("plan_auto_parallel_live", &[("count", &free.to_string())]),
         PlanMode::Auto => env.data.text("plan_auto_live", &[]),
         PlanMode::Replan { failed, outcome, summary, .. } => {
             let plan = previous.clone().unwrap_or_default();
@@ -2086,7 +2089,15 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             .map(|(_, open)| env.data.text("plan_live_edit", &[("plan_id", &open.plan_id), ("version", &open.version.to_string())]))
             .unwrap_or_default(),
     };
-    let parallel = if free > 0 && !auto { env.data.text("plan_parallel", &[("count", &free.to_string())]) } else { String::new() };
+    // A lead session's tasks go to frontier agents, which plan their own steps: the cut is by whole
+    // pieces of the work (seen: the local cut's "Lay out …" task, an empty file, as a whole agent run).
+    let parallel = if env.lead {
+        env.data.text("plan_lead", &[])
+    } else if free > 0 && !auto {
+        env.data.text("plan_parallel", &[("count", &free.to_string())])
+    } else {
+        String::new()
+    };
     // The work earlier plans of this conversation finished: the new plan builds on it (a replan
     // keeps its own done tasks itself).
     let done = if matches!(mode, PlanMode::Replan { .. }) { Vec::new() } else { done_earlier(env, &entries).await };
@@ -2136,11 +2147,29 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         PlanMode::Asked => previous.is_none(),
         PlanMode::Replan { outcome, .. } => !matches!(outcome.as_str(), "done" | "steered" | "unmet"),
     };
-    if think {
-        plan_notes(env, journal, &joined(&[direction_live.clone(), done_live.clone(), open_live.clone(), carry_live.clone(), asks.clone(), edit.clone()])).await?;
-    }
+    let notes_live = joined(&[direction_live.clone(), done_live.clone(), open_live.clone(), carry_live.clone(), asks.clone(), edit.clone()]);
     let live = joined(&[direction_live, done_live, open_live, carry_live, asks, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
-    let (output, _) = decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?;
+    // A lead session's plan is written by a frontier planning agent (it reads the code, changes
+    // nothing, and answers with this same plan); when none can, the local planner writes it.
+    let mut planned: Option<PlanOutput> = None;
+    if env.lead {
+        match frontier_plan(env, journal, &shape, &live).await {
+            Ok(output) => planned = Some(output),
+            Err(error) if error.code == codes::CANCELLED => return Err(error),
+            Err(error) => {
+                journal.note(&env.run_id, "frontier_plan_failed", &env.data.text("frontier_plan_failed", &[("error", &error.message)]), false).await?;
+            }
+        }
+    }
+    let output = match planned {
+        Some(output) => output,
+        None => {
+            if think {
+                plan_notes(env, journal, &notes_live).await?;
+            }
+            decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?.0
+        }
+    };
     let (mut doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
     // A plan written again keeps what the work is for. The goal is the one the user's request
     // set; the approach and the architecture stay too unless a task ended badly (then the approach
@@ -2276,6 +2305,32 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
         cancel_replaced_tasks(env, previous, &made).await;
     }
     Ok(true)
+}
+
+/// The plan of a lead session, written by a frontier planning agent (`agents.plan`): what to plan
+/// is the user's request as ROUTE stated it (or their latest message), with everything the local
+/// planner would be told (`live`), and the answer is an object of the plan's own schema.
+async fn frontier_plan(env: &RunEnv, journal: &mut Journal, shape: &Shape, live: &str) -> Result<PlanOutput, RpcError> {
+    let entries = journal.entries_vec();
+    let route = entries.iter().rev().find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == env.run_id && str_field(&entry.data, "stage") == "route");
+    let work = route.and_then(|entry| entry.data.get("detail")).map(|detail| str_field(detail, "work").trim().to_owned()).unwrap_or_default();
+    let message = entries.iter().rev().find(|entry| entry.kind == kinds::USER_MESSAGE).map(|entry| str_field(&entry.data, "text").trim().to_owned()).unwrap_or_default();
+    let goal = match (work.is_empty(), message.is_empty()) {
+        (false, false) => env.data.text("frontier_plan_goal", &[("work", &work), ("message", &message)]),
+        (false, true) => work,
+        _ => message,
+    };
+    let params = json!({
+        "project_id": env.scope.project_id,
+        "from_session": env.session_id,
+        "goal": goal,
+        "context": live,
+        "schema": schemas::json_schema(shape),
+    });
+    let any = env.stops.any();
+    let value = env.host.call_with(agents_methods::PLAN, params, crate::host::Effect::Effect, Some(&any)).await?;
+    let result: cc_protocol::contracts::agents::FrontierPlanResult = cc_protocol::parse_params(value)?;
+    serde_json::from_value::<PlanOutput>(result.plan).map_err(|error| RpcError::new(codes::INTERNAL, format!("the planning agent's plan could not be read: {error}")))
 }
 
 /// The stage of the planner's thinking before a plan is written ([`plan_notes`]).

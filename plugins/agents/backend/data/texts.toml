@@ -98,3 +98,10 @@ frontier_no_report = "The worker ended without its report."
 progress_waiting = "{agent} asks about \"{title}\": {question}\nAnswer it to {agent} (steer): the answer is its next message."
 progress_worker_fallback = "{agent} works on \"{title}\" with the local model: {reason}"
 board_waiting = "Waiting for the lead on \"{title}\": {question}"
+frontier_no_plan = "The planning agent ended without a plan."
+# The planning agent's first message: what to plan, then what the lead knows; the step is last.
+frontier_plan_request = "Plan this work:\n{goal}\n\nWhat the lead knows for the plan:\n{context}\n\nRead what the work touches, then answer with the plan."
+frontier_plan_title = "Plan: {goal}"
+# Progress the lead hears while frontier agents work.
+progress_planning = "{agent} plans \"{goal}\" (a frontier agent: it reads, changes nothing, and answers with the plan)."
+progress_said = "{agent} on \"{title}\": {text}"

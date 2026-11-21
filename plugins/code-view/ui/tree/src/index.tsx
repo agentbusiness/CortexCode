@@ -163,7 +163,8 @@ function Tree() {
         )}
       </div>
       <div className="cx-tree-scroll">
-        {diff.error && !diff.data && <ServiceProblem service="vcs" state={diff} className="inline-error" />}
+        {/* A folder that is not a git repository has no changes to show: that is no failure. */}
+        {diff.error && !diff.data && diff.errorCode !== 'not_found' && <ServiceProblem service="vcs" state={diff} className="inline-error" />}
         {!diff.data && !diff.error && <p className="hint cx-pad">Reading the changes…</p>}
         {diff.data && nothing && (
           <p className="empty-line cx-pad">

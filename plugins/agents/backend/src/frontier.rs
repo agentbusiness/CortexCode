@@ -92,6 +92,8 @@ pub struct RunEnd {
     pub start_failed: bool,
     /// The CLI's own failure text, when it failed.
     pub error: Option<String>,
+    /// A plan run's plan (its report, in the plan's schema), when it wrote one.
+    pub report: Option<Value>,
 }
 
 /// One CLI as detection found it.
@@ -312,6 +314,17 @@ impl Frontier {
 
     /// One run of a frontier agent on its task, until it reports, fails, or is cancelled.
     pub async fn run(&self, host: &Host, data: &Dataset, record: &AgentRecord, task: &Task, root: &str, cancel: &CancellationToken) -> Result<RunEnd, RpcError> {
+        self.run_job(host, data, record, Job::Task(task), root, cancel).await
+    }
+
+    /// One run of a frontier agent that writes a plan and changes nothing: `text` is what to plan
+    /// (the request and what the lead knows), `schema` the plan's JSON Schema. Its report is the
+    /// plan ([`RunEnd::report`]).
+    pub async fn plan(&self, host: &Host, data: &Dataset, record: &AgentRecord, text: &str, schema: &Value, root: &str, cancel: &CancellationToken) -> Result<RunEnd, RpcError> {
+        self.run_job(host, data, record, Job::Plan { text, schema: strict_schema(schema) }, root, cancel).await
+    }
+
+    async fn run_job(&self, host: &Host, data: &Dataset, record: &AgentRecord, job: Job<'_>, root: &str, cancel: &CancellationToken) -> Result<RunEnd, RpcError> {
         let worker = record.worker.as_str();
         let listed = self.workers(host, false).await;
         let Some(info) = listed.workers.iter().find(|info| info.id == worker).cloned() else {
@@ -327,6 +340,10 @@ impl Frontier {
         let access: AgentEnvResult = host.get(tools_methods::AGENT_ENV, json!({"session_id": session_id, "workspace": root})).await?;
         let mut env = access.env.clone();
         env.insert("CORTEX_AGENT".to_owned(), record.name.clone());
+        // A planner's `cx mcp` offers the lead's tools: it looks and runs checks, it never edits.
+        if matches!(job, Job::Plan { .. }) {
+            env.insert("CORTEX_MCP_LEAD".to_owned(), "1".to_owned());
+        }
 
         let journal = Journal::load(host.clone(), &session_id).await?;
         let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
@@ -335,7 +352,7 @@ impl Frontier {
         let run = Run {
             host: host.clone(),
             data,
-            task,
+            job,
             root,
             session_id: session_id.clone(),
             run_id: format!("run-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
@@ -352,6 +369,8 @@ impl Frontier {
             turns: 0,
             tool_calls: 0,
             usage: json!({}),
+            agent: record.name.clone(),
+            lead: host.session_get(&session_id).await.ok().and_then(|session| session.parent),
         };
         let outcome = run.go(cancel).await;
         lock(&self.live).remove(&key);
@@ -366,11 +385,83 @@ impl Frontier {
     }
 }
 
+/// What a frontier run is for.
+enum Job<'a> {
+    /// An agent's task: it changes the project, and reports done, waiting or blocked.
+    Task(&'a Task),
+    /// A plan: it reads and checks, changes nothing, and its report is the plan in `schema`.
+    Plan { text: &'a str, schema: Value },
+}
+
+impl Job<'_> {
+    fn task_id(&self) -> Option<&str> {
+        match self {
+            Job::Task(task) => Some(task.id.as_str()),
+            Job::Plan { .. } => None,
+        }
+    }
+
+    /// The role prompt (data: `prompts/<id>.md`).
+    fn prompt(&self) -> &'static str {
+        match self {
+            Job::Task(_) => "worker",
+            Job::Plan { .. } => "frontier_planner",
+        }
+    }
+
+    fn schema(&self) -> Value {
+        match self {
+            Job::Task(_) => report_schema(),
+            Job::Plan { schema, .. } => schema.clone(),
+        }
+    }
+}
+
+/// A JSON Schema both CLIs take in their strict modes: every object closed with all its
+/// properties required, no length or count keywords, no host extensions, and an empty `enum`
+/// (nothing to pick from in this conversation) as an empty list.
+pub fn strict_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("array")
+                && map.get("items").and_then(|items| items.get("enum")).and_then(Value::as_array).is_some_and(Vec::is_empty)
+            {
+                return json!({"type": "array", "items": {"type": "string"}, "maxItems": 0});
+            }
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(key.as_str(), "maxLength" | "minLength" | "maxItems" | "minItems" | "pattern" | "format") || key.starts_with("x-") {
+                    continue;
+                }
+                // `properties` names fields: each value is a schema, each key a field kept as it is.
+                let value = match (key.as_str(), value) {
+                    ("properties", Value::Object(fields)) => Value::Object(fields.iter().map(|(name, field)| (name.clone(), strict_schema(field))).collect()),
+                    _ => strict_schema(value),
+                };
+                out.insert(key.clone(), value);
+            }
+            if out.get("type").and_then(Value::as_str) == Some("object")
+                && let Some(properties) = out.get("properties").and_then(Value::as_object)
+            {
+                let required: Vec<Value> = properties.keys().map(|key| Value::String(key.clone())).collect();
+                out.insert("required".to_owned(), Value::Array(required));
+                out.insert("additionalProperties".to_owned(), Value::Bool(false));
+            }
+            if out.get("enum").and_then(Value::as_array).is_some_and(|values| values.iter().all(Value::is_string)) && !out.contains_key("type") {
+                out.insert("type".to_owned(), json!("string"));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(strict_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 /// One frontier run in progress.
 struct Run<'a> {
     host: Host,
     data: &'a Dataset,
-    task: &'a Task,
+    job: Job<'a>,
     root: &'a str,
     session_id: String,
     run_id: String,
@@ -388,6 +479,10 @@ struct Run<'a> {
     turns: u32,
     tool_calls: u32,
     usage: Value,
+    /// The agent's name.
+    agent: String,
+    /// The lead session (the agent session's parent): it sees each message the agent writes.
+    lead: Option<String>,
 }
 
 /// What one CLI turn ended with.
@@ -406,7 +501,7 @@ impl Run<'_> {
         self.journal
             .append(
                 kinds::STATUS,
-                json!({"state": "running", "run_id": self.run_id, "kind": "agent", "task_id": self.task.id, "worker": self.worker, "model": self.model, "effort": self.effort}),
+                json!({"state": "running", "run_id": self.run_id, "kind": "agent", "task_id": self.job.task_id(), "worker": self.worker, "model": self.model, "effort": self.effort}),
             )
             .await?;
         let _ = self.host.session_status(&self.session_id, SessionStatus::Running).await;
@@ -421,15 +516,28 @@ impl Run<'_> {
             Ok(turn) => turn.error.as_deref().map(str::trim).filter(|error| !error.is_empty()).map(str::to_owned),
             _ => None,
         };
+        let mut report = None;
         let (outcome, summary, question) = match ended {
             Err(error) if error.code == codes::CANCELLED => ("cancelled".to_owned(), self.data.text("frontier_cancelled", &[]), None),
             Err(error) => ("failed".to_owned(), self.data.text("frontier_failed", &[("error", &error.message)]), None),
-            Ok(turn) => judge(self.data, &turn),
+            Ok(turn) => match &self.job {
+                Job::Task(_) => judge(self.data, &turn),
+                // A plan is done when its report is the plan (an object with its tasks).
+                Job::Plan { .. } => match (&turn.error, turn.report) {
+                    (Some(error), _) => ("failed".to_owned(), self.data.text("frontier_failed", &[("error", error.trim())]), None),
+                    (None, Some(plan)) if plan.get("tasks").is_some_and(Value::is_array) => {
+                        let goal = str_field(&plan, "goal").trim().to_owned();
+                        report = Some(plan);
+                        ("done".to_owned(), goal, None)
+                    }
+                    (None, _) => ("failed".to_owned(), self.data.text("frontier_no_plan", &[]), None),
+                },
+            },
         };
         let result = AgentRunResult { outcome: outcome.clone(), summary: summary.clone(), turns: self.turns, tool_calls: self.tool_calls, changed_files, usage: self.usage.clone() };
         let _ = self
             .journal
-            .append(kinds::STATUS, json!({"state": outcome, "detail": summary, "run_id": self.run_id, "task_id": self.task.id, "result": result, "worker": self.worker}))
+            .append(kinds::STATUS, json!({"state": outcome, "detail": summary, "run_id": self.run_id, "task_id": self.job.task_id(), "result": result, "worker": self.worker}))
             .await;
         let status = match outcome.as_str() {
             "done" => SessionStatus::Done,
@@ -441,7 +549,7 @@ impl Run<'_> {
         // Failed with no tool call made: the CLI never got to the work (it did not start, or it
         // refused its model or its sign-in), so nothing of the task was done by it.
         let start_failed = result.outcome == "failed" && self.tool_calls == 0;
-        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error })
+        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error, report })
     }
 
     /// The run's first message: the task on its first run; else what waits for it (the lead's
@@ -450,14 +558,17 @@ impl Run<'_> {
         let first_time = !self.journal.entries().any(|entry| entry.kind == kinds::USER_MESSAGE);
         let mut parts = Vec::new();
         if first_time {
-            parts.push(task_text(self.data, self.task));
+            parts.push(match &self.job {
+                Job::Task(task) => task_text(self.data, task),
+                Job::Plan { text, .. } => (*text).to_owned(),
+            });
         }
         parts.extend(self.take_steers().await?);
         if parts.is_empty() {
             parts.push(self.data.text("restart_followup", &[]));
         }
         let text = parts.join("\n\n");
-        self.journal.append(kinds::USER_MESSAGE, json!({"text": text, "run_id": self.run_id, "task_id": self.task.id})).await?;
+        self.journal.append(kinds::USER_MESSAGE, json!({"text": text, "run_id": self.run_id, "task_id": self.job.task_id()})).await?;
         Ok(text)
     }
 
@@ -486,7 +597,7 @@ impl Run<'_> {
             return Ok(None);
         }
         let text = texts.join("\n\n");
-        self.journal.append(kinds::USER_MESSAGE, json!({"text": text, "run_id": self.run_id, "task_id": self.task.id})).await?;
+        self.journal.append(kinds::USER_MESSAGE, json!({"text": text, "run_id": self.run_id, "task_id": self.job.task_id()})).await?;
         Ok(Some(text))
     }
 
@@ -511,9 +622,9 @@ impl Run<'_> {
             .arg(format!("mcp__{MCP_SERVER}"))
             .arg("--disable-slash-commands")
             .arg("--append-system-prompt")
-            .arg(self.data.prompt("worker"))
+            .arg(self.data.prompt(self.job.prompt()))
             .arg("--json-schema")
-            .arg(report_schema().to_string());
+            .arg(self.job.schema().to_string());
         let resumed = self.external.clone();
         match resumed {
             Some(id) => {
@@ -591,7 +702,7 @@ impl Run<'_> {
                 "text" => {
                     let text = str_field(part, "text");
                     if !text.trim().is_empty() {
-                        self.journal.append(kinds::ASSISTANT_MESSAGE, json!({"text": text, "run_id": self.run_id})).await?;
+                        self.assistant_message(&text).await?;
                     }
                 }
                 "thinking" => {
@@ -632,7 +743,7 @@ impl Run<'_> {
     async fn codex(&mut self, first: String, cancel: &CancellationToken) -> Result<TurnEnd, RpcError> {
         // Codex reads the report's schema from a file: one per run, removed when the run ends.
         let schema_file = std::env::temp_dir().join(format!("cortex-agent-report-{}.json", self.run_id));
-        std::fs::write(&schema_file, report_schema().to_string()).map_err(|error| RpcError::internal(format!("cannot write the report schema: {error}")))?;
+        std::fs::write(&schema_file, self.job.schema().to_string()).map_err(|error| RpcError::internal(format!("cannot write the report schema: {error}")))?;
         let mut message = first;
         let ended = loop {
             let turn = self.codex_turn(&message, &schema_file, cancel).await;
@@ -669,7 +780,7 @@ impl Run<'_> {
             .arg("-c")
             .arg(format!("model_reasoning_effort={}", toml_string(self.effort.as_str())))
             .arg("-c")
-            .arg(format!("developer_instructions={}", toml_string(self.data.prompt("worker"))))
+            .arg(format!("developer_instructions={}", toml_string(self.data.prompt(self.job.prompt()))))
             .arg("-c")
             .arg(format!("mcp_servers.{MCP_SERVER}.command={}", toml_string(self.cx.as_str())))
             .arg("-c")
@@ -721,7 +832,7 @@ impl Run<'_> {
                         "agent_message" => {
                             let text = str_field(&item, "text").to_owned();
                             if !text.trim().is_empty() {
-                                self.journal.append(kinds::ASSISTANT_MESSAGE, json!({"text": text, "run_id": self.run_id})).await?;
+                                self.assistant_message(&text).await?;
                                 last_message = Some(text);
                             }
                         }
@@ -776,6 +887,21 @@ impl Run<'_> {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.spawn().map_err(|error| RpcError::new(codes::UNAVAILABLE, format!("cannot start {}: {error}", self.cli.display())))
+    }
+
+    /// A message the agent wrote: in its own journal, and as a progress line on the lead's card
+    /// (not a message its model reads: the agent's `tell_lead` and its report are those), so the
+    /// person following the lead sees each agent's work as it goes.
+    async fn assistant_message(&mut self, text: &str) -> Result<(), RpcError> {
+        self.journal.append(kinds::ASSISTANT_MESSAGE, json!({"text": text, "run_id": self.run_id})).await?;
+        if let Some(lead) = &self.lead {
+            let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect();
+            let _ = self
+                .host
+                .journal_append(lead, kinds::NOTE, json!({"text": format!("{}: {line}", self.agent), "purpose": "agent_progress", "host_message": false, "agent": self.agent, "task_id": self.job.task_id()}))
+                .await;
+        }
+        Ok(())
     }
 
     async fn tool_call(&mut self, call_id: &str, name: &str, input: &Value) -> Result<(), RpcError> {

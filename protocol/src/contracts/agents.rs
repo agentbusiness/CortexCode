@@ -48,6 +48,35 @@ pub mod methods {
     /// [`super::WorkerSetParams`] -> [`super::WorkersResult`]: choose who does agent work (the
     /// setting `agents.worker`). A frontier worker must be installed and signed in.
     pub const WORKER_SET: &str = "agents.worker.set";
+    /// [`super::FrontierPlanParams`] -> [`super::FrontierPlanResult`]: a frontier agent writes a
+    /// plan and changes nothing (its tools only look): a planning agent session under the asking
+    /// session, its run answered with the plan in the asker's JSON Schema. Unavailable when no
+    /// frontier worker can work now (the asker then plans as before).
+    pub const PLAN: &str = "agents.plan";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrontierPlanParams {
+    pub project_id: String,
+    /// The lead session: the planning agent's session is its child, and hears its progress.
+    pub from_session: String,
+    /// What to plan, in the request's words.
+    pub goal: String,
+    /// What the lead knows for the plan (the user's direction, earlier work, the project's check
+    /// commands, the skills to pick from, how the plan is cut).
+    #[serde(default)]
+    pub context: String,
+    /// The plan's JSON Schema; the planning agent's answer is one object of it.
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrontierPlanResult {
+    /// The plan, an object of the given schema.
+    pub plan: Value,
+    /// The planning agent's name and session.
+    pub agent: String,
+    pub session_id: String,
 }
 
 /// Who does an agent's work ([`methods::WORKERS`]).

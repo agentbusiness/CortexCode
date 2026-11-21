@@ -1323,12 +1323,21 @@ fn method_owner(header: &str) -> Option<String> {
 /// `@pytest.mark.skip`/`skipif`/`xfail` and `@unittest.skip` (Python), `it.skip(`, `test.skip(`,
 /// `describe.skip(`, `xit(`, `xdescribe(`, `it.todo(` (Jest, Vitest, Mocha), `t.Skip(` (Go),
 /// `@Disabled` and `@Ignore` (JUnit), `[Ignore` (NUnit, MSTest), `Skip =` in xUnit's `[Fact(...)]`.
+/// A marker counts only where it starts a name (seen: `xit(` inside `sys.exit(` refused every Python
+/// script's `if __name__ == "__main__": sys.exit(main())`).
 fn test_switch_offs(text: &str) -> usize {
     const MARKERS: &[&str] = &[
         "#[ignore", "@pytest.mark.skip", "@pytest.mark.xfail", "@unittest.skip", "it.skip(", "test.skip(", "describe.skip(", "xit(", "xdescribe(", "xtest(", "it.todo(", "test.todo(", "t.Skip(",
         "t.SkipNow(", "@Disabled", "@Ignore", "[Ignore", "[Fact(Skip", "[Theory(Skip",
     ];
-    text.lines().map(str::trim_start).filter(|line| !line.starts_with("//") && !line.starts_with("# ") && MARKERS.iter().any(|marker| line.contains(marker))).count()
+    text.lines().map(str::trim_start).filter(|line| !line.starts_with("//") && !line.starts_with("# ") && MARKERS.iter().any(|marker| marker_at_name_start(line, marker))).count()
+}
+
+/// Whether `marker` occurs in `line` where a name starts: what comes before it is not part of a
+/// name (a letter, digit, `_`, `.` or `$`), so `xit(` is not found in `exit(` nor `t.Skip(` in
+/// `st.Skip(`.
+fn marker_at_name_start(line: &str, marker: &str) -> bool {
+    line.match_indices(marker).any(|(at, _)| line[..at].chars().next_back().is_none_or(|before| !(before.is_alphanumeric() || matches!(before, '_' | '.' | '$'))))
 }
 
 fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Commit) -> Out {

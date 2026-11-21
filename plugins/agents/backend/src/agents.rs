@@ -70,6 +70,7 @@ pub fn hello() -> Hello {
         methods::PROPOSE,
         methods::WORKERS,
         methods::WORKER_SET,
+        methods::PLAN,
     ]
     .iter()
     .map(|method| (*method).to_owned())
@@ -1544,6 +1545,87 @@ impl Agents {
         Ok(json!({"seq": seq, "delivered": "queued"}))
     }
 
+    /// A frontier agent writes the lead's plan (`agents.plan`): its own agent session under the
+    /// lead (listed under it while it works, gone once done), its tools only look, and its answer
+    /// is the plan. Stopped like any agent (`agents.stop`), or by the lead's call ending.
+    async fn plan_frontier(&self, ctx: Ctx, params: cc_protocol::contracts::agents::FrontierPlanParams, caller: CancellationToken) -> Result<cc_protocol::contracts::agents::FrontierPlanResult, RpcError> {
+        let host = Host::new(ctx.clone());
+        let listed = self.inner.frontier.workers(&host, false).await;
+        if !workers::frontier(&listed.active) {
+            return Err(RpcError::new(codes::UNAVAILABLE, listed.fallback.unwrap_or_else(|| "no frontier worker is chosen".to_owned())));
+        }
+        let project = host.project_get(&params.project_id).await?;
+        self.open_project(&host, &project).await;
+        let existing = agents_of(&host, &project.id).await.unwrap_or_default();
+        let taken: BTreeSet<&str> = existing.iter().map(|agent| agent.name.as_str()).collect();
+        let name = pick_name(&taken);
+        let data = self.inner.data.get();
+        let short: String = params.goal.lines().next().unwrap_or_default().chars().take(80).collect();
+        let session = host
+            .session_create(&SessionCreateParams {
+                project_id: project.id.clone(),
+                kind: SessionKind::Agent,
+                title: data.text("frontier_plan_title", &[("goal", &short)]),
+                agent: Some(name.clone()),
+                parent: Some(params.from_session.clone()),
+                workspace: Some(project.root.clone()),
+                task_id: None,
+                flow: None,
+            })
+            .await?;
+        let record = upsert(&ctx, &host, AgentRecord {
+            name: name.clone(),
+            project_id: project.id.clone(),
+            role: "planner".into(),
+            charter: String::new(),
+            status: "working".into(),
+            session_id: Some(session.id.clone()),
+            task_id: None,
+            workspace: Some(project.root.clone()),
+            tasks_done: 0,
+            tasks_failed: 0,
+            updated_ms: now_ms(),
+            mode: "auto".into(),
+            worker: listed.active.clone(),
+            external_session: None,
+        })
+        .await?;
+        progress(&host, Some(&params.from_session), &data.text("progress_planning", &[("agent", &name), ("goal", &short)]), &record).await;
+        let key = AgentKey { project_id: project.id.clone(), name: name.clone() };
+        let token = self.cancellation(&key);
+        let text = data.text("frontier_plan_request", &[("goal", params.goal.trim()), ("context", params.context.trim())]);
+        let ended = tokio::select! {
+            biased;
+            _ = caller.cancelled() => Err(RpcError::cancelled()),
+            ended = self.inner.frontier.plan(&host, &data, &record, &text, &params.schema, &project.root, &token) => ended,
+        };
+        lock(&self.inner.cancellations).remove(&key);
+        // Done or not, the planning agent's work is over: it leaves the list.
+        let mut record = record;
+        let answer = match ended {
+            Ok(end) => {
+                record.external_session = end.external_session.clone();
+                match end.report {
+                    Some(plan) => {
+                        record.status = "done".into();
+                        record.tasks_done += 1;
+                        Ok(cc_protocol::contracts::agents::FrontierPlanResult { plan, agent: name.clone(), session_id: session.id.clone() })
+                    }
+                    None => {
+                        record.status = "stopped".into();
+                        Err(RpcError::new(codes::UNAVAILABLE, end.error.unwrap_or(end.result.summary)))
+                    }
+                }
+            }
+            Err(error) => {
+                record.status = "stopped".into();
+                Err(error)
+            }
+        };
+        let _ = upsert(&ctx, &host, record).await;
+        answer
+    }
+
     /// A frontier agent asked its lead and waits: its place in the scheduler goes to the next
     /// agent, and the lead is told the question (the answer, a steer, resumes the agent).
     async fn waiting(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, question: String) -> Result<(), RpcError> {
@@ -1729,7 +1811,7 @@ impl Agents {
         let Some(message) = data.get("message").cloned().and_then(|message| serde_json::from_value::<BoardMessage>(message).ok()) else {
             return Ok(());
         };
-        if message.kind != "need" || message.to.as_deref() != Some("lead") {
+        if !matches!(message.kind.as_str(), "need" | "progress") || message.to.as_deref() != Some("lead") {
             return Ok(());
         }
         let host = Host::new(ctx.clone());
@@ -1739,6 +1821,14 @@ impl Agents {
             None => None,
         };
         let lead = lead_session(&host, &record).await;
+        // A progress line (`tell_lead`): in the lead's conversation, read by its model; the agent
+        // goes on working, so nothing wakes the lead.
+        if message.kind == "progress" {
+            let title = current.as_ref().map(|task| task.title.clone()).unwrap_or_default();
+            let text = self.inner.data.get().text("progress_said", &[("agent", &record.name), ("title", &title), ("text", &message.text)]);
+            progress_note(&host, lead.as_deref(), &text, &record, true).await;
+            return Ok(());
+        }
         supervise(&ctx, lead.as_deref(), event_of(&message.project_id, events::NEED, &record.name, current.as_ref(), &message.text));
         Ok(())
     }
@@ -2448,6 +2538,7 @@ impl Plugin for Agents {
                 methods::MERGE => to_value(&this.merge(ctx, parse_params(params)?).await?),
                 methods::SCHEDULER => to_value(&this.scheduler_state()),
                 methods::PROPOSE => to_value(&this.propose(ctx, parse_params(params)?).await?),
+                methods::PLAN => to_value(&this.plan_frontier(ctx, parse_params(params)?, call.cancel.clone()).await?),
                 methods::WORKERS => {
                     // `{fresh: true}` asks the CLIs again (the settings panel when it opens).
                     let fresh = params.get("fresh").and_then(Value::as_bool).unwrap_or(false);

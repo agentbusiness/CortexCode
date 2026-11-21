@@ -645,7 +645,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         methods::MCP_LIST => {
             let params: McpListParams = parse_params(params)?;
             let offline = util::canonical_lenient(&util::expand_home(&params.workspace)).join(crate::sandbox::OFFLINE_MARKER).exists();
-            let mut result = schemas::schemas(EditFormat::parse(None), offline);
+            let mut result = if params.lead { schemas::lead_schemas(offline) } else { schemas::schemas(EditFormat::parse(None), offline) };
             for spec in crate::services::specs(host.as_ref()).await {
                 result.tools.push(spec);
             }
@@ -675,7 +675,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 name: params.name.clone(),
                 arguments,
             };
-            let context = ExecContext { project_id, session_id, workspace: params.workspace.clone(), mode: "auto".to_owned(), edit_format: None, lead: false };
+            let context = ExecContext { project_id, session_id, workspace: params.workspace.clone(), mode: "auto".to_owned(), edit_format: None, lead: params.lead };
             let child_cancel = cancel.child_token();
             let task = tokio::spawn(async move { exec::execute(&core, &host, ExecuteParams { context, call }, items, child_cancel).await });
             let guard = CancelOnDrop(cancel.clone());

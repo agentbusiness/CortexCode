@@ -19,6 +19,7 @@ const PROTOCOL: &str = "2025-06-18";
 const KNOWN_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 const ASK_LEAD: &str = "ask_lead";
+const TELL_LEAD: &str = "tell_lead";
 const BOARD: &str = "board";
 
 /// Where the agent works, from the environment the agents plugin started the CLI with.
@@ -26,6 +27,8 @@ struct Scope {
     workspace: String,
     project_id: Option<String>,
     agent: String,
+    /// The lead's tools only (a planning agent: read and run, never edit).
+    lead: bool,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -93,7 +96,7 @@ impl Server {
         let version = if KNOWN_PROTOCOLS.contains(&asked) { asked } else { PROTOCOL };
         // The tools guide is the server's instructions: how each result reads and which tool to use.
         let guide = self
-            .call("tools.mcp.list", json!({"workspace": self.scope.workspace}))
+            .call("tools.mcp.list", json!({"workspace": self.scope.workspace, "lead": self.scope.lead}))
             .await
             .ok()
             .and_then(|listed| listed.get("guide").and_then(Value::as_str).map(str::to_owned))
@@ -107,7 +110,7 @@ impl Server {
     }
 
     async fn list(&mut self) -> Result<Value, (i64, String)> {
-        let listed = self.call("tools.mcp.list", json!({"workspace": self.scope.workspace})).await.map_err(|error| (-32603, error))?;
+        let listed = self.call("tools.mcp.list", json!({"workspace": self.scope.workspace, "lead": self.scope.lead})).await.map_err(|error| (-32603, error))?;
         let mut tools: Vec<Value> = listed
             .get("tools")
             .and_then(Value::as_array)
@@ -131,6 +134,15 @@ impl Server {
             },
         }));
         tools.push(json!({
+            "name": TELL_LEAD,
+            "description": "Tell your lead where the work stands (a step done, a finding); then go on working.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string", "description": "One or two sentences: what is done, what you found, what comes next."}},
+                "required": ["text"],
+            },
+        }));
+        tools.push(json!({
             "name": BOARD,
             "description": "Read the project board: other agents' claims, hand-offs and blockers.",
             "inputSchema": {
@@ -146,8 +158,9 @@ impl Server {
         let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let (ok, text) = match name.as_str() {
             ASK_LEAD => self.ask_lead(&arguments).await,
+            TELL_LEAD => self.tell_lead(&arguments).await,
             BOARD => self.board(&arguments).await,
-            _ => match self.call("tools.mcp.call", json!({"workspace": self.scope.workspace, "name": name, "arguments": arguments})).await {
+            _ => match self.call("tools.mcp.call", json!({"workspace": self.scope.workspace, "name": name, "arguments": arguments, "lead": self.scope.lead})).await {
                 Ok(result) => (
                     result.get("ok").and_then(Value::as_bool).unwrap_or(false),
                     result.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
@@ -156,6 +169,21 @@ impl Server {
             },
         };
         json!({"content": [{"type": "text", "text": text}], "isError": !ok})
+    }
+
+    /// A progress line for the lead (board kind `progress`, to the lead): the agents plugin puts it
+    /// in the lead's conversation; the agent does not wait.
+    async fn tell_lead(&mut self, arguments: &Value) -> (bool, String) {
+        let text = arguments.get("text").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
+        if text.is_empty() {
+            return (false, "Write what to tell in `text`.".to_owned());
+        }
+        let Some(project_id) = self.scope.project_id.clone() else { return (true, "There is no lead to tell. Go on with the task.".to_owned()) };
+        let post = json!({"project_id": project_id, "kind": "progress", "author": self.scope.agent, "text": text, "refs": [], "to": "lead"});
+        match self.call("memory.board.post", post).await {
+            Ok(_) => (true, "Your lead has it. Go on with the task.".to_owned()),
+            Err(error) => (false, format!("It did not reach the lead ({error}). Go on with the task; say it in your report.")),
+        }
     }
 
     async fn ask_lead(&mut self, arguments: &Value) -> (bool, String) {
@@ -203,7 +231,7 @@ impl Server {
 /// Serve MCP on stdin and stdout until the client closes stdin. Returns the exit code.
 pub async fn serve() -> i32 {
     let workspace = env("CORTEX_WORKSPACE").unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned());
-    let scope = Scope { workspace, project_id: env("CORTEX_PROJECT_ID"), agent: env("CORTEX_AGENT").unwrap_or_else(|| "agent".to_owned()) };
+    let scope = Scope { workspace, project_id: env("CORTEX_PROJECT_ID"), agent: env("CORTEX_AGENT").unwrap_or_else(|| "agent".to_owned()), lead: env("CORTEX_MCP_LEAD").is_some() };
     let mut server = Server { scope, client: None };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();

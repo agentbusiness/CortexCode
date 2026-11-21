@@ -90,7 +90,8 @@ export function ListView({ root }: { root: string }) {
   return (
     <div className="cx-list" data-scope={scope} data-files={files.length}>
       <div className="cx-list-scroll" ref={setScroller}>
-        {diff.error && !diff.data && <ServiceProblem service="vcs" state={diff} className="inline-error" />}
+        {/* A folder that is not a git repository has no changes to show: that is no failure. */}
+        {diff.error && !diff.data && diff.errorCode !== 'not_found' && <ServiceProblem service="vcs" state={diff} className="inline-error" />}
         {diff.data && files.length === 0 && <p className="empty-line">Nothing in this scope.</p>}
         {files.length > 0 && (
           <LazyDiff
