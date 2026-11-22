@@ -129,6 +129,10 @@ pub struct EffortConfig {
     /// The thinking of a plan task's loop (execution of a planned step).
     #[serde(default = "default_task_effort")]
     pub task: String,
+    /// The thinking of a step that carries on after results that went as expected (a read, a
+    /// search, an edit that landed, a passing run). Never above the run's own effort.
+    #[serde(default = "default_task_effort")]
+    pub step: String,
 }
 
 fn default_task_effort() -> String {

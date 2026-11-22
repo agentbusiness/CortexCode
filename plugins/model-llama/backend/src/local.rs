@@ -191,6 +191,7 @@ async fn each_event(
 fn usage_from(timings: &Value, queue_ms: f64) -> Usage {
     let n = |key: &str| timings[key].as_u64().unwrap_or(0) as u32;
     Usage {
+        reasoning_tokens: 0,
         prompt_tokens: n("prompt_n") + n("cache_n"),
         cached_tokens: n("cache_n"),
         completion_tokens: n("predicted_n"),

@@ -157,7 +157,12 @@ pub struct CallStream {
     items: mpsc::UnboundedReceiver<Value>,
     done: oneshot::Receiver<Result<Value, RpcError>>,
     conn: Connection,
+    /// Told the final response once [`CallStream::finish`] has it (a call's observer).
+    watch: Option<Watch>,
 }
+
+/// What is told a call's final response.
+pub type Watch = Box<dyn FnOnce(&Result<Value, RpcError>) + Send>;
 
 impl CallStream {
     pub fn id(&self) -> u64 {
@@ -172,7 +177,17 @@ impl CallStream {
     /// Wait for the final response (remaining items are discarded).
     pub async fn finish(mut self) -> Result<Value, RpcError> {
         self.items.close();
-        (&mut self.done).await.unwrap_or_else(|_| Err(RpcError::closed()))
+        let outcome = (&mut self.done).await.unwrap_or_else(|_| Err(RpcError::closed()));
+        if let Some(watch) = self.watch.take() {
+            watch(&outcome);
+        }
+        outcome
+    }
+
+    /// Tell `watch` the final response when it arrives.
+    pub fn watched(mut self, watch: Option<Watch>) -> Self {
+        self.watch = watch;
+        self
     }
 
     /// Ask the peer to cancel. The final response still arrives (usually `cancelled`).
@@ -275,7 +290,7 @@ impl Connection {
             self.lock_pending().remove(&id);
             return Err(RpcError::closed());
         }
-        Ok(CallStream { id, items: items_rx, done: done_rx, conn: self.clone() })
+        Ok(CallStream { id, items: items_rx, done: done_rx, conn: self.clone(), watch: None })
     }
 
     /// Publish an event to the peer.

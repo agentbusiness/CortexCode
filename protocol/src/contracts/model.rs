@@ -419,6 +419,10 @@ pub struct Usage {
     /// Prompt tokens served from cache (not re-processed).
     pub cached_tokens: u32,
     pub completion_tokens: u32,
+    /// Of `completion_tokens`, the ones generated inside the reasoning block (0 when the engine
+    /// does not count them).
+    #[serde(default)]
+    pub reasoning_tokens: u32,
     pub prefill_ms: f64,
     pub decode_ms: f64,
     /// Time the request waited for a slot.

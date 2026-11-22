@@ -691,6 +691,11 @@ pub fn effort_or_default(effort: &str) -> String {
     if EFFORTS.contains(&lower.as_str()) { lower } else { default_effort() }
 }
 
+/// The weaker of two efforts.
+pub fn min_effort(a: &str, b: &str) -> String {
+    if max_effort(a, b) == a { b.to_owned() } else { a.to_owned() }
+}
+
 /// The stronger of two efforts.
 pub fn max_effort(a: &str, b: &str) -> String {
     let rank = |effort: &str| EFFORTS.iter().position(|known| *known == effort).unwrap_or(2);

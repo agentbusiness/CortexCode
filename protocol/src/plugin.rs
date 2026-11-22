@@ -34,6 +34,21 @@ pub fn observe_calls(observer: CallObserver) {
     let _ = CALL_OBSERVER.set(observer);
 }
 
+/// Asked of every call this process makes: what to tell its final response (`stats-kit` records
+/// each model call this way), or nothing.
+pub type OutgoingObserver = fn(&str, &Value) -> Option<crate::conn::Watch>;
+
+static OUTGOING_OBSERVER: OnceLock<OutgoingObserver> = OnceLock::new();
+
+/// Set the observer of the calls this process makes; the first one set stays.
+pub fn observe_outgoing(observer: OutgoingObserver) {
+    let _ = OUTGOING_OBSERVER.set(observer);
+}
+
+fn outgoing(method: &str, params: &Value) -> Option<crate::conn::Watch> {
+    OUTGOING_OBSERVER.get().and_then(|observer| observer(method, params))
+}
+
 /// Told once the plugin has joined its frame, with its connection (`stats-kit` starts handing its
 /// records over).
 pub type ConnectedHook = fn(Ctx);
@@ -138,11 +153,23 @@ impl Ctx {
 
     /// Call any method on any category; the frame routes it to the active plugin.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        self.frame()?.call(method, params).await
+        let watch = outgoing(method, &params);
+        let outcome = self.frame()?.call(method, params).await;
+        if let Some(watch) = watch {
+            watch(&outcome);
+        }
+        outcome
     }
 
     /// Call with stream items delivered.
     pub fn call_stream(&self, method: &str, params: Value) -> Result<crate::conn::CallStream, RpcError> {
+        let watch = outgoing(method, &params);
+        Ok(self.frame()?.call_stream(method, params)?.watched(watch))
+    }
+
+    /// [`Ctx::call_stream`] for a call made on another's behalf (the mesh passing a member's call
+    /// on): not this process's own, so not observed.
+    pub fn relay_stream(&self, method: &str, params: Value) -> Result<crate::conn::CallStream, RpcError> {
         self.frame()?.call_stream(method, params)
     }
 

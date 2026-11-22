@@ -261,7 +261,7 @@ impl Mesh {
         }
         if offer.node == me {
             let ctx = self.ctx()?;
-            let mut call = ctx.call_stream(&params.method, params.params)?;
+            let mut call = ctx.relay_stream(&params.method, params.params)?;
             loop {
                 tokio::select! {
                     item = call.next() => match item {

@@ -17,7 +17,7 @@ use crate::llm::{self, CallSpec, StreamTo};
 use crate::prompts;
 use crate::reads::Scope;
 use crate::repetition::{Detector, Verdict};
-use crate::schemas::max_effort;
+use crate::schemas::min_effort;
 use cc_protocol::contracts::agents::{VerifyReport, methods as agents_methods};
 use cc_protocol::contracts::chatflow::{kinds as chatflow_kinds, topics as chatflow_topics};
 use cc_protocol::contracts::model::methods as model_methods;
@@ -325,6 +325,30 @@ impl LoopOutcome {
 
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
     data.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+/// What the next step faces, which sets how hard it thinks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Footing {
+    /// The run's start or a new message: the work is thought through at the run's own effort.
+    Plan,
+    /// The last results went as expected: the step carries on (`effort.step`, never above the
+    /// run's own effort).
+    Act,
+    /// Something failed (a build or test with errors, a check, a repeat, a generation): the step
+    /// works out why (`effort.escalate`: enough to rethink; a high effort redrafts code in the
+    /// reasoning).
+    Rethink,
+}
+
+impl Footing {
+    fn effort(self, run: &str, config: &crate::data::EffortConfig) -> String {
+        match self {
+            Footing::Plan => run.to_owned(),
+            Footing::Act => min_effort(&config.step, run),
+            Footing::Rethink => config.escalate.clone(),
+        }
+    }
 }
 
 fn of_run<'a>(entries: &'a [JournalEntry], run_id: &'a str) -> impl Iterator<Item = &'a JournalEntry> + 'a {
@@ -1003,13 +1027,17 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     }
     let mut changed = changed_files_of(&entries, &env.run_id);
     let mut tracker = Tracker::default();
-    let mut effort = spec.effort.clone();
+    // Each step's thinking is chosen by what it faces (`Footing`): a run that starts, or resumes
+    // after a failing contract or a repeat, as it left off; otherwise the step carries on.
+    let mut footing = if next_step(&entries, &env.run_id) == 1 {
+        Footing::Plan
+    } else if of_run(&entries, &env.run_id).any(|entry| entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "verify" | "repeat")) {
+        Footing::Rethink
+    } else {
+        Footing::Act
+    };
     // The contract can be revised during the run (a check found broken in itself).
     let mut task = spec.task.clone();
-    // A failing contract raised the effort earlier in this run.
-    if of_run(&entries, &env.run_id).any(|entry| entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "verify" | "repeat")) {
-        effort = max_effort(&effort, &env.data.effort.escalate);
-    }
     // The last test command found no tests (`display.no_tests`): a "done" after it is checked by
     // nothing, and is answered once with the step that makes it a check (seen: a fix "verified" by
     // a jest run that found no tests, and the same failure handed back).
@@ -1114,6 +1142,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         let steers = deliver_steers(journal).await?;
         if !steers.is_empty() {
             detector.reset();
+            // A message is new work to think through at the run's own effort.
+            footing = Footing::Plan;
             answering_session = matches!(spec.kind, LoopKind::Agent { .. });
             // A plan task is one part of a plan: a message during it goes to the planner, which
             // writes the tasks still to do so that they do what the user asks now (seen: "fix all
@@ -1155,7 +1185,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         let step_start = journal.last_seq() + 1;
         // No thinking budget: a thought runs to its own end. A cut thought lost its plan (thinking is
         // not carried to the next step) and the next step rebuilt it; what a step concluded is kept
-        // in the task's notebook instead.
+        // in the task's notebook instead. How long it runs is the step's effort, chosen by what the
+        // step faces: one run-wide effort made a fifteen-line read think as hard as the plan (seen:
+        // a run decided `high` thought 20k tokens before each read, an hour for two edits).
+        let effort = footing.effort(&spec.effort, &env.data.effort);
+        footing = Footing::Act;
         let call = env.call(stage, &effort, messages, None, None, step, true);
         let called = match llm::chat(journal, call, &any).await {
             Ok(called) => {
@@ -1180,7 +1214,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     Verdict::Replan(_) => {
                         let what = env.data.text("repeated_text", &[]);
                         journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &what, research), true).await?;
-                        effort = max_effort(&effort, &env.data.effort.escalate);
+                        footing = Footing::Rethink;
                     }
                     Verdict::Fine | Verdict::Reread(_) | Verdict::Rerun(_) => {}
                 }
@@ -1203,7 +1237,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 return Ok(outcome("stopped", summary, turns, tool_calls, &changed, None));
             }
             journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, &env.data.text("repeated_text", &[]), research), true).await?;
-            effort = max_effort(&effort, &env.data.effort.escalate);
+            footing = Footing::Rethink;
             continue;
         }
 
@@ -1429,7 +1463,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                 prompts::contract_failure(&env.data, &format!("{failures}{before}"))
             };
             journal.note(&env.run_id, "verify", &note, true).await?;
-            effort = max_effort(&effort, &env.data.effort.escalate);
+            footing = Footing::Rethink;
             continue;
         }
 
@@ -1554,6 +1588,11 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                     // A failing test (a test report in the result) repeats for another reason than a
                     // compile error: its note speaks of the test, not of a declaration.
                     let test_run = data.get("display").and_then(|display| display.get("tests")).is_some_and(|tests| !tests.is_null());
+                    // A build or test that failed with errors: the next step works out why. A
+                    // status alone is no failure to think about (a `grep` that found nothing).
+                    if run_failed == Some(true) && (test_run || crate::typeerrors::error_key(&outcome.output).is_some()) {
+                        footing = Footing::Rethink;
+                    }
                     // A read that shows exactly what an earlier read still in the conversation shows
                     // (the file unchanged since): a pointer to it instead of the text again (seen: a
                     // third of a run's reads were files it had already read, a fifth of what it read).
@@ -1751,7 +1790,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         }
         if let Some(Verdict::Replan(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Replan(_))) {
             journal.note(&env.run_id, "repeat", &prompts::repetition_correction(&env.data, what, research), true).await?;
-            effort = max_effort(&effort, &env.data.effort.escalate);
+            footing = Footing::Rethink;
         } else if let Some(Verdict::Reread(what)) = verdicts.iter().find(|verdict| matches!(verdict, Verdict::Reread(_))) {
             // A reread is harmless: said once, plainly, with the step to take.
             journal.note(&env.run_id, "repeat", &env.data.text("reread", &[("what", what)]), true).await?;

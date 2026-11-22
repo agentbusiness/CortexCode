@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94"
 publish = false
-description = "Every app's errors, warnings and call counts: collected in every process, written as Parquet day files and delivered to a CortexManage by the stats plugin (feature `files`); shared by every Cortex app and the knowledge app."
+description = "Every app's errors, warnings, call counts and model calls: collected in every process, written as Parquet day files and delivered to a CortexManage by the stats plugin (feature `files`); shared by every Cortex app and the knowledge app."
 
 # Standalone: every process that records depends on this crate by path.
 [workspace]
@@ -19,7 +19,7 @@ path = "src/lib.rs"
 files = ["dep:arrow-array", "dep:arrow-json", "dep:arrow-schema", "dep:parquet"]
 
 [dependencies]
-cc-protocol = { path = "../protocol", features = ["reports"] }
+cc-protocol = { path = "../protocol", features = ["reports", "mesh", "model"] }
 arrow-array = { version = "58.1.0", optional = true }
 arrow-json = { version = "58.1.0", optional = true }
 arrow-schema = { version = "58.1.0", optional = true }

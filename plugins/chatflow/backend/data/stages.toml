@@ -55,11 +55,18 @@ presence_penalty = 0.0
 [effort]
 # When a decision named no effort.
 default = "medium"
-# After a failing contract or a corrective replan (high made 8k-token thoughts that redrafted code
-# in the reasoning; medium is enough to rethink).
+# Each step of a loop thinks by what it faces. A run's start and a new message: the run's own
+# effort (the decision's, or `task` for a plan task). A step after results that went as expected
+# (reads, searches, edits that landed, passing runs): `step`, never above the run's own effort.
+# A step after a build or test with errors, a failing contract, a repeat or a failed generation:
+# `escalate`.
+# Rethinking a failure (high made 8k-token thoughts that redrafted code in the reasoning; medium is
+# enough to rethink).
 escalate = "medium"
 # A plan task's loop: execution of a planned step, short thoughts, the work in tool calls.
 task = "low"
+# Carrying on (one run-wide `high` made a fifteen-line read think 20k tokens).
+step = "low"
 
 [limits]
 # Times the plan of a decided change is written again, per turn: a task ended badly, or REVIEW found

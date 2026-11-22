@@ -362,7 +362,7 @@ async fn serve_stream(mesh: Arc<Mesh>, node: String, mut send: SendStream, mut r
                 return Ok(());
             };
             let ctx = mesh.ctx().map_err(|e| e.message)?;
-            let mut call = match ctx.call_stream(&method, params) {
+            let mut call = match ctx.relay_stream(&method, params) {
                 Ok(call) => call,
                 Err(error) => {
                     let message = answer(Err(error));

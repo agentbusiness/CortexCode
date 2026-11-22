@@ -5,6 +5,8 @@
 //!   counted (the knowledge app's `error_stats`, the same records).
 //! - **calls**: every contract method the process serves, counted per minute with its time, its
 //!   outcome and, for a model's answer, its tokens.
+//! - **models**: every model call the process makes, one row each: the model, the tag, the
+//!   computer that served it, its tokens (in, cached, out, reasoning) and its times.
 //!
 //! Every process collects; once a minute it hands what it collected to the app's `stats` plugin
 //! (`stats.record`), which alone writes the Parquet day files and delivers them
@@ -16,6 +18,7 @@
 
 pub mod calls;
 pub mod errors;
+pub mod models;
 #[cfg(feature = "files")]
 mod day;
 #[cfg(feature = "files")]
@@ -75,14 +78,16 @@ pub fn start(log_env: &str, default: &str, part: &str, version: &str) {
     cc_protocol::plugin::on_connected(hand_over);
 }
 
-/// Record with this recorder: panics and served calls. For a process that sets up its own log
-/// with [`errors::ErrorLayer`] in it and hands [`take`]'s records over itself (the frame).
+/// Record with this recorder: panics, served calls and the model calls made. For a process that
+/// sets up its own log with [`errors::ErrorLayer`] in it and hands [`take`]'s records over itself
+/// (the frame).
 pub fn begin(recorder: Recorder) {
     if RECORDER.set(recorder).is_err() {
         return;
     }
     errors::install_panic_hook();
     cc_protocol::plugin::observe_calls(calls::observe);
+    cc_protocol::plugin::observe_outgoing(models::observe);
 }
 
 /// What was collected since the last time, as batches for `stats.record`, with the ones not taken
@@ -98,6 +103,10 @@ pub fn take() -> Vec<RecordParams> {
     let calls = calls::drain();
     if !calls.is_empty() {
         out.push(batch(tables::CALLS, calls));
+    }
+    let models = models::drain();
+    if !models.is_empty() {
+        out.push(batch(tables::MODELS, models));
     }
     out
 }

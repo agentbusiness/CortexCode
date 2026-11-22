@@ -202,6 +202,8 @@ pub struct OutputParser {
     pub content: String,
     pub calls: Vec<ToolCall>,
     open: Option<OpenCall>,
+    /// Generated tokens that arrived inside the reasoning block (see [`OutputParser::token`]).
+    pub reasoning_tokens: u32,
 }
 
 const THINK_END: &str = "</think>";
@@ -250,6 +252,7 @@ impl OutputParser {
             content: String::new(),
             calls: Vec::new(),
             open: None,
+            reasoning_tokens: 0,
         }
     }
 
@@ -258,6 +261,14 @@ impl OutputParser {
         let mut parser = Self::new(false, false, &[]);
         parser.raw = true;
         parser
+    }
+
+    /// One generated token arrived, before its text is pushed: counted as reasoning while the
+    /// reasoning block is open (its closing tag included).
+    pub fn token(&mut self) {
+        if matches!(self.mode, Mode::Reasoning) {
+            self.reasoning_tokens += 1;
+        }
     }
 
     /// Whether the generation is inside a tool call.

@@ -1,9 +1,10 @@
-//! The day files the `stats` plugin writes: `<root>/<table>/<part>/YYYY-MM-DD.parquet`, the same
+//! The day files the `stats` plugin writes (`errors`, `calls`, `models`): `<root>/<table>/<part>/YYYY-MM-DD.parquet`, the same
 //! columns as the knowledge app's, kept 30 days.
 
 use crate::calls::CallRecord;
+use crate::models::ModelRecord;
 use crate::day::{Row, write_days};
-use arrow_array::{ArrayRef, Int64Array, StringArray, UInt64Array};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use cc_protocol::contracts::reports::{ErrorRecord, RecordParams, tables};
 use serde::de::DeserializeOwned;
@@ -21,7 +22,8 @@ pub fn store(root: &Path, batch: RecordParams) -> Result<usize, String> {
     match batch.table.as_str() {
         tables::ERRORS => write_days(&folder, parse::<ErrorRecord>(batch.rows)?, |r| r.last_at_ms)?,
         tables::CALLS => write_days(&folder, parse::<CallRecord>(batch.rows)?, |r| r.last_at_ms)?,
-        other => return Err(format!("no table `{other}`: the tables are {} and {}", tables::ERRORS, tables::CALLS)),
+        tables::MODELS => write_days(&folder, parse::<ModelRecord>(batch.rows)?, |r| r.ended_at_ms)?,
+        other => return Err(format!("no table `{other}`: the tables are {}, {} and {}", tables::ERRORS, tables::CALLS, tables::MODELS)),
     }
     Ok(count)
 }
@@ -122,6 +124,75 @@ impl Row for CallRecord {
             count(|r| r.completion_tokens),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.first_at_ms).collect::<Vec<_>>())),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.last_at_ms).collect::<Vec<_>>())),
+        ]
+    }
+}
+
+impl Row for ModelRecord {
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    fn schema() -> Schema {
+        let text = |name: &str| Field::new(name, DataType::Utf8, false);
+        let count = |name: &str| Field::new(name, DataType::UInt64, false);
+        let ms = |name: &str| Field::new(name, DataType::Float64, false);
+        Schema::new(vec![
+            text("event_id"),
+            text("part"),
+            text("method"),
+            text("tag"),
+            text("model_id"),
+            text("plugin"),
+            text("served_by"),
+            text("served_node"),
+            text("tier"),
+            text("outcome"),
+            text("finish"),
+            text("version"),
+            text("node_id"),
+            count("prompt_tokens"),
+            count("cached_tokens"),
+            count("completion_tokens"),
+            count("reasoning_tokens"),
+            ms("prefill_ms"),
+            ms("decode_ms"),
+            ms("queue_ms"),
+            ms("wall_ms"),
+            Field::new("started_at_ms", DataType::Int64, false),
+            Field::new("ended_at_ms", DataType::Int64, false),
+            text("record_json"),
+        ])
+    }
+
+    fn columns(rows: &[Self]) -> Vec<ArrayRef> {
+        let text = |get: fn(&ModelRecord) -> &str| Arc::new(StringArray::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef;
+        let count = |get: fn(&ModelRecord) -> u64| Arc::new(UInt64Array::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef;
+        let ms = |get: fn(&ModelRecord) -> f64| Arc::new(Float64Array::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef;
+        vec![
+            text(|r| r.event_id.as_str()),
+            text(|r| r.part.as_str()),
+            text(|r| r.method.as_str()),
+            text(|r| r.tag.as_str()),
+            text(|r| r.model_id.as_str()),
+            text(|r| r.plugin.as_str()),
+            text(|r| r.served_by.as_str()),
+            text(|r| r.served_node.as_str()),
+            text(|r| r.tier.as_str()),
+            text(|r| r.outcome.as_str()),
+            text(|r| r.finish.as_str()),
+            text(|r| r.version.as_str()),
+            text(|r| r.node_id.as_str()),
+            count(|r| r.prompt_tokens),
+            count(|r| r.cached_tokens),
+            count(|r| r.completion_tokens),
+            count(|r| r.reasoning_tokens),
+            ms(|r| r.prefill_ms),
+            ms(|r| r.decode_ms),
+            ms(|r| r.queue_ms),
+            ms(|r| r.wall_ms),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.started_at_ms).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.ended_at_ms).collect::<Vec<_>>())),
         ]
     }
 }

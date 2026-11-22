@@ -5,7 +5,8 @@
 //! - Every process collects (`stats-kit`) and once a minute hands its rows to the app's `stats`
 //!   plugin (`stats.record`), the one that writes Parquet day files under the stats folder:
 //!   `errors` (warnings, errors and panics, grouped per minute by fingerprint), `calls` (every
-//!   contract method, counted per minute) and any table of its own (the knowledge app: `product`, `llm`).
+//!   contract method, counted per minute), `models` (every model call made, with its model, tag,
+//!   computer and tokens) and any table of its own (the knowledge app: `product`, `llm`).
 //! - Beside each day file a `<day>.sent.parquet` lists the event ids that a CortexManage accepted.
 //!   A row not in it is undelivered.
 //! - Once a minute the `stats` plugin (in the knowledge app, its mesh) offers the undelivered rows, one table of one day at a time, to
@@ -47,6 +48,9 @@ pub struct RecordParams {
 pub mod tables {
     pub const ERRORS: &str = "errors";
     pub const CALLS: &str = "calls";
+    /// Every model call a process made: the model, the tag, the computer that served it and the
+    /// tokens.
+    pub const MODELS: &str = "models";
 }
 
 /// Who sends: the app, as it declares itself, and the computer it runs on.
