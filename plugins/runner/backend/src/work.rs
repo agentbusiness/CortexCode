@@ -26,6 +26,8 @@ const COMMAND_TIMEOUT_MAX: Duration = Duration::from_secs(3600);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
 const RELEASE_PLAN_TIMEOUT: Duration = Duration::from_secs(900);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
+/// A release's own command is not ended by the clock: a week stands for no limit.
+const RELEASE_STEP_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Lines `runner.read` answers when none are asked for, and at most.
 const READ_LINES: u32 = 400;
 const READ_LINES_MAX: u32 = 2000;
@@ -254,7 +256,8 @@ impl Runner {
         if !status.files.is_empty() {
             return Ok(refused(self.text(ctx, "dirty", &[("files", &status.files.len().to_string())])));
         }
-        let fetched: vcs::FetchResult = host.effect(vcs_methods::FETCH, json!({"root": job.mirror, "remote": "origin", "prune": true})).await.and_then(parse_params)?;
+        let token = (!params.token.trim().is_empty()).then(|| params.token.trim().to_owned());
+        let fetched: vcs::FetchResult = host.effect(vcs_methods::FETCH, json!({"root": job.mirror, "remote": "origin", "prune": true, "token": token})).await.and_then(parse_params)?;
         if !fetched.ok {
             return Ok(refused(format!("the source could not be fetched: {}", fetched.detail)));
         }
@@ -321,12 +324,14 @@ impl Runner {
             match github_repo(&job.url) {
                 None => notes.push("no pull request: the source is not on GitHub".into()),
                 Some(repo) => {
-                    let pushed: Result<vcs::PushResult, RpcError> = host.effect(vcs_methods::PUSH, json!({"root": job.root, "remote": "origin", "branch": job.branch})).await.and_then(parse_params);
+                    let pushed: Result<vcs::PushResult, RpcError> = host.effect(vcs_methods::PUSH, json!({"root": job.root, "remote": "origin", "branch": job.branch, "token": token})).await.and_then(parse_params);
                     match pushed {
                         Ok(pushed) if pushed.ok => {
                             let owner = repo.split('/').next().unwrap_or("");
-                            let title = params.requests.iter().map(|(_, title)| title.trim()).collect::<Vec<_>>().join("; ");
-                            let body = params.requests.iter().map(|(id, title)| format!("- {}: {}", id.trim(), title.trim())).collect::<Vec<_>>().join("\n");
+                            // A request's title may be a whole commit message: its first line names it.
+                            let first = |title: &str| title.trim().lines().next().unwrap_or_default().to_owned();
+                            let title = params.requests.iter().map(|(_, title)| first(title)).collect::<Vec<_>>().join("; ");
+                            let body = params.requests.iter().map(|(id, title)| format!("- {}: {}", id.trim(), first(title))).collect::<Vec<_>>().join("\n");
                             let made: Result<vcs::GithubPr, RpcError> =
                                 host.effect(vcs_methods::GITHUB_PR_CREATE, json!({"repo": repo, "head": format!("{owner}:{}", job.branch), "base": job.main, "title": title, "body": body})).await.and_then(parse_params);
                             match made {
@@ -346,7 +351,7 @@ impl Runner {
             Err(error) if error.code == codes::CONFLICT => return Ok(refused(error.message)),
             Err(error) => return Err(error),
         }
-        let pushed: vcs::PushResult = host.effect(vcs_methods::PUSH, json!({"root": job.root, "remote": "origin", "branch": job.main})).await.and_then(parse_params)?;
+        let pushed: vcs::PushResult = host.effect(vcs_methods::PUSH, json!({"root": job.root, "remote": "origin", "branch": job.main, "token": token})).await.and_then(parse_params)?;
         if !pushed.ok {
             notes.insert(0, format!("`{}` was not pushed: {}", job.main, pushed.detail));
             return Ok(refused(notes.join("; ")));
@@ -374,7 +379,10 @@ impl Runner {
 
     async fn release_run(&self, ctx: &Ctx, params: &ReleaseParams, cancel: &CancellationToken) -> Result<ReleaseAnswer, RpcError> {
         let host = Host::new(ctx.clone());
-        let mirror = self.mirror(ctx, &params.repo, &params.url, &params.main).await?;
+        let mirror = self.mirror(ctx, &params.repo, &params.url, &params.main, &params.token).await?;
+        if params.fetch_only {
+            return Ok(ReleaseAnswer { ok: true, stepped: true, ..ReleaseAnswer::default() });
+        }
         let main_ref = format!("refs/remotes/origin/{}", params.main.trim());
         let head = host
             .get::<vcs::RevResult>(vcs_methods::REV, json!({"root": mirror, "rev": main_ref}))
@@ -387,6 +395,9 @@ impl Runner {
         // output that is not ignored) goes.
         host.effect(vcs_methods::RESET, json!({"root": tree.path, "to": head, "clean": true})).await?;
         let root = PathBuf::from(&tree.path);
+        if !params.steps.is_empty() {
+            return self.release_steps(params, &root, &head, cancel).await;
+        }
         let script = root.join("scripts").join("release.sh");
         if !script.is_file() {
             return Err(RpcError::not_found("this repository has no scripts/release.sh"));
@@ -398,7 +409,61 @@ impl Runner {
         }
         let limit = if params.plan_only { RELEASE_PLAN_TIMEOUT } else { RELEASE_TIMEOUT };
         let ran: Ran = process::run(&bash, &args, &root, &[], limit, cancel).await?;
-        Ok(ReleaseAnswer { ok: ran.ok(), parts: released_parts(&ran.lines), tail: ran.tail(TAIL_LINES) })
+        Ok(ReleaseAnswer { ok: ran.ok(), parts: released_parts(&ran.lines), tail: ran.tail(TAIL_LINES), head, stepped: false })
+    }
+
+    /// The repository's own release commands, in order, in the clean checkout: with the files a
+    /// release reads that git does not hold linked in from `secrets_from` for the release only.
+    /// A command that fails ends the release. Releases take as long as they take (an app's
+    /// notarization waits on Apple), so no time limit ends them.
+    async fn release_steps(&self, params: &ReleaseParams, root: &Path, head: &str, cancel: &CancellationToken) -> Result<ReleaseAnswer, RpcError> {
+        let mut linked: Vec<PathBuf> = Vec::new();
+        let outcome = async {
+            for file in &params.secret_files {
+                let name = file.trim().trim_start_matches("./");
+                if name.is_empty() || name.split('/').any(|part| part == ".." || part.is_empty()) {
+                    return Err(RpcError::invalid_params(format!("`{file}` is not a file of the repository")));
+                }
+                let from = params.secrets_from.trim();
+                if from.is_empty() {
+                    return Err(RpcError::invalid_params(format!("the release reads {name}, which git does not hold: set the folder it is taken from in the repository's settings")));
+                }
+                let from = if let Some(rest) = from.strip_prefix("~/") { std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest) } else { PathBuf::from(from) };
+                let source = from.join(name);
+                if !source.is_file() {
+                    return Err(RpcError::not_found(format!("{} is not on this computer: put it there, or set where it is in the repository's settings", source.display())));
+                }
+                let target = root.join(name);
+                if target.exists() {
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| RpcError::internal(format!("cannot create {}: {error}", parent.display())))?;
+                }
+                std::os::unix::fs::symlink(&source, &target).map_err(|error| RpcError::internal(format!("cannot link {}: {error}", target.display())))?;
+                linked.push(target);
+            }
+            let envs: Vec<(String, String)> = params.env.iter().filter(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).cloned().collect();
+            let commands: Vec<String> = if params.plan_only { vec![params.plan_step.clone()] } else { params.steps.clone() };
+            let mut lines: Vec<String> = Vec::new();
+            for command in commands.iter().map(|command| command.trim()).filter(|command| !command.is_empty()) {
+                lines.push(format!("$ {command}"));
+                let ran: Ran = process::run(Path::new("/bin/sh"), &["-lc".to_owned(), command.to_owned()], root, &envs, RELEASE_STEP_TIMEOUT, cancel).await?;
+                lines.extend(ran.lines.iter().cloned());
+                if !ran.ok() {
+                    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].to_vec();
+                    return Ok(ReleaseAnswer { ok: false, parts: released_parts(&lines), tail, head: head.to_owned(), stepped: true });
+                }
+            }
+            let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].to_vec();
+            Ok(ReleaseAnswer { ok: true, parts: released_parts(&lines), tail, head: head.to_owned(), stepped: true })
+        }
+        .await;
+        // The secret files leave the checkout whatever happened.
+        for target in linked {
+            let _ = std::fs::remove_file(target);
+        }
+        outcome
     }
 
     // ---- the mirror's main branch, without a checkout -------------------------------------------

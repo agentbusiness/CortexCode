@@ -54,7 +54,7 @@ async fn commit_of(git: &Git, dir: &Path, name: &str) -> Result<String, RpcError
 }
 
 /// `vcs.mirror`: the bare repository of `url` at `path`, made when absent, then fetched with prune.
-pub async fn mirror(git: &Git, github: &Github, url: &str, path: &str) -> Result<MirrorResult, RpcError> {
+pub async fn mirror(git: &Git, github: &Github, url: &str, path: &str, token: Option<&str>) -> Result<MirrorResult, RpcError> {
     let url = url.trim();
     if url.is_empty() || url.starts_with('-') {
         return Err(RpcError::invalid_params(format!("invalid source address `{url}`")));
@@ -78,7 +78,7 @@ pub async fn mirror(git: &Git, github: &Github, url: &str, path: &str) -> Result
         }
     }
     let dest = std::fs::canonicalize(&dest).unwrap_or(dest);
-    let fetched = remote::fetch(git, github, &dest, Some("origin"), true).await?;
+    let fetched = remote::fetch_as(git, github, &dest, Some("origin"), true, token).await?;
     Ok(MirrorResult { path: dest.to_string_lossy().into_owned(), created, ok: fetched.ok, available: fetched.available, detail: fetched.detail })
 }
 

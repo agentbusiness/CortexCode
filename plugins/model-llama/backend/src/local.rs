@@ -86,9 +86,18 @@ fn sampling_into(body: &mut Map<String, Value>, sampling: &Sampling) {
 }
 
 /// Qwen3.8's template turns thinking on and off with its `enable_thinking` switch, whose default is
-/// on, so it is always passed: on only when the call asks for thinking.
+/// on, so it is always passed: on only when the call asks for thinking. Its `reasoning_effort`
+/// defaults to `xhigh`, so the call's effort is passed too (the template takes low, medium, high
+/// and xhigh, and raises on anything else, so only those go through).
 fn thinking_into(body: &mut Map<String, Value>, thinking: &Thinking) {
-    body.insert("chat_template_kwargs".into(), json!({"enable_thinking": thinking.enabled}));
+    let mut kwargs = Map::new();
+    kwargs.insert("enable_thinking".into(), json!(thinking.enabled));
+    if thinking.enabled
+        && let Some(effort) = thinking.effort.as_deref().filter(|effort| matches!(*effort, "low" | "medium" | "high" | "xhigh"))
+    {
+        kwargs.insert("reasoning_effort".into(), json!(effort));
+    }
+    body.insert("chat_template_kwargs".into(), Value::Object(kwargs));
     if thinking.enabled
         && let Some(budget) = thinking.budget_tokens
     {

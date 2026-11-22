@@ -65,8 +65,17 @@ async fn own_setup(git: &Git, dir: &Path, remote: &str) -> Result<bool, RpcError
 /// is; otherwise with the GitHub sign-in from Settings, when there is one (the token goes to git
 /// through the command's environment only); otherwise git's defaults. Also says whether the
 /// sign-in is used.
-pub(crate) async fn signed(git: &Git, github: &Github, dir: &Path, remote: &str) -> Result<(Cmd, Option<String>), RpcError> {
-    let token = if own_setup(git, dir, remote).await? { None } else { github.clone_token().await };
+/// A token given for the call (a manager's connection for the repository) takes the place of the
+/// sign-in from Settings.
+pub(crate) async fn signed_as(git: &Git, github: &Github, dir: &Path, remote: &str, given: Option<&str>) -> Result<(Cmd, Option<String>), RpcError> {
+    let given = given.map(str::trim).filter(|token| !token.is_empty()).map(str::to_owned);
+    let token = if own_setup(git, dir, remote).await? {
+        None
+    } else if given.is_some() {
+        given
+    } else {
+        github.clone_token().await
+    };
     let mut cmd = git.cmd(dir);
     if let Some(token) = &token {
         // The empty helper drops every configured one, so nothing else answers or stores the token.
@@ -81,6 +90,10 @@ pub(crate) async fn signed(git: &Git, github: &Github, dir: &Path, remote: &str)
 /// Fetch `remote` into the repository at `dir` (a working tree or a bare repository), signed in
 /// as a push is.
 pub async fn fetch(git: &Git, github: &Github, dir: &Path, remote: Option<&str>, prune: bool) -> Result<FetchResult, RpcError> {
+    fetch_as(git, github, dir, remote, prune, None).await
+}
+
+pub async fn fetch_as(git: &Git, github: &Github, dir: &Path, remote: Option<&str>, prune: bool, given: Option<&str>) -> Result<FetchResult, RpcError> {
     let remote = remote.unwrap_or("origin").to_owned();
     if remote.is_empty() || remote.starts_with('-') {
         return Err(RpcError::invalid_params(format!("invalid remote `{remote}`")));
@@ -88,7 +101,7 @@ pub async fn fetch(git: &Git, github: &Github, dir: &Path, remote: Option<&str>,
     if git.try_text(dir, ["remote", "get-url", remote.as_str()]).await?.is_none() {
         return Ok(FetchResult { ok: false, available: false, remote, detail: "no such remote in this repository".into() });
     }
-    let (cmd, token) = signed(git, github, dir, &remote).await?;
+    let (cmd, token) = signed_as(git, github, dir, &remote, given).await?;
     let mut cmd = cmd.args(["fetch", "--quiet", "--tags"]);
     if prune {
         cmd = cmd.arg("--prune");
@@ -111,6 +124,10 @@ pub async fn fetch(git: &Git, github: &Github, dir: &Path, remote: Option<&str>,
 /// Push `branch` to `remote`. The repository's own setup pushes as it is; otherwise the GitHub
 /// sign-in from Settings pushes, when there is one; otherwise git's defaults.
 pub async fn push(git: &Git, github: &Github, repo: &Repo, remote: Option<&str>, branch: Option<&str>) -> Result<PushResult, RpcError> {
+    push_as(git, github, repo, remote, branch, None).await
+}
+
+pub async fn push_as(git: &Git, github: &Github, repo: &Repo, remote: Option<&str>, branch: Option<&str>, given: Option<&str>) -> Result<PushResult, RpcError> {
     let branch = match branch {
         Some(branch) => branch.to_owned(),
         None => repo
@@ -142,7 +159,7 @@ pub async fn push(git: &Git, github: &Github, repo: &Repo, remote: Option<&str>,
     let merge_key = format!("branch.{branch}.merge");
     let has_upstream = git.try_text(&repo.top, ["config", "--get", merge_key.as_str()]).await?.is_some();
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let (cmd, token) = signed(git, github, &repo.top, &remote).await?;
+    let (cmd, token) = signed_as(git, github, &repo.top, &remote, given).await?;
     let mut cmd = cmd.args(["push", "--porcelain"]);
     if !has_upstream {
         cmd = cmd.arg("--set-upstream");

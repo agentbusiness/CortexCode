@@ -371,6 +371,10 @@ pub struct PushParams {
     /// Default: the current branch.
     #[serde(default)]
     pub branch: Option<String>,
+    /// A GitHub token to push with instead of the sign-in from Settings (a manager's connection
+    /// for this repository). Used for this call only, never kept.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -565,6 +569,9 @@ pub struct FetchParams {
     /// Remove remote-tracking branches the remote no longer has.
     #[serde(default)]
     pub prune: bool,
+    /// As [`PushParams::token`].
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -584,6 +591,9 @@ pub struct MirrorParams {
     pub url: String,
     /// Absolute path of the bare repository.
     pub path: String,
+    /// As [`PushParams::token`].
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

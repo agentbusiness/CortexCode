@@ -892,7 +892,7 @@ impl Runner {
             return Err(RpcError::new(codes::CONFLICT, format!("job {} is running; stop it before it is prepared again", params.job_id)));
         }
         let host = Host::new(ctx.clone());
-        let mirror = self.mirror(ctx, &params.repo, &params.url, &params.main).await?;
+        let mirror = self.mirror(ctx, &params.repo, &params.url, &params.main, &params.token).await?;
         let main_ref = format!("refs/remotes/origin/{}", params.main.trim());
         let kept = existing.as_ref().map(|(job, _)| job).filter(|job| job.branch == params.branch && !job.base.is_empty()).map(|job| job.base.clone());
         let wanted = if params.base.trim().is_empty() { kept.unwrap_or(main_ref) } else { params.base.trim().to_owned() };
@@ -933,10 +933,12 @@ impl Runner {
     }
 
     /// The repository's mirror, made when absent and fetched; its record is kept.
-    pub(crate) async fn mirror(&self, ctx: &Ctx, repo: &str, url: &str, main: &str) -> Result<String, RpcError> {
+    pub(crate) async fn mirror(&self, ctx: &Ctx, repo: &str, url: &str, main: &str, token: &str) -> Result<String, RpcError> {
         let host = Host::new(ctx.clone());
         let path = Self::mirror_path(ctx, repo);
-        let made: vcs::MirrorResult = host.effect(vcs_methods::MIRROR, json!({"url": url.trim(), "path": path.to_string_lossy()})).await.and_then(parse_params)?;
+        // A manager's token for this repository reaches it for this fetch only.
+        let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
+        let made: vcs::MirrorResult = host.effect(vcs_methods::MIRROR, json!({"url": url.trim(), "path": path.to_string_lossy(), "token": token})).await.and_then(parse_params)?;
         if !made.ok {
             return Err(RpcError::new(codes::UNAVAILABLE, format!("the source {url} could not be fetched: {}", made.detail)).retryable());
         }

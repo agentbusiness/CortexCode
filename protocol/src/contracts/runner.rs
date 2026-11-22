@@ -82,6 +82,10 @@ pub struct PrepareParams {
     pub commit_name: String,
     #[serde(default)]
     pub commit_email: String,
+    /// A GitHub token the repository is reached with (the manager's connection for it). Empty:
+    /// this computer's own sign-in or git setup. Held in memory for the call, never stored.
+    #[serde(default)]
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -343,6 +347,9 @@ pub struct LandParams {
     /// `none` | `github-pr`.
     #[serde(default)]
     pub changes: String,
+    /// As [`PrepareParams::token`].
+    #[serde(default)]
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -392,6 +399,27 @@ pub struct ReleaseParams {
     pub main: String,
     #[serde(default)]
     pub plan_only: bool,
+    /// The repository's own release commands, run in order with `sh -lc` in the clean checkout;
+    /// empty: `scripts/release.sh`. With `plan_only`, `plan_step` (when set) is run instead.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    #[serde(default)]
+    pub plan_step: String,
+    /// Set for the commands (`RELEASE_VERSION`).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Files not in git the release reads (`.env.release`): each is linked into the checkout from
+    /// `secrets_from`, a folder on this computer, for the release only.
+    #[serde(default)]
+    pub secret_files: Vec<String>,
+    #[serde(default)]
+    pub secrets_from: String,
+    /// Only make or fetch the mirror (nothing runs).
+    #[serde(default)]
+    pub fetch_only: bool,
+    /// As [`PrepareParams::token`].
+    #[serde(default)]
+    pub token: String,
 }
 
 /// One part a release moves.
@@ -411,4 +439,10 @@ pub struct ReleaseAnswer {
     /// The last lines of the script's output.
     #[serde(default)]
     pub tail: Vec<String>,
+    /// The commit the release was made from.
+    #[serde(default)]
+    pub head: String,
+    /// The runner ran `steps` (an older runner runs `scripts/release.sh` whatever it is sent).
+    #[serde(default)]
+    pub stepped: bool,
 }

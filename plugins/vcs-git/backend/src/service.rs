@@ -229,7 +229,7 @@ impl Vcs {
             methods::PUSH => {
                 let p: PushParams = parse_params(params)?;
                 let repo = self.repo(&p.root).await?;
-                to_value(&remote::push(git, &self.github, &repo, p.remote.as_deref(), p.branch.as_deref()).await?)
+                to_value(&remote::push_as(git, &self.github, &repo, p.remote.as_deref(), p.branch.as_deref(), p.token.as_deref()).await?)
             }
             methods::PR_STATUS => {
                 let p: RootParams = parse_params(params)?;
@@ -286,13 +286,13 @@ impl Vcs {
                 let dir = work::repo_dir(&p.root)?;
                 let lock = self.dir_lock(&dir);
                 let _guard = lock.lock().await;
-                to_value(&remote::fetch(git, &self.github, &dir, p.remote.as_deref(), p.prune).await?)
+                to_value(&remote::fetch_as(git, &self.github, &dir, p.remote.as_deref(), p.prune, p.token.as_deref()).await?)
             }
             methods::MIRROR => {
                 let p: MirrorParams = parse_params(params)?;
                 let lock = self.dir_lock(Path::new(&p.path));
                 let _guard = lock.lock().await;
-                to_value(&work::mirror(git, &self.github, &p.url, &p.path).await?)
+                to_value(&work::mirror(git, &self.github, &p.url, &p.path, p.token.as_deref()).await?)
             }
             methods::WORKTREE_ADD => {
                 let p: WorktreeAddParams = parse_params(params)?;
