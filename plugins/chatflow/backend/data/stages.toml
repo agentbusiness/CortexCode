@@ -76,13 +76,10 @@ accepts = 2
 # Tool calls one plan task may make before it is stuck (0 = no limit). Off: a fixed count stopped
 # tasks that were still converging; stuck is the same failure repeating (`fix_cycles`).
 task_calls = 0
-# Most thinking tokens per step of a plan task: execution, so the work is in tool calls and values
-# come from running code. 4096: at 1024, 192 of 892 model calls in the journals ended their
-# thinking at the cut (the thought stops on "I have to give the solution based on the thinking
-# directly now"), and a step cut mid-thought reads again to rebuild what it could not finish (see
-# `fix_think_tokens`). little-coder now runs small Qwen models at 4096, and the Qwen card says a
-# lower reasoning effort does not always shorten a task.
-task_think_tokens = 4096
+# Thinking runs to its own end: no call carries a thinking budget. A thought cut at a budget lost
+# its plan with it (thinking is not carried to the next step), so the next step rebuilt the plan and
+# was cut again (seen: 37 of 235 steps cut, half of all thinking; one task's to-dos restated 15
+# times in an hour). What a step concluded is kept in the task's notebook instead (`notebook`).
 # A plan task whose same command still fails after this many edit-and-rerun cycles is stuck too
 # (debugging decays within 2-3 attempts): the tasks still to do are written again.
 fix_cycles = 3
@@ -95,24 +92,6 @@ same_error_edits = 3
 # them, so `fix_cycles` misses them). High on purpose: debugging needs a run of traces, prints and
 # reruns; seen stuck: 97 calls on one case. 0 = no limit.
 stall_runs = 20
-# Once the task has changed a file, each step may think this much; 0 keeps the task's own budget.
-# 0: at 384, 310 of one agent's 424 steps were cut off mid-thought, and after a cut 61% of its
-# calls were reads (it read to rebuild the plan it could not finish thinking).
-fix_think_tokens = 0
-# Any other agent loop's step (a question, a follow-up). Every step has a budget, the same as a
-# plan task's step and for the same reason: no budget at all let the effort's own table apply
-# (seen: a loop without a plan step thought at every step for two hours), and 1024 cut thoughts
-# short (see `task_think_tokens`).
-loop_think_tokens = 4096
-# A reply's thinking (REPLY): the answer is written from what the turn read, so it needs a plan of
-# the answer, not a re-derivation. Without it the model plugin's table applied (16384 at xhigh).
-reply_think_tokens = 2048
-# The planner's thinking before a plan is written (PLAN_NOTES, a free call before the constrained
-# PLAN call, which cannot think): its notes are the newest thing in the conversation when the plan
-# is written. Seen: the plan of a whole system decided in one constrained generation, with a
-# 1500-character field as its only thought; its tasks named files nobody had looked at. 0 = no
-# notes: the plan is written at once, as before.
-plan_think_tokens = 4096
 # What the session that started agents is told about each when it checks on them (MANAGE): an
 # agent with this many calls since its last edit is named as reading without writing (seen: 103
 # reads and no edit in 90 minutes), one with no step for this many minutes as not moving (seen: an
@@ -301,7 +280,7 @@ effort = "none"
 sampling = "auto"
 
 # Before PLAN (a new plan, or one written again after a task ended badly): the planner's notes,
-# free text with thinking, no tools. `limits.plan_think_tokens` = 0 switches it off.
+# free text with thinking, no tools. Removing this stage switches it off.
 [stage.PLAN_NOTES]
 rules = "plan_notes"
 effort = "medium"

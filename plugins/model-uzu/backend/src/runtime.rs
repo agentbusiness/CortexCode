@@ -33,21 +33,13 @@ use uzu_engine::engine::language_model::stream::SamplingMethod;
 pub const ENGINE_REVISION: &str = "uzu 0.6.7 (391abc29abb26f18aa812f6f02e8b023aed11364) + CortexCode patches P1-P8";
 /// Minimum context one conversation needs for an agent turn (config `min_context_per_slot`).
 pub const DEFAULT_MIN_CONTEXT_PER_SLOT: u64 = 32_768;
-/// Reasoning budget (tokens) per thinking effort when the caller names none: the model is made to
-/// close its reasoning and answer once a block reaches it (Qwen's documented thinking budget).
-pub fn default_think_budget(effort: Option<&str>) -> u32 {
-    match effort {
-        Some("low") => 2048,
-        Some("medium") => 4096,
-        Some("xhigh") => 16384,
-        _ => 8192,
-    }
-}
+/// A caller's reasoning budget is the only one: with none, a thought runs to its own end (a
+/// budget per effort cut agent steps off mid-plan, and the next step rebuilt the plan).
 
 /// What ends reasoning at the budget. Not Qwen's own sentence ("Considering the limited time by
 /// the user, I have to give the solution ... directly now"): it was the last thing the model read
 /// before acting, and it acted on it, with a shortcut in place of the asked part (seen in agent
-/// steps cut at 4096 tokens). The chat flow finds a cut thought by this sentence.
+/// steps cut at 4096 tokens). Used only when a caller names a budget.
 pub const THINK_BUDGET_CLOSE: &str =
     "\n\nI have thought this through far enough for this step; I take the next step from what I worked out above.\n</think>\n\n";
 
@@ -928,8 +920,8 @@ impl Runtime {
             sampling,
             grammar,
             grammar_trigger: params.thinking.enabled.then(|| loaded.think_end.clone()),
-            think_budget: (params.thinking.enabled && !loaded.think_end.is_empty() && loaded.think_close.windows(loaded.think_end.len()).any(|w| w == loaded.think_end.as_slice())).then(|| ThinkBudget {
-                tokens: params.thinking.budget_tokens.unwrap_or_else(|| default_think_budget(params.thinking.effort.as_deref())),
+            think_budget: params.thinking.budget_tokens.filter(|_| params.thinking.enabled && !loaded.think_end.is_empty() && loaded.think_close.windows(loaded.think_end.len()).any(|w| w == loaded.think_end.as_slice())).map(|tokens| ThinkBudget {
+                tokens,
                 end: loaded.think_end.clone(),
                 close: loaded.think_close.clone(),
             }),

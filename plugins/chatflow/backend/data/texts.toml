@@ -96,7 +96,8 @@ repetition_research = " When a fact is missing (how an API, a format or an error
 repeated_text = "the same text"
 reread = "You read {what} already: it is above, unchanged. Work from that view."
 learn_recheck = "Not an episode: a lesson kept from earlier work, judged again because the rules above changed.\nThe lesson: {lesson}\nWrite `lesson` as it stands. `useful`: by the rules above, as if it were learned now."
-thought_cut = "Your thinking in the step above stopped at its budget. It had got this far:\n{thought}\nGo on from there, without working the task out again: take the step it was leading to."
+# The work's notebook, last before each step (projection::Notebook): the newest one the model wrote.
+notebook = "Your notebook for this work, as you last wrote it:\n{notebook}\nWhen the newest results change what you know, write the notebook again, whole, before your calls. Take its first Next step now."
 rerun = "You ran {what} again with no edit since its last run: nothing it checks changed, so its earlier output above is still the answer, whatever you filter. Your next step is an edit; when it is your passing check, run the software the change is about, then reply with what changed."
 # The same, before the task has changed any file: it is still finding out, so its step comes from the output it has (never "an edit" as what must come next).
 rerun_before_edit = "You ran {what} again with nothing changed since its last run: its earlier output above is still the answer, whatever you filter. Take your next step from that output: read what it names, or make the change it points to."

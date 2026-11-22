@@ -171,7 +171,7 @@ pub fn run_spec() -> ToolSpec {
                     "properties": {"pattern": {"type": "string", "description": "Regex in rolling 64 KiB output windows; full output stays in the artifact."}, "silence_s": {"type": "number"}}
                 },
                 "cwd": {"type": "string", "description": "Run this one command in another directory."},
-                "permission": {"type": "string", "description": "Only for an install, another write outside the workspace, or a program the sandbox cannot start: why this command needs it, e.g. \"install the image library the thumbnails need\". Commands may write only in the workspace, temp dirs, package caches and your Python venv (python and pip use it, so `pip install` needs no flags). An install changes the user's machine, so the user is asked; once approved the command runs with writes anywhere. Never for what commands may do already."}
+                "permission": {"type": "string", "description": "Only for an install, another write outside the workspace, or a program the sandbox cannot start: why this command needs it, e.g. \"install the image library the thumbnails need\". Commands may write only in the workspace, temp dirs, package caches and your Python venv (python and pip use it, so `pip install` needs no flags). An install changes the user's machine, so in ask mode the user is asked first; then the command runs with writes anywhere. Never for what commands may do already."}
             },
             "required": ["intent", "command"]
         }),
@@ -213,7 +213,7 @@ pub fn guide(format: EditFormat, offline: bool) -> String {
 2. edit: to change or write a file (below).\n\
 3. run: to build, test, run a script, list files or search exact text (`grep -rn`). cat, head, tail, sed and here-documents on project files are blocked in run: read a project file with read, change it with edit. Check your change with the project's own tests that cover it and by running what the user asked to run; add a test when the request asks for one or the project already tests that code. Run a check whole: no `| tail` or `| grep`, the result shows each failure. A one-off try (call a function, print a value) is a file in `tmp/`, run from the project.\n\
 4. terminal: only for a program that waits for input or redraws the screen. Everything else: run.\n\
-5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so the user is asked first; ask only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through.\n\
+5. An install, another write outside the workspace, or a program the sandbox cannot start (\"Operation not permitted\"): run the command that does it with `permission` saying why. An install changes the user's machine, so in ask mode the user is asked first; use it only when the task needs it. Never change the user's shell setup or tool settings (dotfiles, global config) to get a command through.\n\
 6. {network}\n\
 7. Git: a commit or push request is permission for its normal steps, including staging. Use run without `permission`; do not ask again. Only commit or push when requested. Destructive actions (discard edits, delete refs, rewrite history, force push) get a separate confirmation before running.\n\
 Give every call a short `intent` first.\n\

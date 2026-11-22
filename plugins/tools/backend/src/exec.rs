@@ -2336,7 +2336,7 @@ fn searches_whole_disk(command: &str) -> bool {
 const WRITABLE: &str = "the workspace, temp dirs, package caches and your Python venv";
 
 /// The step after the sandbox kept a program from starting.
-const PROGRAM_STEP: &str = "When the user's request needs what it shows, run the same command with `permission` saying why: the user is asked once, then it runs outside the sandbox. Otherwise answer from what you can read.";
+const PROGRAM_STEP: &str = "When the user's request needs what it shows, run the same command with `permission` saying why: it runs outside the sandbox (in ask mode once the user agrees). Otherwise answer from what you can read.";
 
 /// Whether `path` is a program file (a regular file someone may execute), as opposed to a place a
 /// command tried to write.
@@ -2346,7 +2346,7 @@ fn is_program(path: &Path) -> bool {
 }
 
 /// The step after the sandbox stopped a command.
-const LIFT_STEP: &str = "If the task cannot be done without it (an install), run the command that does it with `permission` saying why: an install changes the user's machine, so the user is asked first; once they approve it runs. Never ask for what commands may do already, and never change the user's shell setup, tool settings or files outside the project to get around it.";
+const LIFT_STEP: &str = "If the task cannot be done without it (an install), run the command that does it with `permission` saying why: an install changes the user's machine, so in ask mode the user is asked first; then it runs. Never ask for what commands may do already, and never change the user's shell setup, tool settings or files outside the project to get around it.";
 
 /// The programs a shell reported missing in command output (`command not found`, as sh, bash and
 /// zsh word it), in order, once each.
@@ -2922,11 +2922,19 @@ async fn exec_run(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>,
             Err(error) => Out::fail("push_failed", format!("Push failed: {}", error.message)),
         };
     }
-    // Past the sandbox: the model asks with `permission` (why the command needs it); the user decides
-    // in every mode, and the approved command runs without the sandbox.
+    // Past the sandbox: the model asks with `permission` (why the command needs it). In auto mode the
+    // command runs past it at once: auto means the person is not there to answer (seen: a run held
+    // eight times on the same test driver, each a slightly different command, so a yes for one
+    // never matched the next). The lift is recorded as an approval, so the session's cleanup knows
+    // a command ran outside the sandbox. In ask mode the person decides. High threats and
+    // destructive git operations above still ask in every mode; an offline workspace refuses below.
     let permission = args.get("permission").and_then(Value::as_str).map(str::trim).filter(|why| !why.is_empty());
     let lift = sandbox::lift_class(command);
-    let lifted = core.approved(session_id).contains(&lift);
+    let mut lifted = core.approved(session_id).contains(&lift);
+    if !lifted && permission.is_some() && session.context.mode != "ask" && !offline {
+        core.approve(session_id, std::slice::from_ref(&lift));
+        lifted = true;
+    }
     let mut classes: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
     let mut concerns: Vec<approval::Concern> = Vec::new();

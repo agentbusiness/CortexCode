@@ -151,10 +151,6 @@ fn default_task_calls() -> u32 {
     0
 }
 
-fn default_fix_think_tokens() -> u32 {
-    384
-}
-
 fn default_same_error_edits() -> u32 {
     3
 }
@@ -169,22 +165,6 @@ fn default_context_tokens() -> u32 {
 
 fn default_stall_runs() -> u32 {
     20
-}
-
-fn default_task_think_tokens() -> u32 {
-    4096
-}
-
-fn default_loop_think_tokens() -> u32 {
-    4096
-}
-
-fn default_reply_think_tokens() -> u32 {
-    2048
-}
-
-fn default_plan_think_tokens() -> u32 {
-    4096
 }
 
 fn default_manage_reading_calls() -> u32 {
@@ -265,25 +245,6 @@ pub struct Limits {
     /// still to do are written again with another approach (within `replans`).
     #[serde(default = "default_task_calls")]
     pub task_calls: u32,
-    /// Most thinking tokens per step of a plan task (0 = the effort's default budget).
-    #[serde(default = "default_task_think_tokens")]
-    pub task_think_tokens: u32,
-    /// Most thinking tokens per step once the task has changed a file (a fix, not the design).
-    #[serde(default = "default_fix_think_tokens")]
-    pub fix_think_tokens: u32,
-    /// Most thinking tokens per step of any other agent loop (a question, a follow-up): every
-    /// generating call carries a budget, so the model plugin's own effort table (4096 for medium)
-    /// is never what a step gets (seen: a loop without a plan step ran 4k-token thoughts for hours).
-    #[serde(default = "default_loop_think_tokens")]
-    pub loop_think_tokens: u32,
-    /// Most thinking tokens of a reply (REPLY): without it a reply got the model plugin's table
-    /// for the decided effort (16384 for xhigh, minutes of thinking before a word of the answer).
-    #[serde(default = "default_reply_think_tokens")]
-    pub reply_think_tokens: u32,
-    /// Most thinking tokens of the planner's notes before a plan is written (PLAN_NOTES: the PLAN
-    /// call itself is constrained and cannot think); 0 = no notes, the plan is written at once.
-    #[serde(default = "default_plan_think_tokens")]
-    pub plan_think_tokens: u32,
     /// An agent that made this many calls since its last edit is named to its session as reading
     /// without writing (MANAGE; 0 = never).
     #[serde(default = "default_manage_reading_calls")]

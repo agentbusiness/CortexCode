@@ -712,11 +712,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 // A reply runs no tools. They stay listed, so the system block matches the other
                 // calls' and is read from the cache; `none` makes the model plugin refuse the
                 // tool-call token (listed and allowed, the model wrote a tool call into the answer).
-                let mut call = env.call("REPLY", &effort, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
-                // Every generating call carries a budget (the loop's are in agent_loop).
-                if env.data.limits.reply_think_tokens > 0 {
-                    call.think_budget = Some(env.data.limits.reply_think_tokens);
-                }
+                let call = env.call("REPLY", &effort, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
                 let any = env.stops.any();
                 llm::chat(journal, call, &any).await.map(|_| ())
             }
@@ -2360,11 +2356,10 @@ pub(crate) const PLAN_NOTES: &str = "PLAN_NOTES";
 /// transcript as it is written and is the newest thing in the conversation when the plan is
 /// written (seen: a plan for a whole system decided in one constrained generation, with a
 /// 1500-character field as its only thought). `live`: what the plan is made from (the direction,
-/// the asks, why it is written again). Off when `limits.plan_think_tokens` is 0. Written once per
+/// the asks, why it is written again). Off when the stage is not in `stages.toml`. Written once per
 /// plan: a resumed run finds its notes after everything the plan is made from.
 async fn plan_notes(env: &RunEnv, journal: &mut Journal, live: &str) -> Result<(), RpcError> {
-    let budget = env.data.limits.plan_think_tokens;
-    if budget == 0 || env.data.stage(PLAN_NOTES).is_none() {
+    if env.data.stage(PLAN_NOTES).is_none() {
         return Ok(());
     }
     let entries = journal.entries_vec();
@@ -2392,8 +2387,7 @@ async fn plan_notes(env: &RunEnv, journal: &mut Journal, live: &str) -> Result<(
         messages
     })
     .await?;
-    let mut call = env.call(PLAN_NOTES, &env.data.effort.default, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
-    call.think_budget = Some(budget);
+    let call = env.call(PLAN_NOTES, &env.data.effort.default, messages, None, Some(json!("none")), next_step(journal, &env.run_id), true);
     let any = env.stops.any();
     llm::chat(journal, call, &any).await.map(|_| ())
 }

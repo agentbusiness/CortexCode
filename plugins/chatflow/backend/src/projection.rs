@@ -312,6 +312,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             .collect();
         &kept
     };
+    let notebook = Notebook::of(entries);
     let context = entries.iter().rev().find(|entry| entry.kind == extra_kinds::CONTEXT);
     let mark = |field: &str| context.and_then(|entry| entry.data.get(field).and_then(Value::as_u64)).unwrap_or(0);
     let folded_through = mark("folded_through");
@@ -665,6 +666,9 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
                     _ => break,
                 }
             }
+            // A step's words the notebook holds or replaced are not shown here: the newest notebook
+            // comes last, and older restatements of the work would be the cue the model copies.
+            let content = if notebook.hides(&key) { String::new() } else { content };
             let mut message = ChatMessage::new("assistant", content);
             if !reasoning.is_empty() && reasoning_kept.contains(&key) {
                 message.reasoning_content = Some(reasoning);
@@ -708,55 +712,72 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         index += 1;
     }
     flush_host(&mut host_group, &mut messages);
-    // The newest step's thinking stopped at its budget: the step's reasoning is not in the prompt
-    // (`reasoning_steps`), so the next step would think from the start again (seen: ten steps in a
-    // row began "Let me understand the task", each cut before it reached an edit). Where it had got
-    // to comes after everything else, so the earlier prompt stays as the engine cached it.
-    // Only while that step's work goes on: not once a decision, a new task or the user came after it.
-    let step_last = step_keys.last().and_then(|key| entries.iter().rev().find(|entry| step_key(entry).as_ref() == Some(key)).map(|entry| entry.seq));
-    let moved_on = step_last.is_some_and(|last| {
-        entries.iter().any(|entry| {
-            entry.seq > last && (entry.kind == kinds::USER_MESSAGE || (entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "decision_text" | "task_start")))
-        })
-    });
-    if let Some(key) = step_keys.last()
-        && !moved_on
-        && !reasoning_kept.contains(key)
-        && let Some(tail) = cut_thought(entries, key)
-    {
-        messages.push(host_message(ds, &ds.text("thought_cut", &[("thought", &tail)])));
+    // The work's notebook comes after everything else, next to the decision: what the steps
+    // concluded, whole. Thinking is not carried from step to step and older outputs fold, so
+    // without it each step rebuilt the picture before one call (seen: 74% of a session's tokens
+    // thinking, `service.rs` read 30 times, the same two to-dos restated 15 times in an hour).
+    if let Some(text) = &notebook.text {
+        messages.push(host_message(ds, &ds.text("notebook", &[("notebook", text)])));
     }
     messages
 }
 
-/// The end of a step's thinking when it stopped at its budget (the model plugin closes it with one
-/// of [`THINK_CUT`]): its last [`CUT_TAIL_CHARS`] characters before the close, at a line or
-/// sentence start. None when the thought ended on its own.
-fn cut_thought(entries: &[JournalEntry], key: &(String, u64)) -> Option<String> {
-    let reasoning: String = entries
-        .iter()
-        .filter(|entry| entry.kind == kinds::REASONING && !bool_field(&entry.data, "interrupted") && step_key(entry).as_ref() == Some(key))
-        .map(|entry| str_field(&entry.data, "text"))
-        .collect();
-    let at = THINK_CUT.iter().filter_map(|close| reasoning.rfind(close)).max()?;
-    let before = reasoning[..at].trim_end();
-    let count = before.chars().count();
-    let tail: String = before.chars().skip(count.saturating_sub(CUT_TAIL_CHARS)).collect();
-    let tail = if count > CUT_TAIL_CHARS {
-        // Start at a line or a sentence, not inside a word.
-        let start = tail.find(['\n', '.']).map(|i| i + 1).filter(|i| *i < tail.len() / 2).unwrap_or(0);
-        tail[start..].trim_start().to_owned()
-    } else {
-        tail
-    };
-    (!tail.trim().is_empty()).then_some(tail)
+/// The notebook of the work going on: the newest step message of it that holds a `Next:` heading
+/// (the form the DO and TASK rules ask for), and the steps whose words it replaces. The work is
+/// what came after the newest user message or task start; a reply (a step without calls) is an
+/// answer, never a notebook.
+struct Notebook {
+    text: Option<String>,
+    hidden: std::collections::HashSet<(String, u64)>,
 }
 
-/// The sentences the model plugins close a thought with at its budget (the current one, and
-/// Qwen's own that older journals hold).
-const THINK_CUT: &[&str] = &["I have thought this through far enough for this step", "Considering the limited time by the user"];
-/// Characters of a cut thought carried into the next step.
-const CUT_TAIL_CHARS: usize = 1500;
+impl Notebook {
+    fn of(entries: &[JournalEntry]) -> Self {
+        let start = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == kinds::USER_MESSAGE || (entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "task_start" | "decision_text")))
+            .map_or(0, |entry| entry.seq);
+        // Each step of the work in order: its words and whether it made a call.
+        let mut steps: Vec<((String, u64), String, bool)> = Vec::new();
+        for entry in entries.iter().filter(|entry| entry.seq > start && !bool_field(&entry.data, "interrupted")) {
+            let Some(key) = step_key(entry) else { continue };
+            if steps.last().map(|(last, _, _)| last) != Some(&key) {
+                steps.push((key.clone(), String::new(), false));
+            }
+            let Some((_, words, called)) = steps.last_mut() else { continue };
+            match entry.kind.as_str() {
+                kinds::ASSISTANT_MESSAGE => words.push_str(str_field(&entry.data, "text")),
+                kinds::TOOL_CALL => *called = true,
+                _ => {}
+            }
+        }
+        let newest = steps.iter().rposition(|(_, words, called)| *called && notebook_text(words).is_some());
+        let Some(newest) = newest else { return Self { text: None, hidden: Default::default() } };
+        let hidden = steps[..=newest].iter().filter(|(_, words, called)| *called && !words.trim().is_empty()).map(|(key, _, _)| key.clone()).collect();
+        Self { text: notebook_text(&steps[newest].1), hidden }
+    }
+
+    fn hides(&self, key: &(String, u64)) -> bool {
+        self.hidden.contains(key)
+    }
+}
+
+/// The notebook in a step's words: from its first `Known:`, `Done:` or `Next:` heading to the end,
+/// when it has a `Next:` heading (markdown marks around a heading are allowed).
+fn notebook_text(words: &str) -> Option<String> {
+    let heading = |line: &str| {
+        let bare = line.trim().trim_start_matches(['#', '-', '*', ' ']).replace("**", "").to_ascii_lowercase();
+        ["known:", "done:", "next:"].into_iter().find(|name| bare.starts_with(name))
+    };
+    let lines: Vec<&str> = words.lines().collect();
+    if !lines.iter().any(|line| heading(line) == Some("next:")) {
+        return None;
+    }
+    let first = lines.iter().position(|line| heading(line).is_some())?;
+    let text = lines[first..].join("\n").trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
 
 /// What plans change about entries in place.
 struct Pins {

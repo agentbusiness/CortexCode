@@ -976,8 +976,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
     // failure (debugging effectiveness decays within 2-3 attempts; a different approach beats a 4th).
     // command -> (edited since its last failure, fruitless cycles, that failure's output)
     let mut failing: HashMap<String, (bool, u32, String)> = HashMap::new();
-    // This task's loop changed a file: its steps are fixes from here on (see the thinking budget).
-    let mut edited = false;
     let mut fruitless = 0u32;
     // Commands run since a failing command last turned to pass, counted once some command has
     // failed twice since then (a probe that fails once is an answer, not a loop): command -> its
@@ -1155,22 +1153,10 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         };
         // The step's own entries start here; what is before it is what the next call shares.
         let step_start = journal.last_seq() + 1;
-        let mut call = env.call(stage, &effort, messages, None, None, step, true);
-        // A plan task is execution: short thinking, so values come from running code, not from
-        // simulating it in thought (seen: thousands of characters tracing a loop by hand).
-        // Thinking in proportion to the step: the full budget while the task designs and writes
-        // its first change, a short one for every fix after that (the design is already in the
-        // file; re-deriving it each step was most of the generated tokens).
-        // Every step carries a budget: a loop without a plan step (a question, a follow-up) gets
-        // the loop budget, never the model plugin's effort table.
-        let budget = if spec.step.is_some() {
-            if edited && env.data.limits.fix_think_tokens > 0 { env.data.limits.fix_think_tokens } else { env.data.limits.task_think_tokens }
-        } else {
-            env.data.limits.loop_think_tokens
-        };
-        if budget > 0 {
-            call.think_budget = Some(budget);
-        }
+        // No thinking budget: a thought runs to its own end. A cut thought lost its plan (thinking is
+        // not carried to the next step) and the next step rebuilt it; what a step concluded is kept
+        // in the task's notebook instead.
+        let call = env.call(stage, &effort, messages, None, None, step, true);
         let called = match llm::chat(journal, call, &any).await {
             Ok(called) => {
                 steps_since_settle += 1;
@@ -1657,7 +1643,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                         tracker.remember(&env.host, &env.scope, path).await;
                     }
                     if !outcome.changed_files.is_empty() {
-                        edited = true;
                         changed.extend(outcome.changed_files.iter().cloned());
                         if let Some(text) = tracker.after_edit(&env.host, &env.scope, &outcome.changed_files, &env.data).await {
                             let seq = journal.note(&env.run_id, "impact", &text, true).await?;
