@@ -203,6 +203,8 @@ pub struct Units {
     serving: Mutex<BTreeMap<String, (String, &'static str)>>,
     /// This machine's physical memory (`hw.memsize`), for the declared machine ranges.
     memory_bytes: u64,
+    /// One `persist` at a time, so an older snapshot never overwrites a newer one.
+    persisting: Mutex<()>,
 }
 
 impl Units {
@@ -247,6 +249,7 @@ impl Units {
             providers: Mutex::new(saved.providers.clone()),
             serving: Mutex::new(BTreeMap::new()),
             memory_bytes,
+            persisting: Mutex::new(()),
         };
         for archive in units.incoming() {
             let outcome = units.install_offline(&archive, &saved.disabled);
@@ -609,6 +612,7 @@ impl Units {
 
     /// Write each plugin's install state into its folder (see the module notes).
     fn persist(&self) -> Result<(), String> {
+        let _one_at_a_time = self.persisting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let providers = self.providers.lock().map(|providers| providers.clone()).unwrap_or_default();
         let disabled = self.disabled();
         for unit in self.all() {

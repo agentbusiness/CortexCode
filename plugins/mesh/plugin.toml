@@ -6,7 +6,7 @@
 [plugin]
 id = "mesh"
 name = "Mesh"
-version = "0.1.43"
+version = "0.1.44"
 description = "This person's CortexCode instances linked together: pairing with a short code, a signed membership, encrypted connections over the local network or a relay, capability cards, and borrowing a member's model or hands through the frame's own contracts."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
@@ -31,11 +31,9 @@ uses = ["frame.machine", "frame.plugins.list", "frame.project.list", "frame.sess
 # Defaults for the frame config's [plugin.config] table (the frame config's values win).
 [backend.config]
 # Relay servers members use to reach each other when no direct connection can be made across
-# networks (empty: n0's public relays). A company with its own iroh relay lists its URL here.
+# networks. Empty: the built-in relay (relay.athlera.ai). A company with its own iroh relay lists
+# its URL here, and it is used in place of the built-in one. n0's public relays are never used.
 relays = []
-# true: only the relays above, never n0's public ones; with none listed, no relay at all (direct
-# connections only).
-private_relays_only = false
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.

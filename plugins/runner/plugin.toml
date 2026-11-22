@@ -7,7 +7,7 @@
 [plugin]
 id = "runner"
 name = "Runner"
-version = "0.1.9"
+version = "0.1.10"
 description = "Builds for a manager (CortexManage): a job is a worktree of the source's mirror, a finished plan carried out by the chat flow, a commit after each task, the facts of the run every 20 s, a build into the proving home, and the landing on the main branch. No window."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

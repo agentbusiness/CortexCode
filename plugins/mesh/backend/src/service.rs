@@ -65,16 +65,15 @@ const CARD_TTL_MS: u64 = 120_000;
 const LOAD_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Default)]
 pub struct Config {
+    /// The relays to use (`[config] relays`); none: the built-in relay
+    /// ([`crate::net::BUILT_IN_RELAY`]). n0's public relays are never used.
     pub relays: Vec<String>,
-    /// Only `relays`, never n0's public ones (`[config] private_relays_only`; off by default).
-    pub private_relays_only: bool,
 }
 
 impl Config {
     pub fn from_value(value: &Value) -> Config {
         Config {
             relays: value.get("relays").and_then(Value::as_array).map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
-            private_relays_only: value.get("private_relays_only").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 }

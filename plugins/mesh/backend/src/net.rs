@@ -32,7 +32,7 @@ use cc_protocol::contracts::now_ms;
 use cc_protocol::{Message, RpcError, codes};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -428,25 +428,10 @@ impl Mesh {
     pub async fn start_net(self: &Arc<Self>) -> Result<(), String> {
         let secret = self.me.secret.clone();
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret).alpns(vec![FRAME_ALPN.to_vec(), pairing::ALPN.to_vec(), LIVE_ALPN.to_vec()]);
-        // Relays: the plugin's configured ones (`[config] relays`, for a company with its own), in
-        // front of n0's public relays, which carry members on other networks that cannot be
-        // reached directly. A relay sees only encrypted traffic. With `[config] private_relays_only`
-        // the configured ones alone, and none of n0's; with none configured, no relay at all
-        // (direct connections only).
-        let mut relays: Vec<iroh::RelayUrl> = Vec::new();
-        for url in lock_config(self).relays.iter() {
-            match url.parse::<iroh::RelayUrl>() {
-                Ok(parsed) => relays.push(parsed),
-                Err(error) => tracing::warn!(url, %error, "a relay URL could not be read"),
-            }
-        }
-        if lock_config(self).private_relays_only {
-            builder = builder.relay_mode(if relays.is_empty() { iroh::RelayMode::Disabled } else { iroh::RelayMode::custom(relays) });
-        } else if !relays.is_empty() {
-            let defaults: Vec<iroh::RelayUrl> = iroh::RelayMode::Default.relay_map().urls();
-            relays.extend(defaults);
-            builder = builder.relay_mode(iroh::RelayMode::custom(relays));
-        }
+        // Relays: the plugin's configured ones (`[config] relays`, for a company with its own), or
+        // the built-in relay when none is configured; never n0's public relays. A relay sees only
+        // encrypted traffic.
+        builder = builder.relay_mode(iroh::RelayMode::custom(relays_in_use(&lock_config(self))));
         let endpoint = builder.bind().await.map_err(|e| format!("cannot bind the mesh endpoint: {e}"))?;
         match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(endpoint.id()) {
             Ok(mdns) => {
@@ -510,7 +495,7 @@ impl Mesh {
         let Some(endpoint) = self.endpoint.get() else { return false };
         let node = member.node.clone();
         let Ok(id) = node.parse::<EndpointId>() else { return false };
-        let addr = member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id));
+        let addr = without_public_relays(member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id)));
         match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, FRAME_ALPN)).await {
             Ok(Ok(connection)) => {
                 self.connected(&node, connection.clone());
@@ -547,7 +532,7 @@ impl Mesh {
         let Some(member) = self.member(node) else { return Err(unreachable()) };
         let Some(endpoint) = self.endpoint.get() else { return Err(unreachable()) };
         let Ok(id) = node.parse::<EndpointId>() else { return Err(unreachable()) };
-        let addr = member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id));
+        let addr = without_public_relays(member.addrs.first().and_then(|text| serde_json::from_str::<EndpointAddr>(text).ok()).unwrap_or_else(|| EndpointAddr::new(id)));
         match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, LIVE_ALPN)).await {
             Ok(Ok(connection)) => Ok(connection),
             _ => Err(unreachable()),
@@ -692,7 +677,7 @@ impl Mesh {
         };
         let entries = match ticket {
             Some(ticket) => {
-                let addr = decode_ticket(&ticket)?;
+                let addr = without_public_relays(decode_ticket(&ticket)?);
                 try_one(addr).await?
             }
             None => {
@@ -734,6 +719,34 @@ fn is_local_network(ip: &std::net::IpAddr) -> bool {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
         std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_private() || v4.is_link_local()),
     }
+}
+
+/// The relay every app uses when its configuration names none. It carries only traffic that is
+/// already encrypted end to end between two computers.
+pub const BUILT_IN_RELAY: &str = "https://relay.athlera.ai";
+
+/// The relays this node uses: the configured ones (`[config] relays`), or the built-in one when
+/// none is configured or none of them can be read. n0's public relays are never among them.
+pub fn relays_in_use(config: &crate::service::Config) -> Vec<iroh::RelayUrl> {
+    let mut relays: Vec<iroh::RelayUrl> = Vec::new();
+    for url in config.relays.iter() {
+        match url.parse::<iroh::RelayUrl>() {
+            Ok(parsed) => relays.push(parsed),
+            Err(error) => tracing::warn!(url, %error, "a relay URL could not be read"),
+        }
+    }
+    if relays.is_empty() {
+        relays.extend(BUILT_IN_RELAY.parse::<iroh::RelayUrl>().ok());
+    }
+    relays
+}
+
+/// A member's address without n0's public relays: an address kept from before they were dropped
+/// (or handed over by an app that still uses them) names one, and dialing it would connect there.
+pub fn without_public_relays(addr: EndpointAddr) -> EndpointAddr {
+    let public: Vec<iroh::RelayUrl> = iroh::RelayMode::Default.relay_map().urls();
+    let id = addr.id;
+    EndpointAddr::from_parts(id, addr.addrs.into_iter().filter(|transport| !matches!(transport, TransportAddr::Relay(url) if public.contains(url))))
 }
 
 /// An invitation's ticket: this node's address, base32 of its JSON.
