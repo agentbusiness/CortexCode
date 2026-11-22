@@ -110,7 +110,8 @@ pub struct ProjectLog {
     /// The workspace path's hash: the prefix of its step keys, its stream and its blob folder.
     hash: String,
     dir: PathBuf,
-    graph: Arc<Graph>,
+    /// Where the steps are kept; none for a scratch workspace, whose log lives only in memory.
+    graph: Option<Arc<Graph>>,
     git: Option<PathBuf>,
     state: Mutex<State>,
     /// Commands and edits of this plugin in flight (their effects are recorded when they end, not
@@ -128,6 +129,9 @@ pub struct StepLog {
     graph: Arc<Graph>,
     git: Option<PathBuf>,
     logs: Mutex<HashMap<PathBuf, Arc<ProjectLog>>>,
+    /// Workspaces that are not the user's (the startup probe's folder): their logs never reach
+    /// the graph, which may not serve yet while they are used.
+    scratch: Mutex<BTreeSet<PathBuf>>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
 }
 
@@ -218,7 +222,7 @@ struct Found {
 
 impl StepLog {
     pub fn new(data_dir: &Path, graph: Arc<Graph>) -> StepLog {
-        StepLog { root: data_dir.join("undo"), graph, git: find_git(), logs: Mutex::new(HashMap::new()), publisher: Mutex::new(None) }
+        StepLog { root: data_dir.join("undo"), graph, git: find_git(), logs: Mutex::new(HashMap::new()), scratch: Mutex::new(BTreeSet::new()), publisher: Mutex::new(None) }
     }
 
     /// The git program the logs use, when one was found.
@@ -253,12 +257,18 @@ impl StepLog {
         }
         let hash = Self::hash(&workspace);
         let dir = self.root.join(&hash);
-        let (meta, records, next_seq) = load(&self.graph, &workspace, &hash, &dir).await;
+        let scratch = lock(&self.scratch).contains(&workspace);
+        let (meta, records, next_seq, graph) = if scratch {
+            (Meta { workspace: workspace.to_string_lossy().into_owned(), ..Meta::default() }, Vec::new(), 1, None)
+        } else {
+            let (meta, records, next_seq) = load(&self.graph, &workspace, &hash, &dir).await;
+            (meta, records, next_seq, Some(self.graph.clone()))
+        };
         if let Some(log) = lock(&self.logs).get(&workspace) {
             return log.clone();
         }
         let git = self.git.clone().filter(|_| workspace.join(".git").exists());
-        let log = Arc::new(ProjectLog::new(workspace.clone(), hash, dir, self.graph.clone(), git, meta, records, next_seq));
+        let log = Arc::new(ProjectLog::new(workspace.clone(), hash, dir, graph, git, meta, records, next_seq));
         *lock(&log.publisher) = lock(&self.publisher).clone();
         let existing = lock(&self.logs).entry(workspace).or_insert_with(|| log.clone()).clone();
         if Arc::ptr_eq(&existing, &log) {
@@ -266,6 +276,19 @@ impl StepLog {
             log.catch_up();
         }
         existing
+    }
+
+    /// Mark `workspace` as scratch before its first use: its log stays in memory.
+    pub fn scratch(&self, workspace: &Path) {
+        lock(&self.scratch).insert(util::canonical_lenient(workspace));
+    }
+
+    /// A scratch workspace is done: its log and blob folder go.
+    pub fn drop_scratch(&self, workspace: &Path) {
+        let workspace = util::canonical_lenient(workspace);
+        lock(&self.logs).remove(&workspace);
+        lock(&self.scratch).remove(&workspace);
+        let _ = std::fs::remove_dir_all(self.root.join(Self::hash(&workspace)));
     }
 
     /// Forget a workspace that no longer exists: its nodes are retired, its blob folder goes.
@@ -501,10 +524,12 @@ fn step_batches(hash: &str, workspace: &str, record: &TimelineRecord) -> Vec<Bat
 
 impl ProjectLog {
     #[allow(clippy::too_many_arguments)]
-    fn new(workspace: PathBuf, hash: String, dir: PathBuf, graph: Arc<Graph>, git: Option<PathBuf>, meta: Meta, records: Vec<TimelineRecord>, next_seq: u64) -> ProjectLog {
+    fn new(workspace: PathBuf, hash: String, dir: PathBuf, graph: Option<Arc<Graph>>, git: Option<PathBuf>, meta: Meta, records: Vec<TimelineRecord>, next_seq: u64) -> ProjectLog {
         let _ = std::fs::create_dir_all(dir.join("blobs"));
         // The node exists before the first step's edge to it.
-        graph.put(workspace_batch(&meta));
+        if let Some(graph) = &graph {
+            graph.put(workspace_batch(&meta));
+        }
         ProjectLog {
             workspace,
             hash,
@@ -556,13 +581,16 @@ impl ProjectLog {
     }
 
     fn write_meta(&self, meta: &Meta) {
-        self.graph.put(workspace_batch(meta));
+        if let Some(graph) = &self.graph {
+            graph.put(workspace_batch(meta));
+        }
     }
 
     /// A new step: its nodes in one put.
     fn write_step(&self, record: &TimelineRecord) {
+        let Some(graph) = &self.graph else { return };
         let workspace = self.workspace.to_string_lossy();
-        self.graph.put_many(step_batches(&self.hash, &workspace, record));
+        graph.put_many(step_batches(&self.hash, &workspace, record));
     }
 
     /// Drop blobs no record names.
@@ -856,7 +884,9 @@ impl ProjectLog {
                 retired.push(graph::gref("Step", &step_key(&self.hash, record.seq)));
             }
         }
-        self.graph.retire(retired, "committed");
+        if let Some(graph) = &self.graph {
+            graph.retire(retired, "committed");
+        }
         self.collect_blobs(&kept);
         let changed = kept.len() != before;
         state.records = kept;

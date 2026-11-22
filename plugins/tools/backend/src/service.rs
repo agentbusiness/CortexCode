@@ -825,6 +825,7 @@ pub async fn probe(core: &Arc<Core>, host: Arc<dyn Host>) -> ProbeReport {
     let mut checks = Vec::new();
     let scratch = std::env::temp_dir().join(format!("cc-tools-probe-{}", uuid::Uuid::new_v4().simple()));
     let _ = std::fs::create_dir_all(&scratch);
+    core.steps.scratch(&scratch);
     let context = ExecContext {
         project_id: "probe".into(),
         session_id: format!("probe-{}", uuid::Uuid::new_v4().simple()),
@@ -987,6 +988,7 @@ pub async fn probe(core: &Arc<Core>, host: Arc<dyn Host>) -> ProbeReport {
     if let Some(id) = big.artifact.as_deref() {
         core.artifacts.remove(id);
     }
+    core.steps.drop_scratch(&scratch);
     let _ = std::fs::remove_dir_all(&scratch);
     ProbeReport::from_checks(checks)
 }
