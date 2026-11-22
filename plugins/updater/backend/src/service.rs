@@ -143,6 +143,8 @@ pub struct Updater {
     catalog: Mutex<Option<(Instant, Result<Catalog, String>)>>,
     /// A check is running; a second request only asks it to look once more.
     checking: AtomicBool,
+    /// The last reset plan, given while a check or a reset runs ([`Self::reset_plan`]).
+    last_plan: Mutex<Option<ResetPlan>>,
     again: AtomicBool,
     wake: Notify,
     /// Versions the frame keeps for its restart (a frame update is staged): (plugin, version).
@@ -175,6 +177,7 @@ impl Updater {
             ctx: OnceLock::new(),
             catalog: Mutex::new(None),
             checking: AtomicBool::new(false),
+            last_plan: Mutex::new(None),
             again: AtomicBool::new(false),
             wake: Notify::new(),
             at_restart: Mutex::new(BTreeSet::new()),
@@ -316,6 +319,13 @@ impl Updater {
 
     pub fn status(&self) -> Status {
         self.status.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A check or a reset is over: announced, so a screen given the plan from before the run
+    /// reads it again ([`Self::reset_plan`]).
+    fn checking_done(&self) {
+        self.checking.store(false, Ordering::SeqCst);
+        self.with_status(|_status| {});
     }
 
     fn with_status(&self, change: impl FnOnce(&mut Status)) {
@@ -536,9 +546,20 @@ impl Updater {
     }
 
     pub async fn reset_plan(&self) -> Result<ResetPlan, RpcError> {
+        // While a check or a reset runs, each of its steps is announced and the settings ask for
+        // the plan again every time, though it changes only when the run is over (which is
+        // announced too, [`Self::checking_done`]): the plan read before serves meanwhile (seen:
+        // about a hundred plans a minute during an update, each reading every plugin's live
+        // folder).
+        let kept = if self.checking.load(Ordering::SeqCst) { self.last_plan.lock().unwrap_or_else(|p| p.into_inner()).clone() } else { None };
+        if let Some(plan) = kept {
+            return Ok(plan);
+        }
         let (ctx, _, catalog, offline, bundled, platform, running_frame) = self.reset_sources(false).await?;
         let items = self.reference_items(&ctx, catalog.as_ref(), &bundled, platform, &running_frame).await?;
-        Ok(ResetPlan { plugins: items.into_iter().map(|(item, _)| item).collect(), running: self.run_going(&ctx).await, offline })
+        let plan = ResetPlan { plugins: items.into_iter().map(|(item, _)| item).collect(), running: self.run_going(&ctx).await, offline };
+        *self.last_plan.lock().unwrap_or_else(|p| p.into_inner()) = Some(plan.clone());
+        Ok(plan)
     }
 
     /// The named plugins (none named: every plugin) back to their official release, or to the
@@ -557,7 +578,7 @@ impl Updater {
             status.state = "idle".into();
             status.detail = String::new();
         });
-        self.checking.store(false, Ordering::SeqCst);
+        self.checking_done();
         // A check follows: plugins new to this machine and the frame.
         self.wake.notify_one();
         outcome
@@ -718,7 +739,7 @@ impl Updater {
                 break;
             }
         }
-        self.checking.store(false, Ordering::SeqCst);
+        self.checking_done();
     }
 
     async fn check_once(self: &Arc<Self>) {

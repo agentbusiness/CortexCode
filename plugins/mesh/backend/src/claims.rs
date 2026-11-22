@@ -43,7 +43,7 @@
 
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{ClaimParams, Placement};
-use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, Priority, SlotsResult};
+use cc_protocol::contracts::model::{ModelInfo, Priority, SlotsResult};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::{RpcError, codes};
 use futures_util::future::select_ok;
@@ -359,8 +359,11 @@ impl Mesh {
                     continue;
                 }
                 let Some((rank, tag)) = ranked(&info.tags) else { continue };
-                let tok_s = ctx.call("model.metrics", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
-                let loaded = ctx.call("model.slots", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok()).is_some_and(|slots| slots.loaded);
+                // One read of the slots: they carry the recent throughput too (`model.metrics` is
+                // optional, and most models do not answer it).
+                let slots = ctx.call("model.slots", crate::card::for_model(&plugin)).await.ok().and_then(|value| serde_json::from_value::<SlotsResult>(value).ok());
+                let tok_s = slots.as_ref().and_then(|slots| slots.metrics.as_ref()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
+                let loaded = slots.is_some_and(|slots| slots.loaded);
                 lock(&self.claims.weights).insert(info.model_id.clone(), info.file_bytes);
                 let window = if info.ctx_native == 0 { info.ctx_total } else { info.ctx_total.min(info.ctx_native) };
                 // A claim of one tag stays within the family of this computer's model for it; one

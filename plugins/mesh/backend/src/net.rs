@@ -46,6 +46,9 @@ pub const LIVE_ALPN: &[u8] = b"cortex/live/1";
 
 /// How long a dial may take before the member counts as unreachable for now.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+/// How often this computer's card is looked at for members that have not got it as it is now
+/// ([`Mesh::push_card`]): a change of its models' load reaches them within this long.
+const CARD_STEP: Duration = Duration::from_secs(3);
 
 /// How long the inviter gives one pairing exchange, from the connection to the answer. An
 /// exchange that reaches it counts as a failed attempt.
@@ -467,8 +470,14 @@ impl Mesh {
                 mesh.dial_all().await;
                 mesh.sync_machine().await;
                 mesh.hand_over().await;
-                mesh.push_card().await;
                 mesh.auto_place().await;
+            }
+        });
+        let mesh = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CARD_STEP).await;
+                mesh.push_card().await;
             }
         });
         Ok(())
@@ -582,16 +591,45 @@ impl Mesh {
         }
     }
 
+    /// This computer's card to every connected member that has not got it as it is now: read once
+    /// for all of them (its models' load included), and sent only where it changed (seen: every
+    /// app sent its whole card to every other every 15 s, reading its models' load again for each
+    /// member, which grows with the square of the apps in the network).
     pub async fn push_card(self: &Arc<Self>) {
         let nodes: Vec<String> = self.connections().keys().cloned().collect();
+        if nodes.is_empty() {
+            return;
+        }
+        let card = self.my_card().await;
         for node in nodes {
-            self.push_card_to(&node).await;
+            let card = self.card_as_seen_by(card.clone(), &node);
+            let fingerprint = crate::card::fingerprint(&card);
+            let known = crate::service::lock(&self.sent_cards).get(&node).cloned();
+            if known.as_ref() == Some(&fingerprint) {
+                continue;
+            }
+            self.send_card(&node, card, fingerprint).await;
         }
     }
 
+    /// This computer's card to one member, whatever it was sent before: a new connection, or a
+    /// member whose rights here changed.
     pub async fn push_card_to(&self, node: &str) {
         let card = self.card_for(node).await;
-        let _ = self.call_member(node, "mesh.card.push", serde_json::to_value(card).unwrap_or(Value::Null), None, CancellationToken::new()).await;
+        let fingerprint = crate::card::fingerprint(&card);
+        self.send_card(node, card, fingerprint).await;
+    }
+
+    /// One card to one member, remembered as its own once the member took it (a card that did
+    /// not arrive is sent again on the next look).
+    async fn send_card(&self, node: &str, card: Card, fingerprint: String) {
+        let sent = self.call_member(node, "mesh.card.push", serde_json::to_value(card).unwrap_or(Value::Null), None, CancellationToken::new()).await;
+        let mut sent_cards = crate::service::lock(&self.sent_cards);
+        if sent.is_ok() {
+            sent_cards.insert(node.to_owned(), fingerprint);
+        } else {
+            sent_cards.remove(node);
+        }
     }
 
     pub async fn push_log_to(&self, node: &str) {

@@ -1,9 +1,10 @@
 //! Errors, failures and log floods of this process (the knowledge app's `error_stats`, the same records).
 //!
-//! Every warning and error the process logs, every panic, and every call site that logs far more
-//! than it should is grouped by where it happened (`fingerprint`) and counted. Each group keeps
-//! the first message of its window, up to five distinct messages, the fields and the spans it
-//! happened in, and the version. Groups are written once a minute.
+//! Every error the process logs, every panic, and every call site that logs far more than it should
+//! is grouped by where it happened (`fingerprint`) and counted. Each group keeps the first message
+//! of its window, up to five distinct messages, the fields and the spans it happened in, and the
+//! version. Groups are handed over once per window. Warnings are never collected: they stay in the
+//! process's own log.
 
 use crate::{OWN_TARGET, now_ms, recorder};
 use cc_protocol::contracts::reports::ErrorRecord;
@@ -177,8 +178,8 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// The tracing layer that collects the process's own failures: every warning and error line,
-/// with its fields and its spans' fields, and every line counted per call site for floods.
+/// The tracing layer that collects the process's own failures: every error line, with its fields
+/// and its spans' fields, and every line counted per call site for floods.
 /// Installed beside the log writer, so it sees exactly what the log shows.
 pub struct ErrorLayer;
 
@@ -237,11 +238,11 @@ where
             return;
         }
         let now = now_ms();
-        let warning = *meta.level() <= Level::WARN;
+        let collected = *meta.level() == Level::ERROR;
         // The flood count reads only the call site; the fields are read for a line that is
         // collected, or the first of a call site's window.
         let first_of_window = flood::count(meta, now);
-        if !warning && !first_of_window {
+        if !collected && !first_of_window {
             return;
         }
         let mut fields = Fields::default();
@@ -250,7 +251,7 @@ where
         if first_of_window {
             flood::sample(meta, &message);
         }
-        if !warning {
+        if !collected {
             return;
         }
         let mut scenario = scenario();
@@ -271,7 +272,7 @@ where
         }
         record(Entry {
             source: "server",
-            kind: if *meta.level() == Level::ERROR { "error" } else { "warning" }.to_string(),
+            kind: "error".to_string(),
             area: area(meta.target()),
             target: meta.target().to_string(),
             location: location(meta),
@@ -334,7 +335,8 @@ mod flood {
     }
 
     /// Ends the window: every call site that logged more than `FLOOD_PER_MINUTE` lines a minute
-    /// in it is recorded as a log flood, with its count and its first message.
+    /// in it, whatever their level, is recorded as a log flood, with its count and its first
+    /// message.
     pub(super) fn close_window(window_ms: i64) {
         let taken = match sites().lock() {
             Ok(mut sites) => std::mem::take(&mut *sites),
@@ -374,7 +376,7 @@ pub(crate) fn drain() -> Vec<Value> {
             area: "stats".to_string(),
             target: "stats".to_string(),
             location: "stats".to_string(),
-            level: "WARN".to_string(),
+            level: "ERROR".to_string(),
             message: format!("{dropped} failures were not grouped: the window held its most groups"),
             fields: json!({ "dropped": dropped }),
             scenario: Value::Object(Default::default()),

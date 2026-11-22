@@ -1,18 +1,22 @@
-//! Reports: what an app sends about itself (its errors, warnings and metrics) to a CortexManage that
+//! Reports: what an app sends about itself (its errors and its metrics) to a CortexManage that
 //! manages its repository. Part of the shared standard (`AGENTS.md`); every app sends, CortexManage
 //! receives.
 //!
-//! - Every process collects (`stats-kit`) and once a minute hands its rows to the app's `stats`
-//!   plugin (`stats.record`), the one that writes Parquet day files under the stats folder:
-//!   `errors` (warnings, errors and panics, grouped per minute by fingerprint), `calls` (every
-//!   contract method, counted per minute), `models` (every model call made, with its model, tag,
-//!   computer and tokens) and any table of its own (the knowledge app: `product`, `llm`).
+//! - Every process collects (`stats-kit`) and every [`SUMMARY_MS`] (five minutes, a panic at once)
+//!   hands its rows to the app's `stats` plugin (`stats.record`), the one that writes Parquet day
+//!   files under the stats folder. The tables are exactly [`tables::ERRORS`] (errors and panics,
+//!   grouped per window by fingerprint, and the call sites that flood the log; warnings are never
+//!   collected), [`tables::CALLS`] (every contract method, summed per five-minute bucket) and
+//!   [`tables::MODELS`] (the model calls made, summed per five-minute bucket by model, tag and
+//!   computer). No app sends a table of its own.
 //! - Beside each day file a `<day>.sent.parquet` lists the event ids that a CortexManage accepted.
 //!   A row not in it is undelivered.
-//! - Once a minute the `stats` plugin (in the knowledge app, its mesh) offers the undelivered rows, one table of one day at a time, to
-//!   each CortexManage that shares [`SERVICE`], this machine first. One that manages the sender's
-//!   repository answers `accepted`; the rows are then marked sent. One that does not answers
-//!   `accepted: false` and the next is asked. With none, the rows wait for the next minute.
+//! - After each hand-over the `stats` plugin (in the knowledge app, its mesh) offers the rows just
+//!   written, one table of one day at a time, to each CortexManage that shares [`SERVICE`], this
+//!   machine first; the day files are read again only for rows a round could not deliver. One that
+//!   manages the sender's repository answers `accepted` once the rows are kept; the rows are then
+//!   marked sent. One that does not answers `accepted: false`, the next is asked, and it is not
+//!   asked again for an hour. With none, the rows wait on disk.
 //! - The repository is the one the app declares (`release::DEFAULT_REPO`, `owner/name`); a
 //!   CortexManage matches it exactly against the GitHub repository a person set on a managed
 //!   repository. Nothing is matched by name or pattern.
@@ -23,6 +27,11 @@ use serde_json::Value;
 /// The service a CortexManage shares for reports.
 pub const SERVICE: &str = "manage.reports";
 pub const VERSION: u32 = 1;
+
+/// The window of a summary row, in milliseconds: `calls` and `models` rows each sum one bucket of
+/// this length that starts at a multiple of it (UTC), and every process hands its rows over once
+/// per window.
+pub const SUMMARY_MS: i64 = 300_000;
 
 pub mod methods {
     /// [`super::SendParams`] -> [`super::SendResult`]. Any member may call it (verb `send`).
@@ -44,13 +53,15 @@ pub struct RecordParams {
     pub rows: Vec<Value>,
 }
 
-/// The tables `stats-kit` writes; an app may send others of its own.
+/// The tables `stats-kit` writes and a CortexManage keeps; there are no others.
 pub mod tables {
     pub const ERRORS: &str = "errors";
     pub const CALLS: &str = "calls";
-    /// Every model call a process made: the model, the tag, the computer that served it and the
-    /// tokens.
+    /// The model calls a process made, summed per five-minute bucket: the model, the tag, the
+    /// computer that served them, their tokens and times.
     pub const MODELS: &str = "models";
+    /// Every table, the only ones a CortexManage accepts.
+    pub const ALL: [&str; 3] = [ERRORS, CALLS, MODELS];
 }
 
 /// Who sends: the app, as it declares itself, and the computer it runs on.
@@ -105,15 +116,15 @@ pub struct SendResult {
     pub reason: String,
 }
 
-/// One group of the same failure at the same place within one minute (the `errors` table).
+/// One group of the same failure at the same place within one window (the `errors` table).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ErrorRecord {
     pub schema_version: u32,
     pub event_id: String,
     /// `server` or `interface`.
     pub source: String,
-    /// `error`, `warning`, `panic`, `http_status`, `log_flood`, `collector_dropped`, or an
-    /// interface kind (`ui_error`, ...).
+    /// `error`, `panic`, `http_status`, `log_flood`, `collector_dropped`, or an interface kind
+    /// (`ui_error`, ...). Warnings are never collected.
     pub kind: String,
     /// The part of the software (a module, a route's first segment, a view).
     pub area: String,
@@ -123,7 +134,7 @@ pub struct ErrorRecord {
     pub location: String,
     /// Stable id of the group across windows and days.
     pub fingerprint: String,
-    /// `ERROR`, `WARN`, `PANIC`, ...
+    /// `ERROR` or `PANIC`; for a `log_flood`, the level of the flooding lines.
     pub level: String,
     /// The first message of the window.
     pub message: String,
@@ -147,7 +158,7 @@ pub struct ErrorRecord {
 }
 
 impl ErrorRecord {
-    /// A failure to repair: an error or a panic. Warnings and the rest are kept as metrics.
+    /// A failure to repair: an error or a panic. A log flood is kept as a metric.
     pub fn is_failure(&self) -> bool {
         self.level == "ERROR" || self.level == "PANIC"
     }

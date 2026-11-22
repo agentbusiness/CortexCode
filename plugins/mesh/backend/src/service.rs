@@ -55,8 +55,12 @@ pub const SUBSCRIBES: &[&str] = &["model.", "plugin.state", "plugin.swapped", "s
 const PAIRING_WINDOW: Duration = Duration::from_secs(3600);
 /// Attempts on one invitation, failed or under way, before the window closes by itself.
 const PAIRING_ATTEMPTS: u32 = 3;
-/// How long a card is reused before it is built again.
-const CARD_TTL_MS: u64 = 20_000;
+/// How long a card is reused before it is built again (a change of plugins, models or projects
+/// builds it at once, [`Mesh::forget_card`]; the models' load is read on every use). Its slow
+/// parts (data hashes, repositories, containers, languages) are real work on each build, and a
+/// build that changed anything reaches every member: two minutes (seen: every app built its card
+/// every 30 s and sent it to every other).
+const CARD_TTL_MS: u64 = 120_000;
 /// How long a method that changes the membership waits for the log to be read from the store.
 const LOAD_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Default)]
@@ -105,6 +109,9 @@ pub struct Mesh {
     pub(crate) log: Mutex<Log>,
     pub cards: Mutex<HashMap<String, Card>>,
     my_card: Mutex<Option<Card>>,
+    /// What each connected member was last sent of this computer's card
+    /// ([`crate::card::fingerprint`]): a card goes to a member only when it differs.
+    pub(crate) sent_cards: Mutex<HashMap<String, String>>,
     conns: Mutex<HashMap<String, Connection>>,
     pub endpoint: OnceLock<Endpoint>,
     pub router: OnceLock<Router>,
@@ -172,6 +179,7 @@ impl Mesh {
             log: Mutex::new(log),
             cards: Mutex::new(HashMap::new()),
             my_card: Mutex::new(None),
+            sent_cards: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             endpoint: OnceLock::new(),
             router: OnceLock::new(),
@@ -580,6 +588,7 @@ impl Mesh {
             conns.remove(node);
             drop(conns);
             lock(&self.event_subs).retain(|sub| sub.node != node);
+            lock(&self.sent_cards).remove(node);
             self.stop_listening(node);
             self.member_gone(node);
             self.requester_gone(node);
@@ -590,7 +599,14 @@ impl Mesh {
 
     // --- cards and events ----------------------------------------------------------------------
 
+    /// A member's card. One that says nothing new (sent again on a new connection, or built again
+    /// the same) is dropped: it wakes no claim and no screen, and the member is not asked again
+    /// what it shares (seen: every card woke every app's screens, which read the members again).
     pub fn card_received(&self, node: &str, card: Card) {
+        let known = lock(&self.cards).get(node).map(crate::card::fingerprint);
+        if known.is_some_and(|known| known == crate::card::fingerprint(&card)) {
+            return;
+        }
         if !card.software.is_empty() {
             self.write(Write::Software(node.to_owned(), card.software.clone()));
         }
@@ -611,7 +627,11 @@ impl Mesh {
 
     /// This computer's card as one member gets it: no projects for a member that may not work here.
     pub async fn card_for(&self, node: &str) -> Card {
-        let mut card = self.my_card().await;
+        self.card_as_seen_by(self.my_card().await, node)
+    }
+
+    /// This computer's card cut for one member: no projects for a member that may not work here.
+    pub fn card_as_seen_by(&self, mut card: Card, node: &str) -> Card {
         if !self.may_work(node) {
             card.projects.clear();
         }
@@ -1046,6 +1066,10 @@ impl Mesh {
         for mut candidate in self.candidates(None, cc_protocol::contracts::model::tags::CODING) {
             let Some(node) = candidate.node.clone() else { continue };
             let free = cards.get(&node).and_then(|card| card.models.iter().find(|model| model.plugin == candidate.plugin)).is_some_and(|model| model.slots > model.slots_busy);
+            // Only a model its card shows free is asked how big it is.
+            if !free {
+                continue;
+            }
             let info = self.call_member(&node, "model.info", crate::card::for_model(&candidate.plugin), None, CancellationToken::new()).await.ok().and_then(|value| serde_json::from_value::<ModelInfo>(value).ok());
             if let (true, Some(info)) = (free, info) {
                 candidate.weights = info.file_bytes;

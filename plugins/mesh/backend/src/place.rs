@@ -13,7 +13,7 @@
 use crate::borrow::Client;
 use crate::service::{Mesh, lock};
 use cc_protocol::contracts::mesh::{Capacity, CapacityParams, PlaceParams, Placement};
-use cc_protocol::contracts::model::{LiveMetrics, ModelInfo, Priority, SlotsResult};
+use cc_protocol::contracts::model::{ModelInfo, Priority, SlotsResult};
 use cc_protocol::{RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -77,7 +77,8 @@ impl Mesh {
             return None;
         }
         let slots: SlotsResult = serde_json::from_value(ctx.call("model.slots", json!({})).await.ok()?).ok()?;
-        let tok_s = ctx.call("model.metrics", json!({})).await.ok().and_then(|value| serde_json::from_value::<LiveMetrics>(value).ok()).map_or(0.0, |metrics| metrics.decode_tps_per_stream);
+        // The slots carry the recent throughput (`model.metrics` is optional).
+        let tok_s = slots.metrics.as_ref().map_or(0.0, |metrics| metrics.decode_tps_per_stream);
         Some(Local {
             family: info.family,
             tags: info.tags,
@@ -106,7 +107,7 @@ impl Mesh {
 
     /// Reachable members with a model of `family` (any family when None), tagged for `tag`, that
     /// no session of ours is placed on: each member's first such model. Whether the model is free now, and how strong it is, are asked live
-    /// ([`Self::free_weights`]): a card is up to 15 s old.
+    /// ([`Self::free_weights`]) of a member whose card shows it free: a card's load is seconds old.
     pub(crate) fn candidates(&self, family: Option<&str>, tag: &str) -> Vec<Candidate> {
         let me = self.me.hex();
         let cards = lock(&self.cards).clone();
@@ -153,6 +154,13 @@ impl Mesh {
         let mut free = Vec::new();
         for mut candidate in self.candidates(family, tag) {
             let Some(node) = candidate.node.clone() else { continue };
+            // A member whose card shows its model busy is not asked (a waiting session asked
+            // every member every second; a change of load reaches here within seconds,
+            // `Mesh::push_card`).
+            let shown_free = lock(&self.cards).get(&node).and_then(|card| card.models.iter().find(|model| model.plugin == candidate.plugin)).is_some_and(|model| model.slots_busy == 0 && model.queued == 0);
+            if !shown_free {
+                continue;
+            }
             if let Some(weights) = self.free_weights(&node, &candidate.plugin).await {
                 candidate.weights = weights;
                 free.push(candidate);

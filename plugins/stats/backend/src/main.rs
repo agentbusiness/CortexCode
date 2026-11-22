@@ -1,7 +1,8 @@
-//! `cc-stats`: serve `stats@1`. Every process of the app hands its rows here (`stats.record`); they
-//! are written as day files under `<home>/stats`, and once a minute the rows no CortexManage has
-//! accepted yet are offered to the CortexManages on the mesh, this app first, then this machine,
-//! then the members, until one that manages this app's repository accepts them.
+//! `cc-stats`: serve `stats@1`. Every process of the app hands its rows here (`stats.record`) once
+//! per five-minute window; they are written as day files under `<home>/stats` and queued, and once
+//! every process has handed over, the rows no CortexManage has accepted yet are offered to the
+//! CortexManages on the mesh, this app first, then this machine, then the members, until one that
+//! manages this app's repository accepts them. One that refuses is not asked again for an hour.
 
 use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::mesh::{Card, ServiceCallParams, ServicesResult, methods as mesh};
@@ -46,7 +47,7 @@ impl Stats {
         tokio::spawn(async move {
             let mut outbox = Outbox::default();
             loop {
-                tokio::time::sleep(cc_stats_kit::WINDOW).await;
+                cc_stats_kit::next_delivery().await;
                 let targets = targets(&ctx).await;
                 if targets.is_empty() {
                     continue;

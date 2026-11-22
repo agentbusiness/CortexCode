@@ -12,18 +12,22 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Write one batch a process handed over into its table's day files.
+/// Write one batch a process handed over into its table's day files, and queue its rows for the next
+/// delivery ([`crate::deliver::queue`]).
 pub fn store(root: &Path, batch: RecordParams) -> Result<usize, String> {
     if batch.part.is_empty() || batch.part.contains(['/', '\\']) || batch.part.starts_with('.') {
         return Err(format!("`{}` is not a process's name", batch.part));
     }
     let folder = root.join(&batch.table).join(&batch.part);
     let count = batch.rows.len();
-    match batch.table.as_str() {
+    let written = match batch.table.as_str() {
         tables::ERRORS => write_days(&folder, parse::<ErrorRecord>(batch.rows)?, |r| r.last_at_ms)?,
         tables::CALLS => write_days(&folder, parse::<CallRecord>(batch.rows)?, |r| r.last_at_ms)?,
         tables::MODELS => write_days(&folder, parse::<ModelRecord>(batch.rows)?, |r| r.ended_at_ms)?,
         other => return Err(format!("no table `{other}`: the tables are {}, {} and {}", tables::ERRORS, tables::CALLS, tables::MODELS)),
+    };
+    for (file, day, rows) in written {
+        crate::deliver::queue(crate::deliver::Pending { file, table: batch.table.clone(), part: batch.part.clone(), day, rows });
     }
     Ok(count)
 }
@@ -102,6 +106,8 @@ impl Row for CallRecord {
             count("completion_tokens"),
             Field::new("first_at_ms", DataType::Int64, false),
             Field::new("last_at_ms", DataType::Int64, false),
+            Field::new("bucket_ms", DataType::Int64, false),
+            Field::new("window_ms", DataType::Int64, false),
             text("record_json"),
         ])
     }
@@ -124,6 +130,8 @@ impl Row for CallRecord {
             count(|r| r.completion_tokens),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.first_at_ms).collect::<Vec<_>>())),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.last_at_ms).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.bucket_ms).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.window_ms).collect::<Vec<_>>())),
         ]
     }
 }
@@ -151,6 +159,7 @@ impl Row for ModelRecord {
             text("finish"),
             text("version"),
             text("node_id"),
+            count("count"),
             count("prompt_tokens"),
             count("cached_tokens"),
             count("completion_tokens"),
@@ -159,8 +168,11 @@ impl Row for ModelRecord {
             ms("decode_ms"),
             ms("queue_ms"),
             ms("wall_ms"),
+            ms("max_wall_ms"),
             Field::new("started_at_ms", DataType::Int64, false),
             Field::new("ended_at_ms", DataType::Int64, false),
+            Field::new("bucket_ms", DataType::Int64, false),
+            Field::new("window_ms", DataType::Int64, false),
             text("record_json"),
         ])
     }
@@ -183,6 +195,7 @@ impl Row for ModelRecord {
             text(|r| r.finish.as_str()),
             text(|r| r.version.as_str()),
             text(|r| r.node_id.as_str()),
+            count(|r| r.count),
             count(|r| r.prompt_tokens),
             count(|r| r.cached_tokens),
             count(|r| r.completion_tokens),
@@ -191,8 +204,11 @@ impl Row for ModelRecord {
             ms(|r| r.decode_ms),
             ms(|r| r.queue_ms),
             ms(|r| r.wall_ms),
+            ms(|r| r.max_wall_ms),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.started_at_ms).collect::<Vec<_>>())),
             Arc::new(Int64Array::from(rows.iter().map(|r| r.ended_at_ms).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.bucket_ms).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|r| r.window_ms).collect::<Vec<_>>())),
         ]
     }
 }

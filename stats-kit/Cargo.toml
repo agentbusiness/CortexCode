@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94"
 publish = false
-description = "Every app's errors, warnings, call counts and model calls: collected in every process, written as Parquet day files and delivered to a CortexManage by the stats plugin (feature `files`); shared by every Cortex app and the knowledge app."
+description = "Every app's errors, and its call counts and model calls summed per five minutes: collected in every process, written as Parquet day files and delivered to a CortexManage by the stats plugin (feature `files`); shared by every Cortex app and the knowledge app."
 
 # Standalone: every process that records depends on this crate by path.
 [workspace]

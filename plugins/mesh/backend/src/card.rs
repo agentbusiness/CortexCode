@@ -115,6 +115,37 @@ pub fn for_model(plugin: &str) -> Value {
     json!({ cc_protocol::contracts::model::PLUGIN_PARAM: plugin })
 }
 
+/// How stale a card's gauges may get at a member: a card is pushed at least this often while
+/// they move, even when nothing else on it changed.
+const GAUGES_EVERY_MS: u64 = 600_000;
+
+/// The card's gauges: what moves all the time and decides nothing at once (free memory and disk,
+/// a model's measured speed, the GPUs and serving figures). They travel with every push, but a
+/// change of theirs alone pushes the card only once per [`GAUGES_EVERY_MS`].
+const GAUGES: [&str; 4] = ["free_memory_bytes", "free_disk_bytes", "gpus", "serving"];
+const MODEL_GAUGES: [&str; 1] = ["tok_s"];
+
+/// What a card says, to tell whether it changed: everything but the moment it was built and its
+/// gauges, with the gauges' period in their place so that they reach the members now and then.
+pub fn fingerprint(card: &Card) -> String {
+    let mut value = serde_json::to_value(card).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("updated_ms");
+        for gauge in GAUGES {
+            object.remove(gauge);
+        }
+        if let Some(Value::Array(models)) = object.get_mut("models") {
+            for model in models.iter_mut().filter_map(Value::as_object_mut) {
+                for gauge in MODEL_GAUGES {
+                    model.remove(gauge);
+                }
+            }
+        }
+        object.insert("gauges_period".to_owned(), json!(card.updated_ms / GAUGES_EVERY_MS));
+    }
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
+
 /// The model's load now: busy slots, those a person waits for, the queue.
 pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
     if let Some(slots) = get::<SlotsResult>(ctx, "model.slots", for_model(&model.plugin)).await {
@@ -154,7 +185,9 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
     let mut models = Vec::new();
     for (plugin, info) in local_models(ctx).await {
         let slots: Option<SlotsResult> = get(ctx, "model.slots", for_model(&plugin)).await;
-        let metrics: Option<LiveMetrics> = get(ctx, "model.metrics", for_model(&plugin)).await;
+        // The slots carry the model's recent throughput; `model.metrics` is optional and most
+        // models do not answer it (seen: tens of thousands of refused calls a day).
+        let metrics: Option<LiveMetrics> = slots.as_ref().and_then(|slots| slots.metrics.clone());
         models.push(ModelCard {
             plugin,
             model_id: info.model_id,

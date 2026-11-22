@@ -63,11 +63,10 @@ pub(crate) trait Row: Serialize + DeserializeOwned {
 /// appended (a replayed event id replaces its row), and the whole day written to a temporary
 /// file, synced and moved over the old one.
 pub(crate) fn write_day<R: Row>(path: &Path, records: Vec<R>) -> Result<(), String> {
+    let replaced: std::collections::HashSet<String> = records.iter().map(|record| record.event_id().to_owned()).collect();
     let mut rows: Vec<R> = read_records(path)?;
-    for record in records {
-        rows.retain(|row| row.event_id() != record.event_id());
-        rows.push(record);
-    }
+    rows.retain(|row| !replaced.contains(row.event_id()));
+    rows.extend(records);
     let json = rows.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     let mut columns = R::columns(&rows);
     columns.push(Arc::new(StringArray::from(json)));
@@ -117,10 +116,12 @@ pub(crate) fn read_batches(path: &Path) -> Result<Vec<RecordBatch>, String> {
     reader.map(|batch| batch.map_err(|e| e.to_string())).collect()
 }
 
-/// Write records into the day file of each one's time, then remove what is past its days.
-pub(crate) fn write_days<R: Row>(folder: &Path, records: Vec<R>, at: fn(&R) -> i64) -> Result<(), String> {
+/// Write records into the day file of each one's time, then remove what is past its days. Returns
+/// what was written: each day file with its day and its new rows.
+pub(crate) fn write_days<R: Row>(folder: &Path, records: Vec<R>, at: fn(&R) -> i64) -> Result<Vec<(std::path::PathBuf, String, Vec<serde_json::Value>)>, String> {
+    let mut written = Vec::new();
     if records.is_empty() {
-        return Ok(());
+        return Ok(written);
     }
     let mut by_day: std::collections::BTreeMap<String, Vec<R>> = Default::default();
     for record in records {
@@ -128,9 +129,13 @@ pub(crate) fn write_days<R: Row>(folder: &Path, records: Vec<R>, at: fn(&R) -> i
     }
     fs::create_dir_all(folder).map_err(|error| format!("{} could not be created: {error}", folder.display()))?;
     for (name, records) in by_day {
-        write_day(&folder.join(format!("{name}.parquet")), records).map_err(|error| format!("the statistics of {name} in {} could not be written: {error}", folder.display()))?;
+        let rows: Vec<serde_json::Value> = records.iter().filter_map(|record| serde_json::to_value(record).ok()).collect();
+        let path = folder.join(format!("{name}.parquet"));
+        write_day(&path, records).map_err(|error| format!("the statistics of {name} in {} could not be written: {error}", folder.display()))?;
+        written.push((path, name, rows));
     }
-    cleanup(folder)
+    cleanup(folder)?;
+    Ok(written)
 }
 
 /// Remove day files older than the days kept, their sent lists and temporary files included;
