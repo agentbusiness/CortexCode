@@ -1209,8 +1209,15 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // a run decided `high` thought 20k tokens before each read, an hour for two edits).
         let effort = footing.effort(&spec.effort, &env.data.effort);
         footing = Footing::Act;
-        // Last, where the step is decided: the law of its thinking level and the notebook.
-        messages.push(crate::projection::host_message(&env.data, &step_law(&env.data, &env.data.effort_for(stage, &effort), &journal.entries_vec())));
+        // Last, where the step is decided: the law of its thinking level and the notebook, inside
+        // the stage message, the one message replaced per call. As a message of its own after it,
+        // the stage message became history the engine checkpointed and the next call no longer
+        // had, so every step re-read all but the system block (seen: 9504 of 100k reused).
+        let law = step_law(&env.data, &env.data.effort_for(stage, &effort), &journal.entries_vec());
+        match messages.last_mut() {
+            Some(last) if last.role == "user" && last.parts.is_empty() => last.content = format!("{}\n\n{law}", last.content),
+            _ => messages.push(crate::projection::host_message(&env.data, &law)),
+        }
         let call = env.call(stage, &effort, messages, None, None, step, true);
         let called = match llm::chat(journal, call, &any).await {
             Ok(called) => {

@@ -20,19 +20,22 @@ use cc_protocol::{Ctx, RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// How long a member has to say what it shares.
 const SHARES_ASK: Duration = Duration::from_secs(3);
+/// How long after an ask that went unanswered the member is asked again.
+const SHARES_RETRY: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub struct Services {
     /// `plugin_id@instance` -> what that plugin build shares.
     declared: Mutex<HashMap<String, Vec<Share>>>,
-    /// A member's full declarations, by node, with the card time they were read at.
-    theirs: Mutex<HashMap<String, (u64, Vec<Share>)>>,
+    /// A member's full declarations, by node, with the card time they were read at; when the
+    /// last ask went unanswered, the moment it may be asked again.
+    theirs: Mutex<HashMap<String, (u64, Vec<Share>, Option<Instant>)>>,
     /// The services' events heard from each app on this machine: the prefixes asked, and the
     /// stream's stop.
     listening: Mutex<HashMap<String, (Vec<String>, CancellationToken)>>,
@@ -169,26 +172,29 @@ impl Mesh {
     }
 
     /// A member's declarations, read again when its card changed. A member that does not answer
-    /// within [`SHARES_ASK`] keeps the list read before (none the first time) until its card
-    /// changes again: one silent member must not hold every call of this computer (seen: each
-    /// command handed to CortexTerm waited about 125 s, the time a dead connection takes to close).
+    /// within [`SHARES_ASK`] keeps the list read before (none the first time) and is asked again
+    /// after [`SHARES_RETRY`]: one silent member must not hold every call of this computer (seen:
+    /// each command handed to CortexTerm waited about 125 s, the time a dead connection takes to
+    /// close), and one missed answer must not hide a member until its card changes (seen: two
+    /// computers that asked each other just after one joined never listed each other).
     async fn member_shares(&self, node: &str) -> Vec<Share> {
         let updated = lock(&self.cards).get(node).map(|card| card.updated_ms).unwrap_or(0);
         let known = lock(&self.services.theirs).get(node).cloned();
-        if let Some((at, shares)) = &known
+        if let Some((at, shares, retry)) = &known
             && *at == updated
+            && retry.is_none_or(|retry| Instant::now() < retry)
         {
             return shares.clone();
         }
         let asked = tokio::time::timeout(SHARES_ASK, self.call_member(node, "mesh.shares", json!({}), None, CancellationToken::new())).await;
-        let shares = match asked {
-            Ok(Ok(value)) => serde_json::from_value::<ShareList>(value).map(|list| list.shares).unwrap_or_default(),
+        let (shares, retry) = match asked {
+            Ok(Ok(value)) => (serde_json::from_value::<ShareList>(value).map(|list| list.shares).unwrap_or_default(), None),
             _ => {
-                tracing::info!(node = %&node[..node.len().min(10)], "a member did not say what it shares in time; its earlier list is kept");
-                known.map(|(_, shares)| shares).unwrap_or_default()
+                tracing::info!(node = %&node[..node.len().min(10)], "a member did not say what it shares in time; its earlier list is kept and it is asked again later");
+                (known.map(|(_, shares, _)| shares).unwrap_or_default(), Some(Instant::now() + SHARES_RETRY))
             }
         };
-        lock(&self.services.theirs).insert(node.to_owned(), (updated, shares.clone()));
+        lock(&self.services.theirs).insert(node.to_owned(), (updated, shares.clone(), retry));
         shares
     }
 
