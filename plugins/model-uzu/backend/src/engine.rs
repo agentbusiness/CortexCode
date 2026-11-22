@@ -1356,6 +1356,7 @@ impl<B: Backend> Worker<B> {
         slot.checkpoints.clear();
         slot.n_tokens = 0;
         slot.images.clear();
+        slot.pinned = None;
     }
 
     fn new_state(&self) -> Result<Box<LanguageModelState<B>>, String> {
@@ -2075,7 +2076,7 @@ impl<B: Backend> Worker<B> {
         // The context checkpoints travel along (their recurrent states; the attention rows they
         // need are in the full snapshot), so the conversation's reuse points survive the restore.
         let checkpoints = &self.slots[index].checkpoints;
-        let header = serde_json::to_vec(&json!({"identity": self.config.identity, "cache_key": key, "n_tokens": n_tokens, "checkpoints": checkpoints.len(), "images": self.slots[index].images}))
+        let header = serde_json::to_vec(&json!({"identity": self.config.identity, "cache_key": key, "n_tokens": n_tokens, "checkpoints": checkpoints.len(), "images": self.slots[index].images, "pinned": self.slots[index].pinned}))
             .map_err(|error| error.to_string())?;
         let written = (|| -> Result<u64, String> {
             let out = std::fs::File::create(&file).map_err(|error| format!("cannot write {}: {error}", file.display()))?;
@@ -2140,22 +2141,29 @@ impl<B: Backend> Worker<B> {
                 read += bytes;
                 checkpoints.push(Checkpoint { snapshot, last_used: Instant::now() });
             }
-            // Beyond this load's count, the longest are kept (the latest reuse points).
+            // The leading block's checkpoint comes back on top of the count, as it is kept while
+            // resident; beyond the count, the longest others are kept (the latest reuse points).
+            // Cut with the others, it was the first to go, and the next rewrite of the history
+            // after a restore read the whole prompt from zero (seen: 0 reused, 60-112 s prefills).
+            let pinned = header["pinned"].as_u64().and_then(|length| usize::try_from(length).ok());
+            let block = pinned.and_then(|length| checkpoints.iter().position(|checkpoint| checkpoint.snapshot.tokens().len() == length)).map(|position| checkpoints.remove(position));
             checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.snapshot.tokens().len()));
             checkpoints.truncate(self.config.checkpoints.max(1));
+            let pinned = block.map(|block| checkpoints.push(block)).and(pinned);
             let mut state = self.new_state()?;
             self.model.restore_state(&mut state, &snapshot).map_err(|error| format!("cannot restore the state: {error}"))?;
             let images: Vec<ImageSpan> = serde_json::from_value(header["images"].clone()).unwrap_or_default();
-            Ok((state, checkpoints, images, read + 12 + header.to_string().len() as u64))
+            Ok((state, checkpoints, images, pinned, read + 12 + header.to_string().len() as u64))
         })();
         let restore_ms = ms(started);
         let _ = std::fs::remove_file(&record.file);
         let event = match outcome {
-            Ok((state, checkpoints, images, bytes)) => {
+            Ok((state, checkpoints, images, pinned, bytes)) => {
                 let n_restored = state.tokens().len() as u32;
                 let slot = &mut self.slots[index];
                 slot.state = Some(state);
                 slot.checkpoints = checkpoints;
+                slot.pinned = pinned;
                 slot.images = images;
                 slot.n_tokens = n_restored;
                 slot.key = Some(record.key.clone());
@@ -2481,7 +2489,8 @@ fn slot_index_of_key<B: Backend>(slot: &Slot<B>, key: &str, index: usize) -> usi
 
 /// A conversation read back from disk: its state, its context checkpoints, its images, and the
 /// bytes read.
-type Restored<B> = (Box<LanguageModelState<B>>, Vec<Checkpoint<B>>, Vec<ImageSpan>, u64);
+/// A restored state, its checkpoints, its images, its leading block's length and the bytes read.
+type Restored<B> = (Box<LanguageModelState<B>>, Vec<Checkpoint<B>>, Vec<ImageSpan>, Option<usize>, u64);
 
 enum Placement {
     Admitted,

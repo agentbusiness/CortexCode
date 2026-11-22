@@ -91,6 +91,13 @@ frontier_plan = "\n\nThe planner's steps:\n{plan}"
 frontier_touches = "\n\nThe code this task claims: {touches}."
 frontier_checks = "\n\nIt is done when these pass from the project root:{checks}"
 frontier_go = "\n\nStart with the code the task names: read it with the cortex tools, then make the change."
+# The project's own rules, first in a new CLI session's first message (the CLI runs outside the
+# project's folder, so it does not find them itself); the task follows, last.
+frontier_contract = "The project's own rules (its AGENTS.md):\n\n{contract}"
+# A CLI session that takes a task over from a session on another computer.
+frontier_moved = "An earlier run worked on this task and its conversation is not here. What it changed is in the project's files: read them before you go on."
+# In the agent's journal while its CLI waits for a free place on the computer that runs it.
+frontier_queued = "Waiting for a free {worker} place on {computer} ({ahead} ahead)."
 frontier_failed = "The worker's run failed: {error}"
 frontier_cancelled = "The worker's run was stopped."
 frontier_no_report = "The worker ended without its report."

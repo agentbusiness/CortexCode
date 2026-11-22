@@ -26,6 +26,7 @@ use cc_protocol::contracts::memory::{
     AgentListResult, AgentRecord, BoardMessage, Contract, ContractCheck, ImpactResult, SearchResult, SymbolMatches, Task, TaskListResult,
     methods as memory_methods, topics as memory_topics,
 };
+use cc_protocol::contracts::frontier as lent;
 use cc_protocol::contracts::mesh::methods as mesh_methods;
 use cc_protocol::contracts::model::{ChatMessage, ModelInfo, Priority, methods as model_methods};
 use cc_protocol::contracts::now_ms;
@@ -74,6 +75,11 @@ pub fn hello() -> Hello {
         methods::PLAN,
         methods::PAUSE,
         methods::PAUSE_STATE,
+        lent::methods::OFFERS,
+        lent::methods::RUN,
+        lent::methods::SAY,
+        lent::methods::CLOSE,
+        lent::methods::MCP,
     ]
     .iter()
     .map(|method| (*method).to_owned())
@@ -1219,7 +1225,9 @@ impl Agents {
                 // its own (the refusal is not in front of it), with the local model's full tools.
                 return self.declined(&ctx, &host, record, &current, ended.result.summary).await;
             } else {
-                if ended.external_session.is_some() && ended.external_session != record.external_session {
+                // The CLI's own session: the one this run said, or none when the earlier one was
+                // left behind on a computer that cannot take the agent's runs now.
+                if ended.external_session != record.external_session && (ended.external_session.is_some() || ended.moved) {
                     record.external_session = ended.external_session.clone();
                     record = upsert(&ctx, &host, record).await?;
                 }
@@ -2770,6 +2778,26 @@ impl Plugin for Agents {
                     // `{fresh: true}` asks the CLIs again (the settings panel when it opens).
                     let fresh = params.get("fresh").and_then(Value::as_bool).unwrap_or(false);
                     to_value(&this.inner.frontier.workers(&Host::new(ctx), fresh).await)
+                }
+                // This computer's frontier CLIs, run for this app's own agents and, over the
+                // mesh, for a member's (`crate::lend`).
+                lent::methods::OFFERS => to_value(&this.inner.frontier.lender.offers(&this.inner.frontier, this.inner.data.get().scheduler.frontier_parallel).await),
+                lent::methods::RUN => {
+                    let limit = this.inner.data.get().scheduler.frontier_parallel;
+                    let home = ctx.env.home.clone();
+                    to_value(&this.inner.frontier.lender.run(&this.inner.frontier, &home, limit, parse_params(params)?, call.items, call.cancel.clone()).await?)
+                }
+                lent::methods::SAY => {
+                    let params: lent::SayParams = parse_params(params)?;
+                    this.inner.frontier.lender.say(&params.run, params.text)
+                }
+                lent::methods::CLOSE => {
+                    let params: lent::RunRef = parse_params(params)?;
+                    this.inner.frontier.lender.close(&params.run)
+                }
+                lent::methods::MCP => {
+                    let params: lent::McpParams = parse_params(params)?;
+                    this.inner.frontier.lender.mcp(&params.run, params.message)
                 }
                 methods::WORKER_SET => {
                     let params: cc_protocol::contracts::agents::WorkerSetParams = parse_params(params)?;

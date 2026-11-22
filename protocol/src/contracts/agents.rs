@@ -164,6 +164,13 @@ pub struct WorkerInfo {
     /// Why it cannot be chosen now, in plain words (absent when it can).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// The member of the mesh whose CLI does its runs (hex), when this computer's own cannot:
+    /// lent over the mesh (`crate::contracts::frontier`). Absent: this computer's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// That member's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

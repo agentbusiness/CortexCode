@@ -79,7 +79,8 @@ foreground_tpot_ms = 150
 # than this share of a window (agents evicting each other).
 pool_restore_share = 0.1
 # Agents a frontier CLI (Claude Code, Codex) works for at once: their own lane, not this computer's
-# model's, so the limit above does not count them.
+# model's, so the limit above does not count them. It is also how many CLI runs this computer
+# takes at once, its own and the ones it lends to members of the mesh; a run beyond it waits there.
 frontier_parallel = 6
 # A higher limit is kept only when it raises agent throughput by at least this fraction.
 gain = 0.05

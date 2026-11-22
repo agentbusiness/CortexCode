@@ -3,9 +3,9 @@
 CortexCode is a local coding agent: a Rust frame that runs everything as plugins (chat flow, model,
 memory and code graph, tools, language plugins, skills, agents) and an Electron UI. Its model is a
 small local one (Qwen3.8-27B, 4-bit, on uzu), offline. Design notes: `docs/BRAINSTORM.md`.
-Optionally, agent work goes to a frontier CLI found on the computer (Claude Code or Codex,
-headless, through CortexCode's tools over MCP) while the local model leads; that needs the
-network (`docs/FRONTIER-AGENTS.md`).
+Optionally, agent work goes to a frontier CLI found on the computer or lent by a member of the
+mesh (Claude Code or Codex, headless, through CortexCode's tools over MCP) while the local model
+leads; that needs the network (`docs/FRONTIER-AGENTS.md`).
 
 ## The lens: design for the small model
 
@@ -142,6 +142,11 @@ built to the same standard as CortexCode. The standard is:
   without one, or a Linux CortexCode with under 16 GB of GPU memory, loads no model and uses a
   member's through the mesh), one models folder for every Cortex app (`~/.cortex-models`,
   `docs/SHARED-MODELS.md`; `shared-models/`);
+- lent frontier CLIs (`protocol/src/contracts/frontier.rs`, `agents.frontier.*`): a computer with
+  Claude Code or Codex signed in runs it for a member under the same switch as its model
+  (`mesh.lend`); the CLI only thinks there, with no tools of its own in an empty folder, and its
+  MCP messages go back to the asking computer, whose own tools do the work where the project is.
+  Optional as every service: an app with no plugin serving these methods lends none;
 - shared services (`protocol/src/contracts/service.rs`): the verbs and what each may do, the
   `<category>.shares` declaration, who a service is for (its `audience`: models, apps or peers),
   where a call may come from, the caller, run options, jobs and read sizes, and the

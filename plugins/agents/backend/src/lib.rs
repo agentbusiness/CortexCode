@@ -17,6 +17,7 @@ pub mod frontier;
 pub mod graph;
 pub mod host;
 pub mod journal;
+pub mod lend;
 pub mod llm;
 pub mod plan;
 pub mod scheduler;

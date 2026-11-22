@@ -1,13 +1,17 @@
 //! Frontier workers (docs/FRONTIER-AGENTS.md): an agent's task done by a frontier CLI, Claude Code
-//! or Codex, run headless in the project's folder, instead of the chat flow's local agent loop.
+//! or Codex, run headless, instead of the chat flow's local agent loop.
 //!
 //! - **Who works.** The setting `agents.worker` chooses `local`, `claude` or `openai`; a frontier
-//!   worker works only when its CLI is found and says it is signed in, else the local agents do
-//!   (and the choice says why: [`Frontier::workers`]).
-//! - **The CLI's hands are CortexCode's.** Its own tools are off (Claude: no built-in tools; Codex:
-//!   a read-only sandbox). Its only way to change files is `cx mcp`, the tools plugin's model tools
-//!   as an MCP server, held to the agent's session: the file reservations, the write sandbox, the
-//!   step log and undo cover it as they cover a local agent.
+//!   worker works when its CLI is found and signed in on this computer or on a member of the mesh
+//!   that lends it, else the local agents do (and the choice says why: [`Frontier::workers`]).
+//! - **Where the CLI runs.** On the computer that has it ([`Frontier::provider`]): this one first,
+//!   else a member's, nearest first, one with a free place before one without. Either way the run
+//!   is asked of that computer's `agents.frontier.run` ([`crate::lend`]); a session stays on the
+//!   computer it began on, and a run that cannot go on there starts a new session from the files.
+//! - **The CLI's hands are CortexCode's.** It has no tools of its own and sees no project folder.
+//!   Its MCP messages come here as items of the run and are answered by `cx mcp` ([`Cli`]), the
+//!   tools plugin's model tools held to the agent's session on this computer: the file
+//!   reservations, the write sandbox, the step log and undo cover it as they cover a local agent.
 //! - **Its run is the agent's run.** The task's text goes in as the first message; every message,
 //!   thought, tool call and result goes into the agent session's journal as the chat flow writes
 //!   them, so the agent's view and the lead's facts read the same. The run ends with a report in a
@@ -24,32 +28,37 @@ use crate::scheduler::AgentKey;
 use cc_protocol::contracts::agents::{WorkerInfo, WorkersResult, workers};
 use cc_protocol::contracts::chatflow::AgentRunResult;
 use cc_protocol::contracts::frame::{SessionStatus, kinds};
+use cc_protocol::contracts::frontier::{Offer, Offers, RunParams, RunResult, methods as lent};
 use cc_protocol::contracts::memory::{AgentRecord, Task};
+use cc_protocol::contracts::mesh::{PeersResult, methods as mesh_methods};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::records::methods as records_methods;
 use cc_protocol::contracts::tools::{AgentEnvResult, TimelineResult, methods as tools_methods};
-use cc_protocol::{RpcError, codes};
+use cc_protocol::{CallStream, RpcError, codes};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::lend::{Lender, MCP_SERVER};
+
 /// The setting that chooses who does agent work.
 pub const WORKER_SETTING: &str = "agents.worker";
-/// The MCP server's name in the CLI's configuration; its tools are `mcp__cortex__<tool>` there.
-const MCP_SERVER: &str = "cortex";
-/// How long a detection (paths and sign-in) is reused before the CLIs are asked again.
+/// How long a detection (paths and sign-in, the members' offers) is reused before asking again.
 const DETECT_FOR: Duration = Duration::from_secs(60);
 /// Longest a sign-in check may take.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
-/// What of a CLI's error output is kept for the run's failure text.
-const STDERR_TAIL: usize = 4000;
+/// Longest a member may take to say which CLIs it lends.
+const OFFER_TIMEOUT: Duration = Duration::from_secs(4);
+/// The event a waiting run's CLI stream carries here ([`Cli::next`]): the serving computer has no
+/// free place yet.
+const QUEUED_EVENT: &str = "cortex.queued";
 
 /// The report every frontier run ends with (strict: every field required, nothing else).
 fn report_schema() -> Value {
@@ -94,6 +103,9 @@ pub struct RunEnd {
     pub error: Option<String>,
     /// A plan run's plan (its report, in the plan's schema), when it wrote one.
     pub report: Option<Value>,
+    /// The run could not go on with the agent's earlier CLI session (its computer cannot take it
+    /// now): that session is no longer the agent's, whether or not a new one was started.
+    pub moved: bool,
 }
 
 /// One CLI as detection found it.
@@ -112,9 +124,51 @@ struct Detected {
     found: HashMap<String, Found>,
 }
 
-/// Frontier workers: detection and the runs going now (for steering).
+/// A CLI a member of the mesh lends.
+#[derive(Clone)]
+struct MemberOffer {
+    node: String,
+    computer: String,
+    /// On the local network.
+    near: bool,
+    rtt_ms: u32,
+    offer: Offer,
+}
+
+#[derive(Default)]
+struct Offered {
+    at: Option<Instant>,
+    offers: Vec<MemberOffer>,
+}
+
+/// The computer a run's CLI runs on.
+#[derive(Clone)]
+pub struct Provider {
+    /// The member (hex); None: this computer.
+    pub node: Option<String>,
+    /// The member's name (empty for this computer).
+    pub computer: String,
+    free: bool,
+    near: u8,
+    rtt_ms: u32,
+}
+
+/// The method and params that ask `method` of a run's computer: its frame directly here, through
+/// the mesh on a member.
+fn asked_at(node: &Option<String>, method: &str, params: Value) -> (String, Value) {
+    match node {
+        Some(node) => (mesh_methods::CALL.to_owned(), json!({"node": node, "method": method, "params": params})),
+        None => (method.to_owned(), params),
+    }
+}
+
+/// Frontier workers: detection, the CLIs lent here and by members, and the runs going now (for
+/// steering).
 #[derive(Default)]
 pub struct Frontier {
+    /// This computer's CLI runs, its own agents' and its members' ([`crate::lend`]).
+    pub lender: Lender,
+    offered: Mutex<Offered>,
     detected: Mutex<Detected>,
     /// Per worker: why its last run failed before doing any work (e.g. a CLI too old for its
     /// model). Kept until the CLIs are looked at again fresh (the settings panel opening, a
@@ -239,6 +293,7 @@ impl Frontier {
         }
         if fresh {
             lock(&self.failures).clear();
+            lock(&self.offered).at = None;
         }
         let mut found = HashMap::new();
         for worker in [workers::CLAUDE, workers::OPENAI] {
@@ -255,9 +310,86 @@ impl Frontier {
         found
     }
 
-    /// Who does agent work: the choice, who works now, and every worker this computer has.
+    /// This computer's own CLIs: each with its version and why it cannot work now (None: it can).
+    pub async fn local(&self, fresh: bool) -> Vec<(String, Option<String>, Option<String>)> {
+        let found = self.detect(fresh).await;
+        [workers::CLAUDE, workers::OPENAI]
+            .into_iter()
+            .map(|worker| match found.get(worker) {
+                Some(found) => (worker.to_owned(), found.version.clone(), found.problem.clone()),
+                None => (worker.to_owned(), None, Some("it was not looked for".to_owned())),
+            })
+            .collect()
+    }
+
+    /// Where this computer's CLI of a worker is, as the last detection found it.
+    pub fn cli_path(&self, worker: &str) -> Option<PathBuf> {
+        lock(&self.detected).found.get(worker).and_then(|found| found.path.clone())
+    }
+
+    /// The CLIs the members of the mesh lend now: every reachable member that runs an agents
+    /// plugin is asked (`agents.frontier.offers`), and the answers are reused for [`DETECT_FOR`].
+    /// Without a mesh, or alone in one, there are none.
+    async fn member_offers(&self, host: &Host) -> Vec<MemberOffer> {
+        {
+            let offered = lock(&self.offered);
+            if offered.at.is_some_and(|at| at.elapsed() < DETECT_FOR) {
+                return offered.offers.clone();
+            }
+        }
+        let peers = host.get::<PeersResult>(mesh_methods::PEERS, json!({})).await.map(|result| result.peers).unwrap_or_default();
+        let mut offers = Vec::new();
+        for peer in peers {
+            // Another app on this machine has this computer's own CLIs: nothing more to find there.
+            let lends = peer.reachable && !peer.member.local && peer.card.as_ref().is_some_and(|card| card.plugins.iter().any(|plugin| plugin.category == "agents" && plugin.active));
+            if !lends {
+                continue;
+            }
+            let (method, params) = asked_at(&Some(peer.member.node.clone()), lent::OFFERS, json!({}));
+            let Ok(Ok(answer)) = tokio::time::timeout(OFFER_TIMEOUT, host.get::<Offers>(&method, params)).await else { continue };
+            for offer in answer.workers {
+                offers.push(MemberOffer { node: peer.member.node.clone(), computer: peer.member.name.clone(), near: peer.path == "lan", rtt_ms: peer.rtt_ms, offer });
+            }
+        }
+        let mut offered = lock(&self.offered);
+        offered.at = Some(Instant::now());
+        offered.offers = offers.clone();
+        offers
+    }
+
+    /// The computer a run of `worker` goes to: `home` (the computer its CLI session lives on) when
+    /// that can still run it; else the best that can: one with a free place first, then this
+    /// computer, then a member on the local network, then the nearest. None: nobody can run it now.
+    pub async fn provider(&self, host: &Host, worker: &str, limit: u32, home: Option<&Option<String>>) -> Option<Provider> {
+        let mut can = Vec::new();
+        if self.detect(false).await.get(worker).is_some_and(|found| found.path.is_some() && found.problem.is_none()) {
+            can.push(Provider { node: None, computer: String::new(), free: self.lender.running() < limit.max(1), near: 0, rtt_ms: 0 });
+        }
+        for member in self.member_offers(host).await {
+            if member.offer.id == worker && member.offer.problem.is_none() {
+                can.push(Provider {
+                    node: Some(member.node),
+                    computer: member.computer,
+                    free: member.offer.running < member.offer.limit.max(1),
+                    near: if member.near { 1 } else { 2 },
+                    rtt_ms: member.rtt_ms,
+                });
+            }
+        }
+        if let Some(home) = home
+            && let Some(provider) = can.iter().find(|provider| &provider.node == home)
+        {
+            return Some(provider.clone());
+        }
+        can.sort_by_key(|provider| (!provider.free, provider.near, provider.rtt_ms));
+        can.into_iter().next()
+    }
+
+    /// Who does agent work: the choice, who works now, and every worker this computer has or a
+    /// member lends it.
     pub async fn workers(&self, host: &Host, fresh: bool) -> WorkersResult {
         let found = self.detect(fresh).await;
+        let lent_here = self.member_offers(host).await;
         let chosen = setting(host, WORKER_SETTING).await.filter(|worker| workers::ALL.contains(&worker.as_str())).unwrap_or_else(|| workers::LOCAL.to_owned());
         let mut list = vec![WorkerInfo { id: workers::LOCAL.to_owned(), label: "Local".to_owned(), installed: true, signed_in: true, ..WorkerInfo::default() }];
         for worker in [workers::CLAUDE, workers::OPENAI] {
@@ -265,20 +397,29 @@ impl Frontier {
             let Found { path, problem, version } = found.get(worker).cloned().unwrap_or(Found { problem: Some("it was not looked for".to_owned()), ..Found::default() });
             let model = setting(host, &format!("agents.{worker}.model")).await.unwrap_or_else(|| model.to_owned());
             let effort = setting(host, &format!("agents.{worker}.effort")).await.unwrap_or_else(|| effort.to_owned());
-            let signed_in = path.is_some() && problem.is_none();
+            // Not able to work here: a member that lends it does the runs (the nearest first).
+            let mut members: Vec<&MemberOffer> = lent_here.iter().filter(|member| member.offer.id == worker && member.offer.problem.is_none()).collect();
+            members.sort_by_key(|member| (!member.near, member.rtt_ms));
+            let member = if path.is_none() || problem.is_some() { members.first().copied() } else { None };
+            let (installed, signed_in, version, problem) = match member {
+                Some(member) => (true, true, member.offer.version.clone(), None),
+                None => (path.is_some(), path.is_some() && problem.is_none(), version, problem),
+            };
             // A run that could not start says what stops it (in the CLI's own words).
             let failure = lock(&self.failures).get(worker).cloned();
             let problem = problem.or_else(|| failure.map(|failure| format!("its last run could not start: {failure}")));
             list.push(WorkerInfo {
                 id: worker.to_owned(),
                 label: label.to_owned(),
-                installed: path.is_some(),
+                installed,
                 signed_in,
-                path: path.map(|path| path.to_string_lossy().into_owned()),
+                path: if member.is_some() { None } else { path.map(|path| path.to_string_lossy().into_owned()) },
                 version,
                 model: Some(model),
                 effort: Some(effort),
                 problem,
+                node: member.map(|member| member.node.clone()),
+                computer: member.map(|member| member.computer.clone()),
             });
         }
         let chosen_info = list.iter().find(|info| info.id == chosen);
@@ -350,7 +491,6 @@ impl Frontier {
         if let Some(problem) = &info.problem {
             return Err(RpcError::new(codes::UNAVAILABLE, format!("{} cannot work now: {problem}", info.label)));
         }
-        let cli = PathBuf::from(info.path.clone().unwrap_or_default());
         let model = info.model.clone().unwrap_or_default();
         let effort = info.effort.clone().unwrap_or_default();
         let session_id = record.session_id.clone().ok_or_else(|| RpcError::internal(format!("agent {} has no session", record.name)))?;
@@ -363,6 +503,33 @@ impl Frontier {
         }
 
         let journal = Journal::load(host.clone(), &session_id).await?;
+        // The computer the CLI runs on. Its own session lives where its last run was (the journal's
+        // last `running` status says): the run goes there again, and when that computer cannot
+        // take it, a new session starts on another from what is in the files.
+        let home: Option<Option<String>> = record.external_session.as_ref().and_then(|_| {
+            journal
+                .entries()
+                .filter(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "state") == "running" && str_field(&entry.data, "worker") == worker)
+                .last()
+                .map(|entry| Some(str_field(&entry.data, "node").to_owned()).filter(|node| !node.is_empty()))
+        });
+        let limit = data.scheduler.frontier_parallel;
+        let Some(provider) = self.provider(host, worker, limit, home.as_ref()).await else {
+            return Err(RpcError::new(codes::UNAVAILABLE, format!("no computer can run {} now", info.label)));
+        };
+        let stays = home.as_ref() == Some(&provider.node);
+        let external = record.external_session.clone().filter(|_| stays);
+        let moved = record.external_session.is_some() && !stays;
+        // The role prompt. Codex is not shown an MCP server's own instructions, so the tools guide
+        // goes into its prompt; Claude Code reads it from the server.
+        let mut prompt = data.prompt(job.prompt()).to_owned();
+        if worker == workers::OPENAI
+            && let Ok(listed) = host.call(tools_methods::MCP_LIST, json!({"workspace": root, "lead": matches!(job, Job::Plan { .. })})).await
+            && let Some(guide) = listed.get("guide").and_then(Value::as_str).map(str::trim).filter(|guide| !guide.is_empty())
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(guide);
+        }
         let job_kind = if matches!(job, Job::Task(_)) { JobKind::Task } else { JobKind::Plan };
         let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
         let (sender, nudges) = mpsc::unbounded_channel();
@@ -375,12 +542,16 @@ impl Frontier {
             session_id: session_id.clone(),
             run_id: format!("run-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
             worker: worker.to_owned(),
-            cli,
+            node: provider.node.clone(),
+            computer: provider.computer.clone(),
+            moved,
+            prompt,
+            opened: 0,
             model,
             effort,
             env,
             cx: access.cx.clone(),
-            external: record.external_session.clone(),
+            external,
             nudges,
             journal,
             step: 0,
@@ -495,7 +666,16 @@ struct Run<'a> {
     session_id: String,
     run_id: String,
     worker: String,
-    cli: PathBuf,
+    /// The computer the CLI runs on: a member (hex), or None for this one; and its name.
+    node: Option<String>,
+    computer: String,
+    /// The agent's CLI session was on a computer that cannot take this run: a new session starts
+    /// here, told the task again and that the files hold the earlier work.
+    moved: bool,
+    /// The role prompt.
+    prompt: String,
+    /// CLI processes this run started (each needs a name of its own).
+    opened: u32,
     model: String,
     effort: String,
     env: BTreeMap<String, String>,
@@ -540,7 +720,7 @@ impl Run<'_> {
         self.journal
             .append(
                 kinds::STATUS,
-                json!({"state": "running", "run_id": self.run_id, "kind": "agent", "task_id": self.job.task_id(), "worker": self.worker, "model": self.model, "effort": self.effort}),
+                json!({"state": "running", "run_id": self.run_id, "kind": "agent", "task_id": self.job.task_id(), "worker": self.worker, "model": self.model, "effort": self.effort, "node": self.node.clone().unwrap_or_default(), "computer": self.computer}),
             )
             .await?;
         let _ = self.host.session_status(&self.session_id, SessionStatus::Running).await;
@@ -595,7 +775,7 @@ impl Run<'_> {
         // Failed with no tool call made: the CLI never got to the work (it did not start, or it
         // refused its model or its sign-in), so nothing of the task was done by it.
         let start_failed = result.outcome == "failed" && self.tool_calls == 0;
-        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error, report })
+        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error, report, moved: self.moved })
     }
 
     /// The run's first message: the task on its first run; else what waits for it (the lead's
@@ -603,7 +783,15 @@ impl Run<'_> {
     async fn first_message(&mut self) -> Result<String, RpcError> {
         let first_time = !self.journal.entries().any(|entry| entry.kind == kinds::USER_MESSAGE);
         let mut parts = Vec::new();
-        if first_time {
+        // A new CLI session knows nothing yet: the project's own rules, then its job. One that
+        // takes over from a session on another computer is told the files hold the earlier work.
+        if first_time || self.moved {
+            if let Some(contract) = project_contract(self.root) {
+                parts.push(self.data.text("frontier_contract", &[("contract", contract.trim())]));
+            }
+            if self.moved && !first_time {
+                parts.push(self.data.text("frontier_moved", &[]));
+            }
             parts.push(match &self.job {
                 Job::Task(task) => task_text(self.data, task),
                 Job::Plan { text, .. } => (*text).to_owned(),
@@ -647,76 +835,60 @@ impl Run<'_> {
         Ok(Some(text))
     }
 
+    // ---- the CLI process --------------------------------------------------------------------------
+
+    /// Start one CLI process on the run's computer with its first message.
+    fn open(&mut self, message: String) -> Result<Cli, RpcError> {
+        self.opened += 1;
+        let params = RunParams {
+            run: format!("{}-{}", self.run_id, self.opened),
+            worker: self.worker.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            prompt: self.prompt.clone(),
+            schema: self.job.schema(),
+            session: self.session_id.clone(),
+            resume: self.external.clone(),
+            message,
+        };
+        Cli::start(&self.host, &self.node, params, &self.cx, &self.env, self.root)
+    }
+
+    /// The run waits for a free place on its computer: said once in the agent's journal, so the
+    /// person watching sees why nothing moves yet.
+    async fn queued(&mut self, event: &Value) -> Result<(), RpcError> {
+        let ahead = event.get("ahead").and_then(Value::as_u64).unwrap_or(0).to_string();
+        let computer = if self.computer.is_empty() { "this computer".to_owned() } else { self.computer.clone() };
+        let text = self.data.text("frontier_queued", &[("worker", label(&self.worker)), ("computer", &computer), ("ahead", &ahead)]);
+        self.journal.append(kinds::NOTE, json!({"text": text, "purpose": "frontier_queued", "host_message": false, "run_id": self.run_id})).await?;
+        Ok(())
+    }
+
     // ---- Claude Code ---------------------------------------------------------------------------
 
     async fn claude(&mut self, first: String, cancel: &CancellationToken) -> Result<TurnEnd, RpcError> {
-        let mut servers = serde_json::Map::new();
-        servers.insert(MCP_SERVER.to_owned(), json!({"type": "stdio", "command": self.cx, "args": ["mcp"], "env": self.env}));
-        let mcp = json!({"mcpServers": servers});
-        let mut command = Command::new(&self.cli);
-        command
-            .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-            .arg("--model")
-            .arg(&self.model)
-            .arg("--effort")
-            .arg(&self.effort)
-            // No built-in tools: CortexCode's tools over MCP are its only hands.
-            .args(["--tools", ""])
-            .args(["--strict-mcp-config", "--mcp-config"])
-            .arg(mcp.to_string())
-            .args(["--permission-mode", "dontAsk", "--allowedTools"])
-            .arg(format!("mcp__{MCP_SERVER}"))
-            .arg("--disable-slash-commands")
-            .arg("--append-system-prompt")
-            .arg(self.data.prompt(self.job.prompt()))
-            .arg("--json-schema")
-            .arg(self.job.schema().to_string());
-        let resumed = self.external.clone();
-        match resumed {
-            Some(id) => {
-                command.arg("--resume").arg(id);
-            }
-            // The id is kept only once the CLI says it (its `system` event): a run that died before
-            // its session was saved starts a new one next time instead of resuming nothing.
-            None => {
-                command.arg("--session-id").arg(uuid::Uuid::new_v4().to_string());
-            }
-        }
-        let mut child = self.spawn(command)?;
-        let mut stdin = child.stdin.take().ok_or_else(|| RpcError::internal("the CLI has no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| RpcError::internal("the CLI has no stdout"))?;
-        let stderr = tail_of(child.stderr.take());
-        send_user(&mut stdin, &first).await?;
-        let mut lines = BufReader::new(stdout).lines();
-        let mut stdin = Some(stdin);
+        let mut cli = self.open(first)?;
         let mut last = TurnEnd::default();
         let mut pausing = false;
+        let mut input_open = true;
         loop {
-            // Paused, with no tool call in flight: the CLI stops here; its session keeps the
-            // conversation, and the resumed run goes on from it.
+            // Paused, with no tool call in flight: the CLI stops here (dropping it ends it); its
+            // session keeps the conversation, and the resumed run goes on from it.
             if pausing && self.in_flight == 0 {
-                let _ = child.start_kill();
                 return Ok(TurnEnd { paused: true, ..TurnEnd::default() });
             }
-            let line = tokio::select! {
+            let event = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    let _ = child.start_kill();
-                    return Err(RpcError::cancelled());
-                }
+                _ = cancel.cancelled() => return Err(RpcError::cancelled()),
                 _ = self.pause.cancelled(), if !pausing => {
                     pausing = true;
                     continue;
                 }
-                line = lines.next_line() => line,
+                event = cli.next() => event,
             };
-            let line = match line {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(error) => return Err(RpcError::internal(format!("reading the CLI's output failed: {error}"))),
-            };
-            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            let Some(event) = event else { break };
             match str_field(&event, "type") {
+                QUEUED_EVENT => self.queued(&event).await?,
                 "system" => {
                     if let Some(id) = event.get("session_id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
                         self.external = Some(id.to_owned());
@@ -736,23 +908,19 @@ impl Run<'_> {
                     // The lead's answers and steers that came during the turn are its next message;
                     // with none, the input ends and the CLI finishes.
                     match self.next_message().await? {
-                        Some(text) if last.error.is_none() && last.refused.is_none() && !pausing => {
-                            if let Some(input) = stdin.as_mut() {
-                                send_user(input, &text).await?;
-                            }
-                        }
+                        Some(text) if last.error.is_none() && last.refused.is_none() && !pausing && input_open => cli.say(&text).await?,
                         _ => {
-                            stdin.take();
+                            if input_open {
+                                input_open = false;
+                                cli.close().await;
+                            }
                         }
                     }
                 }
                 _ => {}
             }
         }
-        let status = child.wait().await.map_err(|error| RpcError::internal(format!("the CLI did not end cleanly: {error}")))?;
-        if last.report.is_none() && last.error.is_none() && !status.success() {
-            last.error = Some(stderr.await.unwrap_or_default());
-        }
+        settle(&mut last, cli.end().await)?;
         Ok(last)
     }
 
@@ -807,12 +975,9 @@ impl Run<'_> {
     // ---- Codex ---------------------------------------------------------------------------------
 
     async fn codex(&mut self, first: String, cancel: &CancellationToken) -> Result<TurnEnd, RpcError> {
-        // Codex reads the report's schema from a file: one per run, removed when the run ends.
-        let schema_file = std::env::temp_dir().join(format!("cortex-agent-report-{}.json", self.run_id));
-        std::fs::write(&schema_file, self.job.schema().to_string()).map_err(|error| RpcError::internal(format!("cannot write the report schema: {error}")))?;
         let mut message = first;
-        let ended = loop {
-            let turn = self.codex_turn(&message, &schema_file, cancel).await;
+        loop {
+            let turn = self.codex_turn(message, cancel).await;
             match turn {
                 // Paused between turns: the next turn waits for Resume.
                 Ok(turn) if turn.error.is_none() && !turn.paused && self.pause.is_cancelled() => break Ok(TurnEnd { paused: true, ..TurnEnd::default() }),
@@ -823,76 +988,33 @@ impl Run<'_> {
                 },
                 other => break other,
             }
-        };
-        let _ = std::fs::remove_file(&schema_file);
-        ended
+        }
     }
 
-    async fn codex_turn(&mut self, message: &str, schema_file: &Path, cancel: &CancellationToken) -> Result<TurnEnd, RpcError> {
-        let env_table = format!(
-            "{{{}}}",
-            self.env.iter().map(|(key, value)| format!("{key} = {}", toml_string(value.as_str()))).collect::<Vec<_>>().join(", ")
-        );
-        let mut command = Command::new(&self.cli);
-        command.arg("exec");
-        if let Some(id) = self.external.clone() {
-            command.arg("resume").arg(id);
-        }
-        command
-            .args(["--json", "--skip-git-repo-check", "-m"])
-            .arg(&self.model)
-            .arg("--output-schema")
-            .arg(schema_file)
-            // Its own shell may look but not change: CortexCode's tools over MCP are its hands.
-            .args(["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""])
-            .arg("-c")
-            .arg(format!("model_reasoning_effort={}", toml_string(self.effort.as_str())))
-            .arg("-c")
-            .arg(format!("developer_instructions={}", toml_string(self.data.prompt(self.job.prompt()))))
-            .arg("-c")
-            .arg(format!("mcp_servers.{MCP_SERVER}.command={}", toml_string(self.cx.as_str())))
-            .arg("-c")
-            .arg(format!("mcp_servers.{MCP_SERVER}.args=[\"mcp\"]"))
-            .arg("-c")
-            .arg(format!("mcp_servers.{MCP_SERVER}.env={env_table}"))
-            // The message comes on stdin.
-            .arg("-");
-        let mut child = self.spawn(command)?;
-        let mut stdin = child.stdin.take().ok_or_else(|| RpcError::internal("the CLI has no stdin"))?;
-        stdin.write_all(message.as_bytes()).await.map_err(|error| RpcError::internal(format!("cannot send the task to the CLI: {error}")))?;
-        drop(stdin);
-        let stdout = child.stdout.take().ok_or_else(|| RpcError::internal("the CLI has no stdout"))?;
-        let stderr = tail_of(child.stderr.take());
-        let mut lines = BufReader::new(stdout).lines();
+    /// One Codex turn: one CLI process (a later turn resumes its thread).
+    async fn codex_turn(&mut self, message: String, cancel: &CancellationToken) -> Result<TurnEnd, RpcError> {
+        let mut cli = self.open(message)?;
         let mut end = TurnEnd::default();
         let mut last_message: Option<String> = None;
         let mut pausing = false;
         loop {
-            // Paused, with no tool call in flight: the CLI stops here; its session keeps the
-            // conversation, and the resumed run goes on from it.
+            // Paused, with no tool call in flight: the CLI stops here (dropping it ends it); its
+            // session keeps the conversation, and the resumed run goes on from it.
             if pausing && self.in_flight == 0 {
-                let _ = child.start_kill();
                 return Ok(TurnEnd { paused: true, ..TurnEnd::default() });
             }
-            let line = tokio::select! {
+            let event = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    let _ = child.start_kill();
-                    return Err(RpcError::cancelled());
-                }
+                _ = cancel.cancelled() => return Err(RpcError::cancelled()),
                 _ = self.pause.cancelled(), if !pausing => {
                     pausing = true;
                     continue;
                 }
-                line = lines.next_line() => line,
+                event = cli.next() => event,
             };
-            let line = match line {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(error) => return Err(RpcError::internal(format!("reading the CLI's output failed: {error}"))),
-            };
-            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            let Some(event) = event else { break };
             match str_field(&event, "type") {
+                QUEUED_EVENT => self.queued(&event).await?,
                 "thread.started" => {
                     if let Some(id) = event.get("thread_id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
                         self.external = Some(id.to_owned());
@@ -947,26 +1069,12 @@ impl Run<'_> {
                 _ => {}
             }
         }
-        let status = child.wait().await.map_err(|error| RpcError::internal(format!("the CLI did not end cleanly: {error}")))?;
         end.report = last_message.as_deref().map(report_value);
-        if end.report.is_none() && end.error.is_none() && !status.success() {
-            end.error = Some(stderr.await.unwrap_or_default());
-        }
+        settle(&mut end, cli.end().await)?;
         Ok(end)
     }
 
     // ---- shared --------------------------------------------------------------------------------
-
-    fn spawn(&self, mut command: Command) -> Result<Child, RpcError> {
-        command
-            .current_dir(self.root)
-            .envs(&self.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        command.spawn().map_err(|error| RpcError::new(codes::UNAVAILABLE, format!("cannot start {}: {error}", self.cli.display())))
-    }
 
     /// A message the agent wrote: in its own journal, and as a progress line on the lead's card
     /// (not a message its model reads: the agent's `tell_lead` and its report are those), so the
@@ -1073,11 +1181,6 @@ fn report_value(text: &str) -> Value {
     serde_json::from_str::<Value>(trimmed).ok().filter(Value::is_object).unwrap_or_else(|| Value::String(text.to_owned()))
 }
 
-/// A TOML basic string (a JSON string's escapes are TOML's).
-fn toml_string(text: &str) -> String {
-    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned())
-}
-
 /// The text of an MCP or Claude tool result's content (a string or a list of parts).
 fn content_text(content: Option<&Value>) -> String {
     match content {
@@ -1088,36 +1191,130 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
-async fn send_user(stdin: &mut ChildStdin, text: &str) -> Result<(), RpcError> {
-    let message = json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}});
-    let mut line = message.to_string();
-    line.push('\n');
-    stdin.write_all(line.as_bytes()).await.map_err(|error| RpcError::internal(format!("cannot send a message to the CLI: {error}")))?;
-    stdin.flush().await.map_err(|error| RpcError::internal(format!("cannot send a message to the CLI: {error}")))
+/// How a CLI process ended, into the turn's end: a CLI that failed without an answer says why in
+/// its own words; a run that could not be asked of its computer at all is the run's failure.
+fn settle(turn: &mut TurnEnd, ended: Result<RunResult, RpcError>) -> Result<(), RpcError> {
+    let answered = turn.report.is_some() || turn.error.is_some();
+    match ended {
+        Ok(result) => {
+            if !answered && !result.ok {
+                turn.error = Some(result.error);
+            }
+            Ok(())
+        }
+        Err(_) if answered => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
-/// The end of a CLI's error output, read while it runs (so a full pipe never stops it).
-fn tail_of(stderr: Option<tokio::process::ChildStderr>) -> tokio::task::JoinHandle<String> {
-    tokio::spawn(async move {
-        let Some(mut stderr) = stderr else { return String::new() };
-        let mut kept: Vec<u8> = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    kept.extend_from_slice(&buffer[..read]);
-                    if kept.len() > STDERR_TAIL * 2 {
-                        kept.drain(..kept.len() - STDERR_TAIL);
-                    }
+/// The project's own rules as its repository states them (`AGENTS.md`, else `CLAUDE.md`): the CLI
+/// runs outside the project's folder, so it reads them in its first message.
+fn project_contract(root: &str) -> Option<String> {
+    ["AGENTS.md", "CLAUDE.md"].iter().find_map(|name| std::fs::read_to_string(Path::new(root).join(name)).ok()).filter(|text| !text.trim().is_empty())
+}
+
+/// One CLI process on the computer that runs it (this one or a member), with this computer's tools
+/// answering it: `cx mcp` runs here for the agent's session, the CLI's MCP messages come as items
+/// of the run and go into it, and its answers go back to the run's computer.
+struct Cli {
+    host: Host,
+    node: Option<String>,
+    run: String,
+    /// The run's call; taken when the run is ended properly ([`Cli::end`]).
+    stream: Option<CallStream>,
+    to_tools: mpsc::UnboundedSender<String>,
+    _tools: Child,
+}
+
+impl Drop for Cli {
+    /// A CLI left before its end (a stop, a pause, an error here) is ended on its computer.
+    fn drop(&mut self) {
+        if let Some(stream) = &self.stream {
+            stream.cancel();
+        }
+    }
+}
+
+impl Cli {
+    fn start(host: &Host, node: &Option<String>, params: RunParams, cx: &str, env: &BTreeMap<String, String>, root: &str) -> Result<Cli, RpcError> {
+        let mut tools = Command::new(cx)
+            .arg("mcp")
+            .current_dir(root)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| RpcError::new(codes::UNAVAILABLE, format!("cannot start the agent's tools ({cx} mcp): {error}")))?;
+        let mut tools_in = tools.stdin.take().ok_or_else(|| RpcError::internal("the agent's tools have no stdin"))?;
+        let tools_out = tools.stdout.take().ok_or_else(|| RpcError::internal("the agent's tools have no stdout"))?;
+        // What the CLI asks of its tools, one message a line, in the order it came.
+        let (to_tools, mut for_tools) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(mut line) = for_tools.recv().await {
+                line.push('\n');
+                if tools_in.write_all(line.as_bytes()).await.is_err() || tools_in.flush().await.is_err() {
+                    break;
                 }
             }
+        });
+        // What the tools answer goes back to the CLI on its computer.
+        let run = params.run.clone();
+        {
+            let host = host.clone();
+            let node = node.clone();
+            let run = run.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(tools_out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+                    let (method, params) = asked_at(&node, lent::MCP, json!({"run": run, "message": message}));
+                    if host.call(&method, params).await.is_err() {
+                        break;
+                    }
+                }
+            });
         }
-        let text = String::from_utf8_lossy(&kept).into_owned();
-        let start = text.len().saturating_sub(STDERR_TAIL);
-        let start = (start..text.len()).find(|index| text.is_char_boundary(*index)).unwrap_or(text.len());
-        text[start..].trim().to_owned()
-    })
+        let params = serde_json::to_value(&params).map_err(|error| RpcError::internal(error.to_string()))?;
+        let (method, params) = asked_at(node, lent::RUN, params);
+        let stream = host.ctx().call_stream(&method, params)?;
+        Ok(Cli { host: host.clone(), node: node.clone(), run, stream: Some(stream), to_tools, _tools: tools })
+    }
+
+    /// The CLI's next output event; None once the process ended. Its MCP messages are handed to
+    /// the tools on the way, and a wait for a place comes as a [`QUEUED_EVENT`].
+    async fn next(&mut self) -> Option<Value> {
+        loop {
+            let item = self.stream.as_mut()?.next().await?;
+            if let Some(message) = item.get("mcp").filter(|message| !message.is_null()) {
+                let _ = self.to_tools.send(message.to_string());
+            } else if let Some(ahead) = item.get("queued").and_then(Value::as_u64) {
+                return Some(json!({"type": QUEUED_EVENT, "ahead": ahead}));
+            } else if let Some(event) = item.get("event").filter(|event| !event.is_null()) {
+                return Some(event.clone());
+            }
+        }
+    }
+
+    /// The CLI's next message (Claude Code takes it when its turn ended).
+    async fn say(&self, text: &str) -> Result<(), RpcError> {
+        let (method, params) = asked_at(&self.node, lent::SAY, json!({"run": self.run, "text": text}));
+        self.host.call(&method, params).await.map(|_| ())
+    }
+
+    /// No further message comes: the CLI ends.
+    async fn close(&self) {
+        let (method, params) = asked_at(&self.node, lent::CLOSE, json!({"run": self.run}));
+        let _ = self.host.call(&method, params).await;
+    }
+
+    /// How the process ended, once its output is read to the end.
+    async fn end(mut self) -> Result<RunResult, RpcError> {
+        let Some(stream) = self.stream.take() else { return Err(RpcError::internal("the run was ended already")) };
+        let value = stream.finish().await?;
+        serde_json::from_value(value).map_err(|error| RpcError::internal(format!("the run's end could not be read: {error}")))
+    }
 }
 
 /// The files a session changed in the project since a time, from the tools plugin's step log: the

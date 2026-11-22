@@ -375,10 +375,21 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // What a read showed: its path with its line range. Only the same read again replaces an older
     // one; a read of other lines of the file does not (seen: lines 1-107 replaced by a later read of
     // 108-320 as "your latest read shows the file", and read again six times).
+    // A read's part: its path, with the `range` argument joined when the call gave one apart.
+    // Keyed by the path alone, a read of other lines of the file stood for this one (seen: lines
+    // 519-720 of one file read 7 times, each later read of other lines making the earlier one
+    // "an older read of the same lines").
     let target_of = |call: &JournalEntry| -> Option<String> {
         let args = call.data.get("args")?;
         let raw = args.get("path").or_else(|| args.get("target")).and_then(Value::as_str)?;
-        (!raw.contains("://")).then(|| raw.trim().trim_start_matches("./").to_owned())
+        if raw.contains("://") {
+            return None;
+        }
+        let path = raw.trim().trim_start_matches("./");
+        Some(match args.get("range").and_then(Value::as_str).map(str::trim).filter(|range| !range.is_empty()) {
+            Some(range) => format!("{path}:{}", range.trim_start_matches(':')),
+            None => path.to_owned(),
+        })
     };
     // A command is named by what it runs, without its output filters (`cargo clippy | grep error`
     // and `cargo clippy | tail -5` are one check): a later run of it replaces the earlier views
@@ -461,9 +472,9 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             && bool_field(&result.data, "ok")
     };
     // An output the notebook took in (as it stood at the settled mark): it was in view when that
-    // notebook was written, so what it showed lives in the notebook, and the output itself is one line. Kept whole: the current
-    // view of each file the work edited (its newest edit result and newest read), which the next
-    // edit is made against. In place, so only up to the settled mark (see the module notes).
+    // notebook was written, so what it showed lives in the notebook, and the output itself is one
+    // line. Kept whole: each edited file's newest edit result and the newest read of each part of
+    // a project file, which the next edit is made against. In place, so only up to the settled mark (see the module notes).
     // Every output kept whole while the notebook already held it made the context only grow
     // (seen: 79k that no compaction could fold, reference files read once and carried to 122k).
     let absorbed = |result: &JournalEntry| -> Option<String> {
@@ -476,8 +487,14 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             if tool == "edit" && edited_at.get(&file) == Some(&result.seq) {
                 return None;
             }
+            // The newest read of each part of a project file stays whole, edited yet or not: the
+            // notebook names what the code is, not its lines, so folding a read the next edit is
+            // built on sent the model to read it again (seen: one range read 7 times, the notebook
+            // saying "read it" each time). Copies in the scratch folder (`tmp/`, reference clones)
+            // are material, not the code being changed: they fold.
             let is_read = tool == "read" || tool == tools_methods::READ;
-            if is_read && edited_at.contains_key(&file) && target_of(call).is_some_and(|target| read_at.get(&target) == Some(&result.seq)) {
+            let scratch = file.trim_start_matches("./").starts_with("tmp/");
+            if is_read && !scratch && target_of(call).is_some_and(|target| read_at.get(&target) == Some(&result.seq)) {
                 return None;
             }
         }

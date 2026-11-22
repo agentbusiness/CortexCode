@@ -5,7 +5,7 @@
 //! closed at once. On `cortex/frame/1` every request is its own bidirectional stream carrying the
 //! frame's own envelopes ([`cc_protocol::envelope::Message`]): the requester writes one `Req`, the
 //! serving side answers with `Item`s and one `Res`, and a `Cancel` or a closed stream cancels the
-//! forwarded call. What a member may ask is fixed ([`lendable`]: the model; and the services the plugins declare); the serving side
+//! forwarded call. What a member may ask is fixed ([`lendable`]: the model and the frontier CLIs; and the services the plugins declare); the serving side
 //! forwards such a call to its own frame (`ctx.call_stream`) and nothing else.
 //!
 //! Mesh-level requests on the same streams: `mesh.card.push` (a member's card), `mesh.log.push`
@@ -53,11 +53,13 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a member has to take a new stream (a request): milliseconds on a live connection.
 const OPEN_STREAM: Duration = Duration::from_secs(5);
 
-/// What every member lends every other as a whole category: its model. The services the plugins
-/// share are lent method by method (`crate::services`); everything else is private to the node,
-/// never forwarded (a member's window reaches this frame's projects through `mesh.window` instead).
+/// What every member lends every other: its model (a whole category), and its frontier CLIs (the
+/// methods `agents.frontier.*`, `cc_protocol::contracts::frontier`: the CLI thinks here, with the
+/// asking computer's tools). The services the plugins share are lent method by method
+/// (`crate::services`); everything else is private to the node, never forwarded (a member's
+/// window reaches this frame's projects through `mesh.window` instead).
 pub fn lendable(method: &str) -> bool {
-    cc_protocol::contracts::category_of(method) == "model"
+    cc_protocol::contracts::category_of(method) == "model" || cc_protocol::contracts::frontier::lent(method)
 }
 
 // --- accepting ---------------------------------------------------------------------------------

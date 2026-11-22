@@ -26,6 +26,9 @@ interface WorkerInfo {
   model?: string;
   effort?: string;
   problem?: string;
+  /** The member of the mesh whose CLI does its runs, when this computer's own cannot. */
+  node?: string;
+  computer?: string;
 }
 
 interface WorkersResult {
@@ -86,7 +89,7 @@ function Workers() {
         .filter((worker) => worker.id !== 'local' && worker.installed)
         .map((worker) => (
           <p key={`${worker.id}-version`} className="hint" data-version={worker.id}>
-            {worker.label}: {worker.version ?? 'version unknown'}{worker.path ? ` · ${worker.path}` : ''}
+            {worker.label}: {worker.version ?? 'version unknown'}{worker.path ? ` · ${worker.path}` : ''}{worker.computer ? ` · lent by ${worker.computer}` : ''}
           </p>
         ))}
       {data.fallback && <p className="hint" data-fallback>{data.fallback}</p>}
