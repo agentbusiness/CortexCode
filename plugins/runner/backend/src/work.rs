@@ -10,6 +10,8 @@ use cc_protocol::contracts::vcs::{self, methods as vcs_methods};
 use cc_protocol::host::Host;
 use cc_protocol::{Ctx, RpcError, codes, parse_params};
 use serde_json::{Value, json};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -413,27 +415,53 @@ impl Runner {
     }
 
     /// The repository's own release commands, in order, in the clean checkout: with the files a
-    /// release reads that git does not hold linked in from `secrets_from` for the release only.
-    /// A command that fails ends the release. Releases take as long as they take (an app's
-    /// notarization waits on Apple), so no time limit ends them.
+    /// release reads that git does not hold written from `secret_texts` or linked in from
+    /// `secrets_from`, for the release only. A command that fails ends the release. Releases take
+    /// as long as they take (an app's notarization waits on Apple), so no time limit ends them.
     async fn release_steps(&self, params: &ReleaseParams, root: &Path, head: &str, cancel: &CancellationToken) -> Result<ReleaseAnswer, RpcError> {
         let mut linked: Vec<PathBuf> = Vec::new();
         let outcome = async {
-            for file in &params.secret_files {
+            let inside = |file: &str| -> Result<String, RpcError> {
                 let name = file.trim().trim_start_matches("./");
                 if name.is_empty() || name.split('/').any(|part| part == ".." || part.is_empty()) {
                     return Err(RpcError::invalid_params(format!("`{file}` is not a file of the repository")));
                 }
+                Ok(name.to_owned())
+            };
+            let mut written: Vec<String> = Vec::new();
+            for (file, text) in &params.secret_texts {
+                let name = inside(file)?;
+                let target = root.join(&name);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| RpcError::internal(format!("cannot create {}: {error}", parent.display())))?;
+                }
+                // Readable by its owner only, and gone after the release.
+                let mut out = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&target)
+                    .map_err(|error| RpcError::internal(format!("cannot write {}: {error}", target.display())))?;
+                linked.push(target.clone());
+                out.write_all(text.as_bytes()).map_err(|error| RpcError::internal(format!("cannot write {}: {error}", target.display())))?;
+                written.push(name);
+            }
+            for file in &params.secret_files {
+                let name = inside(file)?;
+                if written.contains(&name) {
+                    continue;
+                }
                 let from = params.secrets_from.trim();
                 if from.is_empty() {
-                    return Err(RpcError::invalid_params(format!("the release reads {name}, which git does not hold: set the folder it is taken from in the repository's settings")));
+                    return Err(RpcError::invalid_params(format!("the release reads {name}, which git does not hold: give its text in the repository's settings")));
                 }
                 let from = if let Some(rest) = from.strip_prefix("~/") { std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest) } else { PathBuf::from(from) };
-                let source = from.join(name);
+                let source = from.join(&name);
                 if !source.is_file() {
                     return Err(RpcError::not_found(format!("{} is not on this computer: put it there, or set where it is in the repository's settings", source.display())));
                 }
-                let target = root.join(name);
+                let target = root.join(&name);
                 if target.exists() {
                     continue;
                 }

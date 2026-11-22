@@ -712,14 +712,13 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         index += 1;
     }
     flush_host(&mut host_group, &mut messages);
-    // The work's notebook comes after everything else, next to the decision: what the steps
-    // concluded, whole. Thinking is not carried from step to step and older outputs fold, so
-    // without it each step rebuilt the picture before one call (seen: 74% of a session's tokens
-    // thinking, `service.rs` read 30 times, the same two to-dos restated 15 times in an hour).
-    if let Some(text) = &notebook.text {
-        messages.push(host_message(ds, &ds.text("notebook", &[("notebook", text)])));
-    }
     messages
+}
+
+/// The work's notebook as its newest step wrote it (`None`: not written yet). The work loop shows
+/// it last, next to the decision, with the step's law (`agent_loop::step_law`).
+pub fn notebook_of(entries: &[JournalEntry]) -> Option<String> {
+    Notebook::of(entries).text
 }
 
 /// The notebook of the work going on: the newest step message of it that holds a `Next:` heading

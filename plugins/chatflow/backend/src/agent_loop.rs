@@ -351,6 +351,25 @@ impl Footing {
     }
 }
 
+/// The law of a step, last in its prompt: how far it thinks at its level, then the notebook
+/// (as last written, or the order to write it), ending on the step to take. The level alone is
+/// one sentence the template adds and the model passed over (seen: steps at `low` thinking 90k
+/// characters, drafting a whole file, then making one `grep`); the notebook rule alone, far up in
+/// the rules, was never followed (no notebook in 350 steps).
+fn step_law(data: &Dataset, effort: &str, entries: &[JournalEntry]) -> String {
+    let level = match effort {
+        "none" => "think_law_none",
+        "low" => "think_law_low",
+        "medium" => "think_law_medium",
+        _ => "think_law_high",
+    };
+    let notebook = match crate::projection::notebook_of(entries) {
+        Some(text) => data.text("notebook", &[("notebook", &text)]),
+        None => data.text("notebook_missing", &[]),
+    };
+    format!("{}\n\n{notebook}", data.text(level, &[]))
+}
+
 fn of_run<'a>(entries: &'a [JournalEntry], run_id: &'a str) -> impl Iterator<Item = &'a JournalEntry> + 'a {
     entries.iter().filter(move |entry| str_field(&entry.data, "run_id") == run_id)
 }
@@ -1173,7 +1192,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             steps_since_settle = 0;
         }
         // The prompt is counted and compacted until it fits the conversation's context (crate::fit).
-        let messages = match crate::fit::fitted(env, journal, prompt).await {
+        let mut messages = match crate::fit::fitted(env, journal, prompt).await {
             Ok(messages) => messages,
             Err(error) if error.code == crate::fit::CONTEXT_FULL => {
                 journal.note(&env.run_id, "context", &error.message, false).await?;
@@ -1190,6 +1209,8 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         // a run decided `high` thought 20k tokens before each read, an hour for two edits).
         let effort = footing.effort(&spec.effort, &env.data.effort);
         footing = Footing::Act;
+        // Last, where the step is decided: the law of its thinking level and the notebook.
+        messages.push(crate::projection::host_message(&env.data, &step_law(&env.data, &env.data.effort_for(stage, &effort), &journal.entries_vec())));
         let call = env.call(stage, &effort, messages, None, None, step, true);
         let called = match llm::chat(journal, call, &any).await {
             Ok(called) => {

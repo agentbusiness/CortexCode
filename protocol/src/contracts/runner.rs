@@ -414,6 +414,11 @@ pub struct ReleaseParams {
     pub secret_files: Vec<String>,
     #[serde(default)]
     pub secrets_from: String,
+    /// Files not in git the release reads, each `(path, text)`: written into the checkout as they
+    /// are (a person gave the text, in whatever form the repository reads), for the release only.
+    /// A path given here is not looked for in `secrets_from`.
+    #[serde(default)]
+    pub secret_texts: Vec<(String, String)>,
     /// Only make or fetch the mirror (nothing runs).
     #[serde(default)]
     pub fetch_only: bool,

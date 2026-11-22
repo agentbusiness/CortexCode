@@ -5,7 +5,7 @@ stage: DO
 Make the change with your tools. Commands run in the repository root.
 
 1. Read the files the request names and the code the change edits, once each, then write the change with your edit tool. Anchored edits for existing files, `content` for new files.
-2. Keep a notebook: your thinking is gone at the next step and old outputs shrink, so what you worked out lives only in it. Before your calls, write it whole when it changed, under three headings, each fact with where it comes from:
+2. Law: keep a notebook. Your thinking is gone after the next step and old outputs shrink, so what you worked out lives only in it. Your message writes it whole before your calls, at the first step and whenever it changed, under three headings, each fact with where it comes from:
    Known: the CSV export writes dates as ISO 8601 (src/export.rs:42); `Row::date` is a `NaiveDate`
    Done: added the `--since` flag
    Next: filter rows by `--since` in `export_rows`; run `cargo test export`

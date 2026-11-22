@@ -106,11 +106,12 @@ stall_runs = 20
 manage_reading_calls = 10
 manage_idle_minutes = 10
 # Steps whose reasoning stays in the prompt (newest first); older steps keep their answer and calls
-# only, as the model's template renders earlier turns. 0 (none): the engine then resumes every step
-# from the checkpoint at the end of the previous prompt and re-reads only the answer and the new
-# results. With 1 the step before the newest changes every time, so the engine falls back to one
-# fixed older checkpoint and the re-read grows by a step each step (seen: reused 10950 of 19156).
-reasoning_steps = 0
+# only, as the model's template renders earlier turns. 1: the step after a plan still sees the plan
+# it thought through (with 0 a step drafted a whole file in its thinking, made one `grep`, and the
+# next step drafted it again). The cost: the step before the newest changes every time, so the
+# engine falls back to one fixed older checkpoint and the re-read grows by a step each step (seen:
+# reused 10950 of 19156).
+reasoning_steps = 1
 # Host-read rounds per request, the first included (ends a read loop, never output).
 read_rounds = 5
 # Baseline rounds of the CHECKS decision before the checks stand.
