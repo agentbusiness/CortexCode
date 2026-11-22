@@ -907,7 +907,11 @@ impl Chatflow {
             // terminal status, so whoever waits for it sees the workspace as the turn leaves it.
             if let Some(env) = &ran {
                 let since_ms = journal.get(status_seq).map(|entry| entry.ts_ms).unwrap_or(0);
-                let params = json!({"workspace": env.scope.workspace, "session_id": session_id, "since_ms": since_ms});
+                // A turn that stopped unfinished keeps its scratch folder: resumed, the work goes on
+                // from what is in it (seen: a failed run's reference checkout, read by the task at
+                // work, removed with `tmp/`).
+                let keep_scratch = matches!(state.as_str(), "failed" | "cancelled");
+                let params = json!({"workspace": env.scope.workspace, "session_id": session_id, "since_ms": since_ms, "keep_scratch": keep_scratch});
                 match host.call(cc_protocol::contracts::tools::methods::CLEANUP, params).await {
                     Ok(result) => {
                         // What the host took away is told to the user, with how to get one back

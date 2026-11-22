@@ -19,7 +19,7 @@ use std::time::UNIX_EPOCH;
 
 /// Remove what the turn of `session_id` that started at `since_ms` left behind in `workspace`;
 /// returns the removed paths, relative to the workspace.
-pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, session_id: &str, since_ms: u64) -> Vec<String> {
+pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, session_id: &str, since_ms: u64, keep_scratch: bool) -> Vec<String> {
     let mut removed = Vec::new();
     // The files this turn edited are free for other sessions now.
     core.tree.release_session(session_id);
@@ -36,12 +36,15 @@ pub fn turn_end(core: &Core, log: &crate::undo::ProjectLog, workspace: &Path, se
     if !workspace.is_dir() {
         return removed;
     }
-    let scratch = crate::util::scratch_dir(workspace);
-    if scratch.is_dir() && std::fs::remove_dir_all(&scratch).is_ok() {
-        removed.push("tmp/".to_owned());
-    }
-    if restore_gitignore(workspace) {
-        removed.push(".gitignore: the /tmp/ line".to_owned());
+    // An unfinished turn's scratch folder (and its .gitignore line) stays for the work it resumes.
+    if !keep_scratch {
+        let scratch = crate::util::scratch_dir(workspace);
+        if scratch.is_dir() && std::fs::remove_dir_all(&scratch).is_ok() {
+            removed.push("tmp/".to_owned());
+        }
+        if restore_gitignore(workspace) {
+            removed.push(".gitignore: the /tmp/ line".to_owned());
+        }
     }
     if core.approved(session_id).iter().any(|class| class.starts_with(cc_protocol::contracts::tools::approval_classes::LIFT_PREFIX)) {
         return removed;

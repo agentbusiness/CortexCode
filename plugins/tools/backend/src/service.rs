@@ -604,6 +604,8 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let workspace = params.get("workspace").and_then(Value::as_str).unwrap_or_default().to_owned();
             let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or_default().to_owned();
             let since_ms = params.get("since_ms").and_then(Value::as_u64).unwrap_or(0);
+            // `keep_scratch`: the turn stopped unfinished, and the scratch folder is still its work's.
+            let keep_scratch = params.get("keep_scratch").and_then(Value::as_bool).unwrap_or(false);
             if workspace.is_empty() || session_id.is_empty() {
                 return Err(RpcError::invalid_params("tools.cleanup needs workspace and session_id"));
             }
@@ -611,7 +613,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let workspace = util::expand_home(&workspace);
             let log = core.steps.open(&workspace).await;
             let removed = tokio::task::spawn_blocking(move || {
-                let removed = crate::cleanup::turn_end(&core, &log, &workspace, &session_id, since_ms);
+                let removed = crate::cleanup::turn_end(&core, &log, &workspace, &session_id, since_ms, keep_scratch);
                 // What the turn's commands left and the host took away, and anything else the
                 // turn changed that no step recorded yet, is the session's last step of the turn.
                 log.reconcile(&Attribution::session(&session_id, "run", "end of turn"));

@@ -1191,8 +1191,30 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
             crate::fit::settle(env, journal, prompt).await?;
             steps_since_settle = 0;
         }
+        // No thinking budget: a thought runs to its own end. A cut thought lost its plan (thinking is
+        // not carried to the next step) and the next step rebuilt it; what a step concluded is kept
+        // in the task's notebook instead. How long it runs is the step's effort, chosen by what the
+        // step faces: one run-wide effort made a fifteen-line read think as hard as the plan (seen:
+        // a run decided `high` thought 20k tokens before each read, an hour for two edits).
+        let effort = footing.effort(&spec.effort, &env.data.effort);
+        footing = Footing::Act;
+        let law_effort = env.data.effort_for(stage, &effort);
+        // Last, where the step is decided: the law of its thinking level and the notebook, inside
+        // the stage message, the one message replaced per call. As a message of its own after it,
+        // the stage message became history the engine checkpointed and the next call no longer
+        // had, so every step re-read all but the system block (seen: 9504 of 100k reused). It is
+        // part of the prompt the fit counts: added after the count, it was never measured.
+        let step_prompt = |entries: &[JournalEntry]| {
+            let mut messages = prompt(entries);
+            let law = step_law(&env.data, &law_effort, entries);
+            match messages.last_mut() {
+                Some(last) if last.role == "user" && last.parts.is_empty() => last.content = format!("{}\n\n{law}", last.content),
+                _ => messages.push(crate::projection::host_message(&env.data, &law)),
+            }
+            messages
+        };
         // The prompt is counted and compacted until it fits the conversation's context (crate::fit).
-        let mut messages = match crate::fit::fitted(env, journal, prompt).await {
+        let messages = match crate::fit::fitted(env, journal, step_prompt).await {
             Ok(messages) => messages,
             Err(error) if error.code == crate::fit::CONTEXT_FULL => {
                 journal.note(&env.run_id, "context", &error.message, false).await?;
@@ -1202,22 +1224,6 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         };
         // The step's own entries start here; what is before it is what the next call shares.
         let step_start = journal.last_seq() + 1;
-        // No thinking budget: a thought runs to its own end. A cut thought lost its plan (thinking is
-        // not carried to the next step) and the next step rebuilt it; what a step concluded is kept
-        // in the task's notebook instead. How long it runs is the step's effort, chosen by what the
-        // step faces: one run-wide effort made a fifteen-line read think as hard as the plan (seen:
-        // a run decided `high` thought 20k tokens before each read, an hour for two edits).
-        let effort = footing.effort(&spec.effort, &env.data.effort);
-        footing = Footing::Act;
-        // Last, where the step is decided: the law of its thinking level and the notebook, inside
-        // the stage message, the one message replaced per call. As a message of its own after it,
-        // the stage message became history the engine checkpointed and the next call no longer
-        // had, so every step re-read all but the system block (seen: 9504 of 100k reused).
-        let law = step_law(&env.data, &env.data.effort_for(stage, &effort), &journal.entries_vec());
-        match messages.last_mut() {
-            Some(last) if last.role == "user" && last.parts.is_empty() => last.content = format!("{}\n\n{law}", last.content),
-            _ => messages.push(crate::projection::host_message(&env.data, &law)),
-        }
         let call = env.call(stage, &effort, messages, None, None, step, true);
         let called = match llm::chat(journal, call, &any).await {
             Ok(called) => {

@@ -6,9 +6,12 @@
 //! - **A request** ([`cut_turns`]): when a turn ends, every finished turn becomes its digest (its
 //!   user message, plans, spec changes, one note listing its calls, and its final answer), so the
 //!   next request starts from the system block, the spec and that digest.
-//! - **A plan task** ([`fold_steps`], called by the flow before the next task): the finished task's
-//!   steps become one note listing their calls with the files they changed and their last test
-//!   run; the next task's step message lists every finished task's reply ("Done so far").
+//! - **A plan task** ([`fold_steps`], called by the flow before the next task): the finished
+//!   tasks' steps, outputs and host notes are not shown; one note gives the files they changed and
+//!   their last test run, and the next task's step message lists every finished task's report.
+//! - **What the notebook took in** ([`crate::projection`]): an output in view when the newest
+//!   notebook was written is one line from the next settle on; the current view of each file the
+//!   work edited stays whole.
 //! - **Inside a long task** ([`prepare`]): at a wait past `limits.compact_early_tokens`, the least
 //!   compaction that reaches `limits.compact_target_tokens` or halves the prompt is made (older
 //!   tool outputs folded, then older steps as one note; the newest `limits.history_tail_steps`
@@ -20,9 +23,11 @@
 //! system block is a shared leading block the engine keeps), prefilled in the background where
 //! there is a wait.
 //!
-//! Every model call fits the conversation's share of the context. The prompt is counted exactly
-//! (`model.count`: the model's own chat template and tokenizer) and, when it does not leave
-//! `limits.answer_reserve_tokens` free for the answer, the conversation is compacted.
+//! Every model call fits the conversation's share of the context: the window of the model as it is
+//! loaded now ([`window`]), not as it was when the session started. The prompt is counted exactly
+//! as it is sent (`model.count`: the model's own chat template and tokenizer) and, when it does not
+//! leave `limits.answer_reserve_tokens` free for the answer, the conversation is compacted; when
+//! keeping the newest steps whole does not fit, only the newest one is kept whole.
 //!
 //! Compaction is three marks on the session's `context` entry, which the projection honours:
 //! `digested_through` (finished turns at or before it are shown as their user message, one note
@@ -85,19 +90,28 @@ pub async fn fitted(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
         // The model's size is not known (model.info failed): nothing to measure against.
         return Ok(messages);
     }
-    let budget = budget(env);
+    let window = window(env).await;
+    let budget = budget(env, window);
     let tokens = count(env, &messages).await?;
     if tokens <= budget {
         return Ok(messages);
     }
-    match compact(env, journal, &build, u64::MAX, target(env), budget).await? {
-        Some((marks, most)) if most <= budget => {
-            tracing::info!(session = %env.session_id, tokens, compacted = most, ?marks, "compacted to fit");
-            Ok(build(&journal.entries_vec()))
+    // The newest steps are kept whole while that fits; when it does not, only the newest one is:
+    // a prompt that fits always beats one the engine refuses (seen: 79k that could not be
+    // compacted, the run failed at 122k).
+    let tails = [env.data.limits.history_tail_steps, 1];
+    let mut most = tokens;
+    for tail in tails {
+        match compact_with(env, journal, &build, u64::MAX, target(env, window), budget, tail).await? {
+            Some((marks, compacted)) if compacted <= budget => {
+                tracing::info!(session = %env.session_id, tokens, compacted, tail, ?marks, "compacted to fit");
+                return Ok(build(&journal.entries_vec()));
+            }
+            Some((_, compacted)) => most = most.min(compacted),
+            None => {}
         }
-        Some((_, most)) => Err(full(env, most, budget)),
-        None => Err(full(env, tokens, budget)),
     }
+    Err(full(env, most, budget))
 }
 
 /// Settle the conversation up to its newest entry when that saves at least
@@ -161,8 +175,14 @@ pub async fn compact_now(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[J
     if env.prefix.ctx_window == 0 {
         return Ok(false);
     }
-    let budget = budget(env);
-    Ok(compact(env, journal, &build, u64::MAX, target(env), budget).await?.is_some_and(|(_, tokens)| tokens <= budget))
+    let window = window(env).await;
+    let budget = budget(env, window);
+    for tail in [env.data.limits.history_tail_steps, 1] {
+        if compact_with(env, journal, &build, u64::MAX, target(env, window), budget, tail).await?.is_some_and(|(_, tokens)| tokens <= budget) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Cut at the request boundary: every finished turn not digested yet becomes its digest, and the
@@ -255,7 +275,7 @@ pub async fn prepare(
         // (seen: 163k -> 161k, then a 12-minute re-read), and one held to a target below what can
         // never be compacted (the system block, spec, plans, the newest steps) is never made (seen:
         // a 24k target, nothing compacted all night, the prompt grown to 193k).
-        let goal = target(env).max(tokens / 2);
+        let goal = target(env, window(env).await).max(tokens / 2);
         match compact(env, journal, &build, before, goal, goal).await {
             Ok(Some((marks, compacted))) if compacted <= goal => tracing::info!(session = %env.session_id, tokens, compacted, ?marks, "compacted early"),
             Ok(Some((_, most))) => {
@@ -283,14 +303,30 @@ pub async fn prepare(
     Some(crate::prewarm::send(&env.host, &env.cache_key(), messages, &env.prefix.tools, "the compacted conversation", false, when, |_| {}))
 }
 
+/// Tokens one conversation of the loaded model holds now: the model's current load, within the
+/// window the session's prefix was built for. The load changes under a session (another app's
+/// model, a reload with less memory), and the recorded window alone let a 262k session send a
+/// 122k prompt to a load that holds 121k.
+pub async fn window(env: &RunEnv) -> u32 {
+    let live = crate::context::model_info(&env.host)
+        .await
+        .map(|info| crate::context::conversation_window(info.ctx_total, info.ctx_native, 0))
+        .unwrap_or(0);
+    match (live, env.prefix.ctx_window) {
+        (0, recorded) => recorded,
+        (live, 0) => live,
+        (live, recorded) => live.min(recorded),
+    }
+}
+
 /// Tokens a prompt may take: the conversation's context less the answer's reserve.
-fn budget(env: &RunEnv) -> u32 {
-    env.prefix.ctx_window.saturating_sub(env.data.limits.answer_reserve_tokens)
+fn budget(env: &RunEnv, window: u32) -> u32 {
+    window.saturating_sub(env.data.limits.answer_reserve_tokens)
 }
 
 /// Tokens a compaction brings the prompt down to.
-fn target(env: &RunEnv) -> u32 {
-    env.data.limits.compact_target_tokens.min(budget(env))
+fn target(env: &RunEnv, window: u32) -> u32 {
+    env.data.limits.compact_target_tokens.min(budget(env, window))
 }
 
 /// A compaction chosen but not yet written: its marks, the prompt's tokens with them, and the
@@ -307,10 +343,10 @@ pub struct Chosen {
 /// The least compaction of the entries before `before` that brings `build`'s prompt to `target`
 /// tokens (or the most there is, when none does), without writing it; `None` when nothing is left
 /// to compact.
-async fn choose(env: &RunEnv, journal: &Journal, build: &impl Fn(&[JournalEntry]) -> Vec<ChatMessage>, before: u64, target: u32) -> Result<Option<Chosen>, RpcError> {
+async fn choose(env: &RunEnv, journal: &Journal, build: &impl Fn(&[JournalEntry]) -> Vec<ChatMessage>, before: u64, target: u32, tail: u32) -> Result<Option<Chosen>, RpcError> {
     let entries = upto(&journal.entries_vec(), before);
     let Some((context_seq, current)) = journal.context_entry().map(|entry| (entry.seq, Marks::of(entry))) else { return Ok(None) };
-    let levels = levels(&entries, current, env.data.limits.history_tail_steps);
+    let levels = levels(&entries, current, tail);
     if levels.is_empty() {
         return Ok(None);
     }
@@ -356,7 +392,20 @@ async fn compact(
     target: u32,
     accept: u32,
 ) -> Result<Option<(Marks, u32)>, RpcError> {
-    let Some(chosen) = choose(env, journal, build, before, target).await? else { return Ok(None) };
+    compact_with(env, journal, build, before, target, accept, env.data.limits.history_tail_steps).await
+}
+
+/// [`compact`], keeping the newest `tail` steps of the running turn whole.
+async fn compact_with(
+    env: &RunEnv,
+    journal: &mut Journal,
+    build: &impl Fn(&[JournalEntry]) -> Vec<ChatMessage>,
+    before: u64,
+    target: u32,
+    accept: u32,
+    tail: u32,
+) -> Result<Option<(Marks, u32)>, RpcError> {
+    let Some(chosen) = choose(env, journal, build, before, target, tail).await? else { return Ok(None) };
     if chosen.tokens <= accept {
         apply(journal, &chosen).await?;
     }

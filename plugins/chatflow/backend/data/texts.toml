@@ -66,6 +66,7 @@ folded = "(This {size}-byte output was folded to keep the conversation within th
 folded_artifact = "(This {size}-byte output was folded to keep the conversation within the context window. Its full text is readable as {artifact}.)"
 turn_digest = "(The work of this turn was compacted to keep the conversation within the context window: its reasoning and tool outputs are no longer shown. Calls it made: {calls}. Read again what you need.)"
 steps_digest = "(Earlier steps of this turn were compacted to keep the conversation within the context window: their reasoning and tool outputs are no longer shown. Calls they made: {calls}.{state} The newest steps follow; read a file again when you need its current text.)"
+tasks_digest = "(The finished tasks' steps are not shown: what each established is in what the finished tasks reported, below.{state} Read a file when you need its current text.)"
 steps_state_files = " Files they changed: {files}."
 steps_state_tests = " Their last test run, `{command}`: {failed} of {ran} failed{names}."
 turn_digest_more = "{calls}, and {more} more"
@@ -341,6 +342,7 @@ progress_job = "\nRunning in the background: {job_id}, its output so far ends wi
 progress_go_on = "The user asked how the work goes, and the host gave them the plan's progress. Go on with task {n} ({title})."
 # Outdated outputs once settled: the newest read, edit result or run of the same thing shows the
 # current state; the older ones become one line each.
+absorbed = "(Earlier output of {what}: what it showed is in your notebook. Run or read it again when you need its exact text.)"
 read_repeated = "(An older read of {path}; your latest read of the same lines, below, shows them as they are now.)"
 read_in_view = "(Already in view: your earlier read of this file, above, shows these lines, and the file has not changed since. Work from that view.)"
 read_unchanged = "(Unchanged: this read shows exactly what your earlier read of {path}, above, shows. Work from that view.)"

@@ -456,8 +456,33 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         calls.get(str_field(&result.data, "call_id")).is_some_and(|call| matches!(str_field(&call.data, "tool"), tool if tool == "read" || tool == tools_methods::READ) && target_of(call).is_some())
             && bool_field(&result.data, "ok")
     };
+    // An output the newest notebook took in: it was in view when the notebook was written, so what
+    // it showed lives in the notebook, and the output itself is one line. Kept whole: the current
+    // view of each file the work edited (its newest edit result and newest read), which the next
+    // edit is made against. In place, so only up to the settled mark (see the module notes).
+    // Every output kept whole while the notebook already held it made the context only grow
+    // (seen: 79k that no compaction could fold, reference files read once and carried to 122k).
+    let absorbed = |result: &JournalEntry| -> Option<String> {
+        if notebook.from == 0 || result.seq >= notebook.from || result.seq > settled_through || Some(result.seq) == newest_result || is_skill_read(result) {
+            return None;
+        }
+        let call = calls.get(str_field(&result.data, "call_id"))?;
+        let tool = str_field(&call.data, "tool");
+        if let Some(file) = file_of(call) {
+            if tool == "edit" && edited_at.get(&file) == Some(&result.seq) {
+                return None;
+            }
+            let is_read = tool == "read" || tool == tools_methods::READ;
+            if is_read && edited_at.contains_key(&file) && target_of(call).is_some_and(|target| read_at.get(&target) == Some(&result.seq)) {
+                return None;
+            }
+        }
+        Some(ds.text("absorbed", &[("what", &call_label(call))]))
+    };
     let render_base = |result: &JournalEntry| -> String {
         if let Some(pointer) = superseded(result) {
+            pointer
+        } else if let Some(pointer) = absorbed(result) {
             pointer
         } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) && !is_file_read(result) {
             folded_text(ds, result)
@@ -478,7 +503,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     let tasks_through = mark(crate::fit::TASKS_THROUGH);
     let kept_reads: HashSet<u64> = {
         let mut newest: HashMap<String, (u64, u64)> = HashMap::new();
-        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through && is_file_read(entry)) {
+        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through && is_file_read(entry) && absorbed(entry).is_none()) {
             if let Some(call) = calls.get(str_field(&result.data, "call_id"))
                 && let Some(target) = target_of(call)
             {
@@ -493,7 +518,11 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             && entry.seq <= steps_through
             && !bool_field(&entry.data, "interrupted")
             && digests.of(entry, &calls).is_none()
-            && (step_key(entry).is_some() || (entry.kind == kinds::TOOL_RESULT && (!is_host(entry) || entry.seq <= tasks_through)))
+            && (step_key(entry).is_some()
+                || (entry.kind == kinds::TOOL_RESULT && (!is_host(entry) || entry.seq <= tasks_through))
+                // A finished task's host notes (repeats, lessons, guides, impact) spoke to its own
+                // steps; the next task starts without them.
+                || (entry.kind == kinds::NOTE && entry.seq <= tasks_through && bool_field(&entry.data, "host_message") && !matches!(str_field(&entry.data, "purpose"), "baseline" | "checks")))
     };
     // A read answered by a pointer to an identical earlier read (`unchanged`, `repeat_of`): once a
     // compaction no longer shows that earlier read whole, this one shows the text itself.
@@ -514,16 +543,20 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         .collect();
     let step_calls: Vec<(String, bool)> = entries
         .iter()
-        .filter(|entry| entry.kind == kinds::TOOL_CALL && stepped(entry))
+        .filter(|entry| entry.kind == kinds::TOOL_CALL && entry.seq > tasks_through && stepped(entry))
         .map(|entry| (call_label(entry), failed_calls.contains(str_field(&entry.data, "call_id"))))
         .collect();
-    let steps_first = entries.iter().find(|entry| stepped(entry)).map(|entry| entry.seq);
+    // A finished task is shown by what it left (the files it changed, its last test run) and its
+    // report (`plan_done_reports`): the calls it made are not the next task's (seen: the first 40 calls
+    // of seven tasks listed at the start of the eighth).
+    let steps_first = entries.iter().find(|entry| entry.seq > tasks_through && stepped(entry)).map(|entry| entry.seq);
+    let tasks_first = entries.iter().find(|entry| entry.seq <= tasks_through && stepped(entry)).map(|entry| entry.seq);
     // Layer 3, from structured facts (no model call): what the compacted steps changed and how
     // their last test run ended, so the state survives the digest.
-    let steps_state = {
+    let state_of = |finished: bool| {
         let mut files: Vec<String> = Vec::new();
         let mut tests: Option<(String, &Value)> = None;
-        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && stepped(entry)) {
+        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && (entry.seq <= tasks_through) == finished && stepped(entry)) {
             for file in result.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
                 if !files.iter().any(|known| known == file) {
                     files.push(file.to_owned());
@@ -551,6 +584,8 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         }
         state
     };
+    let steps_state = state_of(false);
+    let tasks_state = state_of(true);
 
     // A baseline whose checks stand since (a later settled `checks` note of its run) is shown in
     // its short form: its outputs served the CHECKS decision.
@@ -620,6 +655,9 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         }
         if stepped(entry) {
             flush_host(&mut host_group, &mut messages);
+            if Some(entry.seq) == tasks_first {
+                messages.push(host_message(ds, &ds.text("tasks_digest", &[("state", &tasks_state)])));
+            }
             if Some(entry.seq) == steps_first && !step_calls.is_empty() {
                 messages.push(host_message(ds, &digest_text_with(ds, &step_calls, "steps_digest").replace("{state}", &steps_state)));
             }
@@ -728,6 +766,9 @@ pub fn notebook_of(entries: &[JournalEntry]) -> Option<String> {
 struct Notebook {
     text: Option<String>,
     hidden: std::collections::HashSet<(String, u64)>,
+    /// The first entry of the step that wrote the newest notebook: every tool output before it
+    /// was in view when the notebook was written, so what it showed is in the notebook (0: none).
+    from: u64,
 }
 
 impl Notebook {
@@ -737,12 +778,14 @@ impl Notebook {
             .rev()
             .find(|entry| entry.kind == kinds::USER_MESSAGE || (entry.kind == kinds::NOTE && matches!(str_field(&entry.data, "purpose"), "task_start" | "decision_text")))
             .map_or(0, |entry| entry.seq);
-        // Each step of the work in order: its words and whether it made a call.
+        // Each step of the work in order: its words, whether it made a call, and its first entry.
         let mut steps: Vec<((String, u64), String, bool)> = Vec::new();
+        let mut firsts: Vec<u64> = Vec::new();
         for entry in entries.iter().filter(|entry| entry.seq > start && !bool_field(&entry.data, "interrupted")) {
             let Some(key) = step_key(entry) else { continue };
             if steps.last().map(|(last, _, _)| last) != Some(&key) {
                 steps.push((key.clone(), String::new(), false));
+                firsts.push(entry.seq);
             }
             let Some((_, words, called)) = steps.last_mut() else { continue };
             match entry.kind.as_str() {
@@ -752,9 +795,9 @@ impl Notebook {
             }
         }
         let newest = steps.iter().rposition(|(_, words, called)| *called && notebook_text(words).is_some());
-        let Some(newest) = newest else { return Self { text: None, hidden: Default::default() } };
+        let Some(newest) = newest else { return Self { text: None, hidden: Default::default(), from: 0 } };
         let hidden = steps[..=newest].iter().filter(|(_, words, called)| *called && !words.trim().is_empty()).map(|(key, _, _)| key.clone()).collect();
-        Self { text: notebook_text(&steps[newest].1), hidden }
+        Self { text: notebook_text(&steps[newest].1), hidden, from: firsts[newest] }
     }
 
     fn hides(&self, key: &(String, u64)) -> bool {
