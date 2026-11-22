@@ -1,5 +1,6 @@
 /**
- * card.tasks@1 — the project's planned tasks, one line each: its mark, title and state in words
+ * card.tasks@1 — the project's planned tasks, one line each (running first, then pending, then
+ * failed, done last): its mark, title and state in words
  * (pending, in progress, verifying, done, failed, or blocked when it waits for unfinished
  * prerequisites, which its tooltip names). Only the tasks that are work are listed, flat: a task
  * with sub-tasks is just their summary and is left out, and so is a task a replan cancelled. A line opens the task on the board (brief,
@@ -15,15 +16,20 @@ import './tasks.css';
 
 export interface Row { task: Task; waitsFor: string[] }
 
-/** The work tasks (those without sub-tasks), newest plan first and each plan's tasks in order;
- * unmet prerequisites per task. */
+/** Where a task's state puts it in the card: running first, then pending, then failed or
+ * undecided, done last. */
+const STATE_RANK: Record<string, number> = { in_progress: 0, verifying: 0, pending: 1, failed: 2, indeterminate: 2, done: 3 };
+const stateRank = (task: Task) => STATE_RANK[task.status] ?? 2;
+
+/** The work tasks (those without sub-tasks): running, then pending, then the rest, each group
+ * newest plan first and each plan's tasks in order; unmet prerequisites per task. */
 export function taskRows(tasks: readonly Task[]): Row[] {
   const byId = new Map(tasks.map((task) => [task.id, task]));
   const summaries = new Set(tasks.map((task) => task.parent_id).filter((id): id is string => Boolean(id && byId.has(id))));
   const planned = (task: Task) => (task.parent_id && byId.get(task.parent_id)?.created_ms) || task.created_ms;
   return tasks
     .filter((task) => !summaries.has(task.id) && task.status !== 'cancelled')
-    .sort((a, b) => planned(b) - planned(a) || a.created_ms - b.created_ms)
+    .sort((a, b) => stateRank(a) - stateRank(b) || planned(b) - planned(a) || a.created_ms - b.created_ms)
     .map((task) => ({ task, waitsFor: (task.depends_on ?? []).filter((id) => byId.get(id)?.status !== 'done').map((id) => byId.get(id)?.title ?? id) }));
 }
 

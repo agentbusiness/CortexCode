@@ -320,6 +320,10 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     let settled_through = mark(crate::fit::SETTLED);
     let settled_len = entries.iter().position(|entry| entry.seq > settled_through).unwrap_or(entries.len());
     let settled = &entries[..settled_len];
+    // The notebook as it stood at the settled mark: what it took in and what it hid change the
+    // history in place, so only at a settle (a newer notebook moved them on every step it was
+    // written, and each move voided the engine's cache: seen 12 times in 99 steps).
+    let settled_notebook = Notebook::of(settled);
     // The newest tool output is never folded.
     let newest_result = entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| entry.seq);
 
@@ -456,14 +460,14 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         calls.get(str_field(&result.data, "call_id")).is_some_and(|call| matches!(str_field(&call.data, "tool"), tool if tool == "read" || tool == tools_methods::READ) && target_of(call).is_some())
             && bool_field(&result.data, "ok")
     };
-    // An output the newest notebook took in: it was in view when the notebook was written, so what
-    // it showed lives in the notebook, and the output itself is one line. Kept whole: the current
+    // An output the notebook took in (as it stood at the settled mark): it was in view when that
+    // notebook was written, so what it showed lives in the notebook, and the output itself is one line. Kept whole: the current
     // view of each file the work edited (its newest edit result and newest read), which the next
     // edit is made against. In place, so only up to the settled mark (see the module notes).
     // Every output kept whole while the notebook already held it made the context only grow
     // (seen: 79k that no compaction could fold, reference files read once and carried to 122k).
     let absorbed = |result: &JournalEntry| -> Option<String> {
-        if notebook.from == 0 || result.seq >= notebook.from || result.seq > settled_through || Some(result.seq) == newest_result || is_skill_read(result) {
+        if settled_notebook.from == 0 || result.seq >= settled_notebook.from || result.seq > settled_through || Some(result.seq) == newest_result || is_skill_read(result) {
             return None;
         }
         let call = calls.get(str_field(&result.data, "call_id"))?;
@@ -706,7 +710,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             }
             // A step's words the notebook holds or replaced are not shown here: the newest notebook
             // comes last, and older restatements of the work would be the cue the model copies.
-            let content = if notebook.hides(&key) { String::new() } else { content };
+            let content = if notebook.hides(&settled_notebook, &key) { String::new() } else { content };
             let mut message = ChatMessage::new("assistant", content);
             if !reasoning.is_empty() && reasoning_kept.contains(&key) {
                 message.reasoning_content = Some(reasoning);
@@ -769,6 +773,8 @@ struct Notebook {
     /// The first entry of the step that wrote the newest notebook: every tool output before it
     /// was in view when the notebook was written, so what it showed is in the notebook (0: none).
     from: u64,
+    /// The steps whose own words are a notebook (up to the newest): hidden from their first view.
+    notes: std::collections::HashSet<(String, u64)>,
 }
 
 impl Notebook {
@@ -795,13 +801,17 @@ impl Notebook {
             }
         }
         let newest = steps.iter().rposition(|(_, words, called)| *called && notebook_text(words).is_some());
-        let Some(newest) = newest else { return Self { text: None, hidden: Default::default(), from: 0 } };
+        let Some(newest) = newest else { return Self { text: None, hidden: Default::default(), from: 0, notes: Default::default() } };
         let hidden = steps[..=newest].iter().filter(|(_, words, called)| *called && !words.trim().is_empty()).map(|(key, _, _)| key.clone()).collect();
-        Self { text: notebook_text(&steps[newest].1), hidden, from: firsts[newest] }
+        let notes = steps[..=newest].iter().filter(|(_, words, called)| *called && notebook_text(words).is_some()).map(|(key, _, _)| key.clone()).collect();
+        Self { text: notebook_text(&steps[newest].1), hidden, from: firsts[newest], notes }
     }
 
-    fn hides(&self, key: &(String, u64)) -> bool {
-        self.hidden.contains(key)
+    /// Whether a step's words are left out, `settled` being the notebook as it stood at the settled
+    /// mark: a notebook's own words never show, other words go only at a settle (in place, so only
+    /// then: hiding them on each new notebook voided the engine's cache, seen 6 times in one task).
+    fn hides(&self, settled: &Notebook, key: &(String, u64)) -> bool {
+        self.notes.contains(key) || settled.hidden.contains(key)
     }
 }
 
