@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cc-protocol",
+ "cc-stats-kit",
  "flate2",
  "reqwest",
  "serde",
@@ -156,6 +157,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cc-stats-kit"
+version = "0.1.0"
+dependencies = [
+ "cc-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

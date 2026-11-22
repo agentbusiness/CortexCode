@@ -2107,8 +2107,8 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     // pieces of the work (seen: the local cut's "Lay out …" task, an empty file, as a whole agent run).
     let parallel = if env.lead {
         env.data.text("plan_lead", &[])
-    } else if free > 0 && !auto {
-        env.data.text("plan_parallel", &[("count", &free.to_string())])
+    } else if parallel && !auto {
+        env.data.text("plan_parallel", &[])
     } else {
         String::new()
     };
