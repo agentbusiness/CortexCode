@@ -3368,6 +3368,7 @@ fn local_task(env: &RunEnv, id: &str, brief: &str, contract: cc_protocol::contra
         contract_hash: None,
         contract_revisions: vec![],
         effort: None,
+        worker: None,
     }
 }
 

@@ -133,7 +133,11 @@ pub fn write_frame_info(path: &Path, info: &FrameInfo) -> std::io::Result<()> {
 
 /// Write any file atomically: temp file, fsync, rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A temporary name of its own for every write: two threads saving the same file at once
+    // (several plugins marked known good in one second) would rename one shared file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
     {
         let mut file = OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
         file.write_all(bytes)?;

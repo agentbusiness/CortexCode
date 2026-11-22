@@ -1066,9 +1066,12 @@ impl Plugin for ToolsPlugin {
             if topic == cc_protocol::contracts::vcs::topics::CHANGED
                 && let Some(root) = data.get("root").and_then(Value::as_str)
             {
-                // A commit, a checkout, a reset: what equals HEAD now leaves the step log.
-                let log = core.await.steps.open(std::path::Path::new(root)).await;
-                let _ = tokio::task::spawn_blocking(move || log.on_head_change()).await;
+                // A commit, a checkout, a reset: what equals HEAD now leaves the step log. Only an
+                // open log is told; one opened later applies the boundary itself, and a folder these
+                // tools never worked in (another plugin's worktree) gets no log.
+                if let Some(log) = core.await.steps.opened(std::path::Path::new(root)) {
+                    let _ = tokio::task::spawn_blocking(move || log.on_head_change()).await;
+                }
             } else if topic == frame_topics::SESSION_DELETED
                 && let Ok(deleted) = serde_json::from_value::<SessionDeleted>(data.clone())
             {
