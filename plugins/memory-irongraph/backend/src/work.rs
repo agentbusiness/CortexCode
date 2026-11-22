@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! (:Task {id, project_id, parent_id, title, brief, plan, status*, assignee, depends_on, touches,
-//!         result, session_id, effort, contract_hash, created_ms, updated_ms})
+//!         result, session_id, effort, worker, contract_hash, created_ms, updated_ms})
 //!     -[:IN]->(root)                  a task without a parent; a subtask hangs from its parent
 //! (:Task)-[:HAS_SUBTASK]->(:Task)   (:Task)-[:DEPENDS_ON]->(:Task)
 //! (:Task)-[:HAS_CHECK {position}]->(:ContractCheck {name, kind, spec, expect, position, task_id})
@@ -72,7 +72,7 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
-const TASK_COLS: &str = "t.id, t.project_id, t.parent_id, t.title, t.brief, t.plan, t.status, t.assignee, t.depends_on, t.touches, t.result, t.session_id, t.created_ms, t.updated_ms, t.contract_hash, t.contract_revisions, t.effort";
+const TASK_COLS: &str = "t.id, t.project_id, t.parent_id, t.title, t.brief, t.plan, t.status, t.assignee, t.depends_on, t.touches, t.result, t.session_id, t.created_ms, t.updated_ms, t.contract_hash, t.contract_revisions, t.effort, t.worker";
 
 /// How long the history of a temporal property is kept (as the graph API keeps it).
 const HISTORY_RETENTION: &str = "P3650D";
@@ -327,12 +327,12 @@ impl WorkStore {
         }
         self.run(
             &format!(
-                "{} CREATE (t:Task {{id: $id, name: $title, project_id: $project, parent_id: $parent, title: $title, brief: $brief, plan: $plan, assignee: $assignee, depends_on: $depends, touches: $touches, effort: $effort, created_ms: $now, updated_ms: $now, first_ms: $now, last_ms: $now}})",
+                "{} CREATE (t:Task {{id: $id, name: $title, project_id: $project, parent_id: $parent, title: $title, brief: $brief, plan: $plan, assignee: $assignee, depends_on: $depends, touches: $touches, effort: $effort, worker: $worker, created_ms: $now, updated_ms: $now, first_ms: $now, last_ms: $now}})",
                 layer::WORKSPACE_WRITE
             ),
             params! {
                 "id" => id, "project" => self.scope, "parent" => p.parent_id, "title" => p.title, "brief" => p.brief, "plan" => p.plan,
-                "assignee" => p.assignee, "depends" => p.depends_on, "touches" => p.touches, "effort" => p.effort, "now" => now
+                "assignee" => p.assignee, "depends" => p.depends_on, "touches" => p.touches, "effort" => p.effort, "worker" => p.worker, "now" => now
             },
         )
         .await?;
@@ -419,6 +419,7 @@ impl WorkStore {
             // kept it as JSON text, read here until the task's next revision rewrites it.
             contract_revisions: opt_s(row, 15).and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default(),
             effort: opt_s(row, 16).filter(|effort| !effort.is_empty()),
+            worker: opt_s(row, 17).filter(|worker| !worker.is_empty()),
         }
     }
 

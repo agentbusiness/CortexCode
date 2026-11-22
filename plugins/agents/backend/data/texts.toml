@@ -100,6 +100,8 @@ frontier_moved = "An earlier run worked on this task and its conversation is not
 frontier_queued = "Waiting for a free {worker} place on {computer} ({ahead} ahead)."
 frontier_failed = "The worker's run failed: {error}"
 frontier_cancelled = "The worker's run was stopped."
+# In the agent's journal when its CLI failed on one computer (the run goes on at the next that has it).
+frontier_failed_there = "{worker} failed on {computer}: {error}"
 frontier_no_report = "The worker ended without its report."
 # Said to the lead (its journal) and on the board.
 progress_waiting = "{agent} asks about \"{title}\": {question}\nAnswer it to {agent} (steer): the answer is its next message."
@@ -114,6 +116,11 @@ progress_planning = "{agent} plans \"{goal}\" (a frontier agent: it reads, chang
 progress_said = "{agent} on \"{title}\": {text}"
 # A frontier agent that will not do its task: a local agent takes it.
 board_declined = "{worker} declined \"{title}\" ({reason}); a local agent takes it."
+# A frontier CLI failed on every computer that has it, after part of the work: a local agent takes it.
+board_failed_over = "{worker} failed on \"{title}\" ({reason}); a local agent takes it from what is in the files."
+progress_failed_over = "{agent} ({worker}) failed on \"{title}\" on every computer that has it: {reason}\n{local} takes the task with the local model, from what is in the files."
+# A task its plan holds to the local model is asked to move to a frontier CLI.
+worker_pinned = "\"{title}\" stays with the local model: its plan holds it there (work that must not leave this computer, or that a hosted model would not do)."
 progress_declined = "{agent} ({worker}) declined \"{title}\": {reason}\n{local} takes the task with the local model and all of its tools."
 # An agent's task moved to another worker (the lead's `local`/`frontier`, agents.agent.worker).
 board_moved = "\"{title}\" moves from {from} to {to}: {agent} stopped, {new} takes it."

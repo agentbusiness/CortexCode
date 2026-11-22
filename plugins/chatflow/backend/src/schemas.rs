@@ -487,6 +487,11 @@ pub struct RouterDecision {
     /// task (`flow::direction`).
     #[serde(default)]
     pub direction: String,
+    /// no | yes: the work must stay on this computer (secrets, private data, security testing):
+    /// its plan is written by the local planner and every task of it goes to the local model,
+    /// never to a hosted one (`flow::private_work`).
+    #[serde(default)]
+    pub private: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -629,6 +634,9 @@ pub struct PlanTaskOutput {
     /// Skills the task's implementation reads (`skill://<plugin>/<name>`, from the catalog).
     #[serde(default)]
     pub skills: Vec<String>,
+    /// no | yes: the task stays with the local model ([`crate::plan::PlanTask::local`]).
+    #[serde(default)]
+    pub local: String,
 }
 
 /// A task of the version before that a rewritten plan leaves out, and why.

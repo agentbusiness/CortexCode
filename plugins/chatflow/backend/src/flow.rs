@@ -523,6 +523,7 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             teaches: String::new(),
                             drops: String::new(),
                             direction: String::new(),
+                            private: String::new(),
                         };
                         (fallback, format!("router failed: {error}"))
                     }
@@ -538,12 +539,13 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                 };
                 let teaches = decision.teaches == "yes";
                 let drops = decision.drops == "yes";
+                let private = decision.private == "yes";
                 // The asks are the user's latest message, never the conversation before it.
                 let unanchored = anchor_asks(&mut decision.asks, &message);
                 journal
                     .append(
                         kinds::ROUTE,
-                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "teaches": teaches, "drops": drops, "asks_dropped": unanchored}),
+                        json!({"route": route, "stage": "route", "detail": decision, "raw": raw, "run_id": env.run_id, "teaches": teaches, "drops": drops, "private": private, "asks_dropped": unanchored}),
                     )
                     .await
                     .map(|_| ())
@@ -2165,8 +2167,11 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
     let live = joined(&[direction_live, done_live, open_live, carry_live, asks, edit, parallel, crate::verifiers::candidates_text(&env.data, &candidates), skills_live(&env.data, &env.prefix, &catalog, &previous_skills)]);
     // A lead session's plan is written by a frontier planning agent (it reads the code, changes
     // nothing, and answers with this same plan); when none can, the local planner writes it.
+    // Work that must stay on this computer (ROUTE's `private`, or a plan whose tasks were all held
+    // to the local model) is not shown to a hosted planner: the local planner writes it.
+    let private = private_work(journal, &env.run_id) || previous.as_ref().is_some_and(|previous| !previous.tasks.is_empty() && previous.tasks.iter().all(|task| task.local));
     let mut planned: Option<PlanOutput> = None;
-    if env.lead {
+    if env.lead && !private {
         match frontier_plan(env, journal, &shape, &live).await {
             Ok(output) => planned = Some(output),
             Err(error) if error.code == codes::CANCELLED => return Err(error),
@@ -2184,7 +2189,11 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
             decide_json::<PlanOutput>(env, journal, stage, &shape, &live).await?.0
         }
     };
-    let (mut doc, tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
+    let (mut doc, mut tasks) = plan::from_output(&output, max, plan::Known { skills: &catalog, skills_max });
+    // Private work: every task of it stays with the local model.
+    if private {
+        tasks.iter_mut().for_each(|task| task.local = true);
+    }
     // A plan written again keeps what the work is for. The goal is the one the user's request
     // set; the approach and the architecture stay too unless a task ended badly (then the approach
     // is what changes). Only the user's own words (a steer) rewrite them: written again without
@@ -2469,7 +2478,9 @@ fn final_check_task(env: &RunEnv, journal: &Journal, made: &mut plan::Plan) {
             .collect();
         env.data.text("baseline_task_brief", &[("failures", &lines)])
     };
-    made.tasks.push(plan::PlanTask { n, title: fix_title, brief, checks: every_check, depends_on: ((kept as u32 + 1)..n).collect(), ..Default::default() });
+    // The fix task of a plan held to the local model stays there too.
+    let local = !made.tasks.is_empty() && made.tasks.iter().all(|task| task.local);
+    made.tasks.push(plan::PlanTask { n, title: fix_title, brief, checks: every_check, depends_on: ((kept as u32 + 1)..n).collect(), local, ..Default::default() });
 }
 
 /// The tasks earlier plans of this conversation made that are done now, each once: its title and
@@ -2628,6 +2639,15 @@ async fn implement(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Resul
     }
 }
 
+/// Whether the run's route said its work must stay on this computer (ROUTE's `private`).
+fn private_work(journal: &Journal, run_id: &str) -> bool {
+    journal
+        .entries()
+        .filter(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "stage") == "route" && str_field(&entry.data, "run_id") == run_id)
+        .last()
+        .is_some_and(|route| route.data.get("private").and_then(Value::as_bool) == Some(true))
+}
+
 /// The plan's tasks as memory tasks under a root task, made once: each is recorded on the plan
 /// entry as it is made, so a resumed run never makes a task twice. `last_checks` join the last
 /// task's contract (a foreground plan: the decision's own checks, verified when the work ends).
@@ -2749,6 +2769,7 @@ async fn materialize_plan_tasks(env: &RunEnv, journal: &mut Journal, plan_seq: u
                     "title": task.title,
                     "brief": if task.title == fix_title { format!("{direction}{}", plan::agent_brief(&env.data, current, &task)) } else { format!("{direction}{}{already_failing}{}", plan::agent_brief(&env.data, current, &task), missing_note(env, current, &task).await) },
                     "plan": "",
+                    "worker": task.local.then_some(cc_protocol::contracts::agents::workers::LOCAL),
                     "contract": contract::contract_from(&checks),
                     "depends_on": depends,
                     "touches": task.touches,

@@ -62,6 +62,11 @@ pub struct PlanTask {
     /// Skills the task chose for its implementation (only these reach its run).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// The task stays with the local model: work that must not leave this computer, or that a
+    /// hosted model would not do. Its memory task is made with `worker: local`, and the agents
+    /// plugin never gives it to a frontier CLI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
     /// The memory task made for it when implemented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -470,6 +475,7 @@ pub fn from_output(output: &PlanOutput, max_tasks: usize, known: Known) -> (Plan
             checks: clean(&task.checks),
             covers: Vec::new(),
             skills: crate::skillsel::chosen(&task.skills, known.skills, known.skills_max),
+            local: task.local == "yes",
             task_id: None,
         });
     }
@@ -528,6 +534,8 @@ pub fn user_edit(current: &Plan, edit: &PlanEditParams) -> Result<Plan, String> 
                 checks: clean(&task.checks),
                 covers: clean(&task.covers),
                 skills: clean(&task.skills),
+                // Not in the editor: kept from the task it was.
+                local: task.n.and_then(|n| current.tasks.iter().find(|before| before.n == n)).is_some_and(|before| before.local),
                 task_id: None,
             });
         }

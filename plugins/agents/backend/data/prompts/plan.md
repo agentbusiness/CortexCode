@@ -11,6 +11,7 @@ Split the goal into tasks for background agents that work at the same time, each
 5. `touches`: the files and symbols it changes.
 6. `depends_on`: the titles of the tasks that must be finished first.
 7. `effort`: how hard the task is to think through: none, low, medium, high or xhigh.
+8. `local`: yes when the task must stay with this computer's own model: it handles secrets, keys, passwords or people's private data, or it is security testing (attacking, exploiting, getting around a protection) that a hosted model would not do. no: every other task, most tasks.
 
 Split rules:
 - Only what the goal asks: never a task for work it does not ask for.

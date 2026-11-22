@@ -54,6 +54,8 @@ pub const WORKER_SETTING: &str = "agents.worker";
 const DETECT_FOR: Duration = Duration::from_secs(60);
 /// Longest a sign-in check may take.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a CLI that failed on a computer is left alone there before a run tries it again.
+const FAILED_FOR: Duration = Duration::from_secs(15 * 60);
 /// Longest a member may take to say which CLIs it lends.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(4);
 /// The event a waiting run's CLI stream carries here ([`Cli::next`]): the serving computer has no
@@ -103,6 +105,9 @@ pub struct RunEnd {
     pub error: Option<String>,
     /// A plan run's plan (its report, in the plan's schema), when it wrote one.
     pub report: Option<Value>,
+    /// The CLI failed on every computer that has it after doing part of the work: a new local
+    /// agent takes the task from what is in the files.
+    pub exhausted: bool,
     /// The run could not go on with the agent's earlier CLI session (its computer cannot take it
     /// now): that session is no longer the agent's, whether or not a new one was started.
     pub moved: bool,
@@ -153,6 +158,12 @@ pub struct Provider {
     rtt_ms: u32,
 }
 
+/// A CLI on one computer, as the key of what failed where (`node`: a member, or None for this
+/// computer).
+fn mark(worker: &str, node: &Option<String>) -> String {
+    format!("{worker}@{}", node.as_deref().unwrap_or_default())
+}
+
 /// The method and params that ask `method` of a run's computer: its frame directly here, through
 /// the mesh on a member.
 fn asked_at(node: &Option<String>, method: &str, params: Value) -> (String, Value) {
@@ -170,10 +181,10 @@ pub struct Frontier {
     pub lender: Lender,
     offered: Mutex<Offered>,
     detected: Mutex<Detected>,
-    /// Per worker: why its last run failed before doing any work (e.g. a CLI too old for its
-    /// model). Kept until the CLIs are looked at again fresh (the settings panel opening, a
-    /// choice) or one of its runs works.
-    failures: Mutex<HashMap<String, String>>,
+    /// Per CLI and computer ([`mark`]): why its last run there failed, and when. That computer's
+    /// CLI is left alone for [`FAILED_FOR`] (runs go to the next computer that has it), or until
+    /// the CLIs are looked at again fresh (the settings panel opening, a choice).
+    failures: Mutex<HashMap<String, (String, Instant)>>,
     live: Mutex<HashMap<AgentKey, mpsc::UnboundedSender<()>>>,
     /// Cancelled while the app's work is paused; a fresh one after Resume.
     pause: Mutex<CancellationToken>,
@@ -310,6 +321,13 @@ impl Frontier {
         found
     }
 
+    /// The CLIs that failed lately, by [`mark`], each with why (older marks are forgotten here).
+    fn failed(&self) -> HashMap<String, String> {
+        let mut failures = lock(&self.failures);
+        failures.retain(|_, (_, at)| at.elapsed() < FAILED_FOR);
+        failures.iter().map(|(mark, (why, _))| (mark.clone(), why.clone())).collect()
+    }
+
     /// This computer's own CLIs: each with its version and why it cannot work now (None: it can).
     pub async fn local(&self, fresh: bool) -> Vec<(String, Option<String>, Option<String>)> {
         let found = self.detect(fresh).await;
@@ -357,16 +375,17 @@ impl Frontier {
         offers
     }
 
-    /// The computer a run of `worker` goes to: `home` (the computer its CLI session lives on) when
-    /// that can still run it; else the best that can: one with a free place first, then this
+    /// The computer a run of `worker` goes to, never one where that CLI failed lately: `home` (the
+    /// computer its CLI session lives on) when that can still run it; else the best that can: one with a free place first, then this
     /// computer, then a member on the local network, then the nearest. None: nobody can run it now.
     pub async fn provider(&self, host: &Host, worker: &str, limit: u32, home: Option<&Option<String>>) -> Option<Provider> {
+        let failed = self.failed();
         let mut can = Vec::new();
-        if self.detect(false).await.get(worker).is_some_and(|found| found.path.is_some() && found.problem.is_none()) {
+        if !failed.contains_key(&mark(worker, &None)) && self.detect(false).await.get(worker).is_some_and(|found| found.path.is_some() && found.problem.is_none()) {
             can.push(Provider { node: None, computer: String::new(), free: self.lender.running() < limit.max(1), near: 0, rtt_ms: 0 });
         }
         for member in self.member_offers(host).await {
-            if member.offer.id == worker && member.offer.problem.is_none() {
+            if member.offer.id == worker && member.offer.problem.is_none() && !failed.contains_key(&mark(worker, &Some(member.node.clone()))) {
                 can.push(Provider {
                     node: Some(member.node),
                     computer: member.computer,
@@ -390,6 +409,7 @@ impl Frontier {
     pub async fn workers(&self, host: &Host, fresh: bool) -> WorkersResult {
         let found = self.detect(fresh).await;
         let lent_here = self.member_offers(host).await;
+        let failed = self.failed();
         let chosen = setting(host, WORKER_SETTING).await.filter(|worker| workers::ALL.contains(&worker.as_str())).unwrap_or_else(|| workers::LOCAL.to_owned());
         let mut list = vec![WorkerInfo { id: workers::LOCAL.to_owned(), label: "Local".to_owned(), installed: true, signed_in: true, ..WorkerInfo::default() }];
         for worker in [workers::CLAUDE, workers::OPENAI] {
@@ -397,17 +417,21 @@ impl Frontier {
             let Found { path, problem, version } = found.get(worker).cloned().unwrap_or(Found { problem: Some("it was not looked for".to_owned()), ..Found::default() });
             let model = setting(host, &format!("agents.{worker}.model")).await.unwrap_or_else(|| model.to_owned());
             let effort = setting(host, &format!("agents.{worker}.effort")).await.unwrap_or_else(|| effort.to_owned());
-            // Not able to work here: a member that lends it does the runs (the nearest first).
-            let mut members: Vec<&MemberOffer> = lent_here.iter().filter(|member| member.offer.id == worker && member.offer.problem.is_none()).collect();
+            // Not able to work here (not there, signed out, or its last run here failed): a member
+            // that lends it does the runs (the nearest first, never one where it failed lately).
+            let failed_here = failed.get(&mark(worker, &None)).cloned();
+            let here = path.is_some() && problem.is_none() && failed_here.is_none();
+            let mut members: Vec<&MemberOffer> = lent_here
+                .iter()
+                .filter(|member| member.offer.id == worker && member.offer.problem.is_none() && !failed.contains_key(&mark(worker, &Some(member.node.clone()))))
+                .collect();
             members.sort_by_key(|member| (!member.near, member.rtt_ms));
-            let member = if path.is_none() || problem.is_some() { members.first().copied() } else { None };
+            let member = if here { None } else { members.first().copied() };
             let (installed, signed_in, version, problem) = match member {
                 Some(member) => (true, true, member.offer.version.clone(), None),
-                None => (path.is_some(), path.is_some() && problem.is_none(), version, problem),
+                // A run that failed says what stops it (in the CLI's own words).
+                None => (path.is_some(), path.is_some() && problem.is_none(), version, problem.or_else(|| failed_here.map(|failure| format!("its last run failed: {failure}")))),
             };
-            // A run that could not start says what stops it (in the CLI's own words).
-            let failure = lock(&self.failures).get(worker).cloned();
-            let problem = problem.or_else(|| failure.map(|failure| format!("its last run could not start: {failure}")));
             list.push(WorkerInfo {
                 id: worker.to_owned(),
                 label: label.to_owned(),
@@ -488,9 +512,6 @@ impl Frontier {
         let Some(info) = listed.workers.iter().find(|info| info.id == worker).cloned() else {
             return Err(RpcError::invalid_params(format!("`{worker}` is not a frontier worker")));
         };
-        if let Some(problem) = &info.problem {
-            return Err(RpcError::new(codes::UNAVAILABLE, format!("{} cannot work now: {problem}", info.label)));
-        }
         let model = info.model.clone().unwrap_or_default();
         let effort = info.effort.clone().unwrap_or_default();
         let session_id = record.session_id.clone().ok_or_else(|| RpcError::internal(format!("agent {} has no session", record.name)))?;
@@ -502,24 +523,6 @@ impl Frontier {
             env.insert("CORTEX_MCP_LEAD".to_owned(), "1".to_owned());
         }
 
-        let journal = Journal::load(host.clone(), &session_id).await?;
-        // The computer the CLI runs on. Its own session lives where its last run was (the journal's
-        // last `running` status says): the run goes there again, and when that computer cannot
-        // take it, a new session starts on another from what is in the files.
-        let home: Option<Option<String>> = record.external_session.as_ref().and_then(|_| {
-            journal
-                .entries()
-                .filter(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "state") == "running" && str_field(&entry.data, "worker") == worker)
-                .last()
-                .map(|entry| Some(str_field(&entry.data, "node").to_owned()).filter(|node| !node.is_empty()))
-        });
-        let limit = data.scheduler.frontier_parallel;
-        let Some(provider) = self.provider(host, worker, limit, home.as_ref()).await else {
-            return Err(RpcError::new(codes::UNAVAILABLE, format!("no computer can run {} now", info.label)));
-        };
-        let stays = home.as_ref() == Some(&provider.node);
-        let external = record.external_session.clone().filter(|_| stays);
-        let moved = record.external_session.is_some() && !stays;
         // The role prompt. Codex is not shown an MCP server's own instructions, so the tools guide
         // goes into its prompt; Claude Code reads it from the server.
         let mut prompt = data.prompt(job.prompt()).to_owned();
@@ -532,49 +535,104 @@ impl Frontier {
         }
         let job_kind = if matches!(job, Job::Task(_)) { JobKind::Task } else { JobKind::Plan };
         let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
-        let (sender, nudges) = mpsc::unbounded_channel();
-        lock(&self.live).insert(key.clone(), sender);
-        let run = Run {
-            host: host.clone(),
-            data,
-            job,
-            root,
-            session_id: session_id.clone(),
-            run_id: format!("run-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
-            worker: worker.to_owned(),
-            node: provider.node.clone(),
-            computer: provider.computer.clone(),
-            moved,
-            prompt,
-            opened: 0,
-            model,
-            effort,
-            env,
-            cx: access.cx.clone(),
-            external,
-            nudges,
-            journal,
-            step: 0,
-            turns: 0,
-            tool_calls: 0,
-            usage: json!({}),
-            agent: record.name.clone(),
-            lead: host.session_get(&session_id).await.ok().and_then(|session| session.parent),
-            refusal: None,
-            // A plan is one step of its lead's turn: it is never paused on its own.
-            pause: if matches!(job_kind, JobKind::Task) { self.pause_token() } else { CancellationToken::new() },
-            in_flight: 0,
-        };
-        let outcome = run.go(cancel).await;
-        lock(&self.live).remove(&key);
-        if let Ok(end) = &outcome {
-            if end.start_failed {
-                lock(&self.failures).insert(worker.to_owned(), end.error.clone().unwrap_or_else(|| end.result.summary.clone()));
-            } else if matches!(end.result.outcome.as_str(), "done" | "waiting" | "blocked") {
-                lock(&self.failures).remove(worker);
+        let limit = data.scheduler.frontier_parallel;
+        // One try per computer that has the CLI. A try that fails, for whatever reason, marks the
+        // CLI as failing on that computer and the run goes on at the next one, in a new CLI session
+        // told the task again; with no computer left, the task is the local model's.
+        let mut tries = 0u32;
+        let mut worked = false;
+        let mut last: Option<RunEnd> = None;
+        loop {
+            let journal = Journal::load(host.clone(), &session_id).await?;
+            // The agent's CLI session lives where its last run was (the journal's last `running`
+            // status says): the first try goes there again when that computer can take it.
+            let home: Option<Option<String>> = record.external_session.as_ref().filter(|_| tries == 0).and_then(|_| {
+                journal
+                    .entries()
+                    .filter(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "state") == "running" && str_field(&entry.data, "worker") == worker)
+                    .last()
+                    .map(|entry| Some(str_field(&entry.data, "node").to_owned()).filter(|node| !node.is_empty()))
+            });
+            let Some(provider) = self.provider(host, worker, limit, home.as_ref()).await else {
+                // Nobody (left) can run it: the local model takes the task. With nothing done yet
+                // it goes on in this same run; after part of the work, a new local agent takes it.
+                let mut end = last.unwrap_or_else(|| {
+                    let why = match &info.problem {
+                        Some(problem) => format!("{} cannot work now: {problem}", info.label),
+                        None => format!("no computer can run {} now", info.label),
+                    };
+                    let summary = data.text("frontier_failed", &[("error", &why)]);
+                    RunEnd {
+                        result: AgentRunResult { outcome: "failed".to_owned(), summary: summary.clone(), turns: 0, tool_calls: 0, changed_files: Vec::new(), usage: json!({}) },
+                        external_session: None,
+                        question: None,
+                        start_failed: true,
+                        error: Some(summary),
+                        report: None,
+                        exhausted: false,
+                        moved: record.external_session.is_some(),
+                    }
+                });
+                end.start_failed = !worked;
+                end.exhausted = worked;
+                return Ok(end);
+            };
+            let stays = tries == 0 && home.as_ref() == Some(&provider.node);
+            let external = record.external_session.clone().filter(|_| stays);
+            let moved = tries > 0 || (record.external_session.is_some() && !stays);
+            let (sender, nudges) = mpsc::unbounded_channel();
+            lock(&self.live).insert(key.clone(), sender);
+            let run = Run {
+                host: host.clone(),
+                data,
+                job: job.clone(),
+                root,
+                session_id: session_id.clone(),
+                run_id: format!("run-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+                worker: worker.to_owned(),
+                node: provider.node.clone(),
+                computer: provider.computer.clone(),
+                moved,
+                prompt: prompt.clone(),
+                opened: 0,
+                model: model.clone(),
+                effort: effort.clone(),
+                env: env.clone(),
+                cx: access.cx.clone(),
+                external,
+                nudges,
+                journal,
+                step: 0,
+                turns: 0,
+                tool_calls: 0,
+                usage: json!({}),
+                agent: record.name.clone(),
+                lead: host.session_get(&session_id).await.ok().and_then(|session| session.parent),
+                refusal: None,
+                // A plan is one step of its lead's turn: it is never paused on its own.
+                pause: if matches!(job_kind, JobKind::Task) { self.pause_token() } else { CancellationToken::new() },
+                in_flight: 0,
+            };
+            let outcome = run.go(cancel).await;
+            lock(&self.live).remove(&key);
+            let end = outcome?;
+            if end.result.outcome != "failed" {
+                if matches!(end.result.outcome.as_str(), "done" | "waiting" | "blocked") {
+                    lock(&self.failures).remove(&mark(worker, &provider.node));
+                }
+                return Ok(end);
             }
+            // Failed there: that computer's CLI is left alone for now, and the agent's journal says
+            // where the run went wrong before the next try starts.
+            let why = end.error.clone().unwrap_or_else(|| end.result.summary.clone());
+            lock(&self.failures).insert(mark(worker, &provider.node), (why.clone(), Instant::now()));
+            let computer = if provider.computer.is_empty() { "this computer".to_owned() } else { provider.computer.clone() };
+            let text = data.text("frontier_failed_there", &[("worker", info.label.as_str()), ("computer", &computer), ("error", why.trim())]);
+            let _ = host.journal_append(&session_id, kinds::NOTE, json!({"text": text, "purpose": "frontier_failed_there", "host_message": false})).await;
+            worked = worked || end.result.tool_calls > 0;
+            tries += 1;
+            last = Some(end);
         }
-        outcome
     }
 }
 
@@ -586,6 +644,7 @@ enum JobKind {
 }
 
 /// What a frontier run is for.
+#[derive(Clone)]
 enum Job<'a> {
     /// An agent's task: it changes the project, and reports done, waiting or blocked.
     Task(&'a Task),
@@ -775,7 +834,7 @@ impl Run<'_> {
         // Failed with no tool call made: the CLI never got to the work (it did not start, or it
         // refused its model or its sign-in), so nothing of the task was done by it.
         let start_failed = result.outcome == "failed" && self.tool_calls == 0;
-        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error, report, moved: self.moved })
+        Ok(RunEnd { result, external_session: self.external.clone(), question, start_failed, error: raw_error, report, exhausted: false, moved: self.moved })
     }
 
     /// The run's first message: the task on its first run; else what waits for it (the lead's
@@ -1297,16 +1356,21 @@ impl Cli {
         }
     }
 
-    /// The CLI's next message (Claude Code takes it when its turn ended).
-    async fn say(&self, text: &str) -> Result<(), RpcError> {
+    /// The CLI's next message (Claude Code takes it when its turn ended). The call holds its own
+    /// host, not `&self`: a `Cli` (its call stream) is not `Sync`, and the future is sent.
+    fn say(&self, text: &str) -> impl std::future::Future<Output = Result<(), RpcError>> + Send + 'static {
+        let host = self.host.clone();
         let (method, params) = asked_at(&self.node, lent::SAY, json!({"run": self.run, "text": text}));
-        self.host.call(&method, params).await.map(|_| ())
+        async move { host.call(&method, params).await.map(|_| ()) }
     }
 
     /// No further message comes: the CLI ends.
-    async fn close(&self) {
+    fn close(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let host = self.host.clone();
         let (method, params) = asked_at(&self.node, lent::CLOSE, json!({"run": self.run}));
-        let _ = self.host.call(&method, params).await;
+        async move {
+            let _ = host.call(&method, params).await;
+        }
     }
 
     /// How the process ended, once its output is read to the end.

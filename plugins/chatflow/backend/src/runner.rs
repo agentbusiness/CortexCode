@@ -72,6 +72,7 @@ pub fn plan_of(put: &PlanPut) -> Result<Plan, String> {
             checks: clean(&task.checks),
             covers: Vec::new(),
             skills: Vec::new(),
+            local: false,
             task_id: None,
         });
     }

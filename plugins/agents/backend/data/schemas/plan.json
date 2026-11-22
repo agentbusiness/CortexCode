@@ -13,9 +13,10 @@
           "checks": {"type": "array", "items": {"enum": ["@verifiers"]}, "maxItems": 4},
           "touches": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 16},
           "depends_on": {"type": "array", "items": {"type": "string", "maxLength": 120}, "maxItems": 12},
-          "effort": {"enum": ["none", "low", "medium", "high", "xhigh"]}
+          "effort": {"enum": ["none", "low", "medium", "high", "xhigh"]},
+          "local": {"enum": ["no", "yes"]}
         },
-        "required": ["title", "brief", "plan", "checks", "touches", "depends_on", "effort"],
+        "required": ["title", "brief", "plan", "checks", "touches", "depends_on", "effort", "local"],
         "additionalProperties": false
       }
     }

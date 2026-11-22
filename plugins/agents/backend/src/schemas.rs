@@ -266,6 +266,9 @@ pub struct PlannedTask {
     pub depends_on: Vec<String>,
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// no | yes: the task stays with the local model (its memory task gets `worker: local`).
+    #[serde(default)]
+    pub local: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

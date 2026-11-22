@@ -878,6 +878,10 @@ pub struct Task {
     /// kept as the task's property; absent when the planner gave none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The worker the plan holds the task to: `local` (the local model only: work that must not
+    /// leave the person's computers, or that a hosted model would not do). Absent: any worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -900,6 +904,9 @@ pub struct TaskCreateParams {
     /// The planner's effort for the task, stored as `Task.effort`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The worker the plan holds the task to (`local`), stored as `Task.worker`; absent: any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

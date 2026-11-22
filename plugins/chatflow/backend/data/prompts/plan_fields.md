@@ -26,6 +26,7 @@ Fill the plan's fields in this order:
 - `touches`: the files or symbols it changes, as far as the conversation shows them; empty for a task that only runs something.
 - `checks`: the listed check commands that test this task; none when none does.
 - `skills`: skills from the Skills list whose summary names this task's work; usually none.
+- `local`: yes when the task must stay with this computer's own model: it handles secrets, keys, passwords or people's private data, or it is security testing (attacking, exploiting, getting around a protection) that a hosted model would not do. no: every other task, most tasks.
 8. `replaces`: the listed open background work this plan takes the place of. It stops when the plan starts; what it changed stays in the files, so a task can build on it. Leave out work that goes on next to this plan.
 9. `note`: one short sentence for the user, naming what more should be done that the user did not ask for.
 

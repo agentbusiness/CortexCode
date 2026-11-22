@@ -626,6 +626,7 @@ impl Agents {
                         "depends_on": depends,
                         "touches": planned.touches,
                         "effort": schemas::effort_or_default(&planned.effort, &data.effort.default),
+                        "worker": (planned.local == "yes").then_some(workers::LOCAL),
                     }),
                 )
                 .await?;
@@ -737,7 +738,9 @@ impl Agents {
             .await?;
         // Who does its work: the worker that can work now (a frontier CLI when chosen and signed
         // in, else the local model's agent loop).
+        // A task its plan holds to the local model stays there, whoever asks.
         let worker = match params.worker.clone().filter(|worker| workers::ALL.contains(&worker.as_str())) {
+            _ if task.worker.as_deref() == Some(workers::LOCAL) => workers::LOCAL.to_owned(),
             Some(worker) => worker,
             None => self.inner.frontier.workers(&host, false).await.active,
         };
@@ -1211,7 +1214,7 @@ impl Agents {
                 // It never got to the work (e.g. a CLI too old for its model): the local model
                 // takes the task now, in the same run, and the lead is told why.
                 let label = crate::frontier::label(&record.worker);
-                let reason = format!("{label} could not start: {}", ended.error.clone().unwrap_or_else(|| ended.result.summary.clone()));
+                let reason = format!("{label} could not do it: {}", ended.error.clone().unwrap_or_else(|| ended.result.summary.clone()));
                 record.worker = workers::LOCAL.to_owned();
                 record.external_session = None;
                 record = upsert(&ctx, &host, record).await?;
@@ -1220,10 +1223,15 @@ impl Agents {
                 let text = data.text("progress_worker_fallback", &[("agent", &record.name), ("title", &current.title), ("reason", &reason)]);
                 let lead = lead_session(&host, &record).await;
                 progress_note(&host, lead.as_deref(), &text, &record, true).await;
+            } else if ended.exhausted {
+                // The CLI failed on every computer that has it, after part of the work: a new local
+                // agent takes the task from what is in the files, in a session of its own.
+                let reason = ended.error.clone().unwrap_or_else(|| ended.result.summary.clone());
+                return self.to_local(&ctx, &host, record, &current, reason, "board_failed_over", "progress_failed_over").await;
             } else if ended.result.outcome == "declined" {
                 // The frontier model will not do this task: a local agent takes it, in a session of
                 // its own (the refusal is not in front of it), with the local model's full tools.
-                return self.declined(&ctx, &host, record, &current, ended.result.summary).await;
+                return self.to_local(&ctx, &host, record, &current, ended.result.summary, "board_declined", "progress_declined").await;
             } else {
                 // The CLI's own session: the one this run said, or none when the earlier one was
                 // left behind on a computer that cannot take the agent's runs now.
@@ -1727,14 +1735,16 @@ impl Agents {
     /// A frontier agent declined its task (it said so, or its model refused): it stops, and a new
     /// local agent takes the same task, under the same lead, in a session of its own, with the
     /// local model's agent loop and all of its tools. The lead and the board are told why.
-    async fn declined(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, reason: String) -> Result<(), RpcError> {
+    /// The same hand-over serves a CLI that failed on every computer that has it (`board`,
+    /// `progress`: the texts that say which).
+    async fn to_local(&self, ctx: &Ctx, host: &Host, mut record: AgentRecord, current: &Task, reason: String, board_text: &str, progress_text: &str) -> Result<(), RpcError> {
         let label = crate::frontier::label(&record.worker);
         let lead = lead_session(host, &record).await;
         let reason = if reason.trim().is_empty() { "it gave no reason".to_owned() } else { reason.trim().to_owned() };
         record.status = "stopped".into();
         let record = upsert(ctx, host, record).await?;
         let data = self.inner.data.get();
-        board(host, &record.project_id, "status", &record.name, &data.text("board_declined", &[("title", &current.title), ("worker", label), ("reason", &reason)]), std::slice::from_ref(&current.id)).await;
+        board(host, &record.project_id, "status", &record.name, &data.text(board_text, &[("title", &current.title), ("worker", label), ("reason", &reason)]), std::slice::from_ref(&current.id)).await;
         let local = self
             .spawn(ctx.clone(), SpawnParams {
                 project_id: record.project_id.clone(),
@@ -1747,7 +1757,7 @@ impl Agents {
                 worker: Some(workers::LOCAL.to_owned()),
             })
             .await?;
-        let text = data.text("progress_declined", &[("agent", &record.name), ("worker", label), ("title", &current.title), ("reason", &reason), ("local", &local.name)]);
+        let text = data.text(progress_text, &[("agent", &record.name), ("worker", label), ("title", &current.title), ("reason", &reason), ("local", &local.name)]);
         progress_note(host, lead.as_deref(), &text, &record, true).await;
         Ok(())
     }
@@ -1765,6 +1775,10 @@ impl Agents {
         let current = task(&host, &task_id).await?;
         if record.status == "done" || finished(&current.status) {
             return Err(RpcError::invalid_params(format!("{} finished \"{}\"; nothing is left to move", record.name, current.title)));
+        }
+        // A task its plan holds to the local model does not move to a frontier CLI.
+        if params.worker.trim() != workers::LOCAL && current.worker.as_deref() == Some(workers::LOCAL) {
+            return Err(RpcError::invalid_params(self.inner.data.get().text("worker_pinned", &[("title", &current.title)])));
         }
         let target = self.worker_for(&host, params.worker.trim()).await?;
         if target == record.worker {
