@@ -131,6 +131,8 @@ pub struct Mesh {
     pub services: crate::services::Services,
     /// Members may use this computer's model (`mesh.lend`).
     lend: AtomicBool,
+    /// A model here said its load changed, or the 15 s round came: the next card reads the load.
+    load_changed: AtomicBool,
     /// The members switched off (`mesh.allow`); every other member may work on this computer.
     refused: Mutex<Vec<String>>,
     /// The app's store (`crate::store`) and the queue of its ordered writer.
@@ -194,6 +196,7 @@ impl Mesh {
             local: Mutex::new(HashMap::new()),
             services: crate::services::Services::default(),
             lend: AtomicBool::new(true),
+            load_changed: AtomicBool::new(false),
             refused: Mutex::new(Vec::new()),
             store: OnceLock::new(),
             loaded: tokio::sync::watch::channel(false).0,
@@ -619,6 +622,12 @@ impl Mesh {
         *lock(&self.my_card) = None;
     }
 
+    /// A model here reported a request queued, started or done (`model.progress`), or the 15 s
+    /// round came: the next card reads its models' load again.
+    pub fn load_changed(&self) {
+        self.load_changed.store(true, Ordering::SeqCst);
+    }
+
     /// Whether a member may work on this computer (`mesh.allow`).
     pub fn may_work(&self, node: &str) -> bool {
         !lock(&self.refused).iter().any(|refused| refused == node)
@@ -642,9 +651,11 @@ impl Mesh {
         if let Some(mut card) = cached
             && now_ms().saturating_sub(card.updated_ms) < CARD_TTL_MS
         {
-            // The slow parts are reused; the model's load is what placement decides on, so it is
-            // read live every time.
-            if let Some(ctx) = self.ctx.get() {
+            // The slow parts are reused; the model's load is read again only after a model said it
+            // changed or the 15 s round came (`load_changed`), never on every 3 s push.
+            if self.load_changed.swap(false, Ordering::SeqCst)
+                && let Some(ctx) = self.ctx.get()
+            {
                 for model in &mut card.models {
                     crate::card::refresh_load(ctx, model).await;
                 }
@@ -656,7 +667,7 @@ impl Mesh {
             return card;
         }
         let card = match self.ctx.get() {
-            Some(ctx) => crate::card::build(ctx, &self.me.hex(), &self.name(), &self.home).await,
+            Some(ctx) => crate::card::build(ctx, &self.me.hex(), &self.name()).await,
             None => Card { node: self.me.hex(), name: self.name(), software: crate::SOFTWARE.to_owned(), sharing_priority: Some(crate::SHARING_PRIORITY), version: env!("CARGO_PKG_VERSION").to_owned(), updated_ms: now_ms(), ..Card::default() },
         };
         let mut card = card;

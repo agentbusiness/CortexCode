@@ -138,9 +138,6 @@ pub struct Card {
     pub cpu_cores: u32,
     pub gpu_cores: u32,
     pub os_version: String,
-    /// Free bytes on the home folder's volume.
-    #[serde(default)]
-    pub free_disk_bytes: u64,
     #[serde(default)]
     pub free_memory_bytes: u64,
     #[serde(default)]

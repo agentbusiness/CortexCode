@@ -1,7 +1,8 @@
 /**
- * pane.board@1 — the project's work: the task tree with contracts (`memory.task.list`), the named
- * agents with their state and controls (`agents.*`), and the project board where agents and the
- * person leave messages (`memory.board.*`).
+ * pane.board@1 — the project's work: each delegated goal with its steps, grouped by what needs the
+ * person, what is in progress and what is done (`memory.task.list`); the named agents with their
+ * state and controls (`agents.*`); and the project board where agents and the person leave
+ * messages (`memory.board.*`).
  */
 
 import { useState, type CSSProperties } from 'react';
@@ -27,8 +28,52 @@ import { TaskText } from './TaskText';
 
 type View = 'tasks' | 'agents' | 'board';
 
-/** Arrange tasks under their parents; tasks whose parent is not listed are roots. */
-export function taskTree(tasks: readonly Task[]): Array<{ task: Task; depth: number }> {
+/**
+ * A goal is a task with no listed parent: what the conversation delegated. Its steps are its
+ * descendants, in the order they were made; its leaves (steps with no steps of their own) are the
+ * work, and the goal's state is read from them, since the goal itself stays pending until they end.
+ */
+type GoalState = 'attention' | 'working' | 'waiting' | 'done' | 'cancelled';
+
+interface Goal {
+  goal: Task;
+  steps: Array<{ task: Task; depth: number }>;
+  leaves: Task[];
+  state: GoalState;
+}
+
+const GOAL_LABEL: Record<GoalState, string> = {
+  attention: 'needs you',
+  working: 'working',
+  waiting: 'not started',
+  done: 'done',
+  cancelled: 'cancelled',
+};
+
+/** What needs the person first, then what runs, then what waits. */
+const GOAL_RANK: Record<GoalState, number> = { attention: 0, working: 1, waiting: 2, done: 3, cancelled: 4 };
+
+const STEP_LABEL: Record<string, string> = {
+  pending: 'to do',
+  blocked: 'waits for a step',
+  in_progress: 'working',
+  verifying: 'checking',
+  done: 'done',
+  failed: 'failed',
+  indeterminate: 'unclear',
+  cancelled: 'cancelled',
+};
+
+function goalState(goal: Task, leaves: readonly Task[]): GoalState {
+  if (goal.status === 'cancelled') return 'cancelled';
+  const live = leaves.filter((task) => task.status !== 'cancelled');
+  if (live.some((task) => task.status === 'failed' || task.status === 'indeterminate')) return 'attention';
+  if (live.some((task) => task.status === 'in_progress' || task.status === 'verifying')) return 'working';
+  if (live.some((task) => task.status === 'pending')) return 'waiting';
+  return live.length > 0 || goal.status === 'done' ? 'done' : 'cancelled';
+}
+
+export function goalsOf(tasks: readonly Task[]): Goal[] {
   const ids = new Set(tasks.map((task) => task.id));
   const children = new Map<string, Task[]>();
   const roots: Task[] = [];
@@ -41,18 +86,39 @@ export function taskTree(tasks: readonly Task[]): Array<{ task: Task; depth: num
       roots.push(task);
     }
   }
-  const out: Array<{ task: Task; depth: number }> = [];
+  for (const list of children.values()) list.sort((a, b) => a.created_ms - b.created_ms);
   const seen = new Set<string>();
-  const walk = (task: Task, depth: number) => {
-    if (seen.has(task.id)) return;
-    seen.add(task.id);
-    out.push({ task, depth });
-    for (const child of (children.get(task.id) ?? []).sort((a, b) => a.created_ms - b.created_ms)) walk(child, depth + 1);
+  const build = (goal: Task): Goal => {
+    seen.add(goal.id);
+    const steps: Goal['steps'] = [];
+    const leaves: Task[] = [];
+    const walk = (task: Task, depth: number) => {
+      for (const child of children.get(task.id) ?? []) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        steps.push({ task: child, depth });
+        if (children.has(child.id)) walk(child, depth + 1);
+        else leaves.push(child);
+      }
+    };
+    walk(goal, 0);
+    const work = leaves.length > 0 ? leaves : [goal];
+    return { goal, steps, leaves: work, state: goalState(goal, work) };
   };
-  for (const root of roots.sort((a, b) => b.created_ms - a.created_ms)) walk(root, 0);
-  // Tasks whose parents form a cycle have no root to hang from: they are listed on their own.
-  for (const task of tasks) if (!seen.has(task.id)) walk(task, 0);
+  const out = roots.map(build);
+  // Tasks whose parents form a cycle have no root to hang from: each is a goal of its own.
+  for (const task of tasks) if (!seen.has(task.id)) out.push(build(task));
   return out;
+}
+
+function stepState(task: Task, byId: ReadonlyMap<string, Task>): string {
+  const waiting = (task.depends_on ?? []).some((id) => byId.get(id)?.status !== 'done');
+  return task.status === 'pending' && waiting ? 'blocked' : task.status;
+}
+
+/** The goal's latest change: its own or any step's. */
+function lastChange({ goal, steps }: Goal): number {
+  return Math.max(goal.updated_ms, ...steps.map(({ task }) => task.updated_ms));
 }
 
 function Board() {
@@ -89,14 +155,20 @@ function Scheduler() {
   const { running, queued, max_parallel } = scheduler.data;
   return (
     <span className="cx-board-scheduler" title={`running: ${running.join(', ') || 'none'}\nqueued: ${queued.join(', ') || 'none'}`}>
-      {max_parallel > 0 ? `${running.length} / ${max_parallel} slots busy` : 'No agent slots'}{queued.length ? ` · ${queued.length} queued` : ''}
+      {max_parallel > 0 ? `${running.length} of ${max_parallel} agents running` : 'No agents can run'}{queued.length ? ` · ${queued.length} queued` : ''}
     </span>
   );
 }
 
+/**
+ * The tasks view answers, in this order: what needs me, what is being done and how far along it is,
+ * and what is finished. One block per goal; open goals show their steps, finished goals fold to one
+ * line, cancelled goals stay out of the way until asked for.
+ */
 function Tasks({ projectId }: { projectId: string }) {
   const [focus, setFocus] = useShared<string | null>('board.focus', null);
   const [openIds, setOpenIds] = useSlotState<string[]>(`openTasks:${projectId}`, []);
+  const [showCancelled, setShowCancelled] = useState(false);
   const tasks = useQuery<Task[]>(
     `memory.task.list:${projectId}`,
     async (c) => (await c.call<{ tasks: Task[] }>('memory.task.list', { project_id: projectId }))?.tasks ?? [],
@@ -104,104 +176,175 @@ function Tasks({ projectId }: { projectId: string }) {
   );
   if (tasks.error && !tasks.data) return <ServiceProblem service="memory" state={tasks} className="inline-error" />;
   if (!tasks.data) return <p className="empty-line">Reading tasks…</p>;
-  if (tasks.data.length === 0) return <p className="empty-line">No tasks yet. Larger goals become task trees when the conversation delegates them.</p>;
-  const rows = taskTree(tasks.data);
+  if (tasks.data.length === 0) return <p className="empty-line">No tasks yet. Larger goals become steps for agents when the conversation delegates them.</p>;
   const byId = new Map(tasks.data.map((task) => [task.id, task]));
-  const children = new Map<string, number>();
-  for (const task of tasks.data) {
-    if (task.parent_id && byId.has(task.parent_id)) children.set(task.parent_id, (children.get(task.parent_id) ?? 0) + 1);
-  }
-  const work = tasks.data.filter((task) => !children.has(task.id));
-  const done = work.filter((task) => task.status === 'done').length;
-  const active = work.filter((task) => task.status === 'in_progress' || task.status === 'verifying').length;
-  const hasOpen = rows.some(({ task }) => openIds.includes(task.id) || focus === task.id);
+  const goals = goalsOf(tasks.data);
+  const focused = focus ? goals.find(({ goal, steps }) => goal.id === focus || steps.some(({ task }) => task.id === focus)) : undefined;
+  const isOpen = (id: string) => openIds.includes(id) || focus === id;
+  const toggle = (id: string) => {
+    if (focus === id) setFocus(null);
+    setOpenIds((list) => (isOpen(id) ? list.filter((entry) => entry !== id) : [...list, id]));
+  };
+  const newest = (a: Goal, b: Goal) => lastChange(b) - lastChange(a);
+  const current = goals
+    .filter(({ state }) => state !== 'done' && state !== 'cancelled')
+    .sort((a, b) => GOAL_RANK[a.state] - GOAL_RANK[b.state] || newest(a, b));
+  const finished = goals.filter(({ state }) => state === 'done').sort(newest);
+  const cancelled = goals.filter(({ state }) => state === 'cancelled').sort(newest);
+  const attention = current.filter(({ state }) => state === 'attention').length;
+  const cancelledShown = showCancelled || focused?.state === 'cancelled';
+  const props = { byId, focus, isOpen, toggle };
+  const folded = (entry: Goal) => !isOpen(entry.goal.id) && focused !== entry;
   return (
-    <>
-    <div className="cx-tasks-toolbar">
-      <p className="cx-tasks-summary">{done} of {work.length} tasks done{active > 0 && <span> · {active} active</span>}</p>
-      <div className="cx-tasks-actions">
-        <button className="detent" type="button" onClick={() => setOpenIds(rows.map(({ task }) => task.id))}>Expand all</button>
-        <button className="detent" type="button" disabled={!hasOpen} onClick={() => { setFocus(null); setOpenIds([]); }}>Collapse all</button>
-      </div>
+    <div className="cx-goals">
+      <p className="cx-goals-summary">
+        {current.length === 0 ? 'Nothing in progress' : `${current.length} goal${current.length === 1 ? '' : 's'} in progress`}
+        {attention > 0 && <span className="cx-goals-attention"> · {attention} need{attention === 1 ? 's' : ''} you</span>}
+        <span> · {finished.length} done</span>
+      </p>
+      {current.length > 0 && (
+        <section aria-label="In progress">
+          {current.map((entry) => <GoalBlock key={entry.goal.id} {...props} entry={entry} folded={false} />)}
+        </section>
+      )}
+      {finished.length > 0 && (
+        <section aria-label="Done">
+          <h3 className="cx-goals-head">Done</h3>
+          {finished.map((entry) => <GoalBlock key={entry.goal.id} {...props} entry={entry} folded={folded(entry)} />)}
+        </section>
+      )}
+      {cancelled.length > 0 && (
+        <section aria-label="Cancelled">
+          <button className="cx-goals-more" type="button" aria-expanded={cancelledShown} onClick={() => setShowCancelled(!cancelledShown)}>
+            {cancelledShown ? 'Hide' : 'Show'} {cancelled.length} cancelled goal{cancelled.length === 1 ? '' : 's'}
+          </button>
+          {cancelledShown && cancelled.map((entry) => <GoalBlock key={entry.goal.id} {...props} entry={entry} folded={folded(entry)} />)}
+        </section>
+      )}
     </div>
-    <ul className="cx-tasks" aria-label="Project tasks">
-      {rows.map(({ task, depth }) => {
-        const open = openIds.includes(task.id) || focus === task.id;
-        const childCount = children.get(task.id) ?? 0;
-        const waitingFor = (task.depends_on ?? []).filter((id) => byId.get(id)?.status !== 'done');
-        const state = task.status === 'pending' && waitingFor.length > 0 ? 'blocked' : task.status;
-        const panelId = `cx-task-${task.id}`;
-        return (
-          <li key={task.id} className="cx-task-row" data-task={task.id} data-status={state} data-selected={focus === task.id}
-            style={{ '--task-indent': `${Math.min(depth, 3) * 12}px` } as CSSProperties}>
-            <button className="cx-task-toggle" type="button" aria-expanded={open} aria-controls={panelId}
-              onClick={() => {
-                if (focus === task.id) setFocus(null);
-                setOpenIds((list) => open ? list.filter((id) => id !== task.id) : [...list, task.id]);
-              }}>
-              <svg className="cx-task-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m6 4 4 4-4 4" stroke="currentColor" strokeWidth="1.5" /></svg>
-              <span className="cx-task-heading">
-                <span className="cx-task-title">{task.title}</span>
-                <span className="cx-task-meta">
-                  {task.assignee && <span className="cx-task-assignee">@{task.assignee}</span>}
-                  {childCount > 0 && <span>{childCount} subtask{childCount === 1 ? '' : 's'}</span>}
-                  {(task.contract?.checks.length ?? 0) > 0 && <span>{task.contract!.checks.length} check{task.contract!.checks.length === 1 ? '' : 's'}</span>}
-                  <span>Updated {ago(task.updated_ms)}</span>
-                </span>
-              </span>
-              <span className="cx-task-status"><i aria-hidden="true" />{state.replace(/_/g, ' ')}</span>
-            </button>
-            {open && (
-              <div id={panelId} className="cx-task-open">
-                {task.result && (
-                  <details className="cx-task-section" open>
-                    <summary>Result</summary>
-                    <TaskText text={task.result} />
-                  </details>
-                )}
-                {task.brief && (
-                  <details className="cx-task-section">
-                    <summary>Task brief</summary>
-                    <TaskText text={task.brief} />
-                  </details>
-                )}
-                {task.plan && (
-                  <details className="cx-task-section">
-                    <summary>Plan</summary>
-                    <TaskText text={task.plan} />
-                  </details>
-                )}
-                {(task.contract?.checks.length ?? 0) > 0 && (
-                  <details className="cx-task-section">
-                    <summary>Checks <span>{task.contract!.checks.length}</span></summary>
-                    <ul className="cx-contract">
-                      {task.contract!.checks.map((check, index) => (
-                        <li key={`${check.name}:${index}`}>
-                          <span className="cx-check-name">{check.name}</span>
-                          <span className="cx-check-kind">{check.kind}</span>
-                          <TaskText text={check.spec} />
-                          {check.expect && <div className="cx-check-expect"><span>Expected</span><TaskText text={check.expect} /></div>}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
-                {(task.depends_on?.length ?? 0) > 0 && (
-                  <details className="cx-task-section">
-                    <summary>Dependencies <span>{task.depends_on!.length}</span></summary>
-                    <ul className="cx-task-dependencies">
-                      {task.depends_on!.map((id) => <li key={id}>{byId.get(id)?.title ?? id}<span>{byId.get(id)?.status.replace(/_/g, ' ') ?? 'Unavailable'}</span></li>)}
-                    </ul>
-                  </details>
-                )}
-                {!task.brief && !task.plan && !task.result && !task.contract?.checks.length && !task.depends_on?.length && <p className="cx-task-no-details">No details yet.</p>}
-              </div>
-            )}
-          </li>
-        );
-      })}
-    </ul>
-    </>
+  );
+}
+
+interface GoalProps {
+  entry: Goal;
+  folded: boolean;
+  byId: ReadonlyMap<string, Task>;
+  focus: string | null;
+  isOpen: (id: string) => boolean;
+  toggle: (id: string) => void;
+}
+
+/**
+ * One goal: its title, its state and how many of its steps are done; under it the steps, one line
+ * each. A folded goal is the head alone. The goal's own brief and result open from its head.
+ */
+function GoalBlock({ entry, folded, byId, focus, isOpen, toggle }: GoalProps) {
+  const [showCancelledSteps, setShowCancelledSteps] = useState(false);
+  const { goal, steps, leaves, state } = entry;
+  const live = leaves.filter((task) => task.status !== 'cancelled');
+  const done = live.filter((task) => task.status === 'done').length;
+  const hidden = steps.filter(({ task }) => task.status === 'cancelled' && task.id !== focus).length;
+  const shown = steps.filter(({ task }) => showCancelledSteps || task.status !== 'cancelled' || task.id === focus);
+  const detailsOpen = isOpen(goal.id) && !folded;
+  return (
+    <article className="cx-goal" data-task={goal.id} data-state={state} data-folded={folded} data-selected={focus === goal.id}>
+      <button className="cx-goal-head" type="button" aria-expanded={detailsOpen} onClick={() => toggle(goal.id)}>
+        <span className="cx-goal-title" data-full={detailsOpen}>{goal.title}</span>
+        <span className="cx-goal-state"><i aria-hidden="true" />{GOAL_LABEL[state]}</span>
+        <span className="cx-goal-meta">
+          {steps.length > 0 && <span>{done} of {live.length} step{live.length === 1 ? '' : 's'} done</span>}
+          <span>Updated {ago(lastChange(entry))}</span>
+        </span>
+        {!folded && steps.length > 0 && live.length > 0 && (
+          <span className="cx-goal-bar" aria-hidden="true"><span style={{ width: `${(done / live.length) * 100}%` }} /></span>
+        )}
+      </button>
+      {detailsOpen && <TaskDetails task={goal} byId={byId} />}
+      {!folded && shown.length > 0 && (
+        <ol className="cx-steps" aria-label="Steps">
+          {shown.map(({ task, depth }) => {
+            const open = isOpen(task.id);
+            const step = stepState(task, byId);
+            const panelId = `cx-task-${task.id}`;
+            return (
+              <li key={task.id} className="cx-step" data-task={task.id} data-status={step} data-selected={focus === task.id}
+                style={{ '--step-indent': `${Math.min(depth, 2) * 20}px` } as CSSProperties}>
+                <button className="cx-step-row" type="button" aria-expanded={open} aria-controls={panelId} onClick={() => toggle(task.id)}>
+                  <i className="cx-step-mark" aria-hidden="true" />
+                  <span className="cx-step-title">{task.title}</span>
+                  <span className="cx-step-who">{task.assignee ? `@${task.assignee}` : ''}</span>
+                  <span className="cx-step-state">{STEP_LABEL[step] ?? step.replace(/_/g, ' ')}</span>
+                  <span className="cx-step-ago">{ago(task.updated_ms)}</span>
+                </button>
+                {open && <div id={panelId}><TaskDetails task={task} byId={byId} /></div>}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {!folded && hidden > 0 && (
+        <button className="cx-goals-more cx-steps-more" type="button" onClick={() => setShowCancelledSteps((value) => !value)}>
+          {showCancelledSteps ? 'Hide' : 'Show'} {hidden} cancelled step{hidden === 1 ? '' : 's'}
+        </button>
+      )}
+    </article>
+  );
+}
+
+/** What a task says about itself: what came out first, then what was asked, how, and how it is checked. */
+function TaskDetails({ task, byId }: { task: Task; byId: ReadonlyMap<string, Task> }) {
+  const checks = task.contract?.checks ?? [];
+  const deps = task.depends_on ?? [];
+  if (!task.brief && !task.plan && !task.result && checks.length === 0 && deps.length === 0) {
+    return <div className="cx-task-open"><p className="cx-task-no-details">No details yet.</p></div>;
+  }
+  return (
+    <div className="cx-task-open">
+      {task.result && (
+        <details className="cx-task-section" open>
+          <summary>Result</summary>
+          <TaskText text={task.result} />
+        </details>
+      )}
+      {task.brief && (
+        <details className="cx-task-section" open={!task.result}>
+          <summary>What was asked</summary>
+          <TaskText text={task.brief} />
+        </details>
+      )}
+      {task.plan && (
+        <details className="cx-task-section">
+          <summary>Plan</summary>
+          <TaskText text={task.plan} />
+        </details>
+      )}
+      {checks.length > 0 && (
+        <details className="cx-task-section">
+          <summary>Checks <span>{checks.length}</span></summary>
+          <ul className="cx-contract">
+            {checks.map((check, index) => (
+              <li key={`${check.name}:${index}`}>
+                <span className="cx-check-name">{check.name}</span>
+                <span className="cx-check-kind">{check.kind}</span>
+                <TaskText text={check.spec} />
+                {check.expect && <div className="cx-check-expect"><span>Expected</span><TaskText text={check.expect} /></div>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {deps.length > 0 && (
+        <details className="cx-task-section">
+          <summary>Waits for <span>{deps.length}</span></summary>
+          <ul className="cx-task-dependencies">
+            {deps.map((id) => {
+              const dep = byId.get(id);
+              return <li key={id}>{dep?.title ?? id}<span>{dep ? STEP_LABEL[dep.status] ?? dep.status : 'unavailable'}</span></li>;
+            })}
+          </ul>
+        </details>
+      )}
+    </div>
   );
 }
 

@@ -1,11 +1,11 @@
-//! The contract methods this process serves, summed per five-minute bucket
-//! ([`SUMMARY_MS`](cc_protocol::contracts::reports::SUMMARY_MS)): how many, how long, how they
+//! The contract methods this process serves, summed per hour
+//! ([`ROW_BUCKET_MS`](cc_protocol::contracts::reports::ROW_BUCKET_MS)): how many, how long, how they
 //! ended, and for a model's answer its tokens (`usage` of the model contract's result). The kit's
 //! own hand-over (`stats.record`) is not counted: it would only measure the measuring.
 
-use crate::{bucket_of, now_ms, recorder};
+use crate::{now_ms, recorder, row_bucket_of};
 use cc_protocol::RpcError;
-use cc_protocol::contracts::reports::{SUMMARY_MS, methods};
+use cc_protocol::contracts::reports::{ROW_BUCKET_MS, methods};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use std::time::Duration;
 /// Groups held between two hand-overs; a call past this many is not counted.
 const MAX_GROUPS: usize = 4096;
 
-/// One method with one outcome within one five-minute bucket.
+/// One method with one outcome within one hour.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CallRecord {
     pub schema_version: u32,
@@ -67,7 +67,7 @@ pub fn observe(method: &str, took: Duration, outcome: &Result<Value, RpcError>) 
         Err(error) => (error.code.to_string(), 0, 0, 0),
     };
     let Ok(mut table) = groups().lock() else { return };
-    let key = (bucket_of(now), method.to_owned(), code);
+    let key = (row_bucket_of(now), method.to_owned(), code);
     if let Some(group) = table.get_mut(&key) {
         group.count += 1;
         group.total_us = group.total_us.saturating_add(us);
@@ -99,7 +99,7 @@ pub fn observe(method: &str, took: Duration, outcome: &Result<Value, RpcError>) 
             first_at_ms: now,
             last_at_ms: now,
             bucket_ms: key.0,
-            window_ms: SUMMARY_MS,
+            window_ms: ROW_BUCKET_MS,
             version,
             node_id: node,
         },
@@ -108,7 +108,7 @@ pub fn observe(method: &str, took: Duration, outcome: &Result<Value, RpcError>) 
 
 /// Takes the groups of the closed buckets (with `open_too`, every group), as rows.
 pub(crate) fn drain(open_too: bool) -> Vec<Value> {
-    let open = bucket_of(now_ms());
+    let open = row_bucket_of(now_ms());
     let taken: Vec<CallRecord> = match groups().lock() {
         Ok(mut table) => {
             let keys: Vec<Key> = table.keys().filter(|key| open_too || key.0 < open).cloned().collect();

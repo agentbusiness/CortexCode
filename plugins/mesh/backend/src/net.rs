@@ -451,6 +451,7 @@ impl Mesh {
             mesh.dial_all().await;
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
+                mesh.load_changed();
                 mesh.refresh_local();
                 mesh.dial_all().await;
                 mesh.sync_machine().await;

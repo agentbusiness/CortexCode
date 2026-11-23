@@ -22,17 +22,6 @@ async fn get<T: serde::de::DeserializeOwned>(ctx: &Ctx, method: &str, params: Va
     serde_json::from_value(value).ok()
 }
 
-fn free_disk(path: &Path) -> u64 {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid NUL-terminated path and a zeroed statvfs the call fills.
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-        return 0;
-    }
-    u64::from(stat.f_bavail) * stat.f_frsize
-}
-
 fn free_memory() -> u64 {
     let Ok(mut system) = sysinfo::System::new() else { return 0 };
     system.refresh_memory();
@@ -119,10 +108,10 @@ pub fn for_model(plugin: &str) -> Value {
 /// they move, even when nothing else on it changed.
 const GAUGES_EVERY_MS: u64 = 600_000;
 
-/// The card's gauges: what moves all the time and decides nothing at once (free memory and disk,
+/// The card's gauges: what moves all the time and decides nothing at once (free memory,
 /// a model's measured speed, the GPUs and serving figures). They travel with every push, but a
 /// change of theirs alone pushes the card only once per [`GAUGES_EVERY_MS`].
-const GAUGES: [&str; 4] = ["free_memory_bytes", "free_disk_bytes", "gpus", "serving"];
+const GAUGES: [&str; 3] = ["free_memory_bytes", "gpus", "serving"];
 const MODEL_GAUGES: [&str; 1] = ["tok_s"];
 
 /// What a card says, to tell whether it changed: everything but the moment it was built and its
@@ -156,7 +145,7 @@ pub async fn refresh_load(ctx: &Ctx, model: &mut ModelCard) {
     }
 }
 
-pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
+pub async fn build(ctx: &Ctx, node: &str, name: &str) -> Card {
     let machine: Machine = get(ctx, "frame.machine", json!({})).await.unwrap_or_default();
     let plugins: Vec<PluginInfo> = get::<Value>(ctx, "frame.plugins.list", json!({})).await.and_then(|v| serde_json::from_value(v.get("plugins").cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
     let live_root = ctx.env.live_root.clone();
@@ -238,7 +227,6 @@ pub async fn build(ctx: &Ctx, node: &str, name: &str, home: &Path) -> Card {
         cpu_cores: machine.cpu_cores,
         gpu_cores: machine.gpu_cores,
         os_version: machine.os_version,
-        free_disk_bytes: free_disk(home),
         free_memory_bytes: free_memory(),
         on_mains,
         user_active,

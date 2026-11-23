@@ -26,6 +26,7 @@ use cc_protocol::contracts::model::{
 use cc_protocol::{Ctx, ItemSink, RpcError, codes, parse_params, to_value};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -71,6 +72,11 @@ pub struct Engine {
     ctx: Option<Ctx>,
     /// The member whose Qwen serves here now.
     borrowed: Mutex<Option<Lender>>,
+    /// The mesh said its members or their cards changed (`mesh.changed`), or nothing was looked at
+    /// yet: the next watch looks for a lender again. Without it the lender stays as found.
+    peers_changed: AtomicBool,
+    /// Whether this model was loaded at the last look.
+    looked_loaded: AtomicBool,
     installing: tokio::sync::Mutex<()>,
     install: Arc<Mutex<Option<InstallProgress>>>,
     state: Mutex<&'static str>,
@@ -137,6 +143,8 @@ impl Engine {
             server: tokio::sync::Mutex::new(None),
             ctx,
             borrowed: Mutex::new(None),
+            peers_changed: AtomicBool::new(true),
+            looked_loaded: AtomicBool::new(false),
             installing: tokio::sync::Mutex::new(()),
             install: Arc::new(Mutex::new(None)),
             state: Mutex::new("unloaded"),
@@ -204,6 +212,11 @@ impl Engine {
         *self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The mesh's members or cards changed: the next watch looks for a lender again.
+    pub fn peers_changed(&self) {
+        self.peers_changed.store(true, Ordering::SeqCst);
+    }
+
     fn borrowed(&self) -> Option<Lender> {
         self.borrowed.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -211,7 +224,17 @@ impl Engine {
     async fn watch_once(self: &Arc<Self>) {
         let loaded = self.server.try_lock().ok().and_then(|slot| slot.clone());
         let lender = match (&self.ctx, self.config.borrow) {
-            (Some(ctx), borrow) if borrow || self.gpu.is_none() => borrow::look(ctx, loaded.is_some(), self.gpu.is_none()).await,
+            (Some(ctx), borrow) if borrow || self.gpu.is_none() => {
+                // Looked at again when the mesh changed or this model loaded or unloaded since the
+                // last look (the choice depends on both); otherwise the lender stays as found.
+                let loaded_now = loaded.is_some();
+                let changed = self.peers_changed.swap(false, Ordering::SeqCst) | (self.looked_loaded.swap(loaded_now, Ordering::SeqCst) != loaded_now);
+                if changed {
+                    borrow::look(ctx, loaded_now, self.gpu.is_none()).await
+                } else {
+                    self.borrowed()
+                }
+            }
             _ => None,
         };
         let was = self.borrowed();

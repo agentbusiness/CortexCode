@@ -3,10 +3,10 @@
 //! - **errors**: every error the process logs, every panic and every call site that logs far more
 //!   than it should, grouped per window by where it happened (`fingerprint`) and counted (the
 //!   knowledge app's `error_stats`, the same records). Warnings are never collected.
-//! - **calls**: every contract method the process serves, summed per five-minute bucket with its
-//!   time, its outcome and, for a model's answer, its tokens.
-//! - **models**: the model calls the process makes, summed per five-minute bucket by model, tag,
-//!   computer and outcome: their tokens (in, cached, out, reasoning) and their times.
+//! - **calls**: every contract method the process serves, summed per hour with its time, its
+//!   outcome and, for a model's answer, its tokens.
+//! - **models**: the model calls the process makes, summed per hour by model, tag, computer and
+//!   outcome: their tokens (in, cached, out, reasoning) and their times.
 //!
 //! Every process collects; once per window ([`SUMMARY_MS`], a panic at once) it hands what it
 //! collected to the app's `stats` plugin (`stats.record`), which alone writes the Parquet day
@@ -27,7 +27,7 @@ pub mod deliver;
 #[cfg(feature = "files")]
 pub mod files;
 
-use cc_protocol::contracts::reports::{RecordParams, SUMMARY_MS, methods, tables};
+use cc_protocol::contracts::reports::{ROW_BUCKET_MS, RecordParams, SUMMARY_MS, methods, tables};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -134,9 +134,14 @@ pub fn give_back(batches: Vec<RecordParams>) {
     }
 }
 
-/// The start of the summary bucket a time falls in.
+/// The start of the summary window a time falls in.
 pub fn bucket_of(ms: i64) -> i64 {
     ms.div_euclid(SUMMARY_MS) * SUMMARY_MS
+}
+
+/// The start of the hour a `calls` or `models` row sums ([`ROW_BUCKET_MS`]).
+pub fn row_bucket_of(ms: i64) -> i64 {
+    ms.div_euclid(ROW_BUCKET_MS) * ROW_BUCKET_MS
 }
 
 /// How long until `after` milliseconds past the next window boundary.

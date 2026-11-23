@@ -198,7 +198,7 @@ export function runningStep(items: readonly ActivityItem[]): Step | null {
   return last?.kind === 'step' && !last.step.result ? last.step : null;
 }
 
-export function Activity({ turn, items, live, progress, onOpenFile, closing = true, liveLines = [] }: {
+export function Activity({ turn, items, live, progress, onOpenFile, closing = true, liveLines = [], after = false }: {
   turn: Turn;
   items: ActivityItem[];
   /** The turn is running now: the list is open, the step under way last. */
@@ -210,10 +210,12 @@ export function Activity({ turn, items, live, progress, onOpenFile, closing = tr
   onOpenFile: (path: string) => void;
   /** The turn's last activity line: it carries the turn's time, tokens and model calls. */
   closing?: boolean;
+  /** The running line after the text the model is writing: drawn for as long as the turn runs. */
+  after?: boolean;
 }) {
   const reveal = useContext(RevealContext);
   // Nothing done and nothing measured: no line (never an empty container).
-  const nothing = items.length === 0 && turn.usage.length === 0 && !(live && progress);
+  const nothing = items.length === 0 && turn.usage.length === 0 && !(live && (progress || after));
   const revealed = items.some((item) => item.kind === 'step' && holds(item.step, reveal.seq));
   const [chosen, setOpen] = useState<boolean | null>(null);
   // A step something asked to show opens the list, which then stays open until closed.
@@ -245,7 +247,7 @@ export function Activity({ turn, items, live, progress, onOpenFile, closing = tr
   return (
     <div className="cx-activity" data-open={open ? 'true' : 'false'} data-running={live ? 'true' : 'false'} data-steps={known.steps} data-failed={known.failed}>
       <button type="button" className="cx-activity-line" aria-expanded={open} onClick={() => setOpen(!open)} title={!open && what ? what : undefined}>
-        <Caret dir={open ? 'down' : 'right'} className="thinking-caret" />
+        {(items.length > 0 || !live) && <Caret dir={open ? 'down' : 'right'} className="thinking-caret" />}
         {live && <span className="ap live cx-activity-running">Running</span>}
         {!open && what && <span className="cx-activity-what"><Counted text={what} /></span>}
         {end && <span className="cx-activity-facts"><Counted text={end} /></span>}

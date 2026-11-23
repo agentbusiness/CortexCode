@@ -9,7 +9,7 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { ComputerScope, definePlugin, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord } from '@cortex/sdk';
+import { ComputerScope, definePlugin, useEvent, useHost, useModelState, useQuery, useSelection, useSessions, useShared, useUiPlugins, type AgentRecord } from '@cortex/sdk';
 import { cardSections } from './sections';
 import './card.css';
 
@@ -120,17 +120,16 @@ interface Slots { slots: Array<{ busy: boolean; n_tokens: number }>; queued: num
 
 interface Kv { used: number; total: number; share: number }
 
-/** How much of the model's KV pool the conversations hold, read every two seconds: the band's
- * button says it, the card's foot draws it. */
+/** How much of the model's KV pool the conversations hold, read again when a request is queued
+ * or ends (`model.progress`; its prefill and decode steps do not ask): the band's button says it,
+ * the card's foot draws it. */
 function useKv(): Kv | null {
   const { info } = useModelState();
   const slots = useQuery<Slots>('model.slots', (c) => c.call<Slots>('model.slots', {}));
-  useEffect(() => {
-    const timer = setInterval(() => void slots.refresh(), 2000);
-    return () => clearInterval(timer);
-    // `refresh` is stable per key.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEvent('model.progress', (_topic, data) => {
+    const phase = (data as { phase?: string }).phase;
+    if (phase === 'queued' || phase === 'done') void slots.refresh();
+  });
   const total = info.data?.ctx_total ?? 0;
   if (!slots.data || total <= 0) return null;
   const used = slots.data.slots.reduce((sum, slot) => sum + slot.n_tokens, 0);

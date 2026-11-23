@@ -124,8 +124,9 @@ export const TurnView = memo(function TurnView({ turn, actions, live, progress =
   const routeDetail = last && !['STATUS', 'ANSWER', 'LOOKUP'].includes(str(last.data.route)) ? routeText(last) : '';
   const parts = segments(turn.blocks);
   const closingAt = parts.map((part) => part.kind).lastIndexOf('group');
-  // Scaffolding, then the answer still streaming: the model's progress is shown after the answer.
-  const trailing = closingAt >= 0 && live && progress !== '' && parts.at(-1)?.kind !== 'group';
+  // The running line is always the turn's last thing: once the model writes text after its
+  // scaffolding, that scaffolding folds to a finished line and the running line follows the text.
+  const trailing = closingAt >= 0 && live && parts.at(-1)?.kind !== 'group';
   // The turn's task rows (`task_link`, in the order the plan made them) are one list; a
   // `task_start` note (the host writes one where a task's work begins) makes that task's row the
   // open one, and everything after it nests under that row until the next task starts. The root
@@ -147,8 +148,8 @@ export const TurnView = memo(function TurnView({ turn, actions, live, progress =
   };
   parts.forEach((part, index) => {
     if (part.kind === 'group') {
-      const closing = index === closingAt;
-      place(<Activity key={part.key} turn={turn} items={activityItems(part.blocks)} live={live && closing && !trailing} progress={closing && !trailing ? progress : ''} liveLines={closing && !trailing ? liveLines : []} closing={closing} onOpenFile={actions.openFile} />);
+      const closing = index === closingAt && !trailing;
+      place(<Activity key={part.key} turn={turn} items={activityItems(part.blocks)} live={live && closing} progress={closing ? progress : ''} liveLines={closing ? liveLines : []} closing={closing} onOpenFile={actions.openFile} />);
     } else if (part.block.kind === 'entry') {
       const entry = part.block.entry;
       if (entry.kind === kinds.TASK_LINK) {
@@ -166,7 +167,7 @@ export const TurnView = memo(function TurnView({ turn, actions, live, progress =
   });
   // No scaffolding: the line (what the turn cost) closes the turn.
   if (closingAt < 0 || trailing) {
-    place(<Activity key="activity" turn={turn} items={closingAt < 0 ? activityItems(turn.blocks) : []} live={live} progress={progress} liveLines={liveLines} onOpenFile={actions.openFile} />);
+    place(<Activity key="activity" turn={turn} items={closingAt < 0 ? activityItems(turn.blocks) : []} live={live} progress={progress} liveLines={liveLines} after={trailing} onOpenFile={actions.openFile} />);
   }
   const isSection = (item: ReactNode | Section): item is Section => typeof item === 'object' && item !== null && (item as Section).kind === 'section';
   const rendered: ReactNode[] = body.map((item) => (isSection(item)

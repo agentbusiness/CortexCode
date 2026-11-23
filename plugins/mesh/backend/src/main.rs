@@ -67,6 +67,12 @@ impl Plugin for MeshPlugin {
                 || (topic == cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED && data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION))
             {
                 mesh.projects_changed().await;
+            } else if topic == cc_protocol::contracts::model::topics::PROGRESS {
+                // A request was queued, started or ended: the card's load is read again.
+                if data.get("phase").and_then(Value::as_str) != Some(cc_protocol::contracts::model::progress_phase::DECODE) {
+                    mesh.load_changed();
+                }
+                mesh.event(&topic, &data);
             } else {
                 mesh.event(&topic, &data);
             }

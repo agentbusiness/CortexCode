@@ -6,9 +6,9 @@
 //!   hands its rows to the app's `stats` plugin (`stats.record`), the one that writes Parquet day
 //!   files under the stats folder. The tables are exactly [`tables::ERRORS`] (errors and panics,
 //!   grouped per window by fingerprint, and the call sites that flood the log; warnings are never
-//!   collected), [`tables::CALLS`] (every contract method, summed per five-minute bucket) and
-//!   [`tables::MODELS`] (the model calls made, summed per five-minute bucket by model, tag and
-//!   computer). No app sends a table of its own.
+//!   collected), [`tables::CALLS`] (every contract method, summed per hour, [`ROW_BUCKET_MS`]) and
+//!   [`tables::MODELS`] (the model calls made, summed per hour by model, tag and computer). No app
+//!   sends a table of its own.
 //! - Beside each day file a `<day>.sent.parquet` lists the event ids that a CortexManage accepted.
 //!   A row not in it is undelivered.
 //! - After each hand-over the `stats` plugin (in the knowledge app, its mesh) offers the rows just
@@ -28,10 +28,14 @@ use serde_json::Value;
 pub const SERVICE: &str = "manage.reports";
 pub const VERSION: u32 = 1;
 
-/// The window of a summary row, in milliseconds: `calls` and `models` rows each sum one bucket of
-/// this length that starts at a multiple of it (UTC), and every process hands its rows over once
-/// per window.
+/// The hand-over window, in milliseconds: every process hands its rows over once per window, and
+/// `errors` rows are grouped per window.
 pub const SUMMARY_MS: i64 = 300_000;
+
+/// The bucket of a `calls` or `models` row, in milliseconds: each row sums one hour that starts at
+/// a multiple of it (UTC), handed over in the first window after the hour closed. A five-minute
+/// bucket made a row per method and window, most of them for status reads polled on a timer.
+pub const ROW_BUCKET_MS: i64 = 3_600_000;
 
 pub mod methods {
     /// [`super::SendParams`] -> [`super::SendResult`]. Any member may call it (verb `send`).

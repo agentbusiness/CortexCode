@@ -875,7 +875,12 @@ impl Agents {
         let host = Host::new(ctx.clone());
         self.ensure_controller(&host).await;
         let config = self.inner.data.get().scheduler.clone();
-        if let Ok(slots) = host.get::<Value>(model_methods::SLOTS, json!({})).await {
+        // The model's load matters only while agents run or wait: an idle scheduler reads no slots.
+        let working = {
+            let scheduler = lock(&self.inner.scheduler);
+            !scheduler.running.is_empty() || !scheduler.queued.is_empty()
+        };
+        if working && let Ok(slots) = host.get::<Value>(model_methods::SLOTS, json!({})).await {
             let mut model = lock(&self.inner.model);
             model.queued = slots.get("queued").and_then(Value::as_u64).unwrap_or(0) as u32;
             model.busy = slots.get("slots").and_then(Value::as_array).map(|all| all.iter().filter(|slot| slot.get("busy").and_then(Value::as_bool) == Some(true)).count() as u32).unwrap_or(0);
@@ -1464,9 +1469,9 @@ impl Agents {
     }
 
     /// Start agents for tasks of the same tree whose dependencies are all done.
-    async fn start_dependents(&self, ctx: &Ctx, host: &Host, finished: &Task, agent_session: &str, mode: &str) {
-        let Some(parent_id) = finished.parent_id.clone() else { return };
-        let Ok(list) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": finished.project_id, "parent_id": parent_id})).await else {
+    async fn start_dependents(&self, ctx: &Ctx, host: &Host, ended: &Task, agent_session: &str, mode: &str) {
+        let Some(parent_id) = ended.parent_id.clone() else { return };
+        let Ok(list) = host.get::<TaskListResult>(memory_methods::TASK_LIST, json!({"project_id": ended.project_id, "parent_id": parent_id})).await else {
             return;
         };
         let status: HashMap<String, String> = list.tasks.iter().map(|task| (task.id.clone(), task.status.clone())).collect();
@@ -1510,7 +1515,7 @@ impl Agents {
             // user asked. It gets the facts for that: each task with what checked it, the files it
             // changed and what its agent's runs of the project's own commands printed last (seen:
             // "Every delegated task is merged and verified" over nine tasks no check had run on).
-            let root_dir = host.project_get(&finished.project_id).await.map(|project| project.root).unwrap_or_default();
+            let root_dir = host.project_get(&ended.project_id).await.map(|project| project.root).unwrap_or_default();
             let known = project_commands(host).await;
             let mut facts: Vec<Value> = Vec::new();
             for task in &list.tasks {
@@ -1558,7 +1563,7 @@ impl Agents {
                 })
                 .collect();
             let root = task(host, &parent_id).await.ok();
-            supervise(ctx, from.as_deref(), event_of(&finished.project_id, events::TREE_DONE, "", root.as_ref(), format!("{summary}\n{lines}").trim_end()));
+            supervise(ctx, from.as_deref(), event_of(&ended.project_id, events::TREE_DONE, "", root.as_ref(), format!("{summary}\n{lines}").trim_end()));
         }
     }
 

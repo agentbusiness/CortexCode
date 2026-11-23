@@ -127,6 +127,15 @@ async fn probe(engine: Arc<Engine>) -> ProbeReport {
 }
 
 impl Plugin for ModelPlugin {
+    /// `mesh.changed`: a member came or went, or a card changed; a machine without a GPU looks for
+    /// its lender again at the next watch.
+    fn event(&self, ctx: Ctx, _topic: String, _data: Value) -> BoxFuture<'static, ()> {
+        let engine = self.engine(&ctx);
+        Box::pin(async move {
+            engine.await.peers_changed();
+        })
+    }
+
     fn handle(&self, ctx: Ctx, call: Call) -> BoxFuture<'static, Result<Value, RpcError>> {
         let engine = self.engine(&ctx);
         Box::pin(async move {
@@ -244,6 +253,7 @@ fn main() {
         }
         let mut hello = Hello::new("model-llama", env!("CARGO_PKG_VERSION"), "model", "model@1");
         hello.provides = PROVIDES.iter().map(|m| (*m).to_owned()).collect();
+        hello.subscribes = vec!["mesh.changed".to_owned()];
         // Two instances cannot hold a model at once: drain the old one first.
         hello.swap = SwapPolicy::DrainFirst;
         let code = match cc_protocol::run_plugin(hello, Arc::new(ModelPlugin::default())).await {

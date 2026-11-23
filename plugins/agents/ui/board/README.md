@@ -1,6 +1,6 @@
 # @cortex-ui/agents-board
 
-The board: task tree with contracts, agents, messages.
+The board: goals with their steps (what needs you, what is in progress, what is done), agents, messages.
 
 - **Plugin id:** `agents.board`
 - **Slot:** `pane.board@1`

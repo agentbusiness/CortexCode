@@ -1,33 +1,63 @@
-/* pane.board@1 — compact task disclosures, agents and the project register. */
+/* pane.board@1 — goals with their steps, agents and the project register. */
 #cc .cx-board{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;container-type:inline-size;}
 #cc .cx-board>.bar{padding-left:16px;}
 #cc .cx-board-scroll{flex:1;min-height:0;overflow:auto;padding:0 16px 24px 0;}
 #cc .cx-board-scheduler{font:400 11px/1.5 var(--font-apparatus);color:var(--ink-2);}
 #cc .cx-board .empty-line{padding-left:16px;}
 #cc .cx-board .inline-error{margin-left:16px;}
-#cc .cx-tasks-toolbar{position:sticky;top:0;z-index:1;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;padding:12px 0 12px 16px;background:var(--ground);border-bottom:1px solid var(--rule-2);}
-#cc .cx-tasks-summary{margin:0;color:var(--ink);font:500 12px/1.5 var(--font-apparatus);font-variant-numeric:tabular-nums;}
-#cc .cx-tasks-summary span{color:var(--ink-2);font-weight:400;}
-#cc .cx-tasks-actions{display:flex;flex-wrap:wrap;gap:8px;}
-#cc .cx-tasks-actions .detent{min-height:28px;height:auto;font-size:10px;letter-spacing:.04em;text-transform:none;}
-#cc .cx-tasks{list-style:none;margin:0;padding:0;}
-#cc .cx-task-row{border-bottom:1px solid var(--rule);--task-state:var(--ink-2);}
-#cc .cx-task-row[data-status="in_progress"],#cc .cx-task-row[data-status="verifying"],#cc .cx-task-row[data-status="failed"]{--task-state:var(--rubric);}
-#cc .cx-task-row[data-status="blocked"],#cc .cx-task-row[data-status="indeterminate"]{--task-state:var(--rubric-lift);}
-#cc .cx-task-row[data-status="done"]{--task-state:var(--counter);}
-#cc .cx-task-toggle{width:100%;display:grid;grid-template-columns:16px minmax(0,1fr) minmax(104px,max-content);align-items:start;gap:12px;padding:16px 8px 16px calc(16px + var(--task-indent));border:0;background:transparent;color:var(--ink);text-align:left;cursor:pointer;}
-#cc .cx-task-toggle:hover,#cc .cx-task-row[data-selected="true"]>.cx-task-toggle{background:var(--rubric-wash);}
-#cc .cx-task-toggle:focus-visible{outline-offset:-2px;}
-#cc .cx-task-chevron{width:16px;height:16px;margin-top:2px;color:var(--ink-2);transition:transform .15s ease-out;}
-#cc .cx-task-toggle[aria-expanded="true"]>.cx-task-chevron{transform:rotate(90deg);}
-#cc .cx-task-heading{min-width:0;display:flex;flex-direction:column;gap:8px;}
-#cc .cx-task-title{font:500 14px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
-#cc .cx-task-meta{display:flex;flex-wrap:wrap;gap:4px 12px;color:var(--ink-2);font:400 11px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
-#cc .cx-task-assignee{color:var(--counter);}
-#cc .cx-task-status{display:flex;align-items:center;gap:8px;padding-top:2px;color:var(--task-state);font:500 12px/1.5 var(--font-apparatus);}
-#cc .cx-task-status i{width:6px;height:6px;flex:none;background:currentColor;}
-#cc .cx-task-row[data-status="pending"] .cx-task-status i,#cc .cx-task-row[data-status="cancelled"] .cx-task-status i{background:transparent;border:1px solid currentColor;}
-#cc .cx-task-open{min-width:0;margin:0 8px 16px calc(44px + var(--task-indent));}
+/* Tasks: one block per goal. The head is the goal, its state and its progress; the steps under it are
+   one line each: a mark, the step, who does it, its state, its age. Working is the rubric, needs-you
+   the deep rubric, waiting the lift, done the counter, cancelled the third ink. */
+#cc .cx-goals-summary{position:sticky;top:0;z-index:1;margin:0;padding:12px 0 12px 16px;background:var(--ground);border-bottom:1px solid var(--rule-2);color:var(--ink);font:500 12px/1.5 var(--font-apparatus);font-variant-numeric:tabular-nums;}
+#cc .cx-goals-summary span{color:var(--ink-2);font-weight:400;}
+#cc .cx-goals-summary .cx-goals-attention{color:var(--rubric-deep);font-weight:500;}
+#cc .cx-goals-head{margin:24px 0 0;padding:0 0 8px 16px;border-bottom:1px solid var(--rule-2);color:var(--ink-2);font:500 11px/1.5 var(--font-apparatus);letter-spacing:.08em;text-transform:uppercase;}
+#cc .cx-goals-more{display:block;margin:16px 0 0 16px;padding:4px 0;border:0;background:transparent;color:var(--ink-2);font:400 12px/1.5 var(--font-apparatus);cursor:pointer;text-decoration:underline;text-underline-offset:3px;}
+#cc .cx-goals-more:hover{color:var(--ink);}
+#cc .cx-steps-more{margin:4px 0 0 44px;font-size:11px;}
+#cc .cx-goal{padding:0 0 16px;border-bottom:1px solid var(--rule);--goal-state:var(--ink-2);}
+#cc .cx-goal[data-folded="true"]{padding-bottom:0;}
+#cc .cx-goal[data-state="working"]{--goal-state:var(--rubric);}
+#cc .cx-goal[data-state="attention"]{--goal-state:var(--rubric-deep);}
+#cc .cx-goal[data-state="waiting"]{--goal-state:var(--rubric-lift);}
+#cc .cx-goal[data-state="done"]{--goal-state:var(--counter);}
+#cc .cx-goal[data-state="cancelled"]{--goal-state:var(--ink-3);}
+#cc .cx-goal-head{width:100%;display:grid;grid-template-columns:minmax(0,1fr) max-content;gap:6px 16px;padding:16px 8px 12px 16px;border:0;background:transparent;color:var(--ink);text-align:left;cursor:pointer;}
+#cc .cx-goal[data-folded="true"]>.cx-goal-head{padding:10px 8px 10px 16px;}
+#cc .cx-goal-head:hover,#cc .cx-goal[data-selected="true"]>.cx-goal-head{background:var(--rubric-wash);}
+#cc .cx-goal-head:focus-visible{outline-offset:-2px;}
+#cc .cx-goal-title{grid-column:1;font:600 15px/1.45 var(--font-apparatus);overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;}
+#cc .cx-goal-title[data-full="true"]{-webkit-line-clamp:unset;display:block;}
+#cc .cx-goal[data-folded="true"] .cx-goal-title{font-weight:500;font-size:13px;-webkit-line-clamp:1;color:var(--ink-2);}
+#cc .cx-goal-state{grid-column:2;grid-row:1;display:flex;align-items:center;gap:8px;padding-top:2px;color:var(--goal-state);font:500 12px/1.5 var(--font-apparatus);white-space:nowrap;}
+#cc .cx-goal-state i{width:7px;height:7px;flex:none;background:currentColor;}
+#cc .cx-goal[data-state="waiting"] .cx-goal-state i,#cc .cx-goal[data-state="cancelled"] .cx-goal-state i{background:transparent;box-shadow:inset 0 0 0 1px currentColor;}
+#cc .cx-goal[data-state="working"] .cx-goal-state i{animation:cx-agent-pulse 1.4s ease-in-out infinite;}
+#cc .cx-goal-meta{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:4px 16px;color:var(--ink-2);font:400 11px/1.5 var(--font-apparatus);font-variant-numeric:tabular-nums;}
+#cc .cx-goal[data-folded="true"] .cx-goal-meta{display:none;}
+#cc .cx-goal-bar{grid-column:1 / -1;height:3px;background:var(--rule);}
+#cc .cx-goal-bar>span{display:block;height:100%;background:var(--goal-state);}
+#cc .cx-goal>.cx-task-open{margin:4px 8px 8px 16px;}
+#cc .cx-steps{list-style:none;margin:4px 0 0;padding:0;}
+#cc .cx-step{--step-state:var(--ink-3);}
+#cc .cx-step[data-status="in_progress"],#cc .cx-step[data-status="verifying"]{--step-state:var(--rubric);}
+#cc .cx-step[data-status="failed"],#cc .cx-step[data-status="indeterminate"]{--step-state:var(--rubric-deep);}
+#cc .cx-step[data-status="blocked"]{--step-state:var(--rubric-lift);}
+#cc .cx-step[data-status="done"]{--step-state:var(--counter);}
+#cc .cx-step-row{width:100%;display:grid;grid-template-columns:8px minmax(0,1fr) minmax(0,max-content) 104px 72px;align-items:center;gap:12px;min-height:32px;padding:4px 8px 4px calc(28px + var(--step-indent));border:0;background:transparent;color:var(--ink);text-align:left;cursor:pointer;font:400 13px/1.45 var(--font-apparatus);}
+#cc .cx-step-row:hover,#cc .cx-step[data-selected="true"]>.cx-step-row{background:var(--rubric-wash);}
+#cc .cx-step-row:focus-visible{outline-offset:-2px;}
+#cc .cx-step-mark{width:7px;height:7px;background:var(--step-state);}
+#cc .cx-step:is([data-status="pending"],[data-status="blocked"],[data-status="cancelled"]) .cx-step-mark{background:transparent;box-shadow:inset 0 0 0 1px var(--step-state);}
+#cc .cx-step[data-status="in_progress"] .cx-step-mark{animation:cx-agent-pulse 1.4s ease-in-out infinite;}
+#cc .cx-step-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#cc .cx-step-row[aria-expanded="true"]>.cx-step-title{white-space:normal;overflow-wrap:anywhere;}
+#cc .cx-step:is([data-status="done"],[data-status="cancelled"]) .cx-step-title{color:var(--ink-2);}
+#cc .cx-step-who{color:var(--counter);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#cc .cx-step-state{color:var(--step-state);font-size:11px;white-space:nowrap;}
+#cc .cx-step-ago{color:var(--ink-3);font-size:11px;white-space:nowrap;text-align:right;}
+#cc .cx-step>div>.cx-task-open{margin:0 8px 12px calc(48px + var(--step-indent));}
+#cc .cx-task-open{min-width:0;}
 #cc .cx-task-section{min-width:0;border-top:1px solid var(--rule);}
 #cc .cx-task-section>summary{padding:12px 4px;color:var(--ink-2);font:500 12px/1.5 var(--font-apparatus);cursor:pointer;overflow-wrap:anywhere;}
 #cc .cx-task-section>summary:hover,#cc .cx-task-section[open]>summary{color:var(--ink);}
@@ -68,16 +98,13 @@
 #cc .cx-task-dependencies li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;padding:8px 0;font:400 12px/1.5 var(--font-apparatus);overflow-wrap:anywhere;}
 #cc .cx-task-dependencies li>span{color:var(--ink-2);}
 #cc .cx-task-no-details{margin:0;padding:8px 0;color:var(--ink-2);font-size:13px;}
-@container (max-width:520px){
-  #cc .cx-task-toggle{grid-template-columns:16px minmax(0,1fr);gap:8px 12px;padding-left:calc(12px + var(--task-indent));}
-  #cc .cx-task-heading{display:contents;}
-  #cc .cx-task-title{grid-column:2;grid-row:1;}
-  #cc .cx-task-status{grid-column:2;grid-row:2;padding-top:0;}
-  #cc .cx-task-meta{grid-column:2;grid-row:3;}
-  #cc .cx-task-open{margin-left:calc(40px + var(--task-indent));}
-  #cc .cx-tasks-toolbar{padding-left:12px;}
+@container (max-width:560px){
+  #cc .cx-step-row{grid-template-columns:8px minmax(0,1fr) max-content;padding-left:calc(16px + var(--step-indent));}
+  #cc .cx-step-who,#cc .cx-step-ago{display:none;}
+  #cc .cx-step>div>.cx-task-open{margin-left:calc(36px + var(--step-indent));}
+  #cc .cx-steps-more{margin-left:36px;}
 }
-@media (prefers-reduced-motion:reduce){#cc .cx-task-chevron{transition:none;}}
+@media (prefers-reduced-motion:reduce){#cc .cx-goal-state i,#cc .cx-step-mark,#cc .cx-agent-pip{animation:none !important;}}
 /* Agents: one ruled line each — a state pip, the name, its state in the state's colour, the task, counts,
    age, then the actions. Running is the rubric (pulsing), waiting the lift (hollow), blocked and failed
    the lift and the deep rubric (filled), done the counter, stopped the third ink. */
