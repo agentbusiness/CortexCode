@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94"
 publish = false
-description = "CortexCode skills@1 plugin: security skills for the model (codebase audit, review of a change, triage of a reported vulnerability) with the bundled secaudit tool."
+description = "CortexCode skills@1 plugin: security skills for the model (codebase audit, review of a change, triage of a reported vulnerability) with the bundled secaudit tool, and the security sentinel: sweeps of every project, the local model's filter and the notifications it allows."
 
 # Own workspace: every plugin directory builds independently.
 [workspace]
@@ -16,3 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 cc-lang-kit = { path = "../../../lang-kit" }
+# `preserve_order`: the filter's JSON schema keeps `reason` before `decision`, so the model writes
+# the deciding fact before its choice.
+cc-protocol = { path = "../../../protocol", features = ["memory", "model", "notify", "schedule", "security", "skills", "preserve_order"] }
+cc-stats-kit = { path = "../../../stats-kit" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+tracing = "0.1.44"

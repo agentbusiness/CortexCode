@@ -1015,6 +1015,17 @@ pub struct Verdict {
     pub vulns: Vec<Vuln>,
     /// Days since the name was first published, when the registry says.
     pub age_days: Option<u64>,
+    /// The version an install takes (the one asked for, else the newest), how many hours ago it was
+    /// published, and whether it runs an install script: a fresh version of an established
+    /// package is how the 2025-26 worms spread.
+    pub fresh: Option<Fresh>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Fresh {
+    pub version: String,
+    pub hours: u64,
+    pub install_script: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1030,6 +1041,11 @@ const CHECK_LIMIT: Duration = Duration::from_secs(10);
 const REGISTRY_BYTES: usize = 2 << 20;
 /// A name first published this recently is said in a note.
 const NEW_DAYS: u64 = 30;
+/// A version published this recently is said in a note (the release cooldown package managers
+/// recommend; OSV usually lists a malicious version within hours to two days).
+const FRESH_HOURS: u64 = 72;
+/// The head of npm's abbreviated document read for its `modified` time and dist-tags.
+const NPM_HEAD_BYTES: usize = 64 << 10;
 
 /// Check the packages: through the CortexTerm on this Mac when it shares `terminal.guard`, else
 /// OSV and the registries directly.
@@ -1139,6 +1155,7 @@ async fn guard_packages(host: &dyn Host, installs: &[Install], session_id: &str)
             malware: strings("malware"),
             vulns,
             age_days: None,
+            fresh: None,
         });
     }
     let unchecked = answer.get("unchecked").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
@@ -1193,7 +1210,7 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
     };
     let mut verdicts: Vec<Verdict> = installs
         .iter()
-        .map(|install| Verdict { install: install.clone(), exists: None, malware: Vec::new(), vulns: Vec::new(), age_days: None })
+        .map(|install| Verdict { install: install.clone(), exists: None, malware: Vec::new(), vulns: Vec::new(), age_days: None, fresh: None })
         .collect();
     let mut unchecked: Option<String> = None;
     // OSV: one batch for every package; malicious-package records have `MAL-` ids.
@@ -1243,6 +1260,9 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
         let client = client.clone();
         let install = verdict.install.clone();
         tasks.spawn(async move { Lookup::Registry(index, registry(&client, &install).await) });
+        let client = client.clone();
+        let install = verdict.install.clone();
+        tasks.spawn(async move { Lookup::Fresh(index, fresh_version(&client, &install).await) });
     }
     while let Some(done) = tasks.join_next().await {
         match done {
@@ -1251,6 +1271,7 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
                 verdicts[index].exists = Some(exists);
                 verdicts[index].age_days = age;
             }
+            Ok(Lookup::Fresh(index, fresh)) => verdicts[index].fresh = fresh,
             _ => {}
         }
     }
@@ -1259,6 +1280,7 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
 
 enum Lookup {
     Vuln(usize, Option<Vuln>),
+    Fresh(usize, Option<Fresh>),
     Registry(usize, Option<(bool, Option<u64>)>),
 }
 
@@ -1354,6 +1376,76 @@ async fn registry(client: &reqwest::Client, install: &Install) -> Option<(bool, 
     Some((true, created.and_then(days_since)))
 }
 
+/// The version an install takes and how fresh it is: npm from the head of its abbreviated document
+/// (`modified`, `dist-tags.latest`) and, when the whole document is small, the version's
+/// `hasInstallScript`; PyPI and crates.io from the version's own record. None when the registry
+/// does not say.
+async fn fresh_version(client: &reqwest::Client, install: &Install) -> Option<Fresh> {
+    let name = &install.name;
+    match install.ecosystem {
+        "npm" => {
+            let url = format!("https://registry.npmjs.org/{}", name.replace('/', "%2f"));
+            let mut response = client.get(&url).header("Accept", "application/vnd.npm.install-v1+json").send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let mut body: Vec<u8> = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                body.extend_from_slice(&chunk);
+                if body.len() > REGISTRY_BYTES {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&body[..body.len().min(NPM_HEAD_BYTES)]).into_owned();
+            let modified = Regex::new(r#""modified"\s*:\s*"([^"]+)""#).ok()?.captures(&head)?.get(1)?.as_str().to_owned();
+            let latest = Regex::new(r#""dist-tags"\s*:\s*\{[^}]*"latest"\s*:\s*"([^"]+)""#).ok()?.captures(&head).and_then(|c| c.get(1)).map(|m| m.as_str().to_owned());
+            let version = install.version.clone().or(latest)?;
+            let hours = hours_since(&modified)?;
+            // `modified` is the document's last change: it dates the version only when that version
+            // is the newest one.
+            let newest = install.version.is_none() || Some(version.as_str()) == Regex::new(r#""latest"\s*:\s*"([^"]+)""#).ok()?.captures(&head).and_then(|c| c.get(1)).map(|m| m.as_str());
+            if !newest || hours >= FRESH_HOURS {
+                return None;
+            }
+            let install_script = body.len() <= REGISTRY_BYTES
+                && serde_json::from_slice::<Value>(&body).ok().and_then(|doc| doc.pointer(&format!("/versions/{}/hasInstallScript", version.replace('~', "~0").replace('/', "~1"))).and_then(Value::as_bool)).unwrap_or(false);
+            Some(Fresh { version, hours, install_script })
+        }
+        "PyPI" => {
+            let version = install.version.clone()?;
+            let answer: Value = client.get(format!("https://pypi.org/pypi/{name}/{version}/json")).send().await.ok()?.json().await.ok()?;
+            let uploaded = answer.get("urls").and_then(Value::as_array)?.iter().filter_map(|file| file.get("upload_time_iso_8601").and_then(Value::as_str)).filter_map(hours_since).max()?;
+            (uploaded < FRESH_HOURS).then_some(Fresh { version, hours: uploaded, install_script: false })
+        }
+        "crates.io" => {
+            let answer: Value = client.get(format!("https://crates.io/api/v1/crates/{name}")).send().await.ok()?.json().await.ok()?;
+            let versions = answer.get("versions").and_then(Value::as_array)?;
+            let entry = match &install.version {
+                Some(version) => versions.iter().find(|v| v.get("num").and_then(Value::as_str) == Some(version.trim_start_matches('='))),
+                None => versions.iter().find(|v| !v.get("yanked").and_then(Value::as_bool).unwrap_or(false)),
+            }?;
+            let version = entry.get("num").and_then(Value::as_str)?.to_owned();
+            let hours = hours_since(entry.get("created_at").and_then(Value::as_str)?)?;
+            let install_script = false;
+            (hours < FRESH_HOURS).then_some(Fresh { version, hours, install_script })
+        }
+        _ => None,
+    }
+}
+
+/// Hours from an RFC 3339 time (`2026-10-01T12:30:00.000Z`) to now.
+fn hours_since(date: &str) -> Option<u64> {
+    let days = days_since(date)?;
+    let clock = date.get(11..16)?;
+    let (hour, minute) = clock.split_once(':')?;
+    let (hour, minute): (u64, u64) = (hour.parse().ok()?, minute.parse().ok()?);
+    let now = crate::util::now_ms() / 60_000;
+    let then_minutes_into_day = hour * 60 + minute;
+    let now_minutes_into_day = now % 1440;
+    let minutes = (days * 1440 + now_minutes_into_day).checked_sub(then_minutes_into_day)?;
+    Some(minutes / 60)
+}
+
 /// Days from an RFC 3339 date (`2026-10-01T12:00:00.000Z`) to now.
 fn days_since(date: &str) -> Option<u64> {
     let day = date.get(..10)?;
@@ -1404,6 +1496,14 @@ pub fn gate(checked: &Checked) -> Gate {
         if verdict.exists == Some(false) {
             return Gate::Refuse(format!(
                 "Not run: {registry} has no package named `{name}`. Find the package's real name (the project's docs, or the import the code needs), then install that."
+            ));
+        }
+        if let Some(fresh) = &verdict.fresh {
+            let ago = if fresh.hours == 0 { "less than an hour ago".to_owned() } else if fresh.hours == 1 { "1 hour ago".to_owned() } else { format!("{} hours ago", fresh.hours) };
+            let script = if fresh.install_script { " and runs an install script" } else { "" };
+            notes.push(format!(
+                "[packages: {name} {} was published on {registry} {ago}{script}; the 2025-26 worms spread through versions this fresh. Unless the task needs this version, pin one published at least 3 days ago]",
+                fresh.version
             ));
         }
         if let Some(days) = verdict.age_days.filter(|days| *days < NEW_DAYS) {

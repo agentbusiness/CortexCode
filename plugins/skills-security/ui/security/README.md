@@ -1,7 +1,9 @@
 # @cortex-ui/security-pane
 
-The Security tab: the last audit, the findings by priority, one finding's trace, fix and history,
-and the moves on it.
+The Security tab: the last audit, the findings by priority sorted by the security sentinel's filter
+(alerts in colour, what it set aside grey under a fold), one finding's trace, fix, the filter's
+reason and history, and the moves on it; and All projects: every project's alerts, the problems
+several share, "Am I hit?", and what the sweep found on the computer itself.
 
 - **Plugin id:** `skills-security.pane`
 - **Slot:** `pane.security@1`
@@ -14,11 +16,11 @@ React, ReactDOM and `@cortex/sdk` are peer dependencies the workbench provides.
 - **Fills:** `pane.security@1` as `skills-security.pane`
 - **Props:** `{ active: boolean }` (whether this view is the right pane's open tab)
 - **Hosts:** no slots
-- **Workbench state read:** `agents.defaultMode`, `projectId`, `sessionId`, `security.selected`, `security.severity`, `security.showFixed`
-- **Workbench state written:** `chat.stick`, `code.open`, `pane.tab`, `layout.paneCollapsed`, `card.open`, `overlay.open` (through `openInCode`), `projectId`, `sessionId`, `security.selected`, `security.severity`, `security.showFixed`
+- **Workbench state read:** `agents.defaultMode`, `projectId`, `sessionId`, `security.selected`, `security.severity`, `security.showFixed`, `security.showQuiet`, `security.scope`
+- **Workbench state written:** `chat.stick`, `code.open`, `pane.tab`, `layout.paneCollapsed`, `card.open`, `overlay.open` (through `openInCode`), `projectId`, `sessionId`, `security.selected`, `security.severity`, `security.showFixed`, `security.showQuiet`, `security.scope`
 - **Own durable state (survives hot swaps):** none
-- **Frame methods called:** `chatflow.turn`, `frame.session.create`, `memory.security.finding`, `memory.security.finding.update`, `memory.security.findings`, `memory.security.forget`, `memory.security.summary`
-- **Topics followed:** `memory.security.changed`
+- **Frame methods called:** `chatflow.turn`, `frame.session.create`, `memory.security.finding`, `memory.security.finding.update`, `memory.security.findings`, `memory.security.forget`, `memory.security.summary`, `memory.security.recheck`, `skills-security.status`, `skills-security.fleet`, `skills-security.sweep`, `skills-security.triage`, `skills-security.investigate`, `skills-security.mute.add`, `skills-security.mute.remove`, `skills-security.affected`
+- **Topics followed:** `memory.security.changed`, `skills-security.progress`, `skills-security.changed`
 
 Styles use the theme's tokens and primitives only. Nothing is imported from the renderer or from
 another plugin: the package builds alone.

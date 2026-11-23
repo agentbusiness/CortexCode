@@ -50,6 +50,8 @@ Confirm with a run when you can: a small script in `tmp/` calling the function o
 
 When the user wants the verdict kept with other findings, record it with `python3 "$SA" new <verdict>` and `python3 "$SA" finding <file>` as the audit skill does.
 
+When the message names a finding to investigate, record the verdict on it with each fact as evidence: `python3 "$SA" verdict <id> alert|quiet "<the deciding fact>" --evidence "<path:line shows ...>"`. Which other projects a package or advisory touches: `cx call skills-security.affected '{"query": "<package or advisory>"}'`.
+
 ## Traps
 
 - Confirming from the report's wording: the report may be wrong about this code; read it.

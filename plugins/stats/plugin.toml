@@ -4,7 +4,7 @@
 [plugin]
 id = "stats"
 name = "Statistics"
-version = "0.1.3"
+version = "0.1.4"
 description = "Writes what every process of the app collected about itself (its errors, and its served calls and model calls summed per five minutes) as Parquet day files, kept 30 days, and delivers them to a CortexManage on the mesh that manages the app's repository."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

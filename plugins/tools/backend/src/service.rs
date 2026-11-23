@@ -54,6 +54,7 @@ pub const PROVIDES: &[&str] = &[
     methods::SHARES,
     methods::SECURITY_SCAN,
     methods::SECURITY_DEPS,
+    methods::SECURITY_JUDGE,
     methods::MCP_LIST,
     methods::MCP_CALL,
     methods::AGENT_ENV,
@@ -644,6 +645,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::SHARES => to_value(&crate::share::shares()),
         methods::SECURITY_SCAN | methods::SECURITY_DEPS => crate::share::security(&method, params).await,
+        methods::SECURITY_JUDGE => crate::share::judge(host.as_ref(), params).await,
         methods::MCP_LIST => {
             let params: McpListParams = parse_params(params)?;
             let offline = util::canonical_lenient(&util::expand_home(&params.workspace)).join(crate::sandbox::OFFLINE_MARKER).exists();

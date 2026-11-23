@@ -7,8 +7,8 @@
 [plugin]
 id = "skills-security"
 name = "Security skills"
-version = "0.1.21"
-description = "Security know-how for the model: a whole-codebase security audit (map the stack, hunt each attack class, verify, record and report), a security review of a change, and the triage of a reported vulnerability; with the bundled secaudit tool that maps the project, lists suspicious lines by attack class, checks finding records and writes the report."
+version = "0.1.22"
+description = "Security know-how for the model (a whole-codebase audit, a review of a change, the triage of a reported vulnerability, a fix) with the bundled secaudit tool; and the security sentinel: every project of this computer swept for new advisories every few minutes and for supply-chain, CI, AI-agent-file and credential signals daily, each finding judged by host rules and the local model, only real alerts shown in colour and told, the rest kept grey."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]
 
@@ -21,6 +21,16 @@ contract = "skills@1"
 dir = "backend"
 build = ["cargo", "build", "--release"]
 exec = "backend/target/release/cc-skills-security"
+subscribes = ["memory.security.changed", "memory.settings.changed"]
+publishes = ["skills.changed", "skills-security.progress", "skills-security.changed"]
+# Calls it makes: the findings and its own records (memory), the filter's judgment (model), what it
+# tells (notify), the investigation sessions (frame, chat flow) and the old watch routines (schedule).
+uses = [
+  "memory.project.list", "memory.security.findings", "memory.security.finding", "memory.security.findings.put", "memory.security.finding.update",
+  "memory.security.recheck", "memory.security.summary", "memory.security.triage.put", "memory.settings.list", "memory.graph.machine",
+  "memory.graph.put", "memory.graph.query", "memory.graph.retire", "model.chat", "notify.send", "frame.session.create", "chatflow-coding.turn",
+  "schedule.list", "schedule.remove",
+]
 
 # UI packages: one npm workspace rooted at ui/ (own package-lock.json); each package builds
 # <dir>/dist with manifest.json {id, version, slot, entry, css}, which the frame serves.
@@ -38,3 +48,14 @@ slot = "pane.security@1"
 # the live folder (<home>/live/plugins/skills-security/data).
 [data]
 dirs = ["data"]
+
+# The sentinel's settings, in the main settings database (memory.settings, section `security`). All
+# have defaults; none is needed.
+[settings]
+section = "security"
+keys = [
+  "security.investigate (boolean, default true): what the fast filter cannot settle is investigated by a session",
+  "security.validate_secrets (boolean, default false): ask each credential's own provider whether it is live",
+  "security.notify (alerts | urgent | off, default alerts): urgent alerts at once and a daily digest of the rest",
+  "security.delta_minutes (number, default 15)", "security.full_hours (number, default 24)",
+]

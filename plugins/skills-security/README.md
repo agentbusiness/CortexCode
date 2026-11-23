@@ -11,7 +11,13 @@ skill with `read skill://skills-security/<name>`.
 |---|---|
 | `security-audit` | the user asks for a security audit or pen-test of the codebase: the whole flow, recon to report |
 | `security-review-change` | a diff, pull request, file or function to review for security |
-| `security-triage` | a reported vulnerability, CVE, scanner alert or suspicious code to judge |
+| `security-triage` | a reported vulnerability, CVE, scanner alert or suspicious code to judge; the sentinel's investigations end with its `verdict` |
+| `security-fix` | a finding to fix, from the Security tab |
+
+The same plugin runs the **security sentinel** (its backend, beside the skills): every project of
+this computer watched for new advisories every few minutes and swept fully every day, each finding
+judged by host rules and the local model, only real alerts shown in colour and told. See "The
+sentinel" below.
 
 One self-contained plugin folder, separable into its own repository (only `cc-protocol`,
 `cc-lang-kit` and `@cortex/sdk` come from outside):
@@ -23,6 +29,9 @@ One self-contained plugin folder, separable into its own repository (only `cc-pr
 | `data/skills/` | the skills (`<name>.md`: line 1 the one-sentence summary of when to read it, a blank line, the Markdown body) |
 | `data/scripts/secaudit.py` | the audit tool (Python 3.8+, standard library only), run by the model through `run` from the live folder: `$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py` |
 | `data/scripts/classes-*.json` | the attack classes and the code shapes the tool searches for |
+| `data/scripts/campaigns.json` | the supply-chain campaign indicators the sweep checks: install-hook and payload shapes, the strings credential stealers carry, campaign files and their SHA-256, planted workflows and persistence, `.pth` shapes, and what the 2025-26 worms leave on the computer itself |
+| `data/triage/` | the filter's text for the local model: `system.md`, one decision card per attack class (`card-<class>.md`, `card-default.md`, `card-external.md` for other apps' events) and `investigate.md`, the opening message of an investigation |
+| `backend/src/sentinel.rs`, `triage.rs`, `store.rs` | the sentinel: cadence and sweeps, the filter, its records in the graph |
 | `ui/` | npm workspace with one package, `ui/security` (`skills-security.pane` on `pane.security@1`): the Security tab of the right pane |
 
 ## The tool
@@ -51,6 +60,12 @@ secaudit.py fix-plan <id>                    the exact upgrade commands of a dep
 secaudit.py recheck <id>                     what the code says now; a sink that is gone or a package that moved on marks it fixed
 secaudit.py resolve <id> "<how>"             record a fix: refused while the sink is unchanged; else fixed in the graph with the session and commit
 secaudit.py status --fixing                  the fix skill's done guard: 0 once this session's finding is recorded fixed
+secaudit.py status --investigating           the triage skill's done guard: 0 once this session's investigation has its verdict
+secaudit.py verdict <id> alert|quiet "<reason>" --evidence "<fact>"...   an investigation's verdict on its finding
+secaudit.py fleet --json --root <dir>... [--since <ms>] [--full] [--stamp <dir>=<stamp>...] [--validate]
+                                             the sentinel's sweep of every project, one JSON object, nothing written
+secaudit.py affected --json --query <package|name@version|advisory|file> --root <dir>...
+                                             which trees a package, version, advisory or campaign file touches
 ```
 
 ## The Security tab and the findings in the graph
@@ -101,7 +116,7 @@ Nothing is mirrored or cached. At call time the tool asks:
 | OSV, the open vulnerability database (carries the GitHub Advisory Database, the npm, PyPI, crates.io, Go, RubyGems, Packagist, Maven and NuGet advisories and the CVE list) | every known vulnerability of the exact dependency versions the project's lockfiles pin, with the fixed versions | `recon` (summary, kept with the audit), the dependencies unit of `hunt`, `deps`, the report |
 | NVD | a CVE's description, CVSS and weakness ids when OSV has no record | `cve` |
 | MITRE's CWE API | the mitigations of the weakness behind an advisory | `cve` |
-| the Cloudflare security-audit skill repository | the current hunting guidance for the attack class being hunted | `hunt` |
+| OSV's change list (`osv-vulnerabilities.storage.googleapis.com/modified_id.csv`) | which advisories changed since the last sweep, newest first | the sentinel's delta sweep |
 
 Lockfiles read: package-lock.json, yarn.lock, pnpm-lock.yaml, requirements*.txt, poetry.lock,
 Pipfile.lock, uv.lock, pdm.lock, Cargo.lock, go.mod, Gemfile.lock, composer.lock,
@@ -111,12 +126,75 @@ check did not run, and the audit continues from the code. The `classes-*.json` b
 its own search heuristics (the code shapes to look at, written from the upstream guidance); they
 ship with the plugin and change with it.
 
+## The sentinel
+
+The plugin's backend serves, beside `skills@1`, the methods of
+`protocol/src/contracts/security.rs` on its own category (`skills-security.status`, `.fleet`,
+`.sweep`, `.triage`, `.investigate`, `.mute.add`, `.mute.list`, `.mute.remove`, `.affected`,
+`.judge`). One loop:
+
+1. **Delta sweep, every 15 minutes.** `fleet --since <cursor>` reads the head of OSV's change list
+   (`modified_id.csv`, newest first, read only down to the last sweep's cursor: kilobytes, not the
+   166 MB file), fetches the changed records, and re-checks with OSV only the pinned packages of
+   this computer they name, every project at once. A new malicious-package record (`MAL-`) reaches
+   every project that pins it within minutes of OSV listing it.
+2. **Full sweep, daily and at the first start.** Every project's lockfiles in one OSV batch for the
+   whole computer (each package asked once however many projects pin it), CISA KEV and FIRST EPSS,
+   and the tree checks: install hooks of installed packages that run a campaign dropper or a
+   credential harvester, `binding.gyp` commands, bundled one-line payloads, known payload SHA-256,
+   `github:` optional dependencies, `.pth` files that run code, campaign files, planted workflows and
+   persistence (`.claude/setup.mjs`, `.vscode/tasks.json` on folder open), the package managers'
+   release cooldown and install-script settings (npm `min-release-age`, npm 12's script blocking,
+   pnpm `minimumReleaseAge` and `allowBuilds`, Yarn `npmMinimalAgeGate` and `enableScripts`, Bun
+   `minimumReleaseAge`, uv `exclude-newer`, Dependabot `cooldown`), the GitHub Actions workflows
+   (pull_request_target or workflow_run running a pull request's code, template injection of issue
+   or branch text, cache poisoning, unpinned actions, `toJSON(secrets)`, write-all tokens, self-hosted
+   runners on comments), the AI-agent files (hooks and helpers that run commands, auto-enabled MCP
+   servers, API base URLs sent elsewhere, VS Code auto-approval and folder-open tasks, dev-container
+   host commands, hidden text, escape codes) and credential formats in the tree (with
+   `security.validate_secrets` on, each one's own provider is asked whether it is live). A tree whose
+   stamp (HEAD, uncommitted changes, installed packages) did not change skips the file checks. What
+   the 2025-26 worms leave on the computer itself (the gh-token-monitor launch agent, the axios
+   second stage, a shutdown planted in `~/.zshrc`) is told at once.
+3. **Reachability.** For each vulnerable package the sweep says whether the project's code calls a
+   function the advisory names (Go `imports[].symbols`, RustSec `affects.functions`), imports it,
+   only pulls it in through another package, or needs it for development only.
+4. **The filter** judges every finding not judged yet, from any source: a mute rule first; then host
+   rules (malicious, a campaign indicator, a live credential: alert; exploited and reachable: alert;
+   development only or low and unexploited: quiet; a hardening note: quiet; confirmed by an audit:
+   alert); then the local model, in one constrained call with the class's decision card: reason
+   first, then `dismiss`, `hardening`, `alert` or `investigate`. Text from the project and from
+   packages is data to the model; an instruction inside it is a reason to alert.
+5. **Investigations.** What the model sends to `investigate` gets a chat session of its own, one at
+   a time (`Investigate: <title>`): it reads the code and records `verdict <id> alert|quiet` with its
+   evidence; a session that ends without one leaves the finding shown as an alert.
+6. **Notifications.** An urgent alert (malicious, a campaign indicator, a live credential, exploited,
+   critical, high and called) is told at once; the other alerts in one daily digest; quiet and muted
+   findings never.
+
+Settings (`memory.settings`, section `security`, all optional): `investigate` (true),
+`validate_secrets` (false), `notify` (`alerts`, `urgent` or `off`), `delta_minutes` (15),
+`full_hours` (24). The per-project dependency watch routines an earlier version made are ended at
+the first full sweep. The install gate (the tools plugin, before an install command runs) checks
+the same live sources and adds a note when the version an install takes was published less than
+three days ago or runs an install script.
+
 ## The Security tab's controls
 
 The package `ui/security` (`skills-security.pane`) reads `memory.security.summary`,
 `memory.security.findings` and `memory.security.finding`, follows `memory.security.changed`, and
 writes through `memory.security.finding.update` as `by: "user"`:
 
+- The scope: This project, or All projects (every project's alerts by severity, the urgent ones,
+  what is being investigated, what the filter set aside, the settings gaps; the problems several
+  projects share with the upgrade that fixes them everywhere; "Am I hit?" for a package, a version,
+  an advisory or a campaign file; what the sweep found on the computer itself). The sentinel's line:
+  the running sweep, else when the advisories were last read, a source that is down, and "Sweep now".
+- The list: alerts, investigations and findings not judged yet in colour, each with the filter's
+  reason under its title; what the filter set aside (quiet, muted) grey under one fold.
+- A finding's Filter block: the judgment, who made it, the reason, the reachability, an
+  investigation's evidence and its session; "Investigate", "Mute…" (this finding, the same in every
+  project, the package, the advisory, the class in this folder), "Unmute", "Judge again".
 - The head bar: the last audit (when, units, lines judged) and "Audit now", which creates a chat
   session "Security audit" and sends `security audit of this codebase` as its first message with
   the person's default mode, as the composer does.

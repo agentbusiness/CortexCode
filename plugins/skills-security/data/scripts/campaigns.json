@@ -1,0 +1,93 @@
+{
+  "about": "Supply-chain campaign indicators the security sweep checks in every project and on this computer. Behaviour shapes first (they catch the next variant); names and hashes of the known waves after. Malicious package versions themselves come live from OSV (MAL- records), not from here.",
+  "hook_shapes": [
+    {"regex": "\\bnode\\s+(?:\\./)?setup_bun\\.js\\b", "campaign": "Shai-Hulud 2.0", "why": "installs Bun and runs the bun_environment.js credential stealer"},
+    {"regex": "\\bnode\\s+(?:\\./)?bundle\\.js\\b", "campaign": "Shai-Hulud", "why": "the worm's bundle.js: TruffleHog over the machine, then republishes the victim's packages"},
+    {"regex": "\\bnode\\s+(?:\\./)?setup\\.mjs\\b", "campaign": "ChainDrop", "why": "the ChainDrop dropper: stage two steals npm, GitHub and cloud tokens and republishes"},
+    {"regex": "\\bnode\\s+(?:\\./)?telemetry\\.js\\b", "campaign": "s1ngularity (nx)", "why": "the nx dropper: inventories secrets and wallets, drives local AI CLIs with permission checks off"},
+    {"regex": "\\bbun\\s+run\\s+(?:\\./)?tanstack_runner\\.js\\b", "campaign": "Mini Shai-Hulud", "why": "the TanStack worm's runner, started from a prepare script"},
+    {"regex": "curl\\s+-[a-zA-Z]*\\s+https?://bun\\.sh/install\\s*\\|\\s*(?:ba)?sh", "campaign": "Shai-Hulud family", "why": "an install script that downloads Bun to run a payload outside Node's view"},
+    {"regex": "(?:curl|wget)\\b[^|;&]*\\|\\s*(?:ba|z)?sh\\b", "campaign": "install-time download", "why": "an install script that pipes a download into a shell"},
+    {"regex": "\\bnode\\s+-e\\s+[\"'][^\"']*(?:Buffer\\.from|atob|eval)\\(", "campaign": "obfuscated hook", "why": "an install script that decodes and runs hidden code"}
+  ],
+  "strings": [
+    {"regex": "trufflehog|TruffleHog", "why": "downloads or runs TruffleHog to harvest secrets"},
+    {"regex": "webhook\\.site/", "why": "sends data to webhook.site"},
+    {"regex": "169\\.254\\.169\\.254|169\\.254\\.170\\.2", "why": "reads cloud instance credentials (IMDS)"},
+    {"regex": "registry\\.npmjs\\.org/-/v1/search\\?text=maintainer:", "why": "lists the victim's npm packages to republish them"},
+    {"regex": "/-/npm/v1/tokens", "why": "creates npm tokens"},
+    {"regex": "\\.npmrc", "why": "reads the npm credentials file"},
+    {"regex": "GITHUB_TOKEN|ghp_|gho_|github_pat_", "why": "reaches for GitHub tokens"},
+    {"regex": "\"isSecret\":true", "why": "scrapes secrets from a CI runner's memory"},
+    {"regex": "npm\\s+publish|npm-publish", "why": "publishes packages from an install script"},
+    {"regex": "toJSON\\(secrets\\)", "why": "writes every repository secret into a file"},
+    {"regex": "az\\s+account\\s+get-access-token|gcloud\\s+auth\\s+print-access-token|aws\\s+sts\\s+get-caller-identity", "why": "asks cloud CLIs for tokens"},
+    {"regex": "IfYouRevokeThisTokenItWillWipe|IfYouBlockThisAPIKeyItWillCrash|thebeautifulmarchoftime|svksjrhjkcejg", "why": "a string of the 2026 worms"},
+    {"regex": "Sha1-Hulud|Shai-Hulud|A Mini Shai-Hulud has Appeared|Miasma: The Spreading Blight|Hades . The End for the Damned", "why": "a campaign's own marker"},
+    {"regex": "--dangerously-skip-permissions|gemini\\s+--yolo|--trust-all-tools", "why": "drives a local AI CLI with its permission checks off"},
+    {"regex": "Exiting as russian language detected", "why": "the ChainDrop stage-two check"},
+    {"regex": "npm-cache\\.com/router|api\\.masscan\\.cloud|filev2\\.getsession\\.org|git-tanstack\\.com|models\\.litellm\\.cloud|sfrclak\\.com|pypi-get\\.com|js-mirror\\.com|npmjs\\.help", "why": "a campaign's exfiltration or phishing host"}
+  ],
+  "pth_shapes": [
+    {"regex": "(?:exec|eval)\\s*\\(", "why": "a .pth line that executes code"},
+    {"regex": "base64|b64decode|codecs\\.decode|zlib\\.decompress", "why": "a .pth line that decodes a hidden payload"},
+    {"regex": "subprocess|os\\.system|urllib|requests|socket", "why": "a .pth line that starts programs or opens the network"}
+  ],
+  "files": [
+    {"name": "setup_bun.js", "where": "any", "campaign": "Shai-Hulud 2.0", "why": "the Shai-Hulud 2.0 dropper"},
+    {"name": "bun_environment.js", "where": "any", "campaign": "Shai-Hulud 2.0", "why": "the Shai-Hulud 2.0 credential stealer"},
+    {"name": "router_init.js", "where": "any", "campaign": "Mini Shai-Hulud", "why": "the TanStack worm's payload", "contains": "bun|trufflehog|isSecret|169\\.254"},
+    {"name": "tanstack_runner.js", "where": "any", "campaign": "Mini Shai-Hulud", "why": "the TanStack worm's runner"},
+    {"name": "router_runtime.js", "where": "any", "campaign": "Mini Shai-Hulud", "why": "the TanStack worm's persistence under .claude/"},
+    {"name": "math_init.js", "where": "any", "campaign": "ChainDrop", "why": "ChainDrop's stage two"},
+    {"name": "Math_Symbol.js", "where": "any", "campaign": "ChainDrop", "why": "ChainDrop's stage two"},
+    {"name": "truffleSecrets.json", "where": "repo", "campaign": "Shai-Hulud 2.0", "why": "a Shai-Hulud exfiltration file"},
+    {"name": "actionsSecrets.json", "where": "repo", "campaign": "Shai-Hulud 2.0", "why": "a Shai-Hulud exfiltration file"},
+    {"name": "results.b64", "where": "repo", "campaign": "s1ngularity (nx)", "why": "the nx stealer's exfiltration file"},
+    {"name": "-setup.pth", "where": "any", "campaign": "Hades", "why": "the Hades persistence file"},
+    {"name": "litellm_init.pth", "where": "any", "campaign": "TeamPCP", "why": "the litellm compromise's persistence file"}
+  ],
+  "persistence": [
+    {"path": ".claude/setup.mjs", "campaign": "ChainDrop / Mini Shai-Hulud", "why": "a worm's loader planted where Claude Code starts it"},
+    {"path": ".claude/router_runtime.js", "campaign": "Mini Shai-Hulud", "why": "the TanStack worm's runtime"},
+    {"path": ".claude/math_init.js", "campaign": "ChainDrop", "why": "ChainDrop's stage two"},
+    {"path": ".vscode/setup.mjs", "campaign": "ChainDrop / Mini Shai-Hulud", "why": "a worm's loader planted beside a folder-open task"},
+    {"path": ".cursor/rules/setup.mdc", "campaign": "Miasma", "why": "a rule file the binding.gyp worm plants"}
+  ],
+  "machine": [
+    {"path": "~/Library/LaunchAgents/com.user.gh-token-monitor.plist", "campaign": "Mini Shai-Hulud / ChainDrop", "why": "a launch agent that re-steals GitHub tokens"},
+    {"path": "~/.config/systemd/user/gh-token-monitor.service", "campaign": "Mini Shai-Hulud / ChainDrop", "why": "a service that re-steals GitHub tokens"},
+    {"path": "~/.local/bin/gh-token-monitor.sh", "campaign": "Mini Shai-Hulud / ChainDrop", "why": "the token monitor's script"},
+    {"path": "~/.config/gh-token-monitor/token", "campaign": "Mini Shai-Hulud / ChainDrop", "why": "a token the monitor stole"},
+    {"path": "/Library/Caches/com.apple.act.mond", "campaign": "axios (plain-crypto-js)", "why": "the axios compromise's macOS second stage"},
+    {"path": "/tmp/ld.py", "campaign": "axios (plain-crypto-js)", "why": "the axios compromise's Linux second stage"},
+    {"path": "/tmp/inventory.txt", "campaign": "s1ngularity (nx)", "why": "the nx stealer's inventory of secret files"},
+    {"path": "/tmp/processor.sh", "campaign": "Shai-Hulud", "why": "the worm's helper script"},
+    {"path": "/tmp/migrate-repos.sh", "campaign": "Shai-Hulud", "why": "the worm's script that makes private repositories public"}
+  ],
+  "machine_lines": [
+    {"path": "~/.zshrc", "regex": "sudo\\s+shutdown\\s+-h\\s+0", "campaign": "s1ngularity (nx)", "why": "a shutdown planted in the shell's start file"},
+    {"path": "~/.bashrc", "regex": "sudo\\s+shutdown\\s+-h\\s+0", "campaign": "s1ngularity (nx)", "why": "a shutdown planted in the shell's start file"}
+  ],
+  "workflow_names": [
+    {"regex": "^shai-hulud-workflow\\.ya?ml$", "why": "the Shai-Hulud exfiltration workflow"},
+    {"regex": "^formatter_\\d+\\.ya?ml$", "why": "the Shai-Hulud 2.0 workflow that dumps secrets into an artifact"},
+    {"regex": "^discussion\\.ya?ml$", "why": "the Shai-Hulud 2.0 backdoor: a discussion's body runs on a self-hosted runner", "contains": "self-hosted"}
+  ],
+  "sha256": {
+    "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09": "Shai-Hulud bundle.js",
+    "a3894003ad1d293ba96d77881ccd2071446dc3f65f434669b49b3da92421901a": "Shai-Hulud 2.0 setup_bun.js",
+    "62ee164b9b306250c1172583f138c9614139264f889fa99614903c12755468d0": "Shai-Hulud 2.0 bun_environment.js",
+    "f099c5d9ec417d4445a0328ac0ada9cde79fc37410914103ae9c609cbc0ee068": "Shai-Hulud 2.0 bun_environment.js",
+    "cbb9bc5a8496243e02f3cc080efbe3e4a1430ba0671f2e43a202bf45b05479cd": "Shai-Hulud 2.0 bun_environment.js",
+    "ab4fcadaec49c03278063dd269ea5eef82d24f2124a8e15d7b90f2fa8601266c": "Mini Shai-Hulud router_init.js",
+    "2ec78d556d696e208927cc503d48e4b5eb56b31abc2870c2ed2e98d6be27fc96": "Mini Shai-Hulud tanstack_runner.js",
+    "54dc7ea54a1317cca0e890a2770630cf7fa6c97813e0cb9d2caa93012b350668": "ChainDrop setup.mjs",
+    "fd3ca4007b225fdf8de7af4345a19179d5efa8c4bb9205f88cda806e5684b1eb": "ChainDrop setup.mjs",
+    "9fc2570b7cef51c1b8df116d144d11ff4096357be7d2c4c6367cfc2509cf1bcc": "ChainDrop Math_Symbol.js",
+    "dc48b09b2a5954f7ff79ab8a2fd80202bd3b59c08c7cdbc6025aa923cb4c0efe": "Hades _index.js",
+    "e1342a80d4b5e83d2c7c22e1e0aaa95f2d88e3dbf0d853a4994b180c93a4b17d": "Hades _index.js",
+    "c539766062555d47716f8432e73adbe3a0c0c954a0b6c4005017a668975e275c": "Hades -setup.pth"
+  },
+  "hash_names": ["bundle.js", "setup_bun.js", "bun_environment.js", "router_init.js", "tanstack_runner.js", "setup.mjs", "Math_Symbol.js", "math_init.js", "_index.js", "-setup.pth", "index.js"]
+}

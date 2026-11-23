@@ -45,6 +45,8 @@ pub mod runner;
 pub mod schedule;
 #[cfg(feature = "service")]
 pub mod service;
+#[cfg(feature = "security")]
+pub mod security;
 #[cfg(feature = "skills")]
 pub mod skills;
 #[cfg(feature = "source")]

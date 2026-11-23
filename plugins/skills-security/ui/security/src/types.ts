@@ -142,7 +142,24 @@ export interface SecurityFinding {
   sink_package?: string | null;
   sink_version?: string | null;
   notified_ms?: number | null;
+  /** The filter's judgment; absent: not judged yet. */
+  triage?: SecurityTriageValue | null;
+  triage_reason?: string | null;
+  /** `host`, `model`, `investigation` or `user`. */
+  triage_by?: string | null;
+  triage_ms?: number | null;
+  /** `called`, `imported`, `not_imported`, `transitive`, `dev` or `unknown`. */
+  reachable?: string | null;
+  /** The facts an investigation compiled. */
+  evidence?: string[];
+  muted_by?: string | null;
+  investigation_session?: string | null;
+  /** The same problem across projects. */
+  fleet_key?: string | null;
 }
+
+/** What the filter decided: shown in colour (`alert`, `investigating`, not judged yet) or kept grey (`quiet`, `muted`). */
+export type SecurityTriageValue = 'alert' | 'investigating' | 'quiet' | 'muted';
 
 /** One lifecycle move of a finding. */
 export interface SecurityStatusChange {
@@ -152,6 +169,8 @@ export interface SecurityStatusChange {
   ms: number;
   session_id?: string | null;
   commit?: string | null;
+  /** Set for a judgment of the filter. */
+  triage?: string | null;
 }
 
 /** `memory.security.findings` parameters. */
@@ -203,6 +222,11 @@ export interface SecuritySummary {
   by_severity: Record<string, number>;
   /** Open and fixing findings whose dependency is exploited in the wild (CISA KEV). */
   kev?: number;
+  /** Open and fixing findings by the filter's judgment. */
+  alerts?: number;
+  investigating?: number;
+  quiet?: number;
+  pending?: number;
 }
 
 /** `memory.security.recheck` result: what the host saw of each finding's sink. */
@@ -222,4 +246,106 @@ export interface SecurityChanged {
   project_id: string;
   id?: string | null;
   status?: string | null;
+}
+
+// ---- the security sentinel (`skills-security.*`, protocol/src/contracts/security.rs) ----
+
+export interface SweepProgress {
+  kind: string;
+  phase: string;
+  done: number;
+  total: number;
+  note: string;
+  started_ms: number;
+}
+
+export interface FeedState {
+  name: string;
+  checked_ms?: number | null;
+  ok: boolean;
+  note: string;
+}
+
+export interface SweepRecord {
+  kind: string;
+  started_ms: number;
+  finished_ms: number;
+  projects: number;
+  packages: number;
+  findings: number;
+  alerts: number;
+  quiet: number;
+  errors: string[];
+}
+
+export interface SentinelStatus {
+  running?: SweepProgress | null;
+  last?: SweepRecord | null;
+  next_delta_ms?: number | null;
+  next_full_ms?: number | null;
+  feeds: FeedState[];
+  judging: number;
+  investigations: number;
+  machine: string[];
+}
+
+export interface FleetProject {
+  project_id: string;
+  name: string;
+  root: string;
+  open: number;
+  alerts: number;
+  investigating: number;
+  quiet: number;
+  pending: number;
+  by_severity: Record<string, number>;
+  urgent: number;
+  posture: string[];
+  last_audit_ms?: number | null;
+  error?: string | null;
+}
+
+export interface FleetGroup {
+  key: string;
+  title: string;
+  severity: string;
+  triage: string;
+  project_ids: string[];
+  fix?: string | null;
+}
+
+export interface Fleet {
+  projects: FleetProject[];
+  groups: FleetGroup[];
+  status: SentinelStatus;
+}
+
+export type MuteKind = 'finding' | 'similar' | 'package' | 'advisory' | 'path';
+
+export interface MuteRule {
+  key: string;
+  kind: MuteKind | string;
+  label: string;
+  note: string;
+  created_ms: number;
+  until_ms?: number | null;
+}
+
+export interface AffectedHit {
+  project_id: string;
+  name: string;
+  what: string;
+  path: string;
+}
+
+export interface AffectedResult {
+  query: string;
+  hits: AffectedHit[];
+  checked: number;
+  note: string;
+}
+
+export interface InvestigateResult {
+  session_id?: string | null;
+  queued: boolean;
 }

@@ -79,6 +79,11 @@ pub mod methods {
     /// severity, fixed?, command?}]}`: the project's locked dependencies checked against OSV.
     /// Shared as `tools.security` version 1; only for apps on this machine.
     pub const SECURITY_DEPS: &str = "tools.security.deps.get";
+    /// `{items: [{id, kind, title, facts: [string]}]}` -> `{verdicts: [{id, decision, reason}]}`:
+    /// the security filter's one-line judgment of another app's events (decision `dismiss`, `note`,
+    /// `alert` or `investigate`), answered by the security plugin's sentinel with the local model.
+    /// Shared as `tools.security` version 1; only for apps on this machine.
+    pub const SECURITY_JUDGE: &str = "tools.security.judge.get";
     /// [`super::McpListParams`] -> [`super::McpListResult`]: the model tools of a command's session
     /// as MCP tools (`cx mcp`, the server a frontier CLI starts): the same specs and guide the chat
     /// flow's models get. A command in the model's shells may call it.

@@ -19,7 +19,7 @@ use cc_protocol::contracts::memory::{
     AgentListParams, AgentListResult, AgentRecord, BoardListParams, BoardListResult, BoardPostParams, DescribeParams, EdgesParams, FilesParams, ImpactParams, LinesParams,
     KnowledgeBriefParams, KnowledgeCountParams, KnowledgeGetParams, KnowledgeItem, KnowledgeLinkParams, KnowledgeLinkedParams, KnowledgeListParams, KnowledgeListResult, KnowledgeSearchParams, KnowledgeSupersedeParams, KnowledgeUpsertParams, KnowledgeWithdrawParams,
     NoteAddParams, NoteListParams, NoteListResult, NoteRemoveParams, NoteRemoveResult, NoteSearchParams, FocusParams, OutlineParams, PathParams, ProjectCloseParams, ProjectCloseResult, ProjectInfo, ProjectListResult, ProjectOpenParams, ProjectStatus, RepoMapParams, Rule, RuleListParams, RuleListResult, RunRecordParams,
-    RunRecordResult, Scope, SearchParams, SecurityAdvisoriesPutParams, SecurityAuditPutParams, SecurityAuditStartParams, SecurityAuditStateParams, SecurityChanged, SecurityFinding, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecurityHitsPutParams, SecurityRecheckParams, SecurityRecheckResult, SecuritySummaryParams, SecurityUnitsPutParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
+    RunRecordResult, Scope, SearchParams, SecurityAdvisoriesPutParams, SecurityAuditPutParams, SecurityAuditStartParams, SecurityAuditStateParams, SecurityChanged, SecurityFindingParams, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityFindingsPutParams, SecurityFindingsResult, SecurityHitsPutParams, SecurityTriagePutParams, SecurityRecheckParams, SecurityRecheckResult, SecuritySummaryParams, SecurityUnitsPutParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsListResult, SettingsSetParams, StyleEntry, StyleListParams, StyleListResult, SymbolParams, TaskCreateParams, TaskGetParams, TaskListParams,
     TaskListResult, TaskUpdateParams, UndescribedParams, WorkspaceParams, methods, topics,
     Routine, RoutineListParams, RoutineListResult, RoutineRun, RoutineRunsParams, RoutineRunsResult,
 };
@@ -156,6 +156,8 @@ pub const COMMANDS: &[&str] = &[
     methods::SECURITY_FINDING_UPDATE,
     methods::SECURITY_RECHECK,
     methods::SECURITY_SUMMARY,
+    // Only the investigation session of a finding may record its verdict (the store checks).
+    methods::SECURITY_TRIAGE_PUT,
     methods::TASK_LIST,
     methods::TASK_GET,
     methods::TASK_CREATE,
@@ -227,6 +229,7 @@ pub const PROVIDES: &[&str] = &[
     methods::SECURITY_RECHECK,
     methods::SECURITY_SUMMARY,
     methods::SECURITY_FORGET,
+    methods::SECURITY_TRIAGE_PUT,
     methods::BOARD_POST,
     methods::BOARD_LIST,
     methods::AGENT_UPSERT,
@@ -926,44 +929,6 @@ impl Memory {
         self.registered_root(project_id).await?.ok_or_else(|| RpcError::not_found(format!("project {project_id} is not open; call memory.project.open first")))
     }
 
-    /// Tell the person about findings the dependency watch found (each once; the store marked them).
-    fn notify_findings(&self, project_id: &str, findings: Vec<SecurityFinding>) {
-        use cc_protocol::contracts::notify::{Notification, kinds, methods as notify_methods};
-        if findings.is_empty() {
-            return;
-        }
-        let Some(ctx) = self.ctx.get().cloned() else { return };
-        let project_id = project_id.to_owned();
-        tokio::spawn(async move {
-            for finding in findings {
-                let severity = finding.severity_overall.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "unrated".into());
-                // Critical and known-exploited ones are the report kind; the other high ones are notices.
-                let kind = if finding.kev || severity == "critical" { kinds::REPORT } else { kinds::INFO };
-                let mut facts = vec![format!("{severity} severity")];
-                if finding.kev {
-                    facts.push("exploited in the wild (CISA KEV)".into());
-                }
-                if let Some(epss) = finding.epss {
-                    facts.push(format!("EPSS {:.0}%", epss * 100.0));
-                }
-                let notification = Notification {
-                    kind: kind.into(),
-                    title: format!("Security: {}", finding.title),
-                    body: format!("{}. Open the Security tab to fix it.", facts.join(", ")),
-                    key: Some(format!("security:{project_id}:{}", finding.id)),
-                    project_id: Some(project_id.clone()),
-                    session_id: None,
-                    target: json!({"project_id": project_id, "view": "security"}),
-                    actions: vec!["Open".into()],
-                    subtitle: finding.sink_path.clone(),
-                };
-                if let Err(error) = ctx.call(notify_methods::SEND, serde_json::to_value(&notification).unwrap_or(Value::Null)).await {
-                    tracing::warn!(error = %error.message, finding = %finding.id, "security notification not sent");
-                }
-            }
-        });
-    }
-
     /// A session ended (its turn finished, failed or was cancelled, or it was deleted): the findings
     /// it was fixing without a recorded fix are open again.
     async fn security_session_ended(&self, project_id: &str, session_id: &str) {
@@ -1573,7 +1538,6 @@ impl Memory {
                 self.refuse_reference(&p.project_id, "security findings").await?;
                 let root = self.security_root(&p.project_id, p.workspace.as_deref()).await?;
                 let outcome = self.security(&p.project_id).await?.findings_put(p.audit_id.as_deref(), p.findings, &root).await?;
-                self.notify_findings(&p.project_id, outcome.notify);
                 self.security_changed(&p.project_id, None, None);
                 to_value(&SecurityFindingsResult { findings: outcome.findings, notes: outcome.notes })
             }
@@ -1612,6 +1576,16 @@ impl Memory {
             methods::SECURITY_SUMMARY => {
                 let p: SecuritySummaryParams = parse_params(params)?;
                 to_value(&self.security(&p.project_id).await?.summary().await?)
+            }
+            methods::SECURITY_TRIAGE_PUT => {
+                let caller = security_caller(&params);
+                let p: SecurityTriagePutParams = parse_params(params)?;
+                self.refuse_reference(&p.project_id, "security findings").await?;
+                let outcome = self.security(&p.project_id).await?.triage_put(p.items, &caller).await?;
+                for finding in &outcome.findings {
+                    self.security_changed(&p.project_id, Some(&finding.id), Some(&finding.status));
+                }
+                to_value(&SecurityFindingsResult { findings: outcome.findings, notes: outcome.notes })
             }
             methods::SECURITY_FORGET => {
                 if security_caller(&params).command_session.is_some() {

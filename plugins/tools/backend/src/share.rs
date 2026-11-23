@@ -45,6 +45,22 @@ pub fn shares() -> ShareList {
                 }),
             ),
             method(
+                methods::SECURITY_JUDGE,
+                "Judge security events in one line each: dismiss (normal), note, alert (tell the person) or investigate. The local model decides from the facts given, with the security filter's rules.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {"type": "array", "items": {"type": "object", "properties": {
+                            "id": {"type": "string"},
+                            "kind": {"type": "string", "description": "process, network, file, package, config, login, persistence or other"},
+                            "title": {"type": "string"},
+                            "facts": {"type": "array", "items": {"type": "string"}, "description": "What the caller knows, one fact each (signed by, listens on, path, parent process)."}
+                        }, "required": ["id", "kind", "title"]}}
+                    },
+                    "required": ["items"]
+                }),
+            ),
+            method(
                 methods::SECURITY_DEPS,
                 "Check a project's locked dependencies against OSV. Answers each vulnerable package with its advisories, the version that fixes them and the command that upgrades it.",
                 json!({
@@ -122,6 +138,22 @@ pub async fn security(method: &str, params: Value) -> Result<Value, RpcError> {
             Err(RpcError::internal(format!("the check failed: {error}")))
         }
     }
+}
+
+/// `tools.security.judge.get`: another app's events, judged by the security plugin's sentinel
+/// (`skills-security.judge`). Only apps on this machine.
+pub async fn judge(host: &dyn crate::host::Host, params: Value) -> Result<Value, RpcError> {
+    if let Some(caller) = params.get("caller").filter(|caller| !caller.is_null()) {
+        let caller: Caller = serde_json::from_value(caller.clone()).map_err(|error| RpcError::invalid_params(format!("caller: {error}")))?;
+        if !caller.local {
+            return Err(RpcError::new(codes::CONTRACT_VIOLATION, "`tools.security.judge.get` answers only apps on this machine".to_owned()));
+        }
+    }
+    let items = params.get("items").cloned().unwrap_or(Value::Null);
+    if !items.is_array() {
+        return Err(RpcError::invalid_params("`items` is a list of {id, kind, title, facts}"));
+    }
+    host.call("skills-security.judge", json!({"items": items})).await
 }
 
 /// The audit script in the live folder (`<home>/live/plugins/skills-security/data/scripts`).

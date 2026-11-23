@@ -8,7 +8,7 @@
     python3 secaudit.py cover <unit> covered|candidate|blocked ["<note>"]
     python3 secaudit.py new confirmed|needs_validation|rejected
     python3 secaudit.py finding <file.json>
-    python3 secaudit.py status [--fixing | --finding <id> | --unit <id>]   (exit 0 once the work is done)
+    python3 secaudit.py status [--fixing | --investigating | --finding <id> | --unit <id>]   (exit 0 once the work is done)
     python3 secaudit.py show <id>                   one finding from the project's graph, for a fix session
     python3 secaudit.py fix-plan <id>               the exact upgrade commands of a dependency finding
     python3 secaudit.py recheck [<id>]              what the code says now; the host moves what it sees fixed
@@ -19,6 +19,10 @@
     python3 secaudit.py deps [--json] [--root <dir>]                   --json: one JSON object, nothing written
     python3 secaudit.py check-change [--root <dir>]                    the working tree's own changes: silent when clean, exit 3 with findings
     python3 secaudit.py watch [--root <dir>]                           the dependency watch: new advisories since the last one
+    python3 secaudit.py fleet --json --root <dir>... [--since <ms>] [--full] [--stamp <dir>=<stamp>...] [--validate]
+                                                    the security sentinel's sweep of every project (one JSON object, nothing written)
+    python3 secaudit.py affected --json --query <package|name@version|advisory|file> --root <dir>...
+    python3 secaudit.py verdict <id> alert|quiet "<reason>" --evidence "<fact>"...   an investigation's verdict
     python3 secaudit.py cve <GHSA-... | CVE-...>
 
 Runs from the repository root (every CortexCode `run` starts there). The audit's records (its map,
@@ -44,6 +48,7 @@ The code shapes searched for (`classes-*.json` beside this file) are this tool's
 reference text shipped with it; a hit is a question to trace, never a finding.
 """
 
+import calendar
 import concurrent.futures
 import fnmatch
 import hashlib
@@ -66,7 +71,6 @@ OUT_DEFAULT = "tmp/secaudit"
 MAX_FILE_BYTES = 1_000_000
 HITS_SHOWN = 40
 HITS_PER_PATTERN = 12
-HISTORY_COMMITS = 200
 OSV_URL = "https://api.osv.dev/v1/"
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId="
 CWE_URL = "https://cwe-api.mitre.org/api/v1/cwe/weakness/"
@@ -1071,13 +1075,17 @@ def scan_texts(catalog, texts, class_ids=None, markers=True):
 # ----------------------------------------------------------------------------- AI-agent files
 
 AGENT_DIRS = {".claude", ".cursor", ".vscode", ".codex", ".continue", ".gemini", ".windsurf", ".amazonq", ".github"}
-AGENT_CONFIGS = [".mcp.json", "mcp.json", ".cursor/mcp.json", ".vscode/mcp.json", "claude_desktop_config.json", ".claude/settings.json", ".claude/settings.*.json", ".claude/settings.local.json", ".codex/config.toml", ".continue/config.json", ".continue/config.yaml", ".gemini/settings.json", ".windsurf/mcp.json", ".amazonq/mcp.json", "opencode.json"]
+AGENT_CONFIGS = [".mcp.json", "mcp.json", ".cursor/mcp.json", ".vscode/mcp.json", "claude_desktop_config.json", ".claude/settings.json", ".claude/settings.*.json", ".claude/settings.local.json", ".codex/config.toml", ".continue/config.json", ".continue/config.yaml", ".gemini/settings.json", ".windsurf/mcp.json", ".amazonq/mcp.json", "opencode.json", ".vscode/tasks.json", ".vscode/settings.json", ".devcontainer/devcontainer.json", ".devcontainer.json", ".gemini/settings.json", ".cursor/settings.json"]
 AGENT_INSTRUCTIONS = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", ".windsurfrules", ".github/copilot-instructions.md", "SKILL.md", ".cursor/rules/*.mdc", ".claude/commands/*.md", ".claude/agents/*.md", ".github/instructions/*.md", ".github/prompts/*.md"]
 SERVER_KEYS = ("mcpServers", "servers", "mcp_servers", "context_servers", "mcp")
 RUNNERS = {"npx": "npm", "bunx": "npm", "pnpx": "npm", "uvx": "pypi", "pipx": "pypi"}
 BYPASS_FLAGS = ("--dangerously-skip-permissions", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--trust-all-tools", "--allow-all-tools")
 DOWNLOAD_PLACE = re.compile(r"(^|[\s='\"])(/tmp/|/var/tmp/|/private/tmp/|~/Downloads/|\$HOME/Downloads/|/Users/[^/]+/Downloads/|/home/[^/]+/Downloads/|[A-Za-z]:\\Users\\[^\\]+\\Downloads\\)")
 ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\u2062", "\u2063", "\u2064", "\ufeff", "\u180e"}
+# Variation selectors carry no glyph: runs of them smuggle bytes past a reader.
+VARIATION = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]{4,}")
+# Hosts a coding agent's API endpoint may point at; another host receives its key.
+OFFICIAL_API_HOSTS = ("api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com", "bedrock-runtime", "aiplatform.googleapis.com", "openai.azure.com", "localhost", "127.0.0.1")
 BIDI = {chr(c) for c in list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A))}
 WHITESPACE_RUN = re.compile(r"[ \t]{120,}\S")
 HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.S)
@@ -1280,6 +1288,10 @@ def hidden_text_hits(rel, text):
         controls = sorted({"U+%04X" % ord(ch) for ch in line if ch in BIDI})
         if controls:
             out.append((rel, number, "agent instructions: bidirectional control characters", "%s reorders what a person sees on this line" % ", ".join(controls)))
+        if "\x1b" in line:
+            out.append((rel, number, "agent instructions: terminal escape codes", "an ANSI escape sequence rewrites what a terminal shows of this line"))
+        if VARIATION.search(line):
+            out.append((rel, number, "agent instructions: hidden characters", "a run of variation selectors carries data no reader sees"))
         if WHITESPACE_RUN.search(line):
             out.append((rel, number, "agent instructions: text pushed out of view", "a run of %d spaces hides the text after it: %s" % (len(WHITESPACE_RUN.search(line).group(0)) - 1, shown(line.strip(), 100))))
     for match in HTML_COMMENT.finditer(text):
@@ -1357,6 +1369,50 @@ def agent_config_hits(rel, text):
                     bypass.append((key, "%s is true" % path))
     for needle, what in bypass:
         out.append((rel, line_of(text, needle if len(needle) < 60 else needle[:60]), "agent config: permission checks turned off", what, None))
+    out.extend(agent_command_hits(rel, text, data))
+    return out
+
+
+def agent_command_hits(rel, text, data):
+    """Settings that run a command when an agent or editor opens the folder, or send an agent's key
+    to another host: Claude Code hooks and helpers, auto-enabled MCP servers, VS Code folder-open
+    tasks and auto-approval, dev-container host commands. [(rel, line, shape, text, signal)]."""
+    out = []
+    if not isinstance(data, dict):
+        return out
+    name = os.path.basename(rel)
+    if "/.claude/" in "/" + rel or name.startswith("settings"):
+        for event, entries in (data.get("hooks") or {}).items() if isinstance(data.get("hooks"), dict) else []:
+            commands = [h.get("command") for group in (entries or []) if isinstance(group, dict) for h in (group.get("hooks") or []) if isinstance(h, dict) and h.get("command")]
+            for command in commands:
+                out.append((rel, line_of(text, str(command)[:40]), "agent config: hook runs a command", "the %s hook runs `%s` whenever the agent starts or acts here" % (event, shown(str(command), 80)), None))
+        for key in ("apiKeyHelper", "statusLine", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper", "fileSuggestion"):
+            value = data.get(key)
+            command = value.get("command") if isinstance(value, dict) else value
+            if isinstance(command, str) and command.strip():
+                out.append((rel, line_of(text, key), "agent config: helper runs a command", "%s runs `%s`" % (key, shown(command, 80)), None))
+        if data.get("enabledMcpjsonServers"):
+            out.append((rel, line_of(text, "enabledMcpjsonServers"), "agent config: permission checks turned off", "enabledMcpjsonServers starts the repository's MCP servers without asking", None))
+        for key, value in (data.get("env") or {}).items() if isinstance(data.get("env"), dict) else []:
+            if key.endswith("_BASE_URL") and isinstance(value, str) and not any(host in value for host in OFFICIAL_API_HOSTS):
+                out.append((rel, line_of(text, key), "agent config: API base URL sent elsewhere", "%s sends the agent's requests and its key to %s" % (key, shown(value, 60)), None))
+    if name == "tasks.json":
+        for task in data.get("tasks") or []:
+            if isinstance(task, dict) and ((task.get("runOptions") or {}).get("runOn") == "folderOpen"):
+                command = " ".join(str(part) for part in [task.get("command")] + list(task.get("args") or []) if part)
+                out.append((rel, line_of(text, "folderOpen"), "agent config: task runs a command when the folder opens", "VS Code runs `%s` when this folder opens (the 2026 worms persist this way)" % shown(command, 80), None))
+    if name == "settings.json" and "/.vscode/" in "/" + rel:
+        for key in ("chat.tools.autoApprove", "chat.tools.global.autoApprove", "chat.tools.terminal.enableAutoApprove"):
+            if data.get(key) is True:
+                out.append((rel, line_of(text, key), "agent config: permission checks turned off", "%s is true: the editor's agent runs tools without asking" % key, None))
+        if data.get("task.allowAutomaticTasks") == "on":
+            out.append((rel, line_of(text, "task.allowAutomaticTasks"), "agent config: task runs a command when the folder opens", "task.allowAutomaticTasks is on: folder-open tasks run without asking", None))
+    if name in ("devcontainer.json", ".devcontainer.json"):
+        command = data.get("initializeCommand")
+        if command:
+            out.append((rel, line_of(text, "initializeCommand"), "agent config: dev container runs a command on the host", "initializeCommand runs `%s` on this computer, outside the container" % shown(str(command), 80), None))
+        if data.get("privileged") is True or any("--privileged" in str(arg) or "docker.sock" in str(arg) for arg in data.get("runArgs") or []):
+            out.append((rel, line_of(text, "privileged"), "agent config: privileged dev container", "the container runs privileged or with the Docker socket: it controls the host", None))
     return out
 
 
@@ -1610,7 +1666,8 @@ def parse_flags(args, flags_with_values):
                     i += 1
                     if flags_with_values[name] == "one":
                         break
-                flags[name] = values if flags_with_values[name] == "many" else (values[0] if values else True)
+                # A repeated many-valued flag adds to the earlier values (`--root A --root B`).
+                flags[name] = (flags.get(name) or []) + values if flags_with_values[name] == "many" else (values[0] if values else True)
             else:
                 flags[name] = True
         else:
@@ -1621,28 +1678,48 @@ def parse_flags(args, flags_with_values):
 
 # ----------------------------------------------------------------------------- recon
 
-def history_secrets(root, catalog):
-    """Credential formats added in the last commits' diffs: [(short sha, file, pattern name, masked excerpt)]."""
-    log = git(["log", "-p", "-n", str(HISTORY_COMMITS), "--no-color", "--format=commit %h", "--", "."], root, limit=30_000_000)
-    if not log:
-        return []
+def facts_ci_files(files):
+    """The GitHub Actions workflows among the listed files."""
+    return [rel for rel in files if rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml"))]
+
+
+def history_secrets(root, catalog, since=None):
+    """Credential formats added anywhere in the git history (every commit reachable from HEAD), or
+    only in the commits after `since` when it is an ancestor of HEAD: ([(short sha, file, pattern
+    name, masked excerpt)], HEAD, commits read). Read as a stream, so a long history costs time,
+    never memory."""
+    head = (git(["rev-parse", "HEAD"], root) or "").strip()
+    if not head:
+        return [], None, 0
+    span = "HEAD"
+    if since and since != head:
+        ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", since, "HEAD"], cwd=root, capture_output=True)
+        if ancestor.returncode == 0:
+            span = "%s..HEAD" % since
+    elif since == head:
+        return [], head, 0
     patterns = [p for p in catalog.by_id["obvious"]["patterns"] if p["name"] in STRONG_PATTERNS or p["name"] in ("Google API key", "JWT literal")]
-    rows, sha, path, seen = [], "", "", set()
-    for line in log.split("\n"):
+    rows, sha, path, seen, commits = [], "", "", set(), 0
+    try:
+        process = subprocess.Popen(["git", "log", "-p", "--no-color", "--no-ext-diff", "--format=commit %h", span, "--", "."], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return [], head, 0
+    for raw in process.stdout:
+        line = raw.decode("utf-8", "replace").rstrip("\n")
         if line.startswith("commit "):
             sha = line[7:].strip()
+            commits += 1
         elif line.startswith("+++ b/"):
             path = line[6:].strip()
-        elif line.startswith("+") and not line.startswith("+++"):
+        elif line.startswith("+") and not line.startswith("+++") and len(line) < 4000:
             for pattern in patterns:
                 if (not pattern["needle"] or pattern["needle"] in line) and pattern["re"].search(line):
                     if (path, pattern["name"]) not in seen:
                         seen.add((path, pattern["name"]))
                         rows.append((sha, path, pattern["name"], shown(line[1:], 100)))
                     break
-        if len(rows) >= 30:
-            break
-    return rows
+    process.wait()
+    return rows, head, commits
 
 
 def hit_record(uid, index, cls_id, rel, number, shape, text, signal_kind=None, extra=None):
@@ -1703,7 +1780,15 @@ def cmd_recon(args):
     hits = scan_texts(catalog, texts)
     agent_files = sorted(set(getattr(repo_files, "agent_files", [])))
     agent = agent_hits(root, agent_files)
-    history = history_secrets(root, catalog)
+    campaigns = load_campaigns()
+    supply = [(rel, number, shape, text, "malicious" if signal == "malicious" else None) for rel, number, shape, text, signal, _ in supply_hits(root, files, campaigns)]
+    for rel in facts_ci_files(files):
+        supply.extend((rel_, number, shape, text, None) for rel_, number, shape, text, _, _ in ci_hits(rel, read_text(os.path.join(root, rel)) or ""))
+    for rel, number, check, text, fix in posture_hits(root, sorted(set(getattr(repo_files, "lockfiles", [])))):
+        supply.append((rel, number, "supply chain posture: %s" % check, "%s; fix: %s" % (text, fix), None))
+    ok_before, before_state = graph_call("memory.security.audit.state", {"project_id": pid})
+    since = (((before_state or {}).get("audit") or {}).get("history_head") if ok_before else None) or None
+    history, history_head, history_commits = history_secrets(root, catalog, since)
     rows, packages, not_parsed, deps_why, exploit_problems = live_deps(root)
 
     # What the host sees of the findings already known, before the new audit's units are made.
@@ -1736,6 +1821,8 @@ def cmd_recon(args):
         ok_, reason = applies_to(cls, facts, texts)
         if not ok_ and cls["id"] == "ai-llm-agent" and agent:
             ok_, reason = True, "AI-agent files: %s" % ", ".join(sorted({a[0] for a in agent})[:4])
+        if not ok_ and cls["id"] == "supply-chain-ci" and supply:
+            ok_, reason = True, "supply-chain signals: %s" % ", ".join(sorted({a[0] for a in supply})[:4])
         if not ok_:
             continue
         uid = "U%d" % (len([u for u in units if u["id"] != "U0"]) + 1)
@@ -1759,6 +1846,9 @@ def cmd_recon(args):
             if cls["id"] == "ai-llm-agent":
                 for (rel, number, shape, text, sig) in agent:
                     lines.append(hit_record(uid, len(lines) + 1, cls["id"], rel, number, shape, text, sig))
+            if cls["id"] == "supply-chain-ci":
+                for (rel, number, shape, text, sig) in supply:
+                    lines.append(hit_record(uid, len(lines) + 1, cls["id"], rel, number, shape, text, sig))
             if not lines:
                 lines = [hit_record(uid, 0, cls["id"], "", 0, "the unit", "no code shape of this class matched: read its 'look for' items against the entry points and handlers, then settle the unit")]
         unit["hits"] = sum(1 for h in lines if not h["id"].endswith(".0"))
@@ -1779,6 +1869,7 @@ def cmd_recon(args):
         "manifests": ["%s=%s" % m for m in facts["manifests"]], "lockfiles": facts["lockfiles"], "not_parsed": not_parsed, "ci": facts["ci"], "containers": facts["containers"],
         "iac": facts["iac"], "secret_files": facts["secret_files"], "agent_files": agent_files, "tests": bool(facts["tests"]),
         "deps_checked_ms": None if deps_why else started_ms, "deps_packages": len(packages), "deps_note": deps_why,
+        "history_head": history_head, "history_commits": history_commits,
     }
     state_after = write("memory.security.audit.start", {"project_id": pid, "audit": audit, "units": [unit_record(u) for u in units], "advisories": advisory_records(rows)}, "The audit")
     if not (state_after or {}).get("audit"):
@@ -1947,6 +2038,22 @@ def session_findings(pid):
 def cmd_status(args):
     positional, flags = parse_flags(args, {"finding": "one", "unit": "one"})
     root = os.getcwd()
+    # The investigation session's guard: exit 0 once every finding it investigates has a verdict.
+    if flags.get("investigating"):
+        session = os.environ.get("CORTEX_SESSION_ID")
+        if not session:
+            return
+        pid = require_app(root)
+        ok, result = graph_call("memory.security.findings", {"project_id": pid, "status": ["open", "fixing"], "triage": ["investigating"]})
+        if not ok:
+            fail("the investigation could not be read from the project's graph: %s" % result, APP_NEXT)
+        mine = [f for f in (result or {}).get("findings") or [] if f.get("investigation_session") == session]
+        if not mine:
+            return
+        for finding in mine:
+            print("Open: %s is still under investigation: %s" % (finding["id"], finding.get("title", "")))
+        print("Next: %s verdict %s alert|quiet \"<reason>\" --evidence \"<fact with path:line>\"" % (tool(), mine[0]["id"]))
+        sys.exit(1)
     # The fix session's guard: exit 0 once its finding is recorded fixed.
     if flags.get("fixing") or flags.get("finding"):
         pid = require_app(root)
@@ -2462,28 +2569,12 @@ WATCH_WHEN = "every day at 09:00"
 
 
 def ensure_watch(state):
-    """After a whole audit, the project's locked dependencies are watched daily for new advisories
-    (a command routine of the scheduler running `watch`; new high, critical or exploited ones reach
-    the person as notifications). One routine per project; an offline project gets none. Returns the
-    line to print when it was made now, else None (also when the scheduler is not there: the audit
-    stands without it)."""
+    """Every project of this computer is watched by the security sentinel (the plugin's backend:
+    new advisories every few minutes, a full sweep daily, only judged alerts reach the person), so an
+    audit makes no routine of its own. Returns the line to print, None for an offline project."""
     if offline_here(state.root):
         return None
-    ok, listed = graph_call("schedule.list", {"scope": state.pid})
-    if not ok:
-        return None
-    routines = (listed or {}).get("routines", []) if isinstance(listed, dict) else []
-    if any(r.get("title") == WATCH_TITLE and r.get("state") != "ended" for r in routines):
-        return None
-    # Absolute paths: the routine may run in the CortexTerm on this Mac, whose shell has no
-    # CORTEX_HOME of its own.
-    home = os.environ.get("CORTEX_HOME", "")
-    command = "%spython3 %s watch --root %s" % ("CORTEX_HOME=%s " % shlex.quote(home) if home else "", shlex.quote(str(Path(__file__).resolve())), shlex.quote(state.root))
-    params = {"scope": state.pid, "title": WATCH_TITLE, "kind": "command", "when": WATCH_WHEN, "command": command}
-    ok, _ = graph_call("schedule.add", params)
-    if not ok:
-        return None
-    return "The project's dependencies are now checked for new advisories %s (routine \"%s\"; new high, critical or exploited ones notify)." % (WATCH_WHEN, WATCH_TITLE)
+    return "The security sentinel keeps watching this project: new advisories and supply-chain signals are checked as they appear, and only what its filter judges an alert reaches you."
 
 
 def cmd_report(args):
@@ -3724,9 +3815,1017 @@ def cmd_resolve(args):
     print("Next: reply to the user with one line: what was changed (path:line), how it was verified, and that the finding is marked fixed.")
 
 
+# ----------------------------------------------------------------------------- the fleet sweep
+
+# The security sentinel (the plugin's backend) runs `fleet --json` over every project of this
+# computer: one process, one OSV batch for every pinned package of every project, the supply-chain,
+# CI, agent-file and credential checks of each tree. It writes nothing itself: it answers with the
+# findings, and the sentinel puts them into each project's graph, judges them and decides whom to
+# tell. A delta sweep (`--since <ms>`) reads only which advisories changed since then (OSV's export
+# of modified records, newest first) and re-checks the packages they name.
+
+OSV_EXPORT = "https://osv-vulnerabilities.storage.googleapis.com/"
+# The oldest delta a sweep reads from the change list: beyond it a full check is cheaper.
+DELTA_MAX_MS = 3 * 86_400_000
+FLEET_WORKERS = 8
+# Installed packages read per project (node_modules), by their package.json.
+INSTALLED_MAX = 40_000
+CAMPAIGNS_FILE = HERE / "campaigns.json"
+# Release cooldown: fewer days than this between a version's publication and its install is a gap.
+COOLDOWN_DAYS = 3
+
+
+def load_campaigns():
+    """The supply-chain campaign indicators shipped beside the tool (`campaigns.json`)."""
+    try:
+        with open(CAMPAIGNS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    for key in ("files", "hook_shapes", "workflow_names", "strings", "pth_shapes"):
+        data.setdefault(key, [])
+    data["_strings"] = [re.compile(item["regex"]) for item in data["strings"] if item.get("regex")]
+    data["_hooks"] = [(re.compile(item["regex"]), item) for item in data["hook_shapes"] if item.get("regex")]
+    data["_pth"] = [(re.compile(item["regex"]), item) for item in data["pth_shapes"] if item.get("regex")]
+    data["_files"] = {item["name"].lower(): item for item in data["files"] if item.get("name")}
+    data["_workflows"] = [(re.compile(item["regex"]), item) for item in data["workflow_names"] if item.get("regex")]
+    return data
+
+
+def norm_name(eco, name):
+    """A package name as registries compare it (PyPI folds case and `-_.`; npm, Go and the others
+    keep it, case folded where the registry does)."""
+    if eco == "PyPI":
+        return re.sub(r"[-_.]+", "-", name).lower()
+    if eco in ("npm", "crates.io", "RubyGems", "Packagist", "NuGet"):
+        return name.lower()
+    return name
+
+
+def parse_rfc3339_ms(text):
+    """`2026-11-23T17:31:22.46179925Z` -> epoch ms; None when it is not one."""
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$", text.strip())
+    if not match:
+        return None
+    seconds = calendar.timegm(tuple(int(match.group(i)) for i in range(1, 7)) + (0, 0, 0))
+    fraction = match.group(7) or "0"
+    return seconds * 1000 + int((fraction + "000")[:3])
+
+
+def osv_changed_since(ecosystems, since_ms):
+    """The advisory ids of `ecosystems` that changed after `since_ms`, from the head of OSV's change
+    list (newest first): ({id: ecosystem}, newest ms seen). Reads only until the first older line."""
+    request = urllib.request.Request(OSV_EXPORT + "modified_id.csv", headers={"User-Agent": "secaudit (CortexCode)"})
+    wanted = set(ecosystems)
+    changed, newest = {}, since_ms
+    with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT * 2) as response:
+        for raw in response:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            stamp, _, rest = line.partition(",")
+            ms = parse_rfc3339_ms(stamp)
+            if ms is None:
+                continue
+            if ms <= since_ms:
+                break
+            newest = max(newest, ms)
+            eco, _, ident = rest.rpartition("/")
+            if eco in wanted and ident:
+                changed[ident] = eco
+    return changed, newest
+
+
+def osv_flagged(keys):
+    """OSV's advisory ids for each (ecosystem, name, version): {key: [ids]} (only keys with some)."""
+    keys = list(keys)
+    flagged = {}
+    for start in range(0, len(keys), OSV_BATCH):
+        chunk = keys[start:start + OSV_BATCH]
+        queries = [{"package": {"name": name, "ecosystem": eco}, "version": version} for (eco, name, version) in chunk]
+        result = fetch_json(OSV_URL + "querybatch", {"queries": queries})
+        for key, answer in zip(chunk, result.get("results") or []):
+            ids = [v["id"] for v in answer.get("vulns") or [] if v.get("id")]
+            token = answer.get("next_page_token")
+            while token:
+                eco, name, version = key
+                page = fetch_json(OSV_URL + "query", {"package": {"name": name, "ecosystem": eco}, "version": version, "page_token": token})
+                ids.extend(v["id"] for v in page.get("vulns") or [] if v.get("id"))
+                token = page.get("next_page_token")
+            if ids:
+                flagged[key] = ids
+    return flagged
+
+
+def osv_records(ids):
+    """The full OSV record of each id, read in parallel: {id: record} (one that failed is left out)."""
+    records = {}
+
+    def one(vid):
+        try:
+            return vid, fetch_json(OSV_URL + "vulns/" + urllib.parse.quote(vid))
+        except LIVE_ERRORS:
+            return vid, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=OSV_WORKERS * 2) as pool:
+        for vid, record in pool.map(one, sorted(set(ids))):
+            if record:
+                records[vid] = record
+    return records
+
+
+def vuln_symbols(vuln, name):
+    """The functions an advisory names as vulnerable (Go `imports[].symbols`, RustSec
+    `affects.functions`, GitHub's `vulnerable_functions`), as their last name segment."""
+    out = set()
+    for affected in vuln.get("affected") or []:
+        if norm_name((affected.get("package") or {}).get("ecosystem", ""), (affected.get("package") or {}).get("name", "")) != norm_name((affected.get("package") or {}).get("ecosystem", ""), name):
+            continue
+        specific = affected.get("ecosystem_specific") or {}
+        for item in specific.get("imports") or []:
+            out.update(str(s) for s in item.get("symbols") or [])
+        out.update(str(f) for f in ((specific.get("affects") or {}).get("functions") or []))
+        out.update(str(f) for f in (affected.get("database_specific") or {}).get("vulnerable_functions") or [])
+    return sorted({re.split(r"::|\.", s)[-1] for s in out if s})
+
+
+def advisory_row(vuln, eco, name, version, lockfile):
+    aliases = [a for a in vuln.get("aliases") or [] if a.startswith("CVE-")]
+    summary = (vuln.get("summary") or (vuln.get("details") or "").split("\n")[0]).strip()
+    return {"eco": eco, "name": name, "version": version, "lockfile": lockfile, "id": vuln.get("id", ""), "aliases": aliases, "severity": severity_of(vuln), "summary": summary[:160],
+            "fixed": fixed_versions(vuln, name), "cwes": (vuln.get("database_specific") or {}).get("cwe_ids") or [], "kev": False, "epss": None, "epss_percentile": None,
+            "symbols": vuln_symbols(vuln, name), "published": vuln.get("published", "")}
+
+
+# ----------------------------------------------------------------------------- inventory of one tree
+
+def dev_only(rel, text):
+    """The (ecosystem, name, version) a lockfile marks as needed only for development."""
+    name = os.path.basename(rel)
+    out = set()
+    try:
+        if name == "package-lock.json":
+            data = json.loads(text)
+            for path, info in (data.get("packages") or {}).items():
+                if path and isinstance(info, dict) and info.get("version") and (info.get("dev") or info.get("devOptional")) and "node_modules/" in path:
+                    out.add(("npm", path.rsplit("node_modules/", 1)[1], info["version"]))
+        elif name == "Pipfile.lock":
+            data = json.loads(text)
+            for pkg, info in (data.get("develop") or {}).items():
+                version = (info or {}).get("version", "")
+                if version.startswith("==") and pkg not in (data.get("default") or {}):
+                    out.add(("PyPI", pkg, version[2:]))
+        elif name == "composer.lock":
+            data = json.loads(text)
+            for pkg in data.get("packages-dev") or []:
+                if pkg.get("name") and pkg.get("version"):
+                    out.add(("Packagist", pkg["name"], pkg["version"].lstrip("v")))
+        elif name == "poetry.lock":
+            for match in re.finditer(r'\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"[^\[]*?\ncategory\s*=\s*"dev"', text):
+                out.add(("PyPI", match.group(1), match.group(2)))
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return out
+
+
+def direct_names(root, lockfiles):
+    """Names the project's own manifests list (direct dependencies), by ecosystem."""
+    out = {}
+    for rel in lockfiles:
+        folder = os.path.dirname(rel)
+        base = os.path.basename(rel)
+        if base in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"):
+            text = read_text(os.path.join(root, folder, "package.json"))
+            try:
+                data = json.loads(text) if text else {}
+            except ValueError:
+                data = {}
+            for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                out.setdefault("npm", set()).update(name.lower() for name in (data.get(section) or {}))
+        elif base == "Cargo.lock":
+            text = read_text(os.path.join(root, folder, "Cargo.toml")) or ""
+            out.setdefault("crates.io", set()).update(m.lower() for m in re.findall(r"^\s*([A-Za-z0-9_-]+)\s*=", text, re.M))
+        elif base in ("poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock") or base.startswith("requirements"):
+            text = (read_text(os.path.join(root, folder, "pyproject.toml")) or "") + "\n" + (read_text(os.path.join(root, folder, "Pipfile")) or "")
+            names = re.findall(r'["\']([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:\[[^\]]*\])?\s*[<>=~!;"\']', text)
+            if base.startswith("requirements"):
+                names += re.findall(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)", read_text(os.path.join(root, rel)) or "", re.M)
+            out.setdefault("PyPI", set()).update(norm_name("PyPI", n) for n in names)
+        elif base in ("go.mod", "go.sum"):
+            text = read_text(os.path.join(root, folder, "go.mod")) or ""
+            out.setdefault("Go", set()).update(m for m in re.findall(r"^\s*(?:require\s+)?([\w.~-]+(?:/[\w.~-]+)+)\s+v[\w.+-]+(?!\s*//\s*indirect)", text, re.M))
+    return out
+
+
+def code_imports(root, files):
+    """The packages the project's code imports, and which files import each: {token: [rel]}."""
+    out = {}
+    for rel in files:
+        lang = lang_of(rel)
+        regexes = IMPORT_RES.get(lang)
+        if not regexes:
+            continue
+        text = read_text(os.path.join(root, rel))
+        if text is None:
+            continue
+        for regex in regexes:
+            for match in regex.finditer(text[:40000]):
+                for group in match.groups():
+                    if not group or group.startswith("."):
+                        continue
+                    token = group
+                    if lang == "js":
+                        parts = token.split("/")
+                        token = "/".join(parts[:2]) if token.startswith("@") else parts[0]
+                    elif lang == "py":
+                        token = token.split(".")[0]
+                    elif lang == "rs":
+                        token = token.split("::")[0]
+                    out.setdefault(token.lower(), set()).add(rel)
+    return {key: sorted(value) for key, value in out.items()}
+
+
+def import_tokens(eco, name):
+    """How code names a package when it imports it."""
+    low = name.lower()
+    if eco == "PyPI":
+        base = norm_name("PyPI", name)
+        return {base.replace("-", "_"), base.replace("-", ""), base}
+    if eco == "crates.io":
+        return {low.replace("-", "_")}
+    if eco == "Go":
+        return {name, name.rsplit("/", 1)[-1].lower()}
+    return {low}
+
+
+def reach_of(root, eco, name, symbols, imports, direct, dev):
+    """(`called` | `imported` | `not_imported` | `transitive` | `dev` | `unknown`, the place that
+    shows it or None)."""
+    key = (eco, name)
+    if key in dev:
+        return "dev", None
+    files = []
+    for token in import_tokens(eco, name):
+        files.extend(imports.get(token.lower(), []))
+        if eco == "Go":
+            files.extend(f for t, fs in imports.items() if t.startswith(name.lower() + "/") for f in fs)
+    files = sorted(set(files))
+    if files:
+        for rel in files[:200]:
+            text = read_text(os.path.join(root, rel)) or ""
+            for symbol in symbols:
+                if len(symbol) >= 3 and re.search(r"\b%s\s*\(" % re.escape(symbol), text):
+                    return "called", "%s calls %s" % (rel, symbol)
+        return "imported", files[0]
+    if eco in ("npm", "crates.io", "Go") and name.lower() not in direct.get(eco, set()) and name not in direct.get(eco, set()):
+        return "transitive", None
+    if eco in ("npm", "crates.io"):
+        return "not_imported", None
+    return "unknown", None
+
+
+# ----------------------------------------------------------------------------- supply chain of one tree
+
+def installed_packages(root):
+    """The npm packages installed under the project's node_modules folders, as (folder rel,
+    package.json data); scoped packages included, nested node_modules one level deep."""
+    out = []
+    roots = []
+    for dirpath, dirnames, _ in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if "node_modules" in dirnames:
+            roots.append(os.path.join(dirpath, "node_modules"))
+        dirnames[:] = [d for d in dirnames if depth < 3 and d not in SKIP_DIRS and not d.startswith(".")]
+    for modules in roots:
+        try:
+            entries = os.listdir(modules)
+        except OSError:
+            continue
+        folders = []
+        for entry in entries:
+            if entry.startswith("@"):
+                try:
+                    folders.extend(os.path.join(modules, entry, sub) for sub in os.listdir(os.path.join(modules, entry)))
+                except OSError:
+                    continue
+            elif not entry.startswith("."):
+                folders.append(os.path.join(modules, entry))
+        for folder in folders:
+            if len(out) >= INSTALLED_MAX:
+                return out
+            text = read_text(os.path.join(folder, "package.json"))
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                out.append((os.path.relpath(folder, root), data))
+    return out
+
+
+HOOKS = ("preinstall", "install", "postinstall", "prepare")
+# An installed package's own file larger than this, on one line, is a bundled payload's shape.
+PAYLOAD_BYTES = 1_000_000
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def harvest_reasons(campaigns, text):
+    """The campaign strings a script carries, as their reasons."""
+    return [item.get("why", "") for item in campaigns["strings"] if item.get("regex") and re.search(item["regex"], text)]
+
+
+def supply_hits(root, files, campaigns, installed=None):
+    """What the supply chain left in this tree: install hooks that run campaign droppers or harvest
+    credentials, node-gyp commands, bundled payloads, `.pth` files that run code at every Python
+    start, campaign files and persistence, planted workflows.
+    [(rel, line, shape, text, signal or None, severity)]."""
+    out = []
+    hashes = campaigns.get("sha256") or {}
+    hash_names = {n.lower() for n in campaigns.get("hash_names") or []}
+    installed = installed_packages(root) if installed is None else installed
+    for folder, data in installed:
+        scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
+        name = data.get("name") or os.path.basename(folder)
+        version = data.get("version") or "?"
+        flagged = False
+        for hook in HOOKS:
+            command = scripts.get(hook)
+            if not isinstance(command, str):
+                continue
+            for regex, item in campaigns["_hooks"]:
+                if regex.search(command):
+                    out.append((folder + "/package.json", 0, "supply chain: %s install hook" % item.get("campaign", "malicious"),
+                                "%s %s runs `%s` at %s: %s" % (name, version, shown(command, 80), hook, item.get("why", "a known campaign's dropper")), "malicious", "critical"))
+                    flagged = True
+                    break
+            else:
+                # The hook runs a file of the package: is that file a credential harvester?
+                target = re.search(r"\bnode\s+(?:-[a-z-]+\s+)*([\w./-]+\.(?:c?js|mjs))", command) or re.search(r"\bbun\s+(?:run\s+)?([\w./-]+\.(?:c?js|mjs|ts))", command)
+                if target:
+                    script = read_text(os.path.join(root, folder, target.group(1))) or ""
+                    reasons = harvest_reasons(campaigns, script[:12_000_000])
+                    if len(reasons) >= 2:
+                        out.append((folder + "/" + target.group(1), 0, "supply chain: install hook harvests credentials",
+                                    "%s %s runs %s at %s, which %s" % (name, version, target.group(1), hook, "; ".join(reasons[:4])), "malicious", "critical"))
+                        flagged = True
+        optional = data.get("optionalDependencies") if isinstance(data.get("optionalDependencies"), dict) else {}
+        for dep, spec in optional.items():
+            if isinstance(spec, str) and re.match(r"^(github:|git\+|https?://)", spec):
+                out.append((folder + "/package.json", 0, "supply chain: dependency fetched from a git commit",
+                            "%s %s pulls %s from %s, outside the registry: the TanStack worm hid its prepare script this way" % (name, version, dep, spec), "ioc", "high"))
+        gyp = os.path.join(root, folder, "binding.gyp")
+        if os.path.isfile(gyp):
+            text = read_text(gyp) or ""
+            expansion = re.search(r"<!\(\s*([^)]*)\)", text)
+            runs_file = expansion and re.search(r"\b(?:node|bun|sh|bash|python3?)\s+(?!-[pe]\b)[\w./-]+", expansion.group(1)) and "require(" not in expansion.group(1)
+            if runs_file and (re.search(r"""['"]type['"]\s*:\s*['"]none['"]""", text) or ">/dev/null" in expansion.group(1).replace(" ", "") or harvest_reasons(campaigns, text)):
+                out.append((folder + "/binding.gyp", line_of(text, "<!("), "supply chain: binding.gyp runs a program at install",
+                            "%s %s: node-gyp runs `%s` while it reads the build file, with no install script to see (the June 2026 worm)" % (name, version, shown(expansion.group(1), 80)), "malicious", "critical"))
+                flagged = True
+        if flagged:
+            continue
+        try:
+            entries = os.listdir(os.path.join(root, folder))
+        except OSError:
+            continue
+        for entry in entries:
+            low = entry.lower()
+            if low not in hash_names and low not in campaigns["_files"]:
+                continue
+            full = os.path.join(root, folder, entry)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if low == "index.js" and size < PAYLOAD_BYTES:
+                continue
+            digest = sha256_file(full) if size < 40_000_000 else None
+            if digest and digest in hashes:
+                out.append((folder + "/" + entry, 0, "supply chain: known campaign payload", "%s %s carries %s (SHA-256 matches %s)" % (name, version, entry, hashes[digest]), "malicious", "critical"))
+            elif low in campaigns["_files"]:
+                item = campaigns["_files"][low]
+                text = read_text(full) or ""
+                if not item.get("contains") or re.search(item["contains"], text[:12_000_000]):
+                    out.append((folder + "/" + entry, 0, "supply chain: %s file" % item.get("campaign", "campaign"), "%s %s carries %s: %s" % (name, version, entry, item.get("why", "")), "ioc", "critical"))
+            elif size >= PAYLOAD_BYTES:
+                head = ""
+                try:
+                    with open(full, "rb") as handle:
+                        head = handle.read(4_000_000).decode("utf-8", "replace")
+                except OSError:
+                    pass
+                reasons = harvest_reasons(campaigns, head)
+                if head.count("\n") < 5 and len(reasons) >= 2:
+                    out.append((folder + "/" + entry, 0, "supply chain: bundled payload in an installed package",
+                                "%s %s ships a %d MB one-line %s that %s" % (name, version, size // 1_000_000, entry, "; ".join(reasons[:4])), "malicious", "critical"))
+    for rel in files:
+        base = os.path.basename(rel)
+        item = campaigns["_files"].get(base.lower())
+        if item and item.get("where") in (None, "", "repo", "any"):
+            text = read_text(os.path.join(root, rel)) or ""
+            if not item.get("contains") or re.search(item["contains"], text[:12_000_000]):
+                out.append((rel, 0, "supply chain: %s file" % item.get("campaign", "campaign"), "%s: %s" % (rel, item.get("why", "a file this campaign drops")), "ioc", item.get("severity", "critical")))
+        if rel.startswith(".github/workflows/"):
+            for regex, wf in campaigns["_workflows"]:
+                if regex.search(base):
+                    text = read_text(os.path.join(root, rel)) or ""
+                    if not wf.get("contains") or wf["contains"] in text:
+                        out.append((rel, 0, "supply chain: planted workflow", "%s: %s" % (rel, wf.get("why", "a workflow name a campaign plants")), "ioc", wf.get("severity", "critical")))
+                    break
+    for item in campaigns.get("persistence") or []:
+        path = os.path.join(root, item["path"])
+        if os.path.isfile(path):
+            out.append((item["path"], 0, "supply chain: worm persistence in the project", "%s: %s (%s)" % (item["path"], item.get("why", ""), item.get("campaign", "")), "ioc", "critical"))
+    # .pth files run at every start of the interpreter that owns them.
+    for venv in (".venv", "venv", "env"):
+        lib = os.path.join(root, venv, "lib")
+        if not os.path.isdir(lib):
+            continue
+        for python in os.listdir(lib):
+            site = os.path.join(lib, python, "site-packages")
+            try:
+                names = [n for n in os.listdir(site) if n.endswith(".pth")]
+            except OSError:
+                continue
+            for pth in names:
+                rel = os.path.relpath(os.path.join(site, pth), root)
+                if pth.lower() in campaigns["_files"]:
+                    out.append((rel, 0, "supply chain: %s file" % campaigns["_files"][pth.lower()].get("campaign", "campaign"), "%s: %s" % (pth, campaigns["_files"][pth.lower()].get("why", "")), "ioc", "critical"))
+                    continue
+                text = read_text(os.path.join(site, pth)) or ""
+                for number, line in enumerate(text.split("\n"), 1):
+                    if not line.startswith("import"):
+                        continue
+                    reasons = [item.get("why", "") for regex, item in campaigns["_pth"] if regex.search(line)]
+                    if reasons:
+                        out.append((rel, number, "supply chain: .pth file runs code at every Python start",
+                                    "%s: %s (%s)" % (pth, "; ".join(reasons), shown(line, 80)), "malicious" if len(reasons) >= 2 else "ioc", "critical" if len(reasons) >= 2 else "high"))
+                        break
+    return out
+
+
+def machine_hits(campaigns):
+    """Campaign persistence on this computer itself (outside any project): [(path, campaign, why)]."""
+    out = []
+    for item in campaigns.get("machine") or []:
+        path = os.path.expanduser(item["path"])
+        if os.path.exists(path):
+            out.append((item["path"], item.get("campaign", ""), item.get("why", "")))
+    for item in campaigns.get("machine_lines") or []:
+        text = read_text(os.path.expanduser(item["path"])) or ""
+        if text and re.search(item["regex"], text):
+            out.append((item["path"], item.get("campaign", ""), item.get("why", "")))
+    return out
+
+
+def npm_major():
+    """The major version of this computer's npm, or 0 when there is none."""
+    try:
+        done = subprocess.run(["npm", "--version"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    match = re.match(r"(\d+)\.", done.stdout.strip())
+    return int(match.group(1)) if match else 0
+
+
+_NPM_MAJOR = []
+
+
+def npm_major_cached():
+    if not _NPM_MAJOR:
+        _NPM_MAJOR.append(npm_major())
+    return _NPM_MAJOR[0]
+
+
+def read_ini(path):
+    """`key=value` lines of an rc file (comments dropped), keys lower-cased."""
+    text = read_text(path) or ""
+    out = {}
+    for line in text.split("\n"):
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        if "=" in line:
+            key, value = line.split("=", 1)
+            out[key.strip().lower()] = value.strip().strip("\"'")
+    return out
+
+
+def posture_hits(root, lockfiles):
+    """The supply-chain settings this project's package managers run with: a release cooldown, and
+    install scripts. [(rel, line, check, text, fix)] for each gap."""
+    out = []
+    home = os.path.expanduser("~")
+    bases = {os.path.basename(rel) for rel in lockfiles}
+    folders = sorted({os.path.dirname(rel) for rel in lockfiles}) or [""]
+
+    def first(*paths):
+        return next((p for p in paths if os.path.isfile(p)), None)
+
+    if "package-lock.json" in bases:
+        npmrc = {}
+        for path in (os.path.join(home, ".npmrc"), os.path.join(root, ".npmrc")):
+            npmrc.update(read_ini(path))
+        if not npmrc.get("min-release-age") or npmrc.get("min-release-age") in ("0", ""):
+            out.append((".npmrc", 0, "npm-cooldown", "npm installs a version minutes after it is published (no min-release-age); the 2025-26 worms spread through fresh versions", "add `min-release-age=%d` to .npmrc (npm 11.10 or later)" % COOLDOWN_DAYS))
+        blocks = npm_major_cached() >= 12 and npmrc.get("dangerously-allow-all-scripts", "").lower() != "true"
+        if npmrc.get("ignore-scripts", "").lower() != "true" and not blocks:
+            out.append((".npmrc", 0, "npm-scripts", "npm runs every dependency's install scripts (preinstall, install, postinstall)", "upgrade to npm 12, which runs only the scripts package.json allowScripts approves, or add `ignore-scripts=true` to .npmrc"))
+    if "pnpm-lock.yaml" in bases:
+        workspace = read_text(first(os.path.join(root, "pnpm-workspace.yaml"), os.path.join(root, ".npmrc")) or "") or ""
+        if not re.search(r"(?im)^\s*minimum-?release-?age\s*[:=]\s*[1-9]", workspace):
+            out.append(("pnpm-workspace.yaml", 0, "pnpm-cooldown", "pnpm has no minimumReleaseAge here (pnpm 11 sets 1440 minutes by default; older versions none)", "add `minimumReleaseAge: %d` to pnpm-workspace.yaml (minutes)" % (COOLDOWN_DAYS * 1440)))
+        if re.search(r"(?im)^\s*dangerouslyAllowAllBuilds\s*:\s*true", workspace):
+            out.append(("pnpm-workspace.yaml", line_of(workspace, "dangerouslyAllowAllBuilds"), "pnpm-scripts", "dangerouslyAllowAllBuilds lets every dependency run its install scripts", "remove it and approve the packages that must build under allowBuilds (pnpm 11) or onlyBuiltDependencies (pnpm 10)"))
+    if "yarn.lock" in bases and os.path.isfile(os.path.join(root, ".yarnrc.yml")):
+        yarnrc = read_text(os.path.join(root, ".yarnrc.yml")) or ""
+        if not re.search(r"(?im)^\s*npmMinimalAgeGate\s*:\s*\S", yarnrc):
+            out.append((".yarnrc.yml", 0, "yarn-cooldown", "Yarn installs fresh versions at once (no npmMinimalAgeGate)", "add `npmMinimalAgeGate: \"%dd\"` to .yarnrc.yml (Yarn 4.10 or later)" % COOLDOWN_DAYS))
+        if not re.search(r"(?im)^\s*enableScripts\s*:\s*false", yarnrc):
+            out.append((".yarnrc.yml", 0, "yarn-scripts", "Yarn runs dependencies' install scripts", "add `enableScripts: false` to .yarnrc.yml"))
+    if bases & {"bun.lock", "bun.lockb"}:
+        bunfig = read_text(os.path.join(root, "bunfig.toml")) or ""
+        if not re.search(r"(?im)^\s*minimumReleaseAge\s*=\s*[1-9]", bunfig):
+            out.append(("bunfig.toml", 0, "bun-cooldown", "Bun installs fresh versions at once (no minimumReleaseAge)", "add `minimumReleaseAge = %d` under [install] in bunfig.toml (seconds)" % (COOLDOWN_DAYS * 86400)))
+    if bases & {"uv.lock"}:
+        pyproject = (read_text(os.path.join(root, "pyproject.toml")) or "") + (read_text(os.path.join(root, "uv.toml")) or "")
+        if "exclude-newer" not in pyproject:
+            out.append(("pyproject.toml", 0, "uv-cooldown", "uv resolves to versions published minutes ago (no exclude-newer)", "add `exclude-newer = \"%d days\"` under [tool.uv] in pyproject.toml (uv 0.9.17 or later)" % COOLDOWN_DAYS))
+    workflows_dir = os.path.join(root, ".github")
+    dependabot = first(os.path.join(workflows_dir, "dependabot.yml"), os.path.join(workflows_dir, "dependabot.yaml"))
+    if dependabot:
+        text = read_text(dependabot) or ""
+        if "cooldown" not in text:
+            out.append((os.path.relpath(dependabot, root), 0, "dependabot-cooldown", "Dependabot proposes versions the day they are published (no cooldown)", "add `cooldown: {default-days: 7}` to each update entry"))
+        if re.search(r"insecure-external-code-execution\s*:\s*allow", text):
+            out.append((os.path.relpath(dependabot, root), line_of(text, "insecure-external-code-execution"), "dependabot-execution", "Dependabot runs code from the dependencies it updates", "remove `insecure-external-code-execution: allow`"))
+    return [(rel, line, check, text, fix) for rel, line, check, text, fix in out if folders]
+
+
+# ----------------------------------------------------------------------------- CI workflows
+
+UNTRUSTED_CONTEXT = re.compile(r"\$\{\{\s*(github\.event\.(?:issue\.title|issue\.body|pull_request\.title|pull_request\.body|comment\.body|review\.body|review_comment\.body|discussion\.title|discussion\.body|pages\.[^}]*page_name|commits\.[^}]*message|head_commit\.message|head_commit\.author\.(?:email|name)|pull_request\.head\.(?:ref|label|repo\.default_branch)|workflow_run\.(?:head_branch|head_commit\.message|display_title))|github\.head_ref|inputs\.[\w-]+)[^}]*\}\}")
+SHA_PIN = re.compile(r"@[0-9a-f]{40}\b")
+
+
+def ci_hits(rel, text):
+    """A GitHub Actions workflow's structural weaknesses (the offline checks of zizmor's audits that
+    attackers used in 2025-26): [(rel, line, shape, text, signal or None, severity)]."""
+    out = []
+    lines = text.split("\n")
+    triggers = text[:4000]
+    target = re.search(r"(?m)^\s*(?:on\s*:.*\bpull_request_target\b|pull_request_target\s*:)|^\s*-\s*pull_request_target\b", triggers) or re.search(r"\bpull_request_target\b", triggers)
+    workflow_run = re.search(r"(?m)^\s*workflow_run\s*:", triggers)
+    comment = re.search(r"(?m)^\s*(?:issue_comment|discussion|discussion_comment)\s*:", triggers)
+    release = re.search(r"(?m)^\s*(?:release|push\s*:\s*\n\s*tags)\s*:|tags\s*:\s*\[", triggers) or re.search(r"(?i)\b(npm|pnpm|yarn)\s+publish\b|pypa/gh-action-pypi-publish|cargo\s+publish|twine\s+upload|gem\s+push", text)
+    for number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        injected = UNTRUSTED_CONTEXT.search(line)
+        if injected and not stripped.startswith(("if:", "#", "- if:")) and not re.match(r"^\s*[\w-]+\s*:\s*\$\{\{", line):
+            out.append((rel, number, "ci: template injection", "%s is expanded into code that runs: an issue, comment or branch name becomes a command (pass it through env: and quote it)" % injected.group(1), None, "high" if (target or comment or "issue" in injected.group(1) or "comment" in injected.group(1)) else "medium"))
+        uses = re.match(r"^\s*(?:-\s*)?uses\s*:\s*['\"]?([^'\"\s#]+)", line)
+        if uses:
+            ref = uses.group(1)
+            if not ref.startswith(("./", "docker://")) and "@" in ref and not SHA_PIN.search(ref) and not ref.startswith(("actions/", "github/")):
+                out.append((rel, number, "ci: action pinned to a movable tag", "%s can be repointed by its owner or by whoever takes the repository over (pin the commit SHA)" % ref, None, "medium" if (release or target) else "low"))
+        if re.search(r"toJSON\(\s*secrets\s*\)", line):
+            out.append((rel, number, "ci: every secret handed to one step", "toJSON(secrets) gives this step every secret of the repository", None, "high"))
+        if re.search(r"secrets\s*:\s*inherit", line):
+            out.append((rel, number, "ci: secrets inherited by a called workflow", "secrets: inherit hands every secret to the reusable workflow", None, "low"))
+        if "ACTIONS_ALLOW_UNSECURE_COMMANDS" in line:
+            out.append((rel, number, "ci: insecure workflow commands enabled", "ACTIONS_ALLOW_UNSECURE_COMMANDS lets output set environment variables and paths", None, "high"))
+        if re.search(r">>\s*\"?\$\{?GITHUB_(?:ENV|PATH)\b", line) and (target or workflow_run) and UNTRUSTED_CONTEXT.search(line):
+            out.append((rel, number, "ci: untrusted data written to GITHUB_ENV", "a later step runs with an environment the pull request chose", None, "high"))
+        if re.search(r"permissions\s*:\s*write-all", line):
+            out.append((rel, number, "ci: write-all token", "every job's token can write everything (contents, packages, workflows)", None, "medium"))
+        if re.search(r"(?i)password\s*:\s*\$\{\{\s*secrets\.(?:PYPI|TWINE)", line) or re.search(r"(?i)NODE_AUTH_TOKEN\s*:\s*\$\{\{\s*secrets\.", line):
+            out.append((rel, number, "ci: long-lived publish token", "a stolen registry token publishes as you; trusted publishing (OIDC) issues one per run", None, "low"))
+        if re.search(r"allow-unsafe-pr-checkout\s*:\s*true", line):
+            out.append((rel, number, "ci: unsafe pull request checkout", "allow-unsafe-pr-checkout checks out the pull request's code in a privileged run", None, "high"))
+    if target or workflow_run:
+        head = re.search(r"(?m)^\s*ref\s*:\s*\$\{\{\s*(github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref|github\.event\.workflow_run\.head_(?:sha|branch))", text)
+        if head:
+            out.append((rel, line_of(text, head.group(1)), "ci: privileged run of a pull request's code", "%s checks out the pull request's code (%s) with the repository's secrets and a write token: the Pwn Request of the 2026 worm" % ("pull_request_target" if target else "workflow_run", head.group(1)), None, "critical"))
+        elif target:
+            out.append((rel, line_of(text, "pull_request_target"), "ci: pull_request_target trigger", "runs with secrets for pull requests from forks; safe only while it never runs the pull request's code", None, "low"))
+        if re.search(r"actions/cache@|cache\s*:\s*['\"]?(?:npm|pnpm|yarn|pip|poetry|gradle|maven|cargo)", text):
+            out.append((rel, line_of(text, "cache"), "ci: cache written by an untrusted run", "a cache this run saves is restored by trusted runs (cache poisoning)", None, "high"))
+    if release and re.search(r"actions/cache@|cache\s*:\s*['\"]?(?:npm|pnpm|yarn|pip|poetry|gradle|maven|cargo)", text):
+        out.append((rel, line_of(text, "cache"), "ci: release built from a restored cache", "a publish job restores a cache another run could have written (cache poisoning)", None, "medium"))
+    if comment and re.search(r"runs-on\s*:\s*\[?\s*['\"]?self-hosted", text):
+        out.append((rel, line_of(text, "self-hosted"), "ci: self-hosted runner on comments", "anyone who comments runs code on your own machine", None, "high"))
+    if re.search(r"actions/checkout@", text) and not re.search(r"persist-credentials\s*:\s*false", text) and re.search(r"actions/upload-artifact@", text):
+        out.append((rel, line_of(text, "actions/checkout"), "ci: token left in the checkout and uploaded", "checkout keeps the token in .git/config and an artifact of the tree carries it out (set persist-credentials: false)", None, "medium"))
+    return out
+
+
+# ----------------------------------------------------------------------------- credentials, live
+
+VALIDATORS = {
+    # pattern name -> (URL, header builder): a read-only call that answers 200 for a live credential.
+    "GitHub token": ("https://api.github.com/user", lambda v: {"Authorization": "Bearer " + v, "Accept": "application/vnd.github+json"}),
+    "Slack token": ("https://slack.com/api/auth.test", lambda v: {"Authorization": "Bearer " + v}),
+    "Stripe live key": ("https://api.stripe.com/v1/balance", lambda v: {"Authorization": "Bearer " + v}),
+    "OpenAI key": ("https://api.openai.com/v1/models", lambda v: {"Authorization": "Bearer " + v}),
+    "Anthropic key": ("https://api.anthropic.com/v1/models", lambda v: {"x-api-key": v, "anthropic-version": "2023-06-01"}),
+    "GitLab token": ("https://gitlab.com/api/v4/user", lambda v: {"PRIVATE-TOKEN": v}),
+    "npm token": ("https://registry.npmjs.org/-/whoami", lambda v: {"Authorization": "Bearer " + v}),
+}
+VALUE_KINDS = [
+    ("GitHub token", re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b")),
+    ("Slack token", re.compile(r"\b(xox[baprs]-[A-Za-z0-9-]{10,})\b")),
+    ("Stripe live key", re.compile(r"\b([sr]k_live_[A-Za-z0-9]{16,})\b")),
+    ("Anthropic key", re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{20,})\b")),
+    ("OpenAI key", re.compile(r"\b(sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b")),
+    ("GitLab token", re.compile(r"\b(glpat-[A-Za-z0-9_-]{20,})\b")),
+    ("npm token", re.compile(r"\b(npm_[A-Za-z0-9]{36})\b")),
+    ("AWS access key id", re.compile(r"\b(AKIA[0-9A-Z]{16})\b")),
+    ("private key block", re.compile(r"(-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----)")),
+]
+
+
+def validate_secret(kind, value):
+    """`live`, `dead` or `unknown`: the provider's answer to a read-only call with the value. Only
+    when the person turned validation on (the value goes to its own provider and nowhere else)."""
+    entry = VALIDATORS.get(kind)
+    if not entry:
+        return "unknown"
+    url, headers = entry
+    request = urllib.request.Request(url, headers=dict(headers(value), **{"User-Agent": "secaudit (CortexCode)"}))
+    try:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
+            body = response.read(65536)
+            if kind == "Slack token":
+                return "live" if b'"ok":true' in body.replace(b" ", b"") else "dead"
+            return "live"
+    except urllib.error.HTTPError as error:
+        return "dead" if error.code in (401, 403) else "unknown"
+    except LIVE_ERRORS:
+        return "unknown"
+
+
+def secret_hits(root, files, validate):
+    """Credential formats in the tree's tracked files (tests and examples aside): [(rel, line, kind,
+    masked excerpt, state)], state `live`, `dead` or `unknown`."""
+    out, seen = [], set()
+    for rel in files:
+        if TEST_PLACE.search(rel) or basename_matches(rel, ["*.example", "*.sample", "*.template", "*.md"]):
+            continue
+        text = read_text(os.path.join(root, rel))
+        if not text:
+            continue
+        for number, line in enumerate(text.split("\n"), 1):
+            if len(line) > 4000:
+                continue
+            for kind, regex in VALUE_KINDS:
+                match = regex.search(line)
+                if not match or EXAMPLE_VALUE.search(match.group(1)) and kind != "private key block":
+                    continue
+                key = (rel, kind, match.group(1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                state = validate_secret(kind, match.group(1)) if validate else "unknown"
+                out.append((rel, number, kind, shown(line.strip(), 100), state))
+                break
+    return out
+
+
+# ----------------------------------------------------------------------------- findings of a sweep
+
+def sweep_finding(fid, cls, title, verdict, severity, rel, line, text, how, fix_change="", fix_where="", signal=None, key=None, principal="", impact="", extra=None):
+    finding = {
+        "id": fid, "class": cls, "verdict": verdict, "source": "sweep", "title": title,
+        "principal": principal, "control": "", "impact": impact or text, "result": text,
+        "evidence_how": how, "evidence_observed": text,
+        "severity_overall": severity if verdict != "needs_validation" else None, "host_severity": severity if signal else None,
+        "fix_where": fix_where or rel, "fix_change": fix_change, "fix_test": "",
+        "trace": [{"kind": "sink", "file": rel, "line": line or 0, "what": text[:160]}],
+        "signal": signal, "fleet_key": key,
+    }
+    if verdict == "needs_validation":
+        finding["severity_overall"] = severity
+        finding["missing_fact"] = "whether this is expected here. Check: read the file named"
+        finding["blocker"] = "whether this is expected here"
+        finding["check_how"] = "read the file named and its history"
+    finding.update(extra or {})
+    finding["priority"], finding["priority_reason"] = priority_of(finding)
+    return finding
+
+
+def dep_findings(rows, reach, checked_at):
+    """One finding per vulnerable package and lockfile, as the dependency watch writes them."""
+    findings = []
+    for (eco, name, version, lockfile), group in group_rows(rows):
+        fid = ("watch:%s:%s" % (lockfile, name)).lower()
+        worst = group[0]["severity"]
+        fix = quick_fix_for(name, rows, lockfile)
+        ids = sorted({r["id"] for r in group})
+        kev = any(r.get("kev") for r in group)
+        malicious = any(i.startswith("MAL-") for i in ids)
+        reachable, place = reach.get((eco, name), (None, None))
+        finding = {
+            "id": fid, "class": "dependencies", "verdict": "needs_validation", "source": "sweep",
+            "title": ("%s %s is a malicious package" % (name, version)) if malicious else "%s %s has %d known vulnerabilit%s (worst %s)" % (name, version, len(group), "y" if len(group) == 1 else "ies", worst),
+            "principal": "whoever can reach the vulnerable code of %s with their own input" % name,
+            "control": "", "impact": group[0]["summary"], "result": group[0]["summary"],
+            "evidence_how": "the security sweep: OSV, CISA KEV and FIRST EPSS, checked %s" % checked_at,
+            "evidence_observed": "; ".join("%s %s: %s" % (r["id"], r["severity"], r["summary"][:80]) for r in group[:4]) + (("; reachable: %s%s" % (reachable, " (%s)" % place if place else "")) if reachable else ""),
+            "missing_fact": "Whether this project calls the vulnerable code of %s with outside data. Check: search the code for its imports and read the advisory's affected functions" % name,
+            "blocker": "whether this project calls the vulnerable code of %s with outside data" % name,
+            "check_how": "search the code for its imports and read the advisory's affected functions",
+            "severity_overall": worst if worst in PRIORITY_BAND else None, "host_severity": worst if worst in PRIORITY_BAND else None,
+            "fix_where": lockfile, "fix_change": ("upgrade %s to %s" % (name, fix["to"])) if fix else "no fixed version is published yet", "fix_test": "the project's tests",
+            "trace": [{"kind": "sink", "file": lockfile, "line": 0, "what": "%s pinned at %s" % (name, version)}],
+            "quick_fix": fix, "advisories": ids, "kev": kev,
+            "epss": max((r.get("epss") or 0 for r in group), default=0) or None,
+            "epss_percentile": max((r.get("epss_percentile") or 0 for r in group), default=0) or None,
+            "signal": "malicious package" if malicious else ("exploited in the wild (CISA KEV)" if kev else None),
+            "sink_path": lockfile, "sink_package": name, "sink_version": version,
+            "fleet_key": "dep:%s:%s:%s" % (eco, name.lower(), version),
+        }
+        if reachable:
+            finding["reachable"] = reachable
+        if malicious:
+            finding["severity_overall"] = finding["host_severity"] = "critical"
+            finding["fix_change"] = "remove %s %s, delete node_modules and reinstall from a clean lockfile, then rotate every credential this machine and its CI held since it was installed" % (name, version)
+        finding["priority"], finding["priority_reason"] = priority_of(finding)
+        findings.append(finding)
+    return findings
+
+
+def tree_findings(root, files, campaigns, validate, checked_at):
+    """The file-based checks of one tree as findings: supply chain, posture, CI, agent files,
+    credentials. Returns (findings, posture lines)."""
+    findings, posture = [], []
+    lockfiles = sorted(set(getattr(repo_files, "lockfiles", [])))
+    for rel, line, shape, text, signal, severity in supply_hits(root, files, campaigns):
+        malicious = signal == "malicious"
+        findings.append(sweep_finding(
+            ("supply:%s:%s" % (rel, shape)).lower(), "supply-chain-ci", shape.replace("supply chain: ", "").capitalize(), "confirmed" if malicious else "needs_validation", severity, rel, line, text,
+            "the security sweep's supply-chain check, %s" % checked_at,
+            fix_change="remove the package or file, reinstall from a clean lockfile with install scripts off, and rotate every credential this machine and its CI held since it arrived",
+            signal="malicious package" if malicious else "campaign indicator", key="ioc:%s" % shape.lower(),
+            principal="the author of a compromised package", impact="code that runs on this machine at install with the developer's credentials"))
+    for rel, line, check, text, fix in posture_hits(root, lockfiles):
+        posture.append(text.split(" (")[0])
+        findings.append(sweep_finding(("posture:%s" % check).lower(), "supply-chain-ci", text.split(";")[0].split(" (")[0].capitalize(), "hardening", "low", rel, line, text,
+                                      "the security sweep's package-manager settings check, %s" % checked_at, fix_change=fix, key="posture:%s" % check))
+    for rel in files:
+        if not (rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml"))):
+            continue
+        text = read_text(os.path.join(root, rel)) or ""
+        for rel_, line, shape, what, signal, severity in ci_hits(rel, text):
+            verdict = "needs_validation" if severity in ("critical", "high") else "hardening"
+            findings.append(sweep_finding(("ci:%s:%s:%d" % (rel_, shape, line)).lower(), "supply-chain-ci", shape.replace("ci: ", "").capitalize(), verdict, severity, rel_, line, what,
+                                          "the security sweep's workflow check, %s" % checked_at, key="shape:ci:%s" % shape.lower(), principal="whoever opens a pull request, issue or comment"))
+    agents = sorted(set(getattr(repo_files, "agent_files", [])))
+    for rel, line, shape, text, signal in agent_hits(root, agents):
+        severe = signal == "key" or "permission checks turned off" in shape or "runs a command" in shape or "base URL" in shape
+        findings.append(sweep_finding(("agent:%s:%s:%d" % (rel, shape, line)).lower(), "ai-llm-agent", shape.replace("agent config: ", "").replace("agent instructions: ", "").capitalize(),
+                                      "needs_validation" if severe else "hardening", "high" if severe else "low", rel, line, text,
+                                      "the security sweep's AI-agent file check, %s" % checked_at, signal="real key format" if signal == "key" else None, key="shape:agent:%s" % shape.lower(),
+                                      principal="whoever wrote this file into the repository"))
+    for rel, line, kind, excerpt, state in secret_hits(root, files, validate):
+        if state == "dead":
+            continue
+        live = state == "live"
+        findings.append(sweep_finding(("secret:%s:%s:%d" % (rel, kind, line)).lower(), "obvious", "%s %sin %s" % (kind, "(live) " if live else "", rel), "confirmed" if live else "needs_validation",
+                                      "critical" if live else "high", rel, line, "%s: %s" % (kind, excerpt), "the security sweep's credential check%s, %s" % (" (the provider confirmed it live)" if live else "", checked_at),
+                                      fix_change="revoke the credential at its provider, issue a new one, keep it in the Keychain or the environment, and remove it from the file and from git history",
+                                      signal="live credential" if live else "real key format", key="secret:%s" % kind.lower(), principal="anyone who can read the repository or a copy of it"))
+    return findings, posture
+
+
+def tree_stamp(root):
+    """What the file checks of a tree depend on: its HEAD, its uncommitted changes, its installed
+    packages' state. Equal stamps: the file checks would find the same."""
+    head = (git(["rev-parse", "HEAD"], root) or "").strip()
+    status = git(["status", "--porcelain", "-z"], root) or ""
+    marks = []
+    for marker in ("node_modules/.package-lock.json", "node_modules/.yarn-state.yml", "node_modules/.modules.yaml", ".venv/pyvenv.cfg"):
+        try:
+            stat = os.stat(os.path.join(root, marker))
+            marks.append("%s:%d:%d" % (marker, int(stat.st_mtime), stat.st_size))
+        except OSError:
+            continue
+    return hashlib.sha1(("%s\n%s\n%s\n%s" % (head, status, "\n".join(marks), SKILL_VERSION)).encode("utf-8")).hexdigest()[:16]
+
+
+def cmd_fleet(args):
+    """`fleet --json --root A [--root B ...] [--since MS] [--full] [--stamp A=S ...] [--validate]`."""
+    positional, flags = parse_flags(args, {"root": "many", "since": "one", "stamp": "many"})
+    roots = [os.path.abspath(r) for r in list(flags.get("root", [])) + positional if os.path.isdir(r)]
+    stamps = dict(item.split("=", 1) for item in flags.get("stamp", []) if "=" in item)
+    since = int(flags["since"]) if isinstance(flags.get("since"), str) and flags["since"].isdigit() else 0
+    now_ms = int(time.time() * 1000)
+    full = bool(flags.get("full")) or not since or now_ms - since > DELTA_MAX_MS
+    validate = bool(flags.get("validate"))
+    checked_at = time.strftime("%Y-%m-%d %H:%M")
+    campaigns = load_campaigns()
+    out = {"mode": "full" if full else "delta", "cursor_ms": since, "feeds": [], "packages": 0, "projects": []}
+
+    def inventory(root):
+        files = repo_files(root, [])
+        lockfiles = sorted(set(getattr(repo_files, "lockfiles", [])))
+        agent_files = sorted(set(getattr(repo_files, "agent_files", [])))
+        packages, not_parsed = project_packages(root, lockfiles)
+        dev = set()
+        for rel in lockfiles:
+            text = read_text(os.path.join(root, rel))
+            if text:
+                dev |= dev_only(rel, text)
+        return {"root": root, "files": files, "lockfiles": lockfiles, "agent_files": agent_files, "packages": packages, "not_parsed": not_parsed, "dev": {(e, n) for e, n, _ in dev}}
+
+    # repo_files keeps its side lists on the function: the trees are read one after another.
+    trees = [inventory(root) for root in roots]
+    keys = {}
+    for index, tree in enumerate(trees):
+        for (eco, name, version), lockfile in tree["packages"].items():
+            if offline_here(tree["root"]):
+                continue
+            keys.setdefault((eco, name, version), []).append((index, lockfile))
+    out["packages"] = len(keys)
+
+    # Which packages to ask OSV about: all (full), or the ones the changed advisories name (delta).
+    ask = set(keys)
+    if not full:
+        ecosystems = {eco for (eco, _, _) in keys}
+        try:
+            changed, newest = osv_changed_since(ecosystems, since)
+            out["cursor_ms"] = newest
+            names = set()
+            for vid, record in osv_records(list(changed)).items():
+                for affected in record.get("affected") or []:
+                    package = affected.get("package") or {}
+                    names.add((package.get("ecosystem", ""), norm_name(package.get("ecosystem", ""), package.get("name", ""))))
+            ask = {key for key in keys if (key[0], norm_name(key[0], key[1])) in names}
+            out["feeds"].append({"name": "osv", "ok": True, "note": "%d changed advisor%s since the last sweep, %d of this computer's packages named" % (len(changed), "y" if len(changed) == 1 else "ies", len(ask))})
+        except LIVE_ERRORS as error:
+            out["feeds"].append({"name": "osv", "ok": False, "note": "OSV's change list could not be read (%s); the next sweep reads it again" % (getattr(error, "reason", None) or error)})
+            ask = set()
+    rows_by_tree = {index: [] for index in range(len(trees))}
+    if ask:
+        try:
+            flagged = osv_flagged(sorted(ask))
+            records = osv_records([vid for ids in flagged.values() for vid in ids])
+            for key, ids in flagged.items():
+                eco, name, version = key
+                for vid in ids:
+                    vuln = records.get(vid)
+                    if not vuln or vuln.get("withdrawn"):
+                        continue
+                    for index, lockfile in keys[key]:
+                        rows_by_tree[index].append(advisory_row(vuln, eco, name, version, lockfile))
+            if full:
+                out["cursor_ms"] = now_ms
+                out["feeds"].append({"name": "osv", "ok": True, "note": "%d packages checked, %d with known advisories" % (len(ask), len(flagged))})
+        except LIVE_ERRORS as error:
+            out["feeds"].append({"name": "osv", "ok": False, "note": "OSV did not answer (%s); %d packages unchecked" % (getattr(error, "reason", None) or error, len(ask))})
+            out["cursor_ms"] = since
+    all_rows = [row for rows in rows_by_tree.values() for row in rows]
+    if all_rows:
+        problems = exploit_signals(all_rows)
+        out["feeds"].append({"name": "kev", "ok": not any("KEV" in p for p in problems), "note": next((p for p in problems if "KEV" in p), "read")})
+        out["feeds"].append({"name": "epss", "ok": not any("EPSS" in p for p in problems), "note": next((p for p in problems if "EPSS" in p), "read")})
+    for index, tree in enumerate(trees):
+        root = tree["root"]
+        project = {"root": root, "packages": len(tree["packages"]), "not_parsed": tree["not_parsed"], "findings": [], "posture": [], "complete": [], "errors": []}
+        if offline_here(root):
+            project["errors"].append("offline project (.cortex-offline): no live check")
+        rows = sorted(rows_by_tree[index], key=lambda r: (SEVERITY_RANK.get(r["severity"], 5), r["name"], r["id"]))
+        unique, seen = [], set()
+        for row in rows:
+            marks = {(row["name"], row["version"], row["lockfile"], alias) for alias in [row["id"]] + row["aliases"]}
+            if marks & seen:
+                continue
+            seen |= marks
+            unique.append(row)
+        stamp = tree_stamp(root)
+        project["stamp"] = stamp
+        files_changed = stamps.get(root) != stamp
+        imports = code_imports(root, tree["files"]) if unique and (full or files_changed) else {}
+        direct = direct_names(root, tree["lockfiles"]) if unique else {}
+        reach = {}
+        for row in unique:
+            key = (row["eco"], row["name"])
+            if key not in reach:
+                symbols = sorted({s for r in unique if (r["eco"], r["name"]) == key for s in r.get("symbols") or []})
+                # Without a fresh read of the code the stored answer stands (None keeps it).
+                reach[key] = reach_of(root, row["eco"], row["name"], symbols, imports, direct, tree["dev"]) if imports or key in tree["dev"] else (None, None)
+        project["findings"].extend(dep_findings(unique, reach, checked_at))
+        if full and not any(f["name"] == "osv" and not f["ok"] for f in out["feeds"]) and not offline_here(root):
+            project["complete"].append("dependencies")
+        if full and files_changed:
+            repo_files(root, [])
+            try:
+                findings, posture = tree_findings(root, tree["files"], campaigns, validate, checked_at)
+                project["findings"].extend(findings)
+                project["posture"] = posture
+                project["complete"].append("files")
+            except (OSError, ValueError, re.error) as error:
+                project["errors"].append("the file checks failed: %s" % error)
+        elif full:
+            project["unchanged"] = True
+        out["projects"].append(project)
+    if full:
+        out["machine"] = [{"path": path, "campaign": campaign, "why": why} for path, campaign, why in machine_hits(campaigns)]
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_affected(args):
+    """`affected --json --query Q --root A [--root B ...]`: which trees a package, version, advisory
+    or campaign file touches, from their lockfiles and installed packages now."""
+    positional, flags = parse_flags(args, {"root": "many", "query": "one"})
+    query = (flags.get("query") or (positional[0] if positional else "")).strip()
+    roots = [os.path.abspath(r) for r in flags.get("root", []) if os.path.isdir(r)]
+    if not query:
+        return json_out({"error": "a query is needed: a package, name@version, an advisory id or a file name"}, 2)
+    eco_q, name_q, version_q, advisory = None, query, None, None
+    if re.match(r"^(GHSA-|CVE-|MAL-|PYSEC-|RUSTSEC-|GO-)", query, re.I):
+        advisory = query
+    else:
+        if ":" in query and not query.startswith("@"):
+            eco_q, name_q = query.split(":", 1)
+        if "@" in name_q[1:]:
+            name_q, version_q = name_q.rsplit("@", 1) if not name_q.startswith("@") else ("@" + name_q[1:].rsplit("@", 1)[0], name_q[1:].rsplit("@", 1)[1])
+    targets = set()
+    note = ""
+    if advisory:
+        try:
+            record = fetch_json(OSV_URL + "vulns/" + urllib.parse.quote(advisory))
+            for affected in record.get("affected") or []:
+                package = affected.get("package") or {}
+                targets.add((package.get("ecosystem", ""), norm_name(package.get("ecosystem", ""), package.get("name", ""))))
+        except LIVE_ERRORS as error:
+            return json_out({"error": "OSV could not read %s (%s)" % (advisory, getattr(error, "reason", None) or error)}, 1)
+    hits = []
+    for root in roots:
+        repo_files(root, [])
+        lockfiles = sorted(set(getattr(repo_files, "lockfiles", [])))
+        packages, _ = project_packages(root, lockfiles)
+        matched = []
+        for (eco, name, version), lockfile in packages.items():
+            if advisory:
+                if (eco, norm_name(eco, name)) in targets:
+                    matched.append(((eco, name, version), lockfile))
+            elif norm_name(eco, name) == norm_name(eco, name_q) and (not eco_q or eco_q.lower() == eco.lower()) and (not version_q or version_q == version):
+                matched.append(((eco, name, version), lockfile))
+        if advisory and matched:
+            try:
+                flagged = osv_flagged([key for key, _ in matched])
+                matched = [(key, lockfile) for key, lockfile in matched if advisory in flagged.get(key, []) or any(advisory in i for i in flagged.get(key, []))]
+            except LIVE_ERRORS:
+                note = "OSV did not answer: these pins name an affected package, their versions were not checked"
+        for (eco, name, version), lockfile in matched:
+            hits.append({"root": root, "what": "%s %s pinned" % (name, version), "path": lockfile})
+        if not advisory and "." in query and "/" not in query and not version_q and not matched:
+            base = query.lower()
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in (".git", "target", "dist", "build")]
+                for filename in filenames:
+                    if filename.lower() == base:
+                        rel = os.path.relpath(os.path.join(dirpath, filename), root)
+                        hits.append({"root": root, "what": "%s found" % filename, "path": rel})
+    if hits and (advisory or "").upper().startswith("MAL-"):
+        note = "a malicious package was installed: rotate the npm, GitHub, cloud and CI credentials of this machine and of the CI that installed it, and reinstall from a clean lockfile"
+    return json_out({"query": query, "hits": hits, "checked": len(roots), "note": note}, 0)
+
+
+def cmd_verdict(args):
+    """`verdict <id> alert|quiet "<reason>" [--evidence "fact" ...]`: an investigation's verdict on
+    the finding its session investigates."""
+    positional, flags = parse_flags(args, {"evidence": "many"})
+    if len(positional) < 3 or positional[1] not in ("alert", "quiet"):
+        fail("usage: verdict <finding id> alert|quiet \"<reason in one sentence>\" --evidence \"<fact with path:line>\" ...", "%s verdict <id> alert \"<reason>\" --evidence \"<fact>\"" % tool())
+    ident, decision, reason = positional[0], positional[1], " ".join(positional[2:]).strip()
+    evidence = [e.strip() for e in flags.get("evidence", []) if e.strip()]
+    if not evidence:
+        fail("a verdict carries its evidence: each fact you checked, with the path:line or command that shows it", "%s verdict %s %s \"%s\" --evidence \"<fact>\"" % (tool(), ident, decision, reason))
+    root = os.getcwd()
+    pid = require_app(root)
+    params = {"project_id": pid, "items": [{"id": ident, "triage": decision, "reason": reason, "by": "investigation", "evidence": evidence}]}
+    result = write("memory.security.triage.put", params, "The verdict")
+    stored = ((result or {}).get("findings") or [{}])[0]
+    print("Recorded %s as %s: %s" % (ident, stored.get("triage") or decision, reason))
+    print("Next: reply to the user with the verdict and the evidence in two lines.")
+
+
 # ----------------------------------------------------------------------------- main
 
-COMMANDS = {"next": cmd_next, "units": cmd_units, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve, "show": cmd_show, "fix-plan": cmd_fix_plan, "recheck": cmd_recheck, "resolve": cmd_resolve, "check-change": cmd_check_change, "watch": cmd_watch}
+COMMANDS = {"next": cmd_next, "units": cmd_units, "settle": cmd_settle, "recon": cmd_recon, "hunt": cmd_hunt, "cover": cmd_cover, "new": cmd_new, "finding": cmd_finding, "status": cmd_status, "report": cmd_report, "scan": cmd_scan, "deps": cmd_deps, "cve": cmd_cve, "show": cmd_show, "fix-plan": cmd_fix_plan, "recheck": cmd_recheck, "resolve": cmd_resolve, "check-change": cmd_check_change, "watch": cmd_watch, "fleet": cmd_fleet, "affected": cmd_affected, "verdict": cmd_verdict}
 
 
 def main(argv):

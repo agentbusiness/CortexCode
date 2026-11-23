@@ -10,3 +10,7 @@ unit_done = "python3 \"$CORTEX_HOME/live/plugins/skills-security/data/scripts/se
 
 [security-fix]
 done = "python3 \"$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py\" status --fixing"
+
+[security-triage]
+# An investigation the security sentinel started ends with its verdict recorded; elsewhere it passes.
+done = "python3 \"$CORTEX_HOME/live/plugins/skills-security/data/scripts/secaudit.py\" status --investigating"

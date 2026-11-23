@@ -14,7 +14,7 @@
 //! (:Security:Finding {id, project, ...SecurityFinding's scalar fields})
 //! (f)-[:HAS_STEP]->(:SecurityTraceStep {id, finding_id, position, kind, file, line, what})
 //! (f)-[:QUICK_FIX]->(:SecurityQuickFix {id, finding_id, kind, ecosystem, package, from, to, lockfile, commands})
-//! (f)-[:CHANGED]->(:SecurityStatusChange {id, finding_id, position, status, note, by, ms, session_id, commit})
+//! (f)-[:CHANGED]->(:SecurityStatusChange {id, finding_id, position, status, note, by, ms, session_id, commit, triage})
 //! (f)-[:FOUND_BY]->(a:Audit)                     every audit that reported it
 //! (f)-[:AT {step, kind, what, line}]->(c:Code)   each trace step's innermost symbol, else its file
 //! (f)-[:IN_PACKAGE]->(d:Code:Dependency)         the package a quick fix upgrades
@@ -39,7 +39,7 @@ use crate::params;
 use cc_protocol::RpcError;
 use cc_protocol::contracts::memory::{
     SecurityAdvisory, SecurityAudit, SecurityAuditStartParams, SecurityAuditState, SecurityFinding, SecurityFindingDetail, SecurityFindingUpdateParams, SecurityFindingsParams, SecurityHit,
-    SecurityQuickFix, SecurityRecheck, SecurityRecheckParams, SecurityStatusChange, SecuritySummary, SecurityTraceStep, SecurityUnit,
+    SecurityQuickFix, SecurityRecheck, SecurityRecheckParams, SecurityStatusChange, SecuritySummary, SecurityTraceStep, SecurityTriage, SecurityUnit,
 };
 use cc_protocol::contracts::now_ms;
 use serde::Serialize;
@@ -110,11 +110,26 @@ const FINDING_FIELDS: &[&str] = &[
     "sink_version",
     "notified_ms",
     "ended_ms",
+    "triage",
+    "triage_reason",
+    "triage_by",
+    "triage_ms",
+    "reachable",
+    "evidence",
+    "muted_by",
+    "investigation_session",
+    "fleet_key",
     "history",
     "project",
     "name",
     "updated_ms",
 ];
+
+/// The filter's judgments a finding can carry.
+const TRIAGES: [&str; 4] = ["alert", "investigating", "quiet", "muted"];
+
+/// Who may judge.
+const TRIAGE_BY: [&str; 4] = ["host", "model", "investigation", "user"];
 
 /// Audit properties (the JSON field names of [`SecurityAudit`]).
 const AUDIT_FIELDS: &[&str] = &[
@@ -150,6 +165,8 @@ const AUDIT_FIELDS: &[&str] = &[
     "deps_note",
     "previous_id",
     "ended_ms",
+    "history_head",
+    "history_commits",
 ];
 
 /// Unit properties; `unit` is the unit's own id (`U1`), `id` the node's key.
@@ -204,12 +221,12 @@ impl Caller {
     }
 }
 
-/// What a write produced beyond the records: notes for the caller and findings to tell the person about.
+/// What a write produced beyond the records: notes for the caller. Whom to tell is the security
+/// sentinel's decision after its filter judged a finding, never the store's.
 #[derive(Debug, Default)]
 pub struct PutOutcome {
     pub findings: Vec<SecurityFinding>,
     pub notes: Vec<String>,
-    pub notify: Vec<SecurityFinding>,
 }
 
 /// The security store of one IronGraph project (a repository).
@@ -513,6 +530,53 @@ fn record_evidence(root: &Path, finding: &mut SecurityFinding) {
     let Some(line) = finding.sink_line.filter(|line| *line > 0) else { return };
     if let Some(hash) = text.lines().nth(line as usize - 1).and_then(line_hash) {
         finding.sink_hash = Some(hash);
+    }
+}
+
+/// Whether a finding put again says something new: other advisories, another severity or
+/// verdict, another sink, another signal.
+fn material_change(known: &SecurityFinding, new: &SecurityFinding) -> bool {
+    let mut a = known.advisories.clone();
+    let mut b = new.advisories.clone();
+    a.sort();
+    b.sort();
+    a != b
+        || known.verdict != new.verdict
+        || severity_rank(known.severity_overall.as_deref()) != severity_rank(new.severity_overall.as_deref())
+        || known.kev != new.kev
+        || known.signal != new.signal
+        || known.sink_version != new.sink_version
+        || (new.sink_hash.is_some() && known.sink_hash != new.sink_hash)
+}
+
+fn clear_triage(finding: &mut SecurityFinding) {
+    finding.triage = None;
+    finding.triage_reason = None;
+    finding.triage_by = None;
+    finding.triage_ms = None;
+    finding.muted_by = None;
+}
+
+/// Keep the stored judgment (and what an investigation compiled) on a finding put again.
+fn carry_triage(known: &SecurityFinding, finding: &mut SecurityFinding) {
+    finding.triage = known.triage.clone();
+    finding.triage_reason = known.triage_reason.clone();
+    finding.triage_by = known.triage_by.clone();
+    finding.triage_ms = known.triage_ms;
+    finding.muted_by = known.muted_by.clone();
+    if finding.evidence.is_empty() {
+        finding.evidence = known.evidence.clone();
+    }
+    if finding.investigation_session.is_none() {
+        finding.investigation_session = known.investigation_session.clone();
+    }
+}
+
+/// Whether a finding's judgment is among the wanted ones (`pending`: not judged yet).
+fn triage_wanted(finding: &SecurityFinding, wanted: &[String]) -> bool {
+    match finding.triage.as_deref() {
+        None => wanted.iter().any(|w| w == "pending"),
+        Some(triage) => wanted.iter().any(|w| w == triage),
     }
 }
 
@@ -1044,12 +1108,12 @@ impl SecurityStore {
         for (position, change) in history.iter().enumerate().skip(known) {
             self.run(
                 &format!(
-                    "{} MATCH (f:Security:Finding {{id: $finding}}) MERGE (c:SecurityStatusChange {{id: $id}}) SET c.finding_id = $finding, c.position = $position, c.status = $status, c.note = $note, c.by = $by, c.ms = $ms, c.session_id = $session, c.commit = $commit, c.first_ms = $ms, c.last_ms = $ms MERGE (f)-[e:CHANGED]->(c) SET e.first_ms = CASE WHEN e.first_ms IS NULL THEN $ms ELSE e.first_ms END, e.last_ms = $ms",
+                    "{} MATCH (f:Security:Finding {{id: $finding}}) MERGE (c:SecurityStatusChange {{id: $id}}) SET c.finding_id = $finding, c.position = $position, c.status = $status, c.note = $note, c.by = $by, c.ms = $ms, c.session_id = $session, c.commit = $commit, c.triage = $triage, c.first_ms = $ms, c.last_ms = $ms MERGE (f)-[e:CHANGED]->(c) SET e.first_ms = CASE WHEN e.first_ms IS NULL THEN $ms ELSE e.first_ms END, e.last_ms = $ms",
                     layer::WORKSPACE_WRITE
                 ),
                 params! {
                     "finding" => id, "id" => format!("{id}#{position}"), "position" => position, "status" => change.status, "note" => change.note, "by" => change.by,
-                    "ms" => change.ms, "session" => change.session_id, "commit" => change.commit
+                    "ms" => change.ms, "session" => change.session_id, "commit" => change.commit, "triage" => change.triage
                 },
             )
             .await?;
@@ -1151,7 +1215,9 @@ impl SecurityStore {
                     finding.fixed_commit = None;
                     finding.notified_ms = None;
                     finding.ended_ms = None;
-                    history = vec![SecurityStatusChange { status: finding.status.clone(), by: "model".into(), ms: now, note, session_id: None, commit: None }];
+                    // A new finding waits for the filter's judgment.
+                    clear_triage(&mut finding);
+                    history = vec![SecurityStatusChange { status: finding.status.clone(), by: "model".into(), ms: now, note, session_id: None, commit: None, triage: None }];
                 }
                 Some(row) => {
                     let parts = self.parts(std::slice::from_ref(&finding.id)).await?;
@@ -1169,6 +1235,24 @@ impl SecurityStore {
                         continue;
                     }
                     self.floor_severity(&mut finding, Some(&known), &mut outcome.notes);
+                    // The filter's judgment holds while the finding says the same; a changed one is
+                    // judged again, and told again when it became worse.
+                    if material_change(&known, &finding) {
+                        clear_triage(&mut finding);
+                        let worse = severity_rank(finding.severity_overall.as_deref()) > severity_rank(known.severity_overall.as_deref())
+                            || (finding.kev && !known.kev)
+                            || (finding.signal.is_some() && known.signal != finding.signal);
+                        finding.notified_ms = if worse { None } else { known.notified_ms };
+                    } else {
+                        carry_triage(&known, &mut finding);
+                        finding.notified_ms = known.notified_ms;
+                    }
+                    if finding.reachable.is_none() {
+                        finding.reachable = known.reachable.clone();
+                    }
+                    if finding.fleet_key.is_none() {
+                        finding.fleet_key = known.fleet_key.clone();
+                    }
                     finding.status = known.status;
                     finding.status_note = known.status_note;
                     finding.status_by = known.status_by;
@@ -1177,14 +1261,13 @@ impl SecurityStore {
                     finding.seen_in = known.seen_in + 1;
                     finding.session_id = known.session_id;
                     finding.fixed_commit = known.fixed_commit;
-                    finding.notified_ms = known.notified_ms;
                     finding.ended_ms = None;
                     let person_closed = finding.status == "gone" && finding.status_by == "user";
                     if person_closed {
                         outcome.notes.push(format!("{} stays gone: the person marked it not an issue", finding.id));
                     } else if finding.verdict != "rejected" && matches!(finding.status.as_str(), "fixed" | "verified" | "gone") {
                         // Reported again after it was closed: the fix did not hold, or the code came back.
-                        let change = SecurityStatusChange { status: "open".into(), by: "recheck".into(), ms: now, note: format!("reported again by {audit_name}"), session_id: None, commit: None };
+                        let change = SecurityStatusChange { status: "open".into(), by: "recheck".into(), ms: now, note: format!("reported again by {audit_name}"), session_id: None, commit: None, triage: None };
                         finding.status = change.status.clone();
                         finding.status_by = change.by.clone();
                         finding.status_note = change.note.clone();
@@ -1196,11 +1279,6 @@ impl SecurityStore {
             finding.last_seen_ms = now;
             if audit.is_some() {
                 finding.audit_id = audit.clone();
-            }
-            let urgent = severity_rank(finding.severity_overall.as_deref()) >= 3 || finding.kev;
-            if finding.source == "watch" && urgent && finding.notified_ms.is_none() && finding.status == "open" {
-                finding.notified_ms = Some(now);
-                outcome.notify.push(finding.clone());
             }
             self.write(&finding, &history, now).await?;
             outcome.findings.push(finding);
@@ -1259,6 +1337,7 @@ impl SecurityStore {
             .filter(|f| p.session_id.as_ref().is_none_or(|session| f.session_id.as_ref() == Some(session)))
             .filter(|f| p.source.as_ref().is_none_or(|source| &f.source == source || (source == "audit" && f.source.is_empty())))
             .filter(|f| p.min_priority.is_none_or(|min| f.priority >= min))
+            .filter(|f| p.triage.as_ref().is_none_or(|wanted| triage_wanted(f, wanted)))
             .collect::<Vec<_>>();
         findings.sort_by(|a, b| (std::cmp::Reverse(a.priority), a.first_seen_ms, &a.id).cmp(&(std::cmp::Reverse(b.priority), b.first_seen_ms, &b.id)));
         Ok(findings)
@@ -1316,7 +1395,14 @@ impl SecurityStore {
             return Err(RpcError::invalid_params(format!("finding {id} moves to fixing with the session that fixes it: pass session_id")));
         }
         let mut note = p.note.clone();
-        if p.status == "fixed" && by != "user" {
+        // The sentinel's own sweep re-ran the structural check that raised a sweep finding and no
+        // longer sees it: that is the host's evidence (a missing setting has no line to compare).
+        let swept = p.status == "fixed" && by == "host" && !caller.command() && finding.source == "sweep";
+        if swept {
+            if note.is_empty() {
+                note = "the security sweep no longer finds it".into();
+            }
+        } else if p.status == "fixed" && by != "user" {
             match evidence_now(root, &finding) {
                 Evidence::Gone(sentence) => note = if note.is_empty() { sentence } else { format!("{note} ({sentence})") },
                 Evidence::At { sentence, .. } => {
@@ -1330,7 +1416,7 @@ impl SecurityStore {
                 by = "recheck".into();
             }
         }
-        let change = SecurityStatusChange { status: p.status, note, by, ms: now_ms(), session_id: session, commit: p.commit };
+        let change = SecurityStatusChange { status: p.status, note, by, ms: now_ms(), session_id: session, commit: p.commit, triage: None };
         Ok(Some(self.apply_move(finding, history, change).await?))
     }
 
@@ -1367,7 +1453,7 @@ impl SecurityStore {
                     checked.push(row);
                     continue;
                 };
-                let change = SecurityStatusChange { status: status.to_owned(), note, by: "recheck".into(), ms: now_ms(), session_id: None, commit: None };
+                let change = SecurityStatusChange { status: status.to_owned(), note, by: "recheck".into(), ms: now_ms(), session_id: None, commit: None, triage: None };
                 let after = self.apply_move(stored, history, change).await?;
                 row.now = Some(after.status.clone());
                 moved.push(after.id);
@@ -1392,10 +1478,98 @@ impl SecurityStore {
                 ms: now_ms(),
                 session_id: Some(session_id.to_owned()),
                 commit: None,
+                triage: None,
             };
             reopened.push(self.apply_move(stored, history, change).await?.id);
         }
+        // An investigation that ended without a verdict leaves its finding shown: the filter could
+        // not clear it, so the person sees it.
+        let investigating = self
+            .findings(&SecurityFindingsParams { project_id: self.scope.clone(), status: Some(STATUSES.iter().map(|s| (*s).to_owned()).collect()), triage: Some(vec!["investigating".into()]), ..Default::default() })
+            .await?;
+        for finding in investigating.into_iter().filter(|f| f.investigation_session.as_deref() == Some(session_id)) {
+            let item = SecurityTriage {
+                id: finding.id.clone(),
+                triage: "alert".into(),
+                reason: "the investigation ended without a verdict, so it stays shown until a person decides".into(),
+                by: "host".into(),
+                ..Default::default()
+            };
+            let outcome = self.triage_put(vec![item], &Caller::default()).await?;
+            reopened.extend(outcome.findings.into_iter().map(|f| f.id));
+        }
         Ok(reopened)
+    }
+
+    /// Record the filter's judgments (see
+    /// [`methods::SECURITY_TRIAGE_PUT`](cc_protocol::contracts::memory::methods::SECURITY_TRIAGE_PUT)).
+    /// A command judges only the finding its own session investigates, as `alert` or `quiet`.
+    pub async fn triage_put(&self, items: Vec<SecurityTriage>, caller: &Caller) -> Result<PutOutcome, RpcError> {
+        let mut outcome = PutOutcome::default();
+        for item in items {
+            let Some((mut finding, mut history)) = self.load(&item.id).await? else {
+                outcome.notes.push(format!("{} is not a finding of this project (or was forgotten)", item.id));
+                continue;
+            };
+            let wanted = item.triage.as_str();
+            if wanted != "pending" && !TRIAGES.contains(&wanted) {
+                return Err(RpcError::invalid_params(format!("triage `{wanted}` is not one of alert, investigating, quiet, muted, pending")));
+            }
+            let mut by = if item.by.is_empty() { "host".to_owned() } else { item.by.clone() };
+            if !TRIAGE_BY.contains(&by.as_str()) {
+                return Err(RpcError::invalid_params(format!("by `{by}` is not one of host, model, investigation, user")));
+            }
+            let mut notified = item.notified;
+            let mut muted_by = item.muted_by.clone();
+            if let Some(command) = caller.command_session.as_deref() {
+                let investigating = finding.triage.as_deref() == Some("investigating") && finding.investigation_session.as_deref() == Some(command);
+                if !investigating {
+                    return Err(RpcError::invalid_params(format!(
+                        "finding {} is not under investigation by this session; only the session that investigates a finding records its verdict. Next: reply with what you found.",
+                        finding.id
+                    )));
+                }
+                if !matches!(wanted, "alert" | "quiet") {
+                    return Err(RpcError::invalid_params(format!("an investigation ends with alert or quiet, not {wanted}. Next: record the verdict as alert or quiet with its evidence.")));
+                }
+                by = "investigation".into();
+                notified = false;
+                muted_by = None;
+            }
+            if wanted == "muted" && muted_by.as_deref().is_none_or(str::is_empty) {
+                return Err(RpcError::invalid_params(format!("finding {}: muted needs the mute rule's key (muted_by)", finding.id)));
+            }
+            let now = now_ms();
+            let before = (finding.triage.clone(), finding.triage_reason.clone());
+            if wanted == "pending" {
+                clear_triage(&mut finding);
+            } else {
+                finding.triage = Some(wanted.to_owned());
+                finding.triage_reason = Some(item.reason.clone()).filter(|r| !r.is_empty());
+                finding.triage_by = Some(by.clone());
+                finding.triage_ms = Some(now);
+                finding.muted_by = if wanted == "muted" { muted_by } else { None };
+            }
+            if let Some(reachable) = item.reachable.clone().filter(|r| !r.is_empty()) {
+                finding.reachable = Some(reachable);
+            }
+            if let Some(evidence) = item.evidence.clone() {
+                finding.evidence = evidence.into_iter().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect();
+            }
+            if let Some(session) = item.investigation_session.clone().filter(|s| !s.is_empty()) {
+                finding.investigation_session = Some(session);
+            }
+            if notified {
+                finding.notified_ms = Some(now);
+            }
+            if before != (finding.triage.clone(), finding.triage_reason.clone()) {
+                let session = if by == "investigation" { finding.investigation_session.clone() } else { None };
+                history.push(SecurityStatusChange { status: finding.status.clone(), note: item.reason.clone(), by, ms: now, session_id: session, commit: None, triage: Some(wanted.to_owned()) });
+            }
+            self.write(&finding, &history, now).await?;
+            outcome.findings.push(finding);
+        }
+        Ok(outcome)
     }
 
     pub async fn summary(&self) -> Result<SecuritySummary, RpcError> {
@@ -1416,6 +1590,12 @@ impl SecurityStore {
                 if finding.kev {
                     summary.kev += 1;
                 }
+                match finding.triage.as_deref() {
+                    Some("alert") => summary.alerts += 1,
+                    Some("investigating") => summary.investigating += 1,
+                    Some("quiet" | "muted") => summary.quiet += 1,
+                    _ => summary.pending += 1,
+                }
             }
         }
         summary.last_audit = self.audits().await?.into_iter().max_by_key(|audit| (audit.started_ms, audit.id.clone()));
@@ -1430,7 +1610,7 @@ impl SecurityStore {
         let mut finding = finding;
         finding.ended_ms = Some(now);
         let mut history = history;
-        history.push(SecurityStatusChange { status: finding.status.clone(), note: "forgotten by the person".into(), by: "user".into(), ms: now, session_id: None, commit: None });
+        history.push(SecurityStatusChange { status: finding.status.clone(), note: "forgotten by the person".into(), by: "user".into(), ms: now, session_id: None, commit: None, triage: None });
         self.write(&finding, &history, now).await?;
         Ok(true)
     }

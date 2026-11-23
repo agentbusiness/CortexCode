@@ -48,3 +48,29 @@
 #cc .cx-security-acts{display:flex;gap:4px;flex-wrap:wrap;}
 #cc .cx-security-note{display:flex;flex-direction:column;gap:0;max-width:64ch;}
 #cc .cx-security-note .tools{margin-top:6px;}
+
+/* the sentinel's filter: alerts keep their colour, what it set aside is grey under one fold */
+#cc .cx-security-scope{display:flex;gap:6px;}
+#cc .cx-security-scope .chip{cursor:pointer;background:transparent;}
+#cc .cx-security-scope .chip[aria-pressed="true"]{color:var(--rubric);border-color:var(--rubric);}
+#cc .cx-security-sentinel{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;}
+#cc .ap.cx-security-triage[data-triage="alert"]{color:var(--rubric);}
+#cc .ap.cx-security-triage[data-triage="investigating"]{color:var(--counter);}
+#cc .ap.cx-security-triage[data-triage="judging"]{color:var(--ink-2);}
+#cc .ap.cx-security-triage[data-triage="quiet"],#cc .ap.cx-security-triage[data-triage="muted"]{color:var(--ink-3);}
+#cc .cx-security .lst li[data-triage="quiet"] .t,#cc .cx-security .lst li[data-triage="muted"] .t{color:var(--ink-3);}
+#cc .cx-security-reason{font-size:13px;line-height:1.45;color:var(--ink-3);margin-top:2px;overflow-wrap:anywhere;text-align:left;}
+#cc .cx-security .lst li[data-triage="alert"] .cx-security-reason{color:var(--ink-2);}
+#cc .cx-security-fold{display:block;margin:10px 0 4px 16px;padding:0;background:none;border:0;cursor:pointer;font-size:13px;color:var(--ink-3);}
+#cc .cx-security-fold:hover{color:var(--ink);}
+#cc .cx-security-quiet{opacity:.85;}
+#cc .cx-security-evidence{margin:0;padding-left:16px;font-size:13.5px;line-height:1.5;color:var(--ink-2);}
+
+/* all projects */
+#cc .cx-security-fleet{display:flex;flex-direction:column;gap:6px;padding-left:16px;}
+#cc .cx-security-section{margin-top:12px;}
+#cc .cx-security-machine{border-left:2px solid var(--rubric-lift);padding:6px 0 6px 12px;display:flex;flex-direction:column;gap:4px;}
+#cc .cx-security-ask{display:flex;gap:6px;align-items:center;max-width:64ch;}
+#cc .cx-security-ask input{flex:1;min-width:0;}
+#cc .cx-security-affected{display:flex;flex-direction:column;gap:4px;}
+#cc .cx-security-group{padding:6px 0;}

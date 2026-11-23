@@ -223,6 +223,12 @@ pub mod methods {
     /// Retire a finding (the person's explicit forget in the Security tab; `ended_ms`, history
     /// kept, no longer listed): `{project_id, id}` -> `{}`. Never from a model's command.
     pub const SECURITY_FORGET: &str = "memory.security.forget";
+    /// The filter's judgment of findings (the security plugin's sentinel, a person, or the
+    /// investigation session of one finding): [`super::SecurityTriagePutParams`] ->
+    /// `{findings, notes}`. A command may judge only the finding its own session investigates
+    /// (`by` forced to `investigation`). `pending` clears the judgment so the filter judges it
+    /// again. Each judgment is kept in the finding's history.
+    pub const SECURITY_TRIAGE_PUT: &str = "memory.security.triage.put";
 
     // Routines (the scheduler plugin's recurring and timed work, docs/SCHEDULES-PLAN.md):
     /// Create or replace a routine: [`super::Routine`] -> the routine as stored (its scope's store:
@@ -1284,6 +1290,13 @@ pub struct SecurityAudit {
     /// Set when a newer audit began: the audit is history.
     #[serde(default)]
     pub ended_ms: Option<u64>,
+    /// The commit up to which the git history was searched for credentials: the next audit
+    /// searches only the commits after it.
+    #[serde(default)]
+    pub history_head: Option<String>,
+    /// Commits whose added lines the history search read.
+    #[serde(default)]
+    pub history_commits: u32,
 }
 
 /// One unit of an audit: an attack class that applies to the project, the audit's checklist item.
@@ -1490,7 +1503,8 @@ pub struct SecurityFinding {
     pub priority: i64,
     #[serde(default)]
     pub priority_reason: String,
-    /// Who found it: `audit` (default), `watch` (the daily dependency watch).
+    /// Who found it: `audit` (default), `watch` (the dependency watch), `sweep` (the security
+    /// sentinel's sweep of every project: dependencies, supply chain, CI, agent files, secrets).
     #[serde(default)]
     pub source: String,
     /// The unit and line of the audit it was recorded from.
@@ -1558,9 +1572,43 @@ pub struct SecurityFinding {
     /// Set when the person forgot it: no longer listed, kept as history.
     #[serde(default)]
     pub ended_ms: Option<u64>,
+    /// The filter's judgment: `alert` (shown, and told when urgent), `investigating` (a deeper
+    /// look runs), `quiet` (filtered out, kept grey) or `muted` (a mute rule matched). None: not
+    /// judged yet. A put whose content changed (advisories, severity, sink, verdict) clears it.
+    #[serde(default)]
+    pub triage: Option<String>,
+    /// The judgment's reason in one line.
+    #[serde(default)]
+    pub triage_reason: Option<String>,
+    /// Who judged: `host` (a rule on structural facts), `model` (the fast judgment),
+    /// `investigation` (the session that looked deeper) or `user`.
+    #[serde(default)]
+    pub triage_by: Option<String>,
+    #[serde(default)]
+    pub triage_ms: Option<u64>,
+    /// Whether the project's own code reaches the flagged package or code: `called` (a vulnerable
+    /// function is named in code that imports the package), `imported`, `not_imported`,
+    /// `transitive` (pulled in by another package, not named by the project), `dev` (a
+    /// development-only dependency) or `unknown`.
+    #[serde(default)]
+    pub reachable: Option<String>,
+    /// The facts an investigation compiled, one per entry.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// The mute rule that silenced it (its key).
+    #[serde(default)]
+    pub muted_by: Option<String>,
+    /// The session investigating it, or that investigated it.
+    #[serde(default)]
+    pub investigation_session: Option<String>,
+    /// The same problem across repositories: `dep:<ecosystem>:<package>:<version>`,
+    /// `ioc:<indicator>`, `posture:<check>` or `shape:<class>:<shape>`.
+    #[serde(default)]
+    pub fleet_key: Option<String>,
 }
 
-/// One lifecycle move of a finding.
+/// One lifecycle move of a finding, or one judgment of the filter (`triage` set; the status is
+/// the one it had then).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SecurityStatusChange {
     pub status: String,
@@ -1573,6 +1621,10 @@ pub struct SecurityStatusChange {
     pub session_id: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
+    /// For a judgment: what the filter decided (`alert`, `investigating`, `quiet`, `muted`,
+    /// `pending`).
+    #[serde(default)]
+    pub triage: Option<String>,
 }
 
 /// [`methods::SECURITY_AUDIT_PUT`] parameters.
@@ -1677,6 +1729,41 @@ pub struct SecurityFindingsParams {
     pub source: Option<String>,
     #[serde(default)]
     pub ids: Option<Vec<String>>,
+    /// Only these judgments (`alert`, `investigating`, `quiet`, `muted`; `pending` for none yet).
+    #[serde(default)]
+    pub triage: Option<Vec<String>>,
+}
+
+/// One judgment in [`SecurityTriagePutParams`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityTriage {
+    pub id: String,
+    /// `alert`, `investigating`, `quiet`, `muted`, or `pending` to clear the judgment.
+    pub triage: String,
+    #[serde(default)]
+    pub reason: String,
+    /// `host`, `model`, `investigation` or `user` (a command's is forced to `investigation`).
+    #[serde(default)]
+    pub by: String,
+    /// Set when given; absent keeps what is stored.
+    #[serde(default)]
+    pub reachable: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub muted_by: Option<String>,
+    #[serde(default)]
+    pub investigation_session: Option<String>,
+    /// The person was told about it now (sets `notified_ms`).
+    #[serde(default)]
+    pub notified: bool,
+}
+
+/// [`methods::SECURITY_TRIAGE_PUT`] parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SecurityTriagePutParams {
+    pub project_id: String,
+    pub items: Vec<SecurityTriage>,
 }
 
 /// [`methods::SECURITY_FINDINGS`] and [`methods::SECURITY_FINDINGS_PUT`] result.
@@ -1792,6 +1879,16 @@ pub struct SecuritySummary {
     /// Open and fixing findings whose dependency is in CISA's KEV catalog.
     #[serde(default)]
     pub kev: u32,
+    /// Open and fixing findings by the filter's judgment: shown as alerts, under investigation,
+    /// filtered out (quiet or muted), and not judged yet.
+    #[serde(default)]
+    pub alerts: u32,
+    #[serde(default)]
+    pub investigating: u32,
+    #[serde(default)]
+    pub quiet: u32,
+    #[serde(default)]
+    pub pending: u32,
 }
 
 /// [`topics::SECURITY_CHANGED`] payload.
