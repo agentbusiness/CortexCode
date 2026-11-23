@@ -322,6 +322,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
     let (folded_through, digested_through) = (mark("folded_through"), mark("digested_through"));
     let (steps_through, settled_through) = (mark("steps_through"), mark(crate::fit::SETTLED));
     let tasks_through = mark(crate::fit::TASKS_THROUGH);
+    let reads_through = mark(crate::fit::READS_THROUGH);
     let host = journal.host().clone();
     let (prefix, facts) = build_with(&host, project_id, data, role, lead, project).await?;
     journal
@@ -341,6 +342,7 @@ pub async fn ensure(journal: &mut Journal, project_id: &str, data: &Dataset, rol
                 "digested_through": digested_through,
                 "steps_through": steps_through,
                 "tasks_through": tasks_through,
+                "reads_through": reads_through,
                 "settled_through": settled_through,
                 "skills": prefix.skills,
                 "skill_lines": prefix.skill_lines,

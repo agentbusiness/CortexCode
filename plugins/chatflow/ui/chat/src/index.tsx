@@ -279,12 +279,18 @@ function Chat() {
                   <p>{journal.error}</p>
                 </div>
               )}
-              {entries.length === 0 && journal.status === 'ready' && (
+              {entries.length === 0 && journal.status === 'ready' && (session?.kind === 'agent' ? (
+                // An agent's session exists from the moment the agent is made; it fills when its run starts.
+                <div className="empty" data-empty="agent">
+                  <h1 className="pagekey sm">{session.agent ? `@${session.agent} has not started yet` : 'This agent has not started yet'}</h1>
+                  <p className="prose cx-lead">{session.title.trim() ? `Its task: ${session.title.trim()}. ` : ''}It is waiting for a free place on the model. Its work shows here as soon as it starts.</p>
+                </div>
+              ) : (
                 <div className="empty">
                   <h1 className="pagekey sm">What should we work on?</h1>
                   <p className="prose cx-lead">This conversation is empty.</p>
                 </div>
-              )}
+              ))}
               {turns.map((turn, index) => (
                 <TurnView key={turn.key} turn={turn} actions={actions} live={running && index === turns.length - 1}
                   progress={running && index === turns.length - 1 && !showWorking ? progressLine(liveRun.progress) : ''}

@@ -343,7 +343,7 @@ progress_go_on = "The user asked how the work goes, and the host gave them the p
 # Outdated outputs once settled: the newest read, edit result or run of the same thing shows the
 # current state; the older ones become one line each.
 absorbed = "(Earlier output of {what}: what it showed is in your notebook. Run or read it again when you need its exact text.)"
-read_repeated = "(An older read of {path}; your latest read of the same lines, below, shows them as they are now.)"
+read_repeated = "(An older read of {path}; a later read below shows these lines as they are now.)"
 read_in_view = "(Already in view: your earlier read of this file, above, shows these lines, and the file has not changed since. Work from that view.)"
 read_unchanged = "(Unchanged: this read shows exactly what your earlier read of {path}, above, shows. Work from that view.)"
 edit_superseded = "(An earlier edit of {path}; your latest edit result, below, shows it as it is now.)"
@@ -378,6 +378,7 @@ managed_finish = "{agent} stopped; its task is done and checked in the project, 
 managed_finish_failing = "{agent} stopped; its task's checks fail in the project, so the tasks waiting for it do not start yet."
 managed_restart = "{agent} works on its task again."
 managed_working = "{agent} is still working; it was told what to do differently."
+managed_stalled = "{agent} had no step for {idle} min; its run was started again where it stood."
 managed_restart_refused = "{agent} was not restarted: it failed the same way twice, so the user decides what changes."
 managed_message = "Told {agent}: {text}"
 managed_moved = "{agent} stopped; {new} takes its task with {worker}, from what is in the files."

@@ -119,6 +119,11 @@ impl Scheduler {
     }
 
     /// Remove a queued agent that has not started.
+    /// The agent's run is going now (here or on a member's model).
+    pub fn is_running(&self, key: &AgentKey) -> bool {
+        self.running.contains(key)
+    }
+
     pub fn dequeue(&mut self, key: &AgentKey) -> bool {
         let before = self.queued.len();
         self.queued.retain(|queued| queued != key);

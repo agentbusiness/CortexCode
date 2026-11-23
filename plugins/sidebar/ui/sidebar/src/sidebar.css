@@ -123,7 +123,10 @@
   flex:0 0 22px;display:none;align-items:center;justify-content:center;width:22px;height:22px;padding:0;
   border:0;background:transparent;cursor:pointer;color:var(--ink-3);font-size:15px;line-height:1;
 }
-#cc .cx-sidebar .lst li.cx-row>button.cx-del{margin:0 16px 0 0;}
+/* Over the row's corner, so the line of labels below the title keeps its width when it shows. */
+#cc .cx-sidebar .lst li.cx-row{position:relative;}
+#cc .cx-sidebar .lst li.cx-row>button.cx-del{position:absolute;top:4px;right:14px;margin:0;}
+#cc .cx-sidebar .lst li.cx-row:hover .t,#cc .cx-sidebar .lst li.cx-row:focus-within .t{padding-right:24px;}
 #cc .cx-sidebar .lst li.cx-row>button.cx-del:hover{background:transparent;}
 /* Hidden, it takes no room: the row's text runs the full width until the row is hovered or focused. */
 #cc .cx-sidebar li.cx-row:hover>button.cx-del,#cc .cx-sidebar li.cx-row:focus-within>button.cx-del,

@@ -103,6 +103,9 @@ pub enum MixerEncodeError<B: Backend> {
     Linear(#[from] LinearEncodeError<B>),
     #[error("Attention error: {0}")]
     Attention(#[from] AttentionEncodeError<B>),
+    /// CortexCode patch P10.
+    #[error("this mixer cannot run several sequences in one pass")]
+    BatchUnsupported,
 }
 
 pub trait Mixer<B: Backend>: Any + Send + Sync {
@@ -124,6 +127,33 @@ pub trait Mixer<B: Backend>: Any + Send + Sync {
         state: Option<MaybeMut<dyn MixerState<B>>>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, MixerEncodeError<B>>;
+
+    /// CortexCode patch P10: whether [`Mixer::encode_batch`] can run several sequences in one pass.
+    fn batch_supported(&self) -> bool {
+        false
+    }
+
+    /// CortexCode patch P10: several sequences in one pass. `hidden` holds every part's rows, in
+    /// order; the projections run once over all of them, the per-sequence work (cache, recurrence)
+    /// per part. The output holds the rows in the same order.
+    fn encode_batch(
+        &self,
+        _hidden: B::ScratchBuffer,
+        _parts: &mut [MixerBatchPart<'_, '_, B>],
+        _command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        Err(MixerEncodeError::BatchUnsupported)
+    }
+}
+
+/// CortexCode patch P10: one sequence's rows in a batched mixer pass.
+pub struct MixerBatchPart<'p, 's, B: Backend> {
+    /// The part's first row in the batch.
+    pub row: u32,
+    /// The part's own topology (its rows, heights relative to its own context).
+    pub topology: &'p BatchTopology,
+    pub rope: Option<&'p PrecalculatedRoPE<B>>,
+    pub state: MaybeMut<'s, dyn MixerState<B>>,
 }
 
 #[derive(Debug, Error)]

@@ -275,6 +275,11 @@ impl Mesh {
                         _ => {}
                     }
                 }
+                // The calls it still forwards end with it: nothing waits on a member it no longer
+                // serves (seen: a session's model call held 5½ hours after its lender went away).
+                for cancel in open.lock().unwrap_or_else(|p| p.into_inner()).values() {
+                    cancel.cancel();
+                }
                 ended();
             });
         }

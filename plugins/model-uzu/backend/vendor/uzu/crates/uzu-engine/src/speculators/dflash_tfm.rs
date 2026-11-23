@@ -197,6 +197,29 @@ impl<B: Backend> DFlashTfmSpeculator<B> {
             .map_err(DFlashTreeError::DFlash)
     }
 
+    /// CortexCode patch P10: the device's tree budget (rows one verification pass takes).
+    pub fn tree_budget(&self) -> u32 {
+        self.shape.tree_budget
+    }
+
+    /// CortexCode patch P10: [`Self::make_shape`] with the tree cut to at most `tree_budget` nodes
+    /// (a share of a batched pass); below a root and one draft token it does not draft.
+    pub fn make_shape_within(
+        &self,
+        max_depth: Option<u32>,
+        tree_budget: Option<u32>,
+    ) -> Option<DFlashTfmTreeShape> {
+        let mut shape = self.make_shape(max_depth)?;
+        if let Some(budget) = tree_budget {
+            if budget < 2 {
+                return None;
+            }
+            // The weaver grows its tree and prunes it to the budget; an argmax chain is the budget.
+            shape.tree_budget = u32::min(shape.tree_budget, budget);
+        }
+        Some(shape)
+    }
+
     pub fn make_shape(
         &self,
         max_depth: Option<u32>,

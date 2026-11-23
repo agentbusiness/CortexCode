@@ -29,14 +29,16 @@
 //! leave `limits.answer_reserve_tokens` free for the answer, the conversation is compacted; when
 //! keeping the newest steps whole does not fit, only the newest one is kept whole.
 //!
-//! Compaction is three marks on the session's `context` entry, which the projection honours:
+//! Compaction is four marks on the session's `context` entry, which the projection honours:
 //! `digested_through` (finished turns at or before it are shown as their user message, one note
 //! listing their calls, and their final answer), `folded_through` (older tool outputs become one
-//! line) and `steps_through` (layer 2: the running turn's steps at or before it become one note
-//! listing their calls; its newest `limits.history_tail_steps` steps always stay whole).
+//! line), `steps_through` (layer 2: the running turn's steps at or before it become one note
+//! listing their calls; its newest `limits.history_tail_steps` steps always stay whole) and
+//! `reads_through` (the file reads at or before it, which the other marks keep whole, fold too).
 //! The possible compactions are ordered least first ([`levels`]: older finished turns digested, then
 //! older tool outputs folded, then the newest finished turn digested, then the running turn's older
-//! steps) and the least one that reaches the goal is chosen by bisection, checked by counting.
+//! steps, then the oldest file reads) and the least one that reaches the goal is chosen by
+//! bisection, checked by counting.
 //!
 //! [`prepare`] runs at a wait: while the run's tools execute, and when the turn ended (the user
 //! reads the answer, so the next turn starts with room). It prefills the cut prompt in the
@@ -73,12 +75,19 @@ pub struct Marks {
     pub folded_through: u64,
     /// Layer 2: the running turn's steps at or before it are one note listing their calls.
     pub steps_through: u64,
+    /// The last level: file reads at or before it fold like other outputs.
+    pub reads_through: u64,
 }
 
 impl Marks {
     fn of(entry: &JournalEntry) -> Self {
         let mark = |field: &str| entry.data.get(field).and_then(Value::as_u64).unwrap_or(0);
-        Self { digested_through: mark("digested_through"), folded_through: mark("folded_through"), steps_through: mark("steps_through") }
+        Self {
+            digested_through: mark("digested_through"),
+            folded_through: mark("folded_through"),
+            steps_through: mark("steps_through"),
+            reads_through: mark(READS_THROUGH),
+        }
     }
 }
 
@@ -144,6 +153,12 @@ pub async fn settle(env: &RunEnv, journal: &mut Journal, build: impl Fn(&[Journa
 
 /// The context mark of the last task boundary ([`fold_steps`]).
 pub const TASKS_THROUGH: &str = "tasks_through";
+
+/// The context mark of the last compaction level: the file reads at or before it fold. The newest
+/// read of each part of a file stays whole through every other level (folding it sent the model to
+/// read it again), so a long task that read many parts could reach no goal at all (seen: 163k
+/// compacted to 120k at most, and a run failed at 300k). Oldest reads fold first; the newest stay.
+pub const READS_THROUGH: &str = "reads_through";
 
 /// Fold the running turn's steps so far into their one note (layer 2 through the newest entry) and
 /// settle the conversation there. For a procedure a tool drives piece by piece (an audit of many
@@ -373,6 +388,9 @@ async fn apply(journal: &mut Journal, chosen: &Chosen) -> Result<(), RpcError> {
     if marks.steps_through != current.steps_through {
         journal.set(context_seq, "steps_through", json!(marks.steps_through)).await?;
     }
+    if marks.reads_through != current.reads_through {
+        journal.set(context_seq, READS_THROUGH, json!(marks.reads_through)).await?;
+    }
     let settled_before = journal.context_entry().and_then(|entry| entry.data.get(SETTLED).and_then(Value::as_u64)).unwrap_or(0);
     if chosen.settled > settled_before {
         journal.set(context_seq, SETTLED, json!(chosen.settled)).await?;
@@ -441,24 +459,45 @@ where
 /// Every compaction beyond `current`, least first: finished turns digested oldest first (all but
 /// the newest), then older tool outputs folded oldest first, then the newest finished turn
 /// digested, then (layer 2) the running turn's older steps as one note, oldest first, keeping its
-/// newest `tail_steps` steps whole. A turn still running is never digested whole.
+/// newest `tail_steps` steps whole, then the file reads the other levels keep whole, oldest first
+/// (never the newest output). A turn still running is never digested whole.
 pub fn levels(entries: &[JournalEntry], current: Marks, tail_steps: u32) -> Vec<Marks> {
     let mut ends: Vec<u64> = finished_runs(entries).into_values().filter(|end| *end > current.digested_through).collect();
     ends.sort_unstable();
     let newest = ends.pop();
     let steps = current.steps_through;
-    let mut levels: Vec<Marks> = ends.iter().map(|end| Marks { digested_through: *end, folded_through: current.folded_through, steps_through: steps }).collect();
+    let mut levels: Vec<Marks> = ends.iter().map(|end| Marks { digested_through: *end, folded_through: current.folded_through, steps_through: steps, reads_through: current.reads_through }).collect();
     let digested = levels.last().map(|marks| marks.digested_through).unwrap_or(current.digested_through);
     levels.extend(
-        fold_candidates(entries).into_iter().filter(|seq| *seq > current.folded_through).map(|seq| Marks { digested_through: digested, folded_through: seq, steps_through: steps }),
+        fold_candidates(entries).into_iter().filter(|seq| *seq > current.folded_through).map(|seq| Marks { digested_through: digested, folded_through: seq, steps_through: steps, reads_through: current.reads_through }),
     );
     if let Some(newest) = newest {
         let folded = levels.last().map(|marks| marks.folded_through).unwrap_or(current.folded_through);
-        levels.push(Marks { digested_through: newest, folded_through: folded, steps_through: steps });
+        levels.push(Marks { digested_through: newest, folded_through: folded, steps_through: steps, reads_through: current.reads_through });
     }
     let most = levels.last().copied().unwrap_or(current);
     levels.extend(step_candidates(entries, tail_steps).into_iter().filter(|seq| *seq > steps).map(|seq| Marks { steps_through: seq, ..most }));
+    let most = levels.last().copied().unwrap_or(current);
+    levels.extend(read_candidates(entries).into_iter().filter(|seq| *seq > current.reads_through).map(|seq| Marks { reads_through: seq, ..most }));
     levels
+}
+
+/// The file reads the last level may fold through: every successful read's result but the newest
+/// tool output, oldest first.
+pub fn read_candidates(entries: &[JournalEntry]) -> Vec<u64> {
+    let reads: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_CALL && matches!(entry.data.get("tool").and_then(Value::as_str), Some("read" | cc_protocol::contracts::tools::methods::READ)))
+        .filter(|entry| crate::skillsel::read_skill_uri(entry).is_none())
+        .filter_map(|entry| entry.data.get("call_id").and_then(Value::as_str))
+        .collect();
+    let newest = entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| entry.seq).unwrap_or(0);
+    entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq < newest && entry.data.get("ok").and_then(Value::as_bool) == Some(true))
+        .filter(|entry| entry.data.get("call_id").and_then(Value::as_str).is_some_and(|id| reads.contains(id)))
+        .map(|entry| entry.seq)
+        .collect()
 }
 
 /// The marks layer 2 may set: for each step of the running turns but the newest `tail_steps`, the
@@ -529,6 +568,7 @@ fn with_marks(entries: &[JournalEntry], context_seq: u64, marks: Marks, settled:
                 data.insert("digested_through".into(), json!(marks.digested_through));
                 data.insert("folded_through".into(), json!(marks.folded_through));
                 data.insert("steps_through".into(), json!(marks.steps_through));
+                data.insert(READS_THROUGH.into(), json!(marks.reads_through));
                 let before = data.get(SETTLED).and_then(Value::as_u64).unwrap_or(0);
                 data.insert(SETTLED.into(), json!(settled.max(before)));
             }

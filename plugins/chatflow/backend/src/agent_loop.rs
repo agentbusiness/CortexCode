@@ -461,6 +461,17 @@ fn changed_files_of(entries: &[JournalEntry], run_id: &str) -> BTreeSet<String> 
         .collect()
 }
 
+/// The files every run of a task changed (each run's `status` names its task).
+fn task_changed_files(entries: &[JournalEntry], task_id: &str) -> BTreeSet<String> {
+    let runs: HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::STATUS && str_field(&entry.data, "task_id") == task_id)
+        .map(|entry| str_field(&entry.data, "run_id"))
+        .filter(|run| !run.is_empty())
+        .collect();
+    runs.into_iter().flat_map(|run| changed_files_of(entries, run)).collect()
+}
+
 /// Deliver pending `steer` entries at this tool boundary. Returns their texts.
 pub async fn deliver_steers(journal: &mut Journal) -> Result<Vec<String>, RpcError> {
     let pending = journal.pending_steers("steer");
@@ -1045,6 +1056,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
         failure_shown.insert(lesson);
     }
     let mut changed = changed_files_of(&entries, &env.run_id);
+    // A task's earlier runs (cut off by a restart or an update) changed files too: the work is
+    // the task's, not this run's (seen: a resumed task told "You changed no file" after its first
+    // run had changed five).
+    if let Some(task) = &spec.task {
+        changed.extend(task_changed_files(&entries, &task.id));
+    }
     let mut tracker = Tracker::default();
     // Each step's thinking is chosen by what it faces (`Footing`): a run that starts, or resumes
     // after a failing contract or a repeat, as it left off; otherwise the step carries on.
@@ -1802,7 +1819,13 @@ pub async fn run(env: &RunEnv, journal: &mut Journal, spec: &LoopSpec) -> Result
                             None => {}
                         }
                     }
-                    verdicts.push(detector.observe_call(&outcome.tool, &outcome.args, &outcome.output));
+                    // An edit refused because another agent holds the file never ran: sending it
+                    // again once the file frees is the step the refusal names, not a loop (seen: a
+                    // task stopped as "kept repeating" an edit the lock refused six times, two
+                    // minutes before the holder applied it for it).
+                    if outcome.error_kind.as_deref() != Some("reserved") {
+                        verdicts.push(detector.observe_call(&outcome.tool, &outcome.args, &outcome.output));
+                    }
                     if !outcome.changed_files.is_empty() {
                         detector.changed();
                     }

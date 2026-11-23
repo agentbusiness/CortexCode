@@ -266,6 +266,9 @@ struct Inner {
     frontier: Arc<crate::frontier::Frontier>,
     /// When the app's work was paused (None: it is not).
     paused_since: Mutex<Option<u64>>,
+    /// Working agents whose run is being started again (`agents.restart` of a run that stopped
+    /// moving): when the old run's call ends, the agent is queued again.
+    restarting: Mutex<std::collections::HashSet<AgentKey>>,
 }
 
 #[derive(Clone)]
@@ -295,6 +298,7 @@ impl Agents {
                 park: CancellationToken::new(),
                 frontier: Arc::new(crate::frontier::Frontier::default()),
                 paused_since: Mutex::new(None),
+                restarting: Mutex::new(std::collections::HashSet::new()),
             }),
         })
     }
@@ -424,9 +428,22 @@ async fn flow_method(host: &Host, session_id: &str, verb: &str) -> String {
     flows::method(&flow, verb)
 }
 
+/// The session that supervises an agent: the one that started it, or, when that is an agent of its
+/// own whose task is finished, the first session above it that still runs. A finished agent's run
+/// decides nothing more (seen: a helper's block reported to its finished starter, and that session
+/// woken every 4 minutes for five hours while the lead never heard of it).
 async fn lead_session(host: &Host, record: &AgentRecord) -> Option<String> {
     let session_id = record.session_id.as_deref()?;
-    host.session_get(session_id).await.ok().and_then(|session| session.parent)
+    let mut lead = host.session_get(session_id).await.ok()?.parent?;
+    let mut seen = BTreeSet::new();
+    while seen.insert(lead.clone()) {
+        let Ok(session) = host.session_get(&lead).await else { break };
+        let Some(name) = session.agent.as_deref() else { break };
+        let finished = agent(host, &record.project_id, name).await.is_ok_and(|starter| matches!(starter.status.as_str(), "done" | "stopped"));
+        let Some(parent) = session.parent.filter(|_| finished) else { break };
+        lead = parent;
+    }
+    Some(lead)
 }
 
 /// A progress line in the delegating session's journal: shown on its card, not a model message.
@@ -1042,9 +1059,13 @@ impl Agents {
             let mut scheduler = lock(&self.inner.scheduler);
             scheduler.mark_frontier(&key, frontier);
             let mut start = scheduler.set_frontier_limit(frontier_limit);
-            start.extend(scheduler.enqueue(key));
+            start.extend(scheduler.enqueue(key.clone()));
             start
         };
+        // It may wait now: lists that say who waits (`agents.scheduler`, `waiting`) read again.
+        if !start.contains(&key) {
+            ctx.publish(topics::AGENT_CHANGED, json!({"agent": key.name, "project_id": key.project_id, "status": "working"}));
+        }
         for key in start {
             self.start(ctx.clone(), key);
         }
@@ -1115,6 +1136,8 @@ impl Agents {
     }
 
     fn start(&self, ctx: Ctx, key: AgentKey) {
+        // Its wait is over: lists that say who waits (`agents.scheduler`, `waiting`) read again.
+        ctx.publish(topics::AGENT_CHANGED, json!({"agent": key.name, "project_id": key.project_id, "status": "working"}));
         let token = self.cancellation(&key);
         let this = self.clone();
         self.inner.tasks.spawn(async move {
@@ -1152,6 +1175,11 @@ impl Agents {
             }
             // Stopping frees the scheduler slot too; only plugin parking prevents new starts.
             let next = lock(&this.inner.scheduler).finished(&key);
+            // A run restarted while it was working: its old call ended, the agent goes again.
+            if lock(&this.inner.restarting).remove(&key) && !this.inner.park.is_cancelled() {
+                lock(&this.inner.cancellations).remove(&key);
+                this.enqueue(ctx.clone(), key.clone()).await;
+            }
             // While pausing, each agent that reached its stop is told to the header.
             let pausing = lock(&this.inner.scheduler).paused;
             if pausing {
@@ -1341,29 +1369,45 @@ impl Agents {
             return Err(RpcError::cancelled());
         }
         let mut updated = fresh;
+        // Every file the task's runs changed, not only the last run's: a run cut off by a restart
+        // or an update leaves its edits in the project, and the run that finishes the task starts
+        // after them (seen: "It changed no file" for a task whose first run changed five).
+        let entries = host.journal_read(&session_id, 1).await.unwrap_or_default();
+        let mut changed_files = task_changed_files(&entries, &task.id);
+        for file in &result.changed_files {
+            if !changed_files.contains(file) {
+                changed_files.push(file.clone());
+            }
+        }
+        let own_check = own_check(&entries, &task.id, &project_commands(host).await);
+        let command = own_check.as_deref().map(|command| command.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
         // How the task ends done: its checks passed, nothing checked it, or its checks fail only
         // where the plan's last task takes over. Each is said as what it is, never as a pass.
         let standing = match verdict {
             contract::Verdict::Passed => Some(Stewarded::Verified),
+            // No contract check: the agent's own run of a project command after its last change is
+            // what shows the work, said as that (seen: every task of a plan told "no check ran on
+            // it" while each agent's last run of the project's end-to-end command exited 0).
+            contract::Verdict::NotChecked if own_check.is_some() => Some(Stewarded::OwnRun),
             contract::Verdict::NotChecked => Some(Stewarded::Unchecked),
             // Its checks were killed by the machine: nothing to fix in the work, so the agent is
             // not sent back; said as checks that could not run.
             contract::Verdict::Unrun => Some(Stewarded::Unrun),
             contract::Verdict::Failed => {
-                let awaited = no_worse_and_awaited(host, &session_id, task, &report, &outputs, &result.changed_files, &project.root).await;
+                let awaited = no_worse_and_awaited(host, &session_id, task, &report, &outputs, &changed_files, &project.root).await;
                 awaited.then_some(Stewarded::KnownFailures)
             }
         };
         if let Some(standing) = standing {
             let data = self.inner.data.get();
-            update_task(host, json!({"id": task.id, "status": "done", "result": data.text(standing.result_key(), &[("summary", result.summary.trim())])})).await?;
+            update_task(host, json!({"id": task.id, "status": "done", "result": data.text(standing.result_key(), &[("summary", result.summary.trim()), ("command", &command)])})).await?;
             updated.status = "done".into();
             updated.tasks_done += 1;
             let updated = upsert(ctx, host, updated).await?;
             // What the work left, from the project itself: a file it made and then deleted is named
             // as removed (seen: a handoff listing a file that was gone, and the next agent looking
             // for it nine times).
-            let (kept, removed): (Vec<&String>, Vec<&String>) = result.changed_files.iter().partition(|file| std::path::Path::new(&project.root).join(file).exists());
+            let (kept, removed): (Vec<&String>, Vec<&String>) = changed_files.iter().partition(|file| std::path::Path::new(&project.root).join(file).exists());
             let mut changed = String::new();
             if !kept.is_empty() {
                 changed.push_str(&data.text("board_changed", &[("files", &files_text(kept.iter().map(|file| file.as_str())))]));
@@ -1376,9 +1420,10 @@ impl Agents {
             handoff_ended(host, &updated, task, "is done", &result.summary).await;
             let lead = lead_session(host, &updated).await;
             let changed = if changed.is_empty() { data.text("progress_changed_none", &[]) } else { changed };
-            let checked = data.text(standing.progress_key(), &[]);
+            let checked = data.text(standing.progress_key(), &[("command", &command)]);
             let text = data.text("progress_done", &[("agent", &record.name), ("title", &task.title), ("checked", &checked), ("changed", changed.trim()), ("summary", result.summary.trim())]);
             progress_note(host, lead.as_deref(), &text, &updated, true).await;
+            self.hand_over_checks(host, &updated, lead.as_deref()).await;
             let _ = host.call(memory_methods::REFRESH, json!({"project_id": project.id})).await;
             Ok(standing)
         } else {
@@ -1400,6 +1445,24 @@ impl Agents {
         }
     }
 
+    /// A finished agent's check-ins on the agents it started go to the session above it (`lead`):
+    /// its own run decides nothing more, so their needs and blocks go where a run takes them up.
+    async fn hand_over_checks(&self, host: &Host, record: &AgentRecord, lead: Option<&str>) {
+        let (Some(session_id), Some(lead)) = (record.session_id.as_deref(), lead) else { return };
+        let Ok(listed) = host.get::<cc_protocol::contracts::schedule::ListAnswer>(cc_protocol::contracts::schedule::methods::LIST, json!({"scope": record.project_id})).await else { return };
+        for routine in listed.routines.iter().filter(|routine| routine.state != "ended" && routine.kind == "wake" && routine.report_to.as_deref() == Some(session_id) && !routine.watches.is_empty()) {
+            if host.call(cc_protocol::contracts::schedule::methods::REMOVE, json!({"id": routine.id})).await.is_err() {
+                continue;
+            }
+            for task_id in &routine.watches {
+                let open = task(host, task_id).await.is_ok_and(|watched| !finished(&watched.status));
+                if open {
+                    self.check_in(host, &record.project_id, lead, task_id, &record.mode).await;
+                }
+            }
+        }
+    }
+
     /// Start agents for tasks of the same tree whose dependencies are all done.
     async fn start_dependents(&self, ctx: &Ctx, host: &Host, finished: &Task, agent_session: &str, mode: &str) {
         let Some(parent_id) = finished.parent_id.clone() else { return };
@@ -1408,9 +1471,12 @@ impl Agents {
         };
         let status: HashMap<String, String> = list.tasks.iter().map(|task| (task.id.clone(), task.status.clone())).collect();
         let from = host.session_get(agent_session).await.ok().and_then(|session| session.parent);
-        let mut all_done = true;
+        // Done when every task that will run again is done: a task cancelled when the plan was
+        // made again never runs, and waiting for it kept the finished plan from its session (seen:
+        // the last task done at 06:15, the session never told).
+        let mut all_done = list.tasks.iter().any(|task| task.status == "done");
         for task in &list.tasks {
-            if task.status != "done" {
+            if !finished(&task.status) {
                 all_done = false;
             }
             let ready = task.status == "pending"
@@ -2048,8 +2114,11 @@ impl Agents {
     async fn restart(&self, ctx: Ctx, params: AgentRefParams) -> Result<AgentRecord, RpcError> {
         let host = Host::new(ctx.clone());
         let mut record = agent(&host, &params.project_id, &params.agent).await?;
+        if record.status == "working" {
+            return self.restart_working(ctx, &host, record).await;
+        }
         if record.status != "blocked" && record.status != "stopped" {
-            return Err(RpcError::invalid_params(format!("{} is {}; only a blocked or stopped agent restarts", record.name, record.status)));
+            return Err(RpcError::invalid_params(format!("{} is {}; only a working, blocked or stopped agent restarts", record.name, record.status)));
         }
         let (Some(session_id), Some(task_id)) = (record.session_id.clone(), record.task_id.clone()) else {
             return Err(RpcError::invalid_params(format!("{} has no session or task to go back to", record.name)));
@@ -2081,6 +2150,30 @@ impl Agents {
         Ok(record)
     }
 
+    /// A working agent's run started again where its journal stands: its call is dropped (the chat
+    /// flow parks the run, which stays running in the journal) and made anew, which resumes it. A
+    /// run stuck in a call that never answers (seen: a model call through a member that went
+    /// away, 8½ hours with no step) moves again; nothing it did is lost.
+    async fn restart_working(&self, ctx: Ctx, host: &Host, record: AgentRecord) -> Result<AgentRecord, RpcError> {
+        let key = AgentKey { project_id: record.project_id.clone(), name: record.name.clone() };
+        let running = lock(&self.inner.scheduler).is_running(&key);
+        if running {
+            lock(&self.inner.restarting).insert(key.clone());
+            self.cancel_agent(&key);
+        } else {
+            // Not running here (its call was lost with an earlier instance): queue it.
+            lock(&self.inner.cancellations).remove(&key);
+            self.enqueue(ctx.clone(), key).await;
+        }
+        let lead = lead_session(host, &record).await;
+        let title = match &record.task_id {
+            Some(task_id) => task(host, task_id).await.map(|task| task.title).unwrap_or_default(),
+            None => String::new(),
+        };
+        progress(host, lead.as_deref(), &self.inner.data.get().text("progress_restarted", &[("agent", &record.name), ("title", &title)]), &record).await;
+        Ok(record)
+    }
+
     fn scheduler_state(&self) -> SchedulerState {
         let config = self.inner.data.get().scheduler.clone();
         let scheduler = lock(&self.inner.scheduler);
@@ -2101,6 +2194,8 @@ impl Agents {
             detail: json!({
                 "active": scheduler.running.len(),
                 "queued": scheduler.queued.len(),
+                // Who waits for a place, by project (a name is only unique inside its project).
+                "waiting": scheduler.queued.iter().map(|key| json!({"project_id": key.project_id, "name": key.name})).collect::<Vec<_>>(),
                 "limit": scheduler.limit,
                 "why": adjustments.last().and_then(|last| last.get("reason").cloned()).unwrap_or_else(|| json!("initial limit")),
                 "bounds": {"min": config.min, "max": config.max, "ceiling": controller.as_ref().and_then(|c| c.ceiling)},
@@ -2273,6 +2368,9 @@ enum Stewarded {
     Verified,
     /// Done with nothing checked: the task's contract holds no check. Never said as a pass.
     Unchecked,
+    /// Done with no contract check, but the agent's own last run of a project command after its
+    /// last change passed. Said as that run, never as the contract's pass.
+    OwnRun,
     /// Done with its checks not run: the machine killed them (memory, a stop from outside), so
     /// they show nothing about the work. Never said as a pass, never as a failure to fix.
     Unrun,
@@ -2294,7 +2392,7 @@ impl Stewarded {
     fn state(self) -> &'static str {
         match self {
             Stewarded::Verified => contract::Verdict::Passed.as_str(),
-            Stewarded::Unchecked | Stewarded::Unrun => contract::Verdict::NotChecked.as_str(),
+            Stewarded::Unchecked | Stewarded::OwnRun | Stewarded::Unrun => contract::Verdict::NotChecked.as_str(),
             Stewarded::KnownFailures | Stewarded::Failed => contract::Verdict::Failed.as_str(),
         }
     }
@@ -2303,6 +2401,7 @@ impl Stewarded {
     fn result_key(self) -> &'static str {
         match self {
             Stewarded::Unchecked => "result_unchecked",
+            Stewarded::OwnRun => "result_own_run",
             Stewarded::Unrun => "result_unrun",
             Stewarded::KnownFailures => "result_known_failures",
             Stewarded::Verified | Stewarded::Failed => "result_verified",
@@ -2313,6 +2412,7 @@ impl Stewarded {
     fn progress_key(self) -> &'static str {
         match self {
             Stewarded::Unchecked => "progress_unchecked",
+            Stewarded::OwnRun => "progress_own_run",
             Stewarded::Unrun => "progress_unrun",
             Stewarded::KnownFailures => "progress_known_failures",
             Stewarded::Verified | Stewarded::Failed => "progress_verified",
@@ -2324,6 +2424,7 @@ impl Stewarded {
         match self {
             Stewarded::Verified => "merge_verified",
             Stewarded::Unchecked => "merge_unchecked",
+            Stewarded::OwnRun => "merge_own_run",
             Stewarded::Unrun => "merge_unrun",
             Stewarded::KnownFailures => "merge_known_failures",
             Stewarded::Failed => "merge_failing",
@@ -2538,6 +2639,45 @@ fn runs_project_command(command: &str, known: &[Vec<String>]) -> bool {
     })
 }
 
+/// The command of the agent's newest run of a project command (or a test run) for `task_id`, when
+/// it came after the task's last change to a file and exited 0; None otherwise (no such run, or the
+/// newest failed).
+fn own_check(entries: &[JournalEntry], task_id: &str, known: &[Vec<String>]) -> Option<String> {
+    let runs: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::STATUS && entry.data.get("task_id").and_then(Value::as_str) == Some(task_id))
+        .filter_map(|entry| entry.data.get("run_id").and_then(Value::as_str))
+        .collect();
+    let results: HashMap<&str, &JournalEntry> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT)
+        .filter_map(|entry| Some((entry.data.get("call_id")?.as_str()?, entry)))
+        .collect();
+    let mut newest: Option<(String, bool)> = None;
+    for call in entries.iter().filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("run_id").and_then(Value::as_str).is_some_and(|run| runs.contains(run))) {
+        let Some(result) = call.data.get("call_id").and_then(Value::as_str).and_then(|id| results.get(id)) else { continue };
+        // A change to a file makes every earlier run old.
+        if result.data.get("changed_files").and_then(Value::as_array).is_some_and(|files| !files.is_empty()) {
+            newest = None;
+        }
+        if call.data.get("tool").and_then(Value::as_str) != Some("run") {
+            continue;
+        }
+        let command = call.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str).unwrap_or("").trim();
+        let display = result.data.get("display").cloned().unwrap_or(Value::Null);
+        if command.is_empty() || display.get("background").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let tests = display.get("tests").is_some_and(|tests| !tests.is_null());
+        if !tests && !runs_project_command(command, known) {
+            continue;
+        }
+        let passed = display.get("exit_code").and_then(Value::as_i64) == Some(0);
+        newest = Some((command.to_owned(), passed));
+    }
+    newest.filter(|(_, passed)| *passed).map(|(command, _)| command)
+}
+
 /// Runs of the project's own commands kept per task of a finished tree (the newest of each
 /// command, the last ones the work ended with), and the characters kept of each one's output.
 const TREE_RUNS_PER_TASK: usize = 3;
@@ -2554,6 +2694,27 @@ fn changed_files_of(entries: &[JournalEntry]) -> Vec<String> {
         }
     }
     changed
+}
+
+/// The files the runs of one task changed (each run's `status` names its task), in the order first
+/// changed.
+fn task_changed_files(entries: &[JournalEntry], task_id: &str) -> Vec<String> {
+    let runs: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::STATUS && entry.data.get("task_id").and_then(Value::as_str) == Some(task_id))
+        .filter_map(|entry| entry.data.get("run_id").and_then(Value::as_str))
+        .collect();
+    let calls: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("run_id").and_then(Value::as_str).is_some_and(|run| runs.contains(run)))
+        .filter_map(|entry| entry.data.get("call_id").and_then(Value::as_str))
+        .collect();
+    let of_task: Vec<JournalEntry> = entries
+        .iter()
+        .filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.data.get("call_id").and_then(Value::as_str).is_some_and(|id| calls.contains(id)))
+        .cloned()
+        .collect();
+    changed_files_of(&of_task)
 }
 
 /// A text field of a task's facts ([`task_facts`]); empty when absent.

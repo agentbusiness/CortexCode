@@ -105,6 +105,10 @@ stall_runs = 20
 # agent that waited 82 minutes for the model).
 manage_reading_calls = 10
 manage_idle_minutes = 10
+# A working agent whose run has had no step and no tool running for this many minutes is started
+# again by the host where its journal stands, with no model decision (seen: a model call through a
+# member that went away never answered, and the agent sat 8½ hours with no step).
+manage_stalled_minutes = 30
 # Steps whose reasoning stays in the prompt (newest first); older steps keep their answer and calls
 # only, as the model's template renders earlier turns. 0: what a step worked out lives in its
 # notebook (the law at the end of every step), not in its thinking. With 1 the newest step's

@@ -265,6 +265,28 @@ pub fn describe_decision(ds: &Dataset, data: &Value) -> String {
     out
 }
 
+/// The lines a read's output shows: every line for a whole read (`mode: file`), else each
+/// segment's header (`path:120-260 (of 900 lines):`, `path:300-340:`). An outline or a focus view
+/// shows no line range.
+fn shown_lines(result: &JournalEntry) -> Vec<(usize, usize)> {
+    if result.data.get("display").and_then(|display| display.get("mode")).and_then(Value::as_str) == Some("file") {
+        return vec![(1, usize::MAX)];
+    }
+    str_field(&result.data, "output")
+        .lines()
+        .filter_map(|line| {
+            let head = line.strip_suffix(':')?;
+            let head = head.split_once(" (of ").map_or(head, |(head, _)| head);
+            let (path, range) = head.rsplit_once(':')?;
+            if path.is_empty() || path.contains(|c: char| c.is_whitespace() || c == '|') {
+                return None;
+            }
+            let (from, to) = range.split_once('-')?;
+            Some((from.parse().ok()?, to.parse().ok()?))
+        })
+        .collect()
+}
+
 /// Project the journal into the conversation the model sees (without the system prompt and
 /// without the trailing stage message), for a text-only model.
 pub fn project(entries: &[JournalEntry], ds: &Dataset) -> Vec<ChatMessage> {
@@ -316,6 +338,9 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     let context = entries.iter().rev().find(|entry| entry.kind == extra_kinds::CONTEXT);
     let mark = |field: &str| context.and_then(|entry| entry.data.get(field).and_then(Value::as_u64)).unwrap_or(0);
     let folded_through = mark("folded_through");
+    // The last compaction level ([`crate::fit::READS_THROUGH`]): file reads at or before it fold
+    // and leave layer 2 like any output, oldest first, when everything else did not reach the goal.
+    let reads_through = mark(crate::fit::READS_THROUGH);
     // In-place changes count only up to the last compaction (see the module notes).
     let settled_through = mark(crate::fit::SETTLED);
     let settled_len = entries.iter().position(|entry| entry.seq > settled_through).unwrap_or(entries.len());
@@ -431,6 +456,28 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         }
     }
     let later = |map: &HashMap<String, u64>, key: &str, seq: u64| map.get(key).is_some_and(|&at| at > seq);
+    // The lines each settled read showed, per file: a later read that shows all of an earlier
+    // read's lines replaces it as a read of the same part does. Keyed by the range alone, a read of
+    // 1-400 left the reads of 1-120 and 100-260 before it whole, and every part ever read stayed
+    // until the task ended (seen: 110 parts of one task's files, a 300k prompt).
+    let mut read_spans: HashMap<String, Vec<(u64, Vec<(usize, usize)>)>> = HashMap::new();
+    for result in settled.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && bool_field(&entry.data, "ok") && !bool_field(&entry.data, "unchanged")) {
+        let Some(call) = calls.get(str_field(&result.data, "call_id")) else { continue };
+        if !matches!(str_field(&call.data, "tool"), tool if tool == "read" || tool == tools_methods::READ) {
+            continue;
+        }
+        let (Some(file), spans) = (file_of(call), shown_lines(result)) else { continue };
+        if !spans.is_empty() {
+            read_spans.entry(file).or_default().push((result.seq, spans));
+        }
+    }
+    let covered_later = |file: &str, result: &JournalEntry| -> bool {
+        let spans = shown_lines(result);
+        !spans.is_empty()
+            && read_spans.get(file).is_some_and(|reads| {
+                reads.iter().any(|(seq, later_spans)| *seq > result.seq && spans.iter().all(|(from, to)| later_spans.iter().any(|(a, b)| a <= from && to <= b)))
+            })
+    };
     let superseded = |result: &JournalEntry| -> Option<String> {
         if result.seq > settled_through {
             return None;
@@ -440,14 +487,15 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             tool if tool == "read" || tool == tools_methods::READ => {
                 let file = file_of(call)?;
                 let target = target_of(call).unwrap_or_else(|| file.clone());
+                let read_again = later(&read_at, &target, result.seq) || covered_later(&file, result);
                 // The newest read of a part stays after an edit, with a note: hiding it sent the
                 // model to read the whole file again after every edit (seen: 58 re-reads in one
                 // run). Lines the edit did not change still match by their hash where they moved.
-                if later(&edited_at, &file, result.seq) && !later(&read_at, &target, result.seq) {
+                if later(&edited_at, &file, result.seq) && !read_again {
                     Some(format!("{}\n{}", ds.text("read_before_edit", &[("path", &file)]), str_field(&result.data, "output")))
                 } else if later(&edited_at, &file, result.seq) {
                     Some(ds.text("read_superseded", &[("path", &file)]))
-                } else if later(&read_at, &target, result.seq) {
+                } else if read_again {
                     Some(ds.text("read_repeated", &[("path", &target)]))
                 } else {
                     None
@@ -505,7 +553,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             pointer
         } else if let Some(pointer) = absorbed(result) {
             pointer
-        } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) && !is_file_read(result) {
+        } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) && !(is_file_read(result) && result.seq > reads_through) {
             folded_text(ds, result)
         } else {
             str_field(&result.data, "output").to_owned()
@@ -522,9 +570,16 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // re-reads after compactions in one run).
     // Only within the task at work: a finished task's reads fold at its boundary (`tasks_through`).
     let tasks_through = mark(crate::fit::TASKS_THROUGH);
+    // A read whose lines a later settled read shows all of is that later read's to keep.
+    let covered = |result: &JournalEntry| {
+        result.seq <= settled_through && calls.get(str_field(&result.data, "call_id")).and_then(|call| file_of(call)).is_some_and(|file| covered_later(&file, result))
+    };
     let kept_reads: HashSet<u64> = {
         let mut newest: HashMap<String, (u64, u64)> = HashMap::new();
-        for result in entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through && is_file_read(entry) && absorbed(entry).is_none()) {
+        for result in entries
+            .iter()
+            .filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through.max(reads_through) && is_file_read(entry) && absorbed(entry).is_none() && !covered(entry))
+        {
             if let Some(call) = calls.get(str_field(&result.data, "call_id"))
                 && let Some(target) = target_of(call)
             {

@@ -45,6 +45,7 @@ const STATUS_LABEL: Record<string, string> = {
   failed: 'Failed',
   cancelled: 'Stopped',
   working: 'Working',
+  queued: 'Queued',
   blocked: 'Blocked',
   stopped: 'Stopped',
 };
@@ -440,9 +441,10 @@ function StripProject({ project, remote, notices, selected, selectedSession, onS
     async (client) => (await client.call<{ agents: AgentRecord[] }>('agents.list', { project_id: project.id }))?.agents ?? [],
     { topics: ['agents.changed'] },
   );
+  const waiting = useWaiting(project.id);
   const all = sessions.data ?? [];
   const chats = orderSessions(all.filter((session) => session.kind !== 'agent'));
-  const agentRows = mergeAgents(agents.data ?? [], all.filter((session) => session.kind === 'agent'));
+  const agentRows = mergeAgents(agents.data ?? [], all.filter((session) => session.kind === 'agent'), waiting);
   return (
     <section className={`cx-strip-project${selected ? ' on' : ''}${remote ? ' cx-strip-remote' : ''}`} data-strip-project-block={project.id} aria-label={project.name}>
       {chats.map((session) => {
@@ -510,19 +512,26 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   const isSelected = selected;
   const where = row.computer ? `on ${row.computer}` : project.root;
 
-  // An agent is one row: its record (status, task) joined with its session (live state), by name.
-  const agentRows = mergeAgents(records, agentSessions);
+  // An agent is one row: its record (status, task) joined with its session, by name.
+  const waiting = useWaiting(project.id);
+  const agentRows = mergeAgents(records, agentSessions, waiting);
+  // The sessions the model answers at this moment: of the agents at work, these hold its slots.
+  const served = useServed();
   // Agents whose model calls run on another computer (`mesh.status` placed): their role in blue.
   const mesh = useQuery<{ placed?: Array<{ session_id: string; name: string }> }>('mesh.status', (c) => c.call('mesh.status', {}), { topics: ['mesh.changed'] });
   const away = new Map((row.node ? [] : mesh.data?.placed ?? []).map((placed) => [placed.session_id, placed.name]));
-  // Each agent sits under the conversation that started it; one whose starter is not a listed
-  // conversation (another agent's, or one deleted since) stays in the Agents list below.
+  // Each agent sits under the conversation its work comes from: the one that started it, or, for
+  // an agent another agent started, the conversation at the top of that chain. Only an agent with
+  // no such conversation (none recorded, or deleted since) goes to the list below.
   const chatIds = new Set(chats.map((session) => session.id));
+  const parentOf = new Map(all.map((session) => [session.id, session.parent ?? null]));
   const agentsOf = new Map<string, AgentRow[]>();
+  const looseAgents: AgentRow[] = [];
   for (const agentRow of agentRows) {
-    if (agentRow.parent && chatIds.has(agentRow.parent)) agentsOf.set(agentRow.parent, [...(agentsOf.get(agentRow.parent) ?? []), agentRow]);
+    const lead = conversationOf(agentRow.parent, parentOf, chatIds);
+    if (lead) agentsOf.set(lead, [...(agentsOf.get(lead) ?? []), agentRow]);
+    else looseAgents.push(agentRow);
   }
-  const looseAgents = agentRows.filter((agentRow) => !agentRow.parent || !chatIds.has(agentRow.parent));
 
   const agentItem = (agentRow: AgentRow) => {
     const notice = agentRow.sessionId && selectedSession !== agentRow.sessionId ? notices.get(agentRow.sessionId) : undefined;
@@ -534,7 +543,9 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
           <div className="t"><span className="cx-at">@{agentRow.name}</span>{agentRow.title ? <span className="cx-task"> · {agentRow.title}</span> : null}</div>
           <div className="r">
             <StatePip status={agentRow.status} />
-            <span className={`ap${agentTone(agentRow.status)}`}>{agentLabel(agentRow.status)}</span>
+            {agentRow.status === 'working' && agentRow.sessionId && served.has(agentRow.sessionId)
+              ? <span className="ap origin" data-served="true" title="The model is answering it now: it holds one of the model's slots">On model</span>
+              : <span className={`ap${agentTone(agentRow.status)}`} title={agentRow.status === 'working' ? 'At work, between model calls: running a tool or waiting for a free slot' : undefined}>{agentLabel(agentRow.status)}</span>}
             <WorkerTag worker={agentRow.worker} away={agentRow.sessionId ? away.get(agentRow.sessionId) : undefined} />
             {agentRow.role && <span className="ap faint">{agentRow.role}</span>}
             {notice && <NoticeTag notice={notice} />}
@@ -585,7 +596,7 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
             </li>
             {chats.map((session) => (
               <Fragment key={session.id}>
-                <SessionRow session={session} now={now} away={away.get(session.id)} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
+                <SessionRow session={session} now={now} away={away.get(session.id)} agents={agentsOf.get(session.id) ?? NO_AGENTS} notice={selectedSession === session.id ? undefined : notices.get(session.id)}
                   selected={selectedSession === session.id} onSelect={() => onSelect(session.id)}
                   onDelete={async () => {
                     await onDeleteSession(session.id);
@@ -604,10 +615,9 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
           {looseAgents.length > 0 && (
             <>
               <div className="cx-sub">
-                <span className="ap faint">Agents</span>
-                <span className="ap faint">{looseAgents.filter((agentRow) => isActive(agentRow.status)).length} active</span>
+                <span className="ap faint" title="Agents whose conversation is not in this list">Agents without a conversation</span>
               </div>
-              <ul className="lst cx-agents" aria-label={`Agents in ${project.name}`}>
+              <ul className="lst cx-agents" aria-label={`Agents without a conversation in ${project.name}`}>
                 {looseAgents.map(agentItem)}
               </ul>
             </>
@@ -618,8 +628,27 @@ function ProjectBlock({ row, notices, open, onToggle, selected, selectedSession,
   );
 }
 
-function SessionRow({ session, selected, onSelect, onDelete, now, notice, away }: {
+const NO_AGENTS: AgentRow[] = [];
+
+/**
+ * What a conversation's row says. Its own state while it works or waits for the person; once its
+ * own turn is over, its agents' state while any of them still works or waits for a place, so a
+ * conversation whose agents work never reads as finished.
+ */
+function sessionState(session: Session, agents: AgentRow[]): { status: string; label: string } {
+  const own = { status: session.status, label: STATUS_LABEL[session.status] ?? session.status };
+  if (isActive(session.status)) return own;
+  const working = agents.filter((agentRow) => agentRow.status !== 'queued' && isActive(agentRow.status)).length;
+  if (working > 0) return { status: 'working', label: working === 1 ? '1 agent working' : `${working} agents working` };
+  const queued = agents.filter((agentRow) => agentRow.status === 'queued').length;
+  if (queued > 0) return { status: 'queued', label: queued === 1 ? '1 agent queued' : `${queued} agents queued` };
+  return own;
+}
+
+function SessionRow({ session, selected, onSelect, onDelete, now, notice, away, agents }: {
   session: Session;
+  /** The agents listed under it. */
+  agents: AgentRow[];
   /** The computer its model calls run on, when not this one. */
   away?: string;
   selected: boolean;
@@ -629,14 +658,15 @@ function SessionRow({ session, selected, onSelect, onDelete, now, notice, away }
   notice?: Notice;
 }) {
   const title = session.title.trim() || 'New conversation';
+  const state = sessionState(session, agents);
   return (
     <li className={['cx-row', selected ? 'sel' : '', needsYou(session.status) ? 'cx-attn' : '', notice ? 'cx-notice' : ''].filter(Boolean).join(' ')}
       data-session={session.id} data-status={session.status} data-notice={notice?.kind}>
       <button type="button" onClick={onSelect} aria-current={selected ? 'true' : undefined} title={notice ? notice.title : undefined}>
         <div className="t">{title}</div>
         <div className="r">
-          <StatePip status={session.status} />
-          <span className={`ap${statusTone(session.status)}`}>{STATUS_LABEL[session.status] ?? session.status}</span>
+          <StatePip status={state.status} />
+          <span className={`ap${statusTone(state.status)}`}>{state.label}</span>
           <WorkerTag worker="local" away={away} />
           {notice && <NoticeTag notice={notice} />}
           <span className="grow" />
@@ -725,7 +755,7 @@ function leavesList(status: string): boolean {
 }
 
 function isActive(status: string): boolean {
-  return status === 'running' || status === 'working' || needsYou(status);
+  return status === 'running' || status === 'working' || status === 'queued' || needsYou(status);
 }
 
 /**
@@ -768,8 +798,43 @@ interface AgentRow {
   sessionId: string | null;
   title: string | null;
   updated: number;
-  /** The session that started it (its session's parent). */
+  /** The session that started it (its session's parent): a conversation, or another agent's session. */
   parent: string | null;
+}
+
+/**
+ * The agents waiting for a place to run in this project (`agents.scheduler`, `detail.waiting`).
+ * An agent's record says `working` from the moment it is made; only the scheduler knows that it
+ * has not started.
+ */
+function useWaiting(projectId: string): Set<string> {
+  const scheduler = useQuery<{ detail?: { waiting?: Array<{ project_id: string; name: string }> } }>('agents.scheduler', (c) => c.call('agents.scheduler', {}), { topics: ['agents.changed'] });
+  return new Set((scheduler.data?.detail?.waiting ?? []).filter((entry) => entry.project_id === projectId).map((entry) => entry.name));
+}
+
+/**
+ * The sessions the model answers now: the keys of its busy slots (`model.slots`; a session's model
+ * calls are keyed by its id). Read again when a request is queued, starts or ends.
+ */
+function useServed(): Set<string> {
+  const slots = useQuery<{ slots?: Array<{ busy: boolean; cache_key?: string | null }> }>('model.slots', (c) => c.call('model.slots', {}), {
+    topics: ['model.progress'],
+    when: (_topic, data) => {
+      const event = data as { phase?: string; prefill_done?: number } | null;
+      return !!event && (event.phase === 'queued' || event.phase === 'done' || (event.phase === 'prefill' && (event.prefill_done ?? 0) === 0));
+    },
+  });
+  return new Set((slots.data?.slots ?? []).filter((slot) => slot.busy && slot.cache_key).map((slot) => slot.cache_key as string));
+}
+
+/** The listed conversation at the top of an agent's chain of starters, if there is one. */
+function conversationOf(parent: string | null, parentOf: Map<string, string | null>, chatIds: Set<string>): string | null {
+  const seen = new Set<string>();
+  for (let id = parent; id && !seen.has(id); id = parentOf.get(id) ?? null) {
+    if (chatIds.has(id)) return id;
+    seen.add(id);
+  }
+  return null;
 }
 
 /** Who does a session's or an agent's work, as a short tag: the local model or a frontier CLI. */
@@ -787,12 +852,16 @@ function WorkerTag({ worker, away }: { worker: string; away?: string }) {
   return <span className={`ap cx-worker${worker === 'local' ? ' faint' : ' cx-frontier'}`} data-worker={worker} title={worker === 'local' ? 'Runs on the local model' : `Runs on ${label}`}>{label}</span>;
 }
 
-function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
+/**
+ * One state per agent, in one vocabulary: `queued` (made, waiting for a place), `working` (its
+ * run goes), then what its record says. A session's own `running` is never shown for an agent.
+ */
+function mergeAgents(records: AgentRecord[], sessions: Session[], waiting: Set<string>): AgentRow[] {
   const rows = new Map<string, AgentRow>();
   for (const record of records) {
     rows.set(record.name, {
       name: record.name,
-      status: record.status,
+      status: record.status === 'working' && waiting.has(record.name) ? 'queued' : record.status,
       worker: (record as AgentRecord & { worker?: string }).worker || 'local',
       role: record.role,
       sessionId: record.session_id ?? null,
@@ -810,13 +879,11 @@ function mergeAgents(records: AgentRecord[], sessions: Session[]): AgentRow[] {
       existing.sessionId = existing.sessionId ?? session.id;
       existing.title = session.title || existing.title;
       existing.parent = session.parent ?? existing.parent;
-      // A persisted running session must not resurrect an agent its controller already ended.
-      if (session.status === 'running' && !leavesList(existing.status)) existing.status = 'running';
       // Its run was stopped from its session: the agent is stopped too, unless it had finished.
-      else if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
+      if (session.status === 'cancelled' && existing.status !== 'done') existing.status = 'stopped';
       existing.updated = Math.max(existing.updated, session.updated_ms);
     } else {
-      rows.set(name, { name, status: session.status, worker: 'local', role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
+      rows.set(name, { name, status: session.status === 'running' ? 'working' : session.status, worker: 'local', role: null, sessionId: session.id, title: session.title || null, updated: session.updated_ms, parent: session.parent ?? null });
     }
   }
   return [...rows.values()].filter((row) => !leavesList(row.status)).sort((a, b) => Number(isActive(b.status)) - Number(isActive(a.status)) || b.updated - a.updated);

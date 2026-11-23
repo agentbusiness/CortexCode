@@ -14,7 +14,8 @@ use crate::{
     speculators::dflash_tfm::DFlashTreeError,
 };
 pub use crate::{
-    encodable_block::sampling::SamplingMethod, engine::language_model::stream::stream::LanguageModelStream,
+    encodable_block::sampling::SamplingMethod,
+    engine::language_model::stream::stream::{BatchStep, LanguageModelStream},
 };
 
 mod stream;
@@ -53,6 +54,9 @@ pub enum LanguageModelStreamError<B: Backend> {
     /// CortexCode patch P7.
     #[error("Image input error: {0}")]
     Images(String),
+    /// CortexCode patch P10: the forward pass this stream shared with others failed.
+    #[error("Shared forward pass failed: {0}")]
+    Batch(String),
 }
 
 impl<B: Backend> LanguageModel<B> {

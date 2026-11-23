@@ -97,7 +97,7 @@ pub fn repeated_failure(entries: &[JournalEntry], task_id: &str) -> bool {
 /// check run, not reading (seen: an agent named reading while it ran its checks between edits).
 pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (String, bool) {
     let Some((entries, measured)) = measured(env, agent, checks).await else { return (String::new(), false) };
-    let Measured { steps, edits, since_edit, checks_since, idle, edited_at, files } = measured;
+    let Measured { steps, edits, since_edit, checks_since, idle, edited_at, files, .. } = measured;
     let told = entries.iter().rev().find(|entry| entry.kind == kinds::STEER);
     let measured_files = files.clone();
     let files = if files.is_empty() { env.data.text("manage_no_files", &[]) } else { files.join(", ") };
@@ -130,7 +130,50 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (
     if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
         line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
     }
-    (line, (reading || still) && !told_since_edit)
+    // Not moving needs the session whatever it was told: a message does not reach a run that
+    // takes no step (seen: an agent told something before it stopped moving, never flagged, 8½
+    // hours with no step).
+    (line, (reading && !told_since_edit) || still)
+}
+
+/// Minutes a working agent's run has gone with no step and no tool running, when that is at least
+/// `limits.manage_stalled_minutes`: its call does not answer, and the host starts it again. Counted
+/// from its last restart too (`restarted_ms`): a resumed run that reads its history again for
+/// minutes is not started over and over.
+async fn stalled(env: &RunEnv, agent: &AgentRecord, restarted_ms: u64) -> Option<u64> {
+    let limit = env.data.limits.manage_stalled_minutes;
+    // A frontier CLI's run is its own process's; its journal does not show its steps as they go.
+    if limit == 0 || agent.status != "working" || workers::frontier(&agent.worker) {
+        return None;
+    }
+    let (_, measured) = measured(env, agent, &[]).await?;
+    let since_restart = cc_protocol::contracts::now_ms().saturating_sub(restarted_ms) / 60_000;
+    (measured.waits_on_nothing && measured.idle >= limit && since_restart >= limit).then_some(measured.idle)
+}
+
+/// Start again every open agent whose run stalled ([`stalled`]); the agents started again, and the
+/// lines that say so.
+async fn restart_stalled(env: &RunEnv, entries: &[JournalEntry], work: &[OpenWork]) -> (Vec<String>, Vec<String>) {
+    let (mut names, mut done) = (Vec::new(), Vec::new());
+    for item in work {
+        let name = item.agent.name.as_str();
+        let restarted_ms = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == kinds::NOTE && entry.data.get("stalled").and_then(Value::as_array).is_some_and(|names| names.iter().any(|known| known.as_str() == Some(name))))
+            .map(|entry| entry.ts_ms)
+            .unwrap_or(0);
+        let Some(idle) = stalled(env, &item.agent, restarted_ms).await else { continue };
+        let outcome = env.host.call(agents_methods::RESTART, json!({"project_id": env.scope.project_id, "agent": name})).await;
+        done.push(match outcome {
+            Ok(_) => {
+                names.push(name.to_owned());
+                env.data.text("managed_stalled", &[("agent", name), ("idle", &idle.to_string())])
+            }
+            Err(error) => env.data.text("managed_failed", &[("action", "restart"), ("agent", name), ("error", &error.message)]),
+        });
+    }
+    (names, done)
 }
 
 /// What an agent's current run did, counted from its journal ([`progress`] words it).
@@ -144,6 +187,9 @@ struct Measured {
     idle: u64,
     edited_at: u64,
     files: Vec<String>,
+    /// The run is going (its last status says running) and no tool of it runs now: a long wait
+    /// here is a call that does not answer, not work.
+    waits_on_nothing: bool,
 }
 
 /// The two things that need the session: reading past `limits.manage_reading_calls`, no step for
@@ -201,9 +247,12 @@ async fn measured(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> Optio
     }
     let last_ms = run.iter().map(|entry| entry.ts_ms).max().unwrap_or(0);
     let idle = cc_protocol::contracts::now_ms().saturating_sub(last_ms) / 60_000;
+    let running = entries.iter().rev().find(|entry| entry.kind == kinds::STATUS).is_some_and(|status| str_field(&status.data, "state") == "running");
+    let tool_open = run.iter().any(|entry| entry.kind == kinds::TOOL_CALL && !ok.contains_key(str_field(&entry.data, "call_id")));
+    let waits_on_nothing = running && !tool_open;
     drop(ok);
     drop(run);
-    Some((entries, Measured { steps, edits, since_edit, checks_since, idle, edited_at, files }))
+    Some((entries, Measured { steps, edits, since_edit, checks_since, idle, edited_at, files, waits_on_nothing }))
 }
 
 /// A runner job's session (docs/RUNNER.md): MANAGE's flags go to the manager as
@@ -214,7 +263,7 @@ async fn publish_flags(env: &RunEnv, work: &[OpenWork]) {
         let Some((entries, measured)) = measured(env, &item.agent, &crate::contract::commands(&item.task.contract)).await else { continue };
         let (reading, still) = flags(env, measured.since_edit, measured.idle);
         let told_since_edit = entries.iter().rev().find(|entry| entry.kind == kinds::STEER).is_some_and(|told| told.ts_ms > measured.edited_at);
-        agents.push(ManageFlag { agent: item.agent.name.clone(), reading_calls: measured.since_edit as u32, idle_minutes: measured.idle, flagged: (reading || still) && !told_since_edit });
+        agents.push(ManageFlag { agent: item.agent.name.clone(), reading_calls: measured.since_edit as u32, idle_minutes: measured.idle, flagged: (reading && !told_since_edit) || still });
     }
     let flags = ManageFlags { session_id: env.session_id.clone(), agents };
     env.host.ctx().publish(chatflow_topics::MANAGE_FLAGS, serde_json::to_value(&flags).unwrap_or(Value::Null));
@@ -397,6 +446,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         .find(|entry| entry.kind == kinds::ROUTE && str_field(&entry.data, "run_id") == env.run_id)
         .and_then(|entry| entry.data.get("detail").and_then(|detail| detail.get("check")).and_then(Value::as_bool))
         == Some(true);
+    // A run that stopped moving is started again by the host, not left to a decision: nothing the
+    // session could say reaches it.
+    let (stalled_names, restarted) = restart_stalled(env, &entries, &work).await;
     let (lines, attention) = work_lines_with_progress(env, &work).await;
     // What the user asked of the work while it ran that no plan took up yet: the session hears it
     // once, right before its decision (seen: "the spreadsheet files must work too", promised in an
@@ -407,8 +459,12 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     };
     if check && !attention && unplanned.is_empty() {
         // Transcript only: the session's conversation does not fill with check-ins that did nothing.
-        let text = env.data.text("managed_nothing", &[]);
-        return journal.note(&env.run_id, "managed", &text, false).await.map(|_| ());
+        let text = if restarted.is_empty() { env.data.text("managed_nothing", &[]) } else { restarted.join("\n") };
+        let managed = journal.note(&env.run_id, "managed", &text, !restarted.is_empty()).await?;
+        if !stalled_names.is_empty() {
+            journal.set(managed, "stalled", json!(stalled_names)).await?;
+        }
+        return Ok(());
     }
     let names: Vec<String> = work.iter().map(|item| item.agent.name.clone()).collect();
     let mut shape = crate::flow::stage_shape(env, "MANAGE")?.filled(schemas::AGENTS_PLACEHOLDER, &names, None);
@@ -426,7 +482,7 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
     // The plan, then the folder as it is now, then each agent's report; what the user asked last.
     let live = format!("{}{}{}{asked}", plan_lines(env, &entries, &work).await, folder_line(env), env.data.text("manage_live", &[("work", &lines)]));
     let (decision, _) = crate::flow::decide_json::<Manage>(env, journal, "MANAGE", &shape, &live).await?;
-    let mut done = Vec::new();
+    let mut done = restarted;
     for action in &decision.actions {
         let Some(item) = work.iter().find(|item| item.agent.name == action.agent) else { continue };
         let name = item.agent.name.as_str();
@@ -500,6 +556,9 @@ pub async fn run(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcError> {
         done.push(env.data.text("managed_nothing", &[]));
     }
     let managed = journal.note(&env.run_id, "managed", &done.join("\n"), true).await?;
+    if !stalled_names.is_empty() {
+        journal.set(managed, "stalled", json!(stalled_names)).await?;
+    }
     if !unplanned.is_empty() {
         // Heard: these asks are not shown to the next check again.
         journal.set(managed, "asks_told", json!(true)).await?;

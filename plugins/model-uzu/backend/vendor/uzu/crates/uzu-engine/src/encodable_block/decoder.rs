@@ -4,7 +4,7 @@ use derive_more::Debug;
 use thiserror::Error;
 
 use crate::{
-    backends::common::{Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding},
+    backends::common::{Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding},
     config::decoder::DecoderConfig,
     data_type::DataType,
     encodable_block::{
@@ -12,7 +12,10 @@ use crate::{
         embedding::{Embedding, EmbeddingError},
         normalization::{Normalization, NormalizationNewError, ShortcutMode},
         per_layer_embedding::{PerLayerEmbedding, PerLayerEmbeddingError},
-        transformer::{RopeRows, Transformer, TransformerEncodeError, TransformerNewError, TransformerState},
+        transformer::{
+            RopeRows, Transformer, TransformerBatchSequence, TransformerEncodeError, TransformerNewError,
+            TransformerState,
+        },
     },
     safetensors::ParameterTree,
 };
@@ -237,4 +240,87 @@ impl<B: Backend> Decoder<B> {
             final_hidden,
         })
     }
+
+    /// CortexCode patch P10: whether several sequences can share one pass.
+    pub fn batch_supported(&self) -> bool {
+        self.transformer.batch_supported()
+    }
+
+    /// CortexCode patch P10: one forward pass over several sequences (`token_ids` holds every
+    /// sequence's rows in order). Logits come for every row; the final hidden rows and the
+    /// captured layers' rows (for the speculator) come per sequence when `hidden_feature_layer_indices`
+    /// is given.
+    pub fn encode_batch(
+        &self,
+        token_ids: impl BufferRef<Backend = B>,
+        sequences: &mut [TransformerBatchSequence<'_, B>],
+        hidden_feature_layer_indices: Option<&[u32]>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<DecoderBatchOutput<B>, DecoderError<B>> {
+        let command_buffer = &mut *command_buffer.debug_group("decoder (batch)");
+        let total: u32 = sequences.iter().map(|sequence| sequence.topology.size()).sum();
+
+        let embedded = self.embedding.encode_lookup(token_ids, total, command_buffer)?;
+        let embedded = if let Some(embedding_norm) = &self.embedding_norm {
+            embedding_norm
+                .encode(&embedded, 0, total, None::<&mut B::ScratchBuffer>, command_buffer)
+                .map_err(DecoderError::Backend)?
+        } else {
+            embedded
+        };
+        let per_layer_inputs = if let Some(per_layer_embedding) = &self.per_layer_embedding {
+            Some(per_layer_embedding.encode(token_ids, &embedded, total, command_buffer)?)
+        } else {
+            None
+        };
+
+        let output = self.transformer.encode_batch(
+            embedded,
+            per_layer_inputs.as_ref(),
+            sequences,
+            hidden_feature_layer_indices,
+            command_buffer,
+        )?;
+
+        let logits = self.embedding.encode_readout(
+            &output.output,
+            total,
+            self.embedding.vocab_size(),
+            None::<&B::ScratchBuffer>,
+            true,
+            command_buffer,
+        )?;
+
+        let final_hidden = if hidden_feature_layer_indices.is_some() {
+            let row_bytes = output.output.size() / total as usize;
+            let mut start = 0usize;
+            let mut rows = Vec::with_capacity(sequences.len());
+            for sequence in sequences.iter() {
+                let size = sequence.topology.size() as usize * row_bytes;
+                let mut copy = command_buffer.allocate_scratch(size).map_err(DecoderError::Backend)?;
+                command_buffer.encode_copy((&output.output).subrange(start..start + size), &mut copy);
+                rows.push(copy);
+                start += size;
+            }
+            Some(rows.into_boxed_slice())
+        } else {
+            None
+        };
+
+        Ok(DecoderBatchOutput {
+            logits,
+            final_hidden,
+            hidden_features: output.hidden_features,
+        })
+    }
+}
+
+/// CortexCode patch P10.
+pub struct DecoderBatchOutput<B: Backend> {
+    /// Every row's logits, in the order of the sequences.
+    pub logits: B::ScratchBuffer,
+    /// Per sequence, its rows after the output norm (with a speculator).
+    pub final_hidden: Option<Box<[B::ScratchBuffer]>>,
+    /// Per sequence, the captured layers' rows (with a speculator).
+    pub hidden_features: Option<Box<[Box<[B::ScratchBuffer]>]>>,
 }

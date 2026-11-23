@@ -16,7 +16,7 @@ use crate::{
         batch_topology::BatchTopology,
         convolution::{ConvolutionNewError, SeparableCausalConv},
         linear::{InputRhtParameters, Linear, LinearBlockError, LinearEncodeError},
-        mixer::{Mixer, MixerEncodeError, MixerNewError, MixerState, attention::rope::PrecalculatedRoPE},
+        mixer::{Mixer, MixerBatchPart, MixerEncodeError, MixerNewError, MixerState, attention::rope::PrecalculatedRoPE},
         mlp::{Mlp, MlpBlockNewError, MlpEncodeError},
         normalization::{Normalization, NormalizationNewError, ShortcutMode},
         residual::{ResidualConnection, ResidualEncodeError, ResidualNewError},
@@ -483,6 +483,54 @@ impl<B: Backend> TransformerLayer<B> {
 
         stream = self.mixer_sublayer.encode(stream, row_count, command_buffer, |hidden, command_buffer| {
             Ok(self.mixer.encode(hidden, precalculated_rope, batch_dim, state, command_buffer)?)
+        })?;
+
+        stream = self.mlp_sublayer.encode(stream, row_count, command_buffer, |hidden, command_buffer| {
+            Ok(self.mlp.encode(hidden, row_count, command_buffer)?)
+        })?;
+
+        for op in &self.epilogue {
+            stream = op.encode(stream, op_context, command_buffer)?;
+        }
+
+        Ok(stream)
+    }
+
+    /// CortexCode patch P10: whether rows of different sequences can share a pass through this
+    /// layer: everything but the mixer works row by row (no convolution across rows, no n-gram
+    /// injection), and the mixer runs each sequence on its own state.
+    pub fn batch_supported(&self) -> bool {
+        self.mixer.batch_supported()
+            && self.mixer_sublayer.conv.is_none()
+            && self.mlp_sublayer.conv.is_none()
+            && self.prologue.iter().chain(self.epilogue.iter()).all(|op| !matches!(op, StreamOp::NGramInjection(_)))
+    }
+
+    /// CortexCode patch P10: [`Self::encode`] for several sequences: `all_rows` is a flat topology
+    /// of every row (the row-wise parts only use its size), `parts` say whose rows are whose.
+    pub fn encode_batch(
+        &self,
+        mut stream: B::ScratchBuffer,
+        per_layer_inputs: Option<impl BufferRef<Backend = B>>,
+        all_rows: &BatchTopology,
+        parts: &mut [MixerBatchPart<'_, '_, B>],
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, TransformerLayerError<B>> {
+        debug_assert!(self.batch_supported(), "layer cannot run a batch");
+        let command_buffer =
+            &mut *command_buffer.debug_group(&format!("transformer layer {} (batch)", self.layer_index));
+        let row_count = all_rows.size();
+        let op_context = StreamOpContext {
+            batch_dim: all_rows,
+            per_layer_inputs,
+        };
+
+        for op in &self.prologue {
+            stream = op.encode(stream, op_context, command_buffer)?;
+        }
+
+        stream = self.mixer_sublayer.encode(stream, row_count, command_buffer, |hidden, command_buffer| {
+            Ok(self.mixer.encode_batch(hidden, parts, command_buffer)?)
         })?;
 
         stream = self.mlp_sublayer.encode(stream, row_count, command_buffer, |hidden, command_buffer| {

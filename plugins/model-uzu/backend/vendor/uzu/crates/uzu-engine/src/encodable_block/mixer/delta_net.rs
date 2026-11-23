@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Context, GpuBuffer, Kernels,
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Context, GpuBuffer, Kernels,
         kernel::{
             ConvTreeScanKernel, DeltaNetConvPackKernel, DeltaNetConvScanKernel, DeltaNetConvUpdateKernel,
             DeltaNetNormGateKernel, DeltaNetPrefillKernel, DeltaNetPrefillPrepKernel, DeltaNetUpdateKernel,
@@ -18,7 +18,7 @@ use crate::{
         batch_topology::BatchTopology,
         linear::{InputRhtParameters, Linear, LinearBlockError},
         mixer::{
-            Mixer, MixerEncodeError, MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
+            Mixer, MixerBatchPart, MixerEncodeError, MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode,
             attention::rope::PrecalculatedRoPE,
             delta_net::tree_verify::{TreeVerifyEncodeArguments, TreeVerifyNewArguments},
         },
@@ -413,6 +413,18 @@ impl<B: Backend> DeltaNet<B> {
         state: &mut DeltaNetState<B>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let delta_output = self.tree_verify_core(in_projected, batch_dim, state, command_buffer)?;
+        Ok(self.out_projection.encode(delta_output, batch_dim.size(), command_buffer)?)
+    }
+
+    /// CortexCode patch P10: [`Self::encode_tree_verify`] up to the out projection.
+    fn tree_verify_core(
+        &self,
+        in_projected: impl BufferRef<Backend = B>,
+        batch_dim: &BatchTopology,
+        state: &mut DeltaNetState<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
         let tree_verify = self.tree_verify.as_ref().expect("DeltaNet tree verification is unsupported");
         let tree_size = batch_dim.size();
         let parents =
@@ -495,7 +507,6 @@ impl<B: Backend> DeltaNet<B> {
             )
             .map_err(MixerEncodeError::Backend)?;
 
-        let output = self.out_projection.encode(delta_output, tree_size, command_buffer)?;
         state.suffix_status = Some(DeltaNetSuffixStatus::Tree {
             conv_states,
             k,
@@ -504,7 +515,7 @@ impl<B: Backend> DeltaNet<B> {
             beta,
             parents: batch_dim.parents().into(),
         });
-        Ok(output)
+        Ok(delta_output)
     }
 
     // Runs a fully accepted batch from zero conv and SSM states that live only for this encode.
@@ -532,6 +543,19 @@ impl<B: Backend> DeltaNet<B> {
     }
 
     fn encode_flat(
+        &self,
+        in_projected: B::ScratchBuffer,
+        suffix_length: u32,
+        conv_state: &mut dyn GpuBuffer<Backend = B>,
+        ssm_state: &mut dyn GpuBuffer<Backend = B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let delta_output = self.flat_core(in_projected, suffix_length, conv_state, ssm_state, command_buffer)?;
+        Ok(self.out_projection.encode(delta_output, suffix_length, command_buffer)?)
+    }
+
+    /// CortexCode patch P10: [`Self::encode_flat`] up to the out projection.
+    fn flat_core(
         &self,
         mut in_projected: B::ScratchBuffer,
         suffix_length: u32,
@@ -680,7 +704,7 @@ impl<B: Backend> DeltaNet<B> {
             );
         }
 
-        Ok(self.out_projection.encode(delta_output, suffix_length, command_buffer)?)
+        Ok(delta_output)
     }
 }
 
@@ -770,5 +794,75 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
         });
 
         Ok(output)
+    }
+
+    fn batch_supported(&self) -> bool {
+        true
+    }
+
+    /// CortexCode patch P10: the in and out projections over every part's rows; the convolution
+    /// and the recurrence per part, on a copy of its rows and on its own state.
+    fn encode_batch(
+        &self,
+        hidden: B::ScratchBuffer,
+        parts: &mut [MixerBatchPart<'_, '_, B>],
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let command_buffer = &mut *command_buffer.debug_group("delta net (batch)");
+        let total: u32 = parts.iter().map(|part| part.topology.size()).sum();
+        for part in parts.iter_mut() {
+            assert!(part.rope.is_none(), "unexpected rope for delta net mixer");
+            let MaybeMut::Mut(state) = &mut part.state else {
+                panic!("delta net doesn't support immutable state");
+            };
+            let state = (&mut **state as &mut dyn std::any::Any)
+                .downcast_mut::<DeltaNetState<B>>()
+                .expect("incorrect type of delta net state");
+            assert!(state.suffix_status.is_none(), "delta net called with state with an unaccepted suffix");
+            if state.is_empty {
+                command_buffer.encode_fill(&mut state.conv_state, 0);
+                command_buffer.encode_fill(&mut state.ssm_state, 0);
+                state.is_empty = false;
+            }
+        }
+
+        let in_projected = self.in_projection.encode(hidden, total, command_buffer)?;
+        let in_row_bytes = self.total_proj_dim as usize * self.outer_data_type.size_in_bytes();
+        let out_row_bytes = self.value_dim as usize * self.outer_data_type.size_in_bytes();
+        let mut combined =
+            command_buffer.allocate_scratch(total as usize * out_row_bytes).map_err(MixerEncodeError::Backend)?;
+        for part in parts.iter_mut() {
+            let rows = part.topology.size();
+            let start = part.row as usize;
+            let MaybeMut::Mut(state) = &mut part.state else { unreachable!() };
+            let state = (&mut **state as &mut dyn std::any::Any)
+                .downcast_mut::<DeltaNetState<B>>()
+                .expect("incorrect type of delta net state");
+            // A buffer of its own: the flat path updates it in place, and the kernels read the
+            // part's rows from offset zero.
+            let mut part_in = command_buffer
+                .allocate_scratch(rows as usize * in_row_bytes)
+                .map_err(MixerEncodeError::Backend)?;
+            command_buffer.encode_copy(
+                (&in_projected).subrange(start * in_row_bytes..(start + rows as usize) * in_row_bytes),
+                &mut part_in,
+            );
+            let output = if part.topology.full_accept() {
+                let output =
+                    self.flat_core(part_in, rows, &mut state.conv_state, &mut state.ssm_state, command_buffer)?;
+                state.suffix_status = Some(DeltaNetSuffixStatus::Flat {
+                    suffix_length: rows,
+                });
+                output
+            } else {
+                self.tree_verify_core(&part_in, part.topology, state, command_buffer)?
+            };
+            assert!(output.size() >= rows as usize * out_row_bytes, "delta net output rows");
+            command_buffer.encode_copy(
+                (&output).subrange(..rows as usize * out_row_bytes),
+                (&mut combined).subrange_mut(start * out_row_bytes..(start + rows as usize) * out_row_bytes),
+            );
+        }
+        Ok(self.out_projection.encode(combined, total, command_buffer)?)
     }
 }

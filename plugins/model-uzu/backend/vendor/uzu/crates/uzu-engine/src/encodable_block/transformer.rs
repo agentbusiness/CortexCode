@@ -10,7 +10,9 @@ use crate::{
     encodable_block::{
         batch_topology::BatchTopology,
         linear::InputRhtParameters,
-        mixer::{MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode, attention::rope::PrecalculatedRoPE},
+        mixer::{
+            MixerBatchPart, MixerSnapshot, MixerSnapshotError, MixerState, SnapshotMode, attention::rope::PrecalculatedRoPE,
+        },
         normalization::{Normalization, NormalizationNewError, ShortcutMode},
         residual::{ResidualEncodeError, ResidualHead, ResidualNewError},
         transformer_layer::{TransformerLayer, TransformerLayerError},
@@ -53,6 +55,21 @@ impl RopeRows<'_> {
 pub struct TransformerEncodeOutput<B: Backend> {
     pub output: Option<B::ScratchBuffer>,
     pub hidden_features: Option<Box<[B::ScratchBuffer]>>,
+}
+
+/// CortexCode patch P10: one sequence of a batched pass: its rows' topology (heights relative to
+/// its own context) and its state. Sequences take consecutive rows in the order given.
+pub struct TransformerBatchSequence<'a, B: Backend> {
+    pub topology: &'a BatchTopology,
+    pub state: &'a mut TransformerState<B>,
+}
+
+/// CortexCode patch P10.
+pub struct TransformerBatchOutput<B: Backend> {
+    /// Every row, after the output norm.
+    pub output: B::ScratchBuffer,
+    /// Per sequence, the captured layers' rows of that sequence only.
+    pub hidden_features: Option<Box<[Box<[B::ScratchBuffer]>]>>,
 }
 
 impl<B: Backend> TransformerState<B> {
@@ -517,6 +534,152 @@ impl<B: Backend> Transformer<B> {
 
         Ok(TransformerEncodeOutput {
             output: Some(output),
+            hidden_features,
+        })
+    }
+
+    /// CortexCode patch P10: whether several sequences can share one pass: an additive residual
+    /// stream and every layer row-wise apart from mixers that run each sequence on its own state.
+    pub fn batch_supported(&self) -> bool {
+        matches!(self.residual_head, ResidualHead::Additive) && self.layers.iter().all(|(layer, _)| layer.batch_supported())
+    }
+
+    /// CortexCode patch P10: one forward pass over several sequences' rows (`input` holds them in
+    /// the order of `sequences`). The weights are read once for all rows; attention and the
+    /// recurrent mixers run per sequence on its state. Text positions only (no image rows):
+    /// context index plus the state's rope delta, as [`Self::encode_with_rope_rows`] without rows.
+    pub fn encode_batch(
+        &self,
+        input: B::ScratchBuffer,
+        per_layer_inputs: Option<impl BufferRef<Backend = B>>,
+        sequences: &mut [TransformerBatchSequence<'_, B>],
+        hidden_feature_layer_indices: Option<&[u32]>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<TransformerBatchOutput<B>, TransformerEncodeError<B>> {
+        assert!(self.batch_supported(), "this model cannot run several sequences in one pass");
+        let starts: Box<[u32]> = sequences
+            .iter()
+            .scan(0u32, |next, sequence| {
+                let start = *next;
+                *next += sequence.topology.size();
+                Some(start)
+            })
+            .collect();
+        let total: u32 = sequences.iter().map(|sequence| sequence.topology.size()).sum();
+        let all_rows = BatchTopology::flat(total, true);
+
+        let mut stream = self.residual_head.expand(input, total, command_buffer).map_err(TransformerEncodeError::Backend)?;
+
+        // Each sequence's rotary tables, from its own context and rope delta.
+        let ropes = sequences
+            .iter()
+            .map(|sequence| {
+                let context_length = sequence.state.context_length;
+                let rope_delta = sequence.state.rope_delta;
+                let positions = sequence
+                    .topology
+                    .heights()
+                    .map(|rel_pos| {
+                        u32::try_from(i64::from(context_length + rel_pos) + rope_delta).expect("rotary position out of range")
+                    })
+                    .collect::<Box<[u32]>>();
+                self.ropes
+                    .iter()
+                    .map(|rope_config| PrecalculatedRoPE::precalculate(rope_config, &positions, command_buffer))
+                    .collect::<Result<Box<[_]>, B::Error>>()
+            })
+            .collect::<Result<Box<[_]>, B::Error>>()
+            .map_err(TransformerEncodeError::Backend)?;
+
+        let mut hidden_features = hidden_feature_layer_indices.map(|indices| {
+            sequences.iter().map(|_| (0..indices.len()).map(|_| None).collect::<Vec<Option<B::ScratchBuffer>>>()).collect::<Vec<_>>()
+        });
+
+        for (layer, layer_rope_index) in self.layers.iter() {
+            let layer_index = layer.layer_index as usize;
+            let mut parts = Vec::with_capacity(sequences.len());
+            for ((sequence, &row), sequence_ropes) in sequences.iter_mut().zip(starts.iter()).zip(ropes.iter()) {
+                let state = &mut *sequence.state;
+                // Which layer holds the KV this layer reads, looked up before any borrow is taken.
+                let source = match &state.layer_states[layer_index] {
+                    TransformerLayerStateType::Owned(_) => None,
+                    TransformerLayerStateType::Shared(owned_layer_index) => Some(*owned_layer_index as usize),
+                };
+                let layer_state = match source {
+                    None => {
+                        let TransformerLayerStateType::Owned(layer_state) = &mut state.layer_states[layer_index] else {
+                            unreachable!()
+                        };
+                        MaybeMut::Mut(layer_state.as_mut())
+                    },
+                    Some(owned_layer_index) => {
+                        let TransformerLayerStateType::Owned(owned_layer) = &state.layer_states[owned_layer_index] else {
+                            panic!("shared layer doesn't point to an owned layer");
+                        };
+                        MaybeMut::Const(owned_layer.as_ref())
+                    },
+                };
+                parts.push(MixerBatchPart {
+                    row,
+                    topology: sequence.topology,
+                    rope: layer_rope_index.map(|index| &sequence_ropes[index]),
+                    state: layer_state,
+                });
+            }
+
+            stream = layer.encode_batch(stream, per_layer_inputs, &all_rows, &mut parts, command_buffer)?;
+            drop(parts);
+
+            if let (Some(hidden_features), Some(indices)) = (&mut hidden_features, hidden_feature_layer_indices) {
+                let row_bytes = stream.size() / total as usize;
+                for (feature_index, &feature_layer_index) in indices.iter().enumerate() {
+                    if feature_layer_index != layer.layer_index {
+                        continue;
+                    }
+                    for (sequence_index, sequence) in sequences.iter().enumerate() {
+                        let start = starts[sequence_index] as usize * row_bytes;
+                        let size = sequence.topology.size() as usize * row_bytes;
+                        let mut copy = command_buffer.allocate_scratch(size).map_err(TransformerEncodeError::Backend)?;
+                        command_buffer.encode_copy((&stream).subrange(start..start + size), &mut copy);
+                        hidden_features[sequence_index][feature_index] = Some(copy);
+                    }
+                }
+            }
+        }
+
+        let hidden_features = hidden_features.map(|per_sequence| {
+            per_sequence
+                .into_iter()
+                .map(|features| {
+                    features
+                        .into_iter()
+                        .enumerate()
+                        .map(|(feature_index, feature)| {
+                            feature.unwrap_or_else(|| {
+                                panic!(
+                                    "requested hidden feature for missing layer {}",
+                                    hidden_feature_layer_indices.unwrap()[feature_index]
+                                )
+                            })
+                        })
+                        .collect::<Box<[_]>>()
+                })
+                .collect::<Box<[_]>>()
+        });
+
+        let (hidden, row_offset) = match self.residual_head.readout(&stream, 0, total, command_buffer)? {
+            Some(hidden) => (hidden, 0),
+            None => (stream, 0),
+        };
+        let output = match &self.output_norm {
+            Some(output_norm) => output_norm
+                .encode(&hidden, row_offset, total, None::<&mut B::ScratchBuffer>, command_buffer)
+                .map_err(TransformerEncodeError::Backend)?,
+            None => hidden,
+        };
+
+        Ok(TransformerBatchOutput {
+            output,
             hidden_features,
         })
     }

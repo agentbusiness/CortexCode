@@ -28,14 +28,19 @@
 //!   least recently used first, before admission would wait for room); a request whose own state
 //!   holds less of its prompt than a seed starts from a copy of it. A new conversation thus reads
 //!   only what follows the block.
-//! - **Scheduling.** uzu decodes one sequence per forward pass, so concurrent requests are
-//!   interleaved: every step advances one request by one forward pass (or one 1024-token prefill
-//!   chunk), choosing the highest priority class first and rotating within it. Foreground requests
-//!   therefore preempt agent work at the next step. Requests the full pool cannot take (every
-//!   resident conversation busy), or for a key whose slot is busy, queue by priority, first come
-//!   first served within a class. Interleaving is concurrency, not parallelism: N running requests
-//!   each decode at about 1/N of the speed of one alone.
-//! - **Hibernation** writes a slot's full state to disk and frees it (vendor patch P1).
+//! - **Scheduling.** Every step is one prefill chunk of one request (up to 1024 tokens) or one
+//!   decode step of every generating request, chosen by priority class first and rotating within
+//!   it, so foreground requests preempt agent prefills at the next step. A decode step shares one
+//!   forward pass among all generating requests (vendor patch P10): the weights are read once for
+//!   all their rows, the attention caches and recurrent states stay each conversation's own, and
+//!   the device's draft-tree budget is split among them. N generating requests thus cost about
+//!   one pass per step instead of N. Requests the full pool cannot take (every resident
+//!   conversation busy), or for a key whose slot is busy, queue by priority, first come first
+//!   served within a class.
+//! - **Hibernation** writes a slot's full state to disk and frees it (vendor patch P1). The engine
+//!   thread only copies the state out into memory; the spill writer thread puts it on disk, so
+//!   the other requests keep stepping during the write. A restore before the write is done reads
+//!   the bytes from memory.
 //! - **Images** (vendor patch P7): a request's images that are not in the reused prefix are
 //!   encoded on the vision thread (`vision::worker`, its own engine context and command queue),
 //!   which is started, with the tower, only when an image needs encoding and stopped after
@@ -47,7 +52,7 @@
 //!   matching compares an identity of the tokens in which each image's run carries its digest.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -71,7 +76,7 @@ use uzu_engine::engine::language_model::LanguageModel;
 use uzu_engine::engine::language_model::grammar::{Grammar, GrammarCompiler, GrammarConfig, grammar_compiler};
 use uzu_engine::engine::language_model::images::{ImageEmbedding, ImageInput};
 use uzu_engine::engine::language_model::state::{LanguageModelState, LanguageModelStateSnapshot, SnapshotMode};
-use uzu_engine::engine::language_model::stream::{LanguageModelStream, LanguageModelStreamOptions, SamplingMethod};
+use uzu_engine::engine::language_model::stream::{BatchStep, LanguageModelStream, LanguageModelStreamOptions, SamplingMethod};
 
 /// Prompt tokens per prefill step (uzu's own attention batch is 1024 tokens, so a step costs no
 /// prefill efficiency; it bounds how long a foreground request waits behind another's prefill).
@@ -322,7 +327,81 @@ pub enum Command {
     Adopt(Vec<Hibernated>),
     /// A message of the vision thread.
     Vision(vision_worker::Message),
+    /// The spill writer finished a file: how long the write took, or why it failed.
+    Spilled { file: PathBuf, result: Result<f64, String> },
     Shutdown,
+}
+
+/// A spilled conversation's bytes on their way to disk.
+struct SpillJob {
+    file: PathBuf,
+    bytes: Arc<Vec<u8>>,
+}
+
+/// The thread that writes spilled conversations to disk, so the engine thread only copies the
+/// state out of the GPU and goes on stepping requests. It reports each file as a command.
+struct SpillWriter {
+    tx: Option<mpsc::Sender<SpillJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Set at shutdown when the files are not handed to a successor: what is still queued is skipped.
+    skip: Arc<AtomicBool>,
+}
+
+impl SpillWriter {
+    fn start(commands: mpsc::Sender<Command>) -> Self {
+        let (tx, rx) = mpsc::channel::<SpillJob>();
+        let skip = Arc::new(AtomicBool::new(false));
+        let skipping = skip.clone();
+        let thread = std::thread::Builder::new().name("uzu-spill".into()).spawn(move || {
+            for job in rx {
+                if skipping.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let started = Instant::now();
+                let result = write_spill(&job.file, &job.bytes).map(|()| ms(started));
+                if commands.send(Command::Spilled { file: job.file, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        match thread {
+            Ok(thread) => Self { tx: Some(tx), thread: Some(thread), skip },
+            Err(error) => {
+                tracing::warn!(%error, "cannot start the spill writer; spills are written on the engine thread");
+                Self { tx: None, thread: None, skip }
+            }
+        }
+    }
+
+    /// Queue a file; the job comes back when there is no writer thread.
+    fn send(&self, job: SpillJob) -> Result<(), SpillJob> {
+        match &self.tx {
+            Some(tx) => tx.send(job).map_err(|error| error.0),
+            None => Err(job),
+        }
+    }
+
+    /// Let the writer finish the file it is on (and the queued ones unless `skip`), then end it.
+    fn finish(&mut self, skip: bool) {
+        self.skip.store(skip, Ordering::SeqCst);
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn write_spill(file: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut out = std::fs::File::create(file).map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+    out.write_all(bytes).map_err(|error| format!("cannot write {}: {error}", file.display()))
+}
+
+/// A reply that waits for spill files to reach the disk.
+enum AwaitingWrite {
+    /// `model.hibernate`: answered once its file is written.
+    Hibernate { file: PathBuf, value: Value, reply: HibernateReply },
+    /// The handover to a successor: answered once every file is written.
+    Export { reply: tokio::sync::oneshot::Sender<Vec<Hibernated>> },
 }
 
 /// What `model.slots` reports, maintained by the worker.
@@ -693,6 +772,10 @@ struct Worker<B: Backend> {
     last_work: Instant,
     /// The idle-only request whose wait for room was last logged.
     idle_wait_logged: Option<u64>,
+    spill: SpillWriter,
+    /// Spill files the writer has not finished, with their bytes (a restore reads them from here).
+    writing: HashMap<PathBuf, Arc<Vec<u8>>>,
+    awaiting_writes: Vec<AwaitingWrite>,
 }
 
 fn class(priority: Priority) -> usize {
@@ -705,6 +788,15 @@ fn class(priority: Priority) -> usize {
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
+}
+
+/// A caught panic's message.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_else(|| "engine panic".to_owned())
 }
 
 /// File name for a key: its readable characters plus a hash, so distinct keys never collide.
@@ -789,6 +881,7 @@ impl<B: Backend> Worker<B> {
         // Slots are made as conversations arrive (see `free_slot`): none are planned.
         let slots = Vec::new();
         let stop_tokens = model.generation_config().stop_token_ids.to_vec();
+        let spill = SpillWriter::start(commands.clone());
         let worker = Self {
             config,
             engine,
@@ -818,6 +911,9 @@ impl<B: Backend> Worker<B> {
             seeds: Vec::new(),
             last_work: Instant::now(),
             idle_wait_logged: None,
+            spill,
+            writing: HashMap::new(),
+            awaiting_writes: Vec::new(),
         };
         worker.publish_view();
         worker
@@ -887,6 +983,15 @@ impl<B: Backend> Worker<B> {
             }
             if self.shutting_down {
                 self.stop_all();
+                // Files still being written: finished when a successor takes them, else skipped
+                // (they are deleted below). Their reports answer what waits for them.
+                let handover = self.exported || self.awaiting_writes.iter().any(|awaiting| matches!(awaiting, AwaitingWrite::Export { .. }));
+                self.spill.finish(!handover);
+                while let Ok(command) = self.rx.try_recv() {
+                    if let Command::Spilled { file, result } = command {
+                        self.spill_written(file, result);
+                    }
+                }
                 // Conversations parked on disk belong to this process unless a successor took them.
                 if !self.exported {
                     for record in self.hibernated.values() {
@@ -977,13 +1082,16 @@ impl<B: Backend> Worker<B> {
                         records.push(record);
                     }
                 }
-                records.extend(self.hibernated.values().cloned());
-                records.sort_by(|a, b| a.key.cmp(&b.key));
-                records.dedup_by(|a, b| a.key == b.key);
+                if !records.is_empty() {
+                    tracing::info!(conversations = records.len(), "spilled the idle conversations for the handover");
+                }
+                // The successor takes the files, so the answer waits until every one is written.
                 self.exported = true;
-                let _ = reply.send(records);
+                self.awaiting_writes.push(AwaitingWrite::Export { reply });
+                self.answer_awaiting_writes(None);
                 self.publish_view();
             }
+            Command::Spilled { file, result } => self.spill_written(file, result),
             Command::Adopt(records) => {
                 for record in records {
                     if record.identity == self.config.identity && record.file.exists() {
@@ -1552,18 +1660,76 @@ impl<B: Backend> Worker<B> {
         let turn = &mut self.turn[best];
         *turn = (*turn + 1) % candidates.len().max(1);
         let index = candidates[*turn % candidates.len()];
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.advance(index)));
+        // A decode turn advances every generating request: their forward passes are one pass.
+        if matches!(self.active[index].phase, Phase::Generate(_)) && self.model.batch_supported() {
+            self.decode_together();
+        } else {
+            self.guarded(index, |worker| worker.advance(index));
+        }
+    }
+
+    /// Run `work` on active request `index`; its error fails the request, a panic inside uzu
+    /// fails it hard (its stream and state may not be droppable).
+    fn guarded(&mut self, index: usize, work: impl FnOnce(&mut Self) -> Result<(), String>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => self.fail(index, error),
             Err(panic) => {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
-                    .unwrap_or_else(|| "engine panic".to_owned());
+                let message = panic_message(&panic);
                 tracing::error!(%message, "the engine panicked; the conversation is dropped");
                 self.fail_hard(index, format!("engine error: {message}"));
+            }
+        }
+    }
+
+    /// One step of every generating request, their forward passes shared: uzu reads the weights
+    /// once for all their rows (`LanguageModel::generate_batch`), so the step costs about what one
+    /// request's step costs. Priority still orders whose turn it is; a decode turn takes everyone
+    /// generating along. Requests are handled from the last, so finishing one leaves the indices
+    /// of the others valid.
+    fn decode_together(&mut self) {
+        let members: Vec<usize> =
+            (0..self.active.len()).filter(|&index| matches!(self.active[index].phase, Phase::Generate(_))).collect();
+        if let [index] = members[..] {
+            self.guarded(index, |worker| worker.advance(index));
+            return;
+        }
+        let model = self.model.clone();
+        let outcome = {
+            let mut streams: Vec<&mut LanguageModelStream<'static, B>> = self
+                .active
+                .iter_mut()
+                .filter_map(|active| match &mut active.phase {
+                    Phase::Generate(generation) => Some(&mut generation.stream),
+                    Phase::Prefill { .. } => None,
+                })
+                .collect();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on(model.generate_batch(&mut streams))))
+        };
+        let results = match outcome {
+            Ok(results) => results,
+            Err(panic) => {
+                // The pass was shared: every member's stream and state may be broken.
+                let message = panic_message(&panic);
+                tracing::error!(%message, requests = members.len(), "the engine panicked in a shared pass; its conversations are dropped");
+                for &index in members.iter().rev() {
+                    self.fail_hard(index, format!("engine error: {message}"));
+                }
+                return;
+            }
+        };
+        let steps: Vec<(usize, Result<BatchStep, String>)> = members
+            .iter()
+            .copied()
+            .zip(results.into_iter().map(|result| result.map_err(|error| format!("generation failed: {error}"))))
+            .collect();
+        for (index, step) in steps.into_iter().rev() {
+            match step {
+                Ok(BatchStep::Waiting) => {}
+                Ok(BatchStep::End) => self.guarded(index, |worker| worker.on_generated(index, None)),
+                Ok(BatchStep::Token(token)) => self.guarded(index, |worker| worker.on_generated(index, Some(token))),
+                Err(error) => self.fail(index, error),
             }
         }
     }
@@ -1653,44 +1819,50 @@ impl<B: Backend> Worker<B> {
             }
             None => {
                 let Phase::Generate(generation) = &mut self.active[index].phase else { return Ok(()) };
-                let next = block_on(generation.stream.generate()).transpose();
-                let max_tokens = generation.max_tokens;
-                let stop_tokens = generation.stop_tokens.clone();
-                match next {
-                    None => self.finish(index, Finish::Length),
-                    Some(Err(error)) => return Err(format!("generation failed: {error}")),
-                    Some(Ok(token)) => {
-                        let now = Instant::now();
-                        let active = &mut self.active[index];
-                        active.first_token.get_or_insert(now);
-                        active.last_token = Some(now);
-                        active.generated += 1;
-                        if stop_tokens.contains(&token) {
-                            self.finish(index, Finish::Stop);
-                            return Ok(());
-                        }
-                        let _ = active.request.events.send(Event::Token(token as u32));
-                        active.emitted.push(token);
-                        self.report(index, progress_phase::DECODE);
-                        let active = &mut self.active[index];
-                        if let (Some(used), Work::Generate { think_budget: Some(budget), .. }) = (active.thinking, &active.request.work) {
-                            if active.emitted.ends_with(&budget.end) {
-                                active.thinking = None;
-                            } else if used + 1 >= budget.tokens {
-                                return self.close_thinking(index);
-                            } else {
-                                active.thinking = Some(used + 1);
-                            }
-                        }
-                        let active = &mut self.active[index];
-                        if max_tokens.is_some_and(|max| active.generated >= max) {
-                            self.finish(index, Finish::Length);
-                        }
-                    }
-                }
-                Ok(())
+                let next = block_on(generation.stream.generate()).map_err(|error| format!("generation failed: {error}"))?;
+                self.on_generated(index, next)
             }
         }
+    }
+
+    /// The next token of generating request `index` (None: its stream ended): stop tokens, the
+    /// reasoning budget and the token limit are applied here.
+    fn on_generated(&mut self, index: usize, next: Option<u64>) -> Result<(), String> {
+        let Phase::Generate(generation) = &self.active[index].phase else { return Ok(()) };
+        let max_tokens = generation.max_tokens;
+        let stop_tokens = generation.stop_tokens.clone();
+        match next {
+            None => self.finish(index, Finish::Length),
+            Some(token) => {
+                let now = Instant::now();
+                let active = &mut self.active[index];
+                active.first_token.get_or_insert(now);
+                active.last_token = Some(now);
+                active.generated += 1;
+                if stop_tokens.contains(&token) {
+                    self.finish(index, Finish::Stop);
+                    return Ok(());
+                }
+                let _ = active.request.events.send(Event::Token(token as u32));
+                active.emitted.push(token);
+                self.report(index, progress_phase::DECODE);
+                let active = &mut self.active[index];
+                if let (Some(used), Work::Generate { think_budget: Some(budget), .. }) = (active.thinking, &active.request.work) {
+                    if active.emitted.ends_with(&budget.end) {
+                        active.thinking = None;
+                    } else if used + 1 >= budget.tokens {
+                        return self.close_thinking(index);
+                    } else {
+                        active.thinking = Some(used + 1);
+                    }
+                }
+                let active = &mut self.active[index];
+                if max_tokens.is_some_and(|max| active.generated >= max) {
+                    self.finish(index, Finish::Length);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Keep a checkpoint of the slot's state at `length` tokens (when the state holds exactly that
@@ -1994,7 +2166,13 @@ impl<B: Backend> Worker<B> {
         }
         let mut total: u64 = self.hibernated.values().map(|record| record.bytes).sum();
         while total > self.config.hibernate_limit {
-            let modified = |record: &Hibernated| std::fs::metadata(&record.file).and_then(|meta| meta.modified()).ok();
+            // A file still being written is the newest (it has no modification time yet).
+            let modified = |record: &Hibernated| {
+                if self.writing.contains_key(&record.file) {
+                    return Some(std::time::SystemTime::now());
+                }
+                std::fs::metadata(&record.file).and_then(|meta| meta.modified()).ok()
+            };
             let Some(oldest) = self.hibernated.values().min_by_key(|record| modified(record)).map(|record| record.key.clone()) else {
                 break;
             };
@@ -2031,17 +2209,27 @@ impl<B: Backend> Worker<B> {
                 Some(index) if self.slots[index].busy.is_some() => self.pending_hibernate.push((key, reply)),
                 Some(index) => {
                     let started = Instant::now();
-                    let result = self.hibernate_slot(index).map(|record| {
-                        json!({
-                            "cache_key": record.key,
-                            "slot": index,
-                            "file": record.file,
-                            "n_tokens": record.n_tokens,
-                            "bytes": record.bytes,
-                            "save_ms": ms(started),
-                        })
-                    });
-                    let _ = reply.send(result.map_err(|error| ("internal".to_owned(), error)));
+                    match self.hibernate_slot(index) {
+                        Ok(record) => {
+                            let value = json!({
+                                "cache_key": record.key,
+                                "slot": index,
+                                "file": record.file,
+                                "n_tokens": record.n_tokens,
+                                "bytes": record.bytes,
+                                "save_ms": ms(started),
+                            });
+                            // Answered once the file is on disk.
+                            if self.writing.contains_key(&record.file) {
+                                self.awaiting_writes.push(AwaitingWrite::Hibernate { file: record.file, value, reply });
+                            } else {
+                                let _ = reply.send(Ok(value));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(("internal".to_owned(), error)));
+                        }
+                    }
                 }
                 None => match self.hibernated.get(&key) {
                     Some(record) => {
@@ -2062,13 +2250,16 @@ impl<B: Backend> Worker<B> {
         self.publish_view();
     }
 
-    /// Write slot `index`'s conversation to disk and free the slot.
+    /// Spill slot `index`'s conversation and free the slot. The engine thread copies the state out
+    /// of the GPU into memory; the spill writer puts it on disk while requests keep stepping.
+    /// Until the write is done the bytes stay in `writing`, where a restore reads them.
     fn hibernate_slot(&mut self, index: usize) -> Result<Hibernated, String> {
         let key = self.slots[index].key.clone().ok_or("the slot holds no conversation")?;
         let started = Instant::now();
         let state = self.slots[index].state.as_ref().ok_or("the slot holds no state")?;
         let snapshot =
             self.model.snapshot_state(state, SnapshotMode::Full).map_err(|error| format!("snapshot failed: {error}"))?;
+        let snapshot_ms = ms(started);
         std::fs::create_dir_all(&self.config.hibernate_dir)
             .map_err(|error| format!("cannot create {}: {error}", self.config.hibernate_dir.display()))?;
         let file = self.config.hibernate_dir.join(format!("{}-{}.state", file_stem(&key), cc_protocol::contracts::now_ms()));
@@ -2078,45 +2269,122 @@ impl<B: Backend> Worker<B> {
         let checkpoints = &self.slots[index].checkpoints;
         let header = serde_json::to_vec(&json!({"identity": self.config.identity, "cache_key": key, "n_tokens": n_tokens, "checkpoints": checkpoints.len(), "images": self.slots[index].images, "pinned": self.slots[index].pinned}))
             .map_err(|error| error.to_string())?;
-        let written = (|| -> Result<u64, String> {
-            let out = std::fs::File::create(&file).map_err(|error| format!("cannot write {}: {error}", file.display()))?;
-            let mut out = BufWriter::with_capacity(8 << 20, out);
-            out.write_all(HIBERNATION_MAGIC).map_err(|error| error.to_string())?;
-            out.write_all(&(header.len() as u32).to_le_bytes()).map_err(|error| error.to_string())?;
-            out.write_all(&header).map_err(|error| error.to_string())?;
-            let mut body = snapshot.write_to(&mut out).map_err(|error| format!("cannot write the state: {error}"))?;
-            for checkpoint in checkpoints {
-                body += checkpoint.snapshot.write_to(&mut out).map_err(|error| format!("cannot write a checkpoint: {error}"))?;
-            }
-            out.flush().map_err(|error| error.to_string())?;
-            Ok(12 + header.len() as u64 + body)
-        })();
-        let bytes = match written {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = std::fs::remove_file(&file);
-                return Err(error);
-            }
-        };
-        let save_ms = ms(started);
-        self.costs.saved(u64::from(n_tokens), bytes, save_ms);
+        let serializing = Instant::now();
+        // Sized up front: growing a buffer of gigabytes copies it again at every doubling.
+        let body: usize = std::iter::once(&snapshot)
+            .chain(checkpoints.iter().map(|checkpoint| &checkpoint.snapshot))
+            .map(|snapshot| snapshot.tokens().len() * 8 + snapshot.buffer_bytes())
+            .sum();
+        // A megabyte over for the per-layer lengths and scalars.
+        let mut bytes = Vec::with_capacity(12 + header.len() + body + (1 << 20));
+        bytes.extend_from_slice(HIBERNATION_MAGIC);
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        snapshot.write_to(&mut bytes).map_err(|error| format!("cannot copy the state: {error}"))?;
+        for checkpoint in checkpoints {
+            checkpoint.snapshot.write_to(&mut bytes).map_err(|error| format!("cannot copy a checkpoint: {error}"))?;
+        }
+        let serialize_ms = ms(serializing);
+        let size = bytes.len() as u64;
         drop(snapshot);
         self.clear_slot(index);
         // The snapshot's copies (and the freed state's dense buffers) leave uzu's buffer cache.
         self.engine.trim_buffer_cache();
         self.refresh_device();
-        let record = Hibernated { key: key.clone(), file, n_tokens, bytes, identity: self.config.identity.clone() };
+        let bytes = Arc::new(bytes);
+        let mut write_ms = None;
+        match self.spill.send(SpillJob { file: file.clone(), bytes: bytes.clone() }) {
+            Ok(()) => {
+                self.writing.insert(file.clone(), bytes);
+            }
+            // No writer thread: written here, as before.
+            Err(job) => {
+                let writing = Instant::now();
+                if let Err(error) = write_spill(&job.file, &job.bytes) {
+                    let _ = std::fs::remove_file(&job.file);
+                    return Err(error);
+                }
+                write_ms = Some(ms(writing));
+            }
+        }
+        // What the engine thread spent: the time no request could step.
+        let save_ms = ms(started);
+        self.costs.saved(u64::from(n_tokens), size, save_ms);
+        tracing::info!(cache_key = %key, tokens = n_tokens, bytes = size, snapshot_ms, serialize_ms, ?write_ms, save_ms, "copied a conversation out for spilling");
+        let record = Hibernated { key: key.clone(), file, n_tokens, bytes: size, identity: self.config.identity.clone() };
         self.hibernated.insert(key, record.clone());
         self.bound_spill_files();
         Ok(record)
     }
 
+    /// The spill writer finished `file`. A file whose conversation came back, was forgotten or
+    /// went over the disk bound while it was written is deleted; a failed write leaves the
+    /// conversation cold.
+    fn spill_written(&mut self, file: PathBuf, result: Result<f64, String>) {
+        let size = self.writing.remove(&file).map_or(0, |bytes| bytes.len() as u64);
+        let owner = self.hibernated.values().find(|record| record.file == file).map(|record| record.key.clone());
+        match &result {
+            Ok(write_ms) => {
+                let mb_s = if *write_ms > 0.0 { size as f64 / 1e6 / (write_ms / 1000.0) } else { 0.0 };
+                tracing::info!(file = %file.display(), bytes = size, write_ms, mb_s, kept = owner.is_some(), "wrote a spilled conversation to disk");
+                if owner.is_none() {
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, file = %file.display(), "writing a spilled conversation failed; it starts cold");
+                let _ = std::fs::remove_file(&file);
+                if let Some(key) = owner {
+                    self.hibernated.remove(&key);
+                }
+                self.publish_view();
+            }
+        }
+        self.answer_awaiting_writes(Some((&file, &result)));
+    }
+
+    /// Answer the replies whose files are written: `done` is the file just finished.
+    fn answer_awaiting_writes(&mut self, done: Option<(&PathBuf, &Result<f64, String>)>) {
+        let awaiting = std::mem::take(&mut self.awaiting_writes);
+        for entry in awaiting {
+            match entry {
+                AwaitingWrite::Hibernate { file, mut value, reply } => match done {
+                    Some((written, result)) if *written == file => {
+                        let answer = match result {
+                            Ok(write_ms) => {
+                                value["write_ms"] = json!(write_ms);
+                                Ok(value)
+                            }
+                            Err(error) => Err(("internal".to_owned(), error.clone())),
+                        };
+                        let _ = reply.send(answer);
+                    }
+                    _ => self.awaiting_writes.push(AwaitingWrite::Hibernate { file, value, reply }),
+                },
+                AwaitingWrite::Export { reply } if self.writing.is_empty() => {
+                    let mut records: Vec<Hibernated> = self.hibernated.values().cloned().collect();
+                    records.sort_by(|a, b| a.key.cmp(&b.key));
+                    let _ = reply.send(records);
+                }
+                entry @ AwaitingWrite::Export { .. } => self.awaiting_writes.push(entry),
+            }
+        }
+    }
+
     /// Bring a hibernated conversation back into slot `index` (a failed restore leaves it cold).
     fn restore(&mut self, index: usize, record: &Hibernated) {
         let started = Instant::now();
+        // A file the spill writer has not finished is read from its bytes in memory (the writer's
+        // report then deletes the file, as its conversation is no longer on disk).
+        let unwritten = self.writing.get(&record.file).cloned();
         let outcome = (|| -> Result<Restored<B>, String> {
-            let file = std::fs::File::open(&record.file).map_err(|error| format!("cannot open {}: {error}", record.file.display()))?;
-            let mut input = BufReader::with_capacity(8 << 20, file);
+            let mut input: Box<dyn Read + '_> = match &unwritten {
+                Some(bytes) => Box::new(std::io::Cursor::new(bytes.as_slice())),
+                None => {
+                    let file = std::fs::File::open(&record.file).map_err(|error| format!("cannot open {}: {error}", record.file.display()))?;
+                    Box::new(BufReader::with_capacity(8 << 20, file))
+                }
+            };
             let mut magic = [0u8; 8];
             input.read_exact(&mut magic).map_err(|error| error.to_string())?;
             if &magic != HIBERNATION_MAGIC {

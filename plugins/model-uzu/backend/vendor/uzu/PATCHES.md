@@ -232,3 +232,41 @@ The rebase compiled with these corrections: `FlatTrie::len` (test-only upstream)
 `TrieNode::flat` (dropped upstream) are kept for the retained stream scheduler; `BatchTopology::new`
 takes its nodes by value; the decode pass's token ids are a `&dyn GpuBuffer`, as0.7.1's encoders
 take GPU buffers; the vision tower's GELU activations pass alpha 1.0 (it scales SiLU only).
+
+## P10: several streams in one forward pass (batched decode)
+
+uzu runs one sequence per forward pass, so N streams interleaved each decode at about 1/N of one
+stream's speed and the GPU reads the 27B weights N times for N streams' tokens. A pass costs
+about the same up to the rows the device's tree budget was tuned for (the weights dominate), so
+P10 runs every generating stream's rows in one pass.
+
+- `Mixer::{batch_supported, encode_batch}` with `MixerBatchPart` (a part's first row, its own
+  `BatchTopology`, RoPE tables and state). Attention and Gated DeltaNet run their projections once
+  over all rows; the cache write and attention (`Attention::attend_core`), and the convolution and
+  recurrence (`DeltaNet::{flat_core, tree_verify_core}`), run per part on a copy of its rows (the
+  kernels read from offset zero) and their outputs are copied back in order before the out
+  projection. A single stream still takes `Mixer::encode`, which calls the same cores: its
+  kernels and their order are unchanged. Short convolution has no batched form.
+- `TransformerLayer::{batch_supported, encode_batch}`: a layer batches when its mixer does and it
+  has no sublayer convolution and no n-gram injection (everything else is row-wise; stream ops
+  use only the row count). `Transformer::{batch_supported, encode_batch}` (additive residual
+  only) with `TransformerBatchSequence`: each sequence's rotary tables from its own context and
+  rope delta (text only), each layer's state per sequence (shared-KV layers read their owner's),
+  the captured layers' rows copied out per sequence for its speculator.
+  `Decoder::{batch_supported, encode_batch}` returns every row's logits and, per sequence, its
+  final hidden rows and captured features.
+- `LanguageModelStream::generate` is split into `begin` (uzu's code up to the input of the pass:
+  the previous output, the acceptance, the speculator's tree) and `encode_single` (uzu's own pass,
+  unchanged); `accept_pass` is uzu's tree acceptance, shared with `settle`.
+  `LanguageModel::generate_batch` steps several streams: they run in lockstep (a stream holding
+  accepted tokens hands one out per step while the others report `BatchStep::Waiting`; the pass
+  runs when every stream needs one), each drafts within `tree_budget / streams` nodes
+  (`DFlashTfmSpeculator::make_shape_within`; under two nodes it decodes without drafting), and the
+  members' inputs (resolved on the CPU: constant tokens only) go through one `encode_batch`, then
+  each member's own sampling, acceptance and penalty ring, as `encode_single` does them. The pass
+  is waited for, so the next step reads its outcome without a wait. One member left takes
+  `encode_single`; a model without batch support steps the streams one after another.
+- Prefill is not batched (a 1024-token chunk is compute-bound on its own). The drafters still run
+  one stream after another, each its own small pass.
+
+Source candidate: not built, not run.

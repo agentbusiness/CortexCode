@@ -31,8 +31,11 @@ release_name="${release_name:-release}"
 # scripts/build-app.sh).
 digest_tool="$repo/scripts/release/digest.mjs"
 # Names that must never be in a released file: RELEASE_FORBIDDEN (load_env), kept out of the
-# repository so the list itself is never released.
+# repository so the list itself is never released. RELEASE_ALLOWED (optional, the same form):
+# exact strings that may hold a forbidden name (a service's host name the owner allowed); they are
+# taken out before the scan, so the name anywhere else still stops the release.
 forbidden=""
+allowed=""
 
 step() { printf '%s: %s\n' "$release_name" "$*"; }
 die() { printf '%s: %s\n' "$release_name" "$*" >&2; exit 1; }
@@ -84,6 +87,7 @@ load_env() {
   RELEASE_PLATFORMS="${RELEASE_PLATFORMS:-darwin-arm64}"
   RELEASE_DMG="${RELEASE_DMG:-no}"
   forbidden="${RELEASE_FORBIDDEN:-}"
+  allowed="${RELEASE_ALLOWED:-}"
 }
 
 # runs_on_release_platforms <plugin dir>: true when the plugin runs on one of RELEASE_PLATFORMS
@@ -211,26 +215,38 @@ tar_dir() {
   (cd "$dir" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags -czf "$out" -- *)
 }
 
+# forbidden_count: how many lines of stdin hold a forbidden name, once the allowed strings are
+# taken out. Reads to the end, so the stream feeding it is never cut off.
+forbidden_count() {
+  if [ -n "$allowed" ]; then
+    LC_ALL=C ALLOWED="$allowed" perl -pe 's/(?:$ENV{ALLOWED})//gi' | LC_ALL=C grep -a -i -c -E "$forbidden" || true
+  else
+    LC_ALL=C grep -a -i -c -E "$forbidden" || true
+  fi
+}
+
 # Refuse a file or folder that holds a forbidden name or the release configuration.
 leak_scan() {
-  local item found
+  local item found file
   [ -n "$forbidden" ] || die "RELEASE_FORBIDDEN is not set (.env.release): the names no released file may hold, e.g. 'name1|name2'"
   for item in "$@"; do
     if [ -d "$item" ]; then
-      found="$(LC_ALL=C grep -r -a -i -l -E "$forbidden" "$item" 2>/dev/null | head -3 || true)"
-      [ -z "$found" ] || die "$item holds a forbidden name ($forbidden): $found"
+      while IFS= read -r file; do
+        found="$(forbidden_count < "$file")"
+        [ "${found:-0}" = 0 ] || die "$item holds a forbidden name ($forbidden): $file"
+      done < <(LC_ALL=C grep -r -a -i -l -E "$forbidden" "$item" 2>/dev/null || true)
       [ -z "$(find "$item" -name '.env.release' -print -quit)" ] || die "$item holds .env.release"
     else
       case "$item" in
         *.tar.gz|*.ccplugin)
-          # grep -c reads to the end: tar is never cut off (an early exit would hide a match).
-          found="$(tar -xzOf "$item" | LC_ALL=C grep -a -i -c -E "$forbidden" || true)"
+          found="$(tar -xzOf "$item" | forbidden_count)"
           [ "${found:-0}" = 0 ] || die "$item holds a forbidden name ($forbidden)"
           found="$(tar -tzf "$item" | grep -c '\.env\.release$' || true)"
           [ "${found:-0}" = 0 ] || die "$item holds .env.release"
           ;;
         *)
-          if LC_ALL=C grep -a -i -q -E "$forbidden" "$item"; then die "$item holds a forbidden name ($forbidden)"; fi
+          found="$(forbidden_count < "$item")"
+          [ "${found:-0}" = 0 ] || die "$item holds a forbidden name ($forbidden)"
           ;;
       esac
     fi

@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels,
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels,
         gpu_types::qkv_norm::QKVNormParams,
         kernel::{AttentionArguments, AttentionInput, AttentionKernel, AttentionKernelConfig, AttentionPrepareKernel},
     },
@@ -12,7 +12,7 @@ use crate::{
     encodable_block::{
         batch_topology::BatchTopology,
         linear::{InputRhtParameters, Linear, LinearBlockError, LinearEncodeError},
-        mixer::{Mixer, MixerEncodeError, MixerState, attention::rope::PrecalculatedRoPE},
+        mixer::{Mixer, MixerBatchPart, MixerEncodeError, MixerState, attention::rope::PrecalculatedRoPE},
     },
     safetensors::{ParameterLoaderError, ParameterTree},
     utils::maybe_mut::MaybeMut,
@@ -218,6 +218,20 @@ impl<B: Backend> Attention<B> {
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, AttentionEncodeError<B>> {
         let qkvg = self.projection.encode(hidden, batch_dim.size(), command_buffer)?;
+        let attention_output = self.attend_core(&qkvg, precalculated_rope, batch_dim, state, command_buffer)?;
+        Ok(self.out_projection.encode(attention_output, batch_dim.size(), command_buffer)?)
+    }
+
+    /// CortexCode patch P10: the per-sequence part of [`Self::attend`] (cache write and attention)
+    /// on projected rows; the result goes to the out projection.
+    fn attend_core(
+        &self,
+        qkvg: &B::ScratchBuffer,
+        precalculated_rope: Option<&PrecalculatedRoPE<B>>,
+        batch_dim: &BatchTopology,
+        state: Option<MaybeMut<AttentionState<B>>>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, AttentionEncodeError<B>> {
         let gate = self.has_gate.then(|| {
             qkvg.subrange(
                 (self.projection_dim - self.num_q_heads * self.head_dim) as usize * self.data_type.size_in_bytes()..,
@@ -243,7 +257,7 @@ impl<B: Backend> Attention<B> {
             };
             let (queries, query_scales) = self
                 .prepare(
-                    &qkvg,
+                    qkvg,
                     &mut kv,
                     cache.prefix_len(),
                     self.num_q_heads,
@@ -279,7 +293,47 @@ impl<B: Backend> Attention<B> {
                 .map_err(AttentionEncodeError::Kernel)?
         };
 
-        Ok(self.out_projection.encode(attention_output, batch_dim.size(), command_buffer)?)
+        Ok(attention_output)
+    }
+
+    /// CortexCode patch P10: several sequences in one pass: the QKV and out projections over all
+    /// rows, the cache write and attention per sequence on a copy of its rows.
+    fn attend_batch(
+        &self,
+        hidden: B::ScratchBuffer,
+        parts: &mut [MixerBatchPart<'_, '_, B>],
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let total: u32 = parts.iter().map(|part| part.topology.size()).sum();
+        let qkvg = self.projection.encode(hidden, total, command_buffer).map_err(AttentionEncodeError::from)?;
+        let qkvg_row_bytes = self.projection_dim as usize * self.data_type.size_in_bytes();
+        let output_row_bytes = (self.num_q_heads * self.head_dim) as usize * self.data_type.size_in_bytes();
+        let mut combined = command_buffer
+            .allocate_scratch(total as usize * output_row_bytes)
+            .map_err(MixerEncodeError::Backend)?;
+        for part in parts.iter_mut() {
+            assert_eq!(part.rope.is_some(), self.max_rope_length.is_some(), "precalculated rope mismatch");
+            let rows = part.topology.size() as usize;
+            let start = part.row as usize;
+            // A buffer of its own: the kernels read the part's rows from offset zero.
+            let mut part_qkvg =
+                command_buffer.allocate_scratch(rows * qkvg_row_bytes).map_err(MixerEncodeError::Backend)?;
+            command_buffer
+                .encode_copy((&qkvg).subrange(start * qkvg_row_bytes..(start + rows) * qkvg_row_bytes), &mut part_qkvg);
+            let state = match &mut part.state {
+                MaybeMut::Mut(state) => MaybeMut::Mut(&mut **state),
+                MaybeMut::Const(state) => MaybeMut::Const(&**state),
+            }
+            .downcast::<AttentionState<B>>()
+            .expect("incorrect type of attention state");
+            let output = self.attend_core(&part_qkvg, part.rope, part.topology, Some(state), command_buffer)?;
+            assert!(output.size() >= rows * output_row_bytes, "attention output rows");
+            command_buffer.encode_copy(
+                (&output).subrange(..rows * output_row_bytes),
+                (&mut combined).subrange_mut(start * output_row_bytes..(start + rows) * output_row_bytes),
+            );
+        }
+        Ok(self.out_projection.encode(combined, total, command_buffer).map_err(AttentionEncodeError::from)?)
     }
 
     pub fn append_projected_kv(
@@ -397,5 +451,19 @@ impl<B: Backend> Mixer<B> for Attention<B> {
         let output = self.attend(hidden, precalculated_rope, batch_dim, state, command_buffer)?;
 
         Ok(output)
+    }
+
+    fn batch_supported(&self) -> bool {
+        true
+    }
+
+    fn encode_batch(
+        &self,
+        hidden: B::ScratchBuffer,
+        parts: &mut [MixerBatchPart<'_, '_, B>],
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<B::ScratchBuffer, MixerEncodeError<B>> {
+        let command_buffer = &mut *command_buffer.debug_group("attention (batch)");
+        self.attend_batch(hidden, parts, command_buffer)
     }
 }
