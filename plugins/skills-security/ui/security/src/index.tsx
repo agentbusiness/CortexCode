@@ -581,7 +581,7 @@ function FindingDetail({ projectId, root, row, now, startSession, onSession, onC
       });
       return;
     }
-    if (pending !== 'reopen' && pending !== 'mute' && !text) return;
+    if (pending !== 'reopen' && !text) return;
     const next: SecurityStatus = pending === 'accept' ? 'accepted' : pending === 'gone' ? 'gone' : 'open';
     void run(pending, async () => {
       await update(next, text);

@@ -101,7 +101,7 @@ learn_recheck = "Not an episode: a lesson kept from earlier work, judged again b
 notebook = "Your notebook for this work, as you last wrote it:\n{notebook}\nLaw: when the newest results change what you know, your message writes the notebook again, whole, before your calls. Take its first Next step now."
 notebook_missing = "Law: your message starts with your notebook, whole, before your calls: Known: (each fact with where it comes from), Done: and Next:. You have not written it yet. Write it now from what you know, then take its first Next step."
 think_law_none = "Law for this step: no thinking. Carry out the step the work stands at."
-think_law_low = "Law for this step (thinking: low): the work carries on.\n1. Think in a few short lines: what the newest results show, and the call they lead to.\n2. Never draft code or a plan in your thinking: code goes into the edit, the plan into the notebook.\n3. A question a read or a search answers is that call, not more thinking."
+think_law_low = "Law for this step (thinking: low): the work carries on.\n1. Think in a few short lines: what the newest results show, and the call they lead to.\n2. Never draft code or a plan in your thinking: code goes into the edit, the plan into the notebook.\n3. A question a read or a search answers is that call, not more thinking. Make every read and search the next step needs now, as several calls in this one step: each step costs a minute."
 think_law_medium = "Law for this step (thinking: medium): something did not go as expected.\n1. Think about why it failed, from the output shown, and decide the fix.\n2. Never redraft the code in your thinking: the fix goes into the edit.\n3. What you found goes under Known in the notebook, so it is not worked out again."
 think_law_high = "Law for this step (thinking: high): this step plans the work.\n1. Think the work through once: what changes, in which files, in what order.\n2. Never write the code itself in your thinking: it goes into the edits.\n3. The plan's outcome goes into the notebook: the next steps carry it out with little thinking."
 rerun = "You ran {what} again with no edit since its last run: nothing it checks changed, so its earlier output above is still the answer, whatever you filter. Your next step is an edit; when it is your passing check, run the software the change is about, then reply with what changed."
@@ -304,6 +304,8 @@ same_error_plain = "This error came back {edits} more times after other attempts
 task_nudge = "Task {n} ({title}) ended without a single tool call, so nothing was done for it. Do the task now with your tools (edit, run, read)."
 plan_done_reports = "What the finished tasks reported (established by the work; the tasks still to do build on it, and a report is contradicted only by a new run that shows otherwise):\n{reports}"
 plan_done_report = "- Task {n} ({title}): {summary}\n"
+# A finished plan task's report with what its notebook established (flow.rs, `notebook_known`).
+task_report_known = "{summary}\n  Known (names and where they are): {known}"
 plan_replan_live = "Task {n} ({title}) ended {outcome}: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), with the approach changed where the outcome shows it was wrong. Code that works and that no failure runs through is not changed. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 plan_revise_live = "Task {n} ({title}) is done and showed that the tasks after it must change: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), changed to fit what was found. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 failed_before = "\n{count} of the {of} tests `{command}` fails on failed in the host's check before this work began too: {names}."
@@ -319,6 +321,8 @@ accept_check_passes = "- `{command}` passes\n"
 accept_check_fails = "- `{command}` fails\n"
 accept_no_checks = "(none)"
 accept_run = "`{command}` (exit {exit}):\n{output}\n"
+# A run of a script, example or driver the work itself created or changed (flow.rs `runs_own_script`).
+accept_run_own = "`{command}` (exit {exit}; a script this work wrote itself, so what it prints is the work's own account):\n{output}\n"
 # In place of a run's exit status when the tools plugin hid it (other commands ran after the check: the status was theirs).
 accept_exit_hidden = "not shown: other commands ran after it"
 accept_job = "{text}\n"

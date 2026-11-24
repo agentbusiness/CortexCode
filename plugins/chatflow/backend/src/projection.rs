@@ -349,8 +349,13 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // history in place, so only at a settle (a newer notebook moved them on every step it was
     // written, and each move voided the engine's cache: seen 12 times in 99 steps).
     let settled_notebook = Notebook::of(settled);
-    // The newest tool output is never folded.
-    let newest_result = entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT).map(|entry| entry.seq);
+    // The newest tool output at a mark is never folded by that mark. Keyed to the mark, not to the
+    // newest output now: the output that was newest at a settle or compaction stopped being newest
+    // one step later and was then rewritten in place, so every settle and compaction cost a second
+    // re-read of the history (seen: 55 steps re-reading 40-60k tokens right after one, 2.1 hours).
+    let newest_through = |mark: u64| entries.iter().rev().find(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq <= mark).map(|entry| entry.seq);
+    let newest_settled = newest_through(settled_through);
+    let newest_folded = newest_through(folded_through);
 
     let calls: HashMap<String, &JournalEntry> = entries
         .iter()
@@ -526,7 +531,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     // Every output kept whole while the notebook already held it made the context only grow
     // (seen: 79k that no compaction could fold, reference files read once and carried to 122k).
     let absorbed = |result: &JournalEntry| -> Option<String> {
-        if settled_notebook.from == 0 || result.seq >= settled_notebook.from || result.seq > settled_through || Some(result.seq) == newest_result || is_skill_read(result) {
+        if settled_notebook.from == 0 || result.seq >= settled_notebook.from || result.seq > settled_through || Some(result.seq) == newest_settled || is_skill_read(result) {
             return None;
         }
         let call = calls.get(str_field(&result.data, "call_id"))?;
@@ -553,7 +558,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             pointer
         } else if let Some(pointer) = absorbed(result) {
             pointer
-        } else if result.seq <= folded_through && Some(result.seq) != newest_result && !is_skill_read(result) && !(is_file_read(result) && result.seq > reads_through) {
+        } else if result.seq <= folded_through && Some(result.seq) != newest_folded && !is_skill_read(result) && !(is_file_read(result) && result.seq > reads_through) {
             folded_text(ds, result)
         } else {
             str_field(&result.data, "output").to_owned()
@@ -574,9 +579,11 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
     let covered = |result: &JournalEntry| {
         result.seq <= settled_through && calls.get(str_field(&result.data, "call_id")).and_then(|call| file_of(call)).is_some_and(|file| covered_later(&file, result))
     };
+    // Settled reads only: a read after the settled mark moved "the newest read of this part" off
+    // a read the compacted steps had kept, and that read then changed in place between settles.
     let kept_reads: HashSet<u64> = {
         let mut newest: HashMap<String, (u64, u64)> = HashMap::new();
-        for result in entries
+        for result in settled
             .iter()
             .filter(|entry| entry.kind == kinds::TOOL_RESULT && entry.seq > tasks_through.max(reads_through) && is_file_read(entry) && absorbed(entry).is_none() && !covered(entry))
         {
@@ -835,6 +842,19 @@ pub fn notebook_of(entries: &[JournalEntry]) -> Option<String> {
     Notebook::of(entries).text
 }
 
+/// The `Known:` part of the work's newest notebook (what it established, each fact with where it
+/// comes from), without its `Done:` and `Next:` parts; `None` when there is none.
+pub fn notebook_known(entries: &[JournalEntry]) -> Option<String> {
+    let text = Notebook::of(entries).text?;
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("known:")?;
+    let body = &text[start + "known:".len()..];
+    let lower_body = &lower[start + "known:".len()..];
+    let end = ["done:", "next:"].iter().filter_map(|name| lower_body.find(name)).min().unwrap_or(body.len());
+    let known = body[..end].trim().trim_end_matches(['*', '#', '-', ' ', '\n']).trim_start_matches(['*', ' ']).trim().to_owned();
+    (!known.is_empty()).then_some(known)
+}
+
 /// The notebook of the work going on: the newest step message of it that holds a `Next:` heading
 /// (the form the DO and TASK rules ask for), and the steps whose words it replaces. The work is
 /// what came after the newest user message or task start; a reply (a step without calls) is an
@@ -888,18 +908,33 @@ impl Notebook {
 }
 
 /// The notebook in a step's words: from its first `Known:`, `Done:` or `Next:` heading to the end,
-/// when it has a `Next:` heading (markdown marks around a heading are allowed).
+/// when it has a `Next:` heading (markdown marks around a heading are allowed). A heading opens a
+/// line, or sits inside one in bold (`… **Next:** run it`): the notebook written on one line
+/// counted as none, and the next step was told it had not written one (seen in 40 steps).
 fn notebook_text(words: &str) -> Option<String> {
     let heading = |line: &str| {
         let bare = line.trim().trim_start_matches(['#', '-', '*', ' ']).replace("**", "").to_ascii_lowercase();
         ["known:", "done:", "next:"].into_iter().find(|name| bare.starts_with(name))
     };
+    let lower = words.to_ascii_lowercase();
+    let inline = |name: &str| lower.find(&format!("**{name}:**")).or_else(|| lower.find(&format!("**{name}**:")));
     let lines: Vec<&str> = words.lines().collect();
-    if !lines.iter().any(|line| heading(line) == Some("next:")) {
+    if !lines.iter().any(|line| heading(line) == Some("next:")) && inline("next").is_none() {
         return None;
     }
-    let first = lines.iter().position(|line| heading(line).is_some())?;
-    let text = lines[first..].join("\n").trim().to_owned();
+    // Where the notebook begins: the first heading line, or the first bold heading inside a line,
+    // whichever comes first (as a byte offset into `words`).
+    let mut offset = 0;
+    let mut by_line = None;
+    for line in &lines {
+        if heading(line).is_some() {
+            by_line = Some(offset);
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    let first = [by_line, inline("known"), inline("done"), inline("next")].into_iter().flatten().min()?;
+    let text = words.get(first..)?.trim().to_owned();
     (!text.is_empty()).then_some(text)
 }
 

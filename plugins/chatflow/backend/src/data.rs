@@ -343,7 +343,7 @@ fn knowledge_per_turn() -> u32 {
     5
 }
 fn contract_chars() -> usize {
-    6000
+    40000
 }
 
 fn brief_tokens() -> u32 {

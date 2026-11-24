@@ -7,7 +7,7 @@
 [plugin]
 id = "skills-security"
 name = "Security skills"
-version = "0.1.22"
+version = "0.1.23"
 description = "Security know-how for the model (a whole-codebase audit, a review of a change, the triage of a reported vulnerability, a fix) with the bundled secaudit tool; and the security sentinel: every project of this computer swept for new advisories every few minutes and for supply-chain, CI, AI-agent-file and credential signals daily, each finding judged by host rules and the local model, only real alerts shown in colour and told, the rest kept grey."
 license = "UNLICENSED"
 platforms = ["macos", "linux"]

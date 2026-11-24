@@ -5,8 +5,8 @@
 //!   knowledge app's `error_stats`, the same records). Warnings are never collected.
 //! - **calls**: every contract method the process serves, summed per hour with its time, its
 //!   outcome and, for a model's answer, its tokens.
-//! - **models**: the model calls the process makes, summed per hour by model, tag, computer and
-//!   outcome: their tokens (in, cached, out, reasoning) and their times.
+//! - **models**: the model calls the process makes, summed per five-minute window by model, tag,
+//!   computer and outcome: their tokens (in, cached, out, reasoning) and their times.
 //!
 //! Every process collects; once per window ([`SUMMARY_MS`], a panic at once) it hands what it
 //! collected to the app's `stats` plugin (`stats.record`), which alone writes the Parquet day
@@ -139,7 +139,7 @@ pub fn bucket_of(ms: i64) -> i64 {
     ms.div_euclid(SUMMARY_MS) * SUMMARY_MS
 }
 
-/// The start of the hour a `calls` or `models` row sums ([`ROW_BUCKET_MS`]).
+/// The start of the hour a `calls` row sums ([`ROW_BUCKET_MS`]).
 pub fn row_bucket_of(ms: i64) -> i64 {
     ms.div_euclid(ROW_BUCKET_MS) * ROW_BUCKET_MS
 }

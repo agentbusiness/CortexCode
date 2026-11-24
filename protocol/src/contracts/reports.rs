@@ -7,8 +7,8 @@
 //!   files under the stats folder. The tables are exactly [`tables::ERRORS`] (errors and panics,
 //!   grouped per window by fingerprint, and the call sites that flood the log; warnings are never
 //!   collected), [`tables::CALLS`] (every contract method, summed per hour, [`ROW_BUCKET_MS`]) and
-//!   [`tables::MODELS`] (the model calls made, summed per hour by model, tag and computer). No app
-//!   sends a table of its own.
+//!   [`tables::MODELS`] (the model calls made, summed per five-minute window by model, tag and
+//!   computer, so their tokens arrive while the work runs). No app sends a table of its own.
 //! - Beside each day file a `<day>.sent.parquet` lists the event ids that a CortexManage accepted.
 //!   A row not in it is undelivered.
 //! - After each hand-over the `stats` plugin (in the knowledge app, its mesh) offers the rows just
@@ -32,7 +32,7 @@ pub const VERSION: u32 = 1;
 /// `errors` rows are grouped per window.
 pub const SUMMARY_MS: i64 = 300_000;
 
-/// The bucket of a `calls` or `models` row, in milliseconds: each row sums one hour that starts at
+/// The bucket of a `calls` row, in milliseconds: each row sums one hour that starts at
 /// a multiple of it (UTC), handed over in the first window after the hour closed. A five-minute
 /// bucket made a row per method and window, most of them for status reads polled on a timer.
 pub const ROW_BUCKET_MS: i64 = 3_600_000;

@@ -428,8 +428,17 @@ impl Core {
 /// Where earlier versions kept the approvals in the settings store.
 const LEGACY_APPROVALS: &str = "tools.approvals";
 
+/// The longest node key the graph takes (`memory.graph.put`).
+const KEY_BYTES: usize = 1024;
+
+/// `<session>#<class>`; a class that would make the key too long for the graph (`lift:<command>`
+/// of a long command) stands in the key as its hash. The node's `class` keeps the whole text.
 fn approval_key(session: &str, class: &str) -> String {
-    format!("{session}#{class}")
+    let key = format!("{session}#{class}");
+    if key.len() <= KEY_BYTES {
+        return key;
+    }
+    format!("{session}#sha256:{}", crate::util::content_hash(class.as_bytes()))
 }
 
 /// `(:Approval {key: '<session>#<class>', class, session_id})-[:FOR]->(:Session)`

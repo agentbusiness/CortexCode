@@ -199,8 +199,10 @@ lesson_merge_score = 0.56
 # Earlier runs without a learned mark taken up after a run is learned (the backlog).
 learn_backlog_runs = 3
 # The project's own contract (its AGENTS.md, else CLAUDE.md) in the system prompt, in characters;
-# 0 = none.
-contract_chars = 6000
+# 0 = none. Large enough for a whole contract: at 6000 a 10k AGENTS.md showed its longest section
+# (the shared standard, the rules the work broke) as a heading only, and no step read it.
+# It sits in the byte-stable system block, read once per session and kept in the cache.
+contract_chars = 40000
 # A change whose route names no file a language server checks reads the workspace's diagnostics
 # before DECIDE, at most this many listed per server (errors first, the rest counted).
 diagnostics_shown = 12

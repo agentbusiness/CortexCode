@@ -1257,12 +1257,10 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
         if verdict.install.private || private_index.contains(&verdict.install.ecosystem) || !verdict.malware.is_empty() {
             continue;
         }
-        let client = client.clone();
-        let install = verdict.install.clone();
-        tasks.spawn(async move { Lookup::Registry(index, registry(&client, &install).await) });
-        let client = client.clone();
-        let install = verdict.install.clone();
-        tasks.spawn(async move { Lookup::Fresh(index, fresh_version(&client, &install).await) });
+        let (asker, install) = (client.clone(), verdict.install.clone());
+        tasks.spawn(async move { Lookup::Registry(index, registry(&asker, &install).await) });
+        let (asker, install) = (client.clone(), verdict.install.clone());
+        tasks.spawn(async move { Lookup::Fresh(index, fresh_version(&asker, &install).await) });
     }
     while let Some(done) = tasks.join_next().await {
         match done {

@@ -907,10 +907,18 @@ pub async fn run_turn(env: &RunEnv, journal: &mut Journal, status_seq: u64) -> R
                             let did_nothing = outcome.outcome == "done" && outcome.tool_calls == 0;
                             let outcome_name = if did_nothing { "failed".to_owned() } else { outcome.outcome.clone() };
                             let mut done = plan.steps_done.clone();
+                            // What the task established (its notebook's Known: the names it made
+                            // and where they are) travels with its report: the next task's step
+                            // shows only the reports, so a label or edge one task wrote was guessed
+                            // by the next (seen: "the rel in the graph is probably YIELDS_FROM").
+                            let summary = match crate::projection::notebook_known(&journal.entries_vec()) {
+                                Some(known) => env.data.text("task_report_known", &[("summary", outcome.summary.trim()), ("known", &known)]),
+                                None => outcome.summary.clone(),
+                            };
                             done.push(plan::StepDone {
                                 n,
                                 outcome: outcome_name.clone(),
-                                summary: outcome.summary.clone(),
+                                summary,
                                 changed_files: outcome.changed_files.clone(),
                                 check: outcome.check.clone(),
                                 check_detail: outcome.check_detail.clone(),
@@ -1513,6 +1521,13 @@ fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &
     let Some(first) = entries.iter().find(|entry| str_field(&entry.data, "run_id") == run_id).map(|entry| entry.seq) else { return Vec::new() };
     let results: HashMap<&str, &JournalEntry> =
         entries.iter().filter(|entry| entry.kind == kinds::TOOL_RESULT && str_field(&entry.data, "run_id") == run_id).map(|entry| (str_field(&entry.data, "call_id"), entry)).collect();
+    // The files this run created or changed: a run of one of them is the work's own script.
+    let mut changed: Vec<String> = results
+        .values()
+        .flat_map(|result| result.data.get("changed_files").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned))
+        .collect();
+    changed.sort();
+    changed.dedup();
     let mut runs: Vec<(String, String)> = Vec::new();
     for entry in entries.iter().filter(|entry| entry.seq >= first) {
         if entry.kind == kinds::NOTE && str_field(&entry.data, "purpose") == "job" {
@@ -1546,10 +1561,32 @@ fn project_runs(data: &crate::data::Dataset, entries: &[JournalEntry], run_id: &
         };
         let output = str_field(&result.data, "output").trim_end();
         runs.retain(|(key, _)| key != &command);
-        runs.push((command.clone(), data.text("accept_run", &[("command", &command), ("exit", &exit), ("output", output)])));
+        runs.push((command.clone(), accept_run_text(data, &command, &exit, output, &changed)));
     }
     let skip = runs.len().saturating_sub(8);
     runs.into_iter().skip(skip).map(|(_, text)| text).collect()
+}
+
+/// Whether a command runs a script the work itself created or changed: it names one of `files`
+/// by its path or file name, or a Rust example or binary by its name (`--example e2erun` for
+/// `examples/e2erun.rs`). What such a run prints is the work's own account, not the software
+/// shown working (seen: a driver the work wrote printing "first run: OK", judged as every ask met).
+fn runs_own_script(command: &str, files: &[String]) -> bool {
+    files.iter().any(|file| {
+        let path = std::path::Path::new(file);
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+        let in_examples = file.contains("examples/") || file.contains("src/bin/");
+        command.contains(file.as_str())
+            || (name.len() > 3 && name.contains('.') && command.contains(name))
+            || (in_examples && stem.len() > 2 && (command.contains(&format!("--example {stem}")) || command.contains(&format!("--bin {stem}"))))
+    })
+}
+
+/// One run as ACCEPT reads it, marked when it runs a script the work wrote ([`runs_own_script`]).
+fn accept_run_text(data: &crate::data::Dataset, command: &str, exit: &str, output: &str, files: &[String]) -> String {
+    let key = if runs_own_script(command, files) { "accept_run_own" } else { "accept_run" };
+    data.text(key, &[("command", command), ("exit", exit), ("output", output)])
 }
 
 /// Whether one of the shell command's parts (split at `&&`, `||`, `;` and `|`) starts with one
@@ -1761,10 +1798,10 @@ pub(crate) async fn accept_tree(env: &RunEnv, journal: &mut Journal) -> Result<b
         journal.append(kinds::NOTE, json!({"text": "", "purpose": "accept", "run_id": env.run_id, "host_message": false, "delegation": delegation, "plan_seq": plan_seq})).await?;
         return Ok(false);
     }
-    let mut files: Vec<String> = facts.iter().flat_map(|fact| list(fact, "changed_files")).collect();
-    files.sort();
-    files.dedup();
-    let files = if files.is_empty() { "-".to_owned() } else { files.join(", ") };
+    let mut changed: Vec<String> = facts.iter().flat_map(|fact| list(fact, "changed_files")).collect();
+    changed.sort();
+    changed.dedup();
+    let files = if changed.is_empty() { "-".to_owned() } else { changed.join(", ") };
     let checks: String = plan
         .tasks
         .iter()
@@ -1782,7 +1819,7 @@ pub(crate) async fn accept_tree(env: &RunEnv, journal: &mut Journal) -> Result<b
         .flat_map(|fact| fact.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
         .map(|run| {
             let exit = run.get("exit_code").and_then(Value::as_i64).map(|code| code.to_string()).unwrap_or_else(|| "-".to_owned());
-            env.data.text("accept_run", &[("command", str_field(&run, "command")), ("exit", &exit), ("output", str_field(&run, "output").trim_end())])
+            accept_run_text(&env.data, str_field(&run, "command"), &exit, str_field(&run, "output").trim_end(), &changed)
         })
         .collect();
     let runs = if runs.is_empty() { env.data.text("accept_no_runs", &[]) } else { runs };

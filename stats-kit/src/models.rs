@@ -1,5 +1,5 @@
-//! The model calls this process made, summed per hour
-//! ([`ROW_BUCKET_MS`](cc_protocol::contracts::reports::ROW_BUCKET_MS)): which model answered, for which
+//! The model calls this process made, summed per five-minute window
+//! ([`SUMMARY_MS`](cc_protocol::contracts::reports::SUMMARY_MS)): which model answered, for which
 //! tag, on which computer, how it ended, how many calls, and their tokens (in, cached, out and
 //! reasoning) and times.
 //!
@@ -8,8 +8,8 @@
 //! `cache_key` adds to the row of that placement. A call without a claim ran on this app's own
 //! model.
 
-use crate::{now_ms, recorder, row_bucket_of};
-use cc_protocol::contracts::reports::ROW_BUCKET_MS;
+use crate::{bucket_of, now_ms, recorder};
+use cc_protocol::contracts::reports::SUMMARY_MS;
 use cc_protocol::RpcError;
 use cc_protocol::conn::Watch;
 use cc_protocol::contracts::mesh::methods as mesh_methods;
@@ -24,7 +24,7 @@ const MAX_ROWS: usize = 4096;
 /// Placements held; the oldest goes first.
 const MAX_PLACEMENTS: usize = 1024;
 
-/// The calls of one model, tag, computer and outcome within one hour.
+/// The calls of one model, tag, computer and outcome within one five-minute window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelRecord {
     pub schema_version: u32,
@@ -163,7 +163,7 @@ fn record(method: String, key: &str, started: i64, wall_ms: f64, outcome: &Resul
     let count = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
     let ms = |name: &str| usage.get(name).and_then(Value::as_f64).unwrap_or(0.0);
     let ended = now_ms();
-    let key: Key = (row_bucket_of(ended), method, place.tag, place.model_id, place.plugin, place.name, place.node, place.tier, code, finish);
+    let key: Key = (bucket_of(ended), method, place.tag, place.model_id, place.plugin, place.name, place.node, place.tier, code, finish);
     let Ok(mut rows) = rows().lock() else { return };
     if let Some(row) = rows.get_mut(&key) {
         row.count += 1;
@@ -210,7 +210,7 @@ fn record(method: String, key: &str, started: i64, wall_ms: f64, outcome: &Resul
         started_at_ms: started,
         ended_at_ms: ended,
         bucket_ms: key.0,
-        window_ms: ROW_BUCKET_MS,
+        window_ms: SUMMARY_MS,
         version,
         node_id: node,
     };
@@ -219,7 +219,7 @@ fn record(method: String, key: &str, started: i64, wall_ms: f64, outcome: &Resul
 
 /// Takes the rows of the closed buckets (with `open_too`, every row).
 pub(crate) fn drain(open_too: bool) -> Vec<Value> {
-    let open = row_bucket_of(now_ms());
+    let open = bucket_of(now_ms());
     let taken: Vec<ModelRecord> = match rows().lock() {
         Ok(mut rows) => {
             let keys: Vec<Key> = rows.keys().filter(|key| open_too || key.0 < open).cloned().collect();
