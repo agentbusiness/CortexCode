@@ -92,7 +92,6 @@ fn line(summary: &Value, id: &str, workspace: &Path) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .take(4)
         .filter_map(|p| {
             let name = p["name"].as_str()?;
             let count = p["count"].as_u64().unwrap_or(1);
@@ -107,7 +106,6 @@ fn line(summary: &Value, id: &str, workspace: &Path) -> String {
         .into_iter()
         .flatten()
         .filter(|t| t["how"] == "wrote")
-        .take(3)
         .filter_map(|t| t["name"].as_str().map(|name| crate::util::relative_paths(name, workspace)))
         .collect();
     if !wrote.is_empty() {

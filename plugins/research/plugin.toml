@@ -28,7 +28,6 @@ uses = ["model.chat", "frame.project.get", "browser.open", "browser.eval", "brow
 [backend.config]
 timeout_ms = 20000                 # per HTTP request
 max_download_bytes = 26214400      # per fetch (25 MB); a larger PDF is refused with this name
-max_text_chars = 400000            # extracted text kept per document
 cache_ttl_hours = 168              # cached pages (WebPage nodes) are fresh this long
 allow_private_hosts = false        # research.fetch never reads loopback / private / link-local addresses
 web_search = "auto"                # auto (DuckDuckGo HTML, then the built-in browser when blocked) | http | browser
@@ -40,9 +39,7 @@ deep_depth = 2                     # rounds of search -> read -> synthesize -> g
 deep_sources_per_round = 8
 deep_results_per_query = 4
 chunk_chars = 12000                # characters of a source per model call (map); fits a 32k context
-max_chunks_per_source = 6
 synth_chars = 48000                # characters of notes per synthesis call (reduce)
-model_max_tokens = 2048
 model_priority = "agent"           # foreground | agent | background
 # user_agent = "CortexCode-research/0.1 (local research assistant; macOS)"
 # Endpoints (mirrors, tests): arxiv_api, semantic_scholar_api, github_api, reddit, hackernews_api, duckduckgo_html

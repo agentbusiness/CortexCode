@@ -22,7 +22,7 @@ use cc_protocol::contracts::lifecycle::{Hello, ProbeCheck, ProbeReport};
 use cc_protocol::contracts::memory::{AgentRecord, Routine, RoutineRun, Task, methods as memory_methods, topics as memory_topics};
 use cc_protocol::contracts::now_ms;
 use cc_protocol::contracts::schedule::{AddParams, EditParams, Fired, IdParams, ListAnswer, ListParams, RoutineAnswer, methods, topics};
-use cc_protocol::contracts::tools::{RunParams, RunResult, methods as tools_methods};
+use cc_protocol::contracts::tools::{ArtifactPutResult, ArtifactResult, RunParams, RunResult, methods as tools_methods};
 use cc_protocol::host::Host;
 use cc_protocol::{BoxFuture, Call, Ctx, Plugin, RpcError, parse_params, to_value};
 use serde_json::{Value, json};
@@ -42,6 +42,9 @@ const PAUSE_AFTER_FAILURES: u32 = 3;
 const COMMAND_TIMEOUT_MS: u64 = 600_000;
 /// The global routines' home project folder, under the CortexCode home.
 const ROUTINES_HOME: &str = "routines";
+/// Bytes of output a test run may have for its compact view: the tools plugin's own bound
+/// (`exec::TEST_VIEW_BYTES` in plugins/tools), so a larger output keeps the view it already has.
+const TEST_VIEW_BYTES: u64 = 1 << 20;
 
 pub fn hello() -> Hello {
     let mut hello = Hello::new("cc-scheduler", env!("CARGO_PKG_VERSION"), "schedule", "schedule@1");
@@ -114,9 +117,44 @@ fn short_id() -> String {
     format!("r-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
 }
 
-fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
+/// The id of the artifact where the tools plugin kept a long output whole, read from the marker it
+/// puts where it left lines out (`[N lines not shown: read artifact://<id>:<a>-<b> for them]`).
+fn kept_whole(view: &str) -> Option<&str> {
+    const MARK: &str = " lines not shown: read artifact://";
+    let rest = &view[view.find(MARK)? + MARK.len()..];
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or(rest.len());
+    Some(&rest[..end]).filter(|id| !id.is_empty())
+}
+
+/// The lines of an output that report an error, each whole with the indented lines under it (a
+/// compiler's location and code, a traceback's frames, a stack's `at` lines).
+fn error_lines(text: &str) -> String {
+    const SIGNS: [&str; 8] = ["error", "fail", "panic", "exception", "fatal", "traceback", "cannot", "could not"];
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let starts = SIGNS.iter().any(|sign| lower.contains(sign));
+        let under = inside && !line.trim().is_empty() && line.starts_with(char::is_whitespace);
+        inside = starts || under;
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A run's id with the range of its runs to show (`r-1a2b3c:1-5`, newest first, from 1); no range:
+/// None.
+fn with_range(id: &str) -> (&str, Option<(usize, usize)>) {
+    let Some((routine, range)) = id.rsplit_once(':') else { return (id, None) };
+    let (first, last) = range.split_once('-').unwrap_or((range, range));
+    match (first.trim().parse::<usize>(), last.trim().parse::<usize>()) {
+        (Ok(first), Ok(last)) if first >= 1 && last >= first => (routine, Some((first, last))),
+        (Ok(first), Err(_)) if first >= 1 && last.trim().is_empty() => (routine, Some((first, usize::MAX))),
+        _ => (id, None),
+    }
 }
 
 fn schedule_of(routine: &Routine) -> Option<Schedule> {
@@ -304,7 +342,8 @@ impl Scheduler {
             return;
         }
         let ok = job.state == "done" && job.exit_code == Some(0);
-        let summary = if job.text.trim().is_empty() { tail(&job.tail.join("\n"), 20) } else { job.text.trim().to_owned() };
+        // The provider's own lines (how to read more among them), else the output it sent, whole.
+        let summary = if job.text.trim().is_empty() { job.tail.join("\n").trim().to_owned() } else { job.text.trim().to_owned() };
         let started = if job.started > 0 { job.started } else { now_ms() };
         let run = RoutineRun {
             id: format!("{}:{}", routine.id, started),
@@ -692,8 +731,11 @@ impl Scheduler {
 
     async fn show(&self, ctx: &Ctx, params: IdParams) -> Result<RoutineAnswer, RpcError> {
         let host = Host::new(ctx.clone());
-        let routine = self.find(&host, &params.id).await?;
-        let runs = self.runs_of(&host, &routine.id, 5).await;
+        let (id, range) = with_range(&params.id);
+        let routine = self.find(&host, id).await?;
+        // Every run, newest first: each one's line, and the whole report of the newest one, or of
+        // each run in the range asked for.
+        let runs = self.runs_of(&host, &routine.id, usize::MAX).await;
         let mut text = self.line(ctx, &routine) + "\n";
         let what = if routine.kind == "command" { &routine.command } else { &routine.brief };
         if !what.is_empty() {
@@ -701,9 +743,18 @@ impl Scheduler {
             text.push('\n');
         }
         let now = now_ms();
-        for run in &runs {
-            let summary = first_line(&run.summary, 160);
-            text.push_str(&format!("- {}  {}  {summary}\n", when::show(run.started_ms, now), run.outcome));
+        let (first, last) = range.unwrap_or((1, 1));
+        for (index, run) in runs.iter().enumerate() {
+            let number = index + 1;
+            text.push_str(&format!("{number}. {}  {}\n", when::show(run.started_ms, now), run.outcome));
+            if (first..=last).contains(&number) && !run.summary.trim().is_empty() {
+                text.push_str(run.summary.trim_end());
+                text.push('\n');
+            }
+        }
+        if range.is_none() && runs.len() > 1 {
+            text.push_str(&self.text(ctx, "runs_more", &[("id", &routine.id), ("last", &runs.len().to_string())]));
+            text.push('\n');
         }
         let mut answer = self.answer(ctx, routine, "none", None, false);
         answer.text = text;
@@ -717,6 +768,55 @@ impl Scheduler {
             .ok()
             .and_then(|value| serde_json::from_value(value.get("runs").cloned().unwrap_or(Value::Null)).ok())
             .unwrap_or_default()
+    }
+
+    /// A failed command's output as the model reads it, never cut: whole when the tools plugin
+    /// returned it whole and it is no test report; a test run's failing tests (the runner's compact
+    /// report: one line per failing test with its error, the first failure whole) or a long
+    /// output's error lines, whole, with the pointer to the whole output kept as an artifact of
+    /// `session`. Without error lines, the tools plugin's own view (its start, the pointer, its end).
+    async fn failing_part(&self, ctx: &Ctx, host: &Host, view: &str, session: &str) -> String {
+        let mut kept = kept_whole(view).map(str::to_owned);
+        // A kept output larger than a test view may be is left as the tools plugin showed it (its
+        // view already points to the whole), so it is never loaded and sent again.
+        let whole = match &kept {
+            Some(id) => match host.get::<ArtifactResult>(tools_methods::ARTIFACT, json!({"id": id, "range": "1-1"})).await {
+                Ok(first) if first.total_bytes <= TEST_VIEW_BYTES => match host.get::<ArtifactResult>(tools_methods::ARTIFACT, json!({"id": id})).await {
+                    Ok(artifact) if artifact.encoding == "utf8" => artifact.data,
+                    _ => return view.to_owned(),
+                },
+                _ => return view.to_owned(),
+            },
+            None => view.to_owned(),
+        };
+        let answer = host.call(tools_methods::TESTS_REPORT, json!({"text": whole, "artifact": kept, "session_id": session})).await.ok();
+        let report = answer
+            .as_ref()
+            .and_then(|answer| answer.get("report").and_then(Value::as_str).map(str::to_owned))
+            .filter(|report| !report.trim().is_empty());
+        // The artifact the report kept the output in, when it had to keep it: the pointer names it.
+        if kept.is_none() {
+            kept = answer.as_ref().and_then(|answer| answer.get("artifact").and_then(Value::as_str)).filter(|id| !id.is_empty()).map(str::to_owned);
+        }
+        if kept.is_none() && report.is_none() {
+            return view.to_owned();
+        }
+        let lines = whole.lines().count().max(1).to_string();
+        let id = match kept {
+            Some(id) => id,
+            None => match host.get::<ArtifactPutResult>(tools_methods::ARTIFACT_PUT, json!({"text": whole, "session_id": session})).await {
+                Ok(put) => put.id,
+                Err(_) => return view.to_owned(),
+            },
+        };
+        if let Some(report) = report {
+            return self.text(ctx, "failed_tests", &[("id", &id), ("lines", &lines), ("report", report.trim_end())]);
+        }
+        let errors = error_lines(&whole);
+        if errors.is_empty() {
+            return view.to_owned();
+        }
+        self.text(ctx, "failed_errors", &[("id", &id), ("lines", &lines), ("errors", errors.trim_end())])
     }
 
     // ---- the clock -------------------------------------------------------------------------------
@@ -941,7 +1041,9 @@ impl Scheduler {
             Ok((home, project_id, result)) => {
                 let ok = result.exit_code == Some(0) && !result.timed_out;
                 run.session_id = Some(home.clone());
-                run.summary = tail(result.output.trim(), 20);
+                // The output as the tools plugin returned it: whole, or its start, the pointer to
+                // the whole it kept and its end.
+                run.summary = result.output.trim().to_owned();
                 if !ok {
                     // The model hears only about a failure: the session that made it, else the home one.
                     let code = if result.timed_out { "after timing out".to_owned() } else { result.exit_code.map(|code| code.to_string()).unwrap_or_else(|| "without a code".to_owned()) };
@@ -949,7 +1051,8 @@ impl Scheduler {
                         Some(session) if host.session_get(session).await.is_ok() => session.clone(),
                         _ => home,
                     };
-                    let text = self.text(ctx, "command_failed", &[("command", &routine.command), ("code", &code), ("tail", &tail(result.output.trim(), 40))]);
+                    let output = self.failing_part(ctx, host, result.output.trim(), &target).await;
+                    let text = self.text(ctx, "command_failed", &[("command", &routine.command), ("code", &code), ("output", &output)]);
                     let fired = Fired { id: run.id.clone(), routine_id: routine.id.clone(), session_id: target, project_id, title: routine.title.clone(), when: routine.when.clone(), text, manage: false };
                     ctx.publish(topics::FIRED, serde_json::to_value(&fired).unwrap_or(Value::Null));
                 }

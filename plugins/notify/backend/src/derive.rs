@@ -334,7 +334,18 @@ pub fn duration(ms: u64) -> String {
 
 /// The last non-empty line of a text (a job's output tail, a check's tail): a structural pick.
 pub fn last_line(text: &str) -> Option<String> {
-    text.lines().map(str::trim).rfind(|line| !line.is_empty()).map(str::to_owned)
+    // A pointer to the rest (`... read artifact://<id> ...`, `read diagnostics://...`) says where
+    // the rest is, not what happened: the line before it is the news.
+    text.lines().map(str::trim).rfind(|line| !line.is_empty() && !is_pointer(line)).map(str::to_owned)
+}
+
+/// Whether a line says to read a `<scheme>://` address (`read <word>://`).
+fn is_pointer(line: &str) -> bool {
+    line.match_indices("read ").any(|(at, word)| {
+        let rest = &line[at + word.len()..];
+        let scheme = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        scheme > 0 && rest[scheme..].starts_with("://")
+    })
 }
 
 fn join(parts: &[Option<&str>], separator: &str) -> Option<String> {

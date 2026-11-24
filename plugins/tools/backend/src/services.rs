@@ -18,8 +18,6 @@ use std::time::{Duration, Instant};
 const BUILT_IN: &[&str] = &["read", "edit", "run", "terminal"];
 /// How long the list of services is reused.
 const FRESH: Duration = Duration::from_secs(30);
-/// A tool result longer than this is cut (the service's read sizes keep it short when asked well).
-const OUTPUT_CAP: usize = 6000;
 
 static CACHE: Mutex<Option<(Instant, Vec<Share>)>> = Mutex::new(None);
 
@@ -60,7 +58,7 @@ pub async fn specs(host: &dyn Host) -> Vec<ToolSpec> {
 }
 
 /// A call of a service tool, done; None when `call` is not one.
-pub async fn execute(host: &dyn Host, context: &ExecContext, call: &ToolCall, started: Instant) -> Option<ToolOutcome> {
+pub async fn execute(core: &crate::core::Core, host: &dyn Host, context: &ExecContext, call: &ToolCall, started: Instant) -> Option<ToolOutcome> {
     let shares = offered(host).await;
     let share = shares.iter().find(|share| svc::tool_of(share).0 == call.name)?;
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
@@ -91,12 +89,9 @@ pub async fn execute(host: &dyn Host, context: &ExecContext, call: &ToolCall, st
     let answer = host.call("mesh.service.call", json!({"method": method, "params": params})).await;
     Some(match answer {
         Ok(value) => {
-            let mut output = serde_json::to_string_pretty(&value).unwrap_or_default();
-            if output.len() > OUTPUT_CAP {
-                let cut = (0..=OUTPUT_CAP).rev().find(|&at| output.is_char_boundary(at)).unwrap_or(0);
-                output.truncate(cut);
-                output.push_str("\n[cut: ask for a smaller size or fewer records]");
-            }
+            // A long answer is kept whole as an artifact; the result shows its start and end and
+            // the range between them to read.
+            let (mut output, artifact) = crate::exec::offload_text(core, &context.session_id, serde_json::to_string_pretty(&value).unwrap_or_default(), core.config.run_limits);
             let refused = value.get("needs_approval").is_some_and(|v| !v.is_null());
             if refused {
                 output.push_str("\n[not run: it needs the person's approval; say what it would do and ask them]");
@@ -109,7 +104,7 @@ pub async fn execute(host: &dyn Host, context: &ExecContext, call: &ToolCall, st
                 args,
                 intent: String::new(),
                 changed_files: Vec::new(),
-                artifact: None,
+                artifact,
                 needs_approval: refused,
                 duration_ms: started.elapsed().as_millis() as u64,
                 error_kind: refused.then(|| "needs_approval".to_owned()),

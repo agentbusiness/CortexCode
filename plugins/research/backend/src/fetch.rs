@@ -3,14 +3,16 @@
 //!
 //! ```text
 //! (:WebPage {key: url, url, final_url, fetched_ms, content_sha256, content_type, kind, bytes,
-//!     download_truncated, extractor, title, text, published, authors, site_name, pages})-[:ON]->(:Machine)
+//!     download_truncated, extractor, title, text_file, published, authors, site_name, pages})-[:ON]->(:Machine)
 //! ```
 //!
-//! - the URL's latest fetch (when, the content hash, the extracted text and metadata, the extractor
-//!   version) as a `WebPage` node in the memory plugin's graph (workspace layer); a URL longer than
-//!   a key holds is keyed `sha256:<hex of the URL>`;
+//! - the URL's latest fetch (when, the content hash, the extracted text's file and metadata, the
+//!   extractor version) as a `WebPage` node in the memory plugin's graph (workspace layer); a URL
+//!   longer than a key holds is keyed `sha256:<hex of the URL>`;
 //! - the downloaded bytes stay a file, `$CORTEX_HOME/research/cache/blobs/<sha256 of the content>`,
-//!   shared by every URL with the same content, so a newer extractor re-extracts without the network.
+//!   shared by every URL with the same content, so a newer extractor re-extracts without the network;
+//! - the extracted text is a file beside them, `blobs/<sha256 of the text>.txt` (`text_file`, relative
+//!   to the cache folder): a page's text can be megabytes, and bytes are no graph property.
 //!
 //! A fresh entry (younger than `cache_ttl_hours`) is served without the network; an older one is
 //! fetched again, and returned marked `stale` when the network cannot be reached. While memory is
@@ -49,6 +51,7 @@ struct Entry {
     download_truncated: bool,
     extractor: u32,
     title: String,
+    /// The extracted text, whole: in memory only (the node names its file, `text_file`).
     text: String,
     #[serde(default)]
     published: Option<String>,
@@ -73,7 +76,6 @@ impl Entry {
             "download_truncated": self.download_truncated,
             "extractor": self.extractor,
             "title": self.title,
-            "text": self.text,
             "published": graph::or_null(&self.published),
             "authors": self.authors,
             "site_name": graph::or_null(&self.site_name),
@@ -97,6 +99,8 @@ impl Entry {
             download_truncated: graph::flag(p, "download_truncated"),
             extractor: graph::number(p, "extractor") as u32,
             title: graph::text(p, "title"),
+            // Read from its file by the fetcher (`Fetcher::load`); an entry written before the
+            // text had its own file holds it as `text`.
             text: graph::text(p, "text"),
             published: graph::opt_text(p, "published"),
             authors: graph::texts(p, "authors"),
@@ -126,7 +130,8 @@ impl Fetcher {
         self.dir.join("blobs").join(hash)
     }
 
-    /// The URL's entry; none while memory is away (a miss, fetched again).
+    /// The URL's entry with its text read whole from its file; none while memory is away or when
+    /// the text's file is gone (a miss, fetched again).
     async fn load(&self, url: &str) -> Option<Entry> {
         let rows = self
             .graph
@@ -134,7 +139,12 @@ impl Fetcher {
             .await
             .map_err(|error| tracing::info!("research cache: no lookup of {url}: {}", error.message))
             .ok()?;
-        let entry = Entry::from_props(&graph::props_of(rows.first()?.first()?));
+        let props = graph::props_of(rows.first()?.first()?);
+        let mut entry = Entry::from_props(&props);
+        let file = graph::text(&props, "text_file");
+        if !file.is_empty() {
+            entry.text = std::fs::read_to_string(self.dir.join(&file)).ok()?;
+        }
         (!entry.content_sha256.is_empty()).then_some(entry)
     }
 
@@ -144,9 +154,26 @@ impl Fetcher {
         Ok(())
     }
 
+    /// The entry's node properties, its text written to its file first (`blobs/<sha256>.txt`,
+    /// named by the node's `text_file`).
+    fn page_props(&self, entry: &Entry) -> Result<Map<String, Value>, String> {
+        let file = format!("blobs/{}.txt", sha256_hex(entry.text.as_bytes()));
+        write_atomic(&self.dir.join(&file), entry.text.as_bytes())?;
+        let mut props = entry.props();
+        props.insert("text_file".to_owned(), Value::String(file));
+        Ok(props)
+    }
+
     /// Write the entry to the graph in the background: when memory is away, once it serves.
     fn store_entry(&self, entry: &Entry) {
-        let (graph, key, props, url) = (self.graph.clone(), graph::fit_key(&entry.url), entry.props(), entry.url.clone());
+        let props = match self.page_props(entry) {
+            Ok(props) => props,
+            Err(error) => {
+                tracing::warn!("research cache: cannot keep the text of {}: {error}", entry.url);
+                return;
+            }
+        };
+        let (graph, key, url) = (self.graph.clone(), graph::fit_key(&entry.url), entry.url.clone());
         tokio::spawn(async move {
             let written = async {
                 let machine = graph.machine().await?;
@@ -202,7 +229,8 @@ impl Fetcher {
             let mut edges = Vec::new();
             for (_, entry) in &group {
                 let key = graph::fit_key(&entry.url);
-                nodes.push(node(PAGE, &key, entry.props()));
+                let props = self.page_props(entry).map_err(RpcError::internal)?;
+                nodes.push(node(PAGE, &key, props));
                 edges.push(edge(gref(PAGE, &key), "ON", machine.clone()));
             }
             self.graph.put(nodes, edges, PATIENT).await
@@ -237,14 +265,14 @@ impl Fetcher {
             && now_ms().saturating_sub(entry.fetched_ms) < ttl_ms
         {
             let entry = self.reextract(entry.clone()).await;
-            return Ok(result(&entry, &params, true, false, self.config().max_text_chars));
+            return Ok(result(&entry, &params, true, false));
         }
         match self.download(&url).await {
-            Ok(entry) => Ok(result(&entry, &params, false, false, self.config().max_text_chars)),
+            Ok(entry) => Ok(result(&entry, &params, false, false)),
             Err(error) => match (&error, cached) {
                 (FetchError::Net(net), Some(entry)) if net.is_unreachable() => {
                     let entry = self.reextract(entry).await;
-                    Ok(result(&entry, &params, true, true, self.config().max_text_chars))
+                    Ok(result(&entry, &params, true, true))
                 }
                 _ => Err(error.into_rpc(&url)),
             },
@@ -257,12 +285,11 @@ impl Fetcher {
             return entry;
         }
         let Ok(body) = std::fs::read(self.blob_path(&entry.content_sha256)) else { return entry };
-        let limit = self.config().max_text_chars;
         let (kind, final_url, content_type) = (entry.kind.clone(), entry.final_url.clone(), entry.content_type.clone());
         let extracted = tokio::task::spawn_blocking(move || run_extract(&kind, &body, &content_type, &final_url)).await;
         match extracted {
             Ok(Ok(extracted)) => {
-                let fresh = fill(entry.clone(), extracted, limit);
+                let fresh = fill(entry.clone(), extracted);
                 self.store_entry(&fresh);
                 fresh
             }
@@ -321,7 +348,6 @@ impl Fetcher {
                     pages: None,
                 },
                 extracted,
-                self.config().max_text_chars,
             );
             if let Err(error) = self.store(&entry, &body) {
                 tracing::warn!("research cache: cannot store {url}: {error}");
@@ -339,10 +365,9 @@ fn run_extract(kind: &str, body: &[u8], content_type: &str, url: &str) -> Result
     }
 }
 
-fn fill(mut entry: Entry, extracted: Extracted, max_chars: u64) -> Entry {
-    let (text, cut) = take_chars(&extracted.text, max_chars as usize);
-    entry.text = text.to_owned();
-    entry.download_truncated |= cut;
+/// The whole extracted text is kept: a reader takes what it needs with `offset` and `max_chars`.
+fn fill(mut entry: Entry, extracted: Extracted) -> Entry {
+    entry.text = extracted.text;
     entry.title = if extracted.title.is_empty() { entry.final_url.clone() } else { extracted.title };
     entry.published = extracted.published;
     entry.authors = extracted.authors;
@@ -352,10 +377,14 @@ fn fill(mut entry: Entry, extracted: Extracted, max_chars: u64) -> Entry {
     entry
 }
 
-fn result(entry: &Entry, params: &FetchParams, cached: bool, stale: bool, default_max: u64) -> FetchResult {
+/// Without `max_chars` the text from `offset` on is returned whole.
+fn result(entry: &Entry, params: &FetchParams, cached: bool, stale: bool) -> FetchResult {
     let total_chars = entry.text.chars().count() as u64;
     let rest = skip_chars(&entry.text, params.offset.unwrap_or(0) as usize);
-    let (text, cut) = take_chars(rest, params.max_chars.unwrap_or(default_max) as usize);
+    let (text, cut) = match params.max_chars {
+        Some(max) => take_chars(rest, max as usize),
+        None => (rest, false),
+    };
     FetchResult {
         url: entry.url.clone(),
         title: entry.title.clone(),

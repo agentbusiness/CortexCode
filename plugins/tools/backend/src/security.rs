@@ -501,7 +501,6 @@ static LINE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+)\s*
 /// from `first_line`.
 pub fn invisible_note(text: &str, first_line: usize) -> Option<String> {
     let mut spots: Vec<String> = Vec::new();
-    let mut total = 0usize;
     for (index, line) in text.lines().enumerate() {
         let names: Vec<String> = {
             let mut names: Vec<String> = Vec::new();
@@ -522,18 +521,14 @@ pub fn invisible_note(text: &str, first_line: usize) -> Option<String> {
         if names.is_empty() {
             continue;
         }
-        total += 1;
-        if spots.len() < 5 {
-            let number = LINE_NUMBER.captures(line).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(first_line + index);
-            spots.push(format!("line {number} ({})", names.join(", ")));
-        }
+        let number = LINE_NUMBER.captures(line).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(first_line + index);
+        spots.push(format!("line {number} ({})", names.join(", ")));
     }
     if spots.is_empty() {
         return None;
     }
-    let more = if total > spots.len() { format!(" and {} more lines", total - spots.len()) } else { String::new() };
     Some(format!(
-        "[invisible characters: {}{more}. Code with them can do something other than what it shows; check those lines before relying on them]",
+        "[invisible characters: {}. Code with them can do something other than what it shows; check those lines before relying on them]",
         spots.join(", ")
     ))
 }
@@ -1248,10 +1243,16 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
     // Details (severity, fixed versions) of the vulnerabilities of exact versions, and each name's
     // registry entry, asked at the same time.
     let mut tasks = tokio::task::JoinSet::new();
-    for (index, id) in details.into_iter().take(24) {
-        let client = client.clone();
+    // Every vulnerability is asked, at most OSV_AT_ONCE at a time: a package with hundreds of them
+    // would otherwise open hundreds of requests to OSV at once.
+    let osv = std::sync::Arc::new(tokio::sync::Semaphore::new(OSV_AT_ONCE));
+    for (index, id) in details {
+        let (client, osv) = (client.clone(), osv.clone());
         let package = verdicts[index].install.name.clone();
-        tasks.spawn(async move { Lookup::Vuln(index, vuln_detail(&client, &id, &package).await) });
+        tasks.spawn(async move {
+            let _turn = osv.acquire_owned().await;
+            Lookup::Vuln(index, vuln_detail(&client, &id, &package).await)
+        });
     }
     for (index, verdict) in verdicts.iter().enumerate() {
         if verdict.install.private || private_index.contains(&verdict.install.ecosystem) || !verdict.malware.is_empty() {
@@ -1276,6 +1277,9 @@ async fn direct(installs: &[Install], private_index: &[&'static str]) -> Checked
     Checked { verdicts, unchecked }
 }
 
+/// OSV detail requests running at one time (see [`Lookup::Vuln`]).
+const OSV_AT_ONCE: usize = 8;
+
 enum Lookup {
     Vuln(usize, Option<Vuln>),
     Fresh(usize, Option<Fresh>),
@@ -1288,7 +1292,7 @@ fn short_error(error: &reqwest::Error) -> String {
     } else if error.is_connect() {
         "no connection".to_owned()
     } else {
-        error.to_string().chars().take(120).collect()
+        error.to_string()
     }
 }
 
@@ -1514,16 +1518,14 @@ pub fn gate(checked: &Checked) -> Gate {
             let listed: Vec<String> = verdict
                 .vulns
                 .iter()
-                .take(5)
                 .map(|v| if v.kev { format!("{} ({}, exploited in the wild)", v.id, v.severity) } else { format!("{} ({})", v.id, v.severity) })
                 .collect();
-            let more = if verdict.vulns.len() > 5 { format!(" and {} more", verdict.vulns.len() - 5) } else { String::new() };
             let mut fixed: Vec<&str> = verdict.vulns.iter().flat_map(|v| v.fixed.iter().map(String::as_str)).collect();
             fixed.sort();
             fixed.dedup();
-            let fixed = if fixed.is_empty() { String::new() } else { format!("; fixed in {}", fixed.iter().take(4).copied().collect::<Vec<_>>().join(", ")) };
+            let fixed = if fixed.is_empty() { String::new() } else { format!("; fixed in {}", fixed.join(", ")) };
             notes.push(format!(
-                "[packages: {name}@{version} has known vulnerabilities: {}{more}{fixed}. Use a fixed version unless the project needs this one]",
+                "[packages: {name}@{version} has known vulnerabilities: {}{fixed}. Use a fixed version unless the project needs this one]",
                 listed.join(", ")
             ));
         }

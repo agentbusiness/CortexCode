@@ -24,8 +24,6 @@ use std::path::{Path, PathBuf};
 
 /// Purpose of the note that names the referenced projects to the run.
 pub const NOTE_PURPOSE: &str = "references";
-/// Locations shown for an ambiguous symbol; the rest are counted.
-pub const SYMBOL_MATCHES: usize = 3;
 
 /// A project to open: a known one (by id), or a folder memory does not know yet (empty id).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -47,8 +45,8 @@ pub struct NotOpened {
 /// Where a mentioned symbol is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Located {
-    /// The first [`SYMBOL_MATCHES`] matches and how many there are.
-    At(Vec<SymbolRef>, usize),
+    /// Every match (an ambiguous symbol: each location is one short line).
+    At(Vec<SymbolRef>),
     /// The project's graph is still being indexed.
     Pending,
     Missing,
@@ -151,16 +149,13 @@ pub fn note(ds: &Dataset, referenced: &[Referenced], not_opened: &[NotOpened]) -
         for (asked, located) in &project.symbols {
             let asked = asked.as_str();
             match located {
-                Located::At(matches, total) => {
+                Located::At(matches) => {
                     for symbol in matches {
                         let (start, end) = (symbol.start_line.to_string(), symbol.end_line.to_string());
                         item.push_str(&ds.text(
                             "reference_symbol",
                             &[("asked", asked), ("kind", &symbol.kind), ("qname", &symbol.qname), ("name", name), ("path", &symbol.path), ("start", &start), ("end", &end)],
                         ));
-                    }
-                    if *total > matches.len() {
-                        item.push_str(&ds.text("reference_symbol_more", &[("count", &(total - matches.len()).to_string()), ("name", name), ("asked", asked)]));
                     }
                 }
                 Located::Pending => item.push_str(&ds.text("reference_symbol_pending", &[("asked", asked), ("name", name)])),
@@ -188,10 +183,7 @@ async fn locate(host: &Host, project_id: &str, symbol: &str) -> Located {
     match host.ctx().call(memory_methods::SYMBOL, json!({"project_id": project_id, "name": symbol})).await {
         Ok(value) => match serde_json::from_value::<SymbolMatches>(value) {
             Ok(found) if found.matches.is_empty() => Located::Missing,
-            Ok(found) => {
-                let total = found.matches.len();
-                Located::At(found.matches.into_iter().take(SYMBOL_MATCHES).map(|detail| detail.symbol).collect(), total)
-            }
+            Ok(found) => Located::At(found.matches.into_iter().map(|detail| detail.symbol).collect()),
             Err(error) => Located::Failed(error.to_string()),
         },
         Err(error) if error.code == codes::NOT_FOUND => Located::Missing,

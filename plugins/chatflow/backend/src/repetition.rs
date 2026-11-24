@@ -163,7 +163,7 @@ impl Detector {
             let count = self.runs.entry(base.clone()).or_insert(0);
             *count += 1;
             if *count >= self.repeat_at {
-                return Verdict::Rerun(format!("`{}`", base.chars().take(300).collect::<String>()));
+                return Verdict::Rerun(format!("`{base}`"));
             }
             return Verdict::Fine;
         }
@@ -181,7 +181,7 @@ impl Detector {
             return Verdict::Fine;
         }
         self.read_corrected = true;
-        Verdict::Reread(format!("`{}`", signature.chars().take(300).collect::<String>()))
+        Verdict::Reread(format!("`{signature}`"))
     }
 
     /// Record one executed call and its output.
@@ -190,7 +190,7 @@ impl Detector {
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
         if *count >= self.repeat_at {
-            let what = format!("`{}`", signature.chars().take(300).collect::<String>());
+            let what = format!("`{signature}`");
             // This call was corrected before and repeats again: stop. Its first time: its
             // correction, and every count starts again.
             if self.corrected.contains(signature) {

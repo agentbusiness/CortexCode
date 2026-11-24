@@ -151,7 +151,7 @@ async fn run(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
         Ok(Ok(output)) => Err(format!(
             "{program} {} failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).lines().take(6).collect::<Vec<_>>().join(" | ")
+            String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
 }

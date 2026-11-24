@@ -246,11 +246,8 @@ pub fn failed_before(data: &Dataset, journal: &Journal, run_id: &str, report: &V
         if both.is_empty() {
             continue;
         }
-        const SHOWN: usize = 10;
-        let mut names = both.iter().take(SHOWN).map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
-        if both.len() > SHOWN {
-            names = data.text("failed_before_more", &[("names", &names), ("more", &(both.len() - SHOWN).to_string())]);
-        }
+        // Every name: they are short, and a name left out is a failure the work is sent to prove again.
+        let names = both.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
         let key = if this_run { "failed_before" } else { "failed_before_earlier" };
         lines.push_str(&data.text(key, &[("command", &spec.spec), ("count", &both.len().to_string()), ("of", &now.len().to_string()), ("names", &names)]));
     }

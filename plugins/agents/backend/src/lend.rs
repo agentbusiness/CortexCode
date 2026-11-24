@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
@@ -41,8 +41,6 @@ pub const RELAY_ARG: &str = "frontier-mcp";
 const MCP_OUTPUT_TOKENS: u64 = 1_000_000;
 /// The longest one MCP tool call may take before the CLI gives it up (Codex: 60 s unless set).
 const MCP_TOOL_SECONDS: u64 = 24 * 60 * 60;
-/// What of a CLI's error output is kept for the run's failure text.
-const STDERR_TAIL: usize = 4000;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
@@ -287,6 +285,10 @@ impl Lender {
                 // The message comes on stdin.
                 .arg("-");
         }
+        // Its error output goes to a file in the run's folder while it runs (a run may last a day:
+        // never held in memory), read once when the run fails.
+        let stderr_file = folder.join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_file).map_err(|error| RpcError::internal(format!("cannot make the run's error file: {error}")))?;
         command
             .current_dir(&folder)
             // The CLI is not this app's command: it gets no way into the frame.
@@ -294,12 +296,11 @@ impl Lender {
             .env_remove("CORTEX_FRAME_SOCKET")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| RpcError::new(codes::UNAVAILABLE, format!("cannot start {}: {error}", cli.display())))?;
         let mut stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| RpcError::internal("the CLI has no stdout"))?;
-        let stderr = tail_of(child.stderr.take());
 
         // The first message: Claude Code takes messages as JSON lines and stays open for more;
         // Codex takes this one as text and its input ends.
@@ -393,8 +394,8 @@ impl Lender {
             return Err(RpcError::new(codes::CANCELLED, "the caller went away"));
         }
         let status = child.wait().await.map_err(|error| RpcError::internal(format!("the CLI did not end cleanly: {error}")))?;
+        let error = if status.success() { String::new() } else { failure_of(&stderr_file) };
         drop(scratch);
-        let error = if status.success() { String::new() } else { stderr.await.unwrap_or_default() };
         Ok(RunResult { ok: status.success(), error })
     }
 }
@@ -407,28 +408,20 @@ async fn send_user(stdin: &mut tokio::process::ChildStdin, text: &str) -> Result
     stdin.flush().await.map_err(|error| RpcError::internal(format!("cannot send a message to the CLI: {error}")))
 }
 
-/// The end of a CLI's error output, read while it runs (so a full pipe never stops it).
-fn tail_of(stderr: Option<tokio::process::ChildStderr>) -> tokio::task::JoinHandle<String> {
-    tokio::spawn(async move {
-        let Some(mut stderr) = stderr else { return String::new() };
-        let mut kept: Vec<u8> = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    kept.extend_from_slice(&buffer[..read]);
-                    if kept.len() > STDERR_TAIL * 2 {
-                        kept.drain(..kept.len() - STDERR_TAIL);
-                    }
-                }
-            }
-        }
-        let text = String::from_utf8_lossy(&kept).into_owned();
-        let start = text.len().saturating_sub(STDERR_TAIL);
-        let start = (start..text.len()).find(|index| text.is_char_boundary(*index)).unwrap_or(text.len());
-        text[start..].trim().to_owned()
-    })
+/// A failed CLI's error output as its failure text (it goes back over the mesh, since the asking
+/// side cannot read a file kept here): its error lines, each whole with the lines under it; without
+/// any, its first and last line and how many lines are between them.
+fn failure_of(stderr_file: &Path) -> String {
+    let text = std::fs::read(stderr_file).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned()).unwrap_or_default();
+    let errors = crate::contract::error_lines(&text);
+    if !errors.trim().is_empty() {
+        return errors.trim_end().to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.as_slice() {
+        [] | [_] | [_, _] => lines.join("\n"),
+        [first, .., last] => format!("{first}\n[{} lines between]\n{last}", lines.len() - 2),
+    }
 }
 
 /// `cc-agents frontier-mcp <socket>`: the CLI's MCP server as a pipe. What the CLI writes goes to

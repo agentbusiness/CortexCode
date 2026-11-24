@@ -134,7 +134,8 @@ pub async fn security(method: &str, params: Value) -> Result<Value, RpcError> {
         }
         Ok(answer) if answer.is_object() => Ok(answer),
         _ => {
-            let error: String = String::from_utf8_lossy(&output.stderr).lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no answer").chars().take(300).collect();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error = if stderr.trim().is_empty() { "no answer" } else { stderr.trim() };
             Err(RpcError::internal(format!("the check failed: {error}")))
         }
     }

@@ -33,22 +33,17 @@ use std::path::{Path, PathBuf};
 
 /// The folder under `CORTEX_HOME` where attachment bytes are stored.
 pub const AREA: &str = "attachments";
-/// A folder's top-level listing: at most this many entries and characters reach the model.
-pub const LISTING_ENTRIES: usize = 60;
-pub const LISTING_CHARS: usize = 1500;
 /// Bytes read from an image to find its dimensions (a JPEG's frame header can follow a large EXIF
 /// block).
 const HEADER_BYTES: u64 = 1024 * 1024;
-/// Pasted text's preview for the model: this many lines from its head and from its tail, each cut
-/// at [`PREVIEW_LINE_CHARS`], all within [`PREVIEW_CHARS`] (about 1,000 tokens).
+/// Pasted text's preview for the model: this many whole lines from its head and from its tail, as
+/// many as fit in [`PREVIEW_CHARS`] (about 1,000 tokens), with the file's path and the range left
+/// out to read it.
 pub const PREVIEW_LINES: usize = 20;
-pub const PREVIEW_LINE_CHARS: usize = 200;
 pub const PREVIEW_CHARS: usize = 4000;
 /// Pasted text up to this size (bytes, about 6k tokens) reaches the model whole: a test run's
 /// output is evidence the turn works from, and a folded middle made the model stop to ask for it.
 pub const WHOLE_CHARS: usize = 24_000;
-/// A vision description longer than this is cut (the model reads the image's path for more).
-const DESCRIPTION_CHARS: usize = 4000;
 
 fn invalid(message: impl Into<String>) -> RpcError {
     RpcError::invalid_params(message.into())
@@ -336,29 +331,22 @@ pub async fn record(host: &Host, session_id: Option<&str>, put: &AttachmentPutRe
     graph::put_in_session(host, graph::node("Attachment", sha, graph::props(props)), rel, session_id, None).await
 }
 
-/// Pasted text's line count and its preview: the first and last [`PREVIEW_LINES`] lines (all of it
-/// when it is that short), long lines cut, the whole within [`PREVIEW_CHARS`].
-pub fn text_preview(ds: &Dataset, text: &str) -> (u64, String) {
+/// Pasted text's line count and its preview: all of it when it is short, else the first and last
+/// [`PREVIEW_LINES`] lines within [`PREVIEW_CHARS`], each line whole, and between them the lines
+/// left out with the file's `path` and range to read them.
+pub fn text_preview(ds: &Dataset, path: &str, text: &str) -> (u64, String) {
     let lines: Vec<&str> = text.lines().collect();
     if text.len() <= WHOLE_CHARS {
         return (lines.len() as u64, lines.join("\n"));
     }
-    let cut = |line: &str| -> String {
-        let count = line.chars().count();
-        if count <= PREVIEW_LINE_CHARS {
-            line.to_owned()
-        } else {
-            let kept: String = line.chars().take(PREVIEW_LINE_CHARS).collect();
-            format!("{kept}{}", ds.text("attachment_preview_cut", &[("count", &(count - PREVIEW_LINE_CHARS).to_string())]))
-        }
-    };
-    // Each half gets half the budget, so the tail is never squeezed out by long head lines.
+    // Each half gets half the budget, so the tail is never squeezed out by long head lines. A line
+    // is never cut: one that does not fit is left to the range to read.
     let half = PREVIEW_CHARS / 2;
     let take = |iter: &mut dyn Iterator<Item = &&str>| -> Vec<String> {
         let mut out = Vec::new();
         let mut used = 0;
         for line in iter.take(PREVIEW_LINES) {
-            let line = cut(line);
+            let line = (*line).to_owned();
             if used + line.len() + 1 > half {
                 break;
             }
@@ -374,8 +362,11 @@ pub fn text_preview(ds: &Dataset, text: &str) -> (u64, String) {
     let omitted = lines.len() - shown_head - tail.len();
     let mut preview = head.join("\n");
     if omitted > 0 {
-        preview.push('\n');
-        preview.push_str(&ds.text("attachment_preview_gap", &[("count", &omitted.to_string())]));
+        let (first, last) = (shown_head + 1, shown_head + omitted);
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str(&ds.text("attachment_preview_gap", &[("count", &omitted.to_string()), ("path", path), ("first", &first.to_string()), ("last", &last.to_string())]));
     }
     if !tail.is_empty() {
         preview.push('\n');
@@ -384,7 +375,7 @@ pub fn text_preview(ds: &Dataset, text: &str) -> (u64, String) {
     (lines.len() as u64, preview)
 }
 
-/// A folder's top-level entries, folders first, within [`LISTING_ENTRIES`] and [`LISTING_CHARS`].
+/// A folder's top-level entries, folders first, every one (each is one short line).
 pub fn listing(ds: &Dataset, dir: &Path) -> String {
     let Ok(read) = std::fs::read_dir(dir) else { return ds.text("attachment_listing_unreadable", &[]) };
     let mut folders = Vec::new();
@@ -399,26 +390,10 @@ pub fn listing(ds: &Dataset, dir: &Path) -> String {
     }
     folders.sort();
     files.sort();
-    let total = folders.len() + files.len();
-    if total == 0 {
+    if folders.is_empty() && files.is_empty() {
         return ds.text("attachment_listing_empty", &[]);
     }
-    let mut out = Vec::new();
-    let mut chars = 0;
-    for line in folders.into_iter().chain(files) {
-        if out.len() >= LISTING_ENTRIES || chars + line.len() + 1 > LISTING_CHARS {
-            break;
-        }
-        chars += line.len() + 1;
-        out.push(line);
-    }
-    let shown = out.len();
-    let mut text = out.join("\n");
-    if shown < total {
-        text.push('\n');
-        text.push_str(&ds.text("attachment_listing_more", &[("count", &(total - shown).to_string())]));
-    }
-    text
+    folders.into_iter().chain(files).collect::<Vec<_>>().join("\n")
 }
 
 /// The vision hook. The main model cannot see; a `vision` plugin (being designed) will serve
@@ -444,7 +419,7 @@ pub mod vision_hook {
                     return None;
                 }
                 let by = answer.get("model").and_then(Value::as_str).filter(|by| !by.is_empty()).unwrap_or("vision").to_owned();
-                Some((text.chars().take(DESCRIPTION_CHARS).collect(), by))
+                Some((text.to_owned(), by))
             }
             Err(error) => {
                 if error.code != codes::UNAVAILABLE && error.code != codes::UNKNOWN_METHOD {
@@ -499,7 +474,7 @@ pub fn check(ds: &Dataset, attachments: Vec<Attachment>) -> Result<Vec<Attachmen
                         return Err(too_big(&attachment.name, metadata.len(), "pasted text"));
                     }
                     let bytes = std::fs::read(&path).map_err(|error| invalid(format!("{} cannot be read: {error}", attachment.path)))?;
-                    let (lines, preview) = text_preview(ds, &String::from_utf8_lossy(&bytes));
+                    let (lines, preview) = text_preview(ds, &attachment.path, &String::from_utf8_lossy(&bytes));
                     attachment.lines = Some(lines);
                     attachment.preview = Some(preview);
                 }

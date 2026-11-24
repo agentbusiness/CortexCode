@@ -1141,10 +1141,10 @@ impl Run<'_> {
     async fn assistant_message(&mut self, text: &str) -> Result<(), RpcError> {
         self.journal.append(kinds::ASSISTANT_MESSAGE, json!({"text": text, "run_id": self.run_id})).await?;
         if let Some(lead) = &self.lead {
-            let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect();
+            // The message whole, as the agent wrote it.
             let _ = self
                 .host
-                .journal_append(lead, kinds::NOTE, json!({"text": format!("{}: {line}", self.agent), "purpose": "agent_progress", "host_message": false, "agent": self.agent, "task_id": self.job.task_id()}))
+                .journal_append(lead, kinds::NOTE, json!({"text": format!("{}: {}", self.agent, text.trim()), "purpose": "agent_progress", "host_message": false, "agent": self.agent, "task_id": self.job.task_id()}))
                 .await;
         }
         Ok(())

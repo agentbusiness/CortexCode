@@ -150,6 +150,26 @@ pub fn inline_view(bytes: &[u8], id: &str, limits: InlineLimits) -> String {
     out
 }
 
+/// Model-facing view of output too large to hold whole: its first bytes (`head`) and its last
+/// (`tail`), cut at line boundaries, with the marker naming the lines between them to read.
+/// `newlines` counts the whole output's lines.
+pub fn ends_view(head: &[u8], tail: &[u8], newlines: u64, id: &str, limits: InlineLimits) -> String {
+    let head_text = String::from_utf8_lossy(&head[..head.len().min(limits.head)]).into_owned();
+    let tail_start = tail.len().saturating_sub(limits.tail);
+    let tail_text = String::from_utf8_lossy(&tail[tail_start..]).into_owned();
+    let head_cut = head_text.rfind('\n').map(|index| index + 1).unwrap_or(head_text.len());
+    let tail_cut = tail_text.find('\n').map(|index| index + 1).unwrap_or(0);
+    let (head, tail) = (&head_text[..head_cut], &tail_text[tail_cut..]);
+    let head_lines = head.lines().count();
+    let omitted = (newlines as usize).saturating_sub(head_lines + tail.lines().count());
+    format!("{head}{}{tail}", omitted_marker(id, head_lines, omitted))
+}
+
+/// The lines of `bytes`: its newlines, and one more for a last line without one.
+pub fn line_count(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|b| **b == b'\n').count() as u64 + u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+}
+
 /// The line that stands for output left out of a result: how many lines, and one concrete range
 /// of them to read (at most 200 lines from the first one left out).
 pub fn omitted_marker(id: &str, head_lines: usize, omitted_lines: usize) -> String {

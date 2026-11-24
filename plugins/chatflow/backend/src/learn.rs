@@ -3,11 +3,13 @@
 //! ROUTE (`recall`) and right under a failure they were learned from (`at_failure`), and scored by
 //! what the run shows about them.
 //!
-//! - **Episodes, cut by the host** from the run's journal, no model call: a refused tool call and
+//! - **Episodes, found by the host** in the run's journal, no model call: a refused tool call and
 //!   the next call of that tool that worked; a command failing the same way twice and the
 //!   different call that worked; a failing command that passed again after edits; an attempt
-//!   that ended done and was reported wrong, fixed by this run; a steer. Each is a short card in
-//!   host words (`learn_*` texts): never the conversation.
+//!   that ended done and was reported wrong, fixed by this run; a steer. Each is a card in host
+//!   words (`learn_*` texts) holding its evidence whole: never the conversation. A long output
+//!   shows its failing part whole (the failing tests, else the error lines) with a pointer to the
+//!   whole output. Every episode of a run is learned from.
 //! - **One LEARN call per episode** (`prompts/learn.md`, `schemas/learn.json`): useful or not, an
 //!   anchor from the episode's own tools and languages, a kind, one sentence. It runs at idle
 //!   priority (`model.chat` `idle_only`): only while the model serves nothing else, in a free slot,
@@ -52,23 +54,8 @@ use tokio_util::sync::CancellationToken;
 const CACHE_KEY: &str = "learn";
 /// Placeholder of LEARN's `anchor` enum (the episode's tools, its languages, `approach`).
 const ANCHORS_PLACEHOLDER: &str = "@anchors";
-/// Characters of one failure's gist, of the edits shown, and of a message, in a card.
-const GIST_CHARS: usize = 600;
-const EDITS_CHARS: usize = 1500;
-const MESSAGE_CHARS: usize = 900;
-
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
     data.get(field).and_then(Value::as_str).unwrap_or("")
-}
-
-fn cut(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 enum Job {
@@ -269,8 +256,8 @@ struct Step {
 
 impl Step {
     /// The call as the model made it: its stated intent, then what it asked for (a command, a
-    /// path and range, each edit's operation, anchors and first line of text), so two calls can be
-    /// told apart by what differs between them.
+    /// path and range, each edit's operation, anchors and text), so two calls can be told apart by
+    /// what differs between them.
     fn call(&self, workspace: &str) -> String {
         let field = |name: &str| str_field(&self.args, name).to_owned();
         let intent = field("intent");
@@ -284,50 +271,54 @@ impl Step {
                 let mut parts: Vec<String> = Vec::new();
                 for edit in self.args.get("edits").and_then(Value::as_array).cloned().unwrap_or_default() {
                     let text = str_field(&edit, "text");
-                    let lines = text.lines().count();
-                    let first = cut(text.lines().next().unwrap_or(""), 80);
                     let to = str_field(&edit, "to");
                     let span = if to.is_empty() { str_field(&edit, "at").to_owned() } else { format!("{} to {to}", str_field(&edit, "at")) };
-                    parts.push(format!("{} at {span}, {lines} line(s) of text starting `{first}`", str_field(&edit, "op")));
+                    if text.is_empty() {
+                        parts.push(format!("{} at {span}", str_field(&edit, "op")));
+                    } else {
+                        parts.push(format!("{} at {span} with:\n{}", str_field(&edit, "op"), text.trim_end()));
+                    }
                 }
                 if let Some(content) = self.args.get("content").and_then(Value::as_str).filter(|content| !content.is_empty()) {
-                    parts.push(format!("the whole file as `content`, {} line(s)", content.lines().count()));
+                    parts.push(format!("the whole file as `content`:\n{}", content.trim_end()));
                 }
                 format!("edit {}: {}", field("path"), parts.join("; "))
             }
             _ => format!("{} {}", self.tool, self.args),
         };
         let text = if intent.is_empty() { asked } else { format!("{asked} (intent: {intent})") };
-        cut(&local(&text, workspace), 500)
+        local(text.trim(), workspace)
     }
 
     /// A refusal's text whole (the tool says what rule the call broke and what to send instead).
     fn refusal(&self, workspace: &str) -> String {
-        let lines: Vec<&str> = self.output.lines().filter(|line| !line.trim().is_empty()).take(10).collect();
-        cut(&local(&lines.join("\n"), workspace), 900)
+        let lines: Vec<&str> = self.output.lines().filter(|line| !line.trim().is_empty()).collect();
+        local(&lines.join("\n"), workspace)
     }
 
-    /// The output's head and tail: where an error says what it is.
-    fn gist(&self, workspace: &str) -> String {
-        let lines: Vec<&str> = self.output.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
-        let mut picked: Vec<&str> = lines.iter().take(4).copied().collect();
-        for line in lines.iter().skip(4).rev().take(2).rev() {
-            if !picked.contains(line) {
-                picked.push(line);
-            }
-        }
-        let text: Vec<String> = picked.iter().map(|line| cut(line, 200)).collect();
-        cut(&local(&text.join("\n"), workspace), GIST_CHARS)
+    /// A failing output as evidence: whole when the tools plugin returned it whole; else (it kept
+    /// the whole as an artifact and showed head and tail) what the failure is, whole, with the
+    /// pointer to the rest: a test run's failing tests, any other output's errors (seen: a log shown
+    /// head and tail, where the model stopped to ask for the rest).
+    async fn evidence(&self, host: &Host, workspace: &str) -> String {
+        local(&failing_part(host, &self.output).await, workspace)
     }
 
-    /// The first line of the gist: what two failures must share to be the same failure.
+    /// The output's first line: what two failures must share to be the same failure.
     fn signature(&self, workspace: &str) -> String {
-        self.gist(workspace).lines().next().unwrap_or("").to_owned()
+        let first = self.output.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+        local(first, workspace)
     }
 
     fn command(&self) -> &str {
         str_field(&self.args, "command").trim()
     }
+}
+
+/// What a failing command's output says, as [`Step::evidence`] shows it: the same view a failed
+/// check gets ([`crate::contract::presented`]).
+async fn failing_part(host: &Host, output: &str) -> String {
+    crate::contract::presented(host, output.trim()).await
 }
 
 /// Paths under the workspace written relative to it.
@@ -368,18 +359,15 @@ fn steps(entries: &[JournalEntry], run_id: &str) -> Vec<Step> {
         .collect()
 }
 
-/// The edits made between two steps, as their diffs (cut short), or the files they changed.
+/// The edits made between two steps, each as its whole diff, or the files it changed.
 fn edits_between(steps: &[Step], from: usize, to: usize, workspace: &str) -> String {
     let mut out = String::new();
     for step in steps.iter().take(to).skip(from + 1).filter(|step| step.tool == "edit" && step.ok) {
         let piece = if step.diff.is_empty() { format!("edited {}", step.changed.join(", ")) } else { step.diff.clone() };
         out.push_str(&local(&piece, workspace));
         out.push('\n');
-        if out.chars().count() > EDITS_CHARS {
-            break;
-        }
     }
-    cut(&out, EDITS_CHARS)
+    out.trim().to_owned()
 }
 
 /// One episode: its card body, the tools it involves, and the key of the failure it is about.
@@ -390,18 +378,18 @@ struct Episode {
     key: Option<String>,
 }
 
-/// Reconstruct only one selected episode for synthesis. Raw journal bytes remain in the journal.
-pub(crate) fn procedure_card(data: &Dataset, entries: &[JournalEntry], run: &str, workspace: &str, evidence: &str) -> Option<String> {
+/// Reconstruct only one selected episode for synthesis, whole. Raw journal bytes remain in the
+/// journal.
+pub(crate) async fn procedure_card(host: &Host, data: &Dataset, entries: &[JournalEntry], run: &str, workspace: &str, evidence: &str) -> Option<String> {
     if crate::replay::arm(entries).is_some() { return None; }
     let seq = evidence.rsplit_once('/')?.1.parse::<u64>().ok()?;
-    episodes(data, entries, run, workspace, data.limits.learn_episodes_per_run)
+    episodes(host, data, entries, run, workspace).await
         .into_iter().find(|episode| episode.evidence == seq)
-        .map(|episode| episode.body.chars().take(1800).collect())
+        .map(|episode| episode.body)
 }
 
-/// The run's episodes, the ones about reported failures and the user's words first, at most
-/// `max`.
-fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &str, max: usize) -> Vec<Episode> {
+/// Every episode of the run: the ones about reported failures and the user's words first.
+async fn episodes(host: &Host, data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &str) -> Vec<Episode> {
     let steps = steps(entries, run_id);
     let mut out: Vec<Episode> = Vec::new();
     let run: Vec<&JournalEntry> = entries.iter().filter(|entry| str_field(&entry.data, "run_id") == run_id).collect();
@@ -418,12 +406,12 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
             .iter()
             .rev()
             .find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && entry.data.get("streaming").and_then(Value::as_bool) != Some(true) && !str_field(&entry.data, "text").trim().is_empty())
-            .map(|entry| cut(str_field(&entry.data, "text"), MESSAGE_CHARS))
+            .map(|entry| str_field(&entry.data, "text").trim().to_owned())
             .unwrap_or_default();
         let body = data.text(
             "learn_retry",
             &[
-                ("message", &cut(&local(str_field(&message.data, "text"), workspace), MESSAGE_CHARS)),
+                ("message", &local(str_field(&message.data, "text").trim(), workspace)),
                 ("found", &local(&found, workspace)),
                 ("edits", &edits_between(&steps, 0, steps.len(), workspace)),
             ],
@@ -431,13 +419,17 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
         out.push(Episode { body, tools: vec!["edit".into()], evidence: message.seq, key: None });
     }
 
-    // A steer: what the user said while the work ran, between the steps around it.
+    // A steer: what the user said while the work ran, between the steps it answers (those since the
+    // user's message before it) and the steps it led to (those up to the user's next message).
+    let messages: Vec<u64> = run.iter().filter(|entry| entry.kind == kinds::USER_MESSAGE).map(|entry| entry.seq).collect();
     for steer in run.iter().filter(|entry| entry.kind == kinds::USER_MESSAGE && entry.data.get("from_steer").is_some()) {
-        let before: Vec<String> = steps.iter().filter(|step| step.seq < steer.seq).rev().take(2).map(|step| step.call(workspace)).collect();
-        let after: Vec<String> = steps.iter().filter(|step| step.seq > steer.seq).take(2).map(|step| step.call(workspace)).collect();
+        let since = messages.iter().copied().filter(|seq| *seq < steer.seq).max().unwrap_or(0);
+        let until = messages.iter().copied().filter(|seq| *seq > steer.seq).min().unwrap_or(u64::MAX);
+        let before: Vec<String> = steps.iter().filter(|step| step.seq > since && step.seq < steer.seq).map(|step| step.call(workspace)).collect();
+        let after: Vec<String> = steps.iter().filter(|step| step.seq > steer.seq && step.seq < until).map(|step| step.call(workspace)).collect();
         let body = data.text(
             "learn_steer",
-            &[("message", &cut(str_field(&steer.data, "text"), MESSAGE_CHARS)), ("before", &before.join("; ")), ("after", &after.join("; "))],
+            &[("message", str_field(&steer.data, "text").trim()), ("before", &before.join("\n")), ("after", &after.join("\n"))],
         );
         out.push(Episode { body, tools: Vec::new(), evidence: steer.seq, key: None });
     }
@@ -453,7 +445,7 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
         // The call that did what the refused one meant: the same tool on the same path when there is
         // one (an edit sent again), else the next call of the tool that worked.
         let path = str_field(&step.args, "path");
-        let next: Vec<&Step> = steps.iter().skip(index + 1).take(8).filter(|next| next.tool == step.tool && next.ok).collect();
+        let next: Vec<&Step> = steps.iter().skip(index + 1).filter(|next| next.tool == step.tool && next.ok).collect();
         if let Some(fix) = next.iter().find(|next| !path.is_empty() && str_field(&next.args, "path") == path).or(next.first()) {
             let body = data.text(
                 "learn_refused",
@@ -485,7 +477,7 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
                 seen_commands.insert(step.command().to_owned());
                 let body = data.text(
                     "learn_repeated",
-                    &[("times", &same.len().to_string()), ("command", &step.call(workspace)), ("error", &step.gist(workspace)), ("fix", &fix.call(workspace))],
+                    &[("times", &same.len().to_string()), ("command", &step.call(workspace)), ("error", &step.evidence(host, workspace).await), ("fix", &fix.call(workspace))],
                 );
                 out.push(Episode { body, tools: vec!["run".into()], evidence: step.seq, key: failure_key("run", "", &step.output) });
                 continue;
@@ -495,12 +487,11 @@ fn episodes(data: &Dataset, entries: &[JournalEntry], run_id: &str, workspace: &
             let edits = edits_between(&steps, index, at, workspace);
             if !edits.is_empty() {
                 seen_commands.insert(step.command().to_owned());
-                let body = data.text("learn_red_green", &[("command", &step.call(workspace)), ("error", &step.gist(workspace)), ("edits", &edits)]);
+                let body = data.text("learn_red_green", &[("command", &step.call(workspace)), ("error", &step.evidence(host, workspace).await), ("edits", &edits)]);
                 out.push(Episode { body, tools: vec!["run".into(), "edit".into()], evidence: step.seq, key: failure_key("run", "", &step.output) });
             }
         }
     }
-    out.truncate(max);
     out
 }
 
@@ -637,10 +628,13 @@ async fn distill(host: &Host, data: &Dataset, card: &str, anchors: &[String], ca
         "priority": "background",
         "idle_only": true,
         "cache_key": CACHE_KEY,
-        "max_tokens": 400,
     });
     let value = crate::llm::on_best_model(host, CACHE_KEY, Some(cancel), host.call_with(model_methods::CHAT, params, crate::host::Effect::Idempotent, Some(cancel))).await?;
     let result: ChatResult = cc_protocol::parse_params(value)?;
+    // An answer the model could not finish is no lesson.
+    if result.finish_reason == "length" {
+        return Ok(None);
+    }
     let Ok(learned) = schemas::parse_json::<Learned>(&result.content) else { return Ok(None) };
     let lesson = learned.lesson.split_whitespace().collect::<Vec<_>>().join(" ");
     if learned.useful != "yes" || lesson.is_empty() || !anchors.contains(&learned.anchor) {
@@ -674,7 +668,7 @@ async fn learn_marked(host: &Host, data: &Dataset, session_id: &str, run_id: &st
     let root = host.project_get(&session.project_id).await.map(|project| project.root).unwrap_or_else(|_| session.workspace.clone());
     let scope = Scope { project_id: session.project_id.clone(), workspace: session.workspace.clone(), root };
     let workspace = session.workspace.trim_end_matches('/').to_owned();
-    let found = episodes(data, &entries, run_id, &workspace, data.limits.learn_episodes_per_run);
+    let found = episodes(host, data, &entries, run_id, &workspace).await;
     tracing::info!(session = %session_id, run = %run_id, episodes = found.len(), "learning a run");
     let done = ended_done(&entries, run_id);
     let run_steps = steps(&entries, run_id);
@@ -699,8 +693,18 @@ async fn learn_marked(host: &Host, data: &Dataset, session_id: &str, run_id: &st
             anchors.extend(languages.iter().map(|language| format!("lang:{language}")));
             anchors.push("approach".to_owned());
             let card = data.text("learn_card", &[("languages", &if languages.is_empty() { "unknown".to_owned() } else { languages.join(", ") }), ("outcome", &outcome), ("body", &episode.body)]);
-            let Some((anchor, lesson)) = distill(host, data, &card, &anchors, cancel).await? else {
-                tracing::info!(episode = %cut(&episode.body, 160), "an episode taught nothing");
+            // One episode the model could not take (a card longer than its window) is skipped: failing
+            // the run would take it up again every pass and fail it the same way.
+            let distilled = match distill(host, data, &card, &anchors, cancel).await {
+                Ok(distilled) => distilled,
+                Err(error) if error.code == cc_protocol::codes::CANCELLED => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, evidence = episode.evidence, "an episode could not be learned; skipped");
+                    None
+                }
+            };
+            let Some((anchor, lesson)) = distilled else {
+                tracing::info!(evidence = episode.evidence, "an episode taught nothing");
                 continue;
             };
             let evidence = format!("journal://{session_id}/{}", episode.evidence);
@@ -964,11 +968,14 @@ async fn recheck(host: &Host, data: &Dataset, cancel: &CancellationToken) -> Res
             "priority": "background",
             "idle_only": true,
             "cache_key": CACHE_KEY,
-            "max_tokens": 400,
         });
         let value = crate::llm::on_best_model(host, CACHE_KEY, Some(cancel), host.call_with(model_methods::CHAT, params, crate::host::Effect::Idempotent, Some(cancel))).await?;
         let result: ChatResult = cc_protocol::parse_params(value)?;
-        // Only a judgement that reads as one counts: an unreadable answer is asked again next pass.
+        // Only a judgement that reads as one counts: an unfinished or unreadable answer is asked
+        // again next pass.
+        if result.finish_reason == "length" {
+            continue;
+        }
         let Ok(judged) = schemas::parse_json::<Learned>(&result.content) else { continue };
         let useful = judged.useful.trim().to_owned();
         if useful == "no" {

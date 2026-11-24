@@ -12,8 +12,6 @@ pub struct Config {
     pub timeout_ms: u64,
     /// Most bytes downloaded per fetch (the rest is cut, `truncated`).
     pub max_download_bytes: u64,
-    /// Most characters of extracted text kept per document.
-    pub max_text_chars: u64,
     /// A cached fetch is fresh this long.
     pub cache_ttl_hours: u64,
     /// Let `research.fetch` reach loopback, private and link-local addresses (off: a model-chosen URL
@@ -42,10 +40,8 @@ pub struct Config {
     /// Characters of a source's text per model call (map step); a 32k-token context holds the
     /// prompt, one chunk and the answer.
     pub chunk_chars: u64,
-    pub max_chunks_per_source: u32,
     /// Characters of notes per synthesis call (reduce step); more are condensed in batches first.
     pub synth_chars: u64,
-    pub model_max_tokens: u32,
     /// `foreground` | `agent` | `background`.
     pub model_priority: String,
 }
@@ -56,7 +52,6 @@ impl Default for Config {
             user_agent: "CortexCode-research/0.1 (local research assistant; macOS)".into(),
             timeout_ms: 20_000,
             max_download_bytes: 25 * 1024 * 1024,
-            max_text_chars: 400_000,
             cache_ttl_hours: 168,
             allow_private_hosts: false,
             web_search: "auto".into(),
@@ -74,9 +69,7 @@ impl Default for Config {
             deep_sources_per_round: 8,
             deep_results_per_query: 4,
             chunk_chars: 12_000,
-            max_chunks_per_source: 6,
             synth_chars: 48_000,
-            model_max_tokens: 2_048,
             model_priority: "agent".into(),
         }
     }
@@ -104,7 +97,6 @@ impl Config {
         text("user_agent", &mut config.user_agent);
         number("timeout_ms", &mut config.timeout_ms);
         number("max_download_bytes", &mut config.max_download_bytes);
-        number("max_text_chars", &mut config.max_text_chars);
         number("cache_ttl_hours", &mut config.cache_ttl_hours);
         if let Some(found) = map.get("allow_private_hosts").and_then(Value::as_bool) {
             config.allow_private_hosts = found;
@@ -124,13 +116,10 @@ impl Config {
         small("deep_sources_per_round", &mut config.deep_sources_per_round);
         small("deep_results_per_query", &mut config.deep_results_per_query);
         number("chunk_chars", &mut config.chunk_chars);
-        small("max_chunks_per_source", &mut config.max_chunks_per_source);
         number("synth_chars", &mut config.synth_chars);
-        small("model_max_tokens", &mut config.model_max_tokens);
         text("model_priority", &mut config.model_priority);
         config.chunk_chars = config.chunk_chars.max(1_000);
         config.synth_chars = config.synth_chars.max(4_000);
-        config.max_chunks_per_source = config.max_chunks_per_source.max(1);
         config.deep_sources_per_round = config.deep_sources_per_round.max(1);
         config.deep_results_per_query = config.deep_results_per_query.clamp(1, 25);
         config

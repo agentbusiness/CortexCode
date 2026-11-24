@@ -271,25 +271,46 @@ fn exit_file(dir: &Path) -> PathBuf {
     dir.join("status").join("exit")
 }
 
-fn tail_of(artifacts: &crate::artifacts::Artifacts, id: &str, bytes: u64) -> String {
+/// A job's output as the model reads it, the whole of it staying the artifact: for a test run
+/// with failures, its failing tests whole (see [`crate::testout`]); else the whole output when it
+/// is short, and past that its start and its end with the range of the lines between them to read.
+fn output_view(artifacts: &crate::artifacts::Artifacts, id: &str) -> String {
+    let limits = crate::artifacts::InlineLimits::default();
     let Ok(mut file) = artifacts.open(id) else { return String::new() };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    let start = len.saturating_sub(bytes);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return String::new();
-    }
-    let mut buffer = Vec::new();
-    let _ = file.take(len - start).read_to_end(&mut buffer);
-    let text = String::from_utf8_lossy(&buffer).into_owned();
-    if start > 0 {
-        // Start at a line boundary.
-        match text.find('\n') {
-            Some(newline) if newline + 1 < text.len() => text[newline + 1..].to_owned(),
-            _ => text,
+    if len <= crate::exec::TEST_VIEW_BYTES {
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return String::new();
         }
-    } else {
-        text
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(view) = crate::testout::present(&text, limits.inline, || Some(id.to_owned())) {
+            return format!("{view}\nThe whole output: read artifact://{id}\n");
+        }
+        if bytes.len() <= limits.inline {
+            return text.into_owned();
+        }
+        return crate::artifacts::inline_view(&bytes, id, limits);
     }
+    // Too long to hold: its lines counted in one pass, its start and end read.
+    let mut newlines = 0u64;
+    let mut chunk = vec![0u8; OUTPUT_CHUNK as usize];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => newlines += chunk[..read].iter().filter(|byte| **byte == b'\n').count() as u64,
+        }
+    }
+    let mut part = |from: u64, bytes: u64| -> Vec<u8> {
+        let mut buffer = Vec::new();
+        if file.seek(SeekFrom::Start(from)).is_ok() {
+            let _ = (&mut file).take(bytes).read_to_end(&mut buffer);
+        }
+        buffer
+    };
+    let head = part(0, limits.head as u64);
+    let tail = part(len.saturating_sub(limits.tail as u64), limits.tail as u64);
+    crate::artifacts::ends_view(&head, &tail, newlines, id, limits)
 }
 
 impl Jobs {
@@ -659,7 +680,7 @@ impl Jobs {
                                 "reason": "match",
                                 "matched": line,
                                 "artifact": meta.artifact,
-                                "output_tail": tail_of(&self.artifacts, &meta.artifact, 2048),
+                                "output_tail": output_view(&self.artifacts, &meta.artifact),
                             }));
                         }
                     }
@@ -740,7 +761,7 @@ impl Jobs {
                         "exit_code": meta.exit_code,
                         "reason": "exit",
                         "artifact": meta.artifact,
-                        "output_tail": tail_of(&self.artifacts, &meta.artifact, 4096),
+                        "output_tail": output_view(&self.artifacts, &meta.artifact),
                     }));
                 }
                 if let Ok(mut monitored) = self.monitored.lock() {
@@ -762,7 +783,7 @@ impl Jobs {
                     "reason": "silence",
                     "silent_s": limit.as_secs_f64(),
                     "artifact": meta.artifact,
-                    "output_tail": tail_of(&self.artifacts, &meta.artifact, 2048),
+                    "output_tail": output_view(&self.artifacts, &meta.artifact),
                 }));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -788,8 +809,8 @@ impl Jobs {
 
     pub fn status(&self, job_id: &str) -> Option<(JobMeta, String)> {
         let meta = self.meta(job_id)?;
-        let tail = tail_of(&self.artifacts, &meta.artifact, 4096);
-        Some((meta, tail))
+        let output = output_view(&self.artifacts, &meta.artifact);
+        Some((meta, output))
     }
 
     pub async fn kill(&self, job_id: &str) -> Option<JobMeta> {

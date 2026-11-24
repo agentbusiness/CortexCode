@@ -1038,7 +1038,7 @@ impl Sentinel {
         let mut verdicts = Vec::new();
         for item in p.items {
             let mut facts = vec![format!("Event: {}", item.title), format!("Kind: {}", item.kind)];
-            facts.extend(item.facts.iter().map(|f| f.chars().take(400).collect::<String>()));
+            facts.extend(item.facts.iter().cloned());
             let (decision, reason) = triage::ask(ctx, &system, &card, &facts, &["dismiss", "hardening", "alert", "investigate"]).await?;
             let decision = if decision == "hardening" { "note".to_owned() } else { decision };
             verdicts.push(JudgeVerdict { id: item.id, decision, reason });

@@ -1362,7 +1362,8 @@ async fn asks_reach_plan(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcE
 }
 
 /// The plan's progress for the user (a transcript note, no model call): the running task, the
-/// done ones, the session's running background jobs with the end of their output. The model hears
+/// done ones, the session's running background jobs with what their output says now (its whole
+/// tail as the tools plugin keeps it). The model hears
 /// that the user has it and goes on with the task.
 async fn answer_progress(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan, n: u32) -> Result<(), RpcError> {
     let title = plan.tasks.get(n as usize - 1).map(|task| task.title.clone()).unwrap_or_default();
@@ -1379,8 +1380,7 @@ async fn answer_progress(env: &RunEnv, journal: &mut Journal, plan: &plan::Plan,
             .iter()
             .filter(|job| job.state == "running")
             .map(|job| {
-                let tail = job.output_tail.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
-                env.data.text("progress_job", &[("job_id", &job.job_id), ("tail", tail)])
+                env.data.text("progress_job", &[("job_id", &job.job_id), ("tail", job.output_tail.trim())])
             })
             .collect(),
         Err(_) => String::new(),
@@ -2126,7 +2126,7 @@ async fn write_plan(env: &RunEnv, journal: &mut Journal, mode: PlanMode) -> Resu
                 .filter(|step| step.outcome == "done" && !step.summary.trim().is_empty())
                 .map(|step| {
                     let title = plan.tasks.get(step.n as usize - 1).map(|task| task.title.as_str()).unwrap_or("");
-                    let summary: String = step.summary.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(REPORT_CHARS).collect();
+                    let summary: String = step.summary.split_whitespace().collect::<Vec<_>>().join(" ");
                     env.data.text("plan_done_report", &[("n", &step.n.to_string()), ("title", title), ("summary", &summary)])
                 })
                 .collect();
@@ -3121,7 +3121,14 @@ async fn knowledge_note(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcEr
     if limit > 0
         && let Ok(found) = env.host.get::<KnowledgeSearchResult>(memory_methods::KNOWLEDGE_SEARCH, json!({"project_id": env.scope.project_id, "text": work, "limit": limit})).await
     {
-        let lines: Vec<String> = found.items.iter().filter(|item| !item.text.trim().is_empty() && !env.prefix.system.contains(item.text.trim())).map(knowledge_line).collect();
+        // The contract's short copy is the system prompt's, never a note (a session whose prompt
+        // shows the whole file would get the copy again on top of it).
+        let lines: Vec<String> = found
+            .items
+            .iter()
+            .filter(|item| item.kind != cc_protocol::contracts::memory::knowledge::CONTRACT && !item.text.trim().is_empty() && !env.prefix.system.contains(item.text.trim()))
+            .map(knowledge_line)
+            .collect();
         if !lines.is_empty() {
             parts.push(env.data.text("knowledge_note", &[("text", &lines.join("\n"))]));
         }
@@ -3165,8 +3172,9 @@ async fn knowledge_note(env: &RunEnv, journal: &mut Journal) -> Result<(), RpcEr
 /// The code names a turn saw: the route's symbols and files, the host's symbol, outline and file
 /// reads, and the model's own `read` and `edit` paths (never URIs). What a KNOWLEDGE item may bind
 /// to: the host narrows the choice to code the turn actually looked at, so an item never names code
-/// nobody saw. In journal order, each once, at most `max`.
-pub(crate) fn turn_binds(entries: &[JournalEntry], run_id: &str, route_seq: u64, max: usize) -> Vec<String> {
+/// nobody saw. In journal order, each once, all of them: they are short names, and one left out is
+/// code an item cannot bind to.
+pub(crate) fn turn_binds(entries: &[JournalEntry], run_id: &str, route_seq: u64) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: &str| {
         let name = name.trim();
@@ -3193,7 +3201,6 @@ pub(crate) fn turn_binds(entries: &[JournalEntry], run_id: &str, route_seq: u64,
             _ => {}
         }
     }
-    out.truncate(max);
     out
 }
 
@@ -3203,7 +3210,7 @@ pub(crate) fn turn_binds(entries: &[JournalEntry], run_id: &str, route_seq: u64,
 /// the turn saw ([`turn_binds`]); the model's `state` is kept only when the kind allows it.
 async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) -> Result<(), RpcError> {
     let entries = journal.entries_vec();
-    let binds = turn_binds(&entries, &env.run_id, route_seq, 12);
+    let binds = turn_binds(&entries, &env.run_id, route_seq);
     let shape = stage_shape(env, "KNOWLEDGE")?.with_reads(&binds, 2);
     let proposed = match decide_json::<KnowledgeProposed>(env, journal, "KNOWLEDGE", &shape, "").await {
         Ok((proposed, _)) => proposed.items,
@@ -3219,15 +3226,12 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
         .filter(|entry| entry.kind == chatflow_kinds::KNOWLEDGE && str_field(&entry.data, "state") != proposal::REJECTED)
         .map(|entry| key(str_field(&entry.data, "name")))
         .collect();
-    let mut count = 0;
+    // Every item the model proposed is kept (the schema says how many it may write).
     for item in proposed {
         let kind = item.kind.trim().to_ascii_lowercase();
         let (name, text) = (item.name.trim(), item.text.trim());
         if !matches!(kind.as_str(), "concept" | "fact" | "hypothesis" | "question") || name.is_empty() || text.is_empty() || known.contains(&key(name)) {
             continue;
-        }
-        if count >= env.data.limits.knowledge_items_per_turn {
-            break;
         }
         let state = match (kind.as_str(), item.state.trim()) {
             ("hypothesis", state @ ("open" | "supported" | "refuted")) => state,
@@ -3256,7 +3260,6 @@ async fn propose_knowledge(env: &RunEnv, journal: &mut Journal, route_seq: u64) 
             Err(error) => tracing::warn!(%error, "a knowledge item was not stored"),
         }
         known.push(key(name));
-        count += 1;
     }
     journal.note(&env.run_id, "knowledge_done", "", false).await.map(|_| ())
 }
@@ -3409,6 +3412,12 @@ fn local_task(env: &RunEnv, id: &str, brief: &str, contract: cc_protocol::contra
     }
 }
 
+/// A text without its lines that point to a kept output (`read artifact://<id>...`), which differ
+/// on every run of the same command.
+fn without_pointers(text: &str) -> String {
+    text.lines().filter(|line| !line.contains("artifact://")).collect::<Vec<_>>().join("\n").trim().to_owned()
+}
+
 /// Rounds in a row the `done` output may stay the same before the turn ends: one round without a
 /// settled line is a unit the model is still reading (seen: 68 lines read, then a progress reply);
 /// two is the model repeating itself.
@@ -3418,9 +3427,6 @@ const WORK_OPEN_STALL_ROUNDS: usize = 2;
 /// Short messages are the ones the router answered from the turn before ("so?", "continue", "as i
 /// said stop"); a longer one states its own asks.
 const ROUTE_LATEST_CHARS: usize = 400;
-/// Characters of each finished task's report shown to a plan written again.
-const REPORT_CHARS: usize = 1200;
-
 /// The output of the `done` command of a skill this run used, when it says the work is open (a
 /// non-zero exit); None when no used skill declares one, when every one says finished, or when the
 /// output has not changed for [`WORK_OPEN_STALL_ROUNDS`] rounds (no progress: the model would only
@@ -3446,12 +3452,17 @@ async fn work_open(env: &RunEnv, journal: &Journal) -> Result<Option<String>, Rp
             continue;
         }
         if !ran.result.ok {
-            let output = ran.full_output.trim();
-            if previous.len() >= WORK_OPEN_STALL_ROUNDS && previous.iter().all(|earlier| earlier == output) {
+            // What the model acts on, as a failed check shows it: the failing tests or the errors
+            // whole with the pointer to the whole output, never the run's head and tail.
+            // (`run_check` made it: `output_tail`.) Compared without the pointer line: every run keeps
+            // its output under a new id, so a pointer never matches the round before.
+            let shown = ran.result.output_tail.clone();
+            let output = without_pointers(&shown);
+            if previous.len() >= WORK_OPEN_STALL_ROUNDS && previous.iter().all(|earlier| without_pointers(earlier) == output) {
                 tracing::info!(session = %env.session_id, rounds = WORK_OPEN_STALL_ROUNDS, "work still open with no progress for several rounds; the turn ends");
                 return Ok(None);
             }
-            return Ok(Some(ran.full_output));
+            return Ok(Some(shown));
         }
     }
     Ok(None)

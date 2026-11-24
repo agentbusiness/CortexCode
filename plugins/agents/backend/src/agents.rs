@@ -1415,10 +1415,12 @@ impl Agents {
             let (kept, removed): (Vec<&String>, Vec<&String>) = changed_files.iter().partition(|file| std::path::Path::new(&project.root).join(file).exists());
             let mut changed = String::new();
             if !kept.is_empty() {
-                changed.push_str(&data.text("board_changed", &[("files", &files_text(kept.iter().map(|file| file.as_str())))]));
+                let kept: Vec<String> = kept.iter().map(|file| (*file).clone()).collect();
+                changed.push_str(&data.text("board_changed", &[("files", &files_view(host, &kept).await)]));
             }
             if !removed.is_empty() {
-                changed.push_str(&data.text("board_removed", &[("files", &files_text(removed.iter().map(|file| file.as_str())))]));
+                let removed: Vec<String> = removed.iter().map(|file| (*file).clone()).collect();
+                changed.push_str(&data.text("board_removed", &[("files", &files_view(host, &removed).await)]));
             }
             let post = data.text("board_done", &[("title", &task.title), ("summary", result.summary.trim()), ("changed", &changed)]);
             board(host, &project.id, "handoff", &record.name, &post, std::slice::from_ref(&task.id)).await;
@@ -1546,7 +1548,7 @@ impl Agents {
                         "not_checked" => "tree_task_unchecked",
                         _ => "tree_task_failing",
                     };
-                    let (changed, removed) = (fact_list(fact, "changed_files"), fact_list(fact, "removed_files"));
+                    let (changed, removed) = (fact_list(fact, "changed_view"), fact_list(fact, "removed_view"));
                     let agent = match fact_text(fact, "agent") {
                         "" => String::new(),
                         name => data.text("tree_task_agent", &[("agent", name)]),
@@ -2683,11 +2685,6 @@ fn own_check(entries: &[JournalEntry], task_id: &str, known: &[Vec<String>]) -> 
     newest.filter(|(_, passed)| *passed).map(|(command, _)| command)
 }
 
-/// Runs of the project's own commands kept per task of a finished tree (the newest of each
-/// command, the last ones the work ended with), and the characters kept of each one's output.
-const TREE_RUNS_PER_TASK: usize = 3;
-const TREE_RUN_CHARS: usize = 2000;
-
 /// The files a session changed, from its tool results, in the order first changed.
 fn changed_files_of(entries: &[JournalEntry]) -> Vec<String> {
     let mut changed: Vec<String> = Vec::new();
@@ -2727,25 +2724,24 @@ fn fact_text<'a>(fact: &'a Value, name: &str) -> &'a str {
     fact.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
-/// A list field of a task's facts, comma-separated; empty when absent.
+/// A file list of a task's facts as the lead reads it (`changed_view`, `removed_view`, made by
+/// [`files_view`]); empty when absent.
 fn fact_list(fact: &Value, name: &str) -> String {
-    files_text(fact.get(name).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str))
+    fact.get(name).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
-/// Files named one by one up to this many; more are said by folder.
-const FILES_NAMED: usize = 12;
-/// Folders named when files are said by folder.
-const FOLDERS_NAMED: usize = 12;
-
-/// Files as the lead and the board read them: each path when there are a few; when there are many
-/// (a copied tree, build output) how many, by folder, so the lead reads what happened and where
+/// Files named one per line up to this many. A longer list (a copied tree, build output) is kept
+/// whole as an artifact and read as its folders with their counts and the pointer to every file
 /// (seen: one agent's report naming 30,000 files, 600k tokens, and the lead's context full).
-fn files_text<'a>(files: impl Iterator<Item = &'a str>) -> String {
-    let files: Vec<&str> = files.collect();
-    if files.len() <= FILES_NAMED {
-        return files.join(", ");
+const FILES_LISTED: usize = 200;
+
+/// Files as the lead and the board read them: every path, one line each; a list longer than
+/// [`FILES_LISTED`] as its folders with their counts and `read artifact://<id>` for every path.
+/// When the artifact cannot be kept, every path.
+async fn files_view(host: &Host, files: &[String]) -> String {
+    if files.len() <= FILES_LISTED {
+        return files_text(files.iter().map(String::as_str));
     }
-    // The folder a file is said under: its first two folders (`plugins/mesh/`), or its one folder.
     let folder = |path: &str| -> String {
         let parts: Vec<&str> = path.split('/').collect();
         match parts.len() {
@@ -2755,15 +2751,23 @@ fn files_text<'a>(files: impl Iterator<Item = &'a str>) -> String {
         }
     };
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for file in &files {
+    for file in files {
         *counts.entry(folder(file)).or_default() += 1;
     }
-    let mut folders: Vec<(String, usize)> = counts.into_iter().collect();
-    folders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let named: Vec<String> = folders.iter().take(FOLDERS_NAMED).map(|(folder, count)| format!("{folder} ({count})")).collect();
-    let rest = folders.len().saturating_sub(FOLDERS_NAMED);
-    let more = if rest == 0 { String::new() } else { format!(" and {rest} more folder(s)") };
-    format!("{} files: {}{more}", files.len(), named.join(", "))
+    let put = host.get::<cc_protocol::contracts::tools::ArtifactPutResult>(cc_protocol::contracts::tools::methods::ARTIFACT_PUT, json!({"text": files.join("\n")})).await;
+    match put {
+        Ok(put) => {
+            let folders: Vec<String> = counts.iter().map(|(folder, count)| format!("  {folder} ({count} files)")).collect();
+            format!("{}\n  every file: read artifact://{}:1-{}", folders.join("\n"), put.id, files.len())
+        }
+        Err(_) => files_text(files.iter().map(String::as_str)),
+    }
+}
+
+/// Files as the lead and the board read them: every path, one line each, so the lead reads what
+/// happened and where; a count by folder named no file the next step could open.
+fn files_text<'a>(files: impl Iterator<Item = &'a str>) -> String {
+    files.map(|file| format!("  {file}")).collect::<Vec<String>>().join("\n")
 }
 
 /// One task of a finished tree as its session judges it, all from records (no judgement here):
@@ -2772,10 +2776,11 @@ fn files_text<'a>(files: impl Iterator<Item = &'a str>) -> String {
 ///   task nothing verified is `not_checked`).
 /// - `changed_files`: the files its agent changed that are in the project now; `removed_files`:
 ///   those that are gone.
-/// - `runs`: `[{command, exit_code, tests, output}]`, the newest result of each of its agent's
-///   runs of the project's own commands ([`runs_project_command`], or a run the tools plugin read
-///   as a test run), oldest first, the last [`TREE_RUNS_PER_TASK`]; `output` is the result as the
-///   agent saw it, its last [`TREE_RUN_CHARS`] characters.
+/// - `runs`: `[{command, exit_code, tests, output}]`, every one of its agent's runs of the project's
+///   own commands ([`runs_project_command`], or a run the tools plugin read as a test run), oldest
+///   first; `output` is the result whole as the agent saw it (the tools plugin's view: a failing
+///   test run's failing tests with the pointer to its whole output, a long output's start, the
+///   pointer and its end).
 async fn task_facts(host: &Host, task: &Task, root: &str, known: &[Vec<String>]) -> Value {
     let entries = match task.session_id.as_deref().filter(|session| !session.is_empty()) {
         Some(session) => host.journal_read(session, 1).await.unwrap_or_default(),
@@ -2797,7 +2802,7 @@ async fn task_facts(host: &Host, task: &Task, root: &str, known: &[Vec<String>])
         .filter(|entry| entry.kind == kinds::TOOL_RESULT)
         .filter_map(|entry| Some((entry.data.get("call_id")?.as_str()?, entry)))
         .collect();
-    let mut runs: Vec<(String, Value)> = Vec::new();
+    let mut runs: Vec<Value> = Vec::new();
     for call in entries.iter().filter(|entry| entry.kind == kinds::TOOL_CALL && entry.data.get("tool").and_then(Value::as_str) == Some("run")) {
         let command = call.data.get("args").and_then(|args| args.get("command")).and_then(Value::as_str).unwrap_or("").trim().to_owned();
         let Some(result) = call.data.get("call_id").and_then(Value::as_str).and_then(|id| results.get(id)) else { continue };
@@ -2811,18 +2816,16 @@ async fn task_facts(host: &Host, task: &Task, root: &str, known: &[Vec<String>])
             continue;
         }
         let output = result.data.get("output").and_then(Value::as_str).unwrap_or("").trim_end();
-        let run = json!({"command": command, "exit_code": display.get("exit_code").cloned().unwrap_or(Value::Null), "tests": tests, "output": contract::tail_of(output, TREE_RUN_CHARS)});
-        runs.retain(|(earlier, _)| earlier != &command);
-        runs.push((command, run));
+        runs.push(json!({"command": command, "exit_code": display.get("exit_code").cloned().unwrap_or(Value::Null), "tests": tests, "output": output}));
     }
-    let skip = runs.len().saturating_sub(TREE_RUNS_PER_TASK);
-    let runs: Vec<Value> = runs.into_iter().skip(skip).map(|(_, run)| run).collect();
     json!({
         "task_id": task.id,
         "title": task.title,
         "agent": task.assignee,
         "session_id": task.session_id,
         "state": state,
+        "changed_view": files_view(host, &changed).await,
+        "removed_view": files_view(host, &removed).await,
         "changed_files": changed,
         "removed_files": removed,
         "runs": runs,

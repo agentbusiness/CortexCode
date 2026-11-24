@@ -6,19 +6,13 @@ use cc_protocol::RpcError;
 use cc_protocol::contracts::agents::{CheckResult, VerifyReport};
 use cc_protocol::contracts::memory::{Contract, ContractCheck};
 use cc_protocol::contracts::now_ms;
-use cc_protocol::contracts::tools::{RunResult, methods as tools_methods};
-use serde_json::json;
+use cc_protocol::contracts::tools::{ArtifactPutResult, ArtifactResult, RunResult, methods as tools_methods};
+use serde_json::{Value, json};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// A check command may run a full test suite; this only guards against a hung process.
 const CHECK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-/// Characters of output kept in a report's `output_tail`. As large as what the tools plugin
-/// returns for a long output (its own cut: the start, a pointer to the saved whole, the end), so a
-/// failing check is not cut a second time here: the last 6000 characters alone lost the start of
-/// the failures and the pointer to the rest (seen: a verify note that was "[6255 earlier
-/// characters not shown]" and a row of dots). The same size as the chat flow's own checks.
-const TAIL_CHARS: usize = 16 * 1024;
 
 /// Whether `output` satisfies `expect`: a regular expression, or a plain substring when the text is
 /// not a valid expression. Empty expectations always hold.
@@ -32,19 +26,91 @@ pub fn expectation_holds(expect: Option<&str>, output: &str) -> bool {
     }
 }
 
-fn tail(text: &str) -> String {
-    tail_of(text, TAIL_CHARS)
+/// Bytes of output a test run may have for its compact view: the tools plugin's own bound
+/// (`exec::TEST_VIEW_BYTES` in plugins/tools), so a larger output keeps the view it already has.
+const TEST_VIEW_BYTES: u64 = 1 << 20;
+
+/// The id of the artifact where the tools plugin kept a long output whole, read from the marker it
+/// puts where it left lines out (`[N lines not shown: read artifact://<id>:<a>-<b> for them]`).
+fn kept_whole(view: &str) -> Option<&str> {
+    const MARK: &str = " lines not shown: read artifact://";
+    let rest = &view[view.find(MARK)? + MARK.len()..];
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).unwrap_or(rest.len());
+    Some(&rest[..end]).filter(|id| !id.is_empty())
 }
 
-/// The last `chars` characters of `text`, saying how many came before them.
-pub fn tail_of(text: &str, chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= chars {
-        return text.to_owned();
+/// The lines of an output that report an error, each whole with the indented lines under it (a
+/// compiler's location and code, a traceback's frames, a stack's `at` lines).
+pub(crate) fn error_lines(text: &str) -> String {
+    const SIGNS: [&str; 8] = ["error", "fail", "panic", "exception", "fatal", "traceback", "cannot", "could not"];
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let starts = SIGNS.iter().any(|sign| lower.contains(sign));
+        let under = inside && !line.trim().is_empty() && line.starts_with(char::is_whitespace);
+        inside = starts || under;
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
     }
-    let skipped = count - chars;
-    let kept: String = text.chars().skip(skipped).collect();
-    format!("[{skipped} earlier characters not shown]\n{kept}")
+    out
+}
+
+/// A failing run's output as a report shows it, never cut: a test run's failing tests (the runner's
+/// compact report: one line per failing test with its error, the first failure whole) with the
+/// pointer to the whole output; any other output whole when the tools plugin returned it whole,
+/// else its error lines whole with the pointer to the whole output it kept. A passing run's output
+/// is shown as the tools plugin returned it (whole, or its start, the pointer and its end). A log
+/// cut to its last characters lost the start of the failures and the pointer to the rest (seen: a
+/// verify note that was "[6255 earlier characters not shown]" and a row of dots).
+pub async fn shown(host: &Host, view: &str, failing: bool) -> String {
+    if !failing {
+        return view.to_owned();
+    }
+    let mut kept = kept_whole(view).map(str::to_owned);
+    // The whole output: the artifact the tools plugin kept, or the view itself when it is whole.
+    // A kept output larger than a test view may be is left as the tools plugin showed it (its view
+    // already points to the whole), so it is never loaded and sent again.
+    let whole = match &kept {
+        Some(id) => match host.get::<ArtifactResult>(tools_methods::ARTIFACT, json!({"id": id, "range": "1-1"})).await {
+            Ok(first) if first.total_bytes <= TEST_VIEW_BYTES => match host.get::<ArtifactResult>(tools_methods::ARTIFACT, json!({"id": id})).await {
+                Ok(artifact) if artifact.encoding == "utf8" => artifact.data,
+                _ => return view.to_owned(),
+            },
+            _ => return view.to_owned(),
+        },
+        None => view.to_owned(),
+    };
+    let answer = host.call(tools_methods::TESTS_REPORT, json!({"text": whole, "artifact": kept})).await.ok();
+    let report = answer
+        .as_ref()
+        .and_then(|answer| answer.get("report").and_then(Value::as_str).map(str::to_owned))
+        .filter(|report| !report.trim().is_empty());
+    // The artifact the report kept the output in, when it had to keep it: the pointer names it.
+    if kept.is_none() {
+        kept = answer.as_ref().and_then(|answer| answer.get("artifact").and_then(Value::as_str)).filter(|id| !id.is_empty()).map(str::to_owned);
+    }
+    if kept.is_none() && report.is_none() {
+        return view.to_owned();
+    }
+    let lines = whole.lines().count().max(1);
+    let id = match kept {
+        Some(id) => id,
+        None => match host.get::<ArtifactPutResult>(tools_methods::ARTIFACT_PUT, json!({"text": whole})).await {
+            Ok(put) => put.id,
+            Err(_) => return view.to_owned(),
+        },
+    };
+    if let Some(report) = report {
+        return format!("{}\nEvery failure whole: read artifact://{id}:1-{lines}\n", report.trim_end());
+    }
+    let errors = error_lines(&whole);
+    if errors.is_empty() {
+        return view.to_owned();
+    }
+    format!("{errors}[the whole output: read artifact://{id}:1-{lines}]\n")
 }
 
 /// Whether a check that did not pass was killed from outside: status 137 (SIGKILL) or 143 (SIGTERM)
@@ -148,26 +214,28 @@ pub async fn run_check(
                 let output = format!(
                     "[this check could not run here: the machine killed it (status {}), e.g. for memory; the work is not judged by it]\n{}",
                     run.exit_code.unwrap_or_default(),
-                    tail(&run.output)
+                    run.output
                 );
                 return Ok(Ran {
                     result: CheckResult { name: check.name.clone(), ok: false, exit_code: run.exit_code, output_tail: output.clone(), duration_ms: started.elapsed().as_millis() as u64, indeterminate: true, failed_tests: None },
                     full_output: output,
                 });
             }
-            let mut output = run.output.clone();
+            let mut notes = String::new();
             if run.timed_out {
-                output.push_str("\n[the check timed out]");
+                notes.push_str("\n[the check timed out]");
             }
             if exit_ok && !ok {
-                output.push_str(&format!("\n[exit 0, but the output does not contain the expected `{}`]", check.expect.as_deref().unwrap_or("")));
+                notes.push_str(&format!("\n[exit 0, but the output does not contain the expected `{}`]", check.expect.as_deref().unwrap_or("")));
             }
+            let output = format!("{}{notes}", run.output);
+            let in_report = format!("{}{notes}", shown(host, &run.output, !ok).await);
             Ok(Ran {
                 result: CheckResult {
                     name: check.name.clone(),
                     ok,
                     exit_code: run.exit_code,
-                    output_tail: tail(&output),
+                    output_tail: in_report,
                     duration_ms: started.elapsed().as_millis() as u64,
                     indeterminate: false,
                     failed_tests: if ok { None } else { failed_tests(&run) },

@@ -7,7 +7,7 @@ use cc_protocol::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 fn hash(text: &str) -> String {
     crate::facts::hash_hex(text.as_bytes())
@@ -116,6 +116,9 @@ async fn put(
         .await
         .map(|_| ())
 }
+/// Rows a procedure read asks for: the graph query's own most, so no record of a group is left out.
+const ROWS: u32 = 5000;
+
 async fn read<T: DeserializeOwned>(
     store: &GraphStore,
     query: &str,
@@ -151,10 +154,10 @@ async fn revision(
         .ok_or_else(|| RpcError::not_found("This procedure revision is not in this project."))
 }
 async fn sources(store: &GraphStore, key: &str) -> Result<Vec<ProcedureEpisode>, RpcError> {
-    read(store, "MATCH (p:ProcedureRevision {key: $key})-[:DERIVED_FROM]->(e:ProcedureEpisode) WHERE e.ended_ms IS NULL RETURN e ORDER BY e.key", json!({"key": key}), 8).await
+    read(store, "MATCH (p:ProcedureRevision {key: $key})-[:DERIVED_FROM]->(e:ProcedureEpisode) WHERE e.ended_ms IS NULL RETURN e ORDER BY e.key", json!({"key": key}), ROWS).await
 }
 async fn uses(store: &GraphStore, key: &str) -> Result<Vec<ProcedureUse>, RpcError> {
-    read(store, "MATCH (u:ProcedureUse)-[:FOR]->(p:ProcedureRevision {key: $key}) WHERE u.ended_ms IS NULL RETURN u ORDER BY u.created_ms DESC LIMIT 200", json!({"key": key}), 200).await
+    read(store, "MATCH (u:ProcedureUse)-[:FOR]->(p:ProcedureRevision {key: $key}) WHERE u.ended_ms IS NULL RETURN u ORDER BY u.created_ms DESC", json!({"key": key}), ROWS).await
 }
 
 pub async fn record(store: &GraphStore, mut e: ProcedureEpisode) -> Result<(), RpcError> {
@@ -236,18 +239,28 @@ fn material_key(keys: &[String]) -> String {
     hash(&keys.join("\n"))
 }
 
+/// The first group (one project, one applicability anchor) with episodes from two tasks and two
+/// runs not yet attempted: every live episode of the group and every live revision of its anchor
+/// with all their uses. The group is what is relevant to the procedure, so nothing in it is left out
+/// by age.
 pub async fn material(store: &GraphStore) -> Result<ProcedureMaterial, RpcError> {
-    let episodes: Vec<ProcedureEpisode> = read(store, "MATCH (e:ProcedureEpisode) WHERE e.ended_ms IS NULL RETURN e ORDER BY e.created_ms DESC LIMIT 200", json!({}), 200).await?;
-    let mut groups: BTreeMap<(String, String), Vec<ProcedureEpisode>> = BTreeMap::new();
-    for e in episodes {
-        let group = groups
-            .entry((e.project_id.clone(), e.anchor.clone()))
-            .or_default();
-        if group.len() < 8 {
-            group.push(e);
-        }
-    }
-    for ((project, anchor), group) in groups {
+    let rows = store
+        .query(GraphQueryParams {
+            cypher: "MATCH (e:ProcedureEpisode) WHERE e.ended_ms IS NULL RETURN DISTINCT e.project_id, e.anchor".into(),
+            params: Map::new(),
+            limit: Some(ROWS),
+        })
+        .await?;
+    let groups: BTreeSet<(String, String)> = rows
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or_default().to_owned();
+            (text(0), text(1))
+        })
+        .collect();
+    for (project, anchor) in groups {
+        let group: Vec<ProcedureEpisode> = read(store, "MATCH (e:ProcedureEpisode) WHERE e.project_id = $project AND e.anchor = $anchor AND e.ended_ms IS NULL RETURN e ORDER BY e.created_ms DESC", json!({"project": project, "anchor": anchor}), ROWS).await?;
         let tasks: BTreeSet<_> = group.iter().map(|e| e.task_key.as_str()).collect();
         let runs: BTreeSet<_> = group.iter().map(|e| (&e.session_id, &e.run_id)).collect();
         if tasks.len() < 2 || runs.len() < 2 {
@@ -265,7 +278,7 @@ pub async fn material(store: &GraphStore) -> Result<ProcedureMaterial, RpcError>
         if !attempted.rows.is_empty() {
             continue;
         }
-        let mut history: Vec<ProcedureRevision> = read(store, "MATCH (p:ProcedureRevision) WHERE p.project_id = $project AND p.anchor = $anchor AND p.ended_ms IS NULL RETURN p ORDER BY p.created_ms DESC LIMIT 3", json!({"project": project, "anchor": anchor}), 3).await?;
+        let mut history: Vec<ProcedureRevision> = read(store, "MATCH (p:ProcedureRevision) WHERE p.project_id = $project AND p.anchor = $anchor AND p.ended_ms IS NULL RETURN p ORDER BY p.created_ms DESC", json!({"project": project, "anchor": anchor}), ROWS).await?;
         for p in &mut history {
             p.uses = uses(store, &p.key).await?;
         }
@@ -279,16 +292,16 @@ pub async fn material(store: &GraphStore) -> Result<ProcedureMaterial, RpcError>
 
 pub async fn propose(store: &GraphStore, p: ProcedureProposal) -> Result<(), RpcError> {
     let keys: BTreeSet<_> = p.episode_keys.iter().cloned().collect();
-    if !(2..=8).contains(&keys.len()) {
+    if keys.len() < 2 {
         return Err(RpcError::invalid_params(
-            "Use two to eight stored episodes from different tasks.",
+            "Use two or more stored episodes from different tasks.",
         ));
     }
     let episodes: Vec<ProcedureEpisode> = read(
         store,
         "MATCH (e:ProcedureEpisode) WHERE e.key IN $keys AND e.ended_ms IS NULL RETURN e",
         json!({"keys": keys}),
-        8,
+        ROWS,
     )
     .await?;
     if episodes.len() != keys.len() {

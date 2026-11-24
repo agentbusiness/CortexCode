@@ -155,7 +155,7 @@ pub struct FetchParams {
     /// Fetch again even when the cache holds a fresh copy.
     #[serde(default)]
     pub refresh: bool,
-    /// Most characters of `text` returned (default: the plugin's `max_text_chars`).
+    /// Most characters of `text` returned from `offset` (default: the whole text).
     #[serde(default)]
     pub max_chars: Option<u64>,
     /// Characters of `text` to skip first (paging through a long document).

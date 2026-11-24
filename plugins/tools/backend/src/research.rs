@@ -100,13 +100,12 @@ fn render_search(query: &str, result: &Value) -> String {
     }
     for (i, hit) in hits.iter().enumerate() {
         let date = hit.get("date").and_then(Value::as_str).map(|d| format!(" ({d})")).unwrap_or_default();
-        let authors: Vec<String> = hit.get("authors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).take(3).map(str::to_owned).collect()).unwrap_or_default();
+        let authors: Vec<String> = hit.get("authors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
         let by = if authors.is_empty() { String::new() } else { format!(" — {}", authors.join(", ")) };
         let _ = writeln!(out, "{}. [{}] {}{date}{by}\n   {}", i + 1, s(hit, "source"), s(hit, "title"), s(hit, "url"));
         let snippet = s(hit, "snippet");
         if !snippet.is_empty() {
-            let short: String = snippet.chars().take(240).collect();
-            let _ = writeln!(out, "   {short}{}", if snippet.chars().count() > 240 { "…" } else { "" });
+            let _ = writeln!(out, "   {}", snippet.trim().replace('\n', "\n   "));
         }
         if let Some(extra) = hit.get("extra") {
             let discussion = s(extra, "discussion");

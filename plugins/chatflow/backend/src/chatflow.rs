@@ -2119,7 +2119,7 @@ impl Plugin for Chatflow {
             }
             frame_topics::PROJECT_CHANGED | SKILLS_CHANGED => true,
             cc_protocol::contracts::memory::topics::KNOWLEDGE_CHANGED => {
-                data.get("kind").and_then(Value::as_str) == Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION)
+                matches!(data.get("kind").and_then(Value::as_str), Some(cc_protocol::contracts::memory::knowledge::DESCRIPTION | cc_protocol::contracts::memory::knowledge::CONTRACT))
             }
             _ => false,
         };

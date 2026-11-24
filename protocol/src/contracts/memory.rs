@@ -162,8 +162,9 @@ pub mod methods {
     /// What rides along with code when the host serves it; no model, no search.
     pub const KNOWLEDGE_LINKED: &str = "memory.knowledge.linked";
     /// [`super::KnowledgeBriefParams`] -> [`super::KnowledgeBriefResult`]: what every session of the
-    /// project should know, one line per item, within a token budget: accepted decisions, user
-    /// facts, concepts by how much code they bind, open questions.
+    /// project should know, one line per item, each whole (never cut to a budget): the description,
+    /// accepted decisions, facts (the user's first), open questions and settled hypotheses. Concepts
+    /// are not in it: a turn reaches them by meaning (`memory.knowledge.search`).
     pub const KNOWLEDGE_BRIEF: &str = "memory.knowledge.brief";
     /// [`super::KnowledgeCountParams`] -> [`super::KnowledgeItem`]: add to an item's `seen`,
     /// `helped` and `hurt` counters (how a lesson fared where it was shown).
@@ -2012,11 +2013,16 @@ pub struct NoteRemoveResult {
 
 /// The kinds of a [`KnowledgeItem`] and the states each kind may be in.
 pub mod knowledge {
-    pub const KINDS: &[&str] = &[DESCRIPTION, CONCEPT, FACT, DECISION, HYPOTHESIS, QUESTION, LESSON];
+    pub const KINDS: &[&str] = &[DESCRIPTION, CONTRACT, CONCEPT, FACT, DECISION, HYPOTHESIS, QUESTION, LESSON];
     /// What the software is, in a short paragraph without code (what it does, its core features,
     /// how it is built, run and tested): one per project, written by the model from the
     /// repository's own documents, shown first in the brief.
     pub const DESCRIPTION: &str = "description";
+    /// The project's own contract (its `AGENTS.md`, else `CLAUDE.md`) written again shorter by the
+    /// model with every rule kept, when the file is longer than a session's prompt shows: one per
+    /// project, the file's hash in `evidence`, shown in the system prompt in the file's place. Never
+    /// in the brief.
+    pub const CONTRACT: &str = "contract";
     /// Domain vocabulary: what a word means here, bound to the code that implements it.
     pub const CONCEPT: &str = "concept";
     /// A claim about the project's world, with a source and an `as_of` date.
@@ -2039,7 +2045,7 @@ pub mod knowledge {
     /// refuted`; question: `open | answered`.
     pub fn states(kind: &str) -> &'static [&'static str] {
         match kind {
-            DESCRIPTION | CONCEPT | FACT | LESSON => &["asserted", SUPERSEDED, WITHDRAWN],
+            DESCRIPTION | CONTRACT | CONCEPT | FACT | LESSON => &["asserted", SUPERSEDED, WITHDRAWN],
             DECISION => &["accepted", SUPERSEDED, WITHDRAWN],
             HYPOTHESIS => &["open", "supported", "refuted", SUPERSEDED, WITHDRAWN],
             QUESTION => &["open", "answered", SUPERSEDED, WITHDRAWN],
@@ -2290,7 +2296,7 @@ pub struct KnowledgeLinkedResult {
 pub struct KnowledgeBriefParams {
     #[serde(default)]
     pub project_id: Option<String>,
-    /// Tokens as the model counts them (`model.count`; bytes when no model answers). 0: nothing.
+    /// 0: no brief. Any other value: the whole brief (the count is not a cut).
     pub budget_tokens: u32,
 }
 

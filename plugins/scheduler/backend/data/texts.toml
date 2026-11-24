@@ -12,9 +12,14 @@ run_now = "{id} \"{title}\" runs now."
 no_next = "never again"
 none = "No routines."
 line = "{id}  [{state}]  {when}  {kind}  \"{title}\"  next: {next}"
+# Under a routine's runs (newest is 1): how to read each run's whole report.
+runs_more = "Each run's whole report: read schedule://{id}:1-{last} (or a part of that range)."
 
 # ---- what a run reads ----------------------------------------------------------------------------
 # A handoff run's brief: the routine's brief, then what the last good run found.
 since = "\n\nThe last run ({date}) found:\n{summary}\nReport what is new since then."
 # A command that failed: the session that owns the routine is woken with this.
-command_failed = "The command `{command}` exited {code}. Its output ends:\n{tail}\nFind out why and fix what it reports."
+command_failed = "The command `{command}` exited {code}. Its output:\n{output}\nFind out why and fix what it reports."
+# A failed command's long output, or its test report: the failing part whole, then where the whole is.
+failed_tests = "{report}\nEvery failure whole: read artifact://{id}:1-{lines}"
+failed_errors = "{errors}\n[the whole output: read artifact://{id}:1-{lines}]"

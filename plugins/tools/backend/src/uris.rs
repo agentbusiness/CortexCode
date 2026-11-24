@@ -673,7 +673,15 @@ async fn schedule(host: &dyn Host, scope: &Scope<'_>, id: &str) -> Result<String
     Ok(format!("{text}\n"))
 }
 
+/// `agent://<name>` shows the agent and its most recent journal entries whole, with the range of
+/// the earlier ones to read; `agent://<name>:<range>` shows the entries of that range whole
+/// (`agent://<name>:1-40`).
 async fn agent(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String, UriError> {
+    let (name, range) = match name.split_once(':') {
+        Some((name, range)) => (name, Some(range)),
+        None => (name, None),
+    };
+    let segments = range.map(crate::read::parse_range).transpose().map_err(|error| UriError::new("bad_uri", format!("agent://{name}:{}: {error}", range.unwrap_or(""))))?;
     let name = name.trim_start_matches('@');
     let request = json!({ "project_id": scope.project_id });
     let agents: Vec<AgentRecord> = match host.call("agents.list", request.clone()).await {
@@ -723,28 +731,57 @@ async fn agent(host: &dyn Host, scope: &Scope<'_>, name: &str) -> Result<String,
         && let Ok(journal) = serde_json::from_value::<cc_protocol::contracts::frame::JournalReadResult>(value)
         && !journal.entries.is_empty()
     {
-        let start = journal.entries.len().saturating_sub(12);
-        out.push_str("recent activity:\n");
-        for entry in &journal.entries[start..] {
-            let _ = writeln!(out, "- {}: {}", entry.kind, summarize_entry(&entry.kind, &entry.data));
+        let total = journal.entries.len();
+        let entry_line = |out: &mut String, number: usize| {
+            let entry = &journal.entries[number - 1];
+            let _ = writeln!(out, "{number}. {}: {}", entry.kind, entry_text(&entry.kind, &entry.data).trim_end());
+        };
+        match &segments {
+            Some(segments) => {
+                for segment in segments {
+                    if segment.start > total {
+                        let _ = writeln!(out, "[the journal has {total} entries; entry {} is past the end]", segment.start);
+                        continue;
+                    }
+                    let end = segment.end.unwrap_or(total).min(total);
+                    let _ = writeln!(out, "activity, entries {}-{end} of {total}:", segment.start);
+                    for number in segment.start..=end {
+                        entry_line(&mut out, number);
+                    }
+                }
+            }
+            None => {
+                // The most recent entries say what it is doing now; the earlier ones are named by
+                // their range.
+                let start = total.saturating_sub(RECENT_ENTRIES) + 1;
+                out.push_str("recent activity:\n");
+                if start > 1 {
+                    let _ = writeln!(out, "[entries 1-{} of {total} not shown: read agent://{name}:1-{} for them]", start - 1, start - 1);
+                }
+                for number in start..=total {
+                    entry_line(&mut out, number);
+                }
+            }
         }
     }
     Ok(out)
 }
 
-/// One line per journal entry: the primary text field of each documented entry kind.
-fn summarize_entry(kind: &str, data: &Value) -> String {
+/// Journal entries `agent://<name>` shows without a range: its latest ones (the earlier ones are
+/// named by the range to read).
+const RECENT_ENTRIES: usize = 12;
+
+/// A journal entry's text, whole: the primary text field of each documented entry kind.
+fn entry_text(kind: &str, data: &Value) -> String {
     let field = |name: &str| data.get(name).and_then(Value::as_str).unwrap_or("").to_owned();
-    let text = match kind {
+    match kind {
         "tool_call" => format!("{} {}", field("tool"), field("intent")),
         "tool_result" if data.get("ok").and_then(Value::as_bool) == Some(false) => format!("failed: {}", field("output")),
         "tool_result" => field("output"),
         "status" => format!("{} {}", field("state"), field("detail")),
         "error" => field("message"),
         _ => field("text"),
-    };
-    let first: String = text.lines().next().unwrap_or("").chars().take(160).collect();
-    if text.lines().count() > 1 || text.chars().count() > 160 { format!("{first} …") } else { first }
+    }
 }
 
 async fn board(host: &dyn Host, scope: &Scope<'_>, params: &HashMap<String, String>) -> Result<String, UriError> {

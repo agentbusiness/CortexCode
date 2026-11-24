@@ -991,9 +991,9 @@ fn report_lines(data: &Dataset, report: &VerifyReport, keep: &dyn Fn(&cc_protoco
         if check.ok {
             text.push_str(&data.text("check_passed", &[("command", spec)]));
         } else {
-            // The failing tests by name first, one line each (when the report names every one): the
-            // output under it may be cut, and a cut log sent the model to ask for the rest instead
-            // of fixing.
+            // The failing tests by name first, one line each (when the report names every one), then
+            // the output: whole when short, else its failures whole with the pointer to the rest (a
+            // cut log sent the model to ask for the rest instead of fixing).
             let names = match &check.failed_tests {
                 Some(names) if !names.is_empty() => data.text("check_failing_tests", &[("tests", &names.iter().map(|name| format!("- {name}")).collect::<Vec<_>>().join("\n"))]),
                 _ => String::new(),

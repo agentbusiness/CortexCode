@@ -495,7 +495,12 @@ pub async fn run(commands: &Commands, host: &dyn Host, provider: &Provider, requ
             let timed_out = job.state == "stopped" && !cancelled && job.duration_ms + 1_000 >= request.timeout_ms;
             let stopped = match job.state.as_str() {
                 "lost" => Some("[CortexTerm stopped while this ran; its result is unknown]".to_owned()),
-                "stopped" if !cancelled && !timed_out => Some(format!("[stopped in CortexTerm: {}]", job.tail.last().map(String::as_str).unwrap_or("someone stopped it"))),
+                // How it was stopped, in CortexTerm's own words (its lines on the job), else its
+                // last output line.
+                "stopped" if !cancelled && !timed_out => Some(format!(
+                    "[stopped in CortexTerm: {}]",
+                    Some(job.text.trim()).filter(|text| !text.is_empty()).or_else(|| job.tail.last().map(|line| line.trim())).unwrap_or("someone stopped it")
+                )),
                 _ => None,
             };
             let run = RunOutput {
@@ -636,7 +641,8 @@ pub fn on_event(commands: &Commands, publish: &dyn Fn(&str, Value), topic: &str,
                 "exit_code": meta.exit_code,
                 "reason": "exit",
                 "artifact": format!("cmd://{}", meta.id),
-                "output_tail": format!("{}\n{}", ended.job.tail.join("\n"), meta.text),
+                // CortexTerm sends its output's last lines; the whole of it is kept there.
+                "output_tail": format!("{}\n{}\n[its whole output: read cmd://{}/output]", ended.job.tail.join("\n"), meta.text, meta.id),
             }),
         );
     } else if topic == topics::COMMAND_MATCHED

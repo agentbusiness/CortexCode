@@ -20,6 +20,10 @@ pub mod methods {
     pub const JOB_KILL: &str = "tools.job.kill";
     /// Read back offloaded full output (`artifact://<id>`).
     pub const ARTIFACT: &str = "tools.artifact";
+    /// Keep a whole text as an artifact (a check's output, a job's log, a long report) so a view of
+    /// part of it can point to the rest: [`super::ArtifactPutParams`] -> [`super::ArtifactPutResult`].
+    /// Read back with `read artifact://<id>:<range>` or [`ARTIFACT`].
+    pub const ARTIFACT_PUT: &str = "tools.artifact.put";
     /// Create a copy-on-write workspace clone of a project for an agent.
     pub const WORKSPACE_CREATE: &str = "tools.workspace.create";
     pub const WORKSPACE_REMOVE: &str = "tools.workspace.remove";
@@ -46,7 +50,9 @@ pub mod methods {
     /// could not reach, `{report}` holds its compact form (the counts, one line per failing test with
     /// its error, the first failure whole), else null; `{notes}` holds only what a failure means
     /// where the runner's words hide it and the tests it could not reach (for output shown whole),
-    /// else null.
+    /// else null; `{artifact}` the id that holds the text whole when the report names its lines.
+    /// Optional `{artifact}` (the id the text was read from: it is used, never stored again) and
+    /// `{session_id}` (whose artifacts a newly kept text joins).
     pub const TESTS_REPORT: &str = "tools.tests.report";
     /// `{session_id, workspace, command}`: runs the test command once on the code as it was before
     /// the session's running turn changed it (each code file `edit` changed put back as it was,
@@ -531,6 +537,23 @@ pub struct ArtifactParams {
     pub id: String,
     #[serde(default)]
     pub range: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ArtifactPutParams {
+    /// The whole text to keep.
+    pub text: String,
+    /// The session it belongs to (its artifacts go with it); none: the machine's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ArtifactPutResult {
+    /// Read it back as `artifact://<id>`.
+    pub id: String,
+    /// Its lines, for a pointer that names a range.
+    pub lines: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

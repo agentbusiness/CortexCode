@@ -23,11 +23,6 @@ use std::sync::LazyLock;
 const TYPE_KINDS: &[&str] = &["struct", "class", "enum", "trait", "interface", "type", "union", "record"];
 /// Symbol kinds that declare a member of a type.
 const FIELD_KINDS: &[&str] = &["field", "property", "attribute"];
-/// Errors looked at per failing run, and declarations shown.
-const SITES: usize = 3;
-const SHOWN: usize = 3;
-/// A longer declaration is shown as its first line and its fields.
-const WHOLE_LINES: usize = 25;
 
 /// A line that starts an error report (compiler, runtime or test runner), in any language.
 static HEAD: LazyLock<Regex> =
@@ -59,7 +54,7 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     WORD.find_iter(text).map(|word| word.as_str().to_owned())
 }
 
-/// The first errors of `output`: each from its head line to the next head, located at the first
+/// Every error of `output`: each from its head line to the next head, located at the first
 /// location in it. Output without a head line (a traceback ending in its error) is one error at
 /// its last location (the innermost frame).
 fn sites(output: &str) -> Vec<Site> {
@@ -77,9 +72,6 @@ fn sites(output: &str) -> Vec<Site> {
             continue;
         }
         out.push(Site { path, line, names: quoted(block) });
-        if out.len() == SITES {
-            break;
-        }
     }
     if out.is_empty()
         && let Some((path, line)) = lines.iter().rev().find_map(|line| location(line))
@@ -111,8 +103,9 @@ async fn outline(host: &Host, scope: &Scope, path: &str) -> Vec<SymbolRef> {
     serde_json::from_value::<OutlineResult>(value).map(|outline| outline.symbols).unwrap_or_default()
 }
 
-/// The declarations of the project's types that the first errors of a failing run go through: the
-/// owners of the fields their lines use and the types their lines or messages name. `None` when
+/// The declarations of the project's types that the errors of a failing run go through, every one
+/// and each whole: the owners of the fields their lines use and the types their lines or messages
+/// name. `None` when
 /// the output points at no project type.
 pub async fn declarations(host: &Host, scope: &Scope, output: &str) -> Option<String> {
     let mut files: HashMap<String, (Vec<SymbolRef>, Vec<String>)> = HashMap::new();
@@ -152,36 +145,25 @@ pub async fn declarations(host: &Host, scope: &Scope, output: &str) -> Option<St
     }
     named.sort();
     named.dedup();
-    for name in named.into_iter().take(SHOWN) {
-        if picked.len() >= SHOWN {
-            break;
-        }
+    for name in named {
         let Ok(value) = host.call(memory_methods::SYMBOL, scope_args(scope, json!({"name": name}))).await else { continue };
         let Ok(detail) = serde_json::from_value::<SymbolDetail>(value) else { continue };
         if TYPE_KINDS.contains(&detail.symbol.kind.as_str()) && detail.symbol.name == name && !picked.iter().any(|known| known.sid == detail.symbol.sid) {
             picked.push(detail.symbol);
         }
     }
-    picked.truncate(SHOWN);
     let mut items = Vec::new();
     for ty in &picked {
         if !files.contains_key(&ty.path) {
             let Ok(text) = std::fs::read_to_string(std::path::Path::new(&scope.workspace).join(&ty.path)) else { continue };
-            let symbols = outline(host, scope, &ty.path).await;
-            files.insert(ty.path.clone(), (symbols, text.lines().map(str::to_owned).collect()));
+            files.insert(ty.path.clone(), (Vec::new(), text.lines().map(str::to_owned).collect()));
         }
-        let (symbols, text) = &files[&ty.path];
-        let (start, end) = (ty.start_line as usize, ty.end_line as usize);
+        let (_, text) = &files[&ty.path];
+        let (start, end) = (ty.start_line as usize, (ty.end_line as usize).max(ty.start_line as usize));
         if start == 0 || start > text.len() {
             continue;
         }
-        let shown: Vec<&str> = if end + 1 - start <= WHOLE_LINES {
-            text[start - 1..end.min(text.len())].iter().map(String::as_str).collect()
-        } else {
-            // A long declaration: its first line and its members' lines.
-            let members = symbols.iter().filter(|symbol| FIELD_KINDS.contains(&symbol.kind.as_str()) && owner(symbol) == Some(ty.qname.as_str()));
-            std::iter::once(text[start - 1].as_str()).chain(members.filter_map(|member| text.get(member.start_line as usize - 1).map(String::as_str))).collect()
-        };
+        let shown: Vec<&str> = text[start - 1..end.min(text.len())].iter().map(String::as_str).collect();
         items.push(format!("{}:{}\n{}", ty.path, start, shown.join("\n")));
     }
     (!items.is_empty()).then(|| items.join("\n\n"))

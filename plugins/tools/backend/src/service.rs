@@ -10,7 +10,7 @@ use cc_protocol::contracts::frame::{ProjectDeleted, SessionDeleted, topics as fr
 use cc_protocol::contracts::lifecycle::{ProbeCheck, ProbeReport};
 use cc_protocol::contracts::model::ToolCall;
 use cc_protocol::contracts::tools::{
-    AgentEnvParams, AgentEnvResult, ApproveParams, ApproveResult, ArtifactParams, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
+    AgentEnvParams, AgentEnvResult, ApproveParams, ApproveResult, ArtifactParams, ArtifactPutParams, ArtifactPutResult, ArtifactResult, ExecContext, ExecuteParams, FileEntry, FilesParams, FilesResult,
     JobListParams, JobParams, JobStatus, McpCallParams, McpCallResult, McpListParams, McpListResult, McpTool, NormalizeParams, NormalizeResult, ReadParams, ReadResult, RedoParams, RunParams, RunResult,
     SaveParams, SaveResult, SchemasParams, SkillsShownParams, TimelineDiffParams, TimelineParams, UndoParams, WorkspaceCreateParams, WorkspaceListParams,
     WorkspaceListResult, WorkspaceRemoveParams, methods, topics,
@@ -36,6 +36,7 @@ pub const PROVIDES: &[&str] = &[
     methods::JOB_KILL,
     methods::JOB_LIST,
     methods::ARTIFACT,
+    methods::ARTIFACT_PUT,
     methods::WORKSPACE_CREATE,
     methods::WORKSPACE_REMOVE,
     methods::WORKSPACE_LIST,
@@ -136,7 +137,7 @@ impl crate::jobs::Publisher for JobEnds {
         if ended
             && let Some(core) = self.core.upgrade()
             && let Some(job_id) = data.get("job_id").and_then(Value::as_str)
-            && let Some((meta, _)) = core.jobs.status(job_id)
+            && let Some(meta) = core.jobs.meta(job_id)
             && !meta.cwd.is_empty()
         {
             let who = Attribution::session(&meta.session_id, "run", &meta.command);
@@ -468,8 +469,7 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
             let params: ArtifactParams = parse_params(params)?;
             let bytes = core.artifacts.read(&params.id).map_err(|_| RpcError::not_found(format!("no artifact `{}`", params.id)))?;
             let total_bytes = bytes.len() as u64;
-            let total_lines =
-                bytes.iter().filter(|b| **b == b'\n').count() as u64 + u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+            let total_lines = crate::artifacts::line_count(&bytes);
             let slice: Vec<u8> = match &params.range {
                 None => bytes,
                 Some(range) => {
@@ -494,6 +494,12 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
                 }
             };
             to_value(&ArtifactResult { id: params.id, encoding: encoding.to_owned(), data, bytes: bytes_len, total_bytes, total_lines })
+        }
+        methods::ARTIFACT_PUT => {
+            let params: ArtifactPutParams = parse_params(params)?;
+            let lines = crate::artifacts::line_count(params.text.as_bytes());
+            let id = core.artifacts.store(params.text.as_bytes(), params.session_id.as_deref()).map_err(|error| RpcError::internal(format!("keeping the artifact failed: {error}")))?;
+            to_value(&ArtifactPutResult { id, lines })
         }
         methods::WORKSPACE_CREATE => {
             let params: WorkspaceCreateParams = parse_params(params)?;
@@ -640,8 +646,15 @@ pub async fn dispatch(core: Arc<Core>, host: Arc<dyn Host>, call: Call) -> Resul
         }
         methods::TESTS_REPORT => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or_default().to_owned();
-            let (report, notes) = tokio::task::spawn_blocking(move || crate::exec::tests_report(&text)).await.map_err(|error| RpcError::internal(error.to_string()))?;
-            Ok(json!({ "report": report, "notes": notes }))
+            // The artifact the text was read from (kept, never stored again) and the session a new
+            // one belongs to.
+            let artifact = params.get("artifact").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned);
+            let session = params.get("session_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned);
+            let core = core.clone();
+            let (report, notes, artifact) = tokio::task::spawn_blocking(move || crate::exec::tests_report(&core, &text, artifact, session.as_deref()))
+                .await
+                .map_err(|error| RpcError::internal(error.to_string()))?;
+            Ok(json!({ "report": report, "notes": notes, "artifact": artifact }))
         }
         methods::SHARES => to_value(&crate::share::shares()),
         methods::SECURITY_SCAN | methods::SECURITY_DEPS => crate::share::security(&method, params).await,

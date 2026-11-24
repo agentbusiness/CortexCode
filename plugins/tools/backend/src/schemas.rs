@@ -162,7 +162,7 @@ pub fn run_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "intent": intent(),
-                "command": {"type": "string", "description": "The command line. Every run starts in the repository root: a cd lasts for this command only, exports carry over. A failing test run shows its counts, one line per failing test and the first failure whole; the whole output is artifact://<id>. Long output is saved whole as artifact://<id>: you see its head and tail and can read any range of it."},
+                "command": {"type": "string", "description": "The command line. Every run starts in the repository root: a cd lasts for this command only, exports carry over. A failing test run shows its counts and every failing test with its error; the whole output is artifact://<id>. Long output is saved whole as artifact://<id>: you see its head and tail and can read any range of it."},
                 "timeout_ms": {"type": "integer", "description": "Kill the command and everything it started after this many milliseconds (default 600000)."},
                 "background": {"type": "boolean", "description": "Start as a background job (servers, watchers, long builds) and return at once; you are woken when it exits."},
                 "wake": {

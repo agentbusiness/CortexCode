@@ -120,7 +120,7 @@ pub async fn execute_in(
     let started = Instant::now();
     let ExecuteParams { context, call } = params;
     // A shared service of this machine offered as a tool (`services`).
-    if let Some(outcome) = crate::services::execute(host.as_ref(), &context, &call, started).await {
+    if let Some(outcome) = crate::services::execute(core, host.as_ref(), &context, &call, started).await {
         return outcome;
     }
     let session = Session { workspace: util::canonical_lenient(&util::expand_home(&context.workspace)), context: &context, python_env };
@@ -330,7 +330,7 @@ pub async fn attach_code_skills(core: &Core, host: &dyn Host, session_id: &str, 
 }
 
 /// Offload model-facing text that exceeds the limit (full text kept as an artifact).
-fn offload_text(core: &Core, session: &str, text: String, limits: InlineLimits) -> (String, Option<String>) {
+pub(crate) fn offload_text(core: &Core, session: &str, text: String, limits: InlineLimits) -> (String, Option<String>) {
     if text.len() <= limits.inline {
         return (text, None);
     }
@@ -947,6 +947,10 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
     similar::TextDiff::configure().algorithm(similar::Algorithm::RawMyers).diff_lines(old, new).unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
 }
 
+/// Definitions a refusal names when a name resolves to none: the closest to the name written, the
+/// rest left to the file's outline.
+const CLOSEST_DEFINITIONS: usize = 30;
+
 /// The line range (`a-b`, 1-based) of the one definition of `file` that `name` names: its last
 /// part (`take` in `Cursor::take`) is a word of the definition's header, and every earlier part is
 /// a word of an enclosing definition's header. A refusal lists the candidates when the name is
@@ -981,15 +985,33 @@ fn definition_range(session: &Session<'_>, file: &str, name: &str) -> Result<Str
         .filter(|(parents, item)| has_word(&header(item), last) && earlier.iter().all(|part| parents.iter().any(|parent| has_word(&header(parent), part))))
         .map(|(_, item)| *item)
         .collect();
-    let shown = |item: &crate::lang::Item| format!("line {} `{}`", item.start + 1, lines.get(item.start).map(|line| line.trim().chars().take(60).collect::<String>()).unwrap_or_default());
+    let shown = |item: &crate::lang::Item| format!("line {} `{}`", item.start + 1, lines.get(item.start).map(|line| line.trim()).unwrap_or_default());
     match found.as_slice() {
         [item] => Ok(format!("{}-{}", item.start + 1, item.end + 1)),
         [] => {
-            let listed: Vec<String> = all.iter().take(30).map(|(_, item)| shown(item)).collect();
-            Err(format!("{file} has no definition named `{name}`. Its definitions:\n{}", listed.join("\n")))
+            // The definitions closest to the name it wrote first (a misspelling, another case);
+            // the file's outline has every one.
+            let wanted = last.to_lowercase();
+            let closeness = |item: &crate::lang::Item| -> f32 {
+                header(item)
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|word| !word.is_empty())
+                    .map(|word| similar::TextDiff::from_chars(wanted.as_str(), word.to_lowercase().as_str()).ratio())
+                    .fold(0.0, f32::max)
+            };
+            let mut ranked: Vec<(f32, &crate::lang::Item)> = all.iter().map(|(_, item)| (closeness(item), *item)).collect();
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.start.cmp(&b.1.start)));
+            let listed: Vec<String> = ranked.iter().take(CLOSEST_DEFINITIONS).map(|(_, item)| shown(item)).collect();
+            let rest = if ranked.len() > CLOSEST_DEFINITIONS {
+                format!("\n[{} more definitions: read outline://{file} for every one]", ranked.len() - CLOSEST_DEFINITIONS)
+            } else {
+                String::new()
+            };
+            let heading = if ranked.len() > CLOSEST_DEFINITIONS { "Its definitions closest to that name" } else { "Its definitions" };
+            Err(format!("{file} has no definition named `{name}`. {heading}:\n{}{rest}", listed.join("\n")))
         }
         many => {
-            let listed: Vec<String> = many.iter().take(10).map(|item| shown(item)).collect();
+            let listed: Vec<String> = many.iter().map(|item| shown(item)).collect();
             Err(format!("`{name}` names {} definitions in {file}; name the one you mean with its type, e.g. {file}#Type::{last}:\n{}", many.len(), listed.join("\n")))
         }
     }
@@ -1389,7 +1411,7 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
                 shown.extend(spots.iter().map(|&(line, _)| (line.saturating_sub(1), line)));
             }
             let mut text = format!("Nothing was written: this edit would add a syntax error to {display}.\n");
-            for issue in issues.iter().take(5) {
+            for issue in &issues {
                 let _ = writeln!(text, "- line {}: {}", issue.line, issue.detail);
             }
             for note in closing_notes(&absolute, &old_text, map, &new, &changed) {
@@ -1402,7 +1424,7 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
             for &(start, end) in &shown {
                 lines.extend(start.saturating_sub(1)..(end + 1).min(proposed.len()));
             }
-            for issue in issues.iter().take(5) {
+            for issue in &issues {
                 let at = issue.line.saturating_sub(1);
                 lines.extend(at.saturating_sub(SYNTAX_CONTEXT)..(at + SYNTAX_CONTEXT + 1).min(proposed.len()));
             }
@@ -1414,7 +1436,7 @@ fn commit(core: &Core, host: &Arc<dyn Host>, session: &Session<'_>, commit: Comm
                 let number = (line + 1).to_string();
                 let _ = writeln!(text, "{number}  {}", proposed.lines[line]);
                 // A caret under each error's column: the spot, not only the line.
-                for issue in issues.iter().take(5).filter(|issue| issue.line == line + 1) {
+                for issue in issues.iter().filter(|issue| issue.line == line + 1) {
                     let lead: String = proposed.lines[line].chars().take(issue.column.saturating_sub(1)).map(|c| if c == '\t' { '\t' } else { ' ' }).collect();
                     let _ = writeln!(text, "{}  {lead}^ {}", " ".repeat(number.len()), issue.detail);
                 }
@@ -1819,14 +1841,13 @@ async fn exec_edit(core: &Arc<Core>, host: &Arc<dyn Host>, session: &Session<'_>
                     && let Some(replaced) = replaced_definitions(&absolute, &text, &applied.line_map, &written)
                     && replaced.len() > MAX_DEFINITIONS_PER_EDIT
                 {
-                    let names: Vec<String> = replaced.iter().take(6).map(|name| format!("`{name}`")).collect();
+                    let names: Vec<String> = replaced.iter().map(|name| format!("`{name}`")).collect();
                     return Out::fail(
                         "too_big",
                         format!(
-                            "Nothing was written: this edit replaces {} top-level definitions of {display} at once ({}{}). Change an existing file one or two top-level definitions per edit (a class with its methods is one); the anchors of the lines you do not change stay valid between edits.",
+                            "Nothing was written: this edit replaces {} top-level definitions of {display} at once ({}). Change an existing file one or two top-level definitions per edit (a class with its methods is one); the anchors of the lines you do not change stay valid between edits.",
                             replaced.len(),
                             names.join(", "),
-                            if replaced.len() > 6 { ", ..." } else { "" }
                         ),
                     );
                 }
@@ -2193,16 +2214,7 @@ pub fn present_output(core: &Core, session: &str, captured: Captured, limits: In
         }
         Captured::File { path, head, tail, total, newlines } => {
             let id = core.artifacts.adopt(&path, Some(session)).unwrap_or_else(|_| path.to_string_lossy().into_owned());
-            let head_text = String::from_utf8_lossy(&head[..head.len().min(limits.head)]).into_owned();
-            let tail_start = tail.len().saturating_sub(limits.tail);
-            let tail_text = String::from_utf8_lossy(&tail[tail_start..]).into_owned();
-            let head_cut = head_text.rfind('\n').map(|index| index + 1).unwrap_or(head_text.len());
-            let tail_cut = tail_text.find('\n').map(|index| index + 1).unwrap_or(0);
-            let (head, tail) = (&head_text[..head_cut], &tail_text[tail_cut..]);
-            let head_lines = head.lines().count();
-            let omitted = (newlines as usize).saturating_sub(head_lines + tail.lines().count());
-            let text = format!("{head}{}{tail}", artifacts::omitted_marker(&id, head_lines, omitted));
-            (text, Some(id), total)
+            (artifacts::ends_view(&head, &tail, newlines, &id, limits), Some(id), total)
         }
     }
 }
@@ -2210,9 +2222,10 @@ pub fn present_output(core: &Core, session: &str, captured: Captured, limits: In
 /// Bytes of output a test run may have for its compact view (see [`crate::testout`]).
 pub const TEST_VIEW_BYTES: u64 = 1 << 20;
 
-/// A failing test run shown in the form the model acts on (see [`crate::testout`]): its counts,
-/// one line per failing test, the first failure whole, and the whole output kept as an artifact
-/// for the rest. Any other output is `text` as given.
+/// A failing test run shown in the form the model acts on (see [`crate::testout`]): its counts and
+/// every failing test with its whole error (when those are long, one line per failing test with
+/// the range of its block), and the whole output kept as an artifact for the rest. Any other
+/// output is `text` as given.
 fn test_view(core: &Core, session: &str, whole: Option<String>, text: String, artifact: Option<String>) -> (String, Option<String>) {
     let Some(whole) = whole else { return (text, artifact) };
     // Tests the runner could not reach: said last, passing run or not, since a run without them
@@ -2224,29 +2237,41 @@ fn test_view(core: &Core, session: &str, whole: Option<String>, text: String, ar
         let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
         return (format!("{text}{gap}[No tests ran: this command found none in the project. Add tests to the project, or check the change with a probe in `tmp/`.]\n{unreachable}"), artifact);
     }
-    let Some(summary) = crate::testout::present(&whole) else {
+    // The whole output is kept once, for the ranges a long report names and the pointer after it.
+    let mut kept = artifact;
+    let keep = |kept: &mut Option<String>| -> Option<String> {
+        if kept.is_none() {
+            *kept = core.artifacts.store(whole.as_bytes(), Some(session)).ok();
+        }
+        kept.clone()
+    };
+    let Some(summary) = crate::testout::present(&whole, core.config.run_limits.inline, || keep(&mut kept)) else {
         if unreachable.is_empty() {
-            return (text, artifact);
+            return (text, kept);
         }
         let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-        return (format!("{text}{gap}{unreachable}"), artifact);
+        return (format!("{text}{gap}{unreachable}"), kept);
     };
-    let id = match artifact {
-        Some(id) => id,
-        None => match core.artifacts.store(whole.as_bytes(), Some(session)) {
-            Ok(id) => id,
-            Err(_) => return (text, None),
-        },
-    };
-    (format!("{summary}\nEvery failure whole: read artifact://{id}\n{unreachable}"), Some(id))
+    match keep(&mut kept) {
+        Some(id) => (format!("{summary}\nThe whole output: read artifact://{id}\n{unreachable}"), Some(id)),
+        None => (format!("{summary}{unreachable}"), None),
+    }
 }
 
 /// A test run's output in its compact form (see [`crate::testout`]) for text that did not come from a
 /// command of this session (`tools.tests.report`: output the user pasted or attached): the report and
 /// the line naming tests that never ran (None when the text is not a runner's report with either),
-/// and the notes alone, for output shown whole (what a failure means, tests that never ran).
-pub fn tests_report(text: &str) -> (Option<String>, Option<String>) {
-    let summary = crate::testout::present(text);
+/// and the notes alone, for output shown whole (what a failure means, tests that never ran), and
+/// the artifact that holds the text whole when the report names its lines (the caller's own
+/// `artifact` when it gave one, so the text is never kept twice).
+pub fn tests_report(core: &Core, text: &str, artifact: Option<String>, session: Option<&str>) -> (Option<String>, Option<String>, Option<String>) {
+    // A long report names each failure's lines in the text, kept whole as an artifact: the one the
+    // caller read it from, else stored once under the caller's session.
+    let mut kept = None;
+    let summary = crate::testout::present(text, core.config.run_limits.inline, || {
+        kept = artifact.or_else(|| core.artifacts.store(text.as_bytes(), session).ok());
+        kept.clone()
+    });
     let unreachable = never_run_line(text);
     let mut notes: String = crate::testout::notes(text).iter().map(|note| format!("{note}\n")).collect();
     notes.push_str(&unreachable);
@@ -2256,7 +2281,7 @@ pub fn tests_report(text: &str) -> (Option<String>, Option<String>) {
         (None, false) => Some(unreachable),
         (Some(summary), _) => Some(format!("{summary}{unreachable}")),
     };
-    (report, notes)
+    (report, notes, kept)
 }
 
 /// The line that names tests the runner found but could not run (see [`crate::testout::never_run`]),
@@ -3415,7 +3440,7 @@ async fn piped_download(host: &Arc<dyn Host>, session: &Session<'_>, command: &s
     let shown = format!("tmp/{name}");
     let lines = text.lines().count();
     if !found.is_empty() {
-        let listed: Vec<String> = found.iter().take(6).cloned().collect();
+        let listed: Vec<String> = found.clone();
         let mut out = Out::fail(
             "needs_approval",
             format!(

@@ -78,7 +78,7 @@ pub const ROLES: &[&str] = &[ROLE_CHAT, ROLE_AGENT];
 pub const ROLE_CHAT: &str = "chat";
 pub const ROLE_AGENT: &str = "agent";
 /// Stages the flow runs; each must be configured.
-pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "REVIEW", "MANAGE", "ACCEPT", "STEER", "PLAN_NOTES"];
+pub const STAGES: &[&str] = &["ROUTE", "DECIDE", "CHECKS", "REPLY", "DO", "TASK", "ASK", "PLAN", "PLAN_EDIT", "KNOWLEDGE", "LEARN", "PROCEDURE", "DESCRIBE", "CONTRACT", "REVIEW", "MANAGE", "ACCEPT", "STEER", "PLAN_NOTES"];
 /// Fields the flow reads from each constrained stage's output, and the values it can act on.
 /// (stage, fields it reads, the enum field and the values the flow can act on).
 type SchemaNeed = (&'static str, &'static [&'static str], Option<(&'static str, &'static [&'static str])>);
@@ -299,9 +299,6 @@ pub struct Limits {
     /// first, the rest counted).
     #[serde(default = "diagnostics_shown")]
     pub diagnostics_shown: u32,
-    /// Knowledge items one KNOWLEDGE stage may propose (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
-    #[serde(default = "knowledge_items_per_turn")]
-    pub knowledge_items_per_turn: usize,
     /// Knowledge items read by meaning for a turn's work and shown as one host note; 0 = none (P4).
     #[serde(default = "knowledge_per_turn")]
     pub knowledge_per_turn: u32,
@@ -314,19 +311,25 @@ pub struct Limits {
     /// Lessons learned from a failure shown right under that failure when it comes again; 0 = none.
     #[serde(default = "lessons_per_failure")]
     pub lessons_per_failure: u32,
-    /// Episodes one finished run is learned from, at most.
-    #[serde(default = "learn_episodes_per_run")]
-    pub learn_episodes_per_run: usize,
     /// A new lesson at least this similar to a stored one (search score) is that lesson again.
     #[serde(default = "lesson_merge_score")]
     pub lesson_merge_score: f64,
     /// Earlier runs without a learned mark taken up after a run is learned.
     #[serde(default = "learn_backlog_runs")]
     pub learn_backlog_runs: usize,
-    /// The project's own contract (its `AGENTS.md`, else `CLAUDE.md`) in the system prompt, in
-    /// characters; 0 = none.
+    /// The length the project's own contract (its `AGENTS.md`, else `CLAUDE.md`) is shown within in
+    /// the system prompt, in characters; 0 = none. A longer one is written again shorter by the
+    /// model (stage CONTRACT), never cut.
     #[serde(default = "contract_chars")]
     pub contract_chars: usize,
+    /// No longer read (every item proposed is kept; every episode is learned). Still accepted, so a
+    /// live data set written before stays loadable: limits refuse unknown keys.
+    #[allow(dead_code)]
+    #[serde(default, rename = "knowledge_items_per_turn")]
+    _knowledge_items_per_turn: Option<usize>,
+    #[allow(dead_code)]
+    #[serde(default, rename = "learn_episodes_per_run")]
+    _learn_episodes_per_run: Option<usize>,
 }
 
 // Defaults for limits added after the first data sets (an older override stays valid).
@@ -336,14 +339,11 @@ fn plan_max_tasks() -> usize {
 fn diagnostics_shown() -> u32 {
     12
 }
-fn knowledge_items_per_turn() -> usize {
-    3
-}
 fn knowledge_per_turn() -> u32 {
     5
 }
 fn contract_chars() -> usize {
-    40000
+    20000
 }
 
 fn brief_tokens() -> u32 {
@@ -354,9 +354,6 @@ fn lessons_per_turn() -> u32 {
 }
 fn lessons_per_failure() -> u32 {
     1
-}
-fn learn_episodes_per_run() -> usize {
-    6
 }
 fn lesson_merge_score() -> f64 {
     0.56

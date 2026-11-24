@@ -8,7 +8,7 @@
 //!    (then spread across sources), skipping sources the topic's notes already cite (notes are
 //!    global, kept by the memory plugin: research on the topic from any project counts);
 //! 3. **read** (map): each picked source is fetched as text and split into chunks of `chunk_chars`;
-//!    one model call per chunk extracts notes (claim + verbatim quote) for the questions. A quote
+//!    every chunk is read, one model call per chunk extracts notes (claim + verbatim quote) for the questions. A quote
 //!    that is not in the chunk is dropped, so every note is grounded in what was read;
 //! 4. **synthesize** (reduce): the topic's notes only (never raw pages) become a summary and
 //!    findings citing notes; more notes than fit are condensed in batches first;
@@ -436,6 +436,29 @@ impl Run {
         self.jobs.notes.list("", Some(&self.state.job.topic)).await
     }
 
+    /// Earlier notes of the topic for the plan: all of them when they are few; else the ones closest
+    /// in meaning to the topic and its questions, plus those not embedded yet (the search cannot rank
+    /// them, so they come whole rather than be left out).
+    async fn known_for_plan(&self) -> Result<Vec<Note>, RpcError> {
+        let notes = self.topic_notes().await?;
+        if notes.len() <= PLAN_NOTES {
+            return Ok(notes);
+        }
+        let text = format!("{}\n{}", self.state.job.topic, self.state.job.questions.join("\n"));
+        let Ok(found) = self.jobs.notes.search("", Some(&self.state.job.topic), &text, PLAN_NOTES as u32).await else {
+            return Ok(notes);
+        };
+        let mut picked = found.notes;
+        // Embedding runs in write order: the unranked ones are the newest (the list is oldest first).
+        let unranked = notes.len().saturating_sub(found.pending as usize);
+        for note in notes.into_iter().skip(unranked) {
+            if !picked.iter().any(|p| p.id == note.id) {
+                picked.push(note);
+            }
+        }
+        Ok(picked)
+    }
+
     async fn drive(&mut self) -> Result<(), RpcError> {
         debug_assert!(phase_names().contains(&self.state.job.phase.as_str()));
         loop {
@@ -495,7 +518,8 @@ impl Run {
             priority,
             cache_key: Some(format!("research-{}", self.state.job.job_id)),
             stop: Vec::new(),
-            max_tokens: Some(self.config().model_max_tokens),
+            // No cap: an answer the model was stopped in the middle of is not used (below).
+            max_tokens: None,
             idle_only: false,
         };
         let result = self.jobs.tools.chat(params, self.cancel.clone()).await.map_err(|error| {
@@ -506,6 +530,9 @@ impl Run {
             }
         })?;
         self.check()?;
+        if result.finish_reason == "length" {
+            return Err(RpcError::internal("the model's answer did not fit its context and was stopped before its end"));
+        }
         parse_json_answer(&result.content).ok_or_else(|| RpcError::internal(format!("the model's answer is not JSON: {}", crate::text::clip(&result.content, 200))))
     }
 
@@ -520,7 +547,7 @@ impl Run {
             return Ok(());
         }
         self.progress("plan", 0, 1, "planning sub-questions and searches");
-        let known: Vec<String> = self.topic_notes().await?.iter().take(30).map(|n| format!("- {}", n.claim)).collect();
+        let known: Vec<String> = self.known_for_plan().await?.iter().map(|n| format!("- {}", n.claim)).collect();
         let given = &self.state.job.questions;
         let mut user = format!("Topic: {}\nToday: {}\n", self.state.job.topic, chrono::Utc::now().date_naive());
         if given.is_empty() {
@@ -682,18 +709,18 @@ impl Run {
     }
 
     async fn read_one(&self, candidate: &Candidate) -> Result<(u32, u32), ReadFailure> {
-        let budget = self.config().chunk_chars * u64::from(self.config().max_chunks_per_source);
-        let mut fetched = self.jobs.tools.fetch(FetchParams { url: candidate.read_url.clone(), max_chars: Some(budget), ..FetchParams::default() }).await;
+        // The whole text: every chunk of it is read (one model call each).
+        let mut fetched = self.jobs.tools.fetch(FetchParams { url: candidate.read_url.clone(), max_chars: None, ..FetchParams::default() }).await;
         // A paper's PDF that cannot be read: its landing page still has the abstract.
         if fetched.is_err() && candidate.read_url != candidate.hit.url {
-            fetched = self.jobs.tools.fetch(FetchParams { url: candidate.hit.url.clone(), max_chars: Some(budget), ..FetchParams::default() }).await;
+            fetched = self.jobs.tools.fetch(FetchParams { url: candidate.hit.url.clone(), max_chars: None, ..FetchParams::default() }).await;
         }
         let fetched = fetched.map_err(ReadFailure::Source)?;
         self.check()?;
         if fetched.text.trim().chars().count() < 200 {
             return Err(ReadFailure::Source(RpcError::new(codes::NOT_FOUND, "no readable text")));
         }
-        let chunks = chunk(&fetched.text, self.config().chunk_chars as usize, self.config().max_chunks_per_source as usize);
+        let chunks = chunk(&fetched.text, self.config().chunk_chars as usize);
         let questions = self.questions_block();
         let title = if fetched.title.is_empty() { candidate.hit.title.clone() } else { fetched.title.clone() };
         let date = fetched.published.clone().or_else(|| candidate.hit.date.clone());
@@ -774,7 +801,7 @@ impl Run {
         // Items to reduce: (text, note ids). Notes first; condensed findings when they do not fit.
         let mut items: Vec<(String, Vec<String>)> = notes
             .iter()
-            .map(|n| (format!("({}, {}) {} — \"{}\"", n.title, n.date.as_deref().unwrap_or("undated"), n.claim, crate::text::clip(&n.quote, 400)), vec![n.id.clone()]))
+            .map(|n| (format!("({}, {}) {} — \"{}\"", n.title, n.date.as_deref().unwrap_or("undated"), n.claim, n.quote), vec![n.id.clone()]))
             .collect();
         let budget = self.config().synth_chars as usize;
         let mut level = 0;
@@ -981,6 +1008,9 @@ impl Run {
 }
 
 // ----- prompts and schemas -----
+
+/// Earlier notes shown whole to the plan; more are picked by meaning (a top-k search).
+const PLAN_NOTES: usize = 30;
 
 const PLAN_SYSTEM: &str = "You plan research. Break the topic into sub-questions that can be answered from papers, code repositories, discussions and web pages, and write the searches for each: short keyword queries as typed into a search engine (no quotes unless an exact phrase matters). Answer with JSON only.";
 
@@ -1203,8 +1233,8 @@ pub fn pick(found: Vec<(SearchHit, usize)>, cited: &HashSet<String>, visited: &H
 }
 
 /// Split text at paragraph boundaries into chunks of at most `size` characters (a longer paragraph
-/// is cut), at most `max` chunks.
-pub fn chunk(text: &str, size: usize, max: usize) -> Vec<String> {
+/// is split across chunks); every character of the text is in a chunk.
+pub fn chunk(text: &str, size: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     for paragraph in text.split("\n\n") {
@@ -1227,14 +1257,10 @@ pub fn chunk(text: &str, size: usize, max: usize) -> Vec<String> {
             }
             current.push_str(&paragraph);
         }
-        if chunks.len() >= max {
-            break;
-        }
     }
     if !current.is_empty() {
         chunks.push(current);
     }
-    chunks.truncate(max);
     chunks
 }
 

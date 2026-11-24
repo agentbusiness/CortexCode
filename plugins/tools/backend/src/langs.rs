@@ -173,9 +173,9 @@ pub fn counts(errors: usize, warnings: usize) -> String {
     parts.join(", ")
 }
 
-/// A diagnostic's message whole: up to 3 lines, later ones indented under the first.
+/// A diagnostic's message whole, later lines indented under the first.
 pub fn message_text(message: &str) -> String {
-    message.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).take(3).collect::<Vec<_>>().join("\n  ")
+    message.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect::<Vec<_>>().join("\n  ")
 }
 
 /// The errors and warnings listed for `only` (every file when empty), errors first.

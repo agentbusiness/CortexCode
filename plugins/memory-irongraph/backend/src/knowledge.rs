@@ -573,9 +573,12 @@ impl WorkStore {
         Ok(KnowledgeLinkedResult { items: out })
     }
 
-    /// What every session of the project should know, within `budget_tokens`: accepted decisions,
-    /// then facts (the user's first), concepts by how much code they bind, open questions; newest
-    /// first within a group; one line each, no ids (the Knowledge section has them).
+    /// What every session of the project should know, whole: the project's description, accepted
+    /// decisions, facts (the user's first), open questions and settled hypotheses; newest first within
+    /// a group; one line each, no ids (the Knowledge section has them). Nothing is cut to a budget:
+    /// a nonzero `budget_tokens` is not applied (0 still means no brief). Concepts are not in the
+    /// brief: a turn reaches them by meaning (the chat flow's knowledge note searches the project
+    /// with the work's own sentence), so the brief need not hold them all.
     pub async fn knowledge_brief(&self, budget_tokens: u32, host: Option<Arc<dyn Host>>) -> Result<KnowledgeBriefResult, RpcError> {
         if budget_tokens == 0 {
             return Ok(KnowledgeBriefResult::default());
@@ -584,14 +587,12 @@ impl WorkStore {
         if live.is_empty() {
             return Ok(KnowledgeBriefResult::default());
         }
-        let code_links = |item: &KnowledgeItem| item.links.iter().filter(|l| matches!(l.rel.as_str(), "implemented_by" | "about")).count();
         let mut groups: BTreeMap<u8, Vec<&KnowledgeItem>> = BTreeMap::new();
         for item in &live {
             let group = match item.kind.as_str() {
                 k::DESCRIPTION => 0,
                 k::DECISION => 1,
                 k::FACT => 2,
-                k::CONCEPT => 3,
                 k::QUESTION if item.state == "open" => 4,
                 k::HYPOTHESIS if item.state != "open" => 5,
                 _ => continue,
@@ -602,14 +603,12 @@ impl WorkStore {
         for (group, mut items) in groups {
             match group {
                 2 => items.sort_by(|a, b| ((a.source != "user") as u8, std::cmp::Reverse(a.updated_ms)).cmp(&((b.source != "user") as u8, std::cmp::Reverse(b.updated_ms)))),
-                3 => items.sort_by(|a, b| (std::cmp::Reverse(code_links(a)), std::cmp::Reverse(a.updated_ms)).cmp(&(std::cmp::Reverse(code_links(b)), std::cmp::Reverse(b.updated_ms)))),
                 _ => items.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms)),
             }
             for item in items {
                 let text = match item.kind.as_str() {
                     // The project's description is the brief's opening paragraph, not a bullet.
                     k::DESCRIPTION => format!("{}\n", item.text.trim()),
-                    k::CONCEPT => format!("- {}: {}", item.name, item.text),
                     k::HYPOTHESIS => format!("- {} ({}): {}", item.name, item.state, item.text),
                     k::QUESTION => format!("- open question: {}", item.text),
                     k::DECISION => format!("- decided: {}", item.text),
@@ -619,28 +618,8 @@ impl WorkStore {
             }
         }
         let counter = MapCounter::new(host).await;
-        let render = |n: usize| lines[..n].iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n");
-        let mut fits = 0usize;
-        let mut tokens = 0u32;
-        let full = counter.tokens(&render(lines.len())).await;
-        if full <= budget_tokens {
-            fits = lines.len();
-            tokens = full;
-        } else {
-            // The longest prefix of lines within the budget (tokens grow with lines).
-            let (mut low, mut high) = (0usize, lines.len());
-            while low < high {
-                let mid = (low + high).div_ceil(2);
-                let counted = counter.tokens(&render(mid)).await;
-                if counted <= budget_tokens {
-                    low = mid;
-                    fits = mid;
-                    tokens = counted;
-                } else {
-                    high = mid - 1;
-                }
-            }
-        }
-        Ok(KnowledgeBriefResult { text: render(fits), ids: lines[..fits].iter().map(|(id, _)| id.clone()).collect(), tokens, by_model: counter.by_model() })
+        let text = lines.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n");
+        let tokens = counter.tokens(&text).await;
+        Ok(KnowledgeBriefResult { text, ids: lines.into_iter().map(|(id, _)| id).collect(), tokens, by_model: counter.by_model() })
     }
 }

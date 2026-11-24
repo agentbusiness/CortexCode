@@ -64,7 +64,7 @@ pub async fn episode(
         anchor: anchor.into(),
         lesson_id: lesson_id.into(),
         evidence: evidence.into(),
-        text: text.chars().take(1800).collect(),
+        text: text.to_owned(),
         outcome: outcome.into(),
         ..Default::default()
     };
@@ -84,7 +84,7 @@ struct Proposal {
     steps: Vec<String>,
 }
 
-/// One bounded call at idle, after the existing learning backlog is drained.
+/// One call at idle, after the existing learning backlog is drained.
 pub async fn synthesize(
     host: &Host,
     data: &Dataset,
@@ -97,10 +97,9 @@ pub async fn synthesize(
     if material.episodes.is_empty() || cancel.is_cancelled() {
         return Ok(false);
     }
-    // Outcome history helps the proposer, never the foreground coding model.
-    material.history.truncate(3);
+    // Outcome history helps the proposer, never the foreground coding model: every revision with
+    // every use, so the proposer sees all the advice that failed before.
     for revision in &mut material.history {
-        revision.uses.truncate(3);
         revision.sources.clear();
     }
     let episode_keys: Vec<String> = material.episodes.iter().map(|e| e.key.clone()).collect();
@@ -118,17 +117,20 @@ pub async fn synthesize(
                 journals.insert(episode.session_id.clone(), (session.workspace, entries));
             }
         }
-        let card = journals
-            .get(&episode.session_id)
-            .and_then(|(workspace, entries)| {
+        let card = match journals.get(&episode.session_id) {
+            Some((workspace, entries)) => {
                 crate::learn::procedure_card(
+                    host,
                     data,
                     entries,
                     &episode.run_id,
                     workspace,
                     &episode.evidence,
                 )
-            });
+                .await
+            }
+            None => None,
+        };
         evidence.push(json!({"episode": episode, "card": card}));
     }
     // Full episode cards are transient model input, not duplicate logs stored in graph properties.
@@ -137,7 +139,7 @@ pub async fn synthesize(
         "messages": [ChatMessage::new("system", data.prompt("procedure")), ChatMessage::new("user", serde_json::to_string(&context).map_err(|e| RpcError::internal(e.to_string()))?)],
         "tools": [], "grammar": schemas::grammar(shape), "sampling": data.sampling("PROCEDURE", false),
         "thinking": crate::llm::thinking("none"), "priority": "background", "idle_only": true,
-        "cache_key": "procedure", "max_tokens": 1000
+        "cache_key": "procedure"
     });
     let value = crate::llm::on_best_model(
         host,
@@ -155,6 +157,10 @@ pub async fn synthesize(
         return Ok(false);
     }
     let result: ChatResult = cc_protocol::parse_params(value)?;
+    // An answer the model could not finish proposes nothing.
+    if result.finish_reason == "length" {
+        return Err(RpcError::internal("The procedure proposal was not finished"));
+    }
     let proposal: Proposal = schemas::parse_json(&result.content)
         .map_err(|e| RpcError::internal(format!("Procedure proposal could not be read: {e}")))?;
     host.call(methods::PROCEDURE_PROPOSE, json!({"episode_keys": episode_keys, "useful": proposal.useful == "yes", "name": proposal.name, "applicability": proposal.applicability, "steps": proposal.steps})).await.map(|_| true)

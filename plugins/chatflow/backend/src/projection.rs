@@ -180,21 +180,14 @@ fn digests(entries: &[JournalEntry], calls: &HashMap<String, &JournalEntry>) -> 
     Digests(digests)
 }
 
-/// Calls shown in one digest note at most; the rest are counted.
-const DIGEST_CALLS: usize = 40;
-
-/// A call as `tool target`: its tool and the first argument that names what it worked on.
+/// A call as `tool target`: its tool and the whole first argument that names what it worked on.
 fn call_label(call: &JournalEntry) -> String {
     let tool = str_field(&call.data, "tool");
     let args = call.data.get("args").cloned().unwrap_or(Value::Null);
     let target = ["path", "file", "command", "cmd", "uri", "url", "query", "pattern", "name"]
         .iter()
         .find_map(|field| args.get(*field).and_then(Value::as_str).filter(|value| !value.trim().is_empty()))
-        .map(|value| {
-            let line = value.lines().next().unwrap_or("").trim();
-            let short: String = line.chars().take(80).collect();
-            if short.len() < line.len() || value.lines().nth(1).is_some() { format!("{short}…") } else { short }
-        });
+        .map(|value| value.trim().to_owned());
     match target {
         Some(target) => format!("{tool} {target}"),
         None => tool.to_owned(),
@@ -205,15 +198,12 @@ fn digest_text(ds: &Dataset, calls: &[(String, bool)]) -> String {
     digest_text_with(ds, calls, "turn_digest")
 }
 
-/// A digest note of `calls` in the data set's text `key` (`turn_digest`, `steps_digest`).
+/// A digest note of every one of `calls` in the data set's text `key` (`turn_digest`,
+/// `steps_digest`): each is one short label.
 fn digest_text_with(ds: &Dataset, calls: &[(String, bool)], key: &str) -> String {
     let failed = ds.text("turn_digest_failed", &[]);
-    let shown: Vec<String> = calls.iter().take(DIGEST_CALLS).map(|(label, bad)| if *bad { format!("{label}{failed}") } else { label.clone() }).collect();
-    let mut list = shown.join("; ");
-    if calls.len() > DIGEST_CALLS {
-        list = ds.text("turn_digest_more", &[("calls", &list), ("more", &(calls.len() - DIGEST_CALLS).to_string())]);
-    }
-    ds.text(key, &[("calls", &list)])
+    let shown: Vec<String> = calls.iter().map(|(label, bad)| if *bad { format!("{label}{failed}") } else { label.clone() }).collect();
+    ds.text(key, &[("calls", &shown.join("; "))])
 }
 
 /// Render a router or decide entry as the host's statement of that decision.
@@ -512,8 +502,7 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
             }
             "run" => {
                 let command = command_of(call)?;
-                let shown: String = command.chars().take(60).collect();
-                later(&run_at, &command, result.seq).then(|| ds.text("run_superseded", &[("command", &shown)]))
+                later(&run_at, &command, result.seq).then(|| ds.text("run_superseded", &[("command", command.trim())]))
             }
             _ => None,
         }
@@ -660,10 +649,9 @@ pub fn project_with(entries: &[JournalEntry], ds: &Dataset, image_input: bool) -
         }
         if let Some((command, report)) = tests {
             let number = |field: &str| report.get(field).and_then(Value::as_u64).unwrap_or(0).to_string();
-            let names: Vec<&str> = report.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(5).collect();
+            let names: Vec<&str> = report.get("names").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
             let names = if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) };
-            let command: String = command.lines().next().unwrap_or("").chars().take(80).collect();
-            state.push_str(&ds.text("steps_state_tests", &[("command", &command), ("failed", &number("failed")), ("ran", &number("ran")), ("names", &names)]));
+            state.push_str(&ds.text("steps_state_tests", &[("command", command.trim()), ("failed", &number("failed")), ("ran", &number("ran")), ("names", &names)]));
         }
         state
     };

@@ -187,14 +187,14 @@ pub fn replace(path: &str, text: &str, replacements: &[(String, String, bool)]) 
     Ok(TextChange { text: current, line_map: map, changed: changed_all, notes })
 }
 
-/// The lines (1-based, at most 5) equal to `old`'s first non-blank line except for whitespace.
+/// The lines (1-based) equal to `old`'s first non-blank line except for whitespace.
 fn near_lines(text: &str, old: &str) -> Vec<usize> {
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let first = old.lines().find(|line| !line.trim().is_empty()).map(str::trim).unwrap_or("");
     if first.is_empty() {
         return Vec::new();
     }
-    text.lines().enumerate().filter(|(_, line)| squash(line) == squash(first)).map(|(index, _)| index + 1).take(5).collect()
+    text.lines().enumerate().filter(|(_, line)| squash(line) == squash(first)).map(|(index, _)| index + 1).collect()
 }
 
 /// Point the model at a near miss (same text ignoring whitespace), mechanically.
@@ -205,7 +205,7 @@ fn near_miss(text: &str, old: &str) -> String {
         return String::new();
     }
     let hits: Vec<usize> =
-        text.lines().enumerate().filter(|(_, line)| squash(line) == squash(first)).map(|(index, _)| index + 1).take(5).collect();
+        text.lines().enumerate().filter(|(_, line)| squash(line) == squash(first)).map(|(index, _)| index + 1).collect();
     if hits.is_empty() {
         "; no line resembles its first line either (read the file again)".to_owned()
     } else {

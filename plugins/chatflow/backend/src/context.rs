@@ -375,13 +375,10 @@ pub async fn build(host: &Host, project_id: &str, data: &Dataset, role: &str, le
     Ok(build_with(host, project_id, data, role, lead, project).await?.0)
 }
 
-/// The project's own contract as a prompt section: its `AGENTS.md`, else `CLAUDE.md` (a file that
-/// is only `@OTHER.md` lines is followed to that file), within `limits.contract_chars`. Empty when
-/// the project has none.
-fn contract_section(data: &Dataset, root: &Path) -> String {
-    if data.limits.contract_chars == 0 {
-        return String::new();
-    }
+/// The project's own contract file: the name it is read by and its text (`AGENTS.md`, else
+/// `CLAUDE.md`; a file that is only `@OTHER.md` lines is followed to those files). None when the
+/// project has none.
+fn contract_file(root: &Path) -> Option<(String, String)> {
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let Ok(mut text) = std::fs::read_to_string(root.join(name)) else { continue };
         let mut file = name.to_owned();
@@ -395,26 +392,138 @@ fn contract_section(data: &Dataset, root: &Path) -> String {
             text = included.join("\n\n");
         }
         let text = text.trim();
-        if text.is_empty() {
-            continue;
+        if !text.is_empty() {
+            return Some((file, text.to_owned()));
         }
-        let fitted = fit_sections(text, data.limits.contract_chars, &file);
-        return data.text("section_contract", &[("file", &file), ("text", fitted.trim())]);
     }
-    String::new()
+    None
 }
 
-/// A document within `limit` characters, cut at its headings instead of at its end: its sections
-/// in order, each whole while it fits, and every one that does not by its heading with how to read
-/// it (`AGENTS.md#Heading`), so no part of it is silently gone. One file given as several (`@`
-/// lines) is read by the first's name.
-fn fit_sections(text: &str, limit: usize, file: &str) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
+/// The project's own contract as a prompt section, never cut: the whole file when it is within
+/// `limits.contract_chars`, else the copy the model wrote shorter with every rule kept (a
+/// `contract` knowledge item keyed by the file's hash). While that copy is not written yet it is
+/// being written in the background and the whole file is shown. Empty when the project has none.
+async fn contract_section(host: &Host, data: &Dataset, project_id: &str, root: &Path) -> String {
+    let goal = data.limits.contract_chars;
+    if goal == 0 {
+        return String::new();
     }
-    let file = file.split(", ").next().unwrap_or(file);
-    // Sections start at a `#` heading outside a fenced code block; the text before the first one
-    // is a section of its own.
+    let Some((file, text)) = contract_file(root) else { return String::new() };
+    if text.chars().count() <= goal {
+        return data.text("section_contract", &[("file", &file), ("text", &text)]);
+    }
+    let hash = contract_hash(&text, goal);
+    if let Some(short) = stored_contract(host, project_id, &hash).await {
+        return data.text("section_contract_short", &[("file", file.split(", ").next().unwrap_or(&file)), ("text", short.trim())]);
+    }
+    shorten_in_background(host, data, project_id, &text, &hash);
+    data.text("section_contract", &[("file", &file), ("text", &text)])
+}
+
+/// What a stored short copy is keyed by: the file's text and the length it was written for.
+fn contract_hash(text: &str, goal: usize) -> String {
+    format!("contract:{:016x}:{goal}", crate::repetition::fingerprint(text))
+}
+
+/// The short copy written from this version of the file, when there is one: the item's `as_of`
+/// names the version it was written from (replaced on every write; its `evidence` keeps every
+/// version it ever had, so a file back at an older version would match it with newer rules).
+async fn stored_contract(host: &Host, project_id: &str, hash: &str) -> Option<String> {
+    let listed = host
+        .get::<Value>(memory_methods::KNOWLEDGE_LIST, json!({"project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::CONTRACT}))
+        .await
+        .ok()?;
+    listed
+        .get("items")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| item.get("as_of").and_then(Value::as_str) == Some(hash))
+        .and_then(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// Projects whose contract is being written shorter now: one writer per project.
+static SHORTENING: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Versions of a contract the model could not write shorter in this process: not tried again on
+/// every prefix build (each is several model calls); the whole file stays in the prompt.
+static SHORTEN_FAILED: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Start writing the contract shorter in the background: never on a turn's path. Its stored item's
+/// `memory.knowledge.changed` has the next conversation's block prefilled again with it.
+fn shorten_in_background(host: &Host, data: &Dataset, project_id: &str, text: &str, hash: &str) {
+    if SHORTEN_FAILED.lock().map(|failed| failed.contains(hash)).unwrap_or(false) {
+        return;
+    }
+    let first = SHORTENING.lock().map(|mut shortening| shortening.insert(project_id.to_owned())).unwrap_or(false);
+    if !first {
+        return;
+    }
+    let (host, data, project_id, text, hash) = (host.clone(), data.clone(), project_id.to_owned(), text.to_owned(), hash.to_owned());
+    tokio::spawn(async move {
+        match shorten_contract(&host, &data, &project_id, &text).await {
+            Ok(short) => {
+                let upsert = json!({
+                    "project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::CONTRACT, "name": "contract",
+                    "text": short.trim(), "source": "inferred", "by": "chatflow", "evidence": [hash], "as_of": hash,
+                });
+                if let Err(error) = host.effect(memory_methods::KNOWLEDGE_UPSERT, upsert).await {
+                    tracing::warn!(%error, "the project's contract written shorter could not be stored");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the project's contract could not be written shorter; the whole file stays in the prompt");
+                if let Ok(mut failed) = SHORTEN_FAILED.lock() {
+                    failed.insert(hash.clone());
+                }
+            }
+        }
+        if let Ok(mut shortening) = SHORTENING.lock() {
+            shortening.remove(&project_id);
+        }
+    });
+}
+
+/// Characters of the contract one CONTRACT call reads: a longer file is written shorter part by part
+/// (whole sections, each part given its share of the goal) and the parts joined.
+const CONTRACT_PART_CHARS: usize = 60_000;
+
+/// Rounds of writing shorter: a result still longer than the goal is written shorter again from
+/// itself while each round gains.
+const CONTRACT_ROUNDS: usize = 3;
+
+/// The contract written shorter within `limits.contract_chars`, every rule kept. Each round reads
+/// the previous one's text whole; the best (shortest) result is kept, even one a little over the
+/// goal, since it still holds every rule. An answer the model could not finish fails the round:
+/// a cut copy is never stored.
+async fn shorten_contract(host: &Host, data: &Dataset, project_id: &str, text: &str) -> Result<String, String> {
+    let goal = data.limits.contract_chars;
+    let mut best = text.to_owned();
+    for _ in 0..CONTRACT_ROUNDS {
+        let total = best.chars().count();
+        if total <= goal {
+            break;
+        }
+        let mut written = String::new();
+        for part in contract_parts(&best) {
+            let size = part.chars().count();
+            let share = (goal * size).div_ceil(total).max(1);
+            let short = shorten_part(host, data, project_id, &part, share).await?;
+            written.push_str(short.trim());
+            written.push_str("\n\n");
+        }
+        let written = written.trim().to_owned();
+        if written.is_empty() || written.chars().count() >= total {
+            break;
+        }
+        best = written;
+    }
+    if best == text { Err("the model wrote nothing shorter".to_owned()) } else { Ok(best) }
+}
+
+/// The contract in parts of whole sections (a `#` heading outside a fenced block opens one), each
+/// part at most [`CONTRACT_PART_CHARS`] unless one section alone is longer.
+fn contract_parts(text: &str) -> Vec<String> {
     let mut sections: Vec<String> = vec![String::new()];
     let mut fenced = false;
     for line in text.lines() {
@@ -429,50 +538,82 @@ fn fit_sections(text: &str, limit: usize, file: &str) -> String {
         current.push_str(line);
         current.push('\n');
     }
-    let mut out = String::new();
-    let mut left = limit;
-    for section in sections.iter().filter(|section| !section.trim().is_empty()) {
-        let size = section.chars().count();
-        if size <= left {
-            out.push_str(section);
-            left -= size;
-            continue;
+    let mut parts: Vec<String> = Vec::new();
+    for section in sections.into_iter().filter(|section| !section.trim().is_empty()) {
+        match parts.last_mut() {
+            Some(part) if part.chars().count() + section.chars().count() <= CONTRACT_PART_CHARS => part.push_str(&section),
+            _ => parts.push(section),
         }
-        let heading = section.lines().next().unwrap_or("").trim();
-        let name = heading.trim_start_matches('#').trim();
-        let pointer = if heading.starts_with('#') { format!("{heading}\n(read it: {file}#{name})\n") } else { format!("(the start: read {file}:1-40)\n") };
-        let pointer_size = pointer.chars().count();
-        out.push_str(&pointer);
-        left = left.saturating_sub(pointer_size);
     }
-    out
+    parts
 }
 
-/// What the description is written from: the top of the repository (names only), its languages,
-/// and its own documents (README, the agent file, build manifests), each cut short. The hash of
-/// this text is stored with the description, so it is written again only when they change.
-fn describe_inputs(data: &Dataset, root: &Path, languages: &[String]) -> String {
-    let mut listing: Vec<String> = std::fs::read_dir(root)
-        .map(|read| {
-            read.flatten()
-                .filter_map(|item| {
-                    let name = item.file_name().to_string_lossy().into_owned();
-                    (!name.starts_with('.') && name != "node_modules" && name != "target").then(|| if item.path().is_dir() { format!("{name}/") } else { name })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    listing.sort();
-    listing.truncate(80);
-    let mut documents = String::new();
-    let candidates = ["README.md", "README", "README.rst", "AGENTS.md", "CLAUDE.md", "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile"];
-    for name in candidates {
-        if let Ok(text) = std::fs::read_to_string(root.join(name)) {
-            let cut: String = text.chars().take(if name.starts_with("README") { 4000 } else { 1500 }).collect();
-            documents.push_str(&data.text("describe_document", &[("name", name), ("text", cut.trim())]));
-        }
+/// One part written shorter within `chars`. The answer may take as many tokens as the part has
+/// characters (it is meant to be shorter than the part): one that still ran out was not finished.
+async fn shorten_part(host: &Host, data: &Dataset, project_id: &str, part: &str, chars: usize) -> Result<String, String> {
+    let key = format!("contract:{project_id}");
+    let messages = vec![
+        ChatMessage::new("system", data.prompt("contract").to_owned()),
+        ChatMessage::new("user", data.text("contract_goal", &[("text", part.trim()), ("chars", &chars.to_string())])),
+    ];
+    let params = json!({
+        "messages": messages,
+        "tools": [],
+        "sampling": data.sampling("CONTRACT", false),
+        "thinking": crate::llm::thinking("none"),
+        "priority": "background",
+        "max_tokens": part.chars().count().max(1024),
+        "cache_key": key,
+    });
+    let result = crate::llm::on_best_model(host, &key, None, host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params)).await.map_err(|error| error.to_string())?;
+    if result.finish_reason == "length" {
+        return Err("the model did not finish writing a part".to_owned());
     }
-    data.text("describe_inputs", &[("listing", &listing.join("\n")), ("languages", &languages.join(", ")), ("documents", documents.trim())])
+    if result.content.trim().is_empty() {
+        return Err("the model wrote an empty part".to_owned());
+    }
+    Ok(result.content)
+}
+
+/// What the description is written from: the top of the repository (names only, all of them), its
+/// languages, and its own documents (README, the agent file, build manifests), each whole.
+struct DescribeInputs {
+    listing: String,
+    languages: String,
+    documents: Vec<(String, String)>,
+}
+
+impl DescribeInputs {
+    fn read(root: &Path, languages: &[String]) -> Self {
+        let mut listing: Vec<String> = std::fs::read_dir(root)
+            .map(|read| {
+                read.flatten()
+                    .filter_map(|item| {
+                        let name = item.file_name().to_string_lossy().into_owned();
+                        (!name.starts_with('.') && name != "node_modules" && name != "target").then(|| if item.path().is_dir() { format!("{name}/") } else { name })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        listing.sort();
+        let candidates = ["README.md", "README", "README.rst", "AGENTS.md", "CLAUDE.md", "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile"];
+        let documents = candidates
+            .iter()
+            .filter_map(|name| std::fs::read_to_string(root.join(name)).ok().map(|text| ((*name).to_owned(), text.trim().to_owned())))
+            .filter(|(_, text)| !text.is_empty())
+            .collect();
+        Self { listing: listing.join("\n"), languages: languages.join(", "), documents }
+    }
+
+    /// The documents, each under its name.
+    fn documents_text(&self, data: &Dataset) -> String {
+        self.documents.iter().map(|(name, text)| data.text("describe_document", &[("name", name), ("text", text)])).collect::<String>().trim().to_owned()
+    }
+
+    /// The message DESCRIBE reads, with `documents` as the documents it shows.
+    fn message(&self, data: &Dataset, documents: &str) -> String {
+        data.text("describe_inputs", &[("listing", &self.listing), ("languages", &self.languages), ("documents", documents.trim())])
+    }
 }
 
 /// Projects whose description is being written now: one writer per project.
@@ -497,11 +638,13 @@ fn describe_in_background(host: &Host, data: &Dataset, project_id: &str, root: &
 }
 
 /// The project's description (a `description` knowledge item): written by the model when the
-/// project has none, or when the documents it was written from changed. A failure leaves the
-/// project without one (logged): sessions still work.
+/// project has none, or when the documents it was written from changed. Documents longer than one
+/// call reads are described part by part first, and the description is written from those parts.
+/// A failure leaves the project without one (logged): sessions still work.
 async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root: &Path, languages: &[String]) {
-    let inputs = describe_inputs(data, root, languages);
-    let hash = format!("inputs:{:016x}", crate::repetition::fingerprint(&inputs));
+    let inputs = DescribeInputs::read(root, languages);
+    let whole = inputs.documents_text(data);
+    let hash = format!("inputs:{:016x}", crate::repetition::fingerprint(&inputs.message(data, &whole)));
     let existing = host
         .get::<Value>(memory_methods::KNOWLEDGE_LIST, json!({"project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::DESCRIPTION}))
         .await
@@ -513,32 +656,99 @@ async fn ensure_description(host: &Host, data: &Dataset, project_id: &str, root:
     }
     // The call is keyed by the project, so the network places it on its best free model.
     let key = format!("describe:{project_id}");
-    let messages = vec![
-        ChatMessage::new("system", data.prompt("describe").to_owned()),
-        ChatMessage::new("user", inputs.clone()),
-    ];
+    let documents = if whole.chars().count() <= CONTRACT_PART_CHARS {
+        whole
+    } else {
+        match describe_parts(host, data, &key, &inputs).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                tracing::warn!(%error, "the project's documents could not be described part by part; no description is written");
+                return;
+            }
+        }
+    };
+    match describe(host, data, &key, &inputs.message(data, &documents)).await {
+        Ok(text) => {
+            let upsert = json!({
+                "project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::DESCRIPTION, "name": "project",
+                "text": text.trim(), "source": "inferred", "by": "chatflow", "evidence": [hash],
+            });
+            if let Err(error) = host.effect(memory_methods::KNOWLEDGE_UPSERT, upsert).await {
+                tracing::warn!(%error, "the project description could not be stored");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "the project description could not be written"),
+    }
+}
+
+/// The documents described part by part: each part (whole documents, a document longer than one
+/// call reads split at its sections, [`contract_parts`]) within what one call reads
+/// ([`CONTRACT_PART_CHARS`]) is described with the folder list and languages, and the parts'
+/// descriptions are joined. Joined descriptions still longer than one call reads are described in
+/// parts again, while each round gains.
+async fn describe_parts(host: &Host, data: &Dataset, key: &str, inputs: &DescribeInputs) -> Result<String, String> {
+    let mut units: Vec<String> = Vec::new();
+    for (name, text) in &inputs.documents {
+        let whole = data.text("describe_document", &[("name", name), ("text", text)]);
+        if whole.chars().count() <= CONTRACT_PART_CHARS {
+            units.push(whole);
+            continue;
+        }
+        let sections = contract_parts(text);
+        let count = sections.len();
+        for (n, section) in sections.iter().enumerate() {
+            let name = data.text("describe_document_part", &[("name", name), ("n", &(n + 1).to_string()), ("count", &count.to_string())]);
+            units.push(data.text("describe_document", &[("name", &name), ("text", section.trim())]));
+        }
+    }
+    let mut total = units.iter().map(|unit| unit.chars().count()).sum::<usize>();
+    loop {
+        let mut parts: Vec<String> = Vec::new();
+        for unit in units {
+            match parts.last_mut() {
+                Some(part) if part.chars().count() + unit.chars().count() <= CONTRACT_PART_CHARS => part.push_str(&unit),
+                _ => parts.push(unit),
+            }
+        }
+        let count = parts.len();
+        let mut described: Vec<String> = Vec::new();
+        for (n, part) in parts.iter().enumerate() {
+            let text = describe(host, data, key, &inputs.message(data, part)).await?;
+            described.push(data.text("describe_part", &[("n", &(n + 1).to_string()), ("count", &count.to_string()), ("text", text.trim())]));
+        }
+        let joined: String = described.concat();
+        let size = joined.chars().count();
+        if size <= CONTRACT_PART_CHARS {
+            return Ok(joined.trim().to_owned());
+        }
+        if size >= total {
+            return Err("the parts' descriptions are no shorter than the documents".to_owned());
+        }
+        total = size;
+        units = described;
+    }
+}
+
+/// One DESCRIBE call on `message`. An answer the model could not finish, or an empty one, is an
+/// error: a cut description is never stored.
+async fn describe(host: &Host, data: &Dataset, key: &str, message: &str) -> Result<String, String> {
+    let messages = vec![ChatMessage::new("system", data.prompt("describe").to_owned()), ChatMessage::new("user", message.to_owned())];
     let params = json!({
         "messages": messages,
         "tools": [],
         "sampling": data.sampling("DESCRIBE", false),
         "thinking": crate::llm::thinking("none"),
         "priority": "background",
-        "max_tokens": 700,
         "cache_key": key,
     });
-    match crate::llm::on_best_model(host, &key, None, host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params)).await {
-        Ok(result) if !result.content.trim().is_empty() => {
-            let upsert = json!({
-                "project_id": project_id, "kind": cc_protocol::contracts::memory::knowledge::DESCRIPTION, "name": "project",
-                "text": result.content.trim(), "source": "inferred", "by": "chatflow", "evidence": [hash],
-            });
-            if let Err(error) = host.effect(memory_methods::KNOWLEDGE_UPSERT, upsert).await {
-                tracing::warn!(%error, "the project description could not be stored");
-            }
-        }
-        Ok(_) => tracing::warn!("the project description came back empty"),
-        Err(error) => tracing::warn!(%error, "the project description could not be written"),
+    let result = crate::llm::on_best_model(host, key, None, host.get::<cc_protocol::contracts::model::ChatResult>(model_methods::CHAT, params)).await.map_err(|error| error.to_string())?;
+    if result.finish_reason == "length" {
+        return Err("the model did not finish the description".to_owned());
     }
+    if result.content.trim().is_empty() {
+        return Err("the description came back empty".to_owned());
+    }
+    Ok(result.content)
 }
 
 async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, lead: bool, mut project: ProjectFacts) -> Result<(Prefix, BuiltFacts), RpcError> {
@@ -568,7 +778,7 @@ async fn build_with(host: &Host, project_id: &str, data: &Dataset, role: &str, l
     // misleading cue. The prompt carries what the software is (the description, in the brief) and
     // the project's own contract; code is found per task by searching for its topic.
     let (map_text, map_files) = (String::new(), 0);
-    let contract = if root.is_empty() { String::new() } else { contract_section(data, Path::new(&root)) };
+    let contract = if root.is_empty() { String::new() } else { contract_section(host, data, project_id, Path::new(&root)).await };
     if !root.is_empty() && data.limits.brief_tokens > 0 {
         describe_in_background(host, data, project_id, Path::new(&root), &project.languages);
     }

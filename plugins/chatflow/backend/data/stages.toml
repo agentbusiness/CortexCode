@@ -177,8 +177,6 @@ skills_per_turn = 3
 skills_in_prefix = true
 # Tasks one plan may hold (the `depends_on` numbers its grammar offers).
 plan_max_tasks = 12
-# Knowledge items one KNOWLEDGE stage may propose from the user's message (docs/PROJECT-KNOWLEDGE-PLAN.md P3).
-knowledge_items_per_turn = 3
 # Knowledge items the host reads by meaning for a turn (ROUTE's `work`; 0 = none) and shows as one
 # host note after the skills (P4).
 knowledge_per_turn = 5
@@ -190,19 +188,19 @@ lessons_per_turn = 4
 # first error line) shown right under that failure when it comes again; one, so what the run does
 # next is credited to it alone.
 lessons_per_failure = 1
-# Episodes (a failure and what came after it) one run is learned from, at most.
-learn_episodes_per_run = 6
 # A new lesson this similar to a stored one (search score) is that lesson learned again. Measured
 # with the memory plugin's embedding: a lesson against itself 0.85, rewordings of one lesson
 # 0.57-0.72, different lessons 0.29-0.49.
 lesson_merge_score = 0.56
 # Earlier runs without a learned mark taken up after a run is learned (the backlog).
 learn_backlog_runs = 3
-# The project's own contract (its AGENTS.md, else CLAUDE.md) in the system prompt, in characters;
-# 0 = none. Large enough for a whole contract: at 6000 a 10k AGENTS.md showed its longest section
-# (the shared standard, the rules the work broke) as a heading only, and no step read it.
-# It sits in the byte-stable system block, read once per session and kept in the cache.
-contract_chars = 40000
+# The project's own contract (its AGENTS.md, else CLAUDE.md) in the system prompt: the length it
+# is shown within, in characters; 0 = none. A longer one is never cut: the model writes it again
+# shorter, every rule kept (stage CONTRACT), once per version of the file, stored in the graph, and
+# that copy is shown (seen: cut at its headings, a 10k AGENTS.md showed its longest section, the
+# rules the work broke, as a heading only, and no step read it). Until that copy is written the
+# whole file is shown. It sits in the byte-stable system block, read once per session and cached.
+contract_chars = 20000
 # A change whose route names no file a language server checks reads the workspace's diagnostics
 # before DECIDE, at most this many listed per server (errors first, the rest counted).
 diagnostics_shown = 12
@@ -307,9 +305,17 @@ effort = "none"
 sampling = "auto"
 
 # The project's description, written once when a project is first used (and again when its
-# documents change): what the software is, no code. Stored in the graph, shown first in the brief.
+# documents change): what the software is, no code, from the documents whole (longer ones than a
+# call reads are described part by part first). Stored in the graph, shown first in the brief.
 [stage.DESCRIBE]
 rules = "describe"
+effort = "none"
+sampling = "plain"
+
+# The project's contract written again shorter, every rule kept, when it is longer than
+# `limits.contract_chars`: once per version of the file, stored in the graph, shown in its place.
+[stage.CONTRACT]
+rules = "contract"
 effort = "none"
 sampling = "plain"
 

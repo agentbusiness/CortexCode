@@ -12,6 +12,10 @@ section_rules = "## Project rules\n{text}"
 section_style = "## How the user likes to work\n{text}"
 # The project's knowledge brief (memory.knowledge.brief): decisions, facts, concepts, open questions.
 section_contract = "## The project's own rules ({file})\n{text}"
+# The contract as the model wrote it shorter (stage CONTRACT), every rule kept.
+section_contract_short = "## The project's own rules ({file}, written shorter with every rule kept; read {file} for a rule's exact words)\n{text}"
+# The last line of a CONTRACT call: the length to stay within.
+contract_goal = "{text}\n\n---\nWrite the rules above again within {chars} characters."
 section_knowledge = "## What the project knows\n{text}"
 # Knowledge items found by meaning for the turn's work, one line each (after ROUTE).
 knowledge_note = "What the project knows about this work (`read knowledge://<id>` for an item's evidence and the code it concerns):\n{text}"
@@ -32,7 +36,7 @@ learn_refused = "A `{tool}` call was refused:\n{error}\nThe call: {call}\nThe ne
 learn_repeated = "This command failed {times} times the same way: {command}\n{error}\nThen this worked: {fix}"
 learn_red_green = "This command failed: {command}\n{error}\nThese edits made it pass:\n{edits}"
 learn_retry = "The earlier attempt ended done; then this message said it was wrong:\n{message}\nWhat the work found:\n{found}\nThese edits fixed it, and the run ended done:\n{edits}"
-learn_steer = "While the work ran, the user said: {message}\nThe steps before it: {before}\nThe steps after it: {after}"
+learn_steer = "While the work ran, the user said: {message}\nThe steps before it:\n{before}\nThe steps after it:\n{after}"
 # The one line after a learned run (the transcript only).
 learned_note = "Learned {count} {items}."
 # The skills catalog, in the stage messages of the stages that choose skills (ROUTE, PLAN).
@@ -69,7 +73,6 @@ steps_digest = "(Earlier steps of this turn were compacted to keep the conversat
 tasks_digest = "(The finished tasks' steps are not shown: what each established is in what the finished tasks reported, below.{state} Read a file when you need its current text.)"
 steps_state_files = " Files they changed: {files}."
 steps_state_tests = " Their last test run, `{command}`: {failed} of {ran} failed{names}."
-turn_digest_more = "{calls}, and {more} more"
 turn_digest_failed = " (failed)"
 decision_route = "Route: {route}."
 decision = "Decision: {route}."
@@ -201,7 +204,6 @@ attachment_image = "- image {name}: `{path}` ({size}{dims}). {seen}"
 attachment_image_dims = ", {width}×{height} px"
 attachment_unseen = "You cannot see images and no vision capability described it: only its file and these facts are known."
 attachment_seen = "Described by {by}: {description}"
-attachment_listing_more = "… and {count} more"
 attachment_listing_empty = "(empty)"
 attachment_listing_unreadable = "(the folder could not be listed)"
 attachment_shown = "The image itself is part of this message."
@@ -214,8 +216,7 @@ done_security = "The host's security check of your change found this:\n{found}"
 done_without_tests = "Your last check ran no tests, so it shows nothing about the change. A test is added only when the request asks for one or the project already tests this code. Run the code the change is about now, then reply with what it printed."
 attachment_test_notes = "  What the test output above means:\n{notes}"
 attachment_pasted = "- pasted text {name}: `{path}` ({size}, {lines} lines). Only its first and last lines are shown here; read or search the file for the rest:\n{preview}"
-attachment_preview_gap = "… {count} lines not shown …"
-attachment_preview_cut = " … ({count} more characters)"
+attachment_preview_gap = "[lines {first}-{last} not shown: read {path}:{first}-{last}]"
 
 # ---- other repositories the message references (@project mentions, folder attachments) -------
 references = "Other repositories the user referenced, read-only (never edit them). Read them with `read`:\n{items}"
@@ -223,7 +224,6 @@ reference_project = "- {name}: `{root}`{state}. graph://{name}/search/<words>, s
 reference_listing = " (being indexed)"
 reference_indexing = " (being indexed: {done} of {total} files)"
 reference_symbol = "\n  {asked}: {kind} {qname} at {name}:{path}:{start}-{end}"
-reference_symbol_more = "\n  {asked}: {count} more; read symbol://{name}/{asked}"
 reference_symbol_pending = "\n  {asked}: located once indexed; read symbol://{name}/{asked}"
 reference_symbol_missing = "\n  {asked}: not found; try graph://{name}/search/{asked}"
 reference_symbol_failed = "\n  {asked}: not located ({error})"
@@ -310,7 +310,6 @@ plan_replan_live = "Task {n} ({title}) ended {outcome}: {summary}\nTasks 1 to {d
 plan_revise_live = "Task {n} ({title}) is done and showed that the tasks after it must change: {summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, as a new list numbered from 1 (`depends_on` uses these new numbers), changed to fit what was found. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 failed_before = "\n{count} of the {of} tests `{command}` fails on failed in the host's check before this work began too: {names}."
 failed_before_earlier = "\n{count} of the {of} tests `{command}` fails on failed in the host's check at the start of an earlier request too: {names}."
-failed_before_more = "{names} and {more} more"
 plan_steer_live = "While task {n} ({title}) was running, the user wrote:\n{summary}\nTasks 1 to {done} are done and stay as they are. Write only the tasks still to do, task {n} included, as a new list numbered from 1 (`depends_on` uses these new numbers), so that together they do what the user asks now. Their words go into a task's `rules` as they stand, copied, never narrowed to what is easier to show. Each task still to do from before is carried on by a new task that names it in `from` (same or new title), or is in `dropped` with why; a task for a part the user asked for, or one that runs or measures what they asked for, is dropped only when the user said so: a part that needs something missing gets a task that gets it."
 review_live = "Task {n} ({title}) is done. The tasks still to do:\n{tasks}\nDo they still fit what the work so far showed?"
 review_task = "{n}. {title}: {brief}"
@@ -342,7 +341,7 @@ steer_live = "While task {n} ({title}) was running, the user wrote:\n{text}\nDo 
 steer_agents_live = "While the plan's agents were working, the user wrote:\n{text}\nDo their words only ask a question, or ask something of the work?"
 progress_answer = "Task {n} of {count} is running: {title}. Done: {done}.{jobs}"
 progress_done_none = "none yet"
-progress_job = "\nRunning in the background: {job_id}, its output so far ends with: {tail}"
+progress_job = "\nRunning in the background: {job_id}. Its output so far ends:\n{tail}"
 progress_go_on = "The user asked how the work goes, and the host gave them the plan's progress. Go on with task {n} ({title})."
 # Outdated outputs once settled: the newest read, edit result or run of the same thing shows the
 # current state; the older ones become one line each.
@@ -371,6 +370,10 @@ do_step_done_no_files = "no file"
 # The documents the project description is written from (DESCRIBE).
 describe_inputs = "Folders and files at the top of the repository:\n{listing}\n\nLanguages: {languages}\n\n{documents}"
 describe_document = "--- {name} ---\n{text}\n\n"
+# Documents longer than one DESCRIBE call reads are described part by part first: a long
+# document's sections, then each part's description as the documents the description is written from.
+describe_document_part = "{name}, part {n} of {count}"
+describe_part = "--- the documents, part {n} of {count}, described ---\n{text}\n\n"
 
 # ---- background work of the session (MANAGE, supervision, plans that replace work) ----------------
 manage_live = "Background work of this conversation:\n{work}"
@@ -456,7 +459,6 @@ manage_said = ". It last said: \"{text}\""
 manage_plan = "The plan being carried out: {goal}\n{tasks}\n"
 # What the folder holds now, read by the host at the decision (the agents' reports can be older).
 manage_folder = "The project folder now holds: {entries}\n"
-manage_folder_more = ", and {count} more"
 manage_files_gone = ". Gone from the folder now: {files}"
 # What the user asked while the work ran that no plan took up yet; last, right before the decision.
 manage_asks = "\nThe user asked this of the work while it ran, and no task has it yet:\n{asks}\nThe agent whose task it belongs to gets a `message` with it. When no task covers it, `replan` is yes and `brief` names it."

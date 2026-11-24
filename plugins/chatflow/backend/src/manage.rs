@@ -17,9 +17,6 @@ use cc_protocol::contracts::memory::{AgentRecord, Task, methods as memory_method
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-/// Characters of a task's last result shown per agent.
-const RESULT_CHARS: usize = 400;
-
 fn str_field<'a>(data: &'a Value, field: &str) -> &'a str {
     data.get(field).and_then(Value::as_str).unwrap_or("")
 }
@@ -125,10 +122,10 @@ pub async fn progress(env: &RunEnv, agent: &AgentRecord, checks: &[String]) -> (
     // Both ways: what the session last told it, and what it last said (its answer, its question).
     if let Some(told) = told {
         let ago = cc_protocol::contracts::now_ms().saturating_sub(told.ts_ms) / 60_000;
-        line.push_str(&env.data.text("manage_told", &[("ago", &ago.to_string()), ("text", &short(str_field(&told.data, "text"), SAID_CHARS))]));
+        line.push_str(&env.data.text("manage_told", &[("ago", &ago.to_string()), ("text", &whole(str_field(&told.data, "text")))]));
     }
     if let Some(said) = entries.iter().rev().find(|entry| entry.kind == kinds::ASSISTANT_MESSAGE && !str_field(&entry.data, "text").trim().is_empty()) {
-        line.push_str(&env.data.text("manage_said", &[("text", &short(str_field(&said.data, "text"), SAID_CHARS))]));
+        line.push_str(&env.data.text("manage_said", &[("text", &whole(str_field(&said.data, "text")))]));
     }
     // Not moving needs the session whatever it was told: a message does not reach a run that
     // takes no step (seen: an agent told something before it stopped moving, never flagged, 8½
@@ -269,17 +266,11 @@ async fn publish_flags(env: &RunEnv, work: &[OpenWork]) {
     env.host.ctx().publish(chatflow_topics::MANAGE_FLAGS, serde_json::to_value(&flags).unwrap_or(Value::Null));
 }
 
-/// Characters of an agent's last words, and of the session's last message to it, shown per agent.
-const SAID_CHARS: usize = 300;
-
-fn short(text: &str, chars: usize) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = text.chars().take(chars).collect();
-    if cut.len() < text.len() { format!("{cut}...") } else { cut }
+/// An agent's last words, or the session's last message to it, on one line and whole: what it
+/// said decides what the session does next.
+fn whole(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-/// Entries of the project folder's top level shown to MANAGE at most.
-const FOLDER_ENTRIES: usize = 60;
 
 /// The project folder's top level as it is now, one line: each entry by name (a folder ends in
 /// `/`), hidden entries left out. Read by the host at the decision, so the session compares the
@@ -300,13 +291,7 @@ pub fn folder_line(env: &RunEnv) -> String {
         return String::new();
     }
     names.sort();
-    let more = names.len().saturating_sub(FOLDER_ENTRIES);
-    names.truncate(FOLDER_ENTRIES);
-    let mut shown = names.join(", ");
-    if more > 0 {
-        shown.push_str(&env.data.text("manage_folder_more", &[("count", &more.to_string())]));
-    }
-    env.data.text("manage_folder", &[("entries", &shown)])
+    env.data.text("manage_folder", &[("entries", &names.join(", "))])
 }
 
 /// The plan the background work carries out, task by task with where each stands (done, worked on
@@ -356,8 +341,7 @@ pub fn work_lines(env: &RunEnv, work: &[OpenWork]) -> String {
 
 fn work_line(env: &RunEnv, item: &OpenWork) -> String {
     let result = item.task.result.as_deref().map(str::trim).filter(|result| !result.is_empty()).map(|result| {
-        let cut: String = result.chars().take(RESULT_CHARS).collect();
-        if cut.len() < result.len() { format!(": {cut}...") } else { format!(": {cut}") }
+        format!(": {}", result.split_whitespace().collect::<Vec<_>>().join(" "))
     });
     let repeated = if item.repeated { env.data.text("manage_repeat", &[]) } else { String::new() };
     env.data.text(

@@ -1,6 +1,7 @@
 //! What a definition does, in the words already written around it: no model. A symbol's `summary`
-//! is its doc's first sentence, what callers say right above their calls, what its tests' names say,
-//! the documentation headings that mention it, and its body's own comments and message strings.
+//! is its doc's first sentence, the files that call it (with the pointer to every call), what its
+//! tests' names say, the documentation headings that mention it, and its body's own comments and
+//! message strings.
 //!
 //! The words are gathered from facts the sync already holds (the language plugins' notes, the
 //! resolved edges): one pass over the edges that carry words, borrowing their text, then one
@@ -10,14 +11,11 @@ use crate::facts::{FileFacts, SymbolFact};
 use crate::model::{self, EdgeRow, Model};
 use std::collections::HashMap;
 
-/// Items kept per kind of words, and characters per summary.
-const HEARD_PER_KIND: usize = 3;
-const SUMMARY_CHARS: usize = 700;
-
 /// What other files say about one definition.
 #[derive(Default)]
 pub struct Heard<'a> {
-    /// Comments right above calls to it.
+    /// The files that call it (each once): said by file, so a widely used definition's summary
+    /// changes (and is embedded again) only when the set of calling files changes.
     callers: Vec<&'a str>,
     /// Qualified names of the tests that test it.
     tests: Vec<&'a str>,
@@ -27,7 +25,7 @@ pub struct Heard<'a> {
 
 impl<'a> Heard<'a> {
     fn add(list: &mut Vec<&'a str>, text: &'a str) {
-        if list.len() < HEARD_PER_KIND && !text.is_empty() && !list.contains(&text) {
+        if !text.is_empty() && !list.contains(&text) {
             list.push(text);
         }
     }
@@ -44,8 +42,8 @@ fn qname_in<'s>(sid: &'s str, file: &FileFacts) -> Option<&'s str> {
 }
 
 /// The words other files say about definitions, by target sid, and the targets each file's words
-/// reach (by path). Only edges that carry words are looked at: calls under a comment, tests,
-/// mentions.
+/// reach (by path). Only edges that say something are looked at: calls (by the calling file),
+/// tests, mentions.
 pub fn heard<'a>(model: &'a Model, all_edges: &'a [(String, Vec<EdgeRow>, String)]) -> (HashMap<&'a str, Heard<'a>>, HashMap<&'a str, Vec<&'a str>>) {
     let mut heard: HashMap<&'a str, Heard<'a>> = HashMap::new();
     let mut reach: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
@@ -54,12 +52,9 @@ pub fn heard<'a>(model: &'a Model, all_edges: &'a [(String, Vec<EdgeRow>, String
         let mut reached: Vec<&'a str> = Vec::new();
         for edge in edges {
             match edge.rel {
-                "CALLS" | "INSTANTIATES" if !file.line_notes.is_empty() => {
-                    let Some(line) = edge.props.get("line").and_then(|v| v.as_u64()) else { continue };
-                    if let Ok(at) = file.line_notes.binary_search_by_key(&(line as u32), |note| note.line) {
-                        Heard::add(&mut heard.entry(edge.to.as_str()).or_default().callers, file.line_notes[at].text.as_str());
-                        reached.push(edge.to.as_str());
-                    }
+                "CALLS" | "INSTANTIATES" => {
+                    Heard::add(&mut heard.entry(edge.to.as_str()).or_default().callers, path.as_str());
+                    reached.push(edge.to.as_str());
                 }
                 "TESTS" => {
                     if let Some(qname) = qname_in(&edge.from, file) {
@@ -150,7 +145,8 @@ fn first_sentence(doc: &str) -> &str {
 }
 
 /// One definition's summary: the doc's first sentence first (what one-line results show), then
-/// what callers, tests and documents say, then its body's own words. None when nothing is said.
+/// the files that call it with the pointer to every call, what tests and documents say, then its
+/// body's own words; every distinct test and heading whole. None when nothing is said.
 pub fn compose(symbol: &SymbolFact, heard: Option<&Heard>) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     if let Some(doc) = symbol.doc.as_deref() {
@@ -161,7 +157,10 @@ pub fn compose(symbol: &SymbolFact, heard: Option<&Heard>) -> Option<String> {
     }
     if let Some(heard) = heard {
         if !heard.callers.is_empty() {
-            lines.push(format!("Callers: {}", heard.callers.join("; ")));
+            let mut files = heard.callers.clone();
+            files.sort_unstable();
+            let count = if files.len() == 1 { "1 file".to_owned() } else { format!("{} files", files.len()) };
+            lines.push(format!("Called from {count}: {} (every call: graph://used-by/{})", files.join(", "), symbol.qname));
         }
         let tests: Vec<String> = heard.tests.iter().filter_map(|test| test_phrase(test, &symbol.name)).collect();
         if !tests.is_empty() {
@@ -177,11 +176,7 @@ pub fn compose(symbol: &SymbolFact, heard: Option<&Heard>) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    let text = lines.join("\n");
-    Some(match text.char_indices().nth(SUMMARY_CHARS) {
-        Some((at, _)) => format!("{}…", text[..at].trim_end()),
-        None => text,
-    })
+    Some(lines.join("\n"))
 }
 
 /// Short stable hash of a text or a sid, as stored and compared (`summary_hash`).

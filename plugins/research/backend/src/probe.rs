@@ -119,8 +119,9 @@ async fn notes(core: &Core) -> String {
 
 fn deep() -> Result<String, String> {
     let text = (0..20).map(|i| format!("Paragraph {i}. {}", "word ".repeat(50))).collect::<Vec<_>>().join("\n\n");
-    let chunks = crate::deep::chunk(&text, 1_000, 3);
-    if chunks.len() != 3 || chunks.iter().any(|c| c.chars().count() > 1_000) {
+    let chunks = crate::deep::chunk(&text, 1_000);
+    let kept: usize = chunks.iter().map(|c| c.matches("Paragraph ").count()).sum();
+    if kept != 20 || chunks.iter().any(|c| c.chars().count() > 1_000) {
         return Err(format!("chunking gave {} chunks", chunks.len()));
     }
     let schema = crate::deep::map_schema(3);

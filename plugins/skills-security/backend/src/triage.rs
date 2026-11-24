@@ -182,7 +182,7 @@ pub fn facts(finding: &SecurityFinding) -> Vec<String> {
     let mut add = |label: &str, value: &str| {
         let value = value.trim();
         if !value.is_empty() {
-            out.push(format!("{label}: {}", value.chars().take(400).collect::<String>()));
+            out.push(format!("{label}: {value}"));
         }
     };
     add("Finding", &finding.title);

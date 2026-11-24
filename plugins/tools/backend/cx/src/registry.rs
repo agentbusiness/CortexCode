@@ -417,7 +417,7 @@ fn format_job(value: &Value) -> String {
     if tail.is_empty() {
         format!("{}\n{ended}", job_line(value))
     } else {
-        format!("{}\n--- output (tail) ---\n{}\n{ended}", job_line(value), tail.trim_end())
+        format!("{}\n--- output ---\n{}\n{ended}", job_line(value), tail.trim_end())
     }
 }
 
